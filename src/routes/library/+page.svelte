@@ -2703,7 +2703,7 @@
       >{m.library_remove_missing()}</button>
     {/if}
     {#if hasActiveLibraryFilters}
-      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button>
+      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button>
     {/if}
     <button
       class="dupes-toggle"
@@ -3226,7 +3226,7 @@
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
         <p>{m.library_empty_no_matches()}</p>
-        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button></p>
+        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
       </div>
     {:else if sortedFiles.length === 0 && !initialLoadDone}
       <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
@@ -3553,11 +3553,25 @@
               <div class="comment-loading">{m.library_loading_comments()}</div>
             {:else}
               <div class="comment-our">
-                <div class="comment-rating-row">
+                <div class="comment-rating-row" role="group" aria-label={m.library_your_rating()}>
                   <span class="comment-label">{m.library_your_rating()}</span>
                   {#each [1,2,3,4,5] as star}
-                    <button class="star-btn" onclick={() => ourRating = star} title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}>
-                      {star <= ourRating ? '\u2605' : '\u2606'}
+                    <!--
+                      Named and stateful. The glyph was the accessible name, so
+                      the control announced as "black star" / "white star" and
+                      said nothing about the rating actually set — the filled-vs-
+                      hollow distinction that carries the whole value was purely
+                      visual.
+                    -->
+                    <button
+                      type="button"
+                      class="star-btn"
+                      onclick={() => ourRating = star}
+                      aria-label={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      aria-pressed={star <= ourRating}
+                      title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                    >
+                      <span aria-hidden="true">{star <= ourRating ? '\u2605' : '\u2606'}</span>
                     </button>
                   {/each}
                   {#if ourRating > 0}
@@ -3578,7 +3592,18 @@
                       }
                     }}
                   ></textarea>
-                  <button class="comment-save" onclick={handleSaveComment} disabled={commentSaveState === 'saving'}>
+                  <!--
+                    Also gated on `commentDirty` (which the discard prompt
+                    already tracks) and on the fetch: an enabled Save that
+                    writes the same values back reports "Saved" for work it
+                    didn't do, and pressing it before the fetch lands did
+                    nothing at all with no explanation.
+                  -->
+                  <button
+                    class="comment-save"
+                    onclick={handleSaveComment}
+                    disabled={commentSaveState === 'saving' || commentLoading || !commentDirty}
+                  >
                     {commentSaveState === 'saving' ? m.library_saving() : m.common_save()}
                   </button>
                 </div>

@@ -559,7 +559,10 @@
       <div class="controls-right">
         <span class="inline-stat">{m.security_ranges_count({ count: stats.range_count.toLocaleString() })}</span>
         <span class="inline-sep">&middot;</span>
-        <span class="inline-stat hits-stat">{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
+        <!-- Red only when there is something to be red about. A permanent
+             danger-coloured "0 hits" trains the eye to ignore the one place
+             on the page that reports blocks actually happening. -->
+        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
       </div>
     </div>
 

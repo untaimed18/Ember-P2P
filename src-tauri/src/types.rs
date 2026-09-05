@@ -1198,12 +1198,12 @@ pub struct AppSettings {
     /// Path to server.met file for ed2k server list
     #[serde(default)]
     pub server_list_path: String,
-    /// Automatically connect to KAD on startup (eMule: "Autoconnect" for Kad)
-    #[serde(default)]
-    pub auto_connect_kad: bool,
-    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server),
-    /// independent of `auto_connect_kad`. Defaults to `false`. KAD Connect never
-    /// starts an eD2K session — use the Servers page or enable this setting.
+    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server).
+    /// Defaults to `false`, unlike KAD, which always bootstraps on startup:
+    /// KAD is the peer index the rest of the app is useless without, whereas a
+    /// server is one operator's machine seeing every request you make, so that
+    /// one stays opt-in. KAD Connect never starts an eD2K session — use the
+    /// Servers page or enable this setting.
     #[serde(default)]
     pub auto_connect_server: bool,
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
@@ -1778,16 +1778,13 @@ impl Default for AppSettings {
             add_servers_from_server: true,
             add_servers_from_clients: true,
             server_list_path: String::new(),
-            auto_connect_kad: false,
-            // Matches `auto_connect_kad`: a fresh launch shouldn't reach out
-            // to any network on its own. This used to default to `true`
-            // here while `#[serde(default)]` (used once a settings.json
-            // already exists but predates this field) fell back to
-            // `bool::default() == false` — two different defaults for the
-            // same field depending on whether this is a brand-new install
-            // or an upgrade. Connecting to a server is real, visible network
-            // activity (see `NetworkState::upload_disconnected`), so it must
-            // not happen before the user asks for it either way.
+            // This used to default to `true` here while `#[serde(default)]`
+            // (used once a settings.json already exists but predates this
+            // field) fell back to `bool::default() == false` — two different
+            // defaults for the same field depending on whether this is a
+            // brand-new install or an upgrade. Both paths must agree, and
+            // joining one operator's server is a disclosure KAD's distributed
+            // lookup doesn't make, so "off" is the answer for both.
             auto_connect_server: false,
             max_sources_per_file: 400,
             max_connections: 500,
@@ -1963,10 +1960,11 @@ mod tests {
     /// while `#[serde(default)]` (used when an existing settings.json
     /// predates the field) fell back to `bool::default() == false` — a
     /// fresh install and an upgrade disagreed on whether a server connects
-    /// automatically on startup. Both paths must agree, and connecting to a
-    /// network automatically is significant enough behavior that "off"
-    /// is the only safe shared default (see `auto_connect_kad`, which this
-    /// mirrors).
+    /// automatically on startup. Both paths must agree, and joining a
+    /// specific operator's server is significant enough behavior that "off"
+    /// is the only safe shared default. KAD is deliberately not like this —
+    /// it always bootstraps — because it is distributed and the app cannot
+    /// find anything without it.
     #[test]
     fn auto_connect_server_defaults_to_off_via_both_paths() {
         assert!(

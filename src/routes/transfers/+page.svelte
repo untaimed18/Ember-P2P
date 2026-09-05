@@ -3513,6 +3513,7 @@
                       <ProgressBar
                         value={t.progress}
                         color={downloadProgressColor(t)}
+                        label={t.file_name}
                       />
                     {/if}
                   </td>
@@ -3681,6 +3682,7 @@
                       <ProgressBar
                         value={t.progress}
                         color={t.status === 'failed' ? 'var(--danger)' : 'var(--success)'}
+                        label={t.file_name}
                       />
                     </td>
                   {:else if column.key === 'sources'}
@@ -4025,7 +4027,7 @@
                           No percent overlay — same as the parts bar: this
                           cell is a coverage map, not a completion %.
                         -->
-                        <ProgressBar value={t.completed_size} max={t.total_size} color="var(--accent)" showPercent={false} />
+                        <ProgressBar value={t.completed_size} max={t.total_size} color="var(--accent)" showPercent={false} label={t.file_name} />
                         {/if}
                       {:else}
                         <span class="no-bar">—</span>

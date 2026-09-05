@@ -58,6 +58,48 @@ export function inertBackground(overlay: Element | null | undefined): () => void
 }
 
 /**
+ * Arrow-key navigation for a `role="menu"` container. Call from the
+ * container's `keydown` handler.
+ *
+ * `role="menu"` is a promise: assistive tech announces the number of items and
+ * tells the user to arrow between them. Several menus here made that promise
+ * with nothing but Tab behind it, which is the disclosure-list contract, not
+ * the menu one. Down/Up wrap, Home/End jump to the ends, and disabled items
+ * are skipped (a menu whose first entry is disabled — Browse files, for an
+ * offline friend — would otherwise strand the user on it).
+ */
+export function menuKeydown(e: KeyboardEvent, container: HTMLElement | null | undefined): void {
+  if (!container) return;
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
+  const items = [
+    ...container.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+  ].filter((el) => el.getAttribute('aria-disabled') !== 'true');
+  if (items.length === 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === 'Home') {
+    items[0].focus();
+    return;
+  }
+  if (e.key === 'End') {
+    items[items.length - 1].focus();
+    return;
+  }
+  const active = typeof document !== 'undefined' ? document.activeElement : null;
+  const current = items.findIndex((el) => el === active);
+  const step = e.key === 'ArrowDown' ? 1 : -1;
+  // From outside the item list (focus still on the summary/trigger) Down opens
+  // at the top and Up at the bottom, which is the usual menu behavior.
+  const next =
+    current === -1
+      ? step === 1
+        ? 0
+        : items.length - 1
+      : (current + step + items.length) % items.length;
+  items[next].focus();
+}
+
+/**
  * Standard modal Tab focus-trap. Call from a `keydown` handler; wraps focus
  * between the first and last focusable descendant of `container` so Tab /
  * Shift+Tab cycle within the dialog instead of escaping to the background.

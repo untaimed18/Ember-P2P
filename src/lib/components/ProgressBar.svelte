@@ -5,7 +5,21 @@
     color = '',
     status = '',
     showPercent = true,
-  }: { value?: number; max?: number; color?: string; status?: string; showPercent?: boolean } = $props();
+    label = '',
+  }: {
+    value?: number;
+    max?: number;
+    color?: string;
+    status?: string;
+    showPercent?: boolean;
+    /**
+     * What this bar is measuring — normally the file name. Without it a page
+     * of transfers announces as a column of unnamed progress bars reading
+     * "62%", "9%", "100%", with no way to tell which row is which. Optional
+     * because some callers sit inside an already-labelled row.
+     */
+    label?: string;
+  } = $props();
 
   const STATUS_COLORS: Record<string, string> = {
     active: 'var(--accent)',
@@ -28,6 +42,7 @@
 <div
   class="progress-bar"
   role="progressbar"
+  aria-label={label || undefined}
   aria-valuenow={Math.round(percentage)}
   aria-valuemin={0}
   aria-valuemax={100}

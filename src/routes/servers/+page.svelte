@@ -16,7 +16,8 @@
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { formatCompactCount } from '$lib/utils';
+  import { copyToClipboard, formatCompactCount } from '$lib/utils';
+  import { toastError } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
 
   let servers: ServerInfo[] = $state([]);
@@ -531,9 +532,25 @@
     } else if (action === 'remove') {
       await handleRemoveSelected();
     } else if (action === 'copy_ip' && target) {
-      try { await navigator.clipboard.writeText(`${target.ip}:${target.port}`); flash(m.servers_copied_clipboard()); } catch {}
+      await copyOrWarn(`${target.ip}:${target.port}`, m.servers_copied_clipboard());
     } else if (action === 'copy_ed2k' && target) {
-      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash(m.servers_copied_ed2k()); } catch {}
+      await copyOrWarn(`ed2k://|server|${target.ip}|${target.port}|/`, m.servers_copied_ed2k());
+    }
+  }
+
+  /**
+   * Copy with an outcome either way.
+   *
+   * Both context-menu copies were `try { … } catch {}`: on a denied clipboard
+   * permission the menu closed, nothing was copied, and nothing said so —
+   * indistinguishable from a successful copy until the user pasted. Goes
+   * through the shared helper so the `execCommand` fallback applies here too.
+   */
+  async function copyOrWarn(text: string, okMessage: string) {
+    if (await copyToClipboard(text)) {
+      flash(okMessage);
+    } else {
+      toastError(m.kad_clipboard_unavailable());
     }
   }
 
@@ -791,6 +808,10 @@
             </svg>
             <p>{m.servers_empty_no_matches()}</p>
             <p class="sub">{m.servers_empty_no_matches_sub()}</p>
+            <!-- The filter box is up in the toolbar, out of the eyeline of
+                 someone reading an empty table, so put the way out here too —
+                 the same move the KAD and Library empty states already make. -->
+            <button class="ghost btn-sm" onclick={() => (serverFilter = '')}>{m.common_clear_filters()}</button>
           </div>
         {:else}
           <table class="server-table">

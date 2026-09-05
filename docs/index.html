@@ -1015,7 +1015,7 @@
       </div>
     </div>
 
-    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. On first launch Ember can seed a community <code>server.met</code> from emule-security.org; you connect to KAD and ED2K servers when you choose (or enable optional auto-connect in Settings).</p>
+    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup; ED2K servers are yours to choose, and on first launch Ember can seed a community <code>server.met</code> from emule-security.org.</p>
     <p>Ember also runs a network of its own. The <a href="#ember">Ember Network</a> is an encrypted overlay with no servers and no central directory: Ember nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. It is on by default and runs <em>alongside</em> KAD and eD2K, so you keep the whole eMule network as well.</p>
     <p>On top of that, <a href="#epx">EPX (Ember Peer Exchange)</a> speeds up source discovery between Ember peers on the ordinary eMule wire, and an Ember-exclusive <a href="#friends">Friends</a> system adds <strong>end-to-end encrypted</strong> chat, Noise-secured sessions, and privacy-preserving Friend Codes &mdash; all invisible to non-Ember clients.</p>
   </section>
@@ -1131,11 +1131,11 @@
       </li>
       <li>
         <strong>Setup Wizard</strong><br>
-        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; nickname, download folder, ports, speed limits, KAD auto-connect, and theme.</span>
+        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; nickname, download folder, ports, speed limits, and theme.</span>
       </li>
       <li>
         <strong>Connect</strong><br>
-        <span style="color: var(--text-secondary)">Press <strong>Connect</strong> on the KAD Network page and/or connect from the ED2K Servers page. Optionally enable Auto-Connect KAD and Auto-Connect Server in Settings (or the Setup Wizard) so Ember reconnects on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run. The <a href="#ember">Ember Network</a> needs no connect step &mdash; it is on by default and joins on its own, but it finds its first peers <em>through</em> KAD and eD2K, so keep at least one of them available on a fresh install.</span>
+        <span style="color: var(--text-secondary)">KAD connects on its own at every launch, so there is nothing to press; you can still disconnect for the current session from the KAD Network page. The <a href="#ember">Ember Network</a> needs no connect step either &mdash; it is on by default and finds its first peers <em>through</em> KAD. ED2K servers stay opt-in: connect from the ED2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run.</span>
       </li>
       <li>
         <strong>Share &amp; Download</strong><br>
@@ -1165,7 +1165,7 @@
     <h3>Networking</h3>
     <ul>
       <li><strong>Ember Network</strong> &mdash; Ember&rsquo;s own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. Always on, joins automatically, and runs alongside KAD and eD2K. See the <a href="#ember">Ember Network section</a>.</li>
-      <li><strong>KAD Network</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Optional Auto-Connect KAD in Settings; otherwise press Connect on the KAD Network page. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
+      <li><strong>KAD Network</strong> &mdash; The decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Bootstraps at startup with no setting to configure; the KAD Network page can disconnect it for the current session. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
       <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally Auto-Connect Server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
       <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
       <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
@@ -1216,10 +1216,10 @@
 
     <h3>User Experience</h3>
     <ul>
-      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, optional KAD auto-connect, and theme.</li>
+      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
       <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there.</li>
-      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, and Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages.</li>
+      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages, and Ctrl+, to open Settings.</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
       <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
@@ -1714,7 +1714,7 @@ npm run tauri build</code></pre>
         Is Ember compatible with regular eMule clients?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. Connect to KAD and/or an ED2K server from the app (or enable optional auto-connect in Settings). Ember&rsquo;s own additions &mdash; the <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> extension &mdash; only involve other Ember clients and are silently ignored by everything else.</div>
+      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup, and you can add an ED2K server from the app. Ember&rsquo;s own additions &mdash; the <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> extension &mdash; only involve other Ember clients and are silently ignored by everything else.</div>
     </div>
 
     <div class="faq-item">

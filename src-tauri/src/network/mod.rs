@@ -12835,23 +12835,20 @@ struct NetworkState {
     /// listener rejects new connections and terminates active sessions.
     /// The upload TCP listener binds and starts accepting connections as
     /// soon as `start_network` runs, independent of KAD/server connection
-    /// state, so this must be initialized to match `stats.status` /
-    /// `settings.auto_connect_kad` (see `start_network`) rather than
-    /// defaulting to `false` — otherwise a fresh launch (or any session
-    /// with auto-connect off) serves uploads to anyone who already knows
-    /// our IP:port while the UI still reads "Disconnected".
+    /// state, so this must track `stats.status` (see `start_network`) — a
+    /// node that reads "Disconnected" in the UI must not still be serving
+    /// uploads to peers who remember our IP:port from a prior session.
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// The user asked activity to stop: set by an explicit `KadDisconnect`,
     /// cleared by every path back off `Disconnected`.
     ///
     /// Deliberately not `upload_disconnected`, which answers a different
-    /// question — "are we accepting inbound connections?" — and is *also* true
-    /// on a first run with both auto-connects off, a state in which the
-    /// always-on Ember overlay is expected to keep working. Gating outbound
-    /// activity on that flag would have broken Ember-only operation before the
-    /// user ever connects anything. This one starts `false` and only an
-    /// explicit Disconnect sets it, so it can gate the outbound side: starting
-    /// download workers, dialling friends, and UDP server search.
+    /// question — "are we accepting inbound connections?" — and is *also*
+    /// raised when an eD2K server drops a session whose KAD side is already
+    /// disconnected, and by the shutdown save sequence. Neither of those is
+    /// the user asking to go offline. This one is only ever set by an explicit
+    /// Disconnect, so it can gate the outbound side: starting download
+    /// workers, dialling friends, and UDP server search.
     ///
     /// Shared rather than a plain `bool` because friend dials outlive the
     /// network task's borrow — one spawned before the click can still be
@@ -21780,8 +21777,9 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
-    // eD2K-only sessions (KAD never connected) must re-arm the upload gate
-    // on server drop; otherwise peers keep uploading after we go offline.
+    // A session whose KAD side is disconnected has no other reason to be
+    // accepting inbound connections, so re-arm the upload gate on server
+    // drop; otherwise peers keep uploading after we go offline.
     if state.stats.status == NetworkStatus::Disconnected {
         state
             .upload_disconnected
@@ -21944,8 +21942,8 @@ async fn initiate_server_connect(
     state.preferred_ed2k_server = Some((ip.clone(), port));
     // Connecting to an eD2K server counts as being online for the upload
     // listener: allow peer uploads and (critically) the server's HighID
-    // TCP port-test. Without this, server-first sessions with KAD auto-
-    // connect off always rejected the port-test and got stuck on LowID.
+    // TCP port-test. Without this, joining a server after disconnecting KAD
+    // always rejected the port-test and got stuck on LowID.
     state
         .upload_disconnected
         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -24176,11 +24174,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         publish_manager,
         dht_store,
         stats: NetworkStats {
-            status: if settings.auto_connect_kad {
-                NetworkStatus::Connecting
-            } else {
-                NetworkStatus::Disconnected
-            },
+            // KAD always bootstraps on startup, so the node opens in
+            // `Connecting` rather than waiting to be asked. `Disconnected` is
+            // still reachable — an explicit `KadDisconnect` from the KAD
+            // Network page puts us there for the rest of the session — so
+            // every gate that checks for it below still earns its place.
+            status: NetworkStatus::Connecting,
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -24396,20 +24395,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
-        // Mirror the `stats.status` initialization above: the upload
-        // listener binds and starts accepting TCP connections immediately
-        // (see `start_upload_server`), well before this task has actually
-        // reached KAD or an eD2K server. Defaulting this to `false`
-        // ("uploads allowed") left a fresh launch — or any session with
-        // auto-connect disabled — silently servable by any peer that
-        // already knows our IP:port from a prior session, even while the
-        // UI still read "Disconnected". Cleared by `KadConnect` or
-        // `initiate_server_connect` (eD2K Connect / auto-connect server).
-        // The eD2K server's HighID port-test is also exempted in the upload
-        // accept loop so server-first connect cannot get stuck on LowID.
-        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(
-            !settings.auto_connect_kad && !settings.auto_connect_server,
-        )),
+        // Mirror the `stats.status` initialization above. The upload listener
+        // binds and starts accepting TCP connections immediately (see
+        // `start_upload_server`), well before this task has actually reached
+        // KAD or an eD2K server, so this flag used to start `true` whenever
+        // no auto-connect was configured — otherwise a fresh launch was
+        // silently servable by any peer that remembered our IP:port from a
+        // prior session while the UI still read "Disconnected". Now that KAD
+        // always bootstraps there is no such session: startup is always a
+        // connect. `KadDisconnect` sets the flag, and `KadConnect` /
+        // `initiate_server_connect` clear it again.
+        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Starts false on purpose — see the field comment. "Has not connected
         // yet" is not "was asked to go offline".
         user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -24743,22 +24739,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let firewall_probe_ips: upload_server::FirewallProbeSet =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-    if settings.auto_connect_kad {
-        // Send bootstrap requests to initial contacts
-        for contact in &boot_contacts {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::BootstrapReq;
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, 0x01);
-                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                debug!("Sent bootstrap req to {addr}");
-            }
+    // Send bootstrap requests to initial contacts. Unconditional: KAD is the
+    // peer index everything else reads from, and making it opt-in mostly
+    // produced installs that looked broken. `boot_contacts` has already
+    // fallen back to the hardcoded list if nodes.dat was missing or empty,
+    // so there is always something to ask. The firewall check is deferred to
+    // the periodic bootstrap_timer recheck, which fires once we have verified
+    // contacts (table_size >= 10).
+    for contact in &boot_contacts {
+        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+        let msg = KadMessage::BootstrapReq;
+        if let Ok(packet) = messages::encode_packet(&msg) {
+            state.flood_protection.track_request(addr, 0x01);
+            let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+            debug!("Sent bootstrap req to {addr}");
         }
-
-        // Firewall check is deferred to the periodic bootstrap_timer recheck,
-        // which fires once we have verified contacts (table_size >= 10).
-    } else {
-        info!("KAD auto-connect disabled, skipping bootstrap (use Connect to start KAD)");
     }
 
     // Download / upload event channels.
@@ -26705,9 +26700,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
             }
-            // Same trap as the NAT probe above, and for the same reason: with
-            // `auto_connect_kad` off the node is `Disconnected` for the whole
-            // session, so clearing unconditionally left the in-flight guard
+            // Same trap as the NAT probe above, and for the same reason: once
+            // the user disconnects KAD the node is `Disconnected` for the rest
+            // of the session, so clearing unconditionally left the in-flight guard
             // permanently false. The bootstrap timer then respawned
             // registration every tick, each spawn bumped
             // `rendezvous_register_generation`, and the result handler dropped
@@ -32432,8 +32427,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Only the KAD bootstrap below depends on KAD being up. The
                 // friend-presence and friend-search work after this block must
                 // not: `stats.status` is only ever advanced by KAD code paths,
-                // so an eD2K-only session (the default, `auto_connect_kad` is
-                // off) sits at `Disconnected` forever. Returning here left the
+                // so a session where the user disconnected KAD sits at
+                // `Disconnected` until they reconnect. Returning here left the
                 // connection broker unbuilt, no QUIC listener, and the node
                 // never registered with rendezvous — friends could not find it
                 // at all, with no event emitted to say so.
@@ -48357,8 +48352,8 @@ async fn maybe_publish_ember_sources(
     // not: `KadDisconnect` clears LowID and rebuilds the firewall checker, so
     // the TCP verdict reads `Unknown` immediately afterwards and the node
     // publishes itself as a *reachable* HighID source while rejecting every
-    // connect. The same flag also covers a first run with both auto-connects
-    // off, where the listener has never been opened.
+    // connect. The same flag also covers shutdown, where the listener is
+    // closed before the save sequence runs.
     if state
         .upload_disconnected
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -51144,10 +51139,10 @@ async fn handle_udp_packet_inner(
     // below is KAD's, and an unsolicited KAD packet must not be parsed or folded
     // into the routing table while KAD is disconnected, so the gate belongs here
     // rather than around the whole handler. It used to sit at the call site,
-    // which meant an eD2K-only session (the default: `auto_connect_kad` is off,
-    // and such a session never leaves `Disconnected`) discarded every inbound
-    // peer datagram while still sending reasks — queue ranks never updated,
-    // peers queued on us never got an ack, and the UDP port test always failed.
+    // which meant a session with KAD disconnected — eD2K-only, but still
+    // transferring — discarded every inbound peer datagram while still sending
+    // reasks, so queue ranks never updated, peers queued on us never got an
+    // ack, and the UDP port test always failed.
     if state.stats.status == NetworkStatus::Disconnected {
         debug!("Dropping KAD UDP packet from {from}: KAD is not connected");
         return;

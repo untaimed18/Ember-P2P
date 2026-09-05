@@ -726,6 +726,51 @@ tr:hover td {
 }
 
 /*
+ * Shared parts of an empty state: headline, supporting line, and the action
+ * that gets the user out of it. These were defined identically inside
+ * `friends` and `channels` and simply absent elsewhere — the Statistics load
+ * failure was styling its own message with an inline `color: var(--danger)`,
+ * which is how one page ended up with a red error and the rest with grey ones.
+ *
+ * Pages keep their scoped overrides (Library and KAD both want a tighter
+ * button). Those tie on specificity — Svelte's `.svelte-hash` makes a
+ * one-class rule count for two — and win on order, because a route's CSS
+ * chunk loads after the layout's. So these are defaults, not decrees.
+ */
+.empty-state .empty-title {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.empty-state .empty-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.empty-state .empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.empty-state .empty-action {
+  margin-top: 16px;
+  padding: 7px 20px;
+  font-size: 12px;
+}
+
+/* An action inside `.empty-actions` is already spaced by the row's margin. */
+.empty-state .empty-actions .empty-action {
+  margin-top: 0;
+}
+
+/*
  * Strip banners under page headers. Tinted fill + soft edge, matching
  * the badge/toast recipe, so errors don't read as a hard red rule.
  */

@@ -27,8 +27,15 @@ export type NavItem = {
  * advertised the wrong key for each of them.
  */
 export const navItems: NavItem[] = [
-  { href: '/ember', label: () => m.nav_ember_network(), id: 'ember' },
-  { href: '/', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'] },
+  // `/` is the app's entry route and redirects here, so it counts as Ember for
+  // highlighting purposes — otherwise launch shows a sidebar with nothing
+  // active until the redirect lands.
+  { href: '/ember', label: () => m.nav_ember_network(), id: 'ember', aliases: ['/'] },
+  // KAD moved off `/` when Ember became the entry route. `/kad-network`, the
+  // URL before that, still redirects here and is kept as an alias so a
+  // bookmark highlights this row instead of flickering through "no item
+  // active" on the way through the stub.
+  { href: '/kad', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'] },
   { href: '/servers', label: () => m.nav_ed2k_servers(), id: 'servers' },
   { href: '/search', label: () => m.nav_search(), id: 'search' },
   { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
@@ -41,10 +48,28 @@ export const navItems: NavItem[] = [
 ];
 
 /**
+ * The nav as the sidebar actually renders it. Channels is dropped when the
+ * Ember overlay is off, because the page has nothing to show without it.
+ *
+ * Exported (rather than derived in the sidebar) because Alt+N is positional:
+ * the cheat-sheet has to number the *same* list the shortcut handler walks.
+ * Deriving it twice is how the sheet came to advertise Alt+8 → Channels on a
+ * profile where Alt+8 went to Statistics.
+ */
+export function visibleNavItems(emberNativeEnabled: boolean | undefined): NavItem[] {
+  return emberNativeEnabled === false
+    ? navItems.filter((item) => item.id !== 'channels')
+    : navItems;
+}
+
+/**
  * How many entries get an Alt+N shortcut. Alt+1..9 map to the first nine
- * items; Alt+0 maps to the tenth (Security, today). Anything past that is
- * click-only — worth remembering when reordering, and the reason this says
- * "today": inserting Channels moved which page the tenth slot lands on.
+ * items; Alt+0 maps to the tenth. Which page that is depends on how many
+ * entries are visible, so always number against `visibleNavItems()` rather
+ * than the full list.
+ *
+ * Anything past the tenth is click-only, which is why Settings — last, and
+ * frequently visited — gets `Ctrl/Cmd+,` instead (see `Sidebar.svelte`).
  */
 export const NAV_SHORTCUT_LIMIT = 10;
 

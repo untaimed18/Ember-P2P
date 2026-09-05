@@ -1719,20 +1719,26 @@
         </div>
         <p class="empty-title">{m.channels_empty_title()}</p>
         <p class="empty-sub">{m.channels_empty()}</p>
+        <!--
+          Same gate as the header buttons, and for the same reason: while a
+          username is still required the form below is the username form, so
+          setting `composeMode` here changed nothing on screen and the click
+          read as broken — then produced a create/join form out of nowhere
+          once a name was finally saved. Routed through `toggleCompose` so
+          there is one place that decides what these do.
+        -->
         <div class="empty-actions">
           <button
             class="empty-action"
-            onclick={() => {
-              composeMode = 'create';
-              error = null;
-            }}
+            onclick={() => toggleCompose('create')}
+            disabled={needsUsername}
+            title={needsUsername ? m.channels_username_required() : undefined}
           >{m.channels_create()}</button>
           <button
             class="ghost"
-            onclick={() => {
-              composeMode = 'join';
-              error = null;
-            }}
+            onclick={() => toggleCompose('join')}
+            disabled={needsUsername}
+            title={needsUsername ? m.channels_username_required() : undefined}
           >{m.channels_join_title()}</button>
         </div>
       </div>
@@ -1769,7 +1775,7 @@
                 }}
               />
               {#if listQuery}
-                <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.common_close()} aria-label={m.common_close()}><IconX size={12} /></button>
+                <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
               {/if}
             </div>
           {/if}

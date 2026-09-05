@@ -770,7 +770,7 @@ export interface AppSettings {
   add_servers_from_server: boolean;
   add_servers_from_clients: boolean;
   server_list_path: string;
-  auto_connect_kad: boolean;
+  /** eD2K only. KAD always bootstraps on startup and has no setting. */
   auto_connect_server: boolean;
   max_sources_per_file: number;
   max_connections: number;

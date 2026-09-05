@@ -11,6 +11,7 @@
    * The overlay is always on.
    */
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import {
     getEmberDiagnostics,
     getEmberDhtContacts,
@@ -26,6 +27,7 @@
   import { formatDurationSecs } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { checkForUpdates, updater } from '$lib/stores/updater';
+  import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -438,9 +440,12 @@
 
 <svelte:head><title>{m.nav_ember_network()} — Ember</title></svelte:head>
 
+<!-- `h2` and `.page-header` to match every other page: this was the only page
+     with an `h1`, which put the same chrome at two different heading levels
+     and two different type sizes depending on where you'd navigated from. -->
 <header class="page-header">
   <div>
-    <h1>{m.nav_ember_network()}</h1>
+    <h2>{m.nav_ember_network()}</h2>
     <p class="subtitle">{m.ember_page_subtitle()}</p>
   </div>
 </header>
@@ -464,6 +469,27 @@
           {#if joining}<span class="spinner" aria-hidden="true"></span>{/if}
         </div>
         {#if statusHint}<p class="hint">{statusHint}</p>{/if}
+        {#if heroState === 'off'}
+          <!--
+            "Off" used to end the conversation: the explainer says the service
+            is not running, the health checklist below is hidden while
+            inactive, and there was nothing to press. The overlay is a setting,
+            so send the user to the one that turns it back on — and offer a
+            re-check, since a failed diagnostics poll looks identical to a
+            genuinely disabled overlay from here.
+          -->
+          <div class="hero-actions">
+            <button
+              type="button"
+              onclick={() => void goto('/settings?section=network').catch((e) => console.warn('Failed to open settings:', e))}
+            >{m.ember_open_network_settings()}</button>
+            <button
+              type="button"
+              class="ghost"
+              onclick={() => void refreshDiag()}
+            >{m.common_retry()}</button>
+          </div>
+        {/if}
       </div>
     </div>
   </section>
@@ -550,6 +576,18 @@
       </div>
     </section>
   {/if}
+
+  <!--
+    The reachability check above gives the verdict; these are the readings
+    behind it. Shown regardless of the overlay's state, because external IP,
+    firewall and port mapping describe this machine's connection rather than
+    Ember, and they're most worth reading when something is off. Same
+    component as the KAD page's Network Status panel, so the two can't drift.
+  -->
+  <section class="card">
+    <h2>{m.kad_network_status()}</h2>
+    <NetworkStatusTiles />
+  </section>
 
   <!--
     Everything below is protocol-level diagnostics. Collapsed by default,
@@ -725,10 +763,9 @@
     gap: 16px;
   }
 
-  .page-header h1 {
-    font-size: 24px;
-    font-weight: 700;
-    color: var(--text-primary);
+  /* Size/weight come from the global `.page-header h2` rule; only the layout
+     bits this page adds (icon alignment, and room for the subtitle) live here. */
+  .page-header h2 {
     margin: 0;
     display: flex;
     align-items: center;
@@ -738,7 +775,7 @@
   .subtitle {
     margin: 6px 0 0;
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1.5;
     max-width: 70ch;
   }
@@ -826,6 +863,13 @@
     gap: 16px;
     min-width: 0;
     flex: 1;
+  }
+
+  .hero-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
   }
 
   .status-dot {

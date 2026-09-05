@@ -47,13 +47,6 @@
   let upnpEnabled = $state(_init.upnp_enabled);
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
-  // Deliberately not `_init.auto_connect_kad`. The stored default is off so a
-  // fresh launch reaches for no network before the user asks — but this wizard
-  // *is* that ask, and the copy beside the switch recommends KAD. Starting it
-  // off meant most people finished setup disconnected from the very thing the
-  // page told them to turn on, then found search slow with no clue why. Anyone
-  // who does not want it can see the switch and turn it off before it runs.
-  let autoConnectKad = $state(true);
   let selectedTheme: Theme = $state(getInitialTheme());
 
   let speedTestRunning = $state(false);
@@ -251,7 +244,6 @@
       upnp_enabled: upnpEnabled,
       max_upload_speed: maxUploadSpeed,
       max_download_speed: maxDownloadSpeed,
-      auto_connect_kad: autoConnectKad,
       auto_connect_server: false,
       setup_complete: false,
     };
@@ -451,23 +443,26 @@
           <p class="step-desc">{m.wizard_folder_desc()}</p>
           <div class="field">
             <label for="dl-folder">{m.wizard_folder_label()}</label>
+            <!--
+              Read-only path display + explicit Browse, matching Settings →
+              Downloads. This used to be a field with `cursor: pointer` and a
+              click handler: it had the same chrome as the editable nickname
+              and port inputs one step either side of it, so it invited typing
+              or pasting a path — neither of which did anything, since the
+              backend only accepts a folder the native picker authorized.
+              The value stays selectable so the path can still be copied.
+            -->
             <div class="folder-picker">
               <input
                 id="dl-folder"
                 type="text"
-                bind:value={downloadFolder}
+                value={downloadFolder}
                 class="text-input folder-input"
                 readonly
-                onclick={() => void pickFolder()}
-                onkeydown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    void pickFolder();
-                  }
-                }}
               />
               <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
+            <p class="step-hint">{m.wizard_folder_picker_hint()}</p>
             {#if folderError}
               <p class="save-error">{folderError}</p>
             {/if}
@@ -515,12 +510,29 @@
         </div>
 
       {:else if step === 6}
+        <!--
+          No switches left on this step, and it stays anyway: it is the one
+          screen that tells a new user which networks the app is about to join
+          on their behalf. Dropping it would make that disclosure happen
+          silently, which is the wrong trade even for a shorter wizard.
+        -->
         <div class="step-content">
           <h2 class="step-title">{m.wizard_connect_title()}</h2>
           <p class="step-desc">{m.wizard_connect_desc()}</p>
           <div class="connect-options">
-            <div class="connect-option">
-              <ToggleSwitch bind:checked={autoConnectKad} ariaLabel={m.wizard_connect_kad_title()} />
+            <div class="connect-option connect-option-static">
+              <div class="connect-always-on" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+              </div>
+              <div>
+                <strong>{m.nav_ember_network()}</strong>
+                <span>{m.wizard_connect_ember_desc()}</span>
+              </div>
+            </div>
+            <div class="connect-option connect-option-static">
+              <div class="connect-always-on" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+              </div>
               <div>
                 <strong>{m.wizard_connect_kad_title()}</strong>
                 <span>{m.wizard_connect_kad_desc()}</span>
@@ -528,9 +540,6 @@
             </div>
           </div>
           <p class="step-hint">{m.wizard_connect_hint()}</p>
-          {#if !autoConnectKad}
-            <p class="step-hint wizard-kad-off">{m.wizard_kad_off_warning()}</p>
-          {/if}
         </div>
 
       {:else if step === 7}
@@ -603,10 +612,6 @@
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_download_limit()}</span>
               <span class="summary-value">{maxDownloadSpeed === 0 ? m.wizard_summary_unlimited() : m.wizard_speed_kbps({ kb: Math.round(maxDownloadSpeed / 1024) })}</span>
-            </div>
-            <div class="summary-row">
-              <span class="summary-label">{m.wizard_summary_autoconnect()}</span>
-              <span class="summary-value">{autoConnectKad ? m.common_yes() : m.common_no()}</span>
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_theme()}</span>
@@ -995,9 +1000,10 @@
 
   .folder-input {
     flex: 1;
-    cursor: pointer;
+    min-width: 0;
     font-family: var(--font-mono);
     font-size: 12px;
+    color: var(--text-secondary);
   }
 
   .browse-btn {
@@ -1095,6 +1101,29 @@
     font-size: 12px;
     color: var(--text-secondary);
     line-height: 1.5;
+  }
+
+  /* No control, so it gets the success accent instead of a switch — it must
+     not look like a toggle someone forgot to make interactive. */
+  .connect-option-static {
+    border-color: color-mix(in srgb, var(--success) 40%, var(--border));
+  }
+
+  .connect-always-on {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--success);
+    color: var(--on-success);
+  }
+
+  .connect-always-on svg {
+    width: 14px;
+    height: 14px;
   }
 
   /* Theme cards */
@@ -1418,6 +1447,19 @@
     }
     .wizard-card.transitioning .wizard-body {
       transition: none;
+    }
+  }
+
+  /*
+   * Eight 9px uppercase labels in one row is a lot of type for a narrow
+   * card, and they only disappeared at 700px — so there was a band where
+   * they were on screen, touching, and unreadable. Between here and there,
+   * label just the step you are on: that is the only one that answers
+   * "where am I", and the rest are still countable as dots.
+   */
+  @media (max-width: 900px) {
+    .progress-dot:not(.active) .dot-label {
+      display: none;
     }
   }
 

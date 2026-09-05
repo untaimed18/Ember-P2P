@@ -220,7 +220,13 @@
             onclick={() => setActiveTab(tab.hash)}
             onkeydown={(e) => onTabKeydown(e, tab.hash)}
           >
-            <span class="dock-tab-presence" aria-hidden="true"></span>
+            <!-- Named, not decorative: the tab says nothing else about whether
+                 the friend is reachable, so hiding the dot hides the state. -->
+            <span
+              class="dock-tab-presence"
+              role="img"
+              aria-label={isOnline(tab.hash) ? m.chat_online_label() : m.chat_offline_label()}
+            ></span>
             <span class="dock-tab-name"><bdi dir="auto">{tab.name}</bdi></span>
             {#if unreadFor(tab.hash) > 0}
               <span

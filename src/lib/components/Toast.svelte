@@ -31,7 +31,19 @@
     onfocusout={resumeToastDismiss}
   >
     {#each $toasts as toast (toast.id)}
-      <div class="toast toast-{toast.type}" role="alert" transition:fly={flyParams()}>
+      <!--
+        Severity picks the role. `role="alert"` is assertive: it interrupts
+        whatever the screen reader is saying mid-sentence, which is right for
+        a failed download and wrong for "Copied to clipboard" — and every
+        toast used to be assertive, so a burst of successes talked over the
+        page the user was actually reading. Warnings and errors keep it;
+        success and info become polite `status`.
+      -->
+      <div
+        class="toast toast-{toast.type}"
+        role={toast.type === 'error' || toast.type === 'warning' ? 'alert' : 'status'}
+        transition:fly={flyParams()}
+      >
         <span class="toast-icon" aria-hidden="true">
           {#if toast.type === 'success'}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
