@@ -3981,6 +3981,7 @@ async fn handle_command_inner(
             state.friend_presence_initial_done = false;
             state.last_presence_blocked = false;
             state.friend_search_initial_done = false;
+            state.friend_search_initial_queue.clear();
             state.friend_search_started_at = None;
             state.rendezvous_register_generation =
                 state.rendezvous_register_generation.saturating_add(1);

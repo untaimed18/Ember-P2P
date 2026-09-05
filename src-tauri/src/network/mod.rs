@@ -2992,6 +2992,44 @@ impl NoTransportReason {
 /// How long a rendezvous presence registration is treated as fresh.
 const PRESENCE_HEARTBEAT_SECS: u64 = 120;
 
+/// How many friends the startup presence sweep looks up per bootstrap tick.
+///
+/// Every friend is queued once Ember has an external IP, but they go out a few
+/// per 10s tick rather than all at once. A lookup is several signed HTTP round
+/// trips to the rendezvous server — an identity lookup plus up to four
+/// capability epochs — and nothing in that path handles a 429, so a lookup
+/// refused for being one of two hundred simultaneous requests would surface as
+/// a friend who is merely unreachable. Spread out, a large list still finishes
+/// in well under two minutes.
+const INITIAL_FRIEND_SEARCH_PER_TICK: usize = 5;
+
+/// Take the next slice of the startup presence sweep off `queue`, leaving the
+/// rest in order for later ticks.
+///
+/// `skip` reports the friends nothing is owed for: unfriended mid-sweep,
+/// already reachable, or a lookup already in flight from another path. Those
+/// are dropped rather than deferred, and deliberately do not spend the per-tick
+/// budget — a tick that finds four of its five already online should still send
+/// a fifth lookup, or a mostly-online list would trickle out one useful lookup
+/// per tick and take far longer than the list length suggests.
+fn drain_initial_friend_search(
+    queue: &mut Vec<[u8; 16]>,
+    per_tick: usize,
+    skip: impl Fn(&[u8; 16]) -> bool,
+) -> Vec<[u8; 16]> {
+    let mut targets: Vec<[u8; 16]> = Vec::new();
+    let mut deferred: Vec<[u8; 16]> = Vec::new();
+    for fh in std::mem::take(queue) {
+        if targets.len() >= per_tick {
+            deferred.push(fh);
+        } else if !skip(&fh) {
+            targets.push(fh);
+        }
+    }
+    *queue = deferred;
+    targets
+}
+
 /// Floor on retrying a *failed* presence heartbeat. Successes keep using
 /// [`PRESENCE_HEARTBEAT_SECS`] via [`should_refresh_presence`].
 ///
@@ -6765,6 +6803,62 @@ mod tests {
             true,
             Some(std::time::Duration::from_secs(9_999))
         ));
+    }
+
+    #[test]
+    fn the_startup_sweep_looks_up_every_friend_rather_than_the_first_few() {
+        // The whole point of the queue: the sweep used to stop after three and
+        // leave the rest reading offline until the five-minute auto-retry got
+        // to them.
+        let mut queue: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+        let mut ticks = 0;
+        while !queue.is_empty() {
+            seen.extend(drain_initial_friend_search(&mut queue, 5, |_| false));
+            ticks += 1;
+            assert!(ticks < 10, "the queue has to drain, not cycle");
+        }
+        assert_eq!(ticks, 3, "12 friends at 5 a tick");
+        let expected: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        assert_eq!(seen, expected, "every friend, in order, exactly once");
+    }
+
+    #[test]
+    fn the_startup_sweep_sends_a_full_tick_of_lookups_even_when_most_are_online() {
+        // Skipped friends must not spend the budget. Charging them would make a
+        // list that is mostly online take a tick per *friend* instead of a tick
+        // per five lookups.
+        let mut queue: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        let online = |fh: &[u8; 16]| fh[0].is_multiple_of(2);
+        let first = drain_initial_friend_search(&mut queue, 5, online);
+        assert_eq!(
+            first,
+            vec![[1; 16], [3; 16], [5; 16], [7; 16], [9; 16]],
+            "five actual lookups, the evens among them passed over for free"
+        );
+        // `[10; 16]` is online too, but the budget ran out before it was
+        // examined, so it waits for the next tick to be skipped there.
+        assert_eq!(
+            queue,
+            vec![[10; 16], [11; 16]],
+            "everything past the budget is kept, untested"
+        );
+        assert_eq!(
+            drain_initial_friend_search(&mut queue, 5, online),
+            vec![[11; 16]],
+            "the remainder is filtered on its own tick"
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_friend_nothing_is_owed_for_leaves_the_startup_sweep_entirely() {
+        // Dropped, not deferred: they are already reachable, already being
+        // looked up, or no longer a friend. Deferring would re-offer them every
+        // tick and the queue would never empty.
+        let mut queue = vec![[1; 16], [2; 16]];
+        assert!(drain_initial_friend_search(&mut queue, 5, |_| true).is_empty());
+        assert!(queue.is_empty(), "a fully skipped tick still drains the queue");
     }
 
     #[test]
@@ -12877,9 +12971,14 @@ struct NetworkState {
     /// Tracks active outbound friend session tasks to prevent duplicates.
     /// ember_hash -> Instant when the session was started.
     outbound_session_tasks: HashMap<[u8; 16], std::time::Instant>,
-    /// Whether the initial friend search burst has fired after connect
+    /// Whether the initial friend search has been queued after connect
     friend_search_initial_done: bool,
-    /// When the initial friend search burst started (for 30-min auto-retry cutoff)
+    /// Friends still owed a startup presence lookup, drained
+    /// [`INITIAL_FRIEND_SEARCH_PER_TICK`] at a time by the bootstrap timer.
+    /// Filtered against live state on the way out, so anyone who turns up on
+    /// their own before their turn costs nothing.
+    friend_search_initial_queue: Vec<[u8; 16]>,
+    /// When the initial friend search started (for 30-min auto-retry cutoff)
     friend_search_started_at: Option<std::time::Instant>,
     /// Backoff tracker for friend reconnection: ember_hash -> last attempt time.
     /// Prevents tight reconnect loops when sessions fail immediately.
@@ -24425,6 +24524,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         rendezvous_register_fail_streak: 0,
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
+        friend_search_initial_queue: Vec::new(),
         friend_search_started_at: None,
         friend_reconnect_last: HashMap::new(),
         tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -33177,30 +33277,51 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
-                // Initial friend search burst: look up all offline friends
-                // via the rendezvous server as soon as we have a known IP.
+                // Startup presence sweep: every friend gets a rendezvous lookup
+                // once Ember has an external IP, so the friend list opens with
+                // real online state instead of whatever the last session left.
+                //
+                // Queued rather than searched outright, and drained a few per
+                // tick below. This used to look up three friends and call it a
+                // burst, which left everyone after the third looking offline
+                // until the five-minute auto-retry reached them — ten per
+                // sweep, so a forty-friend list took twenty minutes to
+                // resolve, and the log claimed all of them had been looked up.
                 if !state.friend_search_initial_done
                     && state.external_ip.is_some()
                 {
                     state.friend_search_initial_done = true;
                     state.friend_search_started_at = Some(std::time::Instant::now());
-
-                    let all_friends: Vec<[u8; 16]> = friend_hashes.read().await.iter().copied().collect();
-                    let sessions = state.ember_sessions.read().await;
-
-                    let mut search_targets: Vec<[u8; 16]> = Vec::new();
-                    for fh in &all_friends {
-                        if state.online_friends.contains_key(fh) { continue; }
-                        if sessions.get(fh).is_some_and(|h| h.is_fresh()) { continue; }
-                        if state.outbound_session_tasks.contains_key(fh) { continue; }
-                        search_targets.push(*fh);
+                    state.friend_search_initial_queue =
+                        friend_hashes.read().await.iter().copied().collect();
+                    if !state.friend_search_initial_queue.is_empty() {
+                        info!(
+                            "Startup friend presence sweep: {} friend(s) queued, {} per tick",
+                            state.friend_search_initial_queue.len(),
+                            INITIAL_FRIEND_SEARCH_PER_TICK,
+                        );
                     }
+                }
+
+                if !state.friend_search_initial_queue.is_empty() {
+                    let friends_now = friend_hashes.read().await.clone();
+                    let sessions = state.ember_sessions.read().await;
+                    // Drained into a local list first, because
+                    // `spawn_rendezvous_friend_lookup` borrows the whole state
+                    // and the queue cannot still be held open across it.
+                    let targets = drain_initial_friend_search(
+                        &mut state.friend_search_initial_queue,
+                        INITIAL_FRIEND_SEARCH_PER_TICK,
+                        |fh| {
+                            !friends_now.contains(fh)
+                                || state.online_friends.contains_key(fh)
+                                || sessions.get(fh).is_some_and(|h| h.is_fresh())
+                                || state.outbound_session_tasks.contains_key(fh)
+                        },
+                    );
                     drop(sessions);
 
-                    if !search_targets.is_empty() {
-                        info!("Initial friend search burst: looking up {} offline friend(s) via rendezvous", search_targets.len());
-                    }
-                    for target_hash in search_targets.iter().take(3) {
+                    for target_hash in &targets {
                         state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
                         let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                             "user_hash": hex::encode(target_hash),
