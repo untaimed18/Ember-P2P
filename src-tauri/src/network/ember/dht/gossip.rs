@@ -165,6 +165,31 @@ impl GossipReputation {
         false
     }
 
+    /// Give back the sample [`Self::should_probe`] just granted, because the
+    /// probe it was granted for never reached the wire.
+    ///
+    /// `should_probe` commits its decision as it makes it, so a rationed
+    /// introducer whose sampled lead then failed to send — `prepare_outgoing`
+    /// returned `Error`, or the datagram did not leave the socket — had its
+    /// counter restarted at zero and had to name another `NOISY_SAMPLE_EVERY`
+    /// leads before getting a further chance. `Introducer::seen` is only
+    /// advanced by `note_probe`, so on that path it never refreshed either, and
+    /// the documented recovery property — a reformed introducer is fully funded
+    /// again within a handful of leads — did not hold for it.
+    ///
+    /// Restores the exact prior state: `should_probe` grants a sample only by
+    /// incrementing `skipped` to `NOISY_SAMPLE_EVERY` and resetting it, so one
+    /// short of the bar is where it was. A funded introducer consumed no
+    /// sample and is left alone.
+    pub fn refund_probe(&mut self, introducer: &EmberNodeId) {
+        let Some(record) = self.introducers.get_mut(introducer) else {
+            return;
+        };
+        if !record.funded() {
+            record.skipped = NOISY_SAMPLE_EVERY.saturating_sub(1);
+        }
+    }
+
     /// Note that we have just probed `lead` on `introducer`'s word.
     ///
     /// Attribution starts at the probe, not at the naming: a lead we never
@@ -341,6 +366,43 @@ mod tests {
             allowed, 4,
             "one lead in {NOISY_SAMPLE_EVERY} still gets through"
         );
+    }
+
+    /// A sample the caller could not spend must come back, or our own send
+    /// failures ration an introducer that did nothing wrong.
+    #[test]
+    fn a_sample_is_returned_when_the_probe_never_leaves() {
+        let mut rep = GossipReputation::new();
+        resolve_batch(&mut rep, id(1), MIN_SAMPLE, 0, 10);
+        assert_eq!(rep.rationed_len(), 1);
+
+        // Walk up to the sampled lead, then fail to send it.
+        for _ in 0..NOISY_SAMPLE_EVERY - 1 {
+            assert!(!rep.should_probe(&id(1)));
+        }
+        assert!(rep.should_probe(&id(1)), "the sampled lead comes through");
+        rep.refund_probe(&id(1));
+
+        // The very next lead gets it instead of another full wait.
+        assert!(
+            rep.should_probe(&id(1)),
+            "a refunded sample is available immediately"
+        );
+        // And it is one sample, not an unlimited pass.
+        assert!(!rep.should_probe(&id(1)));
+    }
+
+    /// Refunding for a funded introducer would be a counter it never spent.
+    #[test]
+    fn refunding_a_funded_introducer_changes_nothing() {
+        let mut rep = GossipReputation::new();
+        resolve_batch(&mut rep, id(1), ANSWER_RATE_FLOOR, 1, 10);
+        assert_eq!(rep.rationed_len(), 0);
+        rep.refund_probe(&id(1));
+        // Still funded, so every lead passes on its own merit.
+        for _ in 0..NOISY_SAMPLE_EVERY * 2 {
+            assert!(rep.should_probe(&id(1)));
+        }
     }
 
     /// A peer whose table is merely stale is not the target. One answer in

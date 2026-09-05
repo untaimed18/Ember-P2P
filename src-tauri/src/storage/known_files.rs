@@ -122,6 +122,16 @@ struct KnownPathEntry {
 pub struct KnownFileList {
     files: HashMap<[u8; 16], KnownFileRecord>,
     path_index: HashMap<String, KnownPathEntry>,
+    /// How many `path_index` entries point at each hash.
+    ///
+    /// Only ever consulted to answer "does another path still reference this
+    /// content?", which [`Self::add_or_update`] asks every time a path's hash
+    /// changes. Answering it by scanning `path_index` made a library rescan
+    /// O(changed x total) — with 100k shared files and 5k modified, half a
+    /// billion comparisons. A count rather than the paths themselves because
+    /// this struct is cloned in full on every periodic save, and duplicating
+    /// 100k path strings to answer a yes/no question is not worth the memory.
+    path_refs: HashMap<[u8; 16], u32>,
     dirty: bool,
     dirty_generation: u64,
     authoritative: bool,
@@ -138,9 +148,36 @@ impl KnownFileList {
         Self {
             files: HashMap::new(),
             path_index: HashMap::new(),
+            path_refs: HashMap::new(),
             dirty: false,
             dirty_generation: 0,
             authoritative: false,
+        }
+    }
+
+    /// The only way a `path_index` entry is added or replaced, so `path_refs`
+    /// cannot drift out of step with it.
+    fn index_path(&mut self, key: String, entry: KnownPathEntry) {
+        let hash = entry.hash;
+        if let Some(previous) = self.path_index.insert(key, entry) {
+            if previous.hash != hash {
+                self.release_path_ref(&previous.hash);
+            } else {
+                // Same content at the same key: the reference already exists.
+                return;
+            }
+        }
+        *self.path_refs.entry(hash).or_insert(0) += 1;
+    }
+
+    /// Drop one reference to `hash`, forgetting the counter once it reaches
+    /// zero so the map stays the size of the content actually indexed.
+    fn release_path_ref(&mut self, hash: &[u8; 16]) {
+        if let Some(count) = self.path_refs.get_mut(hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.path_refs.remove(hash);
+            }
         }
     }
 
@@ -208,7 +245,7 @@ impl KnownFileList {
                 continue;
             }
             if !record.file_path.is_empty() {
-                self.path_index.insert(
+                self.index_path(
                     normalize_path_key(&record.file_path),
                     KnownPathEntry {
                         hash,
@@ -224,7 +261,7 @@ impl KnownFileList {
         // path mappings for absorbed hashes are already inserted above.
         for (path_key, entry) in other.path_index {
             if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&path_key) {
-                self.path_index.insert(path_key, entry);
+                self.index_path(path_key, entry);
             }
         }
         // Absorbing a catalog that was actually read off disk is what makes
@@ -365,21 +402,23 @@ impl KnownFileList {
                 // Normalize the key so Windows path-casing differences
                 // between sessions still hit on lookup (the record keeps
                 // the original-case `file_path`).
-                self.path_index.insert(
+                let size = self
+                    .files
+                    .get(&hash)
+                    .map(|record| record.file_size)
+                    .unwrap_or_default();
+                let modified_at = self
+                    .files
+                    .get(&hash)
+                    .map(|record| record.modified_at)
+                    .unwrap_or_default();
+                self.index_path(
                     normalize_path_key(&path),
                     KnownPathEntry {
                         hash,
                         path,
-                        size: self
-                            .files
-                            .get(&hash)
-                            .map(|record| record.file_size)
-                            .unwrap_or_default(),
-                        modified_at: self
-                            .files
-                            .get(&hash)
-                            .map(|record| record.modified_at)
-                            .unwrap_or_default(),
+                        size,
+                        modified_at,
                     },
                 );
             }
@@ -765,16 +804,18 @@ impl KnownFileList {
             if let Some(old_entry) = self.path_index.get(&new_key) {
                 let old_hash = old_entry.hash;
                 if old_hash != hash {
-                    let other_refs = self
-                        .path_index
-                        .iter()
-                        .any(|(p, entry)| entry.hash == old_hash && *p != new_key);
+                    // `new_key` is itself one of `old_hash`'s references, so
+                    // "some other path still points at it" is exactly a count
+                    // above one. This used to be a full scan of `path_index`
+                    // per changed file.
+                    let other_refs =
+                        self.path_refs.get(&old_hash).copied().unwrap_or(0) > 1;
                     if !other_refs {
                         self.files.remove(&old_hash);
                     }
                 }
             }
-            self.path_index.insert(
+            self.index_path(
                 new_key,
                 KnownPathEntry {
                     hash,
@@ -1270,8 +1311,7 @@ impl KnownFileList {
                 if record.file_path.is_empty() {
                     record.file_path = entry.path.clone();
                 }
-                self.path_index
-                    .insert(normalize_path_key(&entry.path), entry);
+                self.index_path(normalize_path_key(&entry.path), entry);
                 loaded += 1;
             }
         }
@@ -1541,6 +1581,75 @@ mod tests {
             last_ember_source_publish: 0,
             last_ember_keyword_publish: 0,
         }
+    }
+
+    /// `path_refs` is only ever read to answer "does another path still point
+    /// at this content?", which used to be a full scan of `path_index`. Pins
+    /// the count against the shape of `path_index` itself across the mutations
+    /// that can move an entry between hashes.
+    #[test]
+    fn path_refs_tracks_how_many_paths_hold_each_hash() {
+        fn scan(kf: &KnownFileList, hash: &[u8; 16]) -> u32 {
+            kf.path_index
+                .values()
+                .filter(|entry| entry.hash == *hash)
+                .count() as u32
+        }
+        fn agrees(kf: &KnownFileList) {
+            for entry in kf.path_index.values() {
+                assert_eq!(
+                    kf.path_refs.get(&entry.hash).copied().unwrap_or(0),
+                    scan(kf, &entry.hash),
+                    "path_refs disagrees with path_index for {:?}",
+                    entry.hash
+                );
+            }
+            // No counter outlives the last path that justified it.
+            for (hash, count) in &kf.path_refs {
+                assert_ne!(*count, 0, "a zeroed counter was left behind");
+                assert_eq!(*count, scan(kf, hash));
+            }
+        }
+
+        let mut kf = KnownFileList::new();
+
+        // Two paths, same content: one hash with two references.
+        let mut first = sample_record();
+        first.file_path = "C:/Library/a.mkv".to_string();
+        kf.add_or_update(first);
+        let mut second = sample_record();
+        second.file_path = "C:/Library/b.mkv".to_string();
+        kf.add_or_update(second);
+        assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), Some(2));
+        agrees(&kf);
+
+        // Re-adding the same path with the same content must not double-count.
+        let mut again = sample_record();
+        again.file_path = "C:/Library/b.mkv".to_string();
+        kf.add_or_update(again);
+        assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), Some(2));
+        agrees(&kf);
+
+        // One path's content changes. The old hash keeps the other path, so it
+        // survives in `files` — this is the branch the scan used to answer.
+        let mut changed = sample_record();
+        changed.file_hash = [0x43; 16];
+        changed.file_path = "C:/Library/b.mkv".to_string();
+        kf.add_or_update(changed);
+        assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), Some(1));
+        assert_eq!(kf.path_refs.get(&[0x43; 16]).copied(), Some(1));
+        assert!(kf.files.contains_key(&[0x42; 16]));
+        agrees(&kf);
+
+        // Now the last path holding the old hash changes too, so nothing
+        // references it and the record goes.
+        let mut last = sample_record();
+        last.file_hash = [0x44; 16];
+        last.file_path = "C:/Library/a.mkv".to_string();
+        kf.add_or_update(last);
+        assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), None);
+        assert!(!kf.files.contains_key(&[0x42; 16]));
+        agrees(&kf);
     }
 
     #[test]

@@ -85,6 +85,7 @@ use self::health::{
     PeriodicSaveJob, PeriodicSaveResult, PublishHealthSnapshot, RendezvousRegisterResult,
     ServerConnectResult, SourceInjectionResult, SpamSaveResult, TcpMappingKeepaliveResult,
     TcpPortConfirmation, UdpDiscoveryHealthSnapshot, UdpMappingKeepaliveResult, UpnpMaintainResult,
+    XferFinishResult,
 };
 
 const FIREWALL_REQ_COOLDOWN_SECS: i64 = 60;
@@ -13202,6 +13203,14 @@ struct NetworkState {
     xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
     /// Ember Transfer: files we accepted and are pulling in.
     xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
+    /// Where [`finish_xfer_recv`] posts a verified transfer back to the event
+    /// loop. Held here rather than threaded through the four frames between
+    /// the loop and the block handler that completes a transfer.
+    xfer_finish_tx: mpsc::UnboundedSender<XferFinishResult>,
+    /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
+    /// holding the newest timestamp seen. Drained once a second by
+    /// [`flush_channel_member_touches`].
+    channel_member_touches: HashMap<([u8; 16], [u8; 32]), i64>,
     /// Offers waiting on the user to accept or decline.
     xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
     /// Data-block send budget. Separate from the chat one on purpose — see
@@ -13818,6 +13827,12 @@ fn channel_member_pubkeys(
         .collect()
 }
 
+/// Ceiling on [`NetworkState::channel_member_touches`] between flushes.
+///
+/// Rooms joined times the roster cap, rounded to something a burst cannot
+/// meaningfully exceed in the one second a buffer lives for.
+const MAX_CHANNEL_MEMBER_TOUCHES: usize = 4096;
+
 /// Queue a roster row for the next presence emit.
 ///
 /// Bounded by the same roster cap as the table it mirrors, so a peer spraying
@@ -13850,11 +13865,20 @@ fn mark_channel_presence_dirty(
 /// roster is a separate question that public and private rooms answer
 /// differently — see [`ember::channel::chat_author_joins_gossip_roster`] — and
 /// answering it here would quietly route around it.
+/// Buffered rather than written, and flushed once per second by
+/// [`flush_channel_member_touches`]. This is called for *every* channel
+/// datagram that authenticates, and the write it used to do was a synchronous
+/// autocommitted `UPDATE` on the network task — one transaction, and under
+/// `synchronous=FULL` one fsync, per datagram, each taking the connection
+/// mutex that every other database user in the process shares. A member in a
+/// few busy rooms turned that into tens of fsyncs a second on the reactor.
+///
+/// Only the newest timestamp per member survives, which is all the row can
+/// hold anyway: the `UPDATE` moves `last_seen` forward or does nothing, so
+/// collapsing a second's worth of datagrams into one write loses nothing.
 fn note_channel_member_alive(
     state: &mut NetworkState,
-    db: &Database,
     channel_id: [u8; 16],
-    channel_id_hex: &str,
     member: &[u8; 32],
     at: i64,
 ) {
@@ -13864,11 +13888,53 @@ fn note_channel_member_alive(
     if at <= 0 {
         return;
     }
-    if db
-        .touch_channel_member_last_seen(channel_id_hex, &hex::encode(member), at)
-        .unwrap_or(false)
+    // Bounded like the roster it mirrors. Every caller has already
+    // authenticated the author against a room we are in, so the key space is
+    // rooms x members, but a cap keeps a burst from deciding how large this
+    // grows between flushes.
+    if state.channel_member_touches.len() >= MAX_CHANNEL_MEMBER_TOUCHES
+        && !state
+            .channel_member_touches
+            .contains_key(&(channel_id, *member))
     {
-        mark_channel_presence_dirty(state, channel_id, member, at);
+        return;
+    }
+    let slot = state
+        .channel_member_touches
+        .entry((channel_id, *member))
+        .or_insert(at);
+    *slot = (*slot).max(at);
+}
+
+/// Write the second's worth of buffered `last_seen` touches as one transaction,
+/// and queue a presence delta for each row that actually moved.
+///
+/// Runs immediately before [`emit_channel_presence_deltas`], so a member heard
+/// from during this tick is still reported on this tick.
+fn flush_channel_member_touches(state: &mut NetworkState, db: &Database) {
+    if state.channel_member_touches.is_empty() {
+        return;
+    }
+    let pending: Vec<(([u8; 16], [u8; 32]), i64)> =
+        state.channel_member_touches.drain().collect();
+    let rows: Vec<(String, String, i64)> = pending
+        .iter()
+        .map(|((channel_id, member), at)| (hex::encode(channel_id), hex::encode(member), *at))
+        .collect();
+    let updated = match db.touch_channel_members_last_seen(&rows) {
+        Ok(updated) => updated,
+        Err(e) => {
+            // Dropped rather than retried: each of these is "this member was
+            // alive a moment ago", and the next datagram from them re-queues a
+            // fresher one. Holding them would only age the buffer.
+            debug!("Failed to flush channel member presence touches: {e}");
+            return;
+        }
+    };
+    for (((channel_id, member), at), moved) in pending.into_iter().zip(updated) {
+        if moved {
+            mark_channel_presence_dirty(state, channel_id, &member, at);
+        }
     }
 }
 
@@ -16522,17 +16588,12 @@ async fn handle_inbound_channel_gossip(
         // offline while doing it.
         note_channel_member_alive(
             state,
-            db,
             gossip.channel_id,
-            &channel_id_hex,
             &sender,
             chrono::Utc::now().timestamp(),
         );
         if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(&key, body) {
-            apply_xfer_block_data(
-                socket, state, db, app_handle, xfer_id, sender, offset, &data,
-            )
-            .await;
+            apply_xfer_block_data(state, app_handle, xfer_id, sender, offset, &data);
         } else if let Some((_, _, _, offset, count)) =
             ember::channel::decode_xfer_block_request(body)
         {
@@ -16621,9 +16682,7 @@ async fn handle_inbound_channel_gossip(
         // calling offline.
         note_channel_member_alive(
             state,
-            db,
             gossip.channel_id,
-            &channel_id_hex,
             &sender_pk,
             chrono::Utc::now().timestamp(),
         );
@@ -16672,9 +16731,7 @@ async fn handle_inbound_channel_gossip(
         }
         note_channel_member_alive(
             state,
-            db,
             gossip.channel_id,
-            &channel_id_hex,
             &sender_pk,
             chrono::Utc::now().timestamp(),
         );
@@ -16882,14 +16939,7 @@ async fn handle_inbound_channel_gossip(
                 // Public rooms do not INSERT strangers from chat (anti-eclipse).
                 // A line from someone already on the roster still refreshes
                 // last_seen so they do not age out while visibly talking.
-                note_channel_member_alive(
-                    state,
-                    db,
-                    gossip.channel_id,
-                    &channel_id_hex,
-                    &sender_pk,
-                    now,
-                );
+                note_channel_member_alive(state, gossip.channel_id, &sender_pk, now);
             }
             let _ = app_handle.emit(
                 "ember:channel-message",
@@ -17523,11 +17573,8 @@ fn apply_xfer_block_request(
     send.enqueue(offset, count);
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn apply_xfer_block_data(
-    socket: &UdpSocket,
+fn apply_xfer_block_data(
     state: &mut NetworkState,
-    db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
@@ -17586,7 +17633,7 @@ async fn apply_xfer_block_data(
         );
     }
     if recv.is_complete() {
-        finish_xfer_recv(socket, state, db, app_handle, xfer_id).await;
+        finish_xfer_recv(state, xfer_id);
     }
 }
 
@@ -17626,72 +17673,111 @@ fn unique_download_path(path: &std::path::Path) -> std::path::PathBuf {
 /// The root is recomputed with the same [`ember::transfer::HashTree`] the
 /// sender used, so "the file I have" and "the file you offered" are compared
 /// by the same function rather than by two that merely agree today.
-async fn finish_xfer_recv(
+///
+/// Verification reads and hashes the entire file — `XFER_MAX_BYTES` is 100 MB —
+/// so it runs on the blocking pool and reports back through
+/// `NetworkState::xfer_finish_tx`. Done inline it froze the network task for
+/// the length of a whole-file read: every peer connection, DHT tick and
+/// datagram the loop owns stalled behind one completing transfer, and on a cold
+/// or spinning disk that is seconds, long enough to lose UDP to receive-buffer
+/// overrun across every unrelated peer.
+///
+/// The `RecvState` is taken out of `xfer_recv` before the hash starts, so the
+/// stall sweep in `drive_channel_transfers` cannot also retire it and a
+/// duplicate final block cannot start a second verification of the same file.
+fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
+    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
+        return;
+    };
+    let tx = state.xfer_finish_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let outcome = (|| -> std::io::Result<bool> {
+            recv.finish()?;
+            let file = std::fs::File::open(&recv.part_path)?;
+            let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
+            if tree.root_hash != recv.root {
+                return Ok(false);
+            }
+            if let Some(parent) = recv.final_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let target = unique_download_path(&recv.final_path);
+            std::fs::rename(&recv.part_path, &target)?;
+            Ok(true)
+        })();
+        let status = match outcome {
+            Ok(true) => "complete",
+            Ok(false) => {
+                // Content did not match what was offered. Keep nothing.
+                let _ = std::fs::remove_file(&recv.part_path);
+                tracing::warn!(
+                    "Ember Transfer: {} failed its hash check and was discarded",
+                    recv.name
+                );
+                "failed"
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&recv.part_path);
+                tracing::warn!(error = %e, "Ember Transfer: could not finalise {}", recv.name);
+                "failed"
+            }
+        };
+        let _ = tx.send(XferFinishResult {
+            xfer_id,
+            channel_id: recv.channel_id,
+            peer: recv.peer,
+            key: recv.key,
+            name: recv.name,
+            size: recv.size,
+            status,
+        });
+    });
+}
+
+/// Tell the sender how a transfer ended and update the UI.
+///
+/// Split from [`finish_xfer_recv`] because the verification between them runs
+/// off the event loop; this half needs the socket and the channel row, so it
+/// runs in the loop's `xfer_finish_rx` arm once the verdict is in.
+async fn apply_xfer_finish(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
-    xfer_id: [u8; 16],
+    result: XferFinishResult,
 ) {
-    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
-        return;
-    };
-    let (channel_id, peer, name, size) =
-        (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
-    let outcome = (|| -> std::io::Result<bool> {
-        recv.finish()?;
-        let file = std::fs::File::open(&recv.part_path)?;
-        let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
-        if tree.root_hash != recv.root {
-            return Ok(false);
-        }
-        if let Some(parent) = recv.final_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let target = unique_download_path(&recv.final_path);
-        std::fs::rename(&recv.part_path, &target)?;
-        Ok(true)
-    })();
-    let status = match outcome {
-        Ok(true) => "complete",
-        Ok(false) => {
-            // Content did not match what was offered. Keep nothing.
-            let _ = std::fs::remove_file(&recv.part_path);
-            tracing::warn!("Ember Transfer: {name} failed its hash check and was discarded");
-            "failed"
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&recv.part_path);
-            tracing::warn!(error = %e, "Ember Transfer: could not finalise {name}");
-            "failed"
-        }
-    };
+    let complete = result.status == "complete";
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its
     // own stall timer would eventually report a finished transfer as failed.
-    let plain = if status == "complete" {
-        ember::channel::encode_xfer_done(&recv.key, &state.local_ed25519_pubkey, &peer, &xfer_id)
+    let plain = if complete {
+        ember::channel::encode_xfer_done(
+            &result.key,
+            &state.local_ed25519_pubkey,
+            &result.peer,
+            &result.xfer_id,
+        )
     } else {
         ember::channel::encode_xfer_cancel(
-            &recv.key,
+            &result.key,
             &state.local_ed25519_pubkey,
-            &peer,
-            &xfer_id,
+            &result.peer,
+            &result.xfer_id,
             ember::channel::XferCancel::User,
         )
     };
-    send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
-    let done = if status == "complete" { size } else { 0 };
+    send_xfer_frame(socket, state, db, result.channel_id, result.peer, &plain).await;
+    let done = if complete { result.size } else { 0 };
     emit_xfer_update(
         app_handle,
-        &xfer_id,
-        &channel_id,
-        &peer,
+        &result.xfer_id,
+        &result.channel_id,
+        &result.peer,
         "receive",
-        &name,
-        size,
+        &result.name,
+        result.size,
         done,
-        status,
+        result.status,
     );
 }
 
@@ -17989,7 +18075,14 @@ async fn drive_channel_transfers(
         .collect();
     for xfer_id in stalled_recv {
         if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-            let _ = std::fs::remove_file(&recv.part_path);
+            // Detached: nothing below depends on the delete landing, and on
+            // Windows removing a large file whose handle was just released
+            // blocks on the antivirus filter driver — on the network task,
+            // once per stalled transfer.
+            let part_path = recv.part_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&part_path);
+            });
             let plain = ember::channel::encode_xfer_cancel(
                 &recv.key,
                 &me,
@@ -19047,6 +19140,7 @@ async fn probe_ember_gossip_leads(
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -19075,6 +19169,12 @@ async fn probe_ember_gossip_leads(
             }
             ember::transport::OutgoingResult::Queued => {
                 behind_handshake = true;
+                // See `probe_bucket_oldest`: a frame parked behind an XX dial
+                // may be discarded at flush rather than sent, so it is not
+                // booked and cannot fault the lead.
+                delivery_certain = state
+                    .ember_transport
+                    .queued_delivery_is_certain(contact.addr, &contact.noise_pub);
                 true
             }
             ember::transport::OutgoingResult::Error(e) => {
@@ -19085,7 +19185,11 @@ async fn probe_ember_gossip_leads(
                 false
             }
         };
-        if send_ok {
+        // `delivery_certain` is only ever false on the `Queued` path, so this
+        // is "the frame is on the wire, or will be when the handshake it is
+        // parked behind completes with the peer we addressed it to".
+        let issued = send_ok && delivery_certain;
+        if issued {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(
@@ -19110,6 +19214,18 @@ async fn probe_ember_gossip_leads(
                     contact.node_id,
                     std::time::Instant::now(),
                 );
+            }
+        } else if !starved {
+            // The probe never reached the wire — the send failed, or it was
+            // parked behind a handshake that may discard it. Either way the
+            // sampling slot `should_probe` spent to allow it bought nothing, so
+            // hand it back; otherwise a rationed introducer is held at arm's
+            // length by our own send failures rather than by anything it did.
+            // Gated on `!starved` because that is the only branch that calls
+            // `should_probe` at all — refunding a sample never spent would let
+            // the counter grant one early.
+            if let Some(intro) = introducer {
+                state.ember_gossip_reputation.refund_probe(&intro);
             }
         }
     }
@@ -21120,11 +21236,18 @@ async fn enrich_and_emit_search_results(
     let analyzed_batch;
     let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
         if let Some(acc) = accumulated_batch {
-            let prev_colliding = acc.colliding_hashes();
+            // Only when something will read it. `colliding_hashes` walks every
+            // name and hash key in the batch — up to 4096 each — and clones a
+            // `String` per hash in every colliding bucket, and this runs on the
+            // network task for every inbound result packet. With the spam
+            // filter off or Relaxed the result was discarded, so a broad search
+            // paid that whole allocation on each of hundreds of packets for
+            // nothing.
+            let prev_colliding = (spam_enabled
+                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed)
+                .then(|| acc.colliding_hashes());
             acc.absorb(&results);
-            if spam_enabled
-                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
-            {
+            if let Some(prev_colliding) = prev_colliding {
                 let skip: std::collections::HashSet<String> = results
                     .iter()
                     .map(|r| r.file.hash.trim().to_ascii_lowercase())
@@ -24033,6 +24156,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?
     };
 
+    // Verified channel transfers, hashed off the event loop. Created here
+    // rather than with the other result channels below because the sender
+    // lives in `NetworkState`, which is built next.
+    let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -24372,6 +24500,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
         xfer_recv: HashMap::new(),
+        xfer_finish_tx,
+        channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_block_times: VecDeque::new(),
         xfer_upload_credit: 0,
@@ -25315,6 +25445,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut spam_save_started_at: Option<tokio::time::Instant> = None;
     let mut upnp_maintain_in_flight = false;
     let mut upnp_maintain_started_at: Option<tokio::time::Instant> = None;
+    // Handle on the detached UPnP pass, kept only so the watchdog can abort a
+    // stuck one. Clearing `upnp_maintain_in_flight` alone lets the next tick
+    // start a second pass while the first is still parked inside a SOAP call
+    // that may never return, and every ten minutes adds another — each holding
+    // a cloned `UpnpMappings` and its gateway socket for the life of the
+    // process. The calls themselves are bounded now (`upnp::SOAP_TIMEOUT`), so
+    // this is the backstop for anything that outlives its own timeout.
+    let mut upnp_maintain_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut rendezvous_register_in_flight = false;
     let mut rendezvous_register_started_at: Option<tokio::time::Instant> = None;
     let mut friend_relay_ticket_polls_in_flight = 0usize;
@@ -25670,7 +25808,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let tx = upnp_maintain_result_tx.clone();
                 upnp_maintain_in_flight = true;
                 upnp_maintain_started_at = Some(tokio::time::Instant::now());
-                tokio::spawn(async move {
+                upnp_maintain_handle = Some(tokio::spawn(async move {
                     mappings.setup().await;
                     let mapped = mappings.is_mapped();
                     if mapped {
@@ -25685,7 +25823,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         mappings,
                         mapped,
                     });
-                });
+                }));
             } else {
                 info!("UPnP disabled by user -- skipping port mapping");
             }
@@ -32847,7 +32985,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             upnp_maintain_in_flight = true;
                                             upnp_maintain_started_at =
                                                 Some(tokio::time::Instant::now());
-                                            tokio::spawn(async move {
+                                            upnp_maintain_handle = Some(tokio::spawn(async move {
                                                 let mapped = mappings.map_quic_port(bound_port).await;
                                                 if mapped {
                                                     tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
@@ -32857,7 +32995,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     mappings,
                                                     mapped,
                                                 });
-                                            });
+                                            }));
                                         }
                                     }
                                     Err(e) => {
@@ -34963,6 +35101,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Transfers whose hash finished on the blocking pool. Drained
+                // here for the same branch-budget reason as the pacing below,
+                // but ahead of both gates it sits under: the verification was
+                // started while Ember was enabled and the overlay connected,
+                // and the sender is waiting on a completion frame it has no
+                // other way to obtain. Dropping the verdict because a setting
+                // was toggled or the eMule side went down mid-hash would leave
+                // that peer to time the transfer out as failed after it had
+                // already succeeded.
+                while let Ok(finished) = xfer_finish_rx.try_recv() {
+                    apply_xfer_finish(&udp_socket, &mut state, &db, &app_handle, finished).await;
+                }
                 // Ember Transfer pacing shares this 100ms tick rather than
                 // taking its own arm — `tokio::select!` tops out at 64
                 // branches and this loop is already at the limit. It runs
@@ -41017,14 +41167,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let tx = upnp_maintain_result_tx.clone();
                     upnp_maintain_in_flight = true;
                     upnp_maintain_started_at = Some(tokio::time::Instant::now());
-                    tokio::spawn(async move {
+                    upnp_maintain_handle = Some(tokio::spawn(async move {
                         let mapped = mappings.maintain().await;
                         let _ = tx.send(UpnpMaintainResult {
                             revision,
                             mappings,
                             mapped,
                         });
-                    });
+                    }));
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -41036,6 +41186,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 upnp_maintain_in_flight = false;
                 upnp_maintain_started_at = None;
+                // The pass that produced this result has finished; dropping a
+                // completed handle is what keeps the watchdog from aborting
+                // whichever pass happens to be running next.
+                upnp_maintain_handle = None;
                 if result.revision == upnp_mappings.revision() {
                     let was_mapped = state.upnp_mapped;
                     upnp_mappings = result.mappings;
@@ -41592,6 +41746,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // tens of seconds, which a minute-granularity caller cannot
                     // express. Its own per-room gate decides when one is due.
                     maybe_beat_channel_presence(&udp_socket, &mut state, &db, &settings).await;
+                    // Ahead of the emit, so a member heard from during this
+                    // tick is reported on this tick rather than the next.
+                    flush_channel_member_touches(&mut state, &db);
                     emit_channel_presence_deltas(&mut state, &app_handle);
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                     drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
@@ -43500,7 +43657,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if upnp_maintain_in_flight
                     && timed_out(upnp_maintain_started_at, PERIODIC_SAVE_WATCHDOG)
                 {
-                    warn!("Watchdog: UPnP maintenance exceeded timeout; allowing next retry");
+                    warn!("Watchdog: UPnP maintenance exceeded timeout; aborting it and allowing next retry");
+                    // Abort before clearing the flag. Left running it is
+                    // unobservable — nothing joins it and its result is
+                    // discarded on arrival by the revision check — so it would
+                    // only sit on a gateway socket while the pass we are about
+                    // to allow does the same work.
+                    if let Some(handle) = upnp_maintain_handle.take() {
+                        handle.abort();
+                    }
                     upnp_maintain_in_flight = false;
                     upnp_maintain_started_at = None;
                 }
@@ -48819,6 +48984,7 @@ async fn probe_bucket_oldest(
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let sent =
             match state
                 .ember_transport
@@ -48849,6 +49015,14 @@ async fn probe_bucket_oldest(
                 }
                 ember::transport::OutgoingResult::Queued => {
                     behind_handshake = true;
+                    // Parked behind a handshake that may complete with someone
+                    // else, in which case this frame is discarded rather than
+                    // sent. Not booked, so its silence cannot fault a contact
+                    // we never actually probed; bucket pressure simply retries
+                    // on the next tick.
+                    delivery_certain = state
+                        .ember_transport
+                        .queued_delivery_is_certain(*oldest_addr, oldest_noise);
                     true
                 }
                 ember::transport::OutgoingResult::Error(e) => {
@@ -48856,7 +49030,7 @@ async fn probe_bucket_oldest(
                     false
                 }
             };
-        if sent {
+        if sent && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(*oldest_id, behind_handshake, now),
@@ -48865,6 +49039,17 @@ async fn probe_bucket_oldest(
                 .ember_diagnostics
                 .ember_dht_liveness_pings_sent
                 .saturating_add(1);
+        } else if !sent {
+            // A probe that never left the machine records no pending entry, so
+            // the timeout sweep cannot fault this contact either — and this is
+            // the path that services bucket pressure, so the newcomer waiting
+            // in the replacement cache is waiting on a promotion that can only
+            // come from the incumbent being faulted. An address family the
+            // socket cannot dial (an IPv6 contact learned by gossip on an IPv4
+            // socket) fails here every time, and the liveness sweep will not
+            // cover it while it is still recent enough not to be due a ping.
+            // Same reasoning as the unreachable arm in `ping_ember_contact`.
+            fault_ember_contact(state, oldest_id, "unreachable");
         }
     }
 }
@@ -49343,6 +49528,7 @@ async fn run_ember_maintenance(
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -49377,6 +49563,14 @@ async fn run_ember_maintenance(
             }
             ember::transport::OutgoingResult::Queued => {
                 behind_handshake = true;
+                // See `probe_bucket_oldest`: parked behind a handshake that may
+                // complete with a different identity, in which case this frame
+                // is dropped at flush rather than sent. Neither booked nor
+                // faulted — the next cycle re-pings it, by which time the
+                // handshake has resolved one way or the other.
+                delivery_certain = state
+                    .ember_transport
+                    .queued_delivery_is_certain(contact.addr, &contact.noise_pub);
                 true
             }
             ember::transport::OutgoingResult::Error(e) => {
@@ -49387,7 +49581,7 @@ async fn run_ember_maintenance(
                 false
             }
         };
-        if send_ok {
+        if send_ok && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(contact.node_id, behind_handshake, now),
@@ -49397,7 +49591,7 @@ async fn run_ember_maintenance(
                 .ember_diagnostics
                 .ember_dht_liveness_pings_sent
                 .saturating_add(1);
-        } else {
+        } else if !send_ok {
             // A contact we cannot even transmit to is as dead as one that
             // never answers, and it is the only case the timeout sweep can't
             // see: with no pending entry recorded, nothing would ever fault

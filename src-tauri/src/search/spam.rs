@@ -67,6 +67,16 @@ const MAX_BATCH_NAME_KEYS: usize = 4_096;
 const MAX_BATCH_HASH_KEYS: usize = 4_096;
 const MAX_BATCH_SOURCE_KEYS: usize = 2_048;
 const MAX_BATCH_SNAPSHOTS: usize = 1_024;
+/// Cap on the *values* behind one `name_hashes` / `hash_names` key.
+///
+/// The key counts above are capped but the sets they hold were not, so a flood
+/// advertising one filename under an unbounded number of distinct hashes grew a
+/// single bucket for the life of the search context. Set to
+/// [`MAX_BATCH_SNAPSHOTS`] because that is the most rows `upgrade_rows` can
+/// ever act on: a hash with no snapshot behind it cannot be emitted, and the
+/// collision bars are `>=` against single digits, so nothing above this bound
+/// changes a decision — only the count shown in a `BatchNameManyHashes` reason.
+const MAX_BATCH_KEY_MEMBERS: usize = MAX_BATCH_SNAPSHOTS;
 
 pub const SEARCH_SPAM_THRESHOLD: u32 = 60;
 pub const SEARCH_SPAM_THRESHOLD_AGGRESSIVE: u32 = 45;
@@ -185,18 +195,18 @@ impl BatchSpamContext {
                 if self.name_hashes.contains_key(&name_norm)
                     || self.name_hashes.len() < MAX_BATCH_NAME_KEYS
                 {
-                    self.name_hashes
-                        .entry(name_norm.clone())
-                        .or_default()
-                        .insert(hash.clone());
+                    let bucket = self.name_hashes.entry(name_norm.clone()).or_default();
+                    if bucket.len() < MAX_BATCH_KEY_MEMBERS {
+                        bucket.insert(hash.clone());
+                    }
                 }
                 if self.hash_names.contains_key(&hash)
                     || self.hash_names.len() < MAX_BATCH_HASH_KEYS
                 {
-                    self.hash_names
-                        .entry(hash.clone())
-                        .or_default()
-                        .insert(name_norm);
+                    let bucket = self.hash_names.entry(hash.clone()).or_default();
+                    if bucket.len() < MAX_BATCH_KEY_MEMBERS {
+                        bucket.insert(name_norm);
+                    }
                 }
                 if self.snapshots.contains_key(&hash) || self.snapshots.len() < MAX_BATCH_SNAPSHOTS
                 {

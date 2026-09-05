@@ -1327,6 +1327,33 @@ impl EmberTransport {
         }
     }
 
+    /// Whether a payload just parked by [`Self::prepare_outgoing`] for
+    /// `remote_noise_pub` is certain to reach that identity.
+    ///
+    /// `false` when the queue it joined belongs to an XX handshake. XX does not
+    /// learn who answered until it completes, so if a different identity turns
+    /// up at that address the flush sites drop the payload
+    /// (`retain_addressed_to`) and it never reaches the wire. A caller that
+    /// books a timeout against a `Queued` result needs the difference: the
+    /// keyed liveness pings the DHT parks behind an unkeyed KAD-bridge or
+    /// channel-neighbour dial to the same address were being counted as sent,
+    /// and the contact then took the strike for a probe discarded in here.
+    pub fn queued_delivery_is_certain(
+        &self,
+        peer: SocketAddr,
+        remote_noise_pub: &[u8; 32],
+    ) -> bool {
+        match self.pending.get(&peer) {
+            Some(PendingHandshake::IkInitiator {
+                remote_noise_pub: target,
+                ..
+            }) => target == remote_noise_pub,
+            // XX in either role: identity unknown until completion.
+            Some(_) => false,
+            None => true,
+        }
+    }
+
     /// The session `prepare_outgoing` should seal to.
     ///
     /// A named static key selects only that session. No key — a ping auto-reply
@@ -1364,7 +1391,16 @@ impl EmberTransport {
 
     /// Install `session` at `(addr, static key)`, replacing a previous handshake
     /// for the same key and sitting alongside any other keys at the address.
-    fn install_session(&mut self, addr: SocketAddr, session: NoiseSession) {
+    /// Returns whether the session is still reachable afterwards — live in
+    /// `sessions`, or staged awaiting the frame that promotes it.
+    ///
+    /// `false` means the per-address cap refused this claimant and its slot is
+    /// gone, which only ever happens to an *unvalidated* arrival:
+    /// `trim_sessions_at` will not shed a proven one. A caller that installs a
+    /// `.validated()` session can ignore the result; the IK responder cannot,
+    /// because it would otherwise answer a peer whose session it no longer has.
+    #[must_use]
+    fn install_session(&mut self, addr: SocketAddr, session: NoiseSession) -> bool {
         let arriving_key = session.remote_noise_pub;
         let slot = (addr, arriving_key);
 
@@ -1413,7 +1449,7 @@ impl EmberTransport {
                 }
             }
             self.staged_sessions.insert(slot, session);
-            return;
+            return true;
         }
 
         self.staged_sessions.remove(&slot);
@@ -1422,6 +1458,7 @@ impl EmberTransport {
         }
         self.sessions.insert(slot, session);
         self.trim_sessions_at(addr, arriving_key);
+        self.sessions.contains_key(&slot)
     }
 
     /// Keep one address from holding more than [`MAX_SESSIONS_PER_ADDR`] sessions.
@@ -1994,7 +2031,35 @@ impl EmberTransport {
             self.trim_deferred_ik(from, remote_noise_pub);
         }
 
-        self.install_session(from, session);
+        if !self.install_session(from, session) {
+            // The per-address cap refused this claimant, and the session this
+            // handshake produced no longer exists. Answering anyway is worse
+            // than not answering: the peer installs its half on receiving
+            // IK_RESP and believes the link is up, while every frame it sends
+            // arrives here to no session, and the probe above would be
+            // soliciting a Pong nothing can decrypt. That state does not heal
+            // — the peer has no reason to re-handshake a session it thinks is
+            // working — so an address already holding `MAX_SESSIONS_PER_ADDR`
+            // proven peers, whether a busy NAT or an attacker who arranged it,
+            // would leave every further identity behind it permanently
+            // half-connected. Dropping the response instead leaves the peer to
+            // time out and retry, which is recoverable.
+            //
+            // The deferred payload goes with it: releasing it needs an
+            // authenticated frame, and without a session none can ever arrive,
+            // so it would otherwise sit until the TTL sweep. `remove_session_for`
+            // clears the same entry for the same reason.
+            self.deferred_ik.remove(&(from, remote_noise_pub));
+            // And forget the digest, or the replay cache would answer the
+            // peer's retransmit with the IK_RESP we just decided not to send —
+            // handing it the working half of a session we do not have, which is
+            // the exact state this branch exists to avoid. Forgetting makes a
+            // retransmit re-run the handshake, so the peer gets in as soon as a
+            // slot at this address frees up.
+            self.forget_handshake(&handshake_digest);
+            debug!("IK responder: per-address session cap refused {from}; not answering");
+            return IncomingResult::Rejected;
+        }
 
         IncomingResult::HandshakeComplete {
             peer: from,
@@ -2169,7 +2234,8 @@ impl EmberTransport {
             }
         }
 
-        self.install_session(from, session);
+        // Validated, so the per-address cap cannot shed it.
+        let _ = self.install_session(from, session);
         trace!("IK handshake completed (initiator) with {from}");
 
         IncomingResult::HandshakeComplete {
@@ -2611,7 +2677,8 @@ impl EmberTransport {
             }
         }
 
-        self.install_session(from, session);
+        // Validated, so the per-address cap cannot shed it.
+        let _ = self.install_session(from, session);
         trace!("XX handshake completed (initiator) with {from}");
 
         IncomingResult::HandshakeComplete {
@@ -2714,7 +2781,8 @@ impl EmberTransport {
             }
         }
 
-        self.install_session(from, session);
+        // Validated, so the per-address cap cannot shed it.
+        let _ = self.install_session(from, session);
         trace!(
             "XX handshake completed (responder) with {from}; flushed {} queued message(s)",
             deliverable.len()

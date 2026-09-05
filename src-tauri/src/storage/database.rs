@@ -293,6 +293,10 @@ const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Where `conn` was opened from, so a long read like
+    /// [`Self::snapshot_to`] can open its own connection instead of holding
+    /// the shared one.
+    path: std::path::PathBuf,
     /// Dedicated random key for chat-history encryption. It is stored beside
     /// the database through `secret_store` (DPAPI on Windows) and zeroized
     /// when the last Database handle is dropped.
@@ -407,6 +411,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            path: db_path.to_path_buf(),
             chat_key,
             corrupt_backup: None,
         };
@@ -2253,6 +2258,14 @@ impl Database {
     /// with no WAL sidecar, which is what a backup needs: copying `ember.db`
     /// by hand while the app is running captures a file whose newest
     /// committed rows are still only in `ember.db-wal`.
+    ///
+    /// Runs on its own connection rather than the shared one. `VACUUM INTO`
+    /// copies the entire database, which on a large one is seconds — and
+    /// `conn` is a plain Rust `Mutex` that every other caller in the process
+    /// blocks on, the network task included, so holding it for the duration
+    /// stalled the overlay and dropped peers for as long as the backup ran.
+    /// WAL gives the second connection a consistent snapshot without excluding
+    /// writers, which is the same guarantee the shared one offered here.
     pub fn snapshot_to(&self, dest: &std::path::Path) -> anyhow::Result<()> {
         // SQLite refuses to overwrite an existing target.
         if dest.exists() {
@@ -2262,7 +2275,14 @@ impl Database {
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Snapshot path is not valid UTF-8"))?;
         {
-            let conn = self.conn.lock();
+            let conn = Connection::open_with_flags(
+                &self.path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            // A reader that arrives mid-checkpoint would otherwise fail
+            // outright instead of waiting the moment out.
+            conn.busy_timeout(std::time::Duration::from_secs(30))?;
             conn.execute("VACUUM INTO ?1", params![dest_str])?;
         }
         crate::security::restrict_file_permissions(dest);
@@ -2903,24 +2923,76 @@ impl Database {
         .is_ok()
     }
 
-    /// Whether a durable, non-terminal download row still owns its `.part`
-    /// files even if the row was quarantined instead of restored in memory.
-    pub fn incomplete_download_owns_partial(&self, transfer_id: &str) -> bool {
+    /// Ids of durable, non-terminal download rows that still own their `.part`
+    /// files, even where the row was quarantined rather than restored in memory.
+    ///
+    /// The orphan sweep tests one id per file in the Temp directory. Asking
+    /// per file meant a query, and a turn on the shared connection mutex, for
+    /// every stale `.part` a crash had left behind — thousands of them on a
+    /// long-lived install, all of it before the network loop reached its first
+    /// `select`. The whole set is one scan of the same index.
+    pub fn incomplete_downloads_owning_partials(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT 1 FROM transfers
-              WHERE id = ?1
-                AND direction = 'download'
+        let mut stmt = conn.prepare(
+            "SELECT id FROM transfers
+              WHERE direction = 'download'
                 AND status NOT IN ('completed', 'noneneeded')",
-            params![transfer_id],
-            |_| Ok(()),
-        )
-        .is_ok()
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
+        Ok(())
+    }
+
+    /// Delete many transfers in one transaction.
+    ///
+    /// [`Database::remove_transfer`] autocommits, so a caller deleting a
+    /// selection paid one transaction — and under `synchronous=FULL` one fsync
+    /// — per row, each of them re-taking the single connection mutex that every
+    /// other database user in the process shares, the network task included.
+    /// Clearing a few thousand completed rows that way froze the app for tens
+    /// of seconds. One transaction is one fsync regardless of the count.
+    pub fn remove_transfers(&self, transfer_ids: &[String]) -> anyhow::Result<()> {
+        if transfer_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
+            for id in transfer_ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record many cancelled/finished downloads in one transaction.
+    ///
+    /// Same reasoning as [`Database::remove_transfers`]: the per-row
+    /// [`Database::record_download_history`] opens its own transaction, so a
+    /// batch cancel paid one fsync per row before it even reached the deletes.
+    /// Rows are `(file_hash, file_name, file_size, status)`.
+    pub fn record_download_history_batch(
+        &self,
+        rows: &[(String, String, u64, &str)],
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for (file_hash, file_name, file_size, status) in rows {
+            Self::record_download_history_in(&tx, file_hash, file_name, *file_size, status)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -5741,6 +5813,43 @@ impl Database {
     /// those as a change turned a quiet roster into a stream of no-op updates.
     /// The monotonic guarantee now lives in the `WHERE` rather than in `MAX`,
     /// so a late frame still cannot walk a row backwards.
+    /// Apply many `last_seen` touches in one transaction.
+    ///
+    /// Returns, for each input row in order, whether it moved a roster row —
+    /// the same answer [`Database::touch_channel_member_last_seen`] gives, and
+    /// the thing the caller needs to know which rows to push to the UI.
+    ///
+    /// Rows are `(channel_id, member_pubkey, last_seen)`. The per-row method
+    /// autocommits, and its caller ran once per received channel datagram, so a
+    /// user in a few busy rooms was charging the shared connection mutex tens
+    /// of fsyncs a second from inside the network task.
+    pub fn touch_channel_members_last_seen(
+        &self,
+        rows: &[(String, String, i64)],
+    ) -> anyhow::Result<Vec<bool>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut updated = Vec::with_capacity(rows.len());
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE channel_members
+                 SET last_seen = ?3
+                 WHERE channel_id = ?1 AND member_pubkey = ?2 AND last_seen < ?3",
+            )?;
+            for (channel_id, member_pubkey, last_seen) in rows {
+                let last_seen = (*last_seen).min(now);
+                let n = stmt.execute(params![channel_id, member_pubkey, last_seen])?;
+                updated.push(n > 0);
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
     pub fn touch_channel_member_last_seen(
         &self,
         channel_id: &str,
@@ -7305,6 +7414,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
@@ -7331,6 +7441,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
@@ -7386,6 +7497,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
@@ -7520,6 +7632,7 @@ mod tests {
         .expect("create schema");
         let locked = Database {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
             chat_key: None,
             corrupt_backup: None,
         };
@@ -8097,6 +8210,7 @@ mod tests {
         .expect("create schema");
         Database {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
         }
@@ -8276,7 +8390,9 @@ mod tests {
         assert_eq!(second[0].id, "middle");
         assert!(db.get_incomplete_downloads_page(1, 2).unwrap().is_empty());
         assert!(
-            db.incomplete_download_owns_partial("newest"),
+            db.incomplete_downloads_owning_partials()
+                .unwrap()
+                .contains("newest"),
             "quarantined rows must keep ownership of user .part data"
         );
 
@@ -10676,6 +10792,7 @@ mod tests {
 
         let wrong_key_db = Database {
             conn: Mutex::new(Connection::open(&path).unwrap()),
+            path: path.clone(),
             chat_key: Some(Zeroizing::new([0x5A; 32])),
             corrupt_backup: None,
         };
@@ -10697,6 +10814,7 @@ mod tests {
 
         let recovered_db = Database {
             conn: Mutex::new(Connection::open(&path).unwrap()),
+            path: path.clone(),
             chat_key: Some(Zeroizing::new(correct_key)),
             corrupt_backup: None,
         };

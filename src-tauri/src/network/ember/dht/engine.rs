@@ -1278,7 +1278,7 @@ impl EmberDht {
             return None;
         }
         let (expected, _) = client.files.get(&file_hash)?;
-        (*expected == token).then_some((client.addr, client.noise_pub))
+        callback_tokens_match(expected, &token).then_some((client.addr, client.noise_pub))
     }
 
     /// Remember that we sent `PROXY_STORE` `request_id` to `buddy`. A later
@@ -2525,6 +2525,22 @@ impl EmberDht {
             }
         }
     }
+}
+
+/// Constant-time comparison of a callback token against the bytes a peer sent.
+///
+/// The derived `PartialEq` on `[u8; 16]` returns at the first differing byte,
+/// so a peer that can time our forwarding decision could walk that timing to
+/// recover a token one byte at a time — 16x256 probes instead of 2^128. The
+/// token is the whole proof that the sender actually read a record we proxied,
+/// so recovering it is what the check exists to prevent. Same reasoning, and
+/// the same shape, as `transport::cookie_tags_match`.
+fn callback_tokens_match(expected: &[u8; 16], got: &[u8; 16]) -> bool {
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(got.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// Extract `file_hash` from a packed Ember DHT record (`type || keyword_hash || file_hash || …`).
