@@ -23883,18 +23883,26 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     info!("UDP socket bound on port {udp_port}");
 
     // The connection broker binds a *second* UDP socket for QUIC on the
-    // configured `tcp_port`. If the user happens to set `tcp_port ==
-    // udp_port` (an easy mistake — old eMule habit, or copy-paste of
-    // the same number into both fields), QUIC will fail to bind to that
-    // port and `build_server_client_endpoint` will fall back to a
-    // neighbour. Warn loudly here so the user can either tolerate the
-    // fallback or pick distinct ports.
+    // configured `tcp_port`, so `tcp_port == udp_port` means QUIC loses that
+    // port to the Kad UDP socket bound above and
+    // `build_server_client_endpoint` takes the next free neighbour.
+    //
+    // Noted rather than warned about, and no advice offered. Setting both
+    // fields to one number is what a VPN forwarding a single port requires,
+    // and `wizard_ports_desc` tells users to do exactly that — telling them
+    // afterwards to pick distinct values asks for something their tunnel
+    // cannot give. Reachability does not depend on the fallback port being
+    // forwarded either: the endpoint STUN-probes its own public port and
+    // rendezvous advertises that, which is what a hole-punch dials whichever
+    // local port QUIC ended up on. The one thing worth having in a log is
+    // that port, because the Windows Firewall rule is added for the port QUIC
+    // actually bound rather than the one configured here.
     if settings.tcp_port == settings.udp_port {
-        warn!(
-            "Configured tcp_port and udp_port are identical ({}). \
-             QUIC will be unable to bind that port (Kad UDP got there first) \
-             and will fall back to a neighbouring port. Set them to distinct \
-             values in Settings to silence this warning.",
+        info!(
+            "tcp_port and udp_port are both {} — a single-port setup. Kad UDP \
+             holds that port, so QUIC will bind a neighbour and advertise its \
+             STUN-discovered public port; see the QUIC endpoint line below for \
+             which local port it took.",
             settings.tcp_port,
         );
     }
