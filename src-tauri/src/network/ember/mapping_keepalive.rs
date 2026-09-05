@@ -209,16 +209,33 @@ pub(crate) async fn stun_keepalive_with_replies(
 /// TCP STUN transaction runs. Uses SO_REUSEADDR so the listener, hold, and
 /// STUN connection can coexist as distinct TCP 4-tuples.
 async fn open_tcp_mapping_hold(local_port: u16) -> Option<TcpStream> {
+    // Reasons are carried to the warning rather than logged and dropped. The
+    // per-target line below is `debug!`, so at the level anyone actually runs
+    // a hold that stops working arrived as "failed for all targets" and
+    // nothing else — and the candidates behind that have nothing in common.
+    // An address already in use means a previous cycle's 4-tuple is still in
+    // TIME_WAIT and this keep-alive is exhausting its own targets; a refusal
+    // or reset means something between here and the internet drops
+    // captive-portal endpoints; a DNS error means neither. One is our bug, one
+    // is the user's network, one is transient, and the aggregate line could
+    // not tell them apart.
+    let mut failures: Vec<String> = Vec::with_capacity(TCP_HOLD_TARGETS.len());
     for &(host, port) in TCP_HOLD_TARGETS {
         match tcp_hold_connect(local_port, host, port).await {
             Ok(stream) => {
                 debug!("TCP mapping hold ok via {host}:{port} from local {local_port}");
                 return Some(stream);
             }
-            Err(e) => debug!("TCP mapping hold {host}:{port} failed: {e}"),
+            Err(e) => {
+                debug!("TCP mapping hold {host}:{port} failed: {e}");
+                failures.push(format!("{host}:{port}: {e}"));
+            }
         }
     }
-    warn!("TCP mapping hold failed for all targets (port {local_port})");
+    warn!(
+        "TCP mapping hold failed for all targets (port {local_port}): {}",
+        failures.join("; ")
+    );
     None
 }
 
