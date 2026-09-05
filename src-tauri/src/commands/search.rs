@@ -30,6 +30,10 @@ const MAX_MARK_SPAM_SOURCES: usize = 64;
 const MAX_MARK_SPAM_FILENAME: usize = 1024;
 /// Maximum search-keyword count in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORDS: usize = 32;
+/// Maximum seed files accepted by `plan_related_search`. Only the first seed's
+/// filename shapes the keyword query; the rest only contribute hashes to the
+/// native eD2k co-share request, which is itself capped further down.
+const MAX_RELATED_SEEDS: usize = 16;
 /// Maximum keyword length in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
 
@@ -101,6 +105,66 @@ fn keywords_for_spam(search_query: Option<&str>, search_keywords: &[String]) -> 
         }
     }
     search_keywords.to_vec()
+}
+
+/// Which of [`search_files`]' hash lists is being validated.
+///
+/// This only picks an error code, and a `&str` parameter would do — except that
+/// `scripts/error-codes.test.mjs` finds codes by scanning for string literals
+/// inside `coded*` calls, so a code reaching `coded_ctx` through a variable is
+/// invisible to the check that it has been translated. Matching to a literal
+/// per variant keeps both codes discoverable.
+#[derive(Debug, Clone, Copy)]
+enum HashList {
+    Related,
+    Exclude,
+}
+
+impl HashList {
+    fn invalid_hash_error(self, hash: &str) -> String {
+        match self {
+            HashList::Related => {
+                coded_ctx("search_related_invalid_hash", "Invalid file hash", hash)
+            }
+            HashList::Exclude => {
+                coded_ctx("search_exclude_invalid_hash", "Invalid file hash", hash)
+            }
+        }
+    }
+}
+
+/// Validate and normalize an optional list of eD2k MD4 hashes from the
+/// renderer to lowercase hex, de-duplicated.
+///
+/// Rejects rather than silently drops a malformed hash: these lists decide
+/// which results are hidden and what goes into the native co-share request, so
+/// quietly ignoring a typo'd hash would make a related search look like it just
+/// found nothing.
+fn normalize_hash_list(
+    hashes: Option<Vec<String>>,
+    list: HashList,
+) -> Result<Vec<String>, String> {
+    let Some(hashes) = hashes else {
+        return Ok(Vec::new());
+    };
+    if hashes.len() > MAX_RELATED_SEEDS {
+        return Err(coded_ctx(
+            "search_related_too_many_seeds",
+            format!("At most {MAX_RELATED_SEEDS} file hashes"),
+            MAX_RELATED_SEEDS,
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        // Reuse the single 32-hex-char check so this can never diverge from
+        // what the rest of the search path considers a valid file hash.
+        parse_exact_file_hash(&hash).map_err(|_| list.invalid_hash_error(&hash))?;
+        let normalized = hash.to_lowercase();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
@@ -236,7 +300,83 @@ pub(crate) fn community_ratings_for(
         .collect()
 }
 
+/// A file the user asked for related files of, as it arrives over IPC.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RelatedSeedInput {
+    pub hash: Option<String>,
+    pub name: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+/// Work out what a "find related files" search should actually look for.
+///
+/// Pure planning: this runs no search and touches no network. The caller takes
+/// [`crate::search::related::RelatedPlan::query`] and
+/// `co_share_hashes` and feeds them straight back into [`search_files`], so a
+/// related search is an ordinary search and inherits streaming, dedup, spam
+/// scoring, filters and cancellation unchanged.
 #[tauri::command]
+pub async fn plan_related_search(
+    seeds: Vec<RelatedSeedInput>,
+) -> Result<crate::search::related::RelatedPlan, String> {
+    if seeds.is_empty() {
+        return Err(coded(
+            "search_related_no_seed",
+            "No file was given to find related files for",
+        ));
+    }
+    if seeds.len() > MAX_RELATED_SEEDS {
+        return Err(coded_ctx(
+            "search_related_too_many_seeds",
+            format!("Select at most {MAX_RELATED_SEEDS} files"),
+            MAX_RELATED_SEEDS,
+        ));
+    }
+    if seeds.iter().any(|s| {
+        s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME)
+            || s.artist.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
+            || s.album.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
+    }) {
+        return Err(coded(
+            "search_related_seed_too_long",
+            "Related-search seed metadata is too long",
+        ));
+    }
+
+    let seeds: Vec<crate::search::related::SeedFile> = seeds
+        .into_iter()
+        .map(|s| crate::search::related::SeedFile {
+            hash: s.hash.unwrap_or_default(),
+            name: s.name.unwrap_or_default(),
+            artist: s.artist,
+            album: s.album,
+        })
+        .collect();
+
+    let plan = crate::search::related::plan(
+        &seeds,
+        crate::network::ed2k::server::related_search_supported(),
+    );
+    if plan.is_empty() {
+        return Err(coded(
+            "search_related_nothing_to_search",
+            "Could not work out anything to search for from this file",
+        ));
+    }
+    Ok(plan)
+}
+
+/// Run a search across the selected networks.
+///
+/// `related_hashes` / `exclude_hashes` are set only by a "find related files"
+/// search (see [`plan_related_search`]). `related_hashes` turns the connected
+/// eD2k server's leg of the search into eMule's native co-share request when
+/// that server advertises `SRV_TCPFLG_RELATEDSEARCH`, and is ignored otherwise
+/// — every other leg always runs `query`. `exclude_hashes` withholds the seed
+/// files from the results, since a file is not related to itself.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn search_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -248,6 +388,8 @@ pub async fn search_files(
     file_type: Option<String>,
     file_extension: Option<String>,
     min_availability: Option<u32>,
+    related_hashes: Option<Vec<String>>,
+    exclude_hashes: Option<Vec<String>>,
 ) -> Result<Vec<SearchResult>, String> {
     if query.len() > MAX_SEARCH_QUERY_LEN {
         return Err(coded_ctx(
@@ -285,6 +427,9 @@ pub async fn search_files(
             MAX_SEARCH_FILTER_LEN,
         ));
     }
+    let related_hashes = normalize_hash_list(related_hashes, HashList::Related)?;
+    let exclude_hashes = normalize_hash_list(exclude_hashes, HashList::Exclude)?;
+
     let (tx, rx) = oneshot::channel();
 
     let keywords = crate::search::query::parse(query.trim())
@@ -335,14 +480,15 @@ pub async fn search_files(
 
     let mut streamed_local = local_hits.clone();
     streamed_local.retain(|r| {
-        merge::result_matches_client_filters(
-            r,
-            file_type_filter.as_deref(),
-            client_min_size,
-            client_max_size,
-            client_file_extension.as_deref(),
-            client_min_availability,
-        )
+        !exclude_hashes.contains(&r.file.hash)
+            && merge::result_matches_client_filters(
+                r,
+                file_type_filter.as_deref(),
+                client_min_size,
+                client_max_size,
+                client_file_extension.as_deref(),
+                client_min_availability,
+            )
     });
     enrich_results_with_batch(&mut streamed_local, &state, &keywords, None, false).await;
     if !streamed_local.is_empty() {
@@ -363,6 +509,8 @@ pub async fn search_files(
             request_id,
             tx,
             search_filters: filters,
+            related_hashes,
+            exclude_hashes: exclude_hashes.clone(),
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
@@ -384,14 +532,15 @@ pub async fn search_files(
 
     results = merge::merge_search_vecs(results, local_hits);
     results.retain(|r| {
-        merge::result_matches_client_filters(
-            r,
-            file_type_filter.as_deref(),
-            client_min_size,
-            client_max_size,
-            client_file_extension.as_deref(),
-            client_min_availability,
-        )
+        !exclude_hashes.contains(&r.file.hash)
+            && merge::result_matches_client_filters(
+                r,
+                file_type_filter.as_deref(),
+                client_min_size,
+                client_max_size,
+                client_file_extension.as_deref(),
+                client_min_availability,
+            )
     });
     // No batch spam context: invoke often re-delivers hashes already shown via
     // streamed events; batch heuristics can flip clean → spam.

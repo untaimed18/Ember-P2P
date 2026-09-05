@@ -2,10 +2,21 @@ import { get, writable, type Unsubscriber } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { SearchMethod, SearchFilters } from '$lib/api/search';
+import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
+
+/** Marks a tab as the result of "find related files" rather than a typed
+ *  query, so it can be labelled by the file it came from instead of by the
+ *  derived keywords — which are an implementation detail the user never typed
+ *  and would not recognise. */
+export type RelatedSearchInfo = {
+  /** Filename(s) the search was started from. */
+  seedLabel: string;
+  /** Signals in use, for explaining the tab. */
+  kinds: RelationKind[];
+};
 
 export type SearchTab = {
   id: string;
@@ -14,6 +25,8 @@ export type SearchTab = {
   method: SearchMethod;
   fileType?: string;
   filters?: SearchFilters;
+  /** Present only for a related search; see [`RelatedSearchInfo`]. */
+  related?: RelatedSearchInfo;
   results: SearchResult[];
   /** Persistent `resultKey` -> index-into-`results` map. Kept on the tab so a
    *  streaming flush only touches the incoming batch instead of rebuilding an
@@ -347,7 +360,7 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
 const MAX_SEARCH_TABS = 20;
 
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
-export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number; stoppedOthers: boolean } {
+export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters, related?: RelatedSearchInfo): { tabId: string; requestId: number; stoppedOthers: boolean } {
   const requestId = newSearchNonce();
   const id = newTabId();
   const tab: SearchTab = {
@@ -357,6 +370,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     method,
     fileType,
     filters,
+    related,
     results: [],
     resultIndex: new Map(),
     isSearching: true,

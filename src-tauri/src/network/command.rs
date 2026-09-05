@@ -148,6 +148,8 @@ async fn handle_command_inner(
             request_id,
             tx,
             search_filters,
+            related_hashes,
+            exclude_hashes,
         } => {
             // Cancel the prior request while it is still `active_search_request`
             // so cancel can clear the UDP queue and emit `search-complete`.
@@ -190,7 +192,24 @@ async fn handle_command_inner(
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
                 streamed_hashes: std::collections::HashSet::new(),
+                exclude_hashes: exclude_hashes.iter().cloned().collect(),
                 batch_spam: crate::search::spam::BatchSpamContext::default(),
+            };
+
+            // eMule's native "Search Related Files": the connected server is
+            // asked for files commonly shared *alongside* these hashes rather
+            // than for a keyword match. Only that one server gets it, and only
+            // when it advertises support — the whole point is its global view
+            // of who shares what, which no other leg of the search has. The
+            // UDP global-search leg deliberately keeps the keyword expression:
+            // a server without `SRV_TCPFLG_RELATEDSEARCH` would read
+            // `related::<hash>` as a filename substring and answer with
+            // nothing useful.
+            let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
+            {
+                None
+            } else {
+                crate::search::related::co_share_term(&related_hashes)
             };
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
@@ -214,7 +233,18 @@ async fn handle_command_inner(
                     || f.max_size.is_some_and(|v| v > 0)
                     || f.min_availability.is_some_and(|v| v > 0)
             }) || wire_file_type.as_ref().is_some_and(|t| !t.is_empty());
-            if keywords.is_empty() && !has_usable_filters {
+            // Whether the keyword legs have anything to send at all. A related
+            // search can legitimately have nothing: a file named `S01E02.mkv`
+            // is all marker and no title, so the co-share request carries the
+            // whole search. Every keyword leg is gated on this rather than on
+            // its own reading of `keywords` so none of them can put an empty
+            // expression on the wire.
+            let has_keyword_query = !keywords.is_empty() || has_usable_filters;
+            // A co-share request needs no keywords: the hashes *are* the query.
+            // Without this a related search on a file whose name yields no
+            // searchable token (all words under the eD2k 3-byte minimum) would
+            // bail out here even though the server could still answer it.
+            if !has_keyword_query && co_share_term.is_none() {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
@@ -250,7 +280,14 @@ async fn handle_command_inner(
             // spraying `OP_GLOBSEARCH` at the whole server list after the user
             // had gone offline. Ember still answers a Global query, which is
             // the documented offline fallback; talking to eD2K servers is not.
-            let run_udp = matches!(method, SearchMethod::Global)
+            //
+            // `has_keyword_query` matters here for a co-share-only related
+            // search: `search_expr` is empty then, and this leg would queue a
+            // keywordless `OP_GLOBSEARCH` to every server in the list. Only the
+            // one connected server can answer a co-share request, and it is
+            // asked over TCP below.
+            let run_udp = has_keyword_query
+                && matches!(method, SearchMethod::Global)
                 && !state
                     .user_offline
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -260,7 +297,27 @@ async fn handle_command_inner(
 
             if run_server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
-                    match conn.send_search_expr_bytes(&search_expr).await {
+                    // The co-share term must be wrapped as a `QueryExpr::Term`
+                    // by hand rather than parsed: `:` is an eD2k keyword
+                    // separator, so parsing `related::<hash>` would send the
+                    // server a keyword search for "related".
+                    let server_expr = match co_share_term.as_deref() {
+                        Some(term) => {
+                            info!(
+                                "TCP server search is a co-share request for {} hash(es)",
+                                related_hashes.len()
+                            );
+                            kad::messages::build_search_expression_with_node(
+                                Some(
+                                    crate::search::query::QueryExpr::Term(term.to_string())
+                                        .to_wire_bytes(),
+                                ),
+                                &search_constraints,
+                            )
+                        }
+                        None => search_expr.clone(),
+                    };
+                    match conn.send_search_expr_bytes(&server_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
                             state.server_search_more_needed = false;

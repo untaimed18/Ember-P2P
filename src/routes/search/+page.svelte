@@ -1,6 +1,7 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import { pendingRelatedSearch, relationKindLabel, startRelatedSearch } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { getEmberDiagnostics } from '$lib/api/ember';
@@ -21,6 +22,7 @@
     searchTabs,
     setActiveSearchTab,
     spamFilterEpoch,
+    type RelatedSearchInfo,
     type SearchTab,
   } from '$lib/stores/search';
   import { networkStats, serverStatus } from '$lib/stores/network';
@@ -537,6 +539,10 @@
     // background tab's live search.
     for (const id of [...searchInvokeSettled]) forgetSettledRequest(id);
     for (const id of miscTimers) clearTimeout(id);
+    // A related search still waiting on network readiness is abandoned when the
+    // user leaves, rather than kept to fire unprompted next time this page is
+    // opened.
+    pendingRelatedSearch.set(null);
   });
 
   function onFilterTextInput() {
@@ -1452,6 +1458,16 @@
     });
   }
 
+  /** Tooltip for a tab: the query for a normal search, and for a related search
+   *  the seed file plus which signals it used and the keywords they derived —
+   *  which is the only place that is discoverable. */
+  function searchTabTitle(tab: SearchTab): string {
+    if (!tab.related) return tab.query;
+    const signals = tab.related.kinds.map(relationKindLabel).join(', ');
+    const base = m.search_related_tab_title({ file: tab.related.seedLabel, signals });
+    return tab.query ? `${base}\n${m.search_related_tab_query({ query: tab.query })}` : base;
+  }
+
   function requestCloseSearchTab(tab: SearchTab) {
     // Only confirm when closing would lose work: an in-flight search or
     // accumulated results. A closed, empty tab is always one click to drop.
@@ -1492,7 +1508,19 @@
     }
   }
 
-  async function handleSearch(query: string) {
+  /**
+   * Run a search.
+   *
+   * `plan` is set only when this is a "find related files" search, in which case
+   * `query` is the keyword query the backend derived from the seed file rather
+   * than anything the user typed. Related searches deliberately reuse this whole
+   * function — the tab strip, the timeout watchdogs, the streaming merge and the
+   * completion fallback all have to behave identically — and differ only in what
+   * they send (seed hashes alongside the query), how the tab is labelled, and
+   * that they may legitimately have no keywords at all when the co-share request
+   * is carrying the search.
+   */
+  async function handleSearch(query: string, plan?: RelatedPlan) {
     // The Search button is disabled in exactly these states, but pressing
     // Enter in the query box reaches this function directly — so without the
     // same gate, clicking did nothing while Enter popped the "no network"
@@ -1520,7 +1548,12 @@
       maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
       minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
     };
-    if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    // A related search whose seed filename yielded no searchable word is still
+    // runnable when the server can answer the co-share request from the hashes
+    // alone, so it is exempt from the "type something" and "needs a keyword"
+    // gates that a hand-typed query has to pass.
+    const coShareOnly = !!plan && plan.co_share_hashes.length > 0 && !plan.query;
+    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
     if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
       addToast('warning', m.search_needs_keyword());
       return;
@@ -1559,7 +1592,10 @@
       clearSearchTimeoutForRequest(t.requestId);
       flushPendingSearchResults(t.requestId);
     }
-    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    const relatedInfo: RelatedSearchInfo | undefined = plan
+      ? { seedLabel: plan.seed_label, kinds: plan.probes.map((p) => p.kind) }
+      : undefined;
+    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot, relatedInfo);
     if (stoppedOthers) {
       addToast('info', m.search_previous_stopped());
     }
@@ -1568,7 +1604,9 @@
     clearChecked();
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
-    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot);
+    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot, plan
+      ? { relatedHashes: plan.co_share_hashes, excludeHashes: plan.exclude_hashes }
+      : undefined);
 
     // Arm the watchdog once and expose a re-arm helper. getSettings() runs in
     // parallel with the search so a slow settings fetch can never block (and
@@ -1649,6 +1687,41 @@
       }));
       forgetSettledRequest(requestId);
     }
+  }
+
+  /*
+   * A related search planned elsewhere (the Transfers or Library context menu,
+   * or this page's own) arrives through `pendingRelatedSearch`.
+   *
+   * It is held until the page will actually accept a search rather than
+   * consumed on arrival: navigating here from another page can land while
+   * network readiness is still resolving, and `handleSearch` refuses quietly in
+   * that window — which would drop the user's click with no explanation. While
+   * it waits, the readiness hint above the results already says why nothing is
+   * searching, and this re-runs the moment that changes.
+   */
+  $effect(() => {
+    const pending = $pendingRelatedSearch;
+    if (!pending || searchSubmitBlocked) return;
+    pendingRelatedSearch.set(null);
+    // Show the derived query so it is visible and editable — a related search
+    // is otherwise the one case where results appear for a query the user
+    // never saw.
+    barQuery = pending.plan.query ?? '';
+    void handleSearch(barQuery, pending.plan);
+  });
+
+  /** Find files related to `result` — the search-results context menu action. */
+  async function findRelated(result: SearchResult) {
+    closeContextMenu();
+    await startRelatedSearch([
+      {
+        hash: result.file.hash,
+        name: result.file.name,
+        artist: result.media?.artist ?? null,
+        album: result.media?.album ?? null,
+      },
+    ]);
   }
 
   // `tabId` defaults to the active tab (toolbar Stop button), but a search
@@ -2646,7 +2719,7 @@
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
     {#each $searchTabs as tab (tab.id)}
-      <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={tab.query}>
+      <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={searchTabTitle(tab)}>
         <button
           type="button"
           class="search-tab-select"
@@ -2657,7 +2730,11 @@
           aria-selected={tab.id === $activeSearchTabId}
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
-          <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
+          <!-- A related search is labelled by what it is, not by the seed
+               filename: release names are long enough that every such tab
+               truncated to the same unreadable prefix. The file, the signals and
+               the derived query are all in the tab's tooltip. -->
+          <span class="search-tab-label">{tab.related ? m.search_related_tab_label() : shortenTabLabel(tab.query)}</span>
           <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
@@ -3288,6 +3365,11 @@
         {#if checkedCount > 1}
           <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
         {/if}
+        <button
+          role="menuitem"
+          onclick={() => { if (contextMenu) void findRelated(contextMenu.result); }}
+          title={m.search_ctx_find_related_title()}
+        >{m.search_ctx_find_related()}</button>
         <button role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
         {#if checkedCount > 1}
           <button role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>

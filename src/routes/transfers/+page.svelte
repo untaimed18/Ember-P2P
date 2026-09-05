@@ -12,6 +12,7 @@
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
+  import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
@@ -2022,6 +2023,11 @@
         }
         case 'paste_link': {
           await pasteLinksFromClipboard();
+          break;
+        }
+        case 'find_related': {
+          // Navigates to Search on success, so nothing after this runs here.
+          await startRelatedSearch([{ hash: t.file_hash, name: t.file_name }]);
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
@@ -4659,6 +4665,7 @@
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
       <button class="ctx-item" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
+      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
     {:else if ctxMenu.section === 'completed'}
@@ -4673,6 +4680,7 @@
       <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>

@@ -7460,6 +7460,7 @@ mod tests {
             server_ip: None,
             server_result_count: 0,
             streamed_hashes: std::collections::HashSet::new(),
+            exclude_hashes: std::collections::HashSet::new(),
             batch_spam: crate::search::spam::BatchSpamContext::default(),
         }
     }
@@ -7518,6 +7519,52 @@ mod tests {
         );
         assert_eq!(resights2.len(), 1);
         assert_eq!(resights2[0].file.hash, "aaaa");
+    }
+
+    /// A related search seeds `exclude_hashes` with the file it was started
+    /// from. Those must be dropped outright — not returned as ed2k
+    /// availability re-sights, which would have the UI try to update a row it
+    /// never showed.
+    #[test]
+    fn dedup_streamed_batch_drops_excluded_hashes_entirely() {
+        let mut active = sample_active_search_request(42);
+        active.exclude_hashes.insert("seedhash".to_string());
+        let mut active = Some(active);
+
+        let mut batch = vec![
+            SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                availability: 9,
+                ..sample_search_result("seedhash")
+            },
+            sample_search_result("otherhash"),
+        ];
+        let resights = dedup_streamed_batch(&mut active, 42, &mut batch);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|r| r.file.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["otherhash"],
+        );
+        assert!(
+            resights.is_empty(),
+            "an excluded hash must not come back as an availability update"
+        );
+    }
+
+    #[test]
+    fn related_search_capability_reads_the_emule_tcp_flag() {
+        assert!(related_search_flag_set(
+            ed2k::server::SRV_TCPFLG_RELATEDSEARCH
+        ));
+        assert!(related_search_flag_set(
+            ed2k::server::SRV_TCPFLG_RELATEDSEARCH | ed2k::server::SRV_TCPFLG_COMPRESSION
+        ));
+        assert!(!related_search_flag_set(0));
+        assert!(!related_search_flag_set(
+            ed2k::server::SRV_TCPFLG_COMPRESSION | ed2k::server::SRV_TCPFLG_UNICODE
+        ));
     }
 
     #[test]
@@ -10722,6 +10769,15 @@ pub enum NetworkCommand {
         request_id: u64,
         tx: oneshot::Sender<Vec<SearchResult>>,
         search_filters: Option<SearchFilters>,
+        /// Seed hashes (lowercase hex) of a "find related files" search. When
+        /// the connected eD2k server advertises `SRV_TCPFLG_RELATEDSEARCH`,
+        /// its leg of this search becomes eMule's native co-share request
+        /// (`related::<HASH>`) instead of the keyword query; every other leg
+        /// still runs `query`. Empty for an ordinary search.
+        related_hashes: Vec<String>,
+        /// Hashes to withhold from the UI for this request: the seed files of
+        /// a related search, which are not related to themselves.
+        exclude_hashes: Vec<String>,
     },
     StartDownload {
         file_hash: String,
@@ -11952,6 +12008,13 @@ struct ActiveSearchRequest {
     /// a pathological all-servers global search from growing this
     /// unboundedly for the lifetime of one search.
     streamed_hashes: std::collections::HashSet<String>,
+    /// Hashes never to forward to the UI for this request. Set only by a
+    /// related search, to the seed files it was started from: a co-share
+    /// request and a title probe both return the seed itself, and listing the
+    /// file you just right-clicked as one of its own related files is noise.
+    /// Kept separate from `streamed_hashes` so these are dropped outright
+    /// rather than being reported back as availability re-sights.
+    exclude_hashes: std::collections::HashSet<String>,
     /// Cross-packet spam batch context for this search (same-name/many-hashes
     /// across UDP/Kad/server pages, not only inside one emit).
     batch_spam: crate::search::spam::BatchSpamContext,
@@ -21216,6 +21279,9 @@ fn dedup_streamed_batch(
     let mut resights = Vec::new();
     let mut kept = Vec::with_capacity(results.len());
     for r in results.drain(..) {
+        if active.exclude_hashes.contains(&r.file.hash) {
+            continue;
+        }
         if !r.file.hash.is_empty() && active.streamed_hashes.contains(&r.file.hash) {
             resights.push(r);
         } else {
@@ -21224,6 +21290,28 @@ fn dedup_streamed_batch(
     }
     *results = kept;
     resights
+}
+
+/// Whether the currently connected eD2k server can answer eMule's native
+/// co-share request (`related::<HASH>`), i.e. "what else do the clients holding
+/// this file share".
+///
+/// Servers without the capability treat the term as an ordinary filename
+/// substring and answer with nothing, so a related search must fall back to its
+/// derived keyword query instead of sending the co-share term blindly.
+fn server_supports_related_search(state: &NetworkState) -> bool {
+    state.server_connected
+        && state
+            .server_connection
+            .as_ref()
+            .and_then(|c| c.session.as_ref())
+            .is_some_and(|s| related_search_flag_set(s.server_flags))
+}
+
+/// `SRV_TCPFLG_RELATEDSEARCH` in the TCP capability flags a server sends with
+/// `OP_IDCHANGE`.
+fn related_search_flag_set(server_flags: u32) -> bool {
+    server_flags & ed2k::server::SRV_TCPFLG_RELATEDSEARCH != 0
 }
 
 fn emit_search_results_event(
@@ -21817,6 +21905,10 @@ fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &TransferHealthUp
 /// touch `udp_search_queue` (throttled global multi-server search) or the
 /// connection fields.
 fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+    // No session means no server capabilities; leaving the mirror set would
+    // have a related search keep planning around a co-share request that can no
+    // longer be sent.
+    ed2k::server::set_server_flags_mirror(0);
     state.server_poll_count = 0;
     state.server_search_more_needed = false;
     state.server_search_more_requests = 0;
@@ -38857,6 +38949,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     }
                                     let was_low = state.low_id;
                                     let is_low = client_id > 0 && client_id < ed2k::server::LOWID_THRESHOLD;
+                                    ed2k::server::set_server_flags_mirror(server_flags);
                                     if let Some(session) = conn.session.as_mut() {
                                         session.client_id = client_id;
                                         session.server_flags = server_flags;
@@ -39885,6 +39978,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         state.server_login_tcp_port = Some(login_tcp_port);
                         state.server_list.record_success(&ip, port);
                         state.server_connected = true;
+                        ed2k::server::set_server_flags_mirror(session.server_flags);
                         state.server_reconnect_failures = 0;
                         state.preferred_ed2k_server = Some((ip.clone(), port));
                         {

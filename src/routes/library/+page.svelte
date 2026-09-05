@@ -30,6 +30,7 @@
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
+  import { startRelatedSearch } from '$lib/relatedSearch';
   import { pickAndLoadCollection, createCollectionWithDialog, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import {
     incomingCollection,
@@ -2075,6 +2076,11 @@
           break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
+        case 'find_related': {
+          // Navigates to Search on success, so nothing after this runs here.
+          await startRelatedSearch([{ hash: f.hash, name: f.name }]);
+          break;
+        }
         case 'delete': {
           const confirmed = await askConfirm(
             m.library_confirm_delete_single({ name: f.name }),
@@ -3692,6 +3698,12 @@
           </div>
         {/if}
       </div>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        onclick={() => ctxAction('find_related')}
+        title={m.search_ctx_find_related_title()}
+      >{m.search_ctx_find_related()}</button>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
         <div

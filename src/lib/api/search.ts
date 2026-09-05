@@ -11,7 +11,17 @@ export interface SearchFilters {
   minAvailability?: number;
 }
 
-export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters): Promise<SearchResult[]> {
+/**
+ * Extra arguments a "find related files" search carries. `relatedHashes` turns
+ * the connected eD2K server's leg of the search into eMule's native co-share
+ * request; `excludeHashes` keeps the seed files out of their own results.
+ */
+export interface RelatedSearchArgs {
+  relatedHashes?: string[];
+  excludeHashes?: string[];
+}
+
+export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters, related?: RelatedSearchArgs): Promise<SearchResult[]> {
   return invoke('search_files', {
     query,
     method,
@@ -21,7 +31,45 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
     minSize: filters?.minSize ?? null,
     maxSize: filters?.maxSize ?? null,
     minAvailability: filters?.minAvailability ?? null,
+    relatedHashes: related?.relatedHashes?.length ? related.relatedHashes : null,
+    excludeHashes: related?.excludeHashes?.length ? related.excludeHashes : null,
   });
+}
+
+/** Why a related search believes results are related to the seed file. */
+export type RelationKind = 'co_share' | 'series' | 'album' | 'volume' | 'title';
+
+export interface RelatedProbe {
+  kind: RelationKind;
+  /** `null` for `co_share`, which the server answers from its own index
+   *  rather than from a keyword query. */
+  query: string | null;
+}
+
+export interface RelatedPlan {
+  /** Combined keyword query, or `null` when the filename yielded nothing
+   *  searchable and only the co-share request can produce results. */
+  query: string | null;
+  probes: RelatedProbe[];
+  co_share_hashes: string[];
+  exclude_hashes: string[];
+  seed_label: string;
+}
+
+export interface RelatedSeed {
+  hash?: string | null;
+  name?: string | null;
+  artist?: string | null;
+  album?: string | null;
+}
+
+/**
+ * Work out what "find related files" should search for, given the file(s) the
+ * user pointed at. Plans only — runs no search. Rejects when nothing usable can
+ * be derived, so callers should surface the error rather than open an empty tab.
+ */
+export async function planRelatedSearch(seeds: RelatedSeed[]): Promise<RelatedPlan> {
+  return invoke('plan_related_search', { seeds });
 }
 
 export async function cancelSearch(requestId: number): Promise<void> {
