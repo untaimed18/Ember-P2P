@@ -1438,6 +1438,7 @@
   "search_ctx_find_related": "Искать связанные файлы",
   "search_ctx_find_related_title": "Искать другие серии, диски, треки или релизы, относящиеся к этому файлу",
   "search_related_tab_label": "Связанные файлы",
+  "search_related_tab_label_named": "Связанные: {title}",
   "search_related_tab_title": "Файлы, связанные с {file} — по признакам: {signals}",
   "search_related_tab_query": "Поиск: {query}",
   "search_related_kind_co_share": "файлы, которые раздают вместе с ним на вашем сервере",

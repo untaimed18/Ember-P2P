@@ -4692,6 +4692,7 @@
         <div class="ctx-sep"></div>
       {/if}
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
         <div class="ctx-sep"></div>
         <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>

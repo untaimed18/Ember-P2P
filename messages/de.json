@@ -1438,6 +1438,7 @@
   "search_ctx_find_related": "Verwandte Dateien suchen",
   "search_ctx_find_related_title": "Nach weiteren Folgen, CDs, Titeln oder Releases suchen, die zu dieser Datei gehören",
   "search_related_tab_label": "Verwandte Dateien",
+  "search_related_tab_label_named": "Verwandt: {title}",
   "search_related_tab_title": "Dateien mit Bezug zu {file} — über {signals}",
   "search_related_tab_query": "Gesucht wird: {query}",
   "search_related_kind_co_share": "Dateien, die auf deinem Server zusammen mit ihr geteilt werden",

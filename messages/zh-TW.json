@@ -1438,6 +1438,7 @@
   "search_ctx_find_related": "尋找相關檔案",
   "search_ctx_find_related_title": "尋找與此檔案配套的其他集數、光碟、音軌或發布版本",
   "search_related_tab_label": "相關檔案",
+  "search_related_tab_label_named": "相關：{title}",
   "search_related_tab_title": "與 {file} 相關的檔案 — 依據：{signals}",
   "search_related_tab_query": "正在搜尋：{query}",
   "search_related_kind_co_share": "在你的伺服器上與它一同分享的檔案",

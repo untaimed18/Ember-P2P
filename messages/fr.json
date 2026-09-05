@@ -1438,6 +1438,7 @@
   "search_ctx_find_related": "Rechercher les fichiers liés",
   "search_ctx_find_related_title": "Rechercher les autres épisodes, disques, pistes ou versions qui accompagnent ce fichier",
   "search_related_tab_label": "Fichiers liés",
+  "search_related_tab_label_named": "Liés : {title}",
   "search_related_tab_title": "Fichiers liés à {file} — via {signals}",
   "search_related_tab_query": "Recherche de : {query}",
   "search_related_kind_co_share": "les fichiers partagés avec lui sur votre serveur",

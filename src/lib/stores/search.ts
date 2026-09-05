@@ -14,6 +14,10 @@ import { dev } from '$app/environment';
 export type RelatedSearchInfo = {
   /** Filename(s) the search was started from. */
   seedLabel: string;
+  /** The most specific probe's query, which is what the tab is labelled with.
+   *  Empty when the seed yielded no keywords at all and the co-share request is
+   *  carrying the search on its own. */
+  queryLabel: string;
   /** Signals in use, for explaining the tab. */
   kinds: RelationKind[];
 };

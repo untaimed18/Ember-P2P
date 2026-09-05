@@ -1438,6 +1438,7 @@
   "search_ctx_find_related": "查找相关文件",
   "search_ctx_find_related_title": "查找与此文件配套的其他剧集、光盘、音轨或发布版本",
   "search_related_tab_label": "相关文件",
+  "search_related_tab_label_named": "相关：{title}",
   "search_related_tab_title": "与 {file} 相关的文件 — 依据：{signals}",
   "search_related_tab_query": "正在搜索：{query}",
   "search_related_kind_co_share": "在你的服务器上与它一同共享的文件",

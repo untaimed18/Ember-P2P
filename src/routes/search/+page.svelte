@@ -1458,6 +1458,18 @@
     });
   }
 
+  /** Tab strip text. A related search is labelled by what it went looking for
+   *  rather than by the seed filename: release names are long enough that every
+   *  such tab truncated to the same unreadable prefix, while the derived title
+   *  has already had all of that metadata stripped off it. */
+  function searchTabLabel(tab: SearchTab): string {
+    if (!tab.related) return shortenTabLabel(tab.query);
+    // No derived title means the co-share request is the whole search, so there
+    // is nothing to name it after.
+    if (!tab.related.queryLabel) return m.search_related_tab_label();
+    return shortenTabLabel(m.search_related_tab_label_named({ title: tab.related.queryLabel }));
+  }
+
   /** Tooltip for a tab: the query for a normal search, and for a related search
    *  the seed file plus which signals it used and the keywords they derived —
    *  which is the only place that is discoverable. */
@@ -1592,8 +1604,14 @@
       clearSearchTimeoutForRequest(t.requestId);
       flushPendingSearchResults(t.requestId);
     }
+    // `probes` is ordered most-specific-first, so the first one carrying a query
+    // is the best one-line answer to "what is this tab looking for".
     const relatedInfo: RelatedSearchInfo | undefined = plan
-      ? { seedLabel: plan.seed_label, kinds: plan.probes.map((p) => p.kind) }
+      ? {
+          seedLabel: plan.seed_label,
+          queryLabel: plan.probes.find((p) => p.query)?.query ?? '',
+          kinds: plan.probes.map((p) => p.kind),
+        }
       : undefined;
     const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot, relatedInfo);
     if (stoppedOthers) {
@@ -2730,11 +2748,7 @@
           aria-selected={tab.id === $activeSearchTabId}
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
-          <!-- A related search is labelled by what it is, not by the seed
-               filename: release names are long enough that every such tab
-               truncated to the same unreadable prefix. The file, the signals and
-               the derived query are all in the tab's tooltip. -->
-          <span class="search-tab-label">{tab.related ? m.search_related_tab_label() : shortenTabLabel(tab.query)}</span>
+          <span class="search-tab-label">{searchTabLabel(tab)}</span>
           <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
