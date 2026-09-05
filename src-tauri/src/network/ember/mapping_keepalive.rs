@@ -209,16 +209,33 @@ pub(crate) async fn stun_keepalive_with_replies(
 /// TCP STUN transaction runs. Uses SO_REUSEADDR so the listener, hold, and
 /// STUN connection can coexist as distinct TCP 4-tuples.
 async fn open_tcp_mapping_hold(local_port: u16) -> Option<TcpStream> {
+    // Reasons are carried to the warning rather than logged and dropped. The
+    // per-target line below is `debug!`, so at the level anyone actually runs
+    // a hold that stops working arrived as "failed for all targets" and
+    // nothing else — and the candidates behind that have nothing in common.
+    // An address already in use means a previous cycle's 4-tuple is still in
+    // TIME_WAIT and this keep-alive is exhausting its own targets; a refusal
+    // or reset means something between here and the internet drops
+    // captive-portal endpoints; a DNS error means neither. One is our bug, one
+    // is the user's network, one is transient, and the aggregate line could
+    // not tell them apart.
+    let mut failures: Vec<String> = Vec::with_capacity(TCP_HOLD_TARGETS.len());
     for &(host, port) in TCP_HOLD_TARGETS {
         match tcp_hold_connect(local_port, host, port).await {
             Ok(stream) => {
                 debug!("TCP mapping hold ok via {host}:{port} from local {local_port}");
                 return Some(stream);
             }
-            Err(e) => debug!("TCP mapping hold {host}:{port} failed: {e}"),
+            Err(e) => {
+                debug!("TCP mapping hold {host}:{port} failed: {e}");
+                failures.push(format!("{host}:{port}: {e}"));
+            }
         }
     }
-    warn!("TCP mapping hold failed for all targets (port {local_port})");
+    warn!(
+        "TCP mapping hold failed for all targets (port {local_port}): {}",
+        failures.join("; ")
+    );
     None
 }
 
@@ -236,6 +253,32 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpS
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
+    // Abortive close, so a cycle does not deny the next one the tuple it just
+    // used. The local port is pinned to the listener's, `lookup_ipv4` takes the
+    // first A record in resolver order, and dropping the stream at the end of
+    // `tcp_mapping_cycle` makes this side the active closer — so the same
+    // (listen port -> target:80) 4-tuple recurred every 20s against a 120s
+    // TIME_WAIT. Windows fails `connect` on a tuple in TIME_WAIT with
+    // WSAEADDRINUSE whatever `SO_REUSEADDR` says, because that waives the bind
+    // and not the connect. The hold worked its way down the target list one
+    // cycle at a time and then failed on every target for two minutes until the
+    // oldest entry aged out, and it left a TIME_WAIT entry on the listen port
+    // each cycle besides.
+    //
+    // `set_zero_linger` rather than `set_linger(Some(ZERO))`: the general form
+    // is deprecated because a non-zero linger blocks the thread on drop, which
+    // is the one case this is not. RST is safe on this connection in
+    // particular, because it carries no data in either direction — no request
+    // is ever written — so there is nothing to truncate, and it closes only
+    // after the STUN measurement the hold exists to protect. Between cycles the
+    // port mapping is held open by the real listener's inbound traffic, not by
+    // this.
+    //
+    // Non-fatal: a platform that refuses the option falls back to the graceful
+    // close, which is a hold that occasionally skips a cycle rather than none.
+    if let Err(e) = stream.set_zero_linger() {
+        debug!("TCP mapping hold: zero-linger unavailable ({e}); closing gracefully");
+    }
     Ok(stream)
 }
 

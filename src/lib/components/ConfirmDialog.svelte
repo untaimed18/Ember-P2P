@@ -105,17 +105,23 @@
   }
 
   $effect(() => {
+    let openFocusFrame: number | undefined;
     if (open) {
       actionTaken = false;
       const preferCancel = danger && !alert;
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
-      requestAnimationFrame(() => {
+      openFocusFrame = requestAnimationFrame(() => {
         if (preferCancel) cancelBtn?.focus();
         else confirmBtn?.focus();
       });
     }
     return () => {
+      // Drop a still-queued open-focus frame: a dialog opened and closed
+      // within one frame would otherwise focus a button being torn down. The
+      // restore below is deliberately *not* cancelled — it has to outlive this
+      // effect to do its job, and it re-checks the element is still attached.
+      if (openFocusFrame !== undefined) cancelAnimationFrame(openFocusFrame);
       // On close (open → false), return focus to the opener. Guard on !open so
       // an unmount-while-open doesn't try to refocus a tearing-down element.
       if (!open && returnFocusEl) {

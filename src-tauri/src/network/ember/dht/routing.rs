@@ -101,6 +101,14 @@ pub struct RoutingTable {
     /// in the same shared form the KAD table uses, so both stacks honour the
     /// same user preference through one implementation.
     ip_gate: dht_common::IpAdmissionGate,
+    /// The strictest tier whose diversity quotas the *resident* set has been
+    /// pruned down to. See [`Self::enforce_scale_quotas`].
+    ///
+    /// Tightens as soon as the table crosses a boundary and relaxes only once
+    /// it has fallen a clear margin back below one, which is what keeps a table
+    /// hovering near a boundary from demoting and re-admitting the same
+    /// contacts forever.
+    enforced_scale: scale::NetworkScale,
 }
 
 impl RoutingTable {
@@ -115,6 +123,7 @@ impl RoutingTable {
             global_subnet_count: HashMap::new(),
             global_ip_count: HashMap::new(),
             ip_gate: dht_common::IpAdmissionGate::new(block_private_ips),
+            enforced_scale: scale::NetworkScale::Bootstrap,
         }
     }
 
@@ -136,6 +145,164 @@ impl RoutingTable {
     /// never answers a liveness ping faults out after `MAX_FAILED_QUERIES`.
     pub fn scale(&self) -> scale::NetworkScale {
         scale::NetworkScale::from_contacts(self.verified_len())
+    }
+
+    /// The tier that governs *admission*: the stricter of what the table looks
+    /// like now and what [`Self::enforce_scale_quotas`] has already pruned to.
+    ///
+    /// [`Self::scale`] counts verified contacts holding a bucket slot, and
+    /// demotion moves them to a replacement cache — so pruning the table to a
+    /// tier lowers the very reading that chose it. Prune 100 verified contacts
+    /// down past 80 and the live tier falls back from `Established` to `Small`,
+    /// whose per-IP allowance is twice as generous; `promote_cached_contacts`
+    /// then runs in the same maintenance tick and re-admits exactly the
+    /// contacts just demoted. The ratchet on [`Self::enforced_scale`] stops
+    /// `enforce_scale_quotas` from re-running, but on its own it did nothing to
+    /// stop the promotion pass undoing its work, which left the cold-start
+    /// grandfathering hole open in the case that matters most — a table crowded
+    /// enough for pruning to move it across a boundary.
+    ///
+    /// Only ever stricter than `scale()`, so this cannot admit something the
+    /// live tier would refuse.
+    pub fn admission_scale(&self) -> scale::NetworkScale {
+        self.scale().max(self.enforced_scale)
+    }
+
+    /// Prune residents the current tier would no longer admit, moving them to
+    /// their bucket's replacement cache.
+    ///
+    /// [`Self::scale`] tightens as the table fills, but until now it only ever
+    /// governed *admission*: nothing re-examined a contact once it held a slot.
+    /// A contact that answers liveness pings is not stale, never faults out, and
+    /// is not displaced by the verified-over-lead rule, so whatever a cold start
+    /// admitted it kept for the life of the process. That is the wrong half of
+    /// the table to grandfather. Node IDs are uniform, so bucket occupancy is
+    /// geometric — about half of all contacts land in the last bucket — and
+    /// `find_closest` serves verified contacts only, which means those slots
+    /// decide the contact lists we gossip, the store-responsibility comparison
+    /// and every lookup frontier. An adversary present while we knew almost
+    /// nobody could hold a quarter of the bucket that matters most, permanently.
+    ///
+    /// Demoted rather than dropped. The cache is where a contact the caps turn
+    /// away already waits, `promote_cached_contacts` brings it back if a slot
+    /// frees up, and the distinction between "we cannot route through this peer
+    /// right now" and "stop remembering this peer" is one the rest of this
+    /// subsystem is careful about — see [`super::peer_cache`].
+    ///
+    /// Acting is deliberately later than admitting. The tier is read from
+    /// four-fifths of the verified count, so `Small` admission starts at 10
+    /// verified contacts but the table is not pruned to it until 13, and
+    /// `Established` at 80 against 100. Between those the caps still refuse
+    /// newcomers, so the margin costs nothing and buys the property that a table
+    /// sitting on a boundary cannot demote a contact one tick and re-admit it
+    /// the next.
+    ///
+    /// The relaxation below is the other half of that, and it has to be
+    /// explicit. [`Self::admission_scale`] is `scale().max(enforced_scale)`, so
+    /// a tier this pass ratchets to governs admission until something lowers it
+    /// — and nothing did. A node that reached 100 verified contacts and then
+    /// lost them (a suspended laptop, a changed network, an upstream outage,
+    /// a wave of evictions) sat on an almost empty table while still enforcing
+    /// the caps meant for a full one: two contacts per address and ten per /24,
+    /// applied at exactly the moment the `Bootstrap` allowances exist to get a
+    /// node reconnected. It held for the life of the process, because nothing
+    /// short of a restart rebuilt the table.
+    ///
+    /// Relaxing is measured from five-fourths of the verified count, mirroring
+    /// the four-fifths above: acting later than the live tier in both
+    /// directions leaves a dead band around every boundary, so the flapping
+    /// this field exists to prevent still cannot happen. Nothing is demoted by
+    /// relaxing, and the pass below cannot fire in the same call — a count low
+    /// enough to widen the band has a `target` at or under the tier it widens
+    /// to.
+    ///
+    /// Returns how many contacts were demoted.
+    pub fn enforce_scale_quotas(&mut self) -> usize {
+        let verified = self.verified_len();
+        let floor = scale::NetworkScale::from_contacts(verified.saturating_mul(5) / 4);
+        if floor < self.enforced_scale {
+            self.enforced_scale = floor;
+        }
+
+        let target = scale::NetworkScale::from_contacts(verified * 4 / 5);
+        if target <= self.enforced_scale {
+            return 0;
+        }
+        self.enforced_scale = target;
+
+        let max_per_ip = target.max_contacts_per_ip();
+        let max_subnet_global = target.max_contacts_per_subnet_global();
+        let max_subnet_bucket = target.max_contacts_per_subnet_per_bucket();
+
+        // Re-admit the whole resident set under the new quotas, best first, and
+        // demote whatever no longer fits. Expressing it as a re-admission rather
+        // than as "find the excess and delete it" is what makes the victim
+        // choice fall out instead of having to be invented: the contacts left
+        // over are the least proven members of the most crowded groups, which is
+        // exactly the shape of the occupation this exists to undo.
+        let mut ranked: Vec<(usize, EmberNodeId, u64, IpAddr, bool, i64)> = Vec::new();
+        for (idx, bucket) in self.buckets.iter().enumerate() {
+            for c in &bucket.contacts {
+                ranked.push((
+                    idx,
+                    c.node_id,
+                    c.subnet_key(),
+                    c.addr.ip(),
+                    c.is_verified(),
+                    c.last_seen,
+                ));
+            }
+        }
+        // Proven before unproven, then most recently heard from. The node id
+        // breaks ties so the outcome does not depend on bucket iteration order.
+        ranked.sort_by(|a, b| {
+            b.4.cmp(&a.4)
+                .then(b.5.cmp(&a.5))
+                .then(a.1 .0.cmp(&b.1 .0))
+        });
+
+        let mut per_bucket_subnet: HashMap<(usize, u64), usize> = HashMap::new();
+        let mut per_subnet: HashMap<u64, usize> = HashMap::new();
+        let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
+        let mut doomed: Vec<(usize, EmberNodeId)> = Vec::new();
+
+        for (idx, node_id, subnet, ip, _, _) in ranked {
+            let in_bucket = per_bucket_subnet
+                .get(&(idx, subnet))
+                .copied()
+                .unwrap_or(0);
+            let in_subnet = per_subnet.get(&subnet).copied().unwrap_or(0);
+            let at_ip = per_ip.get(&ip).copied().unwrap_or(0);
+            if in_bucket >= max_subnet_bucket
+                || in_subnet >= max_subnet_global
+                || at_ip >= max_per_ip
+            {
+                doomed.push((idx, node_id));
+                continue;
+            }
+            *per_bucket_subnet.entry((idx, subnet)).or_insert(0) += 1;
+            *per_subnet.entry(subnet).or_insert(0) += 1;
+            *per_ip.entry(ip).or_insert(0) += 1;
+        }
+
+        let mut demoted = 0usize;
+        for (idx, node_id) in doomed {
+            let Some(pos) = self.buckets[idx].find(&node_id) else {
+                continue;
+            };
+            let contact = self.buckets[idx].contacts.remove(pos).unwrap();
+            self.release_subnet(contact.subnet_key());
+            self.release_ip(contact.addr.ip());
+            self.add_to_cache(idx, contact, target);
+            demoted += 1;
+        }
+        if demoted > 0 {
+            info!(
+                "Ember DHT: limits tightened to {target:?}; demoted {demoted} over-quota \
+                 contact(s) to their replacement caches"
+            );
+        }
+        demoted
     }
 
     /// Share the user's range filter so blocked addresses are refused on
@@ -309,7 +476,12 @@ impl RoutingTable {
             // The tier can only tighten as verified contacts are promoted, and
             // only refuses admissions, so at worst one bucket's batch is
             // admitted a tier late — bounded, and re-evaluated on the next call.
-            let scale = self.scale();
+            //
+            // `admission_scale`, not `scale`: this runs immediately after
+            // `enforce_scale_quotas` in the same maintenance tick, and the
+            // demotion it just performed is what would otherwise loosen the
+            // live tier enough to re-admit the demoted contacts here.
+            let scale = self.admission_scale();
             let mut filled = false;
             while !self.buckets[idx].is_full() {
                 let Some(i) = self.best_promotable_cached(idx, None, scale) else {
@@ -385,7 +557,11 @@ impl RoutingTable {
         // buckets, and `merge_gossip_contacts` runs this whole path once per
         // contact in a FOUND_NODE — most of which land in the cache on a warm
         // table, so recomputing doubled the walks for a frame.
-        let scale = self.scale();
+        //
+        // The enforced tier floors this so a pruned table cannot re-admit
+        // through the front door what `enforce_scale_quotas` just demoted —
+        // see [`Self::admission_scale`].
+        let scale = self.admission_scale();
         let max_per_ip = scale.max_contacts_per_ip();
         let max_subnet_global = scale.max_contacts_per_subnet_global();
         let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
@@ -803,7 +979,7 @@ impl RoutingTable {
         // behaviour) let a bucket fill up with contacts from one subnet via the
         // cache, defeating the eclipse-resistance the `add_contact` checks
         // provide — and treated gossip as equal to a proven contact.
-        let chosen = self.best_promotable_cached(bucket_idx, Some(dead_id), self.scale());
+        let chosen = self.best_promotable_cached(bucket_idx, Some(dead_id), self.admission_scale());
 
         match chosen {
             Some(i) => {
@@ -1301,17 +1477,30 @@ impl RoutingTable {
     /// non-v4, and the table's private/bogus rules still apply. Blocked ranges
     /// are dropped later by [`Self::evict_filtered_contacts`] once the list is
     /// ready.
-    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
+    ///
+    /// Returns the ids that took a bucket slot. Callers need that to be the
+    /// *admitted* set and nothing wider: a contact refused by the IP policy or
+    /// a diversity cap is parked in a replacement cache, and a parked contact
+    /// is never dialled — [`Self::all_contacts`] does not return the cache, so
+    /// it is not a liveness-ping target. Asking [`Self::get_contact`]
+    /// afterwards cannot answer this, because it deliberately searches the
+    /// cache too, so a parked seed reads back as if it had been tried.
+    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) -> Vec<EmberNodeId> {
         let held = self.ip_gate.take_range_filter();
         let count = contacts.len();
-        let mut added = 0;
+        let mut admitted = Vec::with_capacity(contacts.len());
         for contact in contacts {
+            let node_id = contact.node_id;
             if matches!(self.add_contact(contact), AddResult::Added) {
-                added += 1;
+                admitted.push(node_id);
             }
         }
         self.ip_gate.restore_range_filter(held);
-        debug!("Loaded {added}/{count} contacts into Ember routing table");
+        debug!(
+            "Loaded {}/{count} contacts into Ember routing table",
+            admitted.len()
+        );
+        admitted
     }
 
     // ── Internal helpers ──
@@ -1459,6 +1648,294 @@ mod tests {
             last_seen: chrono::Utc::now().timestamp(),
             failed_queries: 0,
         }
+    }
+
+    /// A contact with an explicit id and address, for the diversity tests:
+    /// `make_contact` derives its /24 from the id, so it cannot express several
+    /// peers sharing a subnet.
+    fn contact_with(id: [u8; 16], ip: Ipv4Addr) -> EmberContact {
+        EmberContact {
+            node_id: EmberNodeId(id),
+            addr: SocketAddr::new(IpAddr::V4(ip), 4672),
+            noise_pub: [id[0]; 32],
+            ed25519_pub: [id[1]; 32],
+            last_seen: chrono::Utc::now().timestamp(),
+            failed_queries: 0,
+        }
+    }
+
+    /// Fill the table with peers that share nothing, to move the tier without
+    /// tripping any cap on the way. Seven buckets so the crowded one under test
+    /// is left alone.
+    fn grow_verified(rt: &mut RoutingTable, per_bucket: u8) {
+        for b in 0..7u8 {
+            for i in 0..per_bucket {
+                let mut id = [0u8; 16];
+                id[0] = 1 << b;
+                id[1] = i;
+                id[2] = 0xA5;
+                rt.add_contact(contact_with(id, Ipv4Addr::new(11 + b, i, 1, 1)));
+            }
+        }
+    }
+
+    /// A /24 that took its share of a bucket while we knew almost nobody kept it
+    /// for the life of the process: admission tightened as the table filled, but
+    /// nothing re-read a contact once it held a slot, and one that answers
+    /// liveness pings is never stale, never faults out and is never displaced.
+    /// Bucket occupancy is geometric, so that share sits in the bucket that
+    /// decides most of what `find_closest` serves.
+    #[test]
+    fn growing_out_of_the_cold_start_tier_reclaims_the_share_it_allowed() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // One /24 takes the cold-start allowance in a single bucket. Distinct
+        // addresses within it, so this is the subnet cap under test and not the
+        // per-IP one.
+        let crowded: Vec<EmberContact> = (1..=5u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = 0x80;
+                id[1] = i;
+                contact_with(id, Ipv4Addr::new(80, 7, 7, i))
+            })
+            .collect();
+        for c in &crowded {
+            assert!(matches!(rt.add_contact(c.clone()), AddResult::Added));
+        }
+        let subnet = crowded[0].subnet_key();
+        let bucket = local.bucket_index(&crowded[0].node_id).expect("a bucket");
+        assert_eq!(
+            rt.buckets[bucket].subnet_count(subnet),
+            scale::NetworkScale::Bootstrap.max_contacts_per_subnet_per_bucket(),
+            "the cold-start tier admits five of them"
+        );
+
+        // The network then grows past the point where the strict limits cost
+        // nothing, which is the moment the old code stopped caring.
+        grow_verified(&mut rt, 15);
+        assert_eq!(rt.scale(), scale::NetworkScale::Established);
+
+        let demoted = rt.enforce_scale_quotas();
+        assert!(demoted > 0, "the grandfathered share has to be reclaimed");
+        assert_eq!(
+            rt.buckets[bucket].subnet_count(subnet),
+            scale::NetworkScale::Established.max_contacts_per_subnet_per_bucket(),
+            "the crowded /24 is cut to what this tier would admit"
+        );
+
+        // Demoted, not forgotten: the cache is where a contact the caps turn
+        // away already waits, and `promote_cached_contacts` brings it back if a
+        // slot frees up.
+        let resident: HashSet<EmberNodeId> = rt.buckets[bucket]
+            .contacts
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+        let cached: HashSet<EmberNodeId> = rt.buckets[bucket]
+            .replacement_cache
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+        for c in &crowded {
+            assert!(
+                resident.contains(&c.node_id) || cached.contains(&c.node_id),
+                "a demoted contact must still be remembered, not dropped"
+            );
+        }
+
+        // The peers that were never crowding anything are untouched.
+        assert!(
+            rt.verified_len() >= 100,
+            "only the excess goes, not the table: {} left",
+            rt.verified_len()
+        );
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "a tier already enforced does not re-run"
+        );
+    }
+
+    /// The maintenance tick prunes and then promotes, in that order, and
+    /// promotion reads the tier from the table it is promoting into. Demotion
+    /// moves contacts to replacement caches, which the tier is not derived
+    /// from — so pruning a table that sits just above a boundary drops the live
+    /// reading back below it, and the promotion pass then re-admitted under the
+    /// looser tier exactly what the prune had removed. The ratchet stops
+    /// `enforce_scale_quotas` re-running; on its own it did nothing to stop the
+    /// same tick undoing it.
+    #[test]
+    fn promotion_does_not_re_admit_what_the_quota_pass_just_demoted() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // Eight peers behind one address: exactly what the cold-start tier
+        // allows. Spread across buckets so this is the per-IP cap under test
+        // and not the per-bucket subnet one.
+        let shared_ip = Ipv4Addr::new(80, 7, 7, 7);
+        for b in 0..8u8 {
+            let mut id = [0u8; 16];
+            id[0] = 1 << b;
+            id[1] = 0x11;
+            assert!(matches!(
+                rt.add_contact(contact_with(id, shared_ip)),
+                AddResult::Added
+            ));
+        }
+
+        // Five unrelated peers take the table to thirteen verified contacts —
+        // the point at which the quota pass prunes to `Small`, since it reads
+        // the tier from four-fifths of the count.
+        for i in 0..5u8 {
+            let mut id = [0u8; 16];
+            id[0] = 1 << i;
+            id[1] = 0xA5;
+            id[2] = i;
+            assert!(matches!(
+                rt.add_contact(contact_with(id, Ipv4Addr::new(20 + i, 1, 1, 1))),
+                AddResult::Added
+            ));
+        }
+        assert_eq!(rt.verified_len(), 13);
+
+        let demoted = rt.enforce_scale_quotas();
+        assert_eq!(
+            demoted,
+            8 - scale::NetworkScale::Small.max_contacts_per_ip(),
+            "the cold-start per-IP share is cut to what `Small` would admit"
+        );
+
+        // The trap: the contacts it just demoted are no longer counted, so the
+        // live tier has fallen back to the very one whose allowance was pruned
+        // away. Admission has to keep using the enforced tier here.
+        assert_eq!(rt.scale(), scale::NetworkScale::Bootstrap);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Small);
+
+        rt.promote_cached_contacts();
+
+        let resident_on_shared_ip = rt
+            .buckets
+            .iter()
+            .flat_map(|b| b.contacts.iter())
+            .filter(|c| c.addr.ip() == IpAddr::V4(shared_ip))
+            .count();
+        assert_eq!(
+            resident_on_shared_ip,
+            scale::NetworkScale::Small.max_contacts_per_ip(),
+            "promotion re-admitted the share the quota pass had just reclaimed"
+        );
+    }
+
+    /// Acting on a tightening is deliberately later than admitting under it.
+    /// Without the margin a table sitting on a boundary would demote a contact
+    /// on one tick and re-admit it on the next, since admission below the
+    /// boundary is looser than the pruning above it.
+    #[test]
+    fn enforcement_waits_for_a_margin_past_the_admission_boundary() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        let crowded: Vec<EmberContact> = (1..=5u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = 0x80;
+                id[1] = i;
+                contact_with(id, Ipv4Addr::new(80, 7, 7, i))
+            })
+            .collect();
+        for c in &crowded {
+            assert!(matches!(rt.add_contact(c.clone()), AddResult::Added));
+        }
+        let subnet = crowded[0].subnet_key();
+        let bucket = local.bucket_index(&crowded[0].node_id).expect("a bucket");
+
+        // Ten verified contacts: `Small` is what admission uses from here, but
+        // the table is not pruned to it yet.
+        grow_verified(&mut rt, 1);
+        assert_eq!(rt.verified_len(), 12);
+        assert_eq!(rt.scale(), scale::NetworkScale::Small);
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "sitting just past the boundary must not prune"
+        );
+        assert_eq!(rt.buckets[bucket].subnet_count(subnet), 5);
+
+        // A little further in and it does.
+        grow_verified(&mut rt, 2);
+        assert!(rt.verified_len() >= 13);
+        assert!(rt.enforce_scale_quotas() > 0);
+        assert_eq!(
+            rt.buckets[bucket].subnet_count(subnet),
+            scale::NetworkScale::Small.max_contacts_per_subnet_per_bucket(),
+        );
+    }
+
+    /// The other direction of the same margin. `admission_scale` is the
+    /// stricter of the live tier and the enforced one, so a tier that ratcheted
+    /// tight while the table was full went on governing admission after the
+    /// table emptied — for the life of the process, since nothing rebuilds it.
+    /// A node that loses its peers is in the situation the `Bootstrap`
+    /// allowances exist for, not the one `Established` was chosen for.
+    #[test]
+    fn a_table_that_loses_its_peers_stops_enforcing_the_tier_it_outgrew() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // 105 verified contacts, none of them sharing an address or a /24, so
+        // the tier moves without any cap binding on the way.
+        grow_verified(&mut rt, 15);
+        assert_eq!(rt.verified_len(), 105);
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "nothing shares an address, so tightening demotes nobody"
+        );
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Established);
+
+        // Keep enough to stay inside `Established`'s own band. Relaxing is read
+        // from five-fourths of the count, mirroring the four-fifths that
+        // tightening uses, so the tier does not drop the moment the count does.
+        let resident: Vec<EmberNodeId> = rt.all_contacts().iter().map(|c| c.node_id).collect();
+        for id in resident.iter().take(105 - 70) {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 70);
+        assert_eq!(
+            rt.admission_scale(),
+            scale::NetworkScale::Established,
+            "70 verified is 87 with the margin, still an established table"
+        );
+        assert_eq!(rt.enforce_scale_quotas(), 0);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Established);
+
+        // Far enough below and the caps have to loosen with the table.
+        for id in resident.iter().skip(105 - 70).take(70 - 12) {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 12);
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "relaxing demotes nobody — it only widens what may be admitted"
+        );
+        assert_eq!(
+            rt.admission_scale(),
+            scale::NetworkScale::Small,
+            "a nearly empty table must not be admitting under a full table's caps"
+        );
+
+        // And all the way down, so a node rejoining from nothing gets the
+        // allowances a cold start is supposed to have.
+        let left: Vec<EmberNodeId> = rt.all_contacts().iter().map(|c| c.node_id).collect();
+        for id in &left {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 0);
+        assert_eq!(rt.enforce_scale_quotas(), 0);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Bootstrap);
     }
 
     #[test]
@@ -1609,6 +2086,37 @@ mod tests {
         }
         assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
         rt
+    }
+
+    /// The bulk loader must report only the seeds that took a slot.
+    ///
+    /// Startup used to infer that by asking `get_contact` afterwards, which
+    /// deliberately searches the replacement caches too — so a seed parked
+    /// behind a full bucket read back as admitted, and the bootstrap cache
+    /// charged it a missed session at shutdown for silence it was never given a
+    /// chance to break. A parked contact is not a ping target either, which is
+    /// what makes the charge simply untrue rather than merely early.
+    #[test]
+    fn load_contacts_reports_only_the_seeds_that_took_a_slot() {
+        let mut rt = table_with_one_full_bucket();
+        let parked = contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1);
+
+        let admitted = rt.load_contacts(vec![parked.clone()]);
+
+        assert!(
+            admitted.is_empty(),
+            "the bucket was full, so nothing was dialled"
+        );
+        assert!(
+            rt.get_contact(&parked.node_id).is_some(),
+            "it is still held — this is exactly what misled the caller"
+        );
+        assert!(
+            !rt.all_contacts()
+                .iter()
+                .any(|c| c.node_id == parked.node_id),
+            "and it is not a liveness-ping target, so it can never answer"
+        );
     }
 
     /// Promotion was the one selection point in the table that ranked hearsay
@@ -2165,7 +2673,7 @@ mod tests {
                 })
             })
             .collect();
-        bootstrap::save_nodes(&path, &saved, true).unwrap();
+        bootstrap::save_nodes(&path, &saved, bootstrap::NodesFileState::Loaded).unwrap();
 
         // Through the cache, which is how the network loop restores a table:
         // the file keeps the previous session's timestamps and `seed_batch` is

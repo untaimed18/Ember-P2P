@@ -7,10 +7,14 @@
   // and land on the home page anyway, but the URL would stay wrong —
   // breaking back/forward navigation and any "copy link" actions.
   // `replaceState` keeps the bad URL out of history.
+  //
+  // The view has since moved off `/` as well: Ember Network is the entry
+  // route, and KAD sits at `/kad` with the other transport pages. Both old
+  // URLs still resolve — this one via the hop below, `/` via its own stub.
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   // `goto` returns a Promise; without `.catch` a navigation failure
   // (e.g. user-cancelled or a transient SvelteKit error) surfaces as
   // an unhandled rejection. The void cast keeps the caller sync.
-  onMount(() => { void goto('/', { replaceState: true }).catch(() => {}); });
+  onMount(() => { void goto('/kad', { replaceState: true }).catch(() => {}); });
 </script>

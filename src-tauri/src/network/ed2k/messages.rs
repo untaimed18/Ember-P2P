@@ -161,6 +161,51 @@ pub const OP_EMBER_EXT: u8 = 0xFF;
 /// sender is a courier rather than an authority.
 pub const EMBER_EXT_RELAY_OFFER: u8 = 0x01;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is withdrawing a friend request the
+/// recipient has not answered yet, so it stops sitting on their Friends page
+/// once the sender changes their mind. Carries no body — the only thing it has
+/// to say is who sent it, and that is the authenticated session identity.
+/// Acting on it may only ever delete a queued request, never a friendship.
+pub const EMBER_EXT_FRIEND_RETRACT: u8 = 0x02;
+
+/// [`OP_EMBER_EXT`] sub-type: the sender is (or has just stopped) composing a
+/// friend-chat message. Live only — never queued — and the body is the same
+/// chat AEAD envelope as [`OP_EMBER_CHAT_MSG`], wrapping a single status byte.
+/// A peer that predates this sub-type ignores it.
+pub const EMBER_EXT_CHAT_TYPING: u8 = 0x03;
+
+/// [`OP_EMBER_EXT`] sub-type: the sender has read friend-chat up through the
+/// message whose body hash is in the encrypted payload. Same AEAD envelope
+/// as chat; ignored by older builds.
+pub const EMBER_EXT_CHAT_READ: u8 = 0x04;
+
+/// [`OP_EMBER_EXT`] sub-type: the sender is asking for Ember DHT contacts.
+///
+/// A friend is the strongest bootstrap signal the app has — explicitly
+/// trusted, on a live authenticated session, and holding exactly the routing
+/// table a cold node is missing. The only route from that to a DHT contact was
+/// the eD2K hello carrying a non-zero UDP port plus one bridge `PING` being
+/// answered, so a friend whose hello named no port, or whose address the
+/// discovery guards reject, was never even attempted. The overlay rides UDP,
+/// so such a friend can never *be* a contact — but it can still hand over the
+/// contacts it already has, and this asks over the session that demonstrably
+/// works.
+///
+/// Body is the asker's own 16-byte DHT node ID, so the answer can be the
+/// contacts closest to it; an absent or short body means "anything you have".
+pub const EMBER_EXT_DHT_CONTACT_REQ: u8 = 0x05;
+
+/// [`OP_EMBER_EXT`] sub-type: the answer to [`EMBER_EXT_DHT_CONTACT_REQ`].
+///
+/// Body is a DHT wire contact list
+/// ([`crate::network::ember::dht::messages::encode_contact_list`]), reused
+/// rather than reinvented so the identity binding travels with it: no node ID
+/// is carried, every ID is re-derived from the Ed25519 key beside it, and a
+/// contact whose key is not a valid point is dropped. A friend therefore
+/// cannot name a contact under an ID it does not control, which is the same
+/// guarantee gossip over the DHT wire gets.
+pub const EMBER_EXT_DHT_CONTACTS: u8 = 0x06;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -174,6 +219,18 @@ pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
 pub fn parse_ember_ext(payload: &[u8]) -> Option<(u8, &[u8])> {
     let (ext_type, body) = payload.split_first()?;
     Some((*ext_type, body))
+}
+
+/// Full `OP_EMULEPROT` frame for an [`OP_EMBER_EXT`] sub-type, ready to hand
+/// to a friend-session writer.
+pub fn build_ember_ext_frame(ext_type: u8, body: &[u8]) -> Vec<u8> {
+    let payload = build_ember_ext(ext_type, body);
+    let mut packet = Vec::with_capacity(6 + payload.len());
+    packet.push(OP_EMULEPROT);
+    packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+    packet.push(OP_EMBER_EXT);
+    packet.extend_from_slice(&payload);
+    packet
 }
 
 // Constants
@@ -2859,6 +2916,51 @@ mod tests {
             Some((EMBER_EXT_RELAY_OFFER, &[][..]))
         );
         assert_eq!(parse_ember_ext(&[]), None);
+    }
+
+    /// The retraction carries no body, so it is the case the "body-less
+    /// sub-type is legal" rule above exists to serve. A dispatcher that
+    /// confused it for a malformed envelope would silently leave withdrawn
+    /// requests on the recipient's screen.
+    #[test]
+    fn ember_ext_friend_retract_survives_an_empty_body() {
+        let payload = build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]);
+        assert_eq!(
+            parse_ember_ext(&payload),
+            Some((EMBER_EXT_FRIEND_RETRACT, &[][..]))
+        );
+    }
+
+    #[test]
+    fn ember_ext_frame_carries_the_sub_type() {
+        let frame = build_ember_ext_frame(EMBER_EXT_CHAT_TYPING, b"env");
+        assert_eq!(frame[0], OP_EMULEPROT);
+        assert_eq!(frame[5], OP_EMBER_EXT);
+        assert_eq!(
+            parse_ember_ext(&frame[6..]),
+            Some((EMBER_EXT_CHAT_TYPING, &b"env"[..]))
+        );
+    }
+
+    /// Sub-types dispatch off one byte with no length or type tag around it, so
+    /// a duplicate would silently route one message into the other's handler.
+    #[test]
+    fn ember_ext_sub_types_are_distinct() {
+        let sub_types = [
+            EMBER_EXT_RELAY_OFFER,
+            EMBER_EXT_FRIEND_RETRACT,
+            EMBER_EXT_CHAT_TYPING,
+            EMBER_EXT_CHAT_READ,
+            EMBER_EXT_DHT_CONTACT_REQ,
+            EMBER_EXT_DHT_CONTACTS,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for sub_type in sub_types {
+            assert!(
+                seen.insert(sub_type),
+                "duplicate OP_EMBER_EXT sub-type {sub_type:#04x}"
+            );
+        }
     }
 
     /// Every opcode we send under `OP_EMULEPROT` must stay distinct — from each

@@ -86,6 +86,60 @@ pub const PRESENCE_FETCH_EMPTY_SECS: i64 = 20;
 /// if their last announcement is this recent. Two republish intervals so one
 /// missed announce does not drop them, matching the roster presence dot.
 pub const PRESENCE_FRESH_SECS: i64 = PRESENCE_REPUBLISH_SECS * 2;
+
+/// The presence walk for the one room the user is currently looking at.
+///
+/// [`PRESENCE_FETCH_SECS`] is the right number for the rooms nobody is reading:
+/// it keeps a roster warm for the cost of one walk per room per five minutes.
+/// It is the wrong number for the room on screen, where the five minutes is
+/// simply how long a person who just joined stays invisible. The empty-room
+/// case already pays this rate for the same reason — nobody is watching a room
+/// harder than the one they have open — and only one room is ever focused, so
+/// the cost is bounded no matter how many the user has joined.
+pub const PRESENCE_FETCH_FOCUSED_SECS: i64 = 20;
+
+/// How often an in-room member announces itself on the live gossip mesh.
+///
+/// The DHT presence walk is a backstop, not a signal a person would recognise
+/// as presence. A member re-announces only every [`PRESENCE_REPUBLISH_SECS`],
+/// their roster row carries the *publisher's* timestamp rather than the moment
+/// we learned it, and the walk that collects it runs every
+/// [`PRESENCE_FETCH_SECS`]. Subtract the two and the slack before somebody
+/// crosses [`PRESENCE_FRESH_SECS`] is 600 seconds — two walks. A single
+/// unanswered FIND_VALUE over UDP, or a STORE whose holders churned out, spends
+/// one of them, so a member sitting in a room went dark on every other device
+/// while still reading it. Chat hid this for anyone talking, which is why it
+/// was the quiet ones who looked offline.
+///
+/// The mesh already carries authenticated frames between these same members.
+/// Beating on it costs one small frame per neighbor and puts presence back in
+/// the range a person would call live.
+pub const PRESENCE_BEAT_SECS: i64 = 45;
+
+/// Mesh-confirmed presence window: three missed beats plus a little slack.
+///
+/// Far tighter than [`PRESENCE_FRESH_SECS`], and deliberately so. That window
+/// has to survive a ten-minute republish and a lossy walk, so the strongest
+/// claim it can support is "seen this quarter hour" — which is also why a
+/// member who left kept a green dot for twenty minutes after going. A beacon is
+/// evidence straight from the member, seconds old, so it carries the stronger
+/// claim and the DHT window becomes what it always was: recently seen.
+pub const PRESENCE_MESH_FRESH_SECS: i64 = PRESENCE_BEAT_SECS * 3 + 15;
+
+/// Beacons carried in one digest frame. See
+/// `a_full_presence_digest_fits_one_unfragmented_datagram`.
+pub const PRESENCE_BEACON_BATCH_MAX: usize = 10;
+
+/// Smallest gap between two *flooded* announcements from one member.
+///
+/// A beacon that arrives on the periodic digest costs one hop. One that is
+/// flooded on join or leave costs the room roughly `members × degree` sends, so
+/// it is the only presence frame worth abusing: a member toggling in and out
+/// would otherwise turn a click into a room-wide flood every time. Ingest is
+/// not gated on this — refusing to *record* a valid signed beacon would be
+/// letting the flood budget decide who looks online — only the decision to
+/// pass it on. Well above the honest path, which floods twice per visit.
+pub const PRESENCE_BEACON_FLOOD_MIN_SECS: i64 = 30;
 /// Hard cap on `channel_members` rows per room. Public rooms used to grow
 /// without bound from chat ingest; gossip neighbors are the XOR-closest of
 /// that table, so an unbounded roster is an eclipse. Past this we only drop
@@ -1095,6 +1149,11 @@ const XFER_CANCEL_PLAIN_VERSION: u8 = 13;
 const XFER_DONE_PLAIN_VERSION: u8 = 14;
 /// A block whose payload is encrypted to the recipient alone.
 const XFER_BLOCK_DATA_SEALED_VERSION: u8 = 21;
+/// One or more signed presence beacons. Always a batch — a join announcement is
+/// a batch of one — so the periodic digest can carry a slice of the roster in a
+/// single frame rather than a datagram per member.
+const PRESENCE_BEACON_PLAIN_VERSION: u8 = 22;
+const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
@@ -1206,6 +1265,262 @@ pub fn decode_channel_chat_plain(
         return None;
     }
     Some((pk, text, sig))
+}
+
+/// A member's own signed assertion that they were in a room at an instant.
+///
+/// The unit of the live presence layer, and deliberately the same shape of
+/// claim the DHT presence record makes: self-signed, address-free, and
+/// verifiable by whoever ends up holding it. That is what lets a beacon be
+/// passed along by peers who are not its author without any of them being
+/// trusted — a relayed beacon is checked by its recipient exactly as a
+/// first-hand one is, so a member forwarding the room's presence cannot invent,
+/// re-date, or suppress-and-substitute anybody in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresenceBeacon {
+    pub member: [u8; 32],
+    /// As signed by the member. Kept verbatim rather than clamped so a beacon
+    /// can be passed on byte-identically; [`PresenceBeacon::last_seen_at`] is
+    /// what a roster row should be written from.
+    pub timestamp: i64,
+    /// The member saying they are leaving, not somebody saying it about them.
+    ///
+    /// Inside the signature, which is the whole point. A room where a peer
+    /// could set this bit on a beacon in transit would be a room where any
+    /// member can evict any other, silently, with a frame everyone downstream
+    /// treats as authentic. Going quiet is the only *other* way to leave, and
+    /// that one nobody has to be trusted about.
+    pub departed: bool,
+    pub signature: [u8; 64],
+}
+
+/// `flags(1) || pubkey(32) || timestamp(8) || signature(64)`.
+pub const PRESENCE_BEACON_ENTRY_LEN: usize = 1 + 32 + 8 + 64;
+/// `flags` bit 0: this is a leave rather than an announcement.
+const PRESENCE_BEACON_FLAG_DEPARTED: u8 = 0x01;
+
+/// What a beacon's signature covers.
+///
+/// Room and epoch are both in here, and neither is decoration. Without the
+/// room, a beacon captured in a public channel anyone may join replays into
+/// every *other* room its author belongs to, so watching one room would let an
+/// observer keep a member lit up in rooms they had long since closed. Without
+/// the epoch, a beacon minted under a retired content key still verifies, which
+/// is the case that matters after a private room rotates to evict somebody: the
+/// ban check is the primary defence, but a member who no longer holds the
+/// room's current key should not be able to assert anything about it at all.
+///
+/// The timestamp is signed for the obvious reason and one less obvious one: it
+/// is the only thing distinguishing two beacons from the same member, so
+/// leaving it out would make every beacon they ever sent interchangeable and a
+/// single captured frame would assert presence forever.
+fn presence_beacon_preimage(
+    channel_id: &[u8; 16],
+    key_epoch: i64,
+    member: &[u8; 32],
+    timestamp: i64,
+    departed: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PRESENCE_BEACON_SIG_DOMAIN.len() + 16 + 8 + 32 + 8 + 1);
+    out.extend_from_slice(PRESENCE_BEACON_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(&key_epoch.to_le_bytes());
+    out.extend_from_slice(member);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.push(u8::from(departed));
+    out
+}
+
+/// Mint a beacon for ourselves. Only ever called with our own key.
+pub fn sign_presence_beacon(
+    signing_key: &SigningKey,
+    member: &[u8; 32],
+    channel_id: &[u8; 16],
+    key_epoch: i64,
+    timestamp: i64,
+    departed: bool,
+) -> PresenceBeacon {
+    PresenceBeacon {
+        member: *member,
+        timestamp,
+        departed,
+        signature: crypto::sign(
+            signing_key,
+            &presence_beacon_preimage(channel_id, key_epoch, member, timestamp, departed),
+        ),
+    }
+}
+
+impl PresenceBeacon {
+    /// The roster `last_seen` this beacon supports, or nothing if its clock is
+    /// unusable. Clamped by [`clamp_presence_timestamp`] so a member running
+    /// slightly fast cannot sort ahead of honest peers, and one running wildly
+    /// fast cannot pin themselves online past when they leave.
+    pub fn last_seen_at(&self, now: i64) -> Option<i64> {
+        clamp_presence_timestamp(self.timestamp, now)
+    }
+}
+
+/// Pack beacons for the wire. A join announcement is a batch of one.
+pub fn encode_channel_presence_beacons(beacons: &[PresenceBeacon]) -> Vec<u8> {
+    let count = beacons.len().min(PRESENCE_BEACON_BATCH_MAX);
+    let mut out = Vec::with_capacity(2 + count * PRESENCE_BEACON_ENTRY_LEN);
+    out.push(PRESENCE_BEACON_PLAIN_VERSION);
+    out.push(count as u8);
+    for beacon in beacons.iter().take(count) {
+        out.push(if beacon.departed {
+            PRESENCE_BEACON_FLAG_DEPARTED
+        } else {
+            0
+        });
+        out.extend_from_slice(&beacon.member);
+        out.extend_from_slice(&beacon.timestamp.to_le_bytes());
+        out.extend_from_slice(&beacon.signature);
+    }
+    out
+}
+
+/// Recover the beacons in a frame, keeping only those that prove themselves.
+///
+/// `None` means this is not a beacon frame and the caller should keep matching.
+/// `Some` of an empty batch means it was one and nothing in it survived, which
+/// is a different thing and must not fall through to the chat decoder.
+///
+/// Entries are checked independently and a bad one is dropped rather than
+/// condemning the frame. A digest is assembled by whichever peer sent it out of
+/// beacons it collected from all over the room; one stale or corrupt entry in it
+/// says nothing about the other nine, and refusing the batch would let any
+/// member censor a room's presence by appending garbage to an honest digest.
+///
+/// `key_epoch - 1` is accepted alongside the current one. Rotation is not
+/// simultaneous — the owner publishes a new epoch and members pick it up over
+/// the following minutes — so during that window the two ends disagree about
+/// which number to sign, and refusing on that alone would blind a room's
+/// presence at exactly the moment its membership just changed. One epoch of
+/// tolerance, not unlimited: a key two rotations old proves nothing.
+pub fn decode_channel_presence_beacons(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    key_epoch: i64,
+    now: i64,
+) -> Option<Vec<PresenceBeacon>> {
+    if bytes.len() < 2 || bytes[0] != PRESENCE_BEACON_PLAIN_VERSION {
+        return None;
+    }
+    let count = bytes[1] as usize;
+    if count > PRESENCE_BEACON_BATCH_MAX || bytes.len() < 2 + count * PRESENCE_BEACON_ENTRY_LEN {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let at = 2 + index * PRESENCE_BEACON_ENTRY_LEN;
+        let departed = bytes[at] & PRESENCE_BEACON_FLAG_DEPARTED != 0;
+        let mut member = [0u8; 32];
+        member.copy_from_slice(&bytes[at + 1..at + 33]);
+        let mut stamp = [0u8; 8];
+        stamp.copy_from_slice(&bytes[at + 33..at + 41]);
+        let timestamp = i64::from_le_bytes(stamp);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[at + 41..at + PRESENCE_BEACON_ENTRY_LEN]);
+        let beacon = PresenceBeacon {
+            member,
+            timestamp,
+            departed,
+            signature,
+        };
+        if beacon.last_seen_at(now).is_none() {
+            continue;
+        }
+        let Some(author) = crypto::verifying_key_from_bytes(&member) else {
+            continue;
+        };
+        let signed_under_any = [key_epoch, key_epoch - 1]
+            .into_iter()
+            .filter(|epoch| *epoch >= 0)
+            .any(|epoch| {
+                crypto::verify(
+                    &author,
+                    &presence_beacon_preimage(channel_id, epoch, &member, timestamp, departed),
+                    &signature,
+                )
+            });
+        if signed_under_any {
+            out.push(beacon);
+        }
+    }
+    Some(out)
+}
+
+/// New members one room's roster may gain from beacons per [`PRESENCE_BEAT_SECS`].
+///
+/// Membership is what gossip neighbors are chosen from, so the rate a roster
+/// can be grown is the rate an eclipse can be built. The DHT presence walk
+/// already admits strangers to a public room — its key comes from a secret
+/// anyone can derive for a room anyone may join — and [`CHANNEL_MEMBERS_MAX`]
+/// with its eviction rules is what bounds that. A beacon is the same class of
+/// claim arriving by a cheaper route, so it gets a budget the DHT path does
+/// not need: this makes beacons the *tightest* way onto a roster rather than a
+/// cheaper way around the loosest. Far above what real arrivals look like, and
+/// anything shed here is picked up by the next presence walk regardless.
+pub const BEACON_INSERTS_PER_BEAT: usize = 8;
+
+/// Whether a room may admit one more member from a beacon this window.
+///
+/// `slot` is the room's `(window start, count)`, advanced in place.
+pub fn beacon_insert_allow(slot: &mut (i64, usize), now: i64) -> bool {
+    if schedule_due(slot.0, now, PRESENCE_BEAT_SECS) {
+        *slot = (now, 0);
+    } else if slot.1 >= BEACON_INSERTS_PER_BEAT {
+        return false;
+    }
+    slot.1 += 1;
+    true
+}
+
+/// Whether a beacon from this member may be flooded onward by us.
+///
+/// Only the decision to relay is limited, never the decision to believe.
+/// Refusing to *record* a valid signed beacon would put the flood budget in
+/// charge of who looks online, which is the failure this whole layer exists to
+/// undo. Declining to amplify one only means not spending the room's bandwidth
+/// on somebody arriving and leaving faster than anyone could read it.
+pub fn beacon_flood_allow(last: i64, now: i64) -> bool {
+    schedule_due(last, now, PRESENCE_BEACON_FLOOD_MIN_SECS)
+}
+
+/// Whether something already held about this member outranks an arriving
+/// beacon, so the arriving one should be ignored rather than applied.
+///
+/// Newest wins, and a same-second tie goes to the departure — matching
+/// [`super::dht::publish::keep_latest_presence_member`]. A member who beat and
+/// then left inside one second is gone, and resolving that tie the other way
+/// would let a captured announcement outlive the leave that followed it.
+///
+/// This is what stops a member flickering back after they go. A departure
+/// reaches the room as a flood while every peer is still holding that member's
+/// last ordinary beacon in its own digest; without this check the next digest
+/// from any of them re-inserts the member whose leave we just applied, and they
+/// sit in the roster looking online until the copy finally ages out. Checked
+/// against what we hold rather than against the roster row, because the row is
+/// deleted by the leave and so remembers nothing.
+pub fn beacon_superseded(held: Option<&PresenceBeacon>, incoming: &PresenceBeacon) -> bool {
+    match held {
+        Some(prev) if prev.timestamp > incoming.timestamp => true,
+        Some(prev) => prev.timestamp == incoming.timestamp && prev.departed && !incoming.departed,
+        None => false,
+    }
+}
+
+/// Newest-wins when the same member turns up more than once in a digest round.
+///
+/// Beacons reach us from several neighbors at once and by different routes, so
+/// duplicates are the normal case rather than an anomaly. Keeping the newest is
+/// what makes the layer converge instead of flapping between whichever copy
+/// happened to be processed last.
+pub fn keep_latest_beacon(latest: &mut HashMap<[u8; 32], PresenceBeacon>, beacon: PresenceBeacon) {
+    if !beacon_superseded(latest.get(&beacon.member), &beacon) {
+        latest.insert(beacon.member, beacon);
+    }
 }
 
 /// Whether a gossip envelope timestamp is usable as wall-clock state.
@@ -4630,6 +4945,346 @@ mod tests {
             "a block frame is {framed} bytes, over the {budget}-byte unfragmented budget — \
              lower XFER_BLOCK_SIZE rather than letting blocks fragment"
         );
+    }
+
+    /// Same reasoning as the block test above, for the presence digest.
+    ///
+    /// A digest is sent to every gossip neighbor on a timer, so an oversized one
+    /// fragments repeatedly and forever. The failure would be quiet in the worst
+    /// way: presence would simply never converge on the NATs that drop
+    /// fragments, and the roster would look exactly as stale as it did before
+    /// any of this existed.
+    #[test]
+    fn a_full_presence_digest_fits_one_unfragmented_datagram() {
+        let budget = crate::network::ember::dht::messages::MAX_UNFRAGMENTED_PAYLOAD;
+        let framed = 2
+            + PRESENCE_BEACON_BATCH_MAX * PRESENCE_BEACON_ENTRY_LEN
+            + GOSSIP_HEADER_LEN
+            + GOSSIP_ENVELOPE_OVERHEAD
+            + CHANNEL_RELAY_ENVELOPE_HEADER;
+        assert!(
+            framed <= budget,
+            "a full digest is {framed} bytes, over the {budget}-byte unfragmented budget — \
+             lower PRESENCE_BEACON_BATCH_MAX rather than letting digests fragment"
+        );
+    }
+
+    fn test_beacon(seed: u8, room: &[u8; 16], epoch: i64, at: i64) -> ([u8; 32], PresenceBeacon) {
+        let id = ChannelIdentity::from_seed(&[seed; 32]);
+        let beacon = sign_presence_beacon(&id.signing_key, &id.pubkey, room, epoch, at, false);
+        (id.pubkey, beacon)
+    }
+
+    /// The whole point of the layer: presence a peer relays is still the
+    /// author's word, not the relay's.
+    #[test]
+    fn a_beacon_only_verifies_for_the_member_that_signed_it() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let (pubkey, beacon) = test_beacon(1, &room, 0, now);
+        let frame = encode_channel_presence_beacons(&[beacon]);
+        let got = decode_channel_presence_beacons(&frame, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got, vec![beacon]);
+        assert_eq!(got[0].member, pubkey);
+
+        // Somebody else's key in the same envelope proves nothing.
+        let impostor = PresenceBeacon {
+            member: ChannelIdentity::from_seed(&[2; 32]).pubkey,
+            ..beacon
+        };
+        let forged = encode_channel_presence_beacons(&[impostor]);
+        assert!(
+            decode_channel_presence_beacons(&forged, &room, 0, now)
+                .expect("still a beacon frame")
+                .is_empty(),
+            "a beacon naming a member it was not signed by must not be admitted"
+        );
+    }
+
+    /// The invariant the whole layer rests on: no member may say another member
+    /// has gone. Flipping the departure bit on a beacon in transit would be
+    /// exactly that — a silent eviction everybody downstream treats as
+    /// authentic — so the bit is inside the signature and moving it destroys
+    /// the frame.
+    #[test]
+    fn nobody_can_flip_another_members_beacon_into_a_departure() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let id = ChannelIdentity::from_seed(&[1; 32]);
+        let here = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now, false);
+
+        let tampered = PresenceBeacon {
+            departed: true,
+            ..here
+        };
+        let frame = encode_channel_presence_beacons(&[tampered]);
+        assert!(
+            decode_channel_presence_beacons(&frame, &room, 0, now)
+                .expect("still a beacon frame")
+                .is_empty(),
+            "a relay must not be able to evict the member whose beacon it carries"
+        );
+
+        // The member's own leave, by contrast, verifies and says so.
+        let leaving = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now, true);
+        let frame = encode_channel_presence_beacons(&[leaving]);
+        let got = decode_channel_presence_beacons(&frame, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got, vec![leaving]);
+        assert!(got[0].departed);
+    }
+
+    /// A leave and an announcement dated the same second: the leave stands.
+    #[test]
+    fn a_same_second_leave_is_not_undone_by_the_beat_it_raced() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let id = ChannelIdentity::from_seed(&[1; 32]);
+        let here = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now, false);
+        let gone = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now, true);
+
+        for order in [[here, gone], [gone, here]] {
+            let mut latest = HashMap::new();
+            for beacon in order {
+                keep_latest_beacon(&mut latest, beacon);
+            }
+            assert!(
+                latest.get(&id.pubkey).is_some_and(|b| b.departed),
+                "arrival order must not decide whether a member is still here"
+            );
+        }
+    }
+
+    #[test]
+    fn a_beacon_does_not_replay_into_another_room() {
+        let room = [0x11u8; 16];
+        let elsewhere = [0x22u8; 16];
+        let now = 1_700_000_000;
+        let (_, beacon) = test_beacon(1, &room, 0, now);
+        let frame = encode_channel_presence_beacons(&[beacon]);
+        assert!(
+            decode_channel_presence_beacons(&frame, &elsewhere, 0, now)
+                .expect("still a beacon frame")
+                .is_empty(),
+            "a beacon captured in one room must not light its author up in another"
+        );
+    }
+
+    /// One epoch of tolerance for a rotation in flight, and not a second one.
+    #[test]
+    fn a_beacon_survives_one_rotation_of_skew_and_no_more() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let (_, beacon) = test_beacon(1, &room, 4, now);
+        let frame = encode_channel_presence_beacons(&[beacon]);
+        for epoch in [4, 5] {
+            assert_eq!(
+                decode_channel_presence_beacons(&frame, &room, epoch, now).expect("a beacon frame"),
+                vec![beacon],
+                "epoch {epoch} is the signing epoch or one past it and must be accepted"
+            );
+        }
+        assert!(
+            decode_channel_presence_beacons(&frame, &room, 6, now)
+                .expect("still a beacon frame")
+                .is_empty(),
+            "a key two rotations old proves nothing about the room's present membership"
+        );
+    }
+
+    /// A member cannot date themselves into the future to stay lit after
+    /// leaving. The near-future case is clamped rather than refused, because a
+    /// slightly fast clock is ordinary and dropping it would blink honest
+    /// members offline.
+    #[test]
+    fn a_future_dated_beacon_cannot_pin_a_member_online() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+
+        let (_, ahead) = test_beacon(1, &room, 0, now + 30);
+        assert_eq!(
+            ahead.last_seen_at(now),
+            Some(now),
+            "a slightly fast clock is clamped, not refused"
+        );
+
+        let (_, far) = test_beacon(1, &room, 0, now + PRESENCE_MAX_FUTURE_SKEW_SECS + 1);
+        assert_eq!(far.last_seen_at(now), None);
+        let frame = encode_channel_presence_beacons(&[far]);
+        assert!(
+            decode_channel_presence_beacons(&frame, &room, 0, now)
+                .expect("still a beacon frame")
+                .is_empty(),
+            "a beacon dated past the skew cap would outlive its author's visit"
+        );
+    }
+
+    /// A digest is assembled by a peer out of other people's beacons, so
+    /// appending junk to one must not be a way to censor the rest.
+    #[test]
+    fn a_corrupt_entry_does_not_condemn_the_rest_of_a_digest() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let (_, first) = test_beacon(1, &room, 0, now - 5);
+        let (_, second) = test_beacon(2, &room, 0, now - 5);
+        let junk = PresenceBeacon {
+            member: [0xAAu8; 32],
+            timestamp: now,
+            departed: false,
+            signature: [0xBBu8; 64],
+        };
+        let frame = encode_channel_presence_beacons(&[first, junk, second]);
+        let got = decode_channel_presence_beacons(&frame, &room, 0, now).expect("a beacon frame");
+        assert_eq!(
+            got,
+            vec![first, second],
+            "the honest beacons either side of a bad one must still land"
+        );
+    }
+
+    /// A frame that is a beacon batch and yields nothing is not a chat line.
+    /// Returning `None` here would fall through to the decoders after it.
+    #[test]
+    fn an_empty_beacon_batch_is_still_recognised_as_one() {
+        let room = [0x11u8; 16];
+        let frame = encode_channel_presence_beacons(&[]);
+        assert_eq!(
+            decode_channel_presence_beacons(&frame, &room, 0, 1_700_000_000),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            decode_channel_presence_beacons(&[CHAT_PLAIN_VERSION, 0], &room, 0, 1_700_000_000),
+            None,
+            "another frame type must not be swallowed by the beacon decoder"
+        );
+    }
+
+    #[test]
+    fn a_digest_never_carries_more_than_a_frame_holds() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let many: Vec<PresenceBeacon> = (0..40)
+            .map(|seed| test_beacon(seed as u8 + 1, &room, 0, now).1)
+            .collect();
+        let frame = encode_channel_presence_beacons(&many);
+        assert_eq!(
+            decode_channel_presence_beacons(&frame, &room, 0, now)
+                .expect("a beacon frame")
+                .len(),
+            PRESENCE_BEACON_BATCH_MAX
+        );
+    }
+
+    /// A leave floods the room while every peer is still holding that member's
+    /// last ordinary beacon. The digests that follow must not put them back.
+    #[test]
+    fn a_stale_digest_cannot_resurrect_a_member_who_has_left() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let id = ChannelIdentity::from_seed(&[1; 32]);
+        let beat = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now - 10, false);
+        let gone = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now, true);
+
+        assert!(
+            !beacon_superseded(Some(&beat), &gone),
+            "the leave is newer than the beat it followed and has to apply"
+        );
+        assert!(
+            beacon_superseded(Some(&gone), &beat),
+            "a copy of the beat they sent before leaving must not undo the leave"
+        );
+
+        // And the member coming back is not blocked by their own tombstone.
+        let back = sign_presence_beacon(&id.signing_key, &id.pubkey, &room, 0, now + 5, false);
+        assert!(!beacon_superseded(Some(&gone), &back));
+    }
+
+    #[test]
+    fn keep_latest_beacon_prefers_the_newest_copy() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let (pubkey, old) = test_beacon(1, &room, 0, now - 120);
+        let (_, new) = test_beacon(1, &room, 0, now);
+        let mut latest = HashMap::new();
+        keep_latest_beacon(&mut latest, new);
+        keep_latest_beacon(&mut latest, old);
+        assert_eq!(
+            latest.get(&pubkey).map(|b| b.timestamp),
+            Some(now),
+            "a stale copy arriving second must not undo a fresh one"
+        );
+    }
+
+    /// The rate a roster grows from beacons is the rate an eclipse can be
+    /// built, so it is bounded and the bound resets on a window rather than
+    /// leaking upward.
+    #[test]
+    fn beacons_cannot_grow_a_roster_faster_than_the_budget() {
+        let now = 1_700_000_000;
+        let mut slot = (0i64, 0usize);
+        for index in 0..BEACON_INSERTS_PER_BEAT {
+            assert!(
+                beacon_insert_allow(&mut slot, now),
+                "arrival {index} is inside the budget"
+            );
+        }
+        assert!(
+            !beacon_insert_allow(&mut slot, now),
+            "a flood of invented identities must be refused, not admitted as 257"
+        );
+        // Still refused a moment later: the window is what reopens it, not the
+        // next call.
+        assert!(!beacon_insert_allow(&mut slot, now + PRESENCE_BEAT_SECS - 1));
+        assert!(beacon_insert_allow(&mut slot, now + PRESENCE_BEAT_SECS));
+    }
+
+    /// A beat is one unicast per neighbor, charged to the same allowance the
+    /// mesh forwards on. Over it, part of every beat is shed — and the shed
+    /// part is presence, which is what the roster is drawn from.
+    #[test]
+    fn a_beat_fits_the_relay_allowance_for_a_second() {
+        const {
+            assert!(
+                CHANNEL_NEIGHBOR_COUNT <= CHANNEL_GOSSIP_OUT_PER_SEC,
+                "one room's digest must fit a second of relay budget, or beats arrive in pieces"
+            );
+        }
+    }
+
+    /// A member toggling in and out must not turn each click into a room-wide
+    /// flood, and a clock that jumps backwards must not stall the gate shut.
+    #[test]
+    fn a_member_cannot_flood_a_room_by_rejoining_repeatedly() {
+        let now = 1_700_000_000;
+        assert!(beacon_flood_allow(0, now), "a first announcement always goes");
+        assert!(!beacon_flood_allow(now, now));
+        assert!(!beacon_flood_allow(
+            now,
+            now + PRESENCE_BEACON_FLOOD_MIN_SECS - 1
+        ));
+        assert!(beacon_flood_allow(now, now + PRESENCE_BEACON_FLOOD_MIN_SECS));
+        assert!(
+            beacon_flood_allow(now + 600, now),
+            "a stamp ahead of the clock is not information and must not stall the gate"
+        );
+    }
+
+    /// The mesh window is the whole reason a member who left stops showing a
+    /// green dot in seconds rather than in a quarter of an hour. If it ever
+    /// grew past the DHT window it would be claiming less than the backstop it
+    /// sits in front of, and the two-tier roster would be pointless.
+    #[test]
+    fn mesh_presence_is_sharper_than_the_dht_backstop() {
+        const {
+            assert!(PRESENCE_MESH_FRESH_SECS < PRESENCE_FRESH_SECS);
+            assert!(
+                PRESENCE_MESH_FRESH_SECS > PRESENCE_BEAT_SECS * 2,
+                "a member must survive a missed beat without blinking offline"
+            );
+            assert!(
+                PRESENCE_FETCH_FOCUSED_SECS < PRESENCE_FETCH_SECS,
+                "the room on screen is the one worth walking more often"
+            );
+        }
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

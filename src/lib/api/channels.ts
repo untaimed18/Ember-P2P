@@ -51,6 +51,30 @@ export interface ChannelMemberInfo {
   moderator: boolean;
 }
 
+/** The windows the roster's presence dots are drawn with.
+ *
+ *  Read from the backend rather than declared here. The same numbers decide
+ *  which members this device gossips to, so a copy in the UI is one that can
+ *  drift from the one the protocol runs on. */
+export interface ChannelPresenceConfig {
+  /** Heard from on the live mesh within this many seconds: online. */
+  mesh_fresh_secs: number;
+  /** Heard from by any means within this many seconds: recently here. */
+  dht_fresh_secs: number;
+  /** How often a member announces itself. */
+  beat_secs: number;
+}
+
+/** Payload of `ember:channel-presence`: rows whose `last_seen` moved.
+ *
+ *  Distinct from `ember:channel-members`, which means the roster changed shape
+ *  and costs a full re-read. Presence moves far more often than membership
+ *  does, so it travels as a delta. */
+export interface ChannelPresenceDelta {
+  channel_id: string;
+  members: { member_pubkey: string; last_seen: number }[];
+}
+
 export interface ChannelMessageInfo {
   id: number;
   sender_pubkey: string;
@@ -159,6 +183,16 @@ export async function getChannelInvite(channelId: string): Promise<ChannelInvite
 
 export async function listChannelMembers(channelId: string): Promise<ChannelMemberInfo[]> {
   return invoke('list_channel_members', { channelId });
+}
+
+export async function channelPresenceConfig(): Promise<ChannelPresenceConfig> {
+  return invoke('channel_presence_config');
+}
+
+/** Name the room on screen so the backend walks its presence at the rate
+ *  somebody watching it would expect. `null` when no room is open. */
+export async function setChannelFocus(channelId: string | null): Promise<void> {
+  return invoke('set_channel_focus', { channelId });
 }
 
 export async function getChannelMessages(
@@ -365,14 +399,17 @@ export interface ChannelTransferInfo {
   status: ChannelTransferStatus;
 }
 
-/** Offer one file to one member. Returns the transfer id. Nothing is sent
- *  until they accept. */
-export async function offerChannelTransfer(
+/** Offer one file to one member. Returns the transfer id, or `null` if the
+ *  user dismissed the picker. Nothing is sent until they accept.
+ *
+ *  The file dialog is opened by the backend rather than here: choosing a file
+ *  in the OS dialog is the authorization for reading it, and a path sent over
+ *  IPC is not. */
+export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
-  path: string,
-): Promise<string> {
-  return invoke('offer_channel_transfer', { channelId, memberPubkey, path });
+): Promise<string | null> {
+  return invoke('pick_and_offer_channel_transfer', { channelId, memberPubkey });
 }
 
 export async function respondChannelTransfer(xferId: string, accept: boolean): Promise<void> {

@@ -296,6 +296,25 @@
               <path d="M8 4.5V8l2.25 1.5"/>
             </svg>
             <span class="recent-text" title={q}>{q}</span>
+            <!--
+              Mouse affordance for `removeRecent`, which until now was only
+              reachable by arrowing to a row and pressing Delete — a shortcut
+              the cheat-sheet doesn't list, so in practice the only way to
+              drop one bad query was "Clear all".
+
+              Deliberately `aria-hidden` + untabbable: a `role="option"` must
+              not contain interactive descendants, and keyboard users already
+              have Delete on the focused row. This adds a pointer target
+              without breaking the listbox contract.
+            -->
+            <button
+              type="button"
+              class="recent-remove"
+              aria-hidden="true"
+              tabindex="-1"
+              title={m.common_remove()}
+              onmousedown={(e) => { e.preventDefault(); e.stopPropagation(); removeRecent(q); }}
+            ><IconX size={11} /></button>
           </div>
         {/each}
       </div>
@@ -348,7 +367,7 @@
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--accent-dim) 35%, transparent);
+    background: var(--accent-fill);
     color: var(--text-accent);
     font-size: 13px;
     font-weight: 700;
@@ -476,6 +495,38 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .recent-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    margin-left: auto;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    /* Revealed on the row the pointer is over, so a list of ten queries is
+       not a column of ten delete buttons. */
+    opacity: 0;
+    transition: opacity var(--transition-fast), color var(--transition-fast);
+  }
+
+  .recent-item:hover .recent-remove,
+  .recent-item.active .recent-remove {
+    opacity: 1;
+  }
+
+  .recent-remove:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
 </style>

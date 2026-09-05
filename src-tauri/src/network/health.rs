@@ -82,6 +82,26 @@ pub(crate) struct TcpMappingKeepaliveResult {
     pub(crate) mapped: Option<SocketAddr>,
 }
 
+/// Verdict on a finished channel transfer, verified off the event loop.
+///
+/// Finalising a receive means hashing the whole file back — up to
+/// `XFER_MAX_BYTES` — so it cannot run on the network task. Everything the
+/// completion frame and the UI update need is carried here rather than looked
+/// up again on arrival: by then the `RecvState` is gone, and re-deriving the
+/// authenticator key would mean trusting a channel row that may have been left
+/// or rekeyed while the hash was running.
+pub(crate) struct XferFinishResult {
+    pub(crate) xfer_id: [u8; 16],
+    pub(crate) channel_id: [u8; 16],
+    pub(crate) peer: [u8; 32],
+    /// Authenticator key for this transfer. See `channel::derive_xfer_key`.
+    pub(crate) key: [u8; 32],
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    /// `"complete"` or `"failed"`, as `emit_xfer_update` reports it.
+    pub(crate) status: &'static str,
+}
+
 /// Outcome of one TCP STUN observation against the current TCP
 /// remap-candidate tracking state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -19,10 +19,28 @@ const VOTE_TTL: Duration = Duration::from_secs(15 * 60);
 /// and the least-recently-updated entry is dropped.
 const MAX_TRACKED_ADDRS: usize = 64;
 
+/// The diversity unit one vote is charged to.
+///
+/// Deliberately family-tagged rather than a bare byte array. The two widths
+/// differ, and a shared array would let an IPv6 prefix whose leading bytes
+/// happen to read as an IPv4 /24 share that /24's single vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReporterNet {
+    /// IPv4 /24.
+    V4([u8; 3]),
+    /// IPv6 /48 — the same unit [`super::EmberContact::subnet_key`] uses, and
+    /// the smallest block routinely assigned to one site. Charging the first
+    /// three *bytes* instead, as this once did, is a /24 of IPv6: it folds
+    /// unrelated networks onto one key, so honest reporters spread across a
+    /// region count as a single vote and a genuine address change struggles to
+    /// reach quorum.
+    V6([u8; 6]),
+}
+
 #[derive(Debug, Default)]
 struct AddrVotes {
-    /// Reporter /24 → when it last voted for this address.
-    nets: HashMap<[u8; 3], Instant>,
+    /// Reporter network → when it last voted for this address.
+    nets: HashMap<ReporterNet, Instant>,
     last_update: Option<Instant>,
 }
 
@@ -59,7 +77,7 @@ impl EmberObservedIpVotes {
         if !is_public_reporter(reporter) {
             return None;
         }
-        let net = reporter_net24(reporter)?;
+        let net = reporter_net(reporter)?;
 
         self.prune(now);
 
@@ -143,15 +161,15 @@ impl EmberObservedIpVotes {
     }
 }
 
-fn reporter_net24(ip: IpAddr) -> Option<[u8; 3]> {
+fn reporter_net(ip: IpAddr) -> Option<ReporterNet> {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            Some([o[0], o[1], o[2]])
+            Some(ReporterNet::V4([o[0], o[1], o[2]]))
         }
         IpAddr::V6(v6) => {
             let o = v6.octets();
-            Some([o[0], o[1], o[2]])
+            Some(ReporterNet::V6([o[0], o[1], o[2], o[3], o[4], o[5]]))
         }
     }
 }
@@ -419,6 +437,72 @@ mod tests {
             "a 3-net rival must still be refused against a still-backed confirmation"
         );
         assert_eq!(votes.confirmed(), Some(current));
+    }
+
+    /// IPv6 reporters are charged a /48, the unit `EmberContact::subnet_key`
+    /// uses and the smallest block routinely assigned to one site. Charging the
+    /// first three *bytes* — a /24 of IPv6 — folded unrelated networks onto one
+    /// key, so three genuinely independent reporters counted as one and a real
+    /// address change could not reach quorum.
+    #[test]
+    fn ipv6_reporters_are_distinguished_at_a_48() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let now = Instant::now();
+
+        // Three distinct /48s that share their first three bytes, which is what
+        // the old key looked at.
+        let nets: [IpAddr; 3] = [
+            "2001:db8:1::1".parse().unwrap(),
+            "2001:db8:2::1".parse().unwrap(),
+            "2001:db8:3::1".parse().unwrap(),
+        ];
+        assert!(votes.record_vote_at(target, nets[0], now).is_none());
+        assert!(votes.record_vote_at(target, nets[1], now).is_none());
+        assert_eq!(
+            votes.record_vote_at(target, nets[2], now),
+            Some(target),
+            "three distinct /48s are three votes, not one"
+        );
+
+        // And two addresses inside one /48 remain a single vote.
+        let mut same_site = EmberObservedIpVotes::new();
+        let other = addr(51, 4672);
+        for host in ["2001:db8:9::1", "2001:db8:9::2", "2001:db8:9:ffff::3"] {
+            assert!(same_site
+                .record_vote_at(other, host.parse().unwrap(), now)
+                .is_none());
+        }
+        assert_eq!(
+            same_site.confirmed(),
+            None,
+            "one site cannot reach quorum by itself, however many hosts it uses"
+        );
+    }
+
+    /// The two families are separate key spaces. Sharing one byte array would
+    /// let an IPv6 prefix whose leading bytes read as an IPv4 /24 be charged to
+    /// that /24's single vote.
+    #[test]
+    fn an_ipv6_prefix_does_not_collide_with_the_ipv4_slash24_it_reads_as() {
+        let mut votes = EmberObservedIpVotes::new();
+        let target = addr(50, 4672);
+        let now = Instant::now();
+
+        // 32.1.13.x as IPv4, and an IPv6 address whose first three bytes are
+        // the same 20 01 0d.
+        votes.record_vote_at(target, IpAddr::from([32, 1, 13, 10]), now);
+        votes.record_vote_at(target, "2001:d00::1".parse().unwrap(), now);
+        assert_eq!(
+            votes.confirmed(),
+            None,
+            "two reporters are two votes, not a quorum"
+        );
+        assert_eq!(
+            votes.record_vote_at(target, reporter(9, 9, 9), now),
+            Some(target),
+            "and they did count as two distinct nets, so a third completes it"
+        );
     }
 
     /// A peer answering with a different address each time must not grow the

@@ -392,6 +392,35 @@ export interface EmberDiagnostics {
   ember_dht_refreshes: number;
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
+  /** Contacts moved to a replacement cache because the diversity limits tightened. */
+  /** Of ember_dht_contacts, ones parked in a replacement cache. These are never
+   *  liveness-pinged, so they cannot verify themselves — only promotion into a
+   *  bucket can, and that needs the IP policy to admit them. */
+  ember_dht_cached_contacts?: number;
+  /** Of ember_dht_contacts, firsthand session peers the public table refused. */
+  ember_dht_session_contacts?: number;
+  ember_dht_contacts_demoted?: number;
+  /** PEER_LIST replies received. Zero while we are sending ANNOUNCE_PEER means
+   *  the announces are going unanswered, which is a different failure from
+   *  replies that arrive carrying nobody. */
+  ember_dht_peer_lists_received?: number;
+  /** Contacts carried in inbound gossip, counted before admission. */
+  ember_dht_gossip_contacts?: number;
+  /** Of those, ones we did not already hold and the table accepted. */
+  ember_dht_gossip_new?: number;
+  /** Of those, ones the table turned away on IP policy or diversity caps. */
+  ember_dht_gossip_refused?: number;
+  /** Leads we declined to probe because the peer naming them has a record of
+   *  naming addresses that never answer. Always 0 while our table is starved. */
+  ember_dht_gossip_leads_rationed?: number;
+  /** Introducers currently rationed (gauge). */
+  ember_dht_gossip_introducers_rationed?: number;
+  /** Times we asked a friend for its DHT contacts over the friend session.
+   *  Only while our own table is short of a working set. */
+  ember_dht_friend_contact_asks?: number;
+  /** Contacts a friend answered with that the routing table accepted. Asks
+   *  climbing with this flat means friends have nothing verified to share. */
+  ember_dht_friend_contacts_learned?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
@@ -413,8 +442,6 @@ export interface EmberDiagnostics {
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy?: boolean;
-  /** Firewalled publishing fell back to an unendorsed buddy trailer (older peers only). */
-  ember_dht_buddy_unendorsed_publish?: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */
@@ -743,7 +770,7 @@ export interface AppSettings {
   add_servers_from_server: boolean;
   add_servers_from_clients: boolean;
   server_list_path: string;
-  auto_connect_kad: boolean;
+  /** eD2K only. KAD always bootstraps on startup and has no setting. */
   auto_connect_server: boolean;
   max_sources_per_file: number;
   max_connections: number;
@@ -781,10 +808,12 @@ export interface AppSettings {
   readonly default_shared_folder_seeded: boolean;
   /** Monotonic optimistic-concurrency token for settings saves. */
   settings_revision: number;
-  /** Require approval before granting friend-slot priority */
+  /** Retained for config.json; unsolicited requests always queue, reciprocal accepts auto-confirm. */
   friend_require_approval: boolean;
   /** Disable incoming chat messages from friends */
   friend_chat_disabled: boolean;
+  /** Send and display friend-chat read receipts. Off both ways. */
+  friend_chat_read_receipts: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */

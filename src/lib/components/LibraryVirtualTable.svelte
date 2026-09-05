@@ -854,12 +854,12 @@
     outline-offset: -2px;
   }
   .lib-table tbody tr.selected td {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    background: var(--accent-fill);
     color: var(--text-primary);
     border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border));
   }
   .lib-table tbody tr.ctx-target td {
-    background: color-mix(in srgb, var(--accent-dim) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-bottom-color: color-mix(in srgb, var(--accent) 22%, var(--border));
   }
 

@@ -236,6 +236,17 @@ const ADDR_IPV6: u8 = 0x06;
 /// `a_found_node_carries_more_contacts_than_v2_could` pins the count.
 pub const CONTACT_WIRE_LEN_IPV4: usize = 1 + 4 + 2 + 32 + 32;
 
+/// The most a contact list can legitimately occupy: the declared count cap at
+/// the IPv6 contact size, plus the count byte.
+///
+/// [`decode_contact_list`] already refuses a count above
+/// [`MAX_CONTACTS_PER_RESPONSE`] and bounds every read, so this is not needed
+/// to parse safely. It is here for the friend-session path, where the list
+/// arrives over TCP with no datagram ceiling in front of it: a body far larger
+/// than this cannot be a contact list whatever it decodes to, and is cheaper to
+/// refuse by length than to carry through a channel first.
+pub const MAX_CONTACT_LIST_BYTES: usize = 1 + MAX_CONTACTS_PER_RESPONSE * (1 + 16 + 2 + 32 + 32);
+
 /// Header size without public key (used after encrypted session established):
 /// version(1) + msg_type(1) + request_id(4) + sender_node_id(16) = 22 bytes
 const HEADER_MIN_SIZE: usize = 22;
@@ -1263,7 +1274,14 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
 /// No `node_id` is written — see [`CONTACT_WIRE_LEN_IPV4`]. The receiver derives
 /// it from `ed25519_pub`, which is the only value that could ever have been
 /// authoritative.
-fn encode_contact_list(contacts: &[EmberContact]) -> Vec<u8> {
+///
+/// Also used off the DHT wire, by the friend-session contact exchange
+/// ([`crate::network::ed2k::messages::EMBER_EXT_DHT_CONTACTS`]). The
+/// unfragmented budget is meaningless over TCP and simply caps that answer at
+/// 17 contacts, which is most of a k-bucket and far more than a join needs —
+/// worth strictly less than having one encoder whose identity binding is
+/// already pinned by tests.
+pub(crate) fn encode_contact_list(contacts: &[EmberContact]) -> Vec<u8> {
     // Exact for an IPv4 list, which is all we currently dial; an IPv6 entry is
     // 12 bytes wider and costs one realloc. The byte cap below is what actually
     // bounds the result either way.
@@ -1468,6 +1486,15 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 anyhow::bail!("FIND_VALUE empty");
             }
             let count = data[0] as usize;
+            if count == 0 {
+                // A lookup for nothing. The engine reads `keys[0]` as the key to
+                // serve and had no target to fall back on but its own id, so an
+                // empty request was answered with our closest contacts to
+                // ourselves — a `FIND_NODE` under another name, and one no
+                // builder here can produce. Malformed at the decoder is where
+                // that belongs.
+                anyhow::bail!("FIND_VALUE carries no keys");
+            }
             if count > MAX_FIND_VALUE_KEYS {
                 anyhow::bail!("FIND_VALUE keys count {count} exceeds max {MAX_FIND_VALUE_KEYS}");
             }
@@ -1631,7 +1658,7 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     }
 }
 
-fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
+pub(crate) fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
@@ -2231,6 +2258,38 @@ mod tests {
         }
     }
 
+    /// The friend-session contact exchange refuses a body over
+    /// [`MAX_CONTACT_LIST_BYTES`] before decoding it, so that cap has to be
+    /// above anything the encoder can emit — otherwise the guard would drop
+    /// honest answers, and the symptom (a friend's contacts never arriving)
+    /// looks exactly like the friend running an older build.
+    #[test]
+    fn the_contact_list_size_cap_cannot_refuse_an_honest_list() {
+        let ipv4: Vec<EmberContact> = (1u8..=MAX_CONTACTS_PER_RESPONSE as u8)
+            .map(|i| test_contact(i, &format!("10.0.0.{i}:{}", 1000 + i as u16), i))
+            .collect();
+        assert!(encode_contact_list(&ipv4).len() <= MAX_CONTACT_LIST_BYTES);
+
+        // The wider case the cap is actually sized for. The encoder's own byte
+        // budget stops it well short, which is the point: the cap bounds the
+        // format, not the datagram, so it stays correct if the budget changes.
+        let ipv6: Vec<EmberContact> = (1u8..=MAX_CONTACTS_PER_RESPONSE as u8)
+            .map(|i| test_contact(i, &format!("[2001:db8::{i:x}]:{}", 1000 + i as u16), i))
+            .collect();
+        let encoded = encode_contact_list(&ipv6);
+        assert!(
+            encoded.len() <= MAX_CONTACT_LIST_BYTES,
+            "an IPv6 list encodes to {} bytes, over the {MAX_CONTACT_LIST_BYTES} the \
+             friend path accepts",
+            encoded.len()
+        );
+        assert_eq!(
+            MAX_CONTACT_LIST_BYTES,
+            1 + MAX_CONTACTS_PER_RESPONSE * (CONTACT_WIRE_LEN_IPV4 + 12),
+            "an IPv6 contact is twelve bytes wider than an IPv4 one"
+        );
+    }
+
     #[test]
     fn contact_list_rejects_truncation() {
         let good = test_contact(22, "9.9.9.9:1111", 0x01);
@@ -2401,6 +2460,25 @@ mod tests {
         assert!(
             decode_payload(MSG_FIND_VALUE, &full[..full.len() - 2]).is_err(),
             "an absent position must not decode as zero"
+        );
+    }
+
+    /// A lookup for nothing. No builder here can produce one, and the engine
+    /// reads `keys[0]` as the key to serve — with nothing to fall back on but
+    /// its own id, so an empty request was answered with our closest contacts
+    /// to ourselves. That is a `FIND_NODE` wearing another opcode, and it
+    /// belongs in the decoder's refusals with every other malformed frame.
+    #[test]
+    fn a_find_value_with_no_keys_is_refused() {
+        let (_, id) = test_keypair();
+        let one_key = encode_payload(&build_find_value(id, 1, vec![[0xA1; 16]], 0).payload);
+        assert!(decode_payload(MSG_FIND_VALUE, &one_key).is_ok());
+
+        // The same frame with its key run removed: count 0, then the position.
+        let empty = [0u8, 0u8, 0u8];
+        assert!(
+            decode_payload(MSG_FIND_VALUE, &empty).is_err(),
+            "a keyless FIND_VALUE must not decode"
         );
     }
 

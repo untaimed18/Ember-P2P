@@ -235,6 +235,22 @@ impl BootstrapCache {
         self.offered.iter().filter(|id| held_leads.contains(id)).count()
     }
 
+    /// How many addresses the book holds.
+    ///
+    /// The network loop's maintenance gate reads this. That gate asks whether
+    /// there is anything worth running a cycle for, and it used to ask only
+    /// about live state — routing contacts, session contacts, cached Noise
+    /// keys, keyless eD2K peers, a fresh friend session. A remembered address
+    /// is none of those and is exactly what a cycle would act on: both the
+    /// top-up that offers this book to the table and the
+    /// [`Self::rearm_offers`] that makes a spent book offerable again run
+    /// *inside* the cycle. So a node that lost all its live state kept an
+    /// address book it could no longer reach, which is the restart-only
+    /// ratchet this whole module exists to break.
+    pub fn remembered_len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Allow every remembered address to be offered to the table again.
     ///
     /// `offered` otherwise only grows, and once the book has been walked
@@ -549,6 +565,42 @@ mod tests {
             1,
             "only the address the table actually took owes a miss"
         );
+    }
+
+    /// The maintenance gate in the network loop asks the book whether a cycle
+    /// is worth running, and the case that matters is the one where every other
+    /// signal has already gone: contacts faulted out, the Noise-key cache
+    /// expired, the eD2K side quiet. The book has to keep saying it remembers
+    /// someone even after its entries have been offered and nobody answered —
+    /// reporting "empty" there is what left a node dark until it was restarted,
+    /// holding a perfectly good address book it could no longer reach.
+    #[test]
+    fn a_spent_book_still_reports_that_it_remembers_someone() {
+        let mut cache = cache_started_at(1_000);
+        let local = EmberNodeId([0; 16]);
+        cache.load(
+            (1..=3)
+                .map(|i| CachedContact::new(contact(i, 900)))
+                .collect(),
+        );
+        assert_eq!(cache.remembered_len(), 3);
+
+        let batch = cache.seed_batch(&local, &HashSet::new(), 3);
+        cache.note_offered(batch.iter().map(|c| c.node_id));
+        assert!(
+            cache.seed_batch(&local, &HashSet::new(), 3).is_empty(),
+            "the offers are spent"
+        );
+        assert_eq!(
+            cache.remembered_len(),
+            3,
+            "but a spent book is not an empty one, and the gate reads this"
+        );
+
+        // Which is what makes the re-arm reachable at all: the cycle that calls
+        // it only runs because the gate above stayed open.
+        cache.rearm_offers();
+        assert_eq!(cache.seed_batch(&local, &HashSet::new(), 3).len(), 3);
     }
 
     /// Re-arming must not throw away the record of what we tried. It fires when

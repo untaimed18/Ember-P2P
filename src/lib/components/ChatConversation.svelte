@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { getChatMessages, sendChatMessage, markMessagesRead, isChatLocked, type ChatMessage } from '$lib/api/friends';
+  import { getChatMessages, sendChatMessage, sendChatTyping, markMessagesRead, isChatLocked, type ChatMessage } from '$lib/api/friends';
   import {
     deleteChannelMessage,
     getChannelMessages,
@@ -135,6 +135,9 @@
   // drops inbound and refuses outbound chat, so reflect that in the UI rather
   // than letting the user type into a textarea whose sends will be rejected.
   let chatDisabled = $derived(!isChannel && $appSettings?.friend_chat_disabled === true);
+  let showReadReceipts = $derived(
+    !isChannel && $appSettings?.friend_chat_read_receipts !== false,
+  );
   let chatLocked = $state(false);
 
   $effect(() => {
@@ -144,8 +147,14 @@
         .then((locked) => {
           if (!cancelled) chatLocked = locked;
         })
-        .catch(() => {
-          if (!cancelled) chatLocked = false;
+        .catch((e) => {
+          // Fail closed. This asks the backend whether chat history is sealed
+          // because its key could not be recovered; treating an unanswered
+          // question as "not sealed" unlocked the composer in exactly the
+          // situation where every send fails, and suppressed the warning that
+          // explains why.
+          console.error('Chat: could not determine chat-lock state', e);
+          if (!cancelled) chatLocked = true;
         });
     });
     return () => {
@@ -169,6 +178,24 @@
   const MAX_LIVE_MESSAGES = MAX_LOADED_MESSAGES;
 
   let messages: ConvMessage[] = $state([]);
+  // One read-receipt eye on the newest opened outbound line, not a mark on
+  // every earlier bubble the watermark covers.
+  let lastSeenSentId = $derived(
+    messages.reduce((best, message) => {
+      if (message.direction === 'sent' && message.seen && message.id > best) return message.id;
+      return best;
+    }, 0),
+  );
+  // One "Sent" on the newest delivered outbound line. Queued/failed keep
+  // their own per-bubble captions so a later send does not hide them.
+  let lastDeliveredSentId = $derived(
+    messages.reduce((best, message) => {
+      if (message.direction === 'sent' && message.delivery === 'delivered' && message.id > best) {
+        return message.id;
+      }
+      return best;
+    }, 0),
+  );
   let inputText = $state('');
   let loading = $state(false);
   let sending = $state(false);
@@ -183,6 +210,14 @@
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
   let unlistenDelivery: UnlistenFn | null = null;
+  let unlistenTyping: UnlistenFn | null = null;
+  let unlistenRead: UnlistenFn | null = null;
+  let friendTyping = $state(false);
+  let typingHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastTypingSentOn = false;
+  let lastTypingSentAt = 0;
+  const TYPING_REFRESH_MS = 2000;
+  const TYPING_HOLD_MS = 5000;
   let removingMessage = $state<number | null>(null);
   let loadGen = 0;
   let msgIdCounter = 0;
@@ -223,6 +258,7 @@
       timestamp: row.timestamp,
       read: row.read,
       delivery: 'delivered',
+      seen: false,
       sender_pubkey: row.sender_pubkey,
       edited_at: row.edited_at,
       msg_id: row.msg_id,
@@ -463,6 +499,8 @@
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+      if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
+      if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       messages = [];
       earlyDeliveredIds.clear();
       loadError = null;
@@ -503,8 +541,21 @@
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+      if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
+      if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       if (key) setDraft(key, inputText);
-      if (!channel) activeChatHash.set(null);
+      if (!channel) {
+        if (lastTypingSentOn) {
+          lastTypingSentOn = false;
+          void sendChatTyping(friend, false).catch(() => {});
+        }
+        activeChatHash.set(null);
+      }
+      friendTyping = false;
+      if (typingHoldTimer) {
+        clearTimeout(typingHoldTimer);
+        typingHoldTimer = null;
+      }
     };
   });
 
@@ -512,6 +563,8 @@
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
+    if (unlistenRead) { unlistenRead(); unlistenRead = null; }
     if (channel) {
       let fn: UnlistenFn;
       try {
@@ -538,6 +591,7 @@
             timestamp: event.payload.timestamp,
             read: true,
             delivery: 'delivered',
+            seen: false,
             sender_pubkey: event.payload.sender_pubkey,
             edited_at: event.payload.edited_at ?? 0,
             msg_id: event.payload.msg_id,
@@ -558,9 +612,20 @@
     }
     let fn: UnlistenFn;
     try {
-      fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
+      fn = await listen<{ user_hash: string; id?: number; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
+        // Narrow the direction rather than asserting it (as `stores/friends.ts`
+        // does): an unrecognised value would otherwise be cast straight into a
+        // bubble while skipping the dedup and unread paths, both of which
+        // branch on it being exactly 'sent' or 'received'.
+        const direction: 'sent' | 'received' | null =
+          event.payload.direction === 'sent'
+            ? 'sent'
+            : event.payload.direction === 'received'
+              ? 'received'
+              : null;
+        if (direction === null) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
           // message. Compare the content tuple against the recent tail (a
@@ -572,28 +637,31 @@
           // genuinely distinct messages that share a whole-second timestamp.
           // `handleSend` deliberately renders nothing for a delivered message
           // and relies on this echo, so a collapsed one is lost until reload.
-          const sig = `${event.payload.timestamp}|${event.payload.direction}|${event.payload.message}`;
+          const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
           const isDuplicate =
-            event.payload.direction === 'received' &&
+            direction === 'received' &&
             messages
               .slice(-5)
               .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
           if (isDuplicate) return;
+          if (direction === 'received') setFriendTyping(false);
           const wasPinned = isPinnedToBottom();
+          const durableId = event.payload.id;
           const next = [...messages, {
-            id: --msgIdCounter,
-            direction: event.payload.direction as 'sent' | 'received',
+            id: typeof durableId === 'number' && durableId > 0 ? durableId : --msgIdCounter,
+            direction,
             message: event.payload.message,
             timestamp: event.payload.timestamp,
             read: true,
             delivery: 'delivered' as const,
+            seen: false,
           }];
-          commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
-          noteMissedMessage(wasPinned, event.payload.direction);
+          commitLiveMessages(next, direction === 'sent' || wasPinned);
+          noteMissedMessage(wasPinned, direction);
           // Only acknowledge what the user can actually see. A mounted
           // conversation in a minimized window would otherwise mark the
           // message read and suppress its badge, losing it entirely.
-          if (event.payload.direction === 'received' && isAppVisible()) {
+          if (direction === 'received' && isAppVisible()) {
             markAsRead();
           }
       });
@@ -635,6 +703,45 @@
     } catch (e) {
       // Non-fatal: bubbles stay marked queued until the pane is reopened.
       console.warn('ChatConversation: failed to register delivery listener', e);
+    }
+
+    try {
+      const typingFn = await listen<{ user_hash: string; typing: boolean }>(
+        'ember:chat-typing',
+        (event) => {
+          if (gen !== loadGen) return;
+          if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
+          setFriendTyping(event.payload.typing);
+        },
+      );
+      if (gen !== loadGen) { typingFn(); return true; }
+      unlistenTyping = typingFn;
+    } catch (e) {
+      console.warn('ChatConversation: failed to register typing listener', e);
+    }
+
+    try {
+      const readFn = await listen<{ user_hash: string; until_id: number }>(
+        'ember:chat-read',
+        (event) => {
+          if (gen !== loadGen) return;
+          if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
+          const until = event.payload.until_id;
+          if (typeof until !== 'number' || until <= 0) return;
+          messages = messages.map((message) =>
+            message.direction === 'sent'
+            && message.id > 0
+            && message.id <= until
+            && message.delivery === 'delivered'
+              ? { ...message, seen: true }
+              : message,
+          );
+        },
+      );
+      if (gen !== loadGen) { readFn(); return true; }
+      unlistenRead = readFn;
+    } catch (e) {
+      console.warn('ChatConversation: failed to register read-receipt listener', e);
     }
     return true;
   }
@@ -782,6 +889,8 @@
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
+    if (unlistenRead) { unlistenRead(); unlistenRead = null; }
     liveError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
@@ -810,12 +919,71 @@
     }
   }
 
+  function setFriendTyping(on: boolean) {
+    const was = friendTyping;
+    friendTyping = on;
+    if (typingHoldTimer) {
+      clearTimeout(typingHoldTimer);
+      typingHoldTimer = null;
+    }
+    if (on) {
+      typingHoldTimer = setTimeout(() => {
+        friendTyping = false;
+        typingHoldTimer = null;
+      }, TYPING_HOLD_MS);
+      if (!was && isPinnedToBottom()) scrollToBottom();
+    }
+  }
+
+  function sendOutgoingTyping(on: boolean) {
+    if (isChannel || !friendHash || chatDisabled || chatLocked) return;
+    lastTypingSentOn = on;
+    lastTypingSentAt = Date.now();
+    void sendChatTyping(friendHash, on).catch(() => {});
+  }
+
+  function notifyOutgoingTyping(text = inputText) {
+    // The backend drops this when there is no live session. Gating on the
+    // UI online set used to swallow composing entirely: that store can lag
+    // the session (or miss a friend-online event), while chat still delivers.
+    if (isChannel || chatDisabled || chatLocked) return;
+    const on = text.trim().length > 0;
+    if (!on) {
+      if (lastTypingSentOn) sendOutgoingTyping(false);
+      return;
+    }
+    const now = Date.now();
+    if (!lastTypingSentOn || now - lastTypingSentAt >= TYPING_REFRESH_MS) {
+      sendOutgoingTyping(true);
+    }
+  }
+
+  function stopOutgoingTyping() {
+    if (lastTypingSentOn) sendOutgoingTyping(false);
+  }
+
+  $effect(() => {
+    if (isOnline) return;
+    // A typing packet is itself proof they are composing. Do not subscribe
+    // to the hold timer here: writing it from `setFriendTyping` would
+    // re-run this effect and immediately clear the indicator whenever the
+    // UI still thought they were offline.
+    untrack(() => {
+      friendTyping = false;
+      if (typingHoldTimer) {
+        clearTimeout(typingHoldTimer);
+        typingHoldTimer = null;
+      }
+    });
+  });
+
   // Messages that arrived while the window was hidden were deliberately left
   // unread; clear them once the user actually comes back to the conversation.
   $effect(() => {
     if (typeof document === 'undefined') return;
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') void markAsRead();
+      else stopOutgoingTyping();
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -1002,6 +1170,7 @@
           timestamp: Math.floor(Date.now() / 1000),
           read: true,
           delivery: alreadyDelivered ? 'delivered' as const : 'queued' as const,
+          seen: false,
         }];
       } else if (alreadyDelivered && messages[existing].delivery === 'queued') {
         const next = [...messages];
@@ -1066,6 +1235,7 @@
     const key = conversationKey;
     sending = true;
     sendError = null;
+    stopOutgoingTyping();
     try {
       if (channel) {
         const sent = await sendChannelMessage(channel, text);
@@ -1118,7 +1288,20 @@
       // `sending` is the editor's state, not tied to a friend — always release
       // it so the (possibly newly-active) conversation's input is usable.
       sending = false;
+      // A disabled/readonly composer (and a clicked Send button) drop the
+      // caret; put it back so the next message can be typed without a click.
+      const stillHere = channel ? channel === channelId : h === friendHash;
+      if (stillHere) {
+        void tick().then(() => focusComposer());
+      }
     }
+  }
+
+  function focusComposer() {
+    if (youAreBanned || youAreKeyBehind || chatDisabled || chatLocked) return;
+    const el = chatInputEl;
+    if (!el || el.disabled) return;
+    el.focus();
   }
 
   /** Forget one message on this device only. The protocol has no redaction, so
@@ -1432,35 +1615,24 @@
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
+    if (unlistenRead) { unlistenRead(); unlistenRead = null; }
+    if (typingHoldTimer) { clearTimeout(typingHoldTimer); typingHoldTimer = null; }
+    if (lastTypingSentOn && friendHash) {
+      void sendChatTyping(friendHash, false).catch(() => {});
+    }
     if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
     if (reactionPulseTimer) { clearTimeout(reactionPulseTimer); reactionPulseTimer = null; }
   });
 </script>
 
-{#snippet messageTimestamp(msg: ConvMessage, pending: boolean, failed: boolean)}
+{#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
     {formatTime(msg.timestamp)}
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}
       </span>
-    {/if}
-    {#if pending}
-      <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
-    {:else if failed}
-      <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
-      {#if !isChannel}
-        <button
-          class="bubble-resend"
-          type="button"
-          disabled={resendingId !== null || sending || chatDisabled || chatLocked}
-          onclick={() => resendMessage(msg)}
-          title={m.chat_resend()}
-          aria-label={m.chat_resend()}
-        >
-          {resendingId === msg.id ? m.chat_loading_short() : m.chat_resend()}
-        </button>
-      {/if}
     {/if}
   </div>
 {/snippet}
@@ -1554,6 +1726,8 @@
         {/if}
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
+        {@const showSeen = row.msg.direction === 'sent' && row.msg.seen && showReadReceipts && row.msg.id === lastSeenSentId}
+        {@const showSent = row.msg.direction === 'sent' && row.msg.delivery === 'delivered' && row.msg.id === lastDeliveredSentId && !showSeen}
         <div
           class="conv-msg"
           class:sent={row.msg.direction === 'sent'}
@@ -1630,7 +1804,7 @@
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
-            {@render messageTimestamp(row.msg, pending, failed)}
+            {@render messageTimestamp(row.msg)}
           {/if}
           <!-- Channels only, and only for rows the DB can actually address:
                live bubbles carry negative synthetic ids. -->
@@ -1731,12 +1905,48 @@
                 </div>
                 {/if}
               {/if}
-              {@render messageTimestamp(row.msg, pending, failed)}
+              {@render messageTimestamp(row.msg)}
             </div>
           {/if}
         </div>
+        {#if !isChannel && (pending || failed || showSeen || showSent)}
+          <div class="bubble-status">
+            {#if pending}
+              <span title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+            {:else if failed}
+              <span class="failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+              <button
+                class="bubble-resend"
+                type="button"
+                disabled={resendingId !== null || sending || chatDisabled || chatLocked}
+                onclick={() => resendMessage(row.msg)}
+                title={m.chat_resend()}
+                aria-label={m.chat_resend()}
+              >
+                {resendingId === row.msg.id ? m.chat_loading_short() : m.chat_resend()}
+              </button>
+            {:else if showSeen}
+              <span class="bubble-seen" title={m.chat_seen_title()} aria-label={m.chat_seen()} role="img">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                  <path d="M1.5 8s2.6-4.5 6.5-4.5S14.5 8 14.5 8s-2.6 4.5-6.5 4.5S1.5 8 1.5 8z"/>
+                  <circle class="bubble-seen-pupil" cx="8" cy="8" r="1.85"/>
+                </svg>
+              </span>
+            {:else}
+              <span title={m.chat_delivery_sent_title()}>{m.chat_delivery_sent()}</span>
+            {/if}
+          </div>
+        {/if}
         </div>
       {/each}
+    {/if}
+    {#if friendTyping && !isChannel && !loading && !loadError}
+      <div class="conv-msg received conv-typing-row">
+        <div class="conv-typing" role="status" aria-live="polite">
+          {m.chat_typing({ name: friendName || friendHash.slice(0, 8) })}
+          <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+        </div>
+      </div>
     {/if}
     <div bind:this={messagesEnd}></div>
   </div>
@@ -1800,14 +2010,17 @@
         bind:value={inputText}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
-        oninput={refreshMentionToken}
+        oninput={(e) => {
+          refreshMentionToken();
+          notifyOutgoingTyping(e.currentTarget.value);
+        }}
         onclick={refreshMentionToken}
         onkeyup={refreshMentionToken}
         onblur={() => (mentionStart = -1)}
         placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
         maxlength="4096"
         rows="2"
-        disabled={sending}
+        readonly={sending}
       ></textarea>
       {#if slowModeLeft > 0}
         <!-- Polite: it changes every second, and a live region that asserted
@@ -1816,7 +2029,19 @@
           {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
         </span>
       {/if}
-      <button type="button" class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending || slowModeLeft > 0} title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
+      <button
+        type="button"
+        class="conv-send"
+        onclick={handleSend}
+        onmousedown={(e) => {
+          // Keep the caret in the composer; a click would otherwise move
+          // focus to this button (and then lose it when the button disables).
+          e.preventDefault();
+        }}
+        disabled={!inputText.trim() || sending || slowModeLeft > 0}
+        title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
+        aria-label={m.chat_send_aria()}
+      >
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
@@ -1950,6 +2175,7 @@
 
   .conv-messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 16px;
     display: flex;
@@ -2372,9 +2598,12 @@
     flex-shrink: 0;
   }
 
-  .conversation.channel .conv-bubble.sent .bubble-time,
-  .conversation.channel .conv-bubble.sent .bubble-edited {
-    color: color-mix(in srgb, var(--on-accent) 88%, transparent);
+  /* Sent bubbles are filled with `--accent`; muted gray on that fill is
+     unreadable. Use the same on-accent ink as the message body (white in
+     light theme, dark in dark theme). */
+  .conv-bubble.sent .bubble-time,
+  .conv-bubble.sent .bubble-edited {
+    color: var(--on-accent);
   }
 
   .bubble-meta {
@@ -2393,18 +2622,36 @@
     margin-inline-start: auto;
   }
 
-  /* Sits inside the timestamp line so a queued message reads as "sent at X,
-     not yet delivered" rather than as a separate error state. */
-  .bubble-delivery {
-    margin-left: 6px;
+  /* Delivery captions (queued / sent / seen) share one slot under the
+     trailing corner of a friend bubble, on the transcript surface. */
+  .bubble-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+    font-size: 10px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
+    line-height: 1.2;
+    color: var(--text-muted);
   }
 
-  .bubble-delivery.failed {
+  .bubble-status .failed {
     color: var(--danger);
-    opacity: 1;
+  }
+
+  .bubble-seen {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .bubble-seen svg {
+    display: block;
+  }
+
+  .bubble-seen-pupil {
+    fill: var(--text-primary);
+    stroke: none;
   }
 
   /* Edit and remove share one hover-revealed cluster so they cannot overlap each
@@ -2488,7 +2735,7 @@
   }
 
   .bubble-edit-btn:hover {
-    background: rgb(0 0 0 / 18%);
+    background: color-mix(in srgb, currentColor 16%, transparent);
   }
 
   /* An edit marker belongs with the timestamp, not the text: it is metadata about
@@ -2789,12 +3036,12 @@
     color: color-mix(in srgb, var(--reaction-gold) 65%, var(--text-primary));
   }
 
-  /* Resend sits inside the timestamp line of its own bubble, so it reads as
-     part of the failure notice rather than a general-purpose action. Always
-     visible (unlike `.bubble-remove`, which is hover-revealed): a message that
-     did not arrive is exactly the case where the remedy should not be hidden. */
+  /* Resend sits beside the failure caption under its own bubble, so it
+     reads as part of the failure notice rather than a general-purpose
+     action. Always visible (unlike `.bubble-remove`, which is hover-revealed):
+     a message that did not arrive is exactly the case where the remedy
+     should not be hidden. */
   .bubble-resend {
-    margin-inline-start: 6px;
     padding: 0 5px;
     border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
     border-radius: 4px;
@@ -2866,6 +3113,43 @@
     font-size: 12.5px;
     text-align: center;
     flex-shrink: 0;
+  }
+
+  .conv-typing {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px;
+    color: var(--text-muted);
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .conv-typing-row {
+    align-self: flex-start;
+    max-width: 80%;
+  }
+
+  .conv-typing-dots {
+    display: inline-flex;
+    gap: 3px;
+    align-items: center;
+  }
+
+  .conv-typing-dots span {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: conv-typing-bounce 1.2s infinite ease-in-out;
+  }
+
+  .conv-typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .conv-typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes conv-typing-bounce {
+    0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-2px); }
   }
 
   .conv-input-area {

@@ -573,6 +573,14 @@ async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_
 /// Files whose basename isn't a valid UUID are ignored — only Ember-
 /// created part files use UUID basenames, so user-managed files in the
 /// same folder are never touched.
+///
+/// Must stay on the caller's task rather than being spawned off it, even
+/// though it walks a directory and deletes files. `known_ids` is a snapshot
+/// taken just before the call, and it is the only thing standing between this
+/// sweep and a live download's `.part`. Detached, the sweep would still be
+/// walking Temp while the loop accepted a download whose id postdates that
+/// snapshot — and it would delete that file out from under the worker writing
+/// it. The startup gate this runs behind exists to keep the two ordered.
 pub async fn sweep_orphan_part_files(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,
@@ -587,6 +595,21 @@ pub async fn sweep_orphan_part_files(
         Err(e) => {
             tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
             return;
+        }
+    };
+    // Read once, up front, instead of querying per file. This runs inline on
+    // the network task's startup gate, so a Temp directory full of stale
+    // partials used to mean thousands of blocking queries before the loop
+    // could accept its first connection. On failure the set is empty and the
+    // sweep falls back to `known_ids` alone, which is the conservative
+    // direction only in that it may leave an orphan behind for one more run —
+    // never that it deletes a partial a live download still owns, because
+    // those ids are in `known_ids`.
+    let owns_partial = match db.incomplete_downloads_owning_partials() {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::warn!("Orphan sweep: could not read owned partials; skipping DB check ({e})");
+            std::collections::HashSet::new()
         }
     };
     let mut swept_part: u32 = 0;
@@ -612,7 +635,7 @@ pub async fn sweep_orphan_part_files(
             // Not an Ember-managed file; leave it alone.
             continue;
         }
-        if known_ids.contains(uuid_str) || db.incomplete_download_owns_partial(uuid_str) {
+        if known_ids.contains(uuid_str) || owns_partial.contains(uuid_str) {
             skipped_known += 1;
             continue;
         }
@@ -1182,6 +1205,8 @@ pub async fn cancel_transfers_batch(
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut pending_acks = Vec::with_capacity(transfer_ids.len());
     let mut cancelled_ids = Vec::with_capacity(transfer_ids.len());
+    let mut history_rows: Vec<(String, String, u64, &str)> =
+        Vec::with_capacity(transfer_ids.len());
     let mut teardown_failures = 0usize;
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
@@ -1197,17 +1222,9 @@ pub async fn cancel_transfers_batch(
             (manager.cancel(&transfer_id), info)
         };
         if let Some((file_hash, file_name, file_size)) = cancelled_info {
-            let db = state.db.clone();
-            db_blocking(move || {
-                if let Err(e) =
-                    db.record_download_history(&file_hash, &file_name, file_size, "cancelled")
-                {
-                    tracing::warn!(
-                        "Failed to record cancelled download history for {file_hash}: {e}"
-                    );
-                }
-            })
-            .await;
+            // Collected rather than written here: one transaction for the whole
+            // batch below, instead of one fsync per cancelled transfer.
+            history_rows.push((file_hash, file_name, file_size, "cancelled"));
         }
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
@@ -1262,19 +1279,27 @@ pub async fn cancel_transfers_batch(
         let config = state.config.read().await;
         config.settings.download_folder.clone()
     };
+    // Both writes go out as one transaction each, before the file cleanup: the
+    // rows are what stop a cancelled download resurrecting on the next launch,
+    // and per-row writes interleaved with per-row disk deletes held the shared
+    // connection mutex across the whole loop.
+    {
+        let db = state.db.clone();
+        let rows = history_rows;
+        let ids = cancelled_ids.clone();
+        db_blocking(move || {
+            if let Err(e) = db.record_download_history_batch(&rows) {
+                tracing::warn!("Failed to record cancelled download history: {e}");
+            }
+            if let Err(e) = db.remove_transfers(&ids) {
+                tracing::warn!("Failed to remove cancelled transfers from database: {e}");
+            }
+        })
+        .await;
+    }
     for transfer_id in cancelled_ids {
         cleanup_partial_files(&dl_folder, &transfer_id).await;
         spawn_deferred_partial_cleanup(dl_folder.clone(), transfer_id.clone());
-        {
-            let db = state.db.clone();
-            let tid = transfer_id.clone();
-            db_blocking(move || {
-                if let Err(e) = db.remove_transfer(&tid) {
-                    tracing::warn!("Failed to remove transfer {tid} from database: {e}");
-                }
-            })
-            .await;
-        }
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
@@ -1312,13 +1337,22 @@ pub async fn pause_transfer(
         // frontend zeroes the row's speed on a paused/stopped status event.
         emit_transfer_status(&app, &transfer_id, status);
     }
-    let _ = bounded_send(
+    // The control above is already paused *and* cancelled, so the worker and
+    // its detached per-source tasks stop cooperatively; this command is the
+    // hard-abort backstop. Dropping its error silently hid the one condition
+    // worth seeing here — a network task that cannot accept commands at all.
+    if let Err(e) = bounded_send(
         &state.network_tx,
         NetworkCommand::PauseDownload {
             transfer_id: transfer_id.clone(),
         },
     )
-    .await;
+    .await
+    {
+        tracing::warn!(
+            "pause_transfer: could not reach the network task for {transfer_id}; the transfer is paused locally but its worker was not hard-aborted ({e})"
+        );
+    }
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -1342,14 +1376,21 @@ pub async fn stop_transfer(
     // Reflect the Stop in the UI immediately (eMule CPartFile::StopFile updates
     // synchronously); otherwise the row lingers as Active until the next poll.
     emit_transfer_status(&app, &transfer_id, &TransferStatus::Stopped);
-    let _ = bounded_send(
+    // As in `pause_transfer`: the control is already cancelled, so this is the
+    // hard-abort backstop and its failure is worth a line rather than nothing.
+    if let Err(e) = bounded_send(
         &state.network_tx,
         NetworkCommand::CancelDownload {
             transfer_id: transfer_id.clone(),
             cleanup_ack: None,
         },
     )
-    .await;
+    .await
+    {
+        tracing::warn!(
+            "stop_transfer: could not reach the network task for {transfer_id}; the transfer is stopped locally but its worker was not hard-aborted ({e})"
+        );
+    }
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -1618,17 +1659,14 @@ pub async fn cancel_transfer(
     }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (_, dl_folder) = tokio::join!(
-        async {
-            let _ = bounded_send(
-                &state.network_tx,
-                NetworkCommand::CancelDownload {
-                    transfer_id: transfer_id.clone(),
-                    cleanup_ack: Some(ack_tx),
-                },
-            )
-            .await;
-        },
+    let (send_result, dl_folder) = tokio::join!(
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            },
+        ),
         async {
             let config = state.config.read().await;
             config.settings.download_folder.clone()
@@ -1638,14 +1676,25 @@ pub async fn cancel_transfer(
     // delete the partials. On timeout / closed channel we still proceed
     // (best-effort cleanup), but log it: deleting while the task may still
     // hold a handle is the race this ack exists to avoid.
-    match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => tracing::warn!(
-            "Cancel cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
-        ),
-        Err(_) => tracing::warn!(
-            "Timed out waiting for cancel cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
-        ),
+    //
+    // A send that never landed is reported as itself rather than as a closed
+    // ack channel: the ack sender went out with the undelivered command, so
+    // awaiting it would only mint a misleading "channel closed" line.
+    // `cancel_transfers_batch` already distinguishes the two.
+    if let Err(e) = send_result {
+        tracing::warn!(
+            "cancel_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
+        );
+    } else {
+        match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => tracing::warn!(
+                "Cancel cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
+            ),
+            Err(_) => tracing::warn!(
+                "Timed out waiting for cancel cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
+            ),
+        }
     }
     cleanup_partial_files(&dl_folder, &transfer_id).await;
     spawn_deferred_partial_cleanup(dl_folder, transfer_id.clone());
@@ -1687,17 +1736,14 @@ pub async fn remove_transfer(
     };
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (_, dl_folder) = tokio::join!(
-        async {
-            let _ = bounded_send(
-                &state.network_tx,
-                NetworkCommand::CancelDownload {
-                    transfer_id: transfer_id.clone(),
-                    cleanup_ack: Some(ack_tx),
-                },
-            )
-            .await;
-        },
+    let (send_result, dl_folder) = tokio::join!(
+        bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            },
+        ),
         async {
             let config = state.config.read().await;
             config.settings.download_folder.clone()
@@ -1706,15 +1752,22 @@ pub async fn remove_transfer(
     // Wait for the network task to confirm it released the file before we
     // delete the partials (best-effort on timeout/closed channel, but log the
     // race window — deleting while the task may still hold a handle is exactly
-    // what this ack exists to avoid).
-    match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => tracing::warn!(
-            "Remove cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
-        ),
-        Err(_) => tracing::warn!(
-            "Timed out waiting for remove cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
-        ),
+    // what this ack exists to avoid). An undelivered command is reported as
+    // itself; see `cancel_transfer`.
+    if let Err(e) = send_result {
+        tracing::warn!(
+            "remove_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
+        );
+    } else {
+        match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => tracing::warn!(
+                "Remove cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
+            ),
+            Err(_) => tracing::warn!(
+                "Timed out waiting for remove cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
+            ),
+        }
     }
     let db = state.db.clone();
     let tid = transfer_id.clone();
@@ -2087,14 +2140,21 @@ pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, S
         config.settings.download_folder.clone()
     };
 
-    let db = state.db.clone();
-    for id in &ids {
-        let db_ref = db.clone();
-        let tid = id.clone();
+    // One transaction for every row, then the disk cleanup. The per-row loop
+    // this replaces had no batch-size cap of its own, so clearing a long
+    // completed list issued that many transactions — and that many fsyncs —
+    // back to back on the connection mutex the network task also waits on.
+    {
+        let db = state.db.clone();
+        let ids = ids.clone();
         db_blocking(move || {
-            let _ = db_ref.remove_transfer(&tid);
+            if let Err(e) = db.remove_transfers(&ids) {
+                tracing::warn!("Failed to clear completed transfers from database: {e}");
+            }
         })
         .await;
+    }
+    for id in &ids {
         cleanup_partial_files(&dl_folder, id).await;
     }
     Ok(count)

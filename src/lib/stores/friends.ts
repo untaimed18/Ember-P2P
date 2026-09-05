@@ -10,7 +10,7 @@ import {
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
-import { toastError } from '$lib/stores/toast';
+import { toastError, toastSuccess } from '$lib/stores/toast';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
@@ -294,6 +294,30 @@ export async function initFriendsStore() {
         if (!hash) return;
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
+      }),
+    );
+    registered.push(
+      await listen<{ sender_hash: string }>('ember:friend-request-withdrawn', (event) => {
+        const hash = validFriendHash(event.payload?.sender_hash);
+        if (!hash) return;
+        // They cancelled before we answered, so the card goes without comment —
+        // there is nothing left to accept and nothing for the user to decide.
+        friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
+        scheduleFriendRequestRefetch();
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string; nickname?: string }>('ember:friend-auto-confirmed', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        // They accepted an add we initiated, so the friendship completed
+        // without asking us. Drop any leftover request row from the old
+        // path that queued that accept, then say what happened — otherwise
+        // the reply the user was waiting for arrives with no sign at all.
+        friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
+        scheduleFriendRequestRefetch();
+        const name = safeEventText(event.payload?.nickname, 128) || `${hash.slice(0, 8)}\u2026`;
+        toastSuccess(m.friends_auto_confirmed({ name }));
       }),
     );
     registered.push(

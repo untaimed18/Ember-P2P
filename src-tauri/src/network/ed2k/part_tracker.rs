@@ -546,6 +546,26 @@ impl PartTracker {
         self.gaps.is_empty()
     }
 
+    /// Every byte is present *and* no source still holds a claim on a part.
+    ///
+    /// [`Self::all_complete`] is a byte-level question, and the bytes of a
+    /// part whose MD4 has just failed are all present — they are simply
+    /// wrong. The gap only reappears once the mismatch handler runs, and
+    /// between those two moments sits an AICH round-trip over the network. A
+    /// parent that decides the file is finished on `all_complete` alone
+    /// therefore aborts the very task that was about to repair the part, and
+    /// the corruption surfaces later as a failed whole-file verification and
+    /// a full re-download instead of a ~180 KiB re-fetch.
+    ///
+    /// The claim is the honest signal: the source holds it across the hash
+    /// and the recovery, and it is released by `InProgressGuard` however the
+    /// task exits. Deliberately a second predicate rather than a change to
+    /// `all_complete`, whose other callers — per-source exit, preview gating,
+    /// finalize-after-join — genuinely want the byte-level answer.
+    pub fn all_complete_and_settled(&self) -> bool {
+        self.all_complete() && self.in_progress_part_count() == 0
+    }
+
     pub fn completed_count(&self) -> usize {
         (0..self.part_count)
             .filter(|&i| self.is_part_complete(i))
@@ -1911,6 +1931,39 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// A part whose MD4 has just failed still has every byte on disk, so the
+    /// file looks byte-complete for the whole of the source's AICH recovery
+    /// round-trip. The parent must not read that as "finished" and abort the
+    /// source that is mid-repair, so the abort decision asks whether the
+    /// tracker is *settled* rather than merely gap-free.
+    #[test]
+    fn a_part_still_claimed_by_a_source_is_not_settled() {
+        let part_path = temp_part_path("settled");
+        let file_size = PARTSIZE * 2;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.fill_range(0, file_size);
+
+        // The source that filled the last part is still holding it while it
+        // hashes and then waits on AICH.
+        tracker.claim_in_progress(1);
+        assert!(
+            tracker.all_complete(),
+            "every byte is present — that is what makes this the trap"
+        );
+        assert!(
+            !tracker.all_complete_and_settled(),
+            "a part under an outstanding claim must not count as finished"
+        );
+
+        tracker.release_in_progress(1);
+        assert!(
+            tracker.all_complete_and_settled(),
+            "once the claim is released the file really is done"
+        );
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }

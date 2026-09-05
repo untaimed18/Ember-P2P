@@ -10,7 +10,13 @@
   import { totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
-  import { navItems, navIndexFromShortcutEvent, navShortcutDigit, type NavItem } from '$lib/navItems';
+  import {
+    navItems,
+    navIndexFromShortcutEvent,
+    navShortcutDigit,
+    visibleNavItems,
+    type NavItem,
+  } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { appSettings } from '$lib/stores/settings';
   import { onMount } from 'svelte';
@@ -18,11 +24,9 @@
   let aboutOpen = $state(false);
   let shortcutsOpen = $state(false);
   let shareOpen = $state(false);
-  let visibleNav = $derived(
-    $appSettings?.ember_native_enabled === false
-      ? navItems.filter((item) => item.id !== 'channels')
-      : navItems,
-  );
+  // Shared with the keyboard cheat-sheet so Alt+N is numbered against the
+  // list the user can actually see.
+  let visibleNav = $derived(visibleNavItems($appSettings?.ember_native_enabled));
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -210,17 +214,25 @@
     // could navigate away behind a confirm/close prompt or stack the shortcuts
     // sheet under it. The chat dock uses role="complementary" (not a modal),
     // so shortcuts intentionally keep working alongside it.
-    if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) return;
-    // "?" or F1 — open the keyboard shortcuts cheat-sheet. F1 is the
+    const modalOpen =
+      typeof document !== 'undefined' && !!document.querySelector('[aria-modal="true"]');
+    // "?" or F1 — toggle the keyboard shortcuts cheat-sheet. F1 is the
     // legacy desktop help key; "?" matches GitHub/Slack/Linear
     // conventions. Blocked while typing so users can still type "?"
     // into search fields.
+    //
+    // Handled ahead of the modal guard so the same key closes the sheet it
+    // opened — the sheet is itself `aria-modal`, so the guard used to make
+    // this open-only and Escape the sole way out. It still can't *open* over
+    // another modal, which is what the guard is there to prevent.
     if ((e.key === '?' || e.key === 'F1') && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (isTypingTarget(e.target)) return;
+      if (modalOpen && !shortcutsOpen) return;
       e.preventDefault();
       shortcutsOpen = !shortcutsOpen;
       return;
     }
+    if (modalOpen) return;
     // Ctrl/Cmd+B toggles the sidebar. Matches VS Code/Slack/Discord
     // convention and frees up horizontal space for data-dense pages
     // without the user needing to reach for the mouse. Blocked while
@@ -238,6 +250,17 @@
       if (isTypingTarget(e.target)) return;
       e.preventDefault();
       toggleChatDock();
+      return;
+    }
+    // Ctrl/Cmd+, opens Settings — the desktop convention (VS Code, Slack,
+    // browsers). Settings is the eleventh nav entry, past the Alt+1..0 range,
+    // so without this the most-visited page was the only click-only one. Kept
+    // off the positional map on purpose: Settings keeps this key regardless of
+    // whether Channels is hidden and shifts everything up by one.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === ',') {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      navigateTo('/settings');
       return;
     }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;

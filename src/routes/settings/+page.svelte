@@ -18,7 +18,15 @@
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
-  import { hiddenChannels, ignoredMembers, mutedChannels, toggleMemberIgnore } from '$lib/stores/channels';
+  import {
+    channels as channelsStore,
+    hiddenChannels,
+    ignoredMembers,
+    mutedChannels,
+    toggleChannelMute,
+    toggleMemberIgnore,
+    unhideChannel,
+  } from '$lib/stores/channels';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import { notifySpamFilterReset } from '$lib/stores/search';
@@ -31,6 +39,7 @@
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
   import {
@@ -467,7 +476,6 @@
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
   type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'backup' | 'about';
-  let activeSection: SettingsSection = $state('general');
 
   const sections: SettingsSection[] = [
     'general',
@@ -481,6 +489,30 @@
     'backup',
     'about',
   ];
+
+  /**
+   * `?section=network` opens straight to that card. Pages that send the user
+   * here are pointing at one specific setting — the Ember page's "off" state
+   * means "turn the overlay back on in Network" — and dropping them on
+   * General left them to find it. Unknown or missing values fall back to
+   * General, so a stale link can't land on a blank page.
+   *
+   * Read once at init rather than tracked: this is an entry point, not a
+   * binding, and re-syncing would fight the nav buttons.
+   */
+  function initialSection(): SettingsSection {
+    try {
+      const requested = get(page).url.searchParams.get('section');
+      if (requested && (sections as string[]).includes(requested)) {
+        return requested as SettingsSection;
+      }
+    } catch {
+      /* no URL available — General is the safe default */
+    }
+    return 'general';
+  }
+
+  let activeSection: SettingsSection = $state(initialSection());
 
   function sectionLabel(id: SettingsSection): string {
     switch (id) {
@@ -797,6 +829,7 @@
         ...cached,
         friend_require_approval: settings.friend_require_approval,
         friend_chat_disabled: settings.friend_chat_disabled,
+        friend_chat_read_receipts: settings.friend_chat_read_receipts,
         friend_browse_disabled: settings.friend_browse_disabled,
         friend_session_encryption: true,
         channel_file_offers: settings.channel_file_offers,
@@ -818,6 +851,7 @@
             ...latest,
             friend_require_approval: settings.friend_require_approval,
             friend_chat_disabled: settings.friend_chat_disabled,
+            friend_chat_read_receipts: settings.friend_chat_read_receipts,
             friend_browse_disabled: settings.friend_browse_disabled,
             friend_session_encryption: true,
             channel_file_offers: settings.channel_file_offers,
@@ -830,6 +864,7 @@
               const baseline = JSON.parse(originalSettings) as AppSettings;
               baseline.friend_require_approval = result.settings.friend_require_approval;
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
+              baseline.friend_chat_read_receipts = result.settings.friend_chat_read_receipts;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
               baseline.channel_file_offers = result.settings.channel_file_offers;
@@ -859,6 +894,7 @@
         if (settings) {
           settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
+          settings.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
           settings.channel_file_offers = persisted.channel_file_offers;
           settings.settings_revision = persisted.settings_revision;
@@ -871,6 +907,7 @@
           const baseline = JSON.parse(originalSettings) as AppSettings;
           baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
+          baseline.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
           baseline.channel_file_offers = persisted.channel_file_offers;
           baseline.settings_revision = persisted.settings_revision;
@@ -1114,6 +1151,27 @@
   // theme, same Escape-to-cancel.
   let spamResetConfirmOpen = $state(false);
   let ignoredClearConfirmOpen = $state(false);
+  let mutedClearConfirmOpen = $state(false);
+  let hiddenClearConfirmOpen = $state(false);
+
+  /**
+   * Room name for a stored preference id, falling back to a short id.
+   *
+   * Silenced and removed rooms were shown as a bare count with one bulk
+   * "Clear", so the only thing the user could do about a single room was wipe
+   * every preference and start over. Names come from the joined-rooms store;
+   * a room only ever seen in Discover has no row there, hence the fallback —
+   * a truncated id is still enough to tell two entries apart and undo the
+   * right one.
+   */
+  let channelNamesById = $derived(
+    new Map($channelsStore.map((c) => [c.channel_id.toLowerCase(), c.name])),
+  );
+
+  function channelLabel(channelId: string): string {
+    const name = channelNamesById.get(channelId.toLowerCase())?.trim();
+    return name || shortPubkey(channelId);
+  }
 
   function handleResetSpamData() {
     spamResetConfirmOpen = true;
@@ -2255,17 +2313,25 @@
               <span class="toggle-title">{m.settings_ember_native_label()}</span>
               <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
             </div>
-            <span class="ember-on-badge">{m.settings_ember_status_on()}</span>
+            <span class="always-on-badge">{m.settings_ember_status_on()}</span>
           </div>
 
           <div class="divider"></div>
 
+          <!--
+            KAD bootstraps on startup and there is no switch for it, so this
+            row states the behavior rather than pretending to offer a choice —
+            same shape as the Ember row above. Sitting out KAD for a session is
+            a runtime action and still lives on the KAD Network page; what it
+            is not is a preference that survives a restart, because a client
+            that cannot find peers is a client that looks broken.
+          -->
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_auto_connect_kad()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
-              <span class="hint">{m.settings_auto_connect_kad_hint()}</span>
+              <span class="toggle-title">{m.nav_kad_network()}</span>
+              <span class="hint">{m.settings_kad_auto_connect_hint()} <a href="/kad" onclick={(e) => { e.preventDefault(); goto('/kad'); }}>{m.settings_kad_open_page()}</a></span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_connect_kad} ariaLabel={m.settings_auto_connect_kad()} />
+            <span class="always-on-badge">{m.settings_kad_status_auto()}</span>
           </div>
 
           <div class="field nested">
@@ -2501,12 +2567,11 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field toggle-row">
+          <div class="field">
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_friend_require_approval()}</span>
               <span class="hint">{m.settings_friend_require_approval_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -2515,6 +2580,14 @@
               <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} onchange={() => void applyFriendTogglesLive()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
+              <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_chat_read_receipts} ariaLabel={m.settings_friend_chat_read_receipts()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">
@@ -2583,29 +2656,58 @@
               <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
             </select>
             <span class="hint">{m.settings_channel_file_offers_hint()}</span>
+            <!--
+              This select persists on change (`applyFriendTogglesLive`) while
+              the username field directly above it waits for Save. Two
+              different commit rules in one card, with nothing on screen
+              saying so, read as "my username didn't stick" — so the live one
+              says that it is live.
+            -->
+            <span class="hint hint-live">{m.settings_applies_immediately()}</span>
           </div>
 
           <div class="divider"></div>
 
-          <!-- Muting and ignoring are per-device preferences kept in
-               localStorage, not room state, so nothing else in the app lists
-               them. Ignoring in particular is applied from a member's row and
-               hides them everywhere — without this there is no way to see who
-               is hidden, let alone undo it. -->
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_channels_muted_rooms()}</span>
-              <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
+          <!-- Silencing, ignoring and removing are per-device preferences kept
+               in localStorage, not room state, so nothing else in the app
+               lists them and this is the only place they can be undone.
+               All three are applied a row at a time somewhere else — from a
+               room's menu, or a member's — so all three are undoable a row at
+               a time here. Silenced and removed rooms used to be a bare count
+               with one bulk Clear, which meant reversing a single mistaken
+               mute cost the user every other one they had set. -->
+          <div class="field ignored-field">
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_channels_muted_rooms()}</span>
+                <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
+              </div>
+              <div class="channels-pref-action">
+                <span class="channels-pref-count">{$mutedChannels.length}</span>
+                <button
+                  type="button"
+                  class="ghost"
+                  disabled={$mutedChannels.length === 0}
+                  onclick={() => { mutedClearConfirmOpen = true; }}
+                >{m.settings_channels_clear()}</button>
+              </div>
             </div>
-            <div class="channels-pref-action">
-              <span class="channels-pref-count">{$mutedChannels.length}</span>
-              <button
-                type="button"
-                class="ghost"
-                disabled={$mutedChannels.length === 0}
-                onclick={() => { mutedChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
-              >{m.settings_channels_clear()}</button>
-            </div>
+            {#if $mutedChannels.length > 0}
+              <ul class="ignored-list">
+                {#each $mutedChannels as channelId (channelId)}
+                  <li>
+                    <span class="ignored-name">
+                      <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                    </span>
+                    <button
+                      type="button"
+                      class="ghost"
+                      onclick={() => toggleChannelMute(channelId)}
+                    >{m.channels_unmute()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </div>
 
           <div class="field ignored-field">
@@ -2642,20 +2744,38 @@
             {/if}
           </div>
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_channels_hidden_rooms()}</span>
-              <span class="hint">{m.settings_channels_hidden_rooms_hint()}</span>
+          <div class="field ignored-field">
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_channels_hidden_rooms()}</span>
+                <span class="hint">{m.settings_channels_hidden_rooms_hint()}</span>
+              </div>
+              <div class="channels-pref-action">
+                <span class="channels-pref-count">{$hiddenChannels.length}</span>
+                <button
+                  type="button"
+                  class="ghost"
+                  disabled={$hiddenChannels.length === 0}
+                  onclick={() => { hiddenClearConfirmOpen = true; }}
+                >{m.settings_channels_clear()}</button>
+              </div>
             </div>
-            <div class="channels-pref-action">
-              <span class="channels-pref-count">{$hiddenChannels.length}</span>
-              <button
-                type="button"
-                class="ghost"
-                disabled={$hiddenChannels.length === 0}
-                onclick={() => { hiddenChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
-              >{m.settings_channels_clear()}</button>
-            </div>
+            {#if $hiddenChannels.length > 0}
+              <ul class="ignored-list">
+                {#each $hiddenChannels as channelId (channelId)}
+                  <li>
+                    <span class="ignored-name">
+                      <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                    </span>
+                    <button
+                      type="button"
+                      class="ghost"
+                      onclick={() => unhideChannel(channelId)}
+                    >{m.channels_unignore()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </div>
         </div>
       </section>
@@ -3055,6 +3175,26 @@
   onconfirm={() => { ignoredMembers.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
 />
 
+<!-- Confirmed like the ignored list: these are one-click wipes of a
+     preference the user built up a room at a time, and there is no undo. -->
+<ConfirmDialog
+  bind:open={mutedClearConfirmOpen}
+  title={m.settings_channels_clear_muted_title()}
+  message={m.settings_channels_clear_muted_message()}
+  confirmLabel={m.settings_channels_clear()}
+  danger={true}
+  onconfirm={() => { mutedChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+/>
+
+<ConfirmDialog
+  bind:open={hiddenClearConfirmOpen}
+  title={m.settings_channels_clear_hidden_title()}
+  message={m.settings_channels_clear_hidden_message()}
+  confirmLabel={m.settings_channels_clear()}
+  danger={true}
+  onconfirm={() => { hiddenChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+/>
+
 <ConfirmDialog
   bind:open={historyClearConfirmOpen}
   title={historyClearDialogTitle}
@@ -3381,6 +3521,13 @@
     line-height: 1.5;
   }
 
+  /* Marks a control that persists on change rather than on Save. */
+  .hint-live {
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-weight: 600;
+  }
+
   /* ── Restart badge ─────────────────────────────── */
   .restart-badge {
     display: inline-block;
@@ -3426,7 +3573,7 @@
     margin-top: 0;
   }
 
-  .ember-on-badge {
+  .always-on-badge {
     flex-shrink: 0;
     font-size: 12px;
     font-weight: 600;

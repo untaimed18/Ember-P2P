@@ -2703,7 +2703,7 @@
       >{m.library_remove_missing()}</button>
     {/if}
     {#if hasActiveLibraryFilters}
-      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button>
+      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button>
     {/if}
     <button
       class="dupes-toggle"
@@ -3226,7 +3226,7 @@
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
         <p>{m.library_empty_no_matches()}</p>
-        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button></p>
+        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
       </div>
     {:else if sortedFiles.length === 0 && !initialLoadDone}
       <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
@@ -3553,11 +3553,25 @@
               <div class="comment-loading">{m.library_loading_comments()}</div>
             {:else}
               <div class="comment-our">
-                <div class="comment-rating-row">
+                <div class="comment-rating-row" role="group" aria-label={m.library_your_rating()}>
                   <span class="comment-label">{m.library_your_rating()}</span>
                   {#each [1,2,3,4,5] as star}
-                    <button class="star-btn" onclick={() => ourRating = star} title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}>
-                      {star <= ourRating ? '\u2605' : '\u2606'}
+                    <!--
+                      Named and stateful. The glyph was the accessible name, so
+                      the control announced as "black star" / "white star" and
+                      said nothing about the rating actually set — the filled-vs-
+                      hollow distinction that carries the whole value was purely
+                      visual.
+                    -->
+                    <button
+                      type="button"
+                      class="star-btn"
+                      onclick={() => ourRating = star}
+                      aria-label={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      aria-pressed={star <= ourRating}
+                      title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                    >
+                      <span aria-hidden="true">{star <= ourRating ? '\u2605' : '\u2606'}</span>
                     </button>
                   {/each}
                   {#if ourRating > 0}
@@ -3578,7 +3592,18 @@
                       }
                     }}
                   ></textarea>
-                  <button class="comment-save" onclick={handleSaveComment} disabled={commentSaveState === 'saving'}>
+                  <!--
+                    Also gated on `commentDirty` (which the discard prompt
+                    already tracks) and on the fetch: an enabled Save that
+                    writes the same values back reports "Saved" for work it
+                    didn't do, and pressing it before the fetch lands did
+                    nothing at all with no explanation.
+                  -->
+                  <button
+                    class="comment-save"
+                    onclick={handleSaveComment}
+                    disabled={commentSaveState === 'saving' || commentLoading || !commentDirty}
+                  >
                     {commentSaveState === 'saving' ? m.library_saving() : m.common_save()}
                   </button>
                 </div>
@@ -4155,7 +4180,7 @@
   }
   .tree-btn.tree-unshare:hover,
   .tree-btn.tree-unshare:focus-visible {
-    color: #ffffff;
+    color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
   }
@@ -4166,7 +4191,7 @@
   }
   .tree-btn.tree-remove:hover,
   .tree-btn.tree-remove:focus-visible {
-    color: #ffffff;
+    color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
   }
@@ -4586,7 +4611,7 @@
     background: var(--bg-hover);
   }
   .dupes-toggle.active {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    background: var(--accent-fill);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
     color: var(--text-primary);
     font-weight: 600;
@@ -4616,7 +4641,7 @@
   /* --- Bulk action bar --- */
   .bulk-action-bar {
     border-top: 1px solid var(--border);
-    background: color-mix(in srgb, var(--accent-dim) 22%, var(--bg-secondary));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
     box-shadow: var(--shadow-up-sm);
     padding: 8px 14px;
     display: flex;
@@ -4826,7 +4851,7 @@
   .shared-status.is-shared {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 40%, transparent);
+    background: var(--accent-fill);
   }
   .activity-stats {
     display: grid;
@@ -5296,7 +5321,7 @@
   .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
   .format-option:has(input[type="radio"]:checked) {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
+    background: var(--accent-fill);
   }
   .format-label {
     display: flex;

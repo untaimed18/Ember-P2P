@@ -11,6 +11,7 @@
    * The overlay is always on.
    */
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import {
     getEmberDiagnostics,
     getEmberDhtContacts,
@@ -26,6 +27,7 @@
   import { formatDurationSecs } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { checkForUpdates, updater } from '$lib/stores/updater';
+  import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -341,6 +343,20 @@
     { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
     { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
     { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: String(diag?.ember_dht_republish_backlog ?? 0) },
+    { id: 'cached-contacts', k: m.ember_stat_cached_contacts(), v: String(diag?.ember_dht_cached_contacts ?? 0) },
+    { id: 'session-contacts', k: m.ember_stat_session_contacts(), v: String(diag?.ember_dht_session_contacts ?? 0) },
+    { id: 'contacts-evicted', k: m.ember_stat_contacts_evicted(), v: String(diag?.ember_dht_contacts_evicted ?? 0) },
+    { id: 'contacts-demoted', k: m.ember_stat_contacts_demoted(), v: String(diag?.ember_dht_contacts_demoted ?? 0) },
+    { id: 'peer-lists', k: m.ember_stat_peer_lists_received(), v: String(diag?.ember_dht_peer_lists_received ?? 0) },
+    { id: 'gossip-contacts', k: m.ember_stat_gossip_contacts(), v: String(diag?.ember_dht_gossip_contacts ?? 0) },
+    { id: 'gossip-new', k: m.ember_stat_gossip_new(), v: String(diag?.ember_dht_gossip_new ?? 0) },
+    { id: 'gossip-refused', k: m.ember_stat_gossip_refused(), v: String(diag?.ember_dht_gossip_refused ?? 0) },
+    { id: 'gossip-rationed', k: m.ember_stat_gossip_leads_rationed(), v: String(diag?.ember_dht_gossip_leads_rationed ?? 0) },
+    { id: 'gossip-introducers-rationed', k: m.ember_stat_gossip_introducers_rationed(), v: String(diag?.ember_dht_gossip_introducers_rationed ?? 0) },
+    { id: 'friend-contact-asks', k: m.ember_stat_friend_contact_asks(), v: String(diag?.ember_dht_friend_contact_asks ?? 0) },
+    { id: 'friend-contacts-learned', k: m.ember_stat_friend_contacts_learned(), v: String(diag?.ember_dht_friend_contacts_learned ?? 0) },
+    { id: 'liveness-pings', k: m.ember_stat_liveness_pings(), v: String(diag?.ember_dht_liveness_pings_sent ?? 0) },
+    { id: 'pongs-received', k: m.ember_stat_pongs_received(), v: String(diag?.ember_dht_pongs_received ?? 0) },
     { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
     { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
     { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },
@@ -366,7 +382,6 @@
     { id: 'buddy-pub', k: m.ember_stat_buddy_publishes(), v: String(diag?.ember_dht_buddy_publishes ?? 0) },
     { id: 'buddy-fwd', k: m.ember_stat_buddy_forwards(), v: String(diag?.ember_dht_buddy_forwards ?? 0) },
     { id: 'buddy-unendorsed', k: m.ember_stat_buddy_unendorsed(), v: String(diag?.ember_dht_buddy_unendorsed ?? 0) },
-    { id: 'buddy-compat', k: m.ember_stat_buddy_compat_publish(), v: diag?.ember_dht_buddy_unendorsed_publish ? m.common_yes() : m.common_no() },
     { id: 'callback-sent', k: m.ember_stat_callback_sent(), v: String(diag?.ember_dht_callback_sent ?? 0) },
     { id: 'callback-fwd', k: m.ember_stat_callback_forwards(), v: String(diag?.ember_dht_callback_forwards ?? 0) },
     { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: String(diag?.ember_dht_callback_connects ?? 0) },
@@ -425,9 +440,12 @@
 
 <svelte:head><title>{m.nav_ember_network()} — Ember</title></svelte:head>
 
+<!-- `h2` and `.page-header` to match every other page: this was the only page
+     with an `h1`, which put the same chrome at two different heading levels
+     and two different type sizes depending on where you'd navigated from. -->
 <header class="page-header">
   <div>
-    <h1>{m.nav_ember_network()}</h1>
+    <h2>{m.nav_ember_network()}</h2>
     <p class="subtitle">{m.ember_page_subtitle()}</p>
   </div>
 </header>
@@ -451,6 +469,27 @@
           {#if joining}<span class="spinner" aria-hidden="true"></span>{/if}
         </div>
         {#if statusHint}<p class="hint">{statusHint}</p>{/if}
+        {#if heroState === 'off'}
+          <!--
+            "Off" used to end the conversation: the explainer says the service
+            is not running, the health checklist below is hidden while
+            inactive, and there was nothing to press. The overlay is a setting,
+            so send the user to the one that turns it back on — and offer a
+            re-check, since a failed diagnostics poll looks identical to a
+            genuinely disabled overlay from here.
+          -->
+          <div class="hero-actions">
+            <button
+              type="button"
+              onclick={() => void goto('/settings?section=network').catch((e) => console.warn('Failed to open settings:', e))}
+            >{m.ember_open_network_settings()}</button>
+            <button
+              type="button"
+              class="ghost"
+              onclick={() => void refreshDiag()}
+            >{m.common_retry()}</button>
+          </div>
+        {/if}
       </div>
     </div>
   </section>
@@ -537,6 +576,18 @@
       </div>
     </section>
   {/if}
+
+  <!--
+    The reachability check above gives the verdict; these are the readings
+    behind it. Shown regardless of the overlay's state, because external IP,
+    firewall and port mapping describe this machine's connection rather than
+    Ember, and they're most worth reading when something is off. Same
+    component as the KAD page's Network Status panel, so the two can't drift.
+  -->
+  <section class="card">
+    <h2>{m.kad_network_status()}</h2>
+    <NetworkStatusTiles />
+  </section>
 
   <!--
     Everything below is protocol-level diagnostics. Collapsed by default,
@@ -712,10 +763,9 @@
     gap: 16px;
   }
 
-  .page-header h1 {
-    font-size: 24px;
-    font-weight: 700;
-    color: var(--text-primary);
+  /* Size/weight come from the global `.page-header h2` rule; only the layout
+     bits this page adds (icon alignment, and room for the subtitle) live here. */
+  .page-header h2 {
     margin: 0;
     display: flex;
     align-items: center;
@@ -725,7 +775,7 @@
   .subtitle {
     margin: 6px 0 0;
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1.5;
     max-width: 70ch;
   }
@@ -813,6 +863,13 @@
     gap: 16px;
     min-width: 0;
     flex: 1;
+  }
+
+  .hero-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
   }
 
   .status-dot {
@@ -1243,9 +1300,9 @@
   }
 
   .banner-error {
-    background: color-mix(in srgb, var(--error, #e06a5f) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--error, #e06a5f) 35%, transparent);
-    color: var(--error, #e06a5f);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
   }
 
   .banner-warn {

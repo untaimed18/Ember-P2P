@@ -4,6 +4,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export type Theme = 'light' | 'dark';
 
+// Keep in lockstep with `static/theme-boot.js`, which reads this key
+// before first paint so dark-mode users do not flash the light canvas.
 const STORAGE_KEY = 'ember-theme';
 
 export function getInitialTheme(): Theme {

@@ -349,6 +349,28 @@ impl CreditRecord {
 /// Do **not** rely on SecIdent for any property stronger than "this peer
 /// has the same cryptkey file it had last time". Everything that actually
 /// matters for file integrity is covered by MD4 part hashes and AICH.
+///
+/// ## The Ember fence
+///
+/// What keeps the weak parameters above tolerable is that **no Ember-side
+/// grant reads a [`CreditRecord`]**. Ember queue position comes from
+/// [`Self::get_ember_score_ratio`] over [`EmberCreditRecord`], keyed on the
+/// 32-byte Ed25519 public key, and friend-level access is gated on
+/// `friend_connect::perform_ember_auth`, a signature round-trip over a fresh
+/// nonce. Forging a 384-bit RSA identity buys eD2K queue priority and nothing
+/// on the overlay.
+///
+/// The one place the two identity spaces meet is the `user_hash ↔ ember_hash`
+/// binding ([`Self::set_ember_hash`] and its two lookups), and it is not a way
+/// through: it only decides whether *we* try to escalate one of our own
+/// downloads to a friend transfer, and that attempt is authenticated on
+/// connect like any other. The binding steers our outbound behaviour; it never
+/// grants an inbound peer anything.
+///
+/// Keep it that way. If a future Ember decision needs a reputation input, take
+/// it from [`EmberCreditRecord`] — reaching across to the eD2K ledger would
+/// put overlay trust behind a 384-bit key, which is the one thing this
+/// threat model does not cover.
 #[derive(ZeroizeOnDrop)]
 pub struct CreditManager {
     #[zeroize(skip)]

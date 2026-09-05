@@ -660,7 +660,12 @@ pub struct EmberDiagnostics {
     /// from "stuck", none of which the other counters distinguish.
     #[serde(default)]
     pub ember_dht_seconds_since_inbound: u32,
-    /// Ember DHT `PING` frames we sent this session.
+    /// Ember DHT `PING` frames the dev panel sent this session.
+    ///
+    /// Only the debug harness increments this, not the three automatic probe
+    /// paths — those land in [`Self::ember_dht_liveness_pings_sent`]. Named as
+    /// though it counted every `PING` frame, which is what it is for: to show
+    /// that a hand-driven probe left the machine at all.
     #[serde(default)]
     pub ember_dht_pings_sent: u32,
     /// Ember DHT `PING` frames we received and answered this session.
@@ -696,6 +701,32 @@ pub struct EmberDiagnostics {
     /// Of those, ones the table turned away on IP policy or diversity caps.
     #[serde(default)]
     pub ember_dht_gossip_refused: u32,
+    /// Gossip leads we declined to probe because the peer that named them has
+    /// a record of naming addresses that never answer.
+    ///
+    /// Separates the two reasons a table with plenty of inbound gossip still
+    /// will not grow: nobody is naming anyone reachable, or a few peers are
+    /// naming a great many unreachable ones. Never non-zero while the table is
+    /// starved — see `network::ember::dht::gossip`.
+    #[serde(default)]
+    pub ember_dht_gossip_leads_rationed: u32,
+    /// Introducers currently rationed (gauge). A handful here alongside a
+    /// large `ember_dht_gossip_contacts` is the signature of gossip volume
+    /// that is not worth what it costs to check.
+    #[serde(default)]
+    pub ember_dht_gossip_introducers_rationed: u32,
+    /// Times we asked a friend for its Ember DHT contacts over the
+    /// authenticated friend session, which only happens while our own table is
+    /// short of a working set.
+    #[serde(default)]
+    pub ember_dht_friend_contact_asks: u32,
+    /// Contacts a friend answered with that our routing table accepted.
+    ///
+    /// Paired with the asks, this is what says whether the friend route is
+    /// carrying a cold join: asks climbing with this flat means friends are on
+    /// builds that predate the sub-type, or have nothing verified to share.
+    #[serde(default)]
+    pub ember_dht_friend_contacts_learned: u32,
     /// Iterative Ember DHT lookups currently running (gauge, not a
     /// counter).
     #[serde(default)]
@@ -731,13 +762,53 @@ pub struct EmberDiagnostics {
     /// session (slice 6).
     #[serde(default)]
     pub ember_dht_refreshes: u32,
-    /// Maintenance liveness `PING`s sent to stale contacts this session.
+    /// Automatic verification `PING`s sent this session.
+    ///
+    /// Three paths feed this, not just the maintenance sweep it was originally
+    /// documented as: the 60-second liveness pass over stale contacts,
+    /// `probe_ember_gossip_leads` (a lead someone named, which has to answer
+    /// before it counts as verified) and `probe_bucket_oldest` (a full bucket's
+    /// incumbent, whose silence promotes the newcomer waiting in the
+    /// replacement cache). One number because all three register in
+    /// `ember_dht_maint_pings` and share its fault, evict and promote
+    /// semantics — a probe from any of them verifies a contact or costs it a
+    /// strike. Reading it as the maintenance budget alone overstates that
+    /// budget during a join, when the other two dominate.
     #[serde(default)]
     pub ember_dht_liveness_pings_sent: u32,
-    /// Contacts evicted after failing repeated liveness pings this
-    /// session.
+    /// Of [`Self::ember_dht_contacts`], the ones parked in a bucket's
+    /// replacement cache rather than holding a slot.
+    ///
+    /// Worth its own row because a parked contact is invisible to the thing
+    /// that would promote it: `contacts_due_for_ping` reads `all_contacts`,
+    /// which is buckets only, so a cache entry is never liveness-pinged and can
+    /// never verify itself. It depends entirely on `promote_cached_contacts`
+    /// moving it into a bucket first, and that requires the IP policy to admit
+    /// it — so a peer parked while `ipfilter.dat` was loading, or a LAN address
+    /// under `block_private_ips`, can sit here indefinitely while the headline
+    /// contact count says the overlay is healthier than it is.
+    #[serde(default)]
+    pub ember_dht_cached_contacts: u32,
+    /// Of [`Self::ember_dht_contacts`], firsthand session peers the public
+    /// table refused outright — typically LAN or CGNAT while
+    /// `block_private_ips` is on. Counted, reachable, but not routing entries.
+    #[serde(default)]
+    pub ember_dht_session_contacts: u32,
+    /// Contacts dropped from the routing table this session because they
+    /// stopped answering — repeated liveness-ping failures and the staleness
+    /// purge. Genuinely gone: nothing remembers them but the bootstrap cache.
     #[serde(default)]
     pub ember_dht_contacts_evicted: u32,
+    /// Contacts moved out of a bucket into its replacement cache this session
+    /// because the diversity limits tightened as the table grew.
+    ///
+    /// Counted apart from [`Self::ember_dht_contacts_evicted`] because it means
+    /// something quite different: these peers answered, are still remembered,
+    /// and can be promoted back if a slot frees up. Sharing one counter made a
+    /// healthy table reclaiming a cold-start allowance look identical to peers
+    /// going dark.
+    #[serde(default)]
+    pub ember_dht_contacts_demoted: u32,
     /// Stored records re-published (replicated) to the closest nodes by
     /// the maintenance loop this session.
     #[serde(default)]
@@ -780,12 +851,6 @@ pub struct EmberDiagnostics {
     /// True when firewalled with no HighID buddy yet — source STORE is skipped.
     #[serde(default)]
     pub ember_dht_waiting_buddy: bool,
-    /// True when firewalled publishing fell back to a buddy trailer no
-    /// candidate has endorsed, because none answered `BUDDY_ENDORSE_REQ`.
-    /// Records still go out, but only builds older than this one will act on
-    /// the callback path — current builds park the source instead.
-    #[serde(default)]
-    pub ember_dht_buddy_unendorsed_publish: bool,
     /// Slice 15: true when Ember is on but we have no external IPv4 to put
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
@@ -1133,12 +1198,12 @@ pub struct AppSettings {
     /// Path to server.met file for ed2k server list
     #[serde(default)]
     pub server_list_path: String,
-    /// Automatically connect to KAD on startup (eMule: "Autoconnect" for Kad)
-    #[serde(default)]
-    pub auto_connect_kad: bool,
-    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server),
-    /// independent of `auto_connect_kad`. Defaults to `false`. KAD Connect never
-    /// starts an eD2K session — use the Servers page or enable this setting.
+    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server).
+    /// Defaults to `false`, unlike KAD, which always bootstraps on startup:
+    /// KAD is the peer index the rest of the app is useless without, whereas a
+    /// server is one operator's machine seeing every request you make, so that
+    /// one stays opt-in. KAD Connect never starts an eD2K session — use the
+    /// Servers page or enable this setting.
     #[serde(default)]
     pub auto_connect_server: bool,
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
@@ -1217,12 +1282,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub settings_revision: u64,
 
-    /// Require approval before granting friend-slot priority to new friend requests
+    /// Retained so existing `config.json` still deserializes. Unsolicited
+    /// friend requests always queue for approval; a verified reciprocal from
+    /// someone already on the friends list always auto-confirms — adding them
+    /// was the approval. The inbound handler does not read this flag.
     #[serde(default = "default_true")]
     pub friend_require_approval: bool,
     /// Disable incoming chat messages from friends
     #[serde(default)]
     pub friend_chat_disabled: bool,
+    /// Send and display friend-chat read receipts. Off both ways: we neither
+    /// tell friends we have read their messages nor show when they have read
+    /// ours.
+    #[serde(default = "default_true")]
+    pub friend_chat_read_receipts: bool,
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
@@ -1705,16 +1778,13 @@ impl Default for AppSettings {
             add_servers_from_server: true,
             add_servers_from_clients: true,
             server_list_path: String::new(),
-            auto_connect_kad: false,
-            // Matches `auto_connect_kad`: a fresh launch shouldn't reach out
-            // to any network on its own. This used to default to `true`
-            // here while `#[serde(default)]` (used once a settings.json
-            // already exists but predates this field) fell back to
-            // `bool::default() == false` — two different defaults for the
-            // same field depending on whether this is a brand-new install
-            // or an upgrade. Connecting to a server is real, visible network
-            // activity (see `NetworkState::upload_disconnected`), so it must
-            // not happen before the user asks for it either way.
+            // This used to default to `true` here while `#[serde(default)]`
+            // (used once a settings.json already exists but predates this
+            // field) fell back to `bool::default() == false` — two different
+            // defaults for the same field depending on whether this is a
+            // brand-new install or an upgrade. Both paths must agree, and
+            // joining one operator's server is a disclosure KAD's distributed
+            // lookup doesn't make, so "off" is the answer for both.
             auto_connect_server: false,
             max_sources_per_file: 400,
             max_connections: 500,
@@ -1738,6 +1808,7 @@ impl Default for AppSettings {
             settings_revision: 0,
             friend_require_approval: true,
             friend_chat_disabled: false,
+            friend_chat_read_receipts: true,
             friend_browse_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
@@ -1889,10 +1960,11 @@ mod tests {
     /// while `#[serde(default)]` (used when an existing settings.json
     /// predates the field) fell back to `bool::default() == false` — a
     /// fresh install and an upgrade disagreed on whether a server connects
-    /// automatically on startup. Both paths must agree, and connecting to a
-    /// network automatically is significant enough behavior that "off"
-    /// is the only safe shared default (see `auto_connect_kad`, which this
-    /// mirrors).
+    /// automatically on startup. Both paths must agree, and joining a
+    /// specific operator's server is significant enough behavior that "off"
+    /// is the only safe shared default. KAD is deliberately not like this —
+    /// it always bootstraps — because it is distributed and the app cannot
+    /// find anything without it.
     #[test]
     fn auto_connect_server_defaults_to_off_via_both_paths() {
         assert!(

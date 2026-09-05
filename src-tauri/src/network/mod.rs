@@ -85,6 +85,7 @@ use self::health::{
     PeriodicSaveJob, PeriodicSaveResult, PublishHealthSnapshot, RendezvousRegisterResult,
     ServerConnectResult, SourceInjectionResult, SpamSaveResult, TcpMappingKeepaliveResult,
     TcpPortConfirmation, UdpDiscoveryHealthSnapshot, UdpMappingKeepaliveResult, UpnpMaintainResult,
+    XferFinishResult,
 };
 
 const FIREWALL_REQ_COOLDOWN_SECS: i64 = 60;
@@ -1222,7 +1223,27 @@ const EMBER_BRIDGE_RETRY_MAX: std::time::Duration = std::time::Duration::from_se
 /// How long to leave a bridge peer alone after `failed_attempts` unanswered
 /// pings. Doubles from [`EMBER_BRIDGE_RETRY_FIRST`] up to
 /// [`EMBER_BRIDGE_RETRY_MAX`].
-fn bridge_retry_after(failed_attempts: u32) -> std::time::Duration {
+///
+/// `starved` flattens the curve to its first step. The backoff exists so a
+/// genuinely dead address stops costing a datagram a minute forever, which is
+/// the right trade once the table is healthy and the peer is one candidate
+/// among many — but below [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts
+/// those same candidates *are* the join, and backing off to five minutes prices
+/// a lost datagram at the whole session. A friend is the sharpest case: you
+/// have explicitly trusted them, there is a live authenticated session to them,
+/// and their routing table is exactly what you are missing — yet one dropped
+/// bridge PING put the next attempt five minutes out, and a shorter visit than
+/// that never got a second chance.
+///
+/// Costing nothing is what makes this safe rather than merely helpful. The
+/// bridge only runs while starved, it is capped at
+/// [`EMBER_KAD_BRIDGE_MAX_PINGS`] per cycle, and the maintenance tick driving it
+/// is 60 seconds — so the flattened rate is one datagram per candidate per
+/// minute, and it stops of its own accord the moment the table fills.
+fn bridge_retry_after(failed_attempts: u32, starved: bool) -> std::time::Duration {
+    if starved {
+        return EMBER_BRIDGE_RETRY_FIRST;
+    }
     let doublings = failed_attempts.saturating_sub(1).min(8);
     let secs = EMBER_BRIDGE_RETRY_FIRST
         .as_secs()
@@ -1237,11 +1258,12 @@ fn bridge_retry_due(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     key: &(Ipv4Addr, u16),
     now: std::time::Instant,
+    starved: bool,
 ) -> bool {
     match attempted.get(key) {
         None => true,
         Some((at, failed_attempts)) => {
-            now.duration_since(*at) >= bridge_retry_after(*failed_attempts)
+            now.duration_since(*at) >= bridge_retry_after(*failed_attempts, starved)
         }
     }
 }
@@ -1250,8 +1272,36 @@ fn kad_bridge_candidates(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
-    kad_bridge_candidates_at(noise_keys, attempted, max, std::time::Instant::now())
+    kad_bridge_candidates_at(
+        noise_keys,
+        attempted,
+        max,
+        std::time::Instant::now(),
+        starved,
+    )
+}
+
+/// Order in which due bridge candidates are dialled: fewest unanswered pings
+/// first, then most recently observed.
+///
+/// Freshness alone used to be the key. That was fine while a miss earned a
+/// longer wait, because a dead address dropped out of the due set and the
+/// next-freshest got its turn. A starved table flattens the wait to one tick
+/// ([`bridge_retry_after`]), so every address is due on every tick, and the
+/// freshest few — re-observed by every KAD lookup whether or not they ever
+/// answer — were dialled again and again while candidates further down the
+/// list, which had never been tried at all, waited behind them indefinitely.
+/// An answered ping clears the entry (see the PONG path), so the count here is
+/// exactly the number of times the address has ignored us.
+fn bridge_candidate_rank(
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
+    key: &(Ipv4Addr, u16),
+    seen: std::time::Instant,
+) -> (u32, std::cmp::Reverse<std::time::Instant>) {
+    let misses = attempted.get(key).map(|(_, n)| *n).unwrap_or(0);
+    (misses, std::cmp::Reverse(seen))
 }
 
 /// `kad_bridge_candidates` with an explicit "now", so the retry window is
@@ -1261,6 +1311,7 @@ fn kad_bridge_candidates_at(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
     if max == 0 {
         return Vec::new();
@@ -1268,11 +1319,11 @@ fn kad_bridge_candidates_at(
     let mut candidates: Vec<(Ipv4Addr, u16, [u8; 32], std::time::Instant)> = noise_keys
         .iter()
         .filter(|(key, _)| {
-            !crate::security::is_bogus_v4(key.0) && bridge_retry_due(attempted, key, now)
+            !crate::security::is_bogus_v4(key.0) && bridge_retry_due(attempted, key, now, starved)
         })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
+    candidates.sort_by_key(|c| bridge_candidate_rank(attempted, &(c.0, c.1), c.3));
     candidates
         .into_iter()
         .take(max)
@@ -1371,12 +1422,13 @@ fn record_ember_keyless_peer(
 /// client-to-client sessions rather than KAD source tags. Anything we already
 /// hold a Noise key for is skipped so the cheaper 1-RTT IK path wins; the rest
 /// pay one extra round trip, which is the price of joining without KAD.
-/// Freshest first, same as the IK side.
+/// Ranked by [`bridge_candidate_rank`], same as the IK side.
 fn xx_bridge_candidates(
     keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16)> {
     xx_bridge_candidates_at(
         keyless,
@@ -1384,6 +1436,7 @@ fn xx_bridge_candidates(
         attempted,
         max,
         std::time::Instant::now(),
+        starved,
     )
 }
 
@@ -1394,6 +1447,7 @@ fn xx_bridge_candidates_at(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16)> {
     if max == 0 {
         return Vec::new();
@@ -1402,12 +1456,12 @@ fn xx_bridge_candidates_at(
         .iter()
         .filter(|(key, _)| {
             !crate::security::is_bogus_v4(key.0)
-                && bridge_retry_due(attempted, key, now)
+                && bridge_retry_due(attempted, key, now, starved)
                 && !noise_keys.contains_key(*key)
         })
         .map(|(key, seen)| (key.0, key.1, *seen))
         .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
+    candidates.sort_by_key(|c| bridge_candidate_rank(attempted, &(c.0, c.1), c.2));
     candidates
         .into_iter()
         .take(max)
@@ -1415,10 +1469,52 @@ fn xx_bridge_candidates_at(
         .collect()
 }
 
+/// Share of one bridge pass held back for the Noise_XX candidates.
+///
+/// The IK pass used to run first and hand the XX pass only what it left, which
+/// on a healthy table was fine: dead IK addresses backed off, the due set
+/// thinned, and the budget reached the keyless peers within a few ticks. A
+/// starved table flattens that backoff, so with more due IK addresses than the
+/// budget — a KAD-fed key cache holds up to `MAX_KNOWN_EMBER_NOISE_KEYS`, most
+/// of them stale source records — the IK pass spent the whole budget every
+/// tick and the XX pass never ran. The keyless peers are the live eD2K sessions
+/// that advertised Ember without a key: LAN friends under `block_private_ips`,
+/// LowID peers — the ones most likely to actually answer.
+///
+/// A quarter, with a floor of one so the 1 Hz fast pass (four pings) still
+/// reaches them. Only held back while there are keyless peers to spend it on,
+/// and anything the reserve does not use goes to the IK pass, so a node with
+/// nothing on the XX side loses no throughput.
+const EMBER_BRIDGE_XX_RESERVE_DIVISOR: usize = 4;
+
+fn xx_bridge_reserve(max_pings: usize, keyless_known: bool) -> usize {
+    if !keyless_known || max_pings == 0 {
+        return 0;
+    }
+    (max_pings / EMBER_BRIDGE_XX_RESERVE_DIVISOR).clamp(1, max_pings)
+}
+
 /// Hard cap on firsthand DHT contacts learned from live eD2K Ember sessions.
 /// These sit beside the routing table so a LAN peer can be asked without
 /// being gossiped onto the public overlay.
 const MAX_EMBER_SESSION_DHT_CONTACTS: usize = 64;
+
+/// Whether a firsthand session contact still earns the place it holds beside
+/// the routing table.
+///
+/// A contact here is exempt from everything that disciplines a routing
+/// contact — no liveness ping reaches it, so `failed_queries` never rises and
+/// the table's own staleness purge never sees it. That left the map with no
+/// expiry at all, only the LRU in [`record_ember_session_dht_contact`], and 64
+/// slots take a long time to turn over on a LAN.
+///
+/// `last_seen == 0` is kept: that is a peer we learned from a LAN `PEER_LIST`
+/// and have not asked yet, not one that went quiet. The LRU already ranks
+/// those first for eviction, which is the right order — an unproven lead
+/// should lose its slot to a proven peer, not to the clock.
+fn ember_session_contact_is_live(contact: &ember::dht::EmberContact, now_secs: i64) -> bool {
+    contact.last_seen == 0 || now_secs.saturating_sub(contact.last_seen) < EMBER_CONTACT_STALE_SECS
+}
 
 fn record_ember_session_dht_contact(
     map: &mut HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
@@ -2896,6 +2992,44 @@ impl NoTransportReason {
 /// How long a rendezvous presence registration is treated as fresh.
 const PRESENCE_HEARTBEAT_SECS: u64 = 120;
 
+/// How many friends the startup presence sweep looks up per bootstrap tick.
+///
+/// Every friend is queued once Ember has an external IP, but they go out a few
+/// per 10s tick rather than all at once. A lookup is several signed HTTP round
+/// trips to the rendezvous server — an identity lookup plus up to four
+/// capability epochs — and nothing in that path handles a 429, so a lookup
+/// refused for being one of two hundred simultaneous requests would surface as
+/// a friend who is merely unreachable. Spread out, a large list still finishes
+/// in well under two minutes.
+const INITIAL_FRIEND_SEARCH_PER_TICK: usize = 5;
+
+/// Take the next slice of the startup presence sweep off `queue`, leaving the
+/// rest in order for later ticks.
+///
+/// `skip` reports the friends nothing is owed for: unfriended mid-sweep,
+/// already reachable, or a lookup already in flight from another path. Those
+/// are dropped rather than deferred, and deliberately do not spend the per-tick
+/// budget — a tick that finds four of its five already online should still send
+/// a fifth lookup, or a mostly-online list would trickle out one useful lookup
+/// per tick and take far longer than the list length suggests.
+fn drain_initial_friend_search(
+    queue: &mut Vec<[u8; 16]>,
+    per_tick: usize,
+    skip: impl Fn(&[u8; 16]) -> bool,
+) -> Vec<[u8; 16]> {
+    let mut targets: Vec<[u8; 16]> = Vec::new();
+    let mut deferred: Vec<[u8; 16]> = Vec::new();
+    for fh in std::mem::take(queue) {
+        if targets.len() >= per_tick {
+            deferred.push(fh);
+        } else if !skip(&fh) {
+            targets.push(fh);
+        }
+    }
+    *queue = deferred;
+    targets
+}
+
 /// Floor on retrying a *failed* presence heartbeat. Successes keep using
 /// [`PRESENCE_HEARTBEAT_SECS`] via [`should_refresh_presence`].
 ///
@@ -3295,8 +3429,6 @@ fn emit_chat_delivery_failed(app_handle: &tauri::AppHandle, expired: &[(i64, Str
     }
 }
 
-/// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
-/// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
 /// Replay outbound chat that was queued while a friend was unreachable.
 ///
 /// Called whenever a session to `friend` becomes live. Messages go out oldest
@@ -3437,6 +3569,87 @@ async fn flush_pending_chat(
     }
 }
 
+/// Hand a typing or read-receipt signal to a live friend session. Returns
+/// false when there is no fresh session or the writer queue is full — the
+/// caller decides whether to retry (receipts) or drop (typing).
+async fn send_encrypted_chat_ext(
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+    ext_type: u8,
+    plaintext: &[u8],
+) -> bool {
+    let Some((session_tx, envelope)) = ({
+        let sessions = ember_sessions.read().await;
+        sessions
+            .get(&friend)
+            .filter(|h| h.is_fresh() && h.is_secure_v2())
+            .and_then(|sender| {
+                let peer_pubkey = sender.peer_ember_pubkey();
+                let envelope = match ext_type {
+                    ed2k::messages::EMBER_EXT_CHAT_TYPING => {
+                        crate::network::ember::crypto::encrypt_chat_typing(
+                            ed25519_secret_key,
+                            &peer_pubkey,
+                            plaintext.first().copied().unwrap_or(0) != 0,
+                        )
+                    }
+                    ed2k::messages::EMBER_EXT_CHAT_READ => plaintext.try_into().ok().and_then(
+                        |body_hash: [u8; crate::network::ember::crypto::CHAT_BODY_HASH_LEN]| {
+                            crate::network::ember::crypto::encrypt_chat_read(
+                                ed25519_secret_key,
+                                &peer_pubkey,
+                                &body_hash,
+                            )
+                        },
+                    ),
+                    _ => crate::network::ember::crypto::encrypt_chat_for_peer(
+                        ed25519_secret_key,
+                        &peer_pubkey,
+                        plaintext,
+                    ),
+                };
+                envelope.map(|envelope| (sender.tx.clone(), envelope))
+            })
+    }) else {
+        return false;
+    };
+    session_tx
+        .try_send(ed2k::messages::build_ember_ext_frame(ext_type, &envelope))
+        .is_ok()
+}
+
+async fn flush_pending_read_receipt(
+    db: &Arc<Database>,
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+) {
+    let hash_hex = hex::encode(friend);
+    let db_read = db.clone();
+    let Ok(Ok(Some(hash_hex_str))) =
+        tokio::task::spawn_blocking(move || db_read.latest_read_received_hash(&hash_hex)).await
+    else {
+        return;
+    };
+    let Ok(bytes) = hex::decode(&hash_hex_str) else {
+        return;
+    };
+    let Ok(body_hash) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return;
+    };
+    let _ = send_encrypted_chat_ext(
+        ember_sessions,
+        ed25519_secret_key,
+        friend,
+        ed2k::messages::EMBER_EXT_CHAT_READ,
+        &body_hash,
+    )
+    .await;
+}
+
+/// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
+/// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
 async fn friend_transfer_request_status(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
@@ -4208,119 +4421,36 @@ mod friend_transfer_tests {
         assert!(ember_tcp_firewalled_from(true, FirewallStatus::Unknown));
     }
 
-    /// The compatibility trailer for a network that has not upgraded: the
-    /// buddy's observed address, carrying no endorsement. It must still be a
-    /// routable IPv4 endpoint, and it must never satisfy the dial gate — that
-    /// combination is what makes publishing it safe to do and safe to receive.
+    /// A buddy that never endorsed the endpoint is not a callback destination.
+    ///
+    /// This used to be half of a pair: the other test pinned the compatibility
+    /// trailer we published for peers too old to endorse. That trailer is gone —
+    /// it shipped before wire v4, so every peer that can still reach us speaks
+    /// endorsements, and a current build parks the source either way. What
+    /// remains is the dial gate, which is the half that still has to hold: an
+    /// unendorsed buddy can arrive from anywhere, and must never be dialled.
     #[test]
-    fn the_unendorsed_fallback_trailer_is_routable_but_never_dialled() {
-        use std::net::{IpAddr, SocketAddr};
-        let ok = ember::dht::EmberContact {
-            node_id: ember::dht::EmberNodeId([1u8; 16]),
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 4672),
-            noise_pub: [0x11; 32],
-            ed25519_pub: [0x22; 32],
-            last_seen: 1,
-            failed_queries: 0,
-        };
-        let buddy = ember_unendorsed_source_buddy(&ok).expect("a routable contact is nameable");
-        assert_eq!(buddy.ip, Ipv4Addr::new(8, 8, 4, 4));
-        assert_eq!(buddy.udp_port, 4672);
-        assert_eq!(buddy.noise_pub, ok.noise_pub);
-        assert!(
-            !buddy.has_identity(),
-            "the fallback carries no key, so no searcher on this build will dial it"
-        );
-
+    fn an_unendorsed_buddy_is_never_dialled() {
         let src = ember::dht::publish::DiscoveredSource {
             ip: Ipv4Addr::new(10, 0, 0, 9),
             tcp_port: 4662,
             udp_port: 4672,
             flags: ember::SOURCE_FLAG_FIREWALLED,
             user_hash: Some([0xCCu8; 16]),
-            buddy: Some(buddy),
+            buddy: Some(ember::dht::publish::SourceBuddy {
+                ip: Ipv4Addr::new(8, 8, 4, 4),
+                udp_port: 4672,
+                noise_pub: [0x11; 32],
+                ed25519_pub: [0u8; 32],
+                endorsed_until: 0,
+                endorsement: [0u8; 64],
+            }),
             callback_token: Some([0xDDu8; 16]),
             publisher_id: [0xAAu8; 16],
         };
-        assert!(!ember_source_uses_callback(&src, false, false, true, 1_000));
-
-        for (why, addr) in [
-            ("LAN", SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4672)),
-            (
-                "TEST-NET",
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 4672),
-            ),
-            (
-                "port 0",
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 0),
-            ),
-            (
-                "IPv6",
-                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 4672),
-            ),
-        ] {
-            let mut c = ok.clone();
-            c.addr = addr;
-            assert!(
-                ember_unendorsed_source_buddy(&c).is_none(),
-                "{why} is not a callback destination even in compatibility mode"
-            );
-        }
-    }
-
-    /// The compatibility publish and the endorsement request go out on the same
-    /// tick, so the endorsement arrives while those records are still queued for
-    /// `PROXY_STORE_ACK`. Letting them land pins the file for
-    /// `EMBER_SOURCE_REPUBLISH`, so the fallback would keep a usable endorsement
-    /// off the wire for two hours. This is the predicate that picks them out.
-    #[test]
-    fn a_queued_record_is_recognised_as_carrying_the_compatibility_trailer() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
-        let base = ember::dht::publish::SourceContact {
-            ip: Ipv4Addr::new(10, 0, 0, 9),
-            tcp_port: 4662,
-            udp_port: 4672,
-            flags: ember::SOURCE_FLAG_FIREWALLED,
-            noise_pub: [0x33; 32],
-            user_hash: Some([0xCCu8; 16]),
-            callback_token: Some([0xDDu8; 16]),
-            buddy: None,
-        };
-        let unendorsed = ember::dht::publish::SourceBuddy {
-            ip: Ipv4Addr::new(8, 8, 4, 4),
-            udp_port: 4672,
-            noise_pub: [0xB1; 32],
-            ed25519_pub: [0u8; 32],
-            endorsed_until: 0,
-            endorsement: [0u8; 64],
-        };
-        let endorsed = ember::dht::publish::SourceBuddy {
-            ed25519_pub: [0xB2; 32],
-            endorsed_until: 4_000_000_000,
-            endorsement: [0xB3; 64],
-            ..unendorsed
-        };
-        let record = |buddy| {
-            ember::dht::publish::SignedRecord::source(
-                [0xAA; 16],
-                [0xBB; 32],
-                1,
-                "f.iso",
-                ember::dht::publish::SourceContact { buddy, ..base },
-                &sk,
-            )
-        };
-
-        assert!(ember_record_names_unendorsed_buddy(&record(Some(
-            unendorsed
-        ))));
         assert!(
-            !ember_record_names_unendorsed_buddy(&record(Some(endorsed))),
-            "an endorsed record is already what we want on the wire"
-        );
-        assert!(
-            !ember_record_names_unendorsed_buddy(&record(None)),
-            "a record naming no buddy cannot be reissued endorsed"
+            !ember_source_uses_callback(&src, false, false, true, 1_000),
+            "no identity key means no endorsement to check, so the source parks"
         );
     }
 
@@ -5789,11 +5919,10 @@ async fn persist_chat_history_message(
     user_hash: String,
     direction: &'static str,
     message: String,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     tokio::task::spawn_blocking(move || db.insert_chat_message(&user_hash, direction, &message))
         .await
         .map_err(|error| format!("Chat history persistence task failed: {error}"))?
-        .map(|_| ())
         .map_err(|error| format!("Failed to persist chat history: {error}"))
 }
 
@@ -5835,15 +5964,14 @@ async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Res
 /// (pubkey, ember_hash) pair.
 ///
 /// It only drives the DB row + UI verification badge for queued strangers.
-/// Auto-promotion of an already-added (non-mutual) friend when the user
-/// disabled approval still requires `verified` (Ed25519 PoP) so
-/// a hash-spoofing peer cannot force mutual status.
+/// Auto-promotion of an already-added (non-mutual) friend still requires
+/// `verified` (Ed25519 PoP) so a hash-spoofing peer cannot force mutual
+/// status. Adding them *was* the approval; their accept must not ask again.
 async fn process_inbound_friend_request(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     online_friends: &mut HashMap<[u8; 16], i64>,
     mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
-    require_approval: bool,
     req_hash: [u8; 16],
     peer_pubkey: Option<[u8; 32]>,
     nickname: &str,
@@ -5856,6 +5984,7 @@ async fn process_inbound_friend_request(
         AlreadyMutual,
         Promoted,
         PromotionSkipped,
+        IgnoredUnverifiedReciprocal,
         Queued,
         Failed(String),
     }
@@ -5896,16 +6025,22 @@ async fn process_inbound_friend_request(
             })
             .unwrap_or((false, false));
         if already_mutual {
+            // Leftover queue rows from the old double-approval path.
+            let _ = db_q.remove_friend_request(&h_q);
             FriendRequestDbOutcome::AlreadyMutual
-        } else if is_friend && !require_approval && verified {
-            // Auto-confirm only after Ed25519 PoP (or equivalent verified
-            // binding). An unverified reciprocal request still queues so a
-            // spoofed hash cannot promote a listed friend to mutual.
+        } else if is_friend && verified {
+            // Reciprocal of an add we initiated: that add was the approval.
+            // Still require Ed25519 PoP so a spoofed hash cannot promote a
+            // listed friend to mutual.
             match db_q.set_friend_mutual(&h_q, &ip_q, peer_port, peer_pubkey_q.as_ref()) {
                 Ok(n) if n > 0 => FriendRequestDbOutcome::Promoted,
                 Ok(_) => FriendRequestDbOutcome::PromotionSkipped,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
+        } else if is_friend {
+            // Already added, but this session has no PoP — do not auto-promote
+            // and do not ask again. A later verified session completes it.
+            FriendRequestDbOutcome::IgnoredUnverifiedReciprocal
         } else {
             match db_q.add_friend_request(
                 &h_q,
@@ -5938,12 +6073,12 @@ async fn process_inbound_friend_request(
             );
         }
         FriendRequestDbOutcome::Promoted => {
-            // Auto-confirm: the user already added this peer and disabled "require
-            // approval", so a reciprocal request upgrades the friendship to mutual
-            // without prompting. Strangers (not already in our list) still fall
-            // through to the approval queue — we never auto-add an unknown peer.
+            // Auto-confirm: the user already added this peer, so a reciprocal
+            // request upgrades the friendship to mutual without prompting.
+            // Strangers (not already in our list) still fall through to the
+            // approval queue — we never auto-add an unknown peer.
             info!(
-                "Auto-confirming friend {} (already added; approval not required)",
+                "Auto-confirming friend {} (already added; their accept completes it)",
                 hash_hex
             );
             // The DB row is now mutual, so grant browse / friends-only access
@@ -5981,10 +6116,27 @@ async fn process_inbound_friend_request(
                     "user_hash": hash_hex,
                 }),
             );
+            // Separate from `friend-confirmed`, which every rediscovery sweep
+            // emits for an already-live session: this fires only on the
+            // promotion itself, so the notice can't repeat every few minutes.
+            // Without it the accept the user was waiting for is silent.
+            let _ = app_handle.emit(
+                "ember:friend-auto-confirmed",
+                serde_json::json!({
+                    "user_hash": hash_hex,
+                    "nickname": nickname,
+                }),
+            );
         }
         FriendRequestDbOutcome::PromotionSkipped => {
             debug!(
                 "Friend {} promotion skipped because no DB row changed",
+                hash_hex
+            );
+        }
+        FriendRequestDbOutcome::IgnoredUnverifiedReciprocal => {
+            debug!(
+                "Ignoring unverified reciprocal friend request from {} (already added; waiting for PoP)",
                 hash_hex
             );
         }
@@ -6001,6 +6153,109 @@ async fn process_inbound_friend_request(
         }
         FriendRequestDbOutcome::Failed(e) => {
             warn!("Failed to persist inbound friend request from {hash_hex}: {e}");
+        }
+    }
+}
+
+/// Deliver one queued friend-request withdrawal, clearing its row once it lands.
+///
+/// The stored address is where the peer answered when the request itself was
+/// delivered, so it is worth trying first and costs nothing when it still holds.
+/// The rendezvous fallback is what makes the queue worth keeping though: a peer
+/// on a dynamic address, or one we never had an address for, would otherwise sit
+/// in the queue until it expired and keep the withdrawn request on their screen
+/// for good. The lookup is keyed by identity alone and does not consult the
+/// friend list, which matters because by now they are not a friend.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_friend_request_retraction(
+    db: Arc<Database>,
+    rendezvous_url: String,
+    hash_hex: String,
+    target: [u8; 16],
+    stored: Option<SocketAddr>,
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
+) {
+    let mut already_tried: Option<SocketAddr> = None;
+    for use_rendezvous in [false, true] {
+        let addr = if use_rendezvous {
+            match rendezvous::lookup(
+                &rendezvous_url,
+                &our_ember_hash,
+                &ed25519_pubkey,
+                &ed25519_secret_key,
+                &target,
+            )
+            .await
+            {
+                Ok(Some((ip, port))) => Some(SocketAddr::new(ip.into(), port)),
+                Ok(None) => {
+                    debug!("Rendezvous has no address for {hash_hex} to withdraw at");
+                    None
+                }
+                Err(e) => {
+                    debug!("Rendezvous lookup for withdrawal to {hash_hex} failed: {e}");
+                    None
+                }
+            }
+        } else {
+            stored
+        };
+        let Some(addr) = addr else { continue };
+        // The rendezvous commonly reports exactly the address we just failed on.
+        if already_tried == Some(addr) {
+            continue;
+        }
+        already_tried = Some(addr);
+        // Re-read the row rather than trusting the one we were handed. Adding
+        // that identity back clears the queue, and a dial started before the
+        // re-add would otherwise land afterwards and retract the request the
+        // new add had just sent.
+        let db_check = db.clone();
+        let still_owed = tokio::task::spawn_blocking(move || {
+            db_check.pending_friend_request_retractions()
+        })
+        .await
+        .ok()
+        .and_then(|rows| rows.ok())
+        .map(|rows| rows.iter().any(|(hash, ..)| hash == &hash_hex))
+        .unwrap_or(false);
+        if !still_owed {
+            debug!("Withdrawal to {hash_hex} was countermanded before it was sent");
+            return;
+        }
+        match ed2k::friend_connect::send_friend_request_retraction(
+            addr,
+            target,
+            our_user_hash,
+            our_ember_hash,
+            our_nickname.clone(),
+            our_client_id,
+            tcp_port,
+            udp_port,
+            obfuscate,
+            Some(ed25519_pubkey),
+            Some(ed25519_secret_key),
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    db.clear_friend_request_retraction(&hash_hex)
+                })
+                .await;
+                return;
+            }
+            Err(e) => {
+                debug!("Withdrawal to {hash_hex} at {addr} did not land: {e}");
+            }
         }
     }
 }
@@ -6031,6 +6286,7 @@ fn spawn_rendezvous_friend_lookup(
     let app_fc = app_handle.clone();
     let fh_fc = friend_hashes.clone();
     let sess_fc = state.ember_sessions.clone();
+    let offline_fc = state.user_offline.clone();
     let ultx_fc = ul_event_tx.clone();
     // Ember NAT-fallback context for `connect_friend_with_fallback`: a
     // plain `TcpStream::connect` alone can't reach a friend whose NAT
@@ -6149,6 +6405,7 @@ fn spawn_rendezvous_friend_lookup(
                         udp,
                         obfuscate,
                         sess_fc,
+                        offline_fc,
                         ultx_fc.clone(),
                         fh_fc,
                         Some(ed25519_pubkey),
@@ -6304,6 +6561,72 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// Firsthand session contacts sit beside the routing table and are exempt
+    /// from everything that disciplines a resident: no liveness ping reaches
+    /// them, so they never accrue a failed query, and the table's staleness
+    /// purge never sees them. Nothing aged them out at all — a LAN peer that
+    /// went away stayed in the UI's overlay count, on every search shortlist,
+    /// in the publish target set, and holding known-peer UDP treatment, until
+    /// 64 better contacts pushed it out.
+    #[test]
+    fn a_session_contact_that_goes_quiet_stops_being_counted() {
+        let now = 1_800_000_000i64;
+        let contact = |last_seen: i64, last: u8| ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([last; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last)), 4672),
+            noise_pub: [last; 32],
+            ed25519_pub: [last; 32],
+            last_seen,
+            failed_queries: 0,
+        };
+
+        let answering = contact(now - 60, 1);
+        let quiet = contact(now - EMBER_CONTACT_STALE_SECS - 1, 2);
+        let never_asked = contact(0, 3);
+
+        assert!(ember_session_contact_is_live(&answering, now));
+        assert!(
+            !ember_session_contact_is_live(&quiet, now),
+            "two hours unheard is the same verdict the routing table reaches"
+        );
+        assert!(
+            ember_session_contact_is_live(&never_asked, now),
+            "a LAN lead we have not probed yet is not a peer that went silent"
+        );
+
+        // And as the sweep applies it.
+        let mut map: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact> = HashMap::new();
+        for c in [&answering, &quiet, &never_asked] {
+            record_ember_session_dht_contact(&mut map, c.clone());
+        }
+        assert_eq!(map.len(), 3);
+        map.retain(|_, c| ember_session_contact_is_live(c, now));
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&(Ipv4Addr::new(192, 168, 1, 2), 4672)));
+
+        // The unproven lead is not immortal either: it is the first thing the
+        // LRU gives up, which is the order that matters — a proven peer should
+        // take its slot, not the clock.
+        for i in 0..MAX_EMBER_SESSION_DHT_CONTACTS as u8 {
+            record_ember_session_dht_contact(
+                &mut map,
+                ember::dht::EmberContact {
+                    node_id: ember::dht::EmberNodeId([0x80 | i; 16]),
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, i, 1)), 4672),
+                    noise_pub: [0x80 | i; 32],
+                    ed25519_pub: [0x80 | i; 32],
+                    last_seen: now - 10,
+                    failed_queries: 0,
+                },
+            );
+        }
+        assert!(map.len() <= MAX_EMBER_SESSION_DHT_CONTACTS);
+        assert!(
+            !map.contains_key(&(Ipv4Addr::new(192, 168, 1, 3), 4672)),
+            "the never-probed lead loses its slot to peers that answer"
+        );
+    }
 
     /// A succession claim hands a room to someone new, so the checks that gate
     /// it are the most consequential in the feature. "The owner is silent" and
@@ -6480,6 +6803,62 @@ mod tests {
             true,
             Some(std::time::Duration::from_secs(9_999))
         ));
+    }
+
+    #[test]
+    fn the_startup_sweep_looks_up_every_friend_rather_than_the_first_few() {
+        // The whole point of the queue: the sweep used to stop after three and
+        // leave the rest reading offline until the five-minute auto-retry got
+        // to them.
+        let mut queue: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+        let mut ticks = 0;
+        while !queue.is_empty() {
+            seen.extend(drain_initial_friend_search(&mut queue, 5, |_| false));
+            ticks += 1;
+            assert!(ticks < 10, "the queue has to drain, not cycle");
+        }
+        assert_eq!(ticks, 3, "12 friends at 5 a tick");
+        let expected: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        assert_eq!(seen, expected, "every friend, in order, exactly once");
+    }
+
+    #[test]
+    fn the_startup_sweep_sends_a_full_tick_of_lookups_even_when_most_are_online() {
+        // Skipped friends must not spend the budget. Charging them would make a
+        // list that is mostly online take a tick per *friend* instead of a tick
+        // per five lookups.
+        let mut queue: Vec<[u8; 16]> = (0..12u8).map(|i| [i; 16]).collect();
+        let online = |fh: &[u8; 16]| fh[0].is_multiple_of(2);
+        let first = drain_initial_friend_search(&mut queue, 5, online);
+        assert_eq!(
+            first,
+            vec![[1; 16], [3; 16], [5; 16], [7; 16], [9; 16]],
+            "five actual lookups, the evens among them passed over for free"
+        );
+        // `[10; 16]` is online too, but the budget ran out before it was
+        // examined, so it waits for the next tick to be skipped there.
+        assert_eq!(
+            queue,
+            vec![[10; 16], [11; 16]],
+            "everything past the budget is kept, untested"
+        );
+        assert_eq!(
+            drain_initial_friend_search(&mut queue, 5, online),
+            vec![[11; 16]],
+            "the remainder is filtered on its own tick"
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_friend_nothing_is_owed_for_leaves_the_startup_sweep_entirely() {
+        // Dropped, not deferred: they are already reachable, already being
+        // looked up, or no longer a friend. Deferring would re-offer them every
+        // tick and the queue would never empty.
+        let mut queue = vec![[1; 16], [2; 16]];
+        assert!(drain_initial_friend_search(&mut queue, 5, |_| true).is_empty());
+        assert!(queue.is_empty(), "a fully skipped tick still drains the queue");
     }
 
     #[test]
@@ -8207,8 +8586,8 @@ mod tests {
     /// recently, which is the empty-room poll case.
     #[test]
     fn an_empty_room_asks_for_its_roster_far_sooner_than_a_settled_one() {
-        let empty = channel_presence_interval(1);
-        let settled = channel_presence_interval(4);
+        let empty = channel_presence_interval(1, false);
+        let settled = channel_presence_interval(4, false);
 
         assert_eq!(empty, ember::channel::PRESENCE_FETCH_EMPTY_SECS);
         assert_eq!(settled, ember::channel::PRESENCE_FETCH_SECS);
@@ -8218,10 +8597,28 @@ mod tests {
         );
         // Zero should not be reachable — we write our own member row on join —
         // but it is the same "nobody else" situation if it ever is.
-        assert_eq!(channel_presence_interval(0), empty);
+        assert_eq!(channel_presence_interval(0, false), empty);
         assert!(
             empty < ember::channel::PRESENCE_REPUBLISH_SECS,
             "asking less often than members announce would miss arrivals"
+        );
+    }
+
+    /// The room on screen is walked at the watched rate however settled it is.
+    ///
+    /// A busy room takes the five-minute interval from its member count, which
+    /// is right for the twenty-nine rooms nobody is reading and wrong for the
+    /// one that is open: five minutes is simply how long a new arrival stays
+    /// invisible to the person looking straight at the member list.
+    #[test]
+    fn the_room_on_screen_is_walked_at_the_watched_rate() {
+        assert_eq!(
+            channel_presence_interval(40, true),
+            ember::channel::PRESENCE_FETCH_FOCUSED_SECS
+        );
+        assert!(
+            channel_presence_interval(40, true) < channel_presence_interval(40, false),
+            "focus has to beat the settled interval or naming the open room buys nothing"
         );
     }
 
@@ -9183,7 +9580,7 @@ mod tests {
 
         // Nothing attempted yet → freshest-first, capped at `max`.
         let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
-        let picked = kad_bridge_candidates(&map, &empty, 2);
+        let picked = kad_bridge_candidates(&map, &empty, 2, false);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), c); // freshest first
         assert_eq!(picked[0].2, [0xCC; 32]);
@@ -9192,13 +9589,13 @@ mod tests {
         // Mark C attempted → it drops out, leaving B then A.
         let mut attempted = HashMap::new();
         attempted.insert(c, (std::time::Instant::now(), 1u32));
-        let picked = kad_bridge_candidates(&map, &attempted, 8);
+        let picked = kad_bridge_candidates(&map, &attempted, 8, false);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), b);
         assert_eq!((picked[1].0, picked[1].1), a);
 
         // max == 0 → no work.
-        assert!(kad_bridge_candidates(&map, &empty, 0).is_empty());
+        assert!(kad_bridge_candidates(&map, &empty, 0, false).is_empty());
     }
 
     #[test]
@@ -9209,7 +9606,7 @@ mod tests {
         record_ember_noise_key(&mut map, docs, 4672, [0xAA; 32]);
         record_ember_noise_key(&mut map, ok, 4672, [0xBB; 32]);
         let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
-        let picked = kad_bridge_candidates(&map, &empty, 8);
+        let picked = kad_bridge_candidates(&map, &empty, 8, false);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].0, ok);
     }
@@ -9228,7 +9625,7 @@ mod tests {
         assert!(record_ember_keyless_peer(&mut keyless, bare.0, bare.1));
         record_ember_noise_key(&mut keys, keyed.0, keyed.1, [0xAA; 32]);
 
-        let picked = xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 8);
+        let picked = xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 8, false);
         assert_eq!(picked, vec![bare]);
     }
 
@@ -9248,19 +9645,19 @@ mod tests {
 
         // Freshest first, and the budget caps the batch.
         assert_eq!(
-            xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1),
+            xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1, false),
             vec![b]
         );
 
         let mut attempted = HashMap::new();
         attempted.insert(b, (std::time::Instant::now(), 1u32));
         assert_eq!(
-            xx_bridge_candidates(&keyless, &keys, &attempted, 8),
+            xx_bridge_candidates(&keyless, &keys, &attempted, 8, false),
             vec![a]
         );
 
         // A spent budget means no work, which is how the IK pass reserves it.
-        assert!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 0).is_empty());
+        assert!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 0, false).is_empty());
     }
 
     /// One lost ping must not be final. The discovery caches refresh a peer's
@@ -9281,19 +9678,21 @@ mod tests {
 
         // Just after the attempt the bridge moves on to other peers.
         let soon = attempt_at + std::time::Duration::from_secs(30);
-        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, soon).is_empty());
+        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, soon, false).is_empty());
 
         // Past the window it is eligible again.
         let later = attempt_at + EMBER_BRIDGE_RETRY_FIRST;
-        let picked = kad_bridge_candidates_at(&keys, &attempted, 8, later);
+        let picked = kad_bridge_candidates_at(&keys, &attempted, 8, later, false);
         assert_eq!(picked.len(), 1);
         assert_eq!((picked[0].0, picked[0].1), peer);
 
         // The XX pass honours the same window (with no Noise key known).
         let no_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
-        assert!(xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, soon).is_empty());
+        assert!(
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, soon, false).is_empty()
+        );
         assert_eq!(
-            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, later),
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, later, false),
             vec![peer]
         );
     }
@@ -9304,15 +9703,127 @@ mod tests {
     /// rate rather than being probed forever.
     #[test]
     fn bridge_retry_backs_off_from_one_maintenance_tick_to_the_old_ceiling() {
-        assert_eq!(bridge_retry_after(1), EMBER_BRIDGE_RETRY_FIRST);
-        assert_eq!(bridge_retry_after(2), EMBER_BRIDGE_RETRY_FIRST * 2);
-        assert_eq!(bridge_retry_after(3), EMBER_BRIDGE_RETRY_FIRST * 4);
-        assert_eq!(bridge_retry_after(4), EMBER_BRIDGE_RETRY_MAX);
-        assert_eq!(bridge_retry_after(50), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(1, false), EMBER_BRIDGE_RETRY_FIRST);
+        assert_eq!(bridge_retry_after(2, false), EMBER_BRIDGE_RETRY_FIRST * 2);
+        assert_eq!(bridge_retry_after(3, false), EMBER_BRIDGE_RETRY_FIRST * 4);
+        assert_eq!(bridge_retry_after(4, false), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(50, false), EMBER_BRIDGE_RETRY_MAX);
         // Saturating rather than shifting past the width of the counter.
-        assert_eq!(bridge_retry_after(u32::MAX), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(u32::MAX, false), EMBER_BRIDGE_RETRY_MAX);
         // A peer with no recorded attempt is due immediately.
-        assert_eq!(bridge_retry_after(0), EMBER_BRIDGE_RETRY_FIRST);
+        assert_eq!(bridge_retry_after(0, false), EMBER_BRIDGE_RETRY_FIRST);
+    }
+
+    /// While the table is too thin to run a lookup on, the backoff flattens to
+    /// its first step. The curve is right for a healthy node deciding how much
+    /// to keep spending on an address that will not answer; it is wrong when
+    /// those addresses are the entire join, because five minutes is longer than
+    /// many sessions and a friend who dropped one datagram gets no second
+    /// chance inside a visit.
+    #[test]
+    fn a_starved_table_does_not_let_the_bridge_back_off() {
+        for attempts in [0u32, 1, 2, 3, 4, 50, u32::MAX] {
+            assert_eq!(
+                bridge_retry_after(attempts, true),
+                EMBER_BRIDGE_RETRY_FIRST,
+                "a starved node retries every tick, whatever the attempt count"
+            );
+        }
+
+        // And it is the maintenance tick, not something faster: the bridge is
+        // driven by that timer, so this cannot become a busy loop.
+        assert_eq!(EMBER_BRIDGE_RETRY_FIRST, EMBER_MAINT_INTERVAL);
+
+        // The same peer, same history, is due while starved and not otherwise.
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let peer = (Ipv4Addr::new(8, 8, 8, 8), 4672u16);
+        record_ember_noise_key(&mut keys, peer.0, peer.1, [0x11; 32]);
+        let at = std::time::Instant::now();
+        let mut attempted = HashMap::new();
+        // Four misses: settled at the five-minute ceiling on a healthy table.
+        attempted.insert(peer, (at, 4u32));
+        let one_tick = at + EMBER_BRIDGE_RETRY_FIRST;
+
+        assert!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, false).is_empty(),
+            "a healthy table still lets a dead address rest"
+        );
+        assert_eq!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, true).len(),
+            1,
+            "a starved one tries again on the next tick"
+        );
+    }
+
+    /// Flattening the backoff made every address due on every tick, and with
+    /// freshness as the only key the same freshest few — re-observed by each
+    /// KAD lookup whether or not they ever answered — took the whole budget
+    /// every time. An address that has never been asked has to come ahead of
+    /// one that has ignored us, however recently the latter was seen.
+    #[test]
+    fn a_starved_bridge_tries_untested_addresses_before_ones_that_kept_ignoring_it() {
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let ignored_fresh = (Ipv4Addr::new(8, 8, 8, 1), 4672u16);
+        let untried_old = (Ipv4Addr::new(8, 8, 8, 2), 4672u16);
+        let untried_fresh = (Ipv4Addr::new(8, 8, 8, 3), 4672u16);
+        let once_missed = (Ipv4Addr::new(8, 8, 8, 4), 4672u16);
+        // Oldest observation first so the timestamps strictly increase.
+        for peer in [untried_old, once_missed, untried_fresh, ignored_fresh] {
+            record_ember_noise_key(&mut keys, peer.0, peer.1, [0x22; 32]);
+            record_ember_keyless_peer(&mut keyless, peer.0, peer.1);
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let at = std::time::Instant::now();
+        let mut attempted = HashMap::new();
+        attempted.insert(ignored_fresh, (at, 3u32));
+        attempted.insert(once_missed, (at, 1u32));
+        let one_tick = at + EMBER_BRIDGE_RETRY_FIRST;
+
+        let picked: Vec<_> = kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, true)
+            .into_iter()
+            .map(|(ip, port, _)| (ip, port))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![untried_fresh, untried_old, once_missed, ignored_fresh],
+            "never-asked first (freshest of those ahead), then by how often each has ignored us"
+        );
+        // A budget of two therefore reaches both untried addresses, where the
+        // old order spent one of them re-dialling the address with three misses.
+        let two: Vec<_> = kad_bridge_candidates_at(&keys, &attempted, 2, one_tick, true)
+            .into_iter()
+            .map(|(ip, port, _)| (ip, port))
+            .collect();
+        assert_eq!(two, vec![untried_fresh, untried_old]);
+
+        // The XX side ranks the same way.
+        let no_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        assert_eq!(
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, one_tick, true),
+            vec![untried_fresh, untried_old, once_missed, ignored_fresh]
+        );
+    }
+
+    /// The IK pass ran first and left the XX pass its remainder. While starved,
+    /// a key cache with more due addresses than the budget — the usual state of
+    /// a KAD-fed cache, most of it stale source records — left nothing over, so
+    /// the keyless peers, which are live sessions and the likeliest to answer,
+    /// were never dialled at all.
+    #[test]
+    fn the_xx_bridge_pass_keeps_a_share_of_the_budget_while_there_is_anyone_to_spend_it_on() {
+        // A quarter, floored at one so the four-ping fast pass still reaches it.
+        assert_eq!(
+            xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, true),
+            EMBER_KAD_BRIDGE_MAX_PINGS / 4
+        );
+        assert_eq!(xx_bridge_reserve(EMBER_BRIDGE_FAST_MAX_PINGS, true), 1);
+        assert_eq!(xx_bridge_reserve(1, true), 1);
+        // Never more than the pass itself, and nothing at all when the pass is
+        // empty or there is no keyless peer to spend it on.
+        assert_eq!(xx_bridge_reserve(0, true), 0);
+        assert_eq!(xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, false), 0);
+        assert!(xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, true) < EMBER_KAD_BRIDGE_MAX_PINGS);
     }
 
     /// Each unanswered ping must lengthen the next wait. Overwriting the entry
@@ -9329,10 +9840,19 @@ mod tests {
         attempted.insert(peer, (at, 3u32));
 
         // Two doublings in: one tick is no longer enough.
-        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST)
-            .is_empty());
+        assert!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST, false)
+                .is_empty()
+        );
         assert_eq!(
-            kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST * 4).len(),
+            kad_bridge_candidates_at(
+                &keys,
+                &attempted,
+                8,
+                at + EMBER_BRIDGE_RETRY_FIRST * 4,
+                false
+            )
+            .len(),
             1
         );
     }
@@ -9525,6 +10045,160 @@ mod tests {
             to_public.is_empty(),
             "LAN session contacts must not be gossiped to the public net"
         );
+    }
+
+    /// A friend asks for contacts because its own table is thin, so answering
+    /// with addresses we have never heard from would hand it our guesses and
+    /// call them introductions. `find_closest` falls back to leads exactly
+    /// when we hold nothing verified, which is the case that must answer
+    /// empty instead.
+    #[test]
+    fn a_friend_is_only_ever_told_about_contacts_that_answered_us() {
+        let target = ember::dht::EmberNodeId([0x11; 16]);
+        let mut table =
+            ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0xFF; 16]), false);
+
+        let mut lead = test_ember_contact(2, [10, 2, 0, 20], 4672);
+        lead.last_seen = 0;
+        table.add_contact(lead.clone());
+        assert!(!lead.is_verified());
+        assert!(
+            ember_friend_contact_answer(&table, &target).is_empty(),
+            "a node holding only leads has nothing to introduce"
+        );
+
+        let proven = test_ember_contact(1, [10, 1, 0, 10], 4672);
+        assert!(proven.is_verified());
+        table.add_contact(proven.clone());
+        let answer = ember_friend_contact_answer(&table, &target);
+        assert_eq!(answer.len(), 1);
+        assert_eq!(answer[0].node_id, proven.node_id);
+    }
+
+    /// Every friend has to get a turn. The ask interval equals the maintenance
+    /// tick, so a friend asked last cycle is due again this cycle, and the
+    /// per-tick budget is smaller than a friends list — so ordering by
+    /// least-recently-asked is the only thing stopping the first few from
+    /// holding the budget while the rest are never asked at all.
+    #[test]
+    fn the_friend_ask_rotates_instead_of_pinning_the_first_few() {
+        let friends: Vec<[u8; 16]> = (1..=9u8).map(|i| [i; 16]).collect();
+        assert!(
+            friends.len() > EMBER_FRIEND_CONTACT_ASKS_PER_TICK,
+            "the fixture only means anything with more friends than one tick can ask"
+        );
+        let mut asked: HashMap<[u8; 16], std::time::Instant> = HashMap::new();
+        let mut ever_asked: HashSet<[u8; 16]> = HashSet::new();
+        let start = std::time::Instant::now();
+
+        for tick in 0..3u32 {
+            let now = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL * tick;
+            let live: Vec<([u8; 16], ())> = friends.iter().map(|f| (*f, ())).collect();
+            let due = ember_friend_ask_order(live, &asked, now);
+            for (eh, _) in due.into_iter().take(EMBER_FRIEND_CONTACT_ASKS_PER_TICK) {
+                asked.insert(eh, now);
+                ever_asked.insert(eh);
+            }
+        }
+
+        assert_eq!(
+            ever_asked.len(),
+            friends.len(),
+            "every friend must get a turn within a few ticks"
+        );
+    }
+
+    /// A friend asked this tick must not be asked again on the next one, or
+    /// the throttle would be doing nothing.
+    #[test]
+    fn a_friend_just_asked_is_not_due_again_immediately() {
+        let friend = [7u8; 16];
+        let start = std::time::Instant::now();
+        let mut asked = HashMap::new();
+        asked.insert(friend, start);
+
+        let soon = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL / 2;
+        assert!(ember_friend_ask_order(vec![(friend, ())], &asked, soon).is_empty());
+
+        let later = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL;
+        assert_eq!(
+            ember_friend_ask_order(vec![(friend, ())], &asked, later).len(),
+            1
+        );
+    }
+
+    /// A contact with a real key, since the friend answer is decoded on the
+    /// far side and `decode_contact_list` drops anything whose Ed25519 key is
+    /// not a valid point.
+    fn keyed_ember_contact(seed: u8, ip: [u8; 4]) -> ember::dht::EmberContact {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId(
+                crate::network::ember::crypto::node_id_from_public_key(&vk),
+            ),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), 4672),
+            noise_pub: [seed; 32],
+            ed25519_pub: vk.to_bytes(),
+            last_seen: 1,
+            failed_queries: 0,
+        }
+    }
+
+    /// What we hand a friend has to survive the round trip the friend session
+    /// puts it through, and arrive on the far side as *leads* — with every
+    /// node ID re-derived from the key beside it, so a friend cannot name a
+    /// contact under an ID it does not control.
+    #[test]
+    fn a_friend_answer_survives_the_round_trip_as_unverified_leads() {
+        let target = ember::dht::EmberNodeId([0x11; 16]);
+        let mut table =
+            ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0xFF; 16]), false);
+        // Distinct /24s, or the diversity caps refuse most of them.
+        for i in 1..=ember::dht::MAX_CONTACTS_PER_RESPONSE as u8 {
+            table.add_contact(keyed_ember_contact(i, [10, 0, i, 10]));
+        }
+        let answer = ember_friend_contact_answer(&table, &target);
+        assert!(!answer.is_empty(), "the fixture must produce an answer");
+
+        let body = ember::dht::messages::encode_contact_list(&answer);
+        let frame =
+            ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACTS, &body);
+        let (ext_type, wire_body) =
+            ed2k::messages::parse_ember_ext(&frame[6..]).expect("a framed answer parses");
+        assert_eq!(ext_type, ed2k::messages::EMBER_EXT_DHT_CONTACTS);
+        assert!(
+            wire_body.len() <= ember::dht::messages::MAX_CONTACT_LIST_BYTES,
+            "the receiver refuses a body over the cap before decoding it, so an \
+             honest answer must fit: {} contacts encoded to {} bytes",
+            answer.len(),
+            wire_body.len()
+        );
+
+        // The encoder trims to its own datagram budget, which over TCP only
+        // caps the answer at 17 — see `encode_contact_list`. What must hold is
+        // that nothing it did carry is lost on the far side.
+        let carried = wire_body[0] as usize;
+        assert!(carried > 0 && carried <= answer.len());
+        let decoded = ember::dht::messages::decode_contact_list(wire_body)
+            .expect("our own answer must decode");
+        assert_eq!(
+            decoded.len(),
+            carried,
+            "no carried contact may be dropped for an unusable key"
+        );
+        for contact in &decoded {
+            assert_eq!(
+                contact.node_id.0,
+                crate::network::ember::crypto::node_id_from_ed25519_bytes(&contact.ed25519_pub)
+                    .expect("the fixture keys are valid points"),
+                "the ID must come from the key, never from the wire"
+            );
+            assert!(
+                !contact.is_verified(),
+                "a contact learned from a friend is a lead until it answers us"
+            );
+        }
     }
 
     #[test]
@@ -10328,6 +11002,18 @@ pub enum NetworkCommand {
         message: String,
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Live composing signal. Never queued: if the friend is not on a fresh
+    /// session the packet is dropped and the next keystroke retries.
+    SendChatTyping {
+        ember_hash: [u8; 16],
+        typing: bool,
+    },
+    /// Read-receipt watermark (BLAKE3-16 of the latest inbound line we have
+    /// opened). Offline sends are retried the next time a session comes up.
+    SendChatReadReceipt {
+        ember_hash: [u8; 16],
+        body_hash: [u8; 16],
+    },
     BrowseFriend {
         ember_hash: [u8; 16],
         request_id: String,
@@ -10340,6 +11026,12 @@ pub enum NetworkCommand {
     FriendRemoved {
         ember_hash: [u8; 16],
         tx: oneshot::Sender<()>,
+    },
+    /// Withdraw a friend request the user has just cancelled. Fire-and-forget:
+    /// the row in `friend_request_retractions` is what guarantees delivery, so
+    /// the UI never waits on the peer being reachable this second.
+    RetractFriendRequest {
+        ember_hash: [u8; 16],
     },
     FindFriendAndConnect {
         ember_hash: [u8; 16],
@@ -10503,6 +11195,22 @@ pub enum NetworkCommand {
     RefreshChannelMembers {
         channel_id: [u8; 16],
     },
+    /// Announce our arrival or departure on the live mesh right now.
+    ///
+    /// The DHT record this pairs with takes a republish interval to be written
+    /// and a fetch interval to be read, so on its own it makes joining a room
+    /// something the rest of the room learns about minutes later. This is the
+    /// same fact, signed the same way, taking the path the room's own chat
+    /// takes.
+    AnnounceChannelPresence {
+        channel_id: [u8; 16],
+        departed: bool,
+    },
+    /// Which room the user is looking at, if any. Raises that room's presence
+    /// cadence and lowers the previous one back to the resting rate.
+    SetChannelFocus {
+        channel_id: Option<[u8; 16]>,
+    },
     /// Ember Transfer: offer one file to one channel member. The file is
     /// already hashed by the caller, so the network task never blocks on a
     /// 100 MB read.
@@ -10647,6 +11355,9 @@ pub struct EmberMaintenanceResult {
     /// KAD-bridge bootstrap `PING`s sent to KAD-learned Ember peers (slice
     /// 13). Non-zero only while the table is still sparse.
     pub kad_bridge_pings_sent: usize,
+    /// Friend sessions asked for their Ember DHT contacts. Like the bridge,
+    /// non-zero only while the table is short of a working set.
+    pub friend_contact_asks: usize,
 }
 
 /// Persisted peak of verified Ember DHT contacts, so a restart does not
@@ -11059,6 +11770,37 @@ pub(crate) fn apply_transfer_status_write(
     last.insert(transfer_id.to_string(), seq);
     if let Err(e) = db.update_transfer_status(transfer_id, status) {
         warn!("DB update_transfer_status('{status}') failed for {transfer_id}: {e}");
+    }
+}
+
+/// The completion counterpart of [`apply_transfer_status_write`].
+///
+/// Ordered against the same clock — a completion that lost a race to a newer
+/// status must not resurrect the row — but commits the final progress, the
+/// status, the history row and the optional delete in one transaction instead
+/// of four independent statements.
+pub(crate) fn apply_transfer_completion_write(
+    clock: &TransferStatusWriteClock,
+    db: &Database,
+    transfer_id: &str,
+    final_total: Option<u64>,
+    history: Option<(String, String, u64)>,
+    remove_row: bool,
+    seq: u64,
+) {
+    let mut last = match clock.last.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if transfer_status_write_is_stale(last.get(transfer_id).copied(), seq) {
+        return;
+    }
+    last.insert(transfer_id.to_string(), seq);
+    let history = history
+        .as_ref()
+        .map(|(hash, name, size)| (hash.as_str(), name.as_str(), *size));
+    if let Err(e) = db.complete_transfer(transfer_id, final_total, history, remove_row) {
+        warn!("DB complete_transfer failed for {transfer_id}: {e}");
     }
 }
 
@@ -11958,11 +12700,12 @@ struct NetworkState {
     /// its peers on every restart and could only ever shrink the file. See
     /// [`ember::dht::peer_cache`].
     ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache,
-    /// Whether this session actually read `nodes_ember.dat`. Lets the save path
-    /// tell "the book is genuinely empty" from "we never got to look at it" —
-    /// see [`ember::dht::bootstrap::save_nodes`]. `true` when the file is simply
-    /// absent, which is a new profile rather than a failure.
-    ember_nodes_loaded: bool,
+    /// What this session knows about `nodes_ember.dat`. Lets the save path tell
+    /// "the book is genuinely empty" from "we never got to look at it", and
+    /// from "we read a truncated file and must not write our subset back over
+    /// it" — see [`ember::dht::bootstrap::save_nodes`]. `Loaded` when the file
+    /// is simply absent, which is a new profile rather than a failure.
+    ember_nodes_file: ember::dht::bootstrap::NodesFileState,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
     ember_rendezvous_published_at: i64,
@@ -12007,7 +12750,17 @@ struct NetworkState {
     ember_last_self_lookup: i64,
     /// Unix time we last received any Ember DHT frame. `None` until the first
     /// one arrives. Drives disconnect detection.
+    ///
+    /// Only ever written when a frame actually arrives. The disconnect re-arm
+    /// used to stamp it too, to keep itself from firing every tick, which made
+    /// `ember_dht_seconds_since_inbound` read a couple of seconds on a node
+    /// that had heard nothing for an hour — "joined and quiet" and "stuck
+    /// rejoining" looked identical in diagnostics, and the second is the one
+    /// worth seeing. The debounce lives in `ember_rearmed_at` instead.
     ember_last_inbound: Option<i64>,
+    /// Unix time the disconnect re-arm last fired, so it fires once per silent
+    /// stretch rather than on every maintenance tick within one.
+    ember_rearmed_at: Option<i64>,
     /// Overlay contact count as of the previous maintenance tick, so emptying
     /// can re-arm bootstrap on the *transition* to zero rather than every tick
     /// spent there.
@@ -12093,6 +12846,19 @@ struct NetworkState {
     /// frame. See `probe_ember_gossip_leads`.
     ember_gossip_probe_window: (std::time::Instant, usize),
 
+    /// Which peers' introductions have been worth probing. Decides how much of
+    /// the gossip-probe budget one introducer may spend; see
+    /// [`ember::dht::gossip`] for why it never refuses a contact outright and
+    /// is not consulted while the table is starved.
+    ember_gossip_reputation: ember::dht::gossip::GossipReputation,
+
+    /// When we last asked each friend for its Ember DHT contacts, and when we
+    /// last answered that question for them. Kept apart so the two directions
+    /// cannot throttle each other: a friend asking us on its own schedule says
+    /// nothing about when we should next ask them.
+    ember_friend_contacts_asked: HashMap<[u8; 16], std::time::Instant>,
+    ember_friend_contacts_served: HashMap<[u8; 16], std::time::Instant>,
+
     /// Session store-ack/fail totals as of the previous Ember publish
     /// heartbeat, so that line can report a per-cycle delta next to the total
     /// instead of printing a lifetime counter among per-cycle ones.
@@ -12163,12 +12929,26 @@ struct NetworkState {
     /// listener rejects new connections and terminates active sessions.
     /// The upload TCP listener binds and starts accepting connections as
     /// soon as `start_network` runs, independent of KAD/server connection
-    /// state, so this must be initialized to match `stats.status` /
-    /// `settings.auto_connect_kad` (see `start_network`) rather than
-    /// defaulting to `false` — otherwise a fresh launch (or any session
-    /// with auto-connect off) serves uploads to anyone who already knows
-    /// our IP:port while the UI still reads "Disconnected".
+    /// state, so this must track `stats.status` (see `start_network`) — a
+    /// node that reads "Disconnected" in the UI must not still be serving
+    /// uploads to peers who remember our IP:port from a prior session.
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// The user asked activity to stop: set by an explicit `KadDisconnect`,
+    /// cleared by every path back off `Disconnected`.
+    ///
+    /// Deliberately not `upload_disconnected`, which answers a different
+    /// question — "are we accepting inbound connections?" — and is *also*
+    /// raised when an eD2K server drops a session whose KAD side is already
+    /// disconnected, and by the shutdown save sequence. Neither of those is
+    /// the user asking to go offline. This one is only ever set by an explicit
+    /// Disconnect, so it can gate the outbound side: starting download
+    /// workers, dialling friends, and UDP server search.
+    ///
+    /// Shared rather than a plain `bool` because friend dials outlive the
+    /// network task's borrow — one spawned before the click can still be
+    /// mid-handshake after it, and the session-insert path has to be able to
+    /// see that the answer changed underneath it.
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
     /// Last successful `/register` had intro *and* every pairwise presence
@@ -12191,9 +12971,14 @@ struct NetworkState {
     /// Tracks active outbound friend session tasks to prevent duplicates.
     /// ember_hash -> Instant when the session was started.
     outbound_session_tasks: HashMap<[u8; 16], std::time::Instant>,
-    /// Whether the initial friend search burst has fired after connect
+    /// Whether the initial friend search has been queued after connect
     friend_search_initial_done: bool,
-    /// When the initial friend search burst started (for 30-min auto-retry cutoff)
+    /// Friends still owed a startup presence lookup, drained
+    /// [`INITIAL_FRIEND_SEARCH_PER_TICK`] at a time by the bootstrap timer.
+    /// Filtered against live state on the way out, so anyone who turns up on
+    /// their own before their turn costs nothing.
+    friend_search_initial_queue: Vec<[u8; 16]>,
+    /// When the initial friend search started (for 30-min auto-retry cutoff)
     friend_search_started_at: Option<std::time::Instant>,
     /// Backoff tracker for friend reconnection: ember_hash -> last attempt time.
     /// Prevents tight reconnect loops when sessions fail immediately.
@@ -12292,10 +13077,16 @@ struct NetworkState {
     /// Pending Ember DHT `FIND_NODE` requests awaiting a `FOUND_NODE`,
     /// keyed by `request_id`. The waiter receives the contacts the peer
     /// returned. Bounded by `MAX_EMBER_PENDING_PINGS`.
+    /// The destination is kept alongside the waiter so an answer has to come
+    /// from the peer the query went to, the way `ember_dht_pending_pings`
+    /// already requires. Request ids come from one guessable counter, so
+    /// matching on the id alone let any peer holding a session answer somebody
+    /// else's query with its own contact list.
     ember_dht_pending_finds: HashMap<
         u32,
         (
             std::time::Instant,
+            SocketAddr,
             oneshot::Sender<Vec<EmberDhtContactInfo>>,
         ),
     >,
@@ -12343,15 +13134,6 @@ struct NetworkState {
     /// elapsed, mirroring KAD's per-file source-publish schedule but driven
     /// independently of KAD connectivity so it works on a KAD-less network.
     ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
-    /// Whether any live source record of ours names a buddy that did not endorse
-    /// the endpoint — the compatibility trailer taken when no candidate had
-    /// answered `BUDDY_ENDORSE_REQ` yet.
-    ///
-    /// A latch, not a gauge: it survives the tick that set it so
-    /// [`ember_endorsement_supersedes_unendorsed_sources`] can retire those
-    /// records the moment an endorsement arrives, and is cleared there so an
-    /// unsolicited endorsement cannot force repeated republishing.
-    ember_source_published_unendorsed: bool,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     ember_source_publish_unix: HashMap<[u8; 16], u32>,
@@ -12451,6 +13233,33 @@ struct NetworkState {
     ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
     /// Last presence FIND_VALUE start per channel.
     channel_presence_fetch_at: HashMap<[u8; 16], i64>,
+    /// The one room the user currently has open, if any.
+    ///
+    /// Presence costs are paid per room, and a user who has joined thirty of
+    /// them is reading one. Walking and beating that one harder is the whole
+    /// difference between a roster that is right when somebody looks at it and
+    /// one that is right five minutes later.
+    channel_focused: Option<[u8; 16]>,
+    /// Last mesh presence beat per channel.
+    channel_beacon_beat_at: HashMap<[u8; 16], i64>,
+    /// Freshest beacon held per room, keyed by the member that signed it.
+    ///
+    /// Bounded by the roster, because a beacon is only kept for a member the
+    /// roster already admits — the cap and eviction rules in
+    /// `upsert_channel_member` are what stop a flood of invented identities
+    /// becoming gossip neighbors, and this map must not be a way around them.
+    channel_beacons: HashMap<[u8; 16], HashMap<[u8; 32], ember::channel::PresenceBeacon>>,
+    /// Last time a member's beacon was passed on as a flood, per (room, member).
+    channel_beacon_flood_at: HashMap<([u8; 16], [u8; 32]), i64>,
+    /// Rolling `(window start, count)` of members a room's roster has gained
+    /// from beacons, which is the one thing this layer must not make cheap.
+    channel_beacon_inserts: HashMap<[u8; 16], (i64, usize)>,
+    /// Roster rows whose `last_seen` moved since the last presence emit.
+    ///
+    /// Coalesced rather than emitted as they land: a busy room touches the same
+    /// handful of rows many times a second, and the UI only needs to know where
+    /// they ended up.
+    channel_presence_dirty: HashMap<[u8; 16], HashMap<[u8; 32], i64>>,
     /// In-flight FIND_VALUE of channel moderation keys (`search_id` → channel).
     ember_channel_moderation_searches: HashMap<u32, [u8; 16]>,
     /// Moderation blobs waiting for DB apply + UI emit (async drain), with how
@@ -12490,6 +13299,19 @@ struct NetworkState {
     xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
     /// Ember Transfer: files we accepted and are pulling in.
     xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
+    /// Where [`finish_xfer_recv`] posts a verified transfer back to the event
+    /// loop. Held here rather than threaded through the four frames between
+    /// the loop and the block handler that completes a transfer.
+    xfer_finish_tx: mpsc::UnboundedSender<XferFinishResult>,
+    /// Verifications handed to the blocking pool that the loop has not yet
+    /// applied. Shutdown drains exactly this many results before it tears the
+    /// socket down, so a transfer that finished hashing as the user quit still
+    /// gets its completion frame instead of being timed out by the sender.
+    xfer_finish_in_flight: usize,
+    /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
+    /// holding the newest timestamp seen. Drained once a second by
+    /// [`flush_channel_member_touches`].
+    channel_member_touches: HashMap<([u8; 16], [u8; 32]), i64>,
     /// Offers waiting on the user to accept or decline.
     xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
     /// Data-block send budget. Separate from the chat one on purpose — see
@@ -13106,6 +13928,581 @@ fn channel_member_pubkeys(
         .collect()
 }
 
+/// Ceiling on [`NetworkState::channel_member_touches`] between flushes.
+///
+/// Rooms joined times the roster cap, rounded to something a burst cannot
+/// meaningfully exceed in the one second a buffer lives for.
+const MAX_CHANNEL_MEMBER_TOUCHES: usize = 4096;
+
+/// Queue a roster row for the next presence emit.
+///
+/// Bounded by the same roster cap as the table it mirrors, so a peer spraying
+/// beacons for identities we refuse to admit cannot grow this instead.
+fn mark_channel_presence_dirty(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+    at: i64,
+) {
+    let room = state.channel_presence_dirty.entry(channel_id).or_default();
+    if room.len() >= ember::channel::CHANNEL_MEMBERS_MAX && !room.contains_key(member) {
+        return;
+    }
+    let slot = room.entry(*member).or_insert(at);
+    *slot = (*slot).max(at);
+}
+
+/// Record that a member was demonstrably alive a moment ago.
+///
+/// Every caller has already established the author cryptographically — a
+/// signature over the frame, or the pairwise transfer key that only that member
+/// and this device can derive — so this is first-hand evidence rather than one
+/// peer's claim about another. It is also free: these frames were already
+/// crossing the mesh between exactly these members, and the one thing they
+/// proved was the one thing the roster never learned from them. A member who
+/// was relaying gossip and moving a file could still be shown offline.
+///
+/// Deliberately a touch and never an insert. Whether a stranger may *join* a
+/// roster is a separate question that public and private rooms answer
+/// differently — see [`ember::channel::chat_author_joins_gossip_roster`] — and
+/// answering it here would quietly route around it.
+/// Buffered rather than written, and flushed once per second by
+/// [`flush_channel_member_touches`]. This is called for *every* channel
+/// datagram that authenticates, and the write it used to do was a synchronous
+/// autocommitted `UPDATE` on the network task — one transaction, and under
+/// `synchronous=FULL` one fsync, per datagram, each taking the connection
+/// mutex that every other database user in the process shares. A member in a
+/// few busy rooms turned that into tens of fsyncs a second on the reactor.
+///
+/// Only the newest timestamp per member survives, which is all the row can
+/// hold anyway: the `UPDATE` moves `last_seen` forward or does nothing, so
+/// collapsing a second's worth of datagrams into one write loses nothing.
+fn note_channel_member_alive(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+    at: i64,
+) {
+    if *member == state.local_ed25519_pubkey {
+        return;
+    }
+    if at <= 0 {
+        return;
+    }
+    // Bounded like the roster it mirrors. Every caller has already
+    // authenticated the author against a room we are in, so the key space is
+    // rooms x members, but a cap keeps a burst from deciding how large this
+    // grows between flushes.
+    if state.channel_member_touches.len() >= MAX_CHANNEL_MEMBER_TOUCHES
+        && !state
+            .channel_member_touches
+            .contains_key(&(channel_id, *member))
+    {
+        return;
+    }
+    let slot = state
+        .channel_member_touches
+        .entry((channel_id, *member))
+        .or_insert(at);
+    *slot = (*slot).max(at);
+}
+
+/// Write the second's worth of buffered `last_seen` touches as one transaction,
+/// and queue a presence delta for each row that actually moved.
+///
+/// Runs immediately before [`emit_channel_presence_deltas`], so a member heard
+/// from during this tick is still reported on this tick.
+fn flush_channel_member_touches(state: &mut NetworkState, db: &Database) {
+    if state.channel_member_touches.is_empty() {
+        return;
+    }
+    let pending: Vec<(([u8; 16], [u8; 32]), i64)> =
+        state.channel_member_touches.drain().collect();
+    let rows: Vec<(String, String, i64)> = pending
+        .iter()
+        .map(|((channel_id, member), at)| (hex::encode(channel_id), hex::encode(member), *at))
+        .collect();
+    let updated = match db.touch_channel_members_last_seen(&rows) {
+        Ok(updated) => updated,
+        Err(e) => {
+            // Dropped rather than retried: each of these is "this member was
+            // alive a moment ago", and the next datagram from them re-queues a
+            // fresher one. Holding them would only age the buffer.
+            debug!("Failed to flush channel member presence touches: {e}");
+            return;
+        }
+    };
+    for (((channel_id, member), at), moved) in pending.into_iter().zip(updated) {
+        if moved {
+            mark_channel_presence_dirty(state, channel_id, &member, at);
+        }
+    }
+}
+
+/// Push the roster rows whose `last_seen` moved since the last pass.
+///
+/// A delta rather than a nudge to re-read the whole list. `ember:channel-members`
+/// means "the roster changed shape" and costs the UI a round trip through
+/// `list_channel_members` for every member of the room; presence moves far more
+/// often than membership does, and firing that event every time somebody was
+/// heard from turned a quiet room into a steady stream of full refetches. What
+/// changed here is one number on one row, so that is what goes across.
+fn emit_channel_presence_deltas(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+    if state.channel_presence_dirty.is_empty() {
+        return;
+    }
+    for (channel_id, rows) in std::mem::take(&mut state.channel_presence_dirty) {
+        if rows.is_empty() {
+            continue;
+        }
+        let members: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(member, last_seen)| {
+                serde_json::json!({
+                    "member_pubkey": hex::encode(member),
+                    "last_seen": last_seen,
+                })
+            })
+            .collect();
+        let _ = app_handle.emit(
+            "ember:channel-presence",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "members": members,
+            }),
+        );
+    }
+}
+
+/// Rooms beaten per one-second tick.
+///
+/// One, because a beat is [`ember::channel::CHANNEL_NEIGHBOR_COUNT`] unicasts
+/// and those are charged to the same relay allowance as the mesh's own
+/// forwarding — `channel_gossip_rate_ok`. Beating several rooms in one tick
+/// would spend the whole second's budget on presence and have the rest of it
+/// silently shed, including part of the digest that prompted it. At a
+/// [`ember::channel::PRESENCE_BEAT_SECS`] interval this still covers far more
+/// rooms than anyone joins, and `a_beat_fits_the_relay_allowance_for_a_second`
+/// pins the relationship.
+const CHANNEL_BEACON_BEAT_PER_TICK: usize = 1;
+
+/// Keep a beacon for later relay.
+///
+/// The roster cap and its eviction rules are what stop a flood of invented
+/// identities being chosen as gossip neighbors. A separate beacon map that
+/// accepted anyone would be a way around that, so callers hand in only beacons
+/// the table admitted — `apply_channel_presence_beacons` skips a
+/// [`ChannelMemberWrite::Refused`] — and the size cap here is a backstop for
+/// the tombstones, which are kept for identities the roster no longer holds.
+fn remember_channel_beacon(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    beacon: ember::channel::PresenceBeacon,
+) {
+    let room = state.channel_beacons.entry(channel_id).or_default();
+    if room.len() >= ember::channel::CHANNEL_MEMBERS_MAX && !room.contains_key(&beacon.member) {
+        return;
+    }
+    ember::channel::keep_latest_beacon(room, beacon);
+}
+
+/// The beacons worth putting in one digest frame, freshest first.
+///
+/// Newest-first is what makes the layer converge on the case people notice.
+/// A member who just arrived is by definition the freshest beacon in the room,
+/// so they ride out to every neighbor on the next round and reach the far side
+/// in a few hops, while a member who has been sitting there for an hour is
+/// already known to everyone and can afford to wait.
+fn channel_presence_digest(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    ours: ember::channel::PresenceBeacon,
+    now: i64,
+) -> Vec<ember::channel::PresenceBeacon> {
+    let mut out = vec![ours];
+    let Some(room) = state.channel_beacons.get_mut(&channel_id) else {
+        return out;
+    };
+    // A beacon past the freshness window says nothing anyone can act on: its
+    // subject is offline by every rule that reads it. Dropped rather than
+    // merely sorted last, because in a room with fewer members than a digest
+    // holds nothing ever sorts it out — a member who left months ago would ride
+    // every digest this device sent for as long as it stayed in the room.
+    let cutoff = now.saturating_sub(ember::channel::PRESENCE_FRESH_SECS);
+    room.retain(|_, beacon| beacon.timestamp >= cutoff);
+    if room.is_empty() {
+        state.channel_beacons.remove(&channel_id);
+        return out;
+    }
+    let mut others: Vec<ember::channel::PresenceBeacon> = room
+        .values()
+        .filter(|b| b.member != ours.member)
+        .copied()
+        .collect();
+    others.sort_unstable_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.member.cmp(&b.member))
+    });
+    out.extend(
+        others
+            .into_iter()
+            .take(ember::channel::PRESENCE_BEACON_BATCH_MAX - 1),
+    );
+    out
+}
+
+/// Seal a beacon batch for one room.
+fn seal_channel_beacons(
+    channel_id: [u8; 16],
+    key: &[u8; 32],
+    beacons: &[ember::channel::PresenceBeacon],
+    ttl: u8,
+    now: i64,
+) -> Vec<u8> {
+    let plain = ember::channel::encode_channel_presence_beacons(beacons);
+    let mut envelope_id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
+    ember::channel::ChannelGossip::sealed(
+        channel_id,
+        envelope_id,
+        key,
+        now.max(0) as u64,
+        &plain,
+        ttl,
+        now,
+    )
+    .encode()
+}
+
+/// Announce ourselves on the live mesh and pass along the freshest beacons we
+/// hold while we are at it.
+///
+/// Sent at `ttl = 1`, which is what separates the two ways a beacon travels.
+/// A digest is anti-entropy: one hop to our own neighbors, repeated on a timer,
+/// so its cost is one small frame per neighbor per beat no matter how large the
+/// room. Flooding it instead would multiply by the roster — in a full room that
+/// is a quarter of a million frames a minute for something nobody is waiting
+/// on. Joins and leaves are the frames people *are* waiting on, and those flood
+/// (see [`flood_channel_presence_beacon`]); they are rare enough to afford it.
+async fn maybe_beat_channel_presence(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels_lite() else {
+        return;
+    };
+    let mut beaten = 0usize;
+    for ch in channels {
+        if beaten >= CHANNEL_BEACON_BEAT_PER_TICK {
+            break;
+        }
+        if !ch.in_room_now() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let last = state
+            .channel_beacon_beat_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if !ember::channel::schedule_due(last, now, ember::channel::PRESENCE_BEAT_SECS) {
+            continue;
+        }
+        // Stamped before the work rather than after it. A room that cannot beat
+        // — no content key on this device, nobody on the roster to beat at —
+        // has to back off like any other, or every tick re-reads its key and
+        // its whole member list to reach the same conclusion a second later.
+        state.channel_beacon_beat_at.insert(channel_id, now);
+        let Some(key) = channel_content_key(db, &ch) else {
+            continue;
+        };
+        let neighbors = ember::channel::gossip_neighbors(
+            &state.local_ed25519_pubkey,
+            &channel_member_pubkeys(db, &ch.channel_id),
+            ember::channel::CHANNEL_NEIGHBOR_COUNT,
+        );
+        if neighbors.is_empty() {
+            continue;
+        }
+        let ours = ember::channel::sign_presence_beacon(
+            &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
+            &state.local_ed25519_pubkey,
+            &channel_id,
+            ch.key_epoch,
+            now,
+            false,
+        );
+        remember_channel_beacon(state, channel_id, ours);
+        let digest = channel_presence_digest(state, channel_id, ours, now);
+        let body = seal_channel_beacons(channel_id, &key, &digest, 1, now);
+        for peer in neighbors {
+            send_channel_gossip_unicast(socket, state, db, channel_id, peer, body.clone()).await;
+        }
+        beaten += 1;
+    }
+}
+
+/// Flood a single beacon to the room, for the moments presence actually
+/// changes: arriving, and leaving.
+///
+/// These are the events a person is watching for, and the only ones worth
+/// `members × degree` sends. Everything else rides the periodic digest.
+async fn flood_channel_presence_beacon(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    departed: bool,
+    now: i64,
+) {
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return;
+    };
+    let Some(key) = channel_content_key(db, &ch) else {
+        return;
+    };
+    let ours = ember::channel::sign_presence_beacon(
+        &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
+        &state.local_ed25519_pubkey,
+        &channel_id,
+        ch.key_epoch,
+        now,
+        departed,
+    );
+    let body = seal_channel_beacons(
+        channel_id,
+        &key,
+        &[ours],
+        ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+        now,
+    );
+    if departed {
+        // Nothing local to keep: the room is being left, so its schedules and
+        // caches go with it rather than sitting there holding a tombstone we
+        // would go on republishing to ourselves.
+        state.channel_beacons.remove(&channel_id);
+        state.channel_beacon_beat_at.remove(&channel_id);
+        state.channel_beacon_inserts.remove(&channel_id);
+        state.channel_presence_dirty.remove(&channel_id);
+        state
+            .channel_beacon_flood_at
+            .retain(|(room, _), _| *room != channel_id);
+        // Only when it is the room we were watching. Leaving one room while
+        // reading another must not drop the other back to the resting walk.
+        if state.channel_focused == Some(channel_id) {
+            state.channel_focused = None;
+        }
+    } else {
+        remember_channel_beacon(state, channel_id, ours);
+        state.channel_beacon_beat_at.insert(channel_id, now);
+    }
+    // Handed to our neighbors directly rather than through
+    // `fanout_channel_gossip_body`, which refuses to send for a room this
+    // device is not in — and a leave is by definition sent from outside it,
+    // since `leave_channel` clears `in_room` before the network loop ever sees
+    // the command. The frame still carries a full TTL, so the neighbors that
+    // take it are the ones that flood it onward.
+    let neighbors = ember::channel::gossip_neighbors(
+        &state.local_ed25519_pubkey,
+        &channel_member_pubkeys(db, &channel_id_hex),
+        ember::channel::CHANNEL_NEIGHBOR_COUNT,
+    );
+    for peer in neighbors {
+        send_channel_gossip_unicast(socket, state, db, channel_id, peer, body.clone()).await;
+    }
+}
+
+fn channel_beacon_flood_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+    now: i64,
+) -> bool {
+    let key = (channel_id, *member);
+    let last = state.channel_beacon_flood_at.get(&key).copied().unwrap_or(0);
+    if !ember::channel::beacon_flood_allow(last, now) {
+        return false;
+    }
+    if state.channel_beacon_flood_at.len() >= ember::channel::CHANNEL_MEMBERS_MAX * 4 {
+        state
+            .channel_beacon_flood_at
+            .retain(|_, at| now.saturating_sub(*at) < ember::channel::PRESENCE_FRESH_SECS);
+    }
+    state.channel_beacon_flood_at.insert(key, now);
+    true
+}
+
+fn channel_beacon_insert_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    now: i64,
+) -> bool {
+    let slot = state
+        .channel_beacon_inserts
+        .entry(channel_id)
+        .or_insert((now, 0));
+    ember::channel::beacon_insert_allow(slot, now)
+}
+
+/// Apply presence beacons that arrived on the mesh.
+///
+/// Each entry was verified against its own signature before it got here, so a
+/// peer relaying the room's presence is a courier and not a witness — it cannot
+/// invent a member, re-date one, or drop one without the gap simply being
+/// filled by the next digest from somebody else. There is deliberately no frame
+/// that says "X is gone": absence of a fresh beacon is how a member goes
+/// offline, and a leave is a member's own signed departure record. Accepting a
+/// third party's word for either would let any member evict anyone.
+async fn apply_channel_presence_beacons(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    beacons: Vec<ember::channel::PresenceBeacon>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let channel_id = gossip.channel_id;
+    // A single beacon is somebody announcing an arrival or a departure and is
+    // worth passing on; a batch is one peer's digest of the room, which is
+    // already reaching its own neighbors on their own timers. Without this a
+    // member could wrap ten beacons in a flooded envelope and have the room
+    // amplify all of them at once.
+    let announcement = beacons.len() == 1;
+    let mut roster_changed = false;
+    let mut relay = false;
+    for beacon in beacons {
+        if beacon.member == state.local_ed25519_pubkey {
+            continue;
+        }
+        let Some(at) = beacon.last_seen_at(now) else {
+            continue;
+        };
+        let member_hex = hex::encode(beacon.member);
+        let status = db
+            .channel_member_status(&ch.channel_id, &member_hex)
+            .unwrap_or(None);
+        if status == Some(true) {
+            continue;
+        }
+        // Anything we already hold that outranks this one settles it. Without
+        // this, a member's leave is undone by the next digest from any peer
+        // still carrying their last ordinary beacon, and they flicker back into
+        // the roster looking online.
+        if ember::channel::beacon_superseded(
+            state
+                .channel_beacons
+                .get(&channel_id)
+                .and_then(|room| room.get(&beacon.member)),
+            &beacon,
+        ) {
+            continue;
+        }
+        if beacon.departed {
+            // Signed by the member themselves — the loop skipped our own key
+            // above, so this can never be a replayed tombstone of ours removing
+            // us from a room we are sitting in. `remove_channel_member` is
+            // timestamped, so a leave cannot delete a row a newer rejoin wrote.
+            if status.is_some()
+                && db
+                    .remove_channel_member(&ch.channel_id, &member_hex, at)
+                    .unwrap_or(false)
+            {
+                roster_changed = true;
+                state.rendezvous_last_register = None;
+            }
+            // Kept rather than dropped, and passed on in digests like any other
+            // beacon. It is signed, so relaying it needs no trust, and holding
+            // it is what makes the check above work — the roster row is gone,
+            // so this map is the only thing left that remembers the member
+            // left rather than simply never having been here.
+            remember_channel_beacon(state, channel_id, beacon);
+            if announcement && channel_beacon_flood_ok(state, channel_id, &beacon.member, now) {
+                relay = true;
+            }
+            continue;
+        }
+        if status.is_some() {
+            if db
+                .touch_channel_member_last_seen(&ch.channel_id, &member_hex, at)
+                .unwrap_or(false)
+            {
+                mark_channel_presence_dirty(state, channel_id, &beacon.member, at);
+            }
+        } else {
+            if !channel_beacon_insert_ok(state, channel_id, now) {
+                continue;
+            }
+            // Nickname is left empty on purpose: a beacon carries no display
+            // name, and nothing outside the member's own signed presence record
+            // should be able to set one. The presence walk fills it in.
+            match db.upsert_channel_member(
+                &ch.channel_id,
+                &member_hex,
+                "",
+                at,
+                Some(&hex::encode(state.local_ed25519_pubkey)),
+            ) {
+                Ok(ChannelMemberWrite::Inserted) => {
+                    roster_changed = true;
+                    // A new member changes who our XOR-neighbors are, so the
+                    // pairwise capability they will look us up under has to be
+                    // re-registered rather than waiting out the heartbeat.
+                    state.rendezvous_last_register = None;
+                }
+                // The room is full of members who are neither stale nor exempt.
+                // Not cached and not relayed: the beacon map is meant to be
+                // bounded by the roster, and a digest is freshest-first, so a
+                // burst of invented identities admitted here would ride out in
+                // place of the members who are actually present.
+                Ok(ChannelMemberWrite::Refused) => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(
+                        "Ember channel presence: roster write failed for {}: {e}",
+                        ch.channel_id
+                    );
+                    continue;
+                }
+            }
+        }
+        remember_channel_beacon(state, channel_id, beacon);
+        if announcement && channel_beacon_flood_ok(state, channel_id, &beacon.member, now) {
+            relay = true;
+        }
+    }
+    if roster_changed {
+        // The roster gained or lost somebody. A beacon cannot say who a new
+        // member is, only that they are here, and the full list is what carries
+        // the nickname and the badges — so ask for it rather than inventing a
+        // row. A `last_seen` that merely moved goes out as a delta instead.
+        let _ = app_handle.emit(
+            "ember:channel-members",
+            serde_json::json!({ "channel_id": ch.channel_id }),
+        );
+    }
+    if relay {
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+    }
+}
+
 fn collect_channel_neighbor_caps(
     db: &Database,
     our_pubkey: &[u8; 32],
@@ -13165,8 +14562,15 @@ const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
 /// in and somebody else is arriving. Until presence names a second member there
 /// is nobody to gossip to either, so chat cannot move until this resolves.
 ///
-/// `member_count` includes us, so 1 means nobody else yet.
-fn channel_presence_interval(member_count: i64) -> i64 {
+/// `member_count` includes us, so 1 means nobody else yet. `focused` is the
+/// room the user has open, which is walked at the same rate as an empty one for
+/// the same reason: it is the roster somebody is actually reading, so five
+/// minutes of staleness in it is five minutes of a member being in the room and
+/// not shown there.
+fn channel_presence_interval(member_count: i64, focused: bool) -> i64 {
+    if focused {
+        return ember::channel::PRESENCE_FETCH_FOCUSED_SECS;
+    }
     if member_count > 1 {
         ember::channel::PRESENCE_FETCH_SECS
     } else {
@@ -13217,7 +14621,7 @@ async fn start_channel_presence_fetch(
     }
     let mut any = false;
     for key in keys {
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -13277,6 +14681,7 @@ async fn maybe_refresh_channel_members(
         if !ember::channel::schedule_due(last, now, ember::channel::PRESENCE_FETCH_EMPTY_SECS) {
             continue;
         }
+        let focused = state.channel_focused == Some(channel_id);
         let fresh = db
             .count_fresh_channel_members(
                 &ch.channel_id,
@@ -13284,7 +14689,7 @@ async fn maybe_refresh_channel_members(
                 ember::channel::PRESENCE_FRESH_SECS,
             )
             .unwrap_or(0);
-        if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh)) {
+        if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh, focused)) {
             continue;
         }
         if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
@@ -13341,7 +14746,7 @@ async fn maybe_refresh_channel_moderation(
             continue;
         }
         let key = ember::channel::moderation_key(&channel_id);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -13852,7 +15257,7 @@ async fn maybe_refresh_channel_key_epoch(
             continue;
         }
         let key = ember::channel::epoch_key(&channel_id, &our_pk, target);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -13980,7 +15385,7 @@ async fn maybe_refresh_channel_handoff(
             continue;
         }
         let key = ember::channel::handoff_key(&channel_id);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14014,7 +15419,7 @@ async fn maybe_refresh_channel_handoff(
             continue;
         }
         let claim = ember::channel::claim_key(&channel_id);
-        let Some(claim_search) = state.ember_search.start_find_value(
+        let Some(claim_search) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(claim),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14304,6 +15709,11 @@ fn ingest_channel_presence_records(
             member.timestamp,
             Some(&our_hex),
         ) {
+            // A refused newcomer holds no row, so it gets no key cached
+            // either: that map is sized to the rosters it serves.
+            if write == ChannelMemberWrite::Refused {
+                continue;
+            }
             state
                 .ember_channel_noise_keys
                 .insert(member.publisher_key, member.noise_pub);
@@ -14314,10 +15724,25 @@ fn ingest_channel_presence_records(
                     }
                     outcome.roster_changed = true;
                 }
+                // The nickname moved, so the row has to be re-read to be drawn.
                 ChannelMemberWrite::Updated => {
                     outcome.roster_changed = true;
                 }
-                ChannelMemberWrite::Unchanged => {}
+                // A routine republish from somebody already on the list. One
+                // number changed, and it goes out as that rather than as a
+                // reason to rebuild the room's whole roster. `member.timestamp`
+                // was clamped when the batch was merged.
+                ChannelMemberWrite::Touched => {
+                    if member.publisher_key != *our_pubkey {
+                        mark_channel_presence_dirty(
+                            state,
+                            channel_id,
+                            &member.publisher_key,
+                            member.timestamp,
+                        );
+                    }
+                }
+                ChannelMemberWrite::Unchanged | ChannelMemberWrite::Refused => {}
             }
         }
     }
@@ -14414,7 +15839,7 @@ async fn maybe_dial_channel_neighbors(
         if find_nodes < CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK {
             if let Some(search_id) = state
                 .ember_search
-                .start_find_node(node_id, state.ember_dht.routing())
+                .start_background_find_node(node_id, state.ember_dht.routing())
             {
                 find_nodes += 1;
                 pending_find.push(search_id);
@@ -15257,11 +16682,19 @@ async fn handle_inbound_channel_gossip(
             );
             return;
         };
+        // The pairwise key that just authenticated this frame can be derived
+        // only by us and the member it names, so a transfer in flight is proof
+        // of presence every bit as good as a beacon — and it was already on the
+        // wire. A member moving a file through the room could still be shown
+        // offline while doing it.
+        note_channel_member_alive(
+            state,
+            gossip.channel_id,
+            &sender,
+            chrono::Utc::now().timestamp(),
+        );
         if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(&key, body) {
-            apply_xfer_block_data(
-                socket, state, db, app_handle, xfer_id, sender, offset, &data,
-            )
-            .await;
+            apply_xfer_block_data(state, app_handle, xfer_id, sender, offset, &data);
         } else if let Some((_, _, _, offset, count)) =
             ember::channel::decode_xfer_block_request(body)
         {
@@ -15275,6 +16708,21 @@ async fn handle_inbound_channel_gossip(
         } else if ember::channel::decode_xfer_done(body).is_some() {
             apply_xfer_done(state, app_handle, xfer_id, sender);
         }
+        return;
+    }
+    // Ahead of the rest because it is the frame this room sends most often once
+    // nobody is talking, and every decoder below it would otherwise be tried
+    // against each one first.
+    if let Some(beacons) = ember::channel::decode_channel_presence_beacons(
+        &plain,
+        &gossip.channel_id,
+        ch.key_epoch,
+        chrono::Utc::now().timestamp(),
+    ) {
+        apply_channel_presence_beacons(
+            socket, state, db, app_handle, &ch, &gossip, beacons, from_id,
+        )
+        .await;
         return;
     }
     let channel_pk = hex::decode(&ch.pubkey)
@@ -15329,6 +16777,16 @@ async fn handle_inbound_channel_gossip(
         {
             return;
         }
+        // Signature-verified above, so asking for catch-up is itself evidence
+        // the asker is here — and a member who has just come back online and is
+        // filling in what they missed is exactly the one a roster should not be
+        // calling offline.
+        note_channel_member_alive(
+            state,
+            gossip.channel_id,
+            &sender_pk,
+            chrono::Utc::now().timestamp(),
+        );
         // Its own budget, and the tightest one here. Every other branch costs
         // the sender roughly what it costs us; this one answers a single small
         // request with up to `CHANNEL_HISTORY_SYNC_MAX` separately sealed
@@ -15372,6 +16830,12 @@ async fn handle_inbound_channel_gossip(
         {
             return;
         }
+        note_channel_member_alive(
+            state,
+            gossip.channel_id,
+            &sender_pk,
+            chrono::Utc::now().timestamp(),
+        );
         // Same author budget as chat: a moderator spraying ban/unban actions
         // rewrites every peer's member list as fast as they can send.
         if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
@@ -15544,24 +17008,39 @@ async fn handle_inbound_channel_gossip(
                 // First line from someone this device did not already hold: the
                 // roster has to grow, and XOR-neighbors may have changed, so do
                 // not wait for the next presence walk or the friend heartbeat.
-                if let Ok(ChannelMemberWrite::Inserted) = db.upsert_channel_member(
+                match db.upsert_channel_member(
                     &channel_id_hex,
                     &sender_hex,
                     "",
                     now,
                     Some(&hex::encode(state.local_ed25519_pubkey)),
                 ) {
-                    state.rendezvous_last_register = None;
-                    let _ = app_handle.emit(
-                        "ember:channel-members",
-                        serde_json::json!({ "channel_id": channel_id_hex }),
-                    );
+                    Ok(ChannelMemberWrite::Inserted) => {
+                        state.rendezvous_last_register = None;
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id_hex }),
+                        );
+                    }
+                    // Chat carries no nickname, so `Updated` is unreachable
+                    // here; both are folded in anyway so a future caller that
+                    // does pass one cannot silently stop refreshing the row.
+                    Ok(ChannelMemberWrite::Touched) => {
+                        mark_channel_presence_dirty(state, gossip.channel_id, &sender_pk, now);
+                    }
+                    Ok(ChannelMemberWrite::Updated) => {
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id_hex }),
+                        );
+                    }
+                    _ => {}
                 }
             } else {
                 // Public rooms do not INSERT strangers from chat (anti-eclipse).
                 // A line from someone already on the roster still refreshes
                 // last_seen so they do not age out while visibly talking.
-                let _ = db.touch_channel_member_last_seen(&channel_id_hex, &sender_hex, now);
+                note_channel_member_alive(state, gossip.channel_id, &sender_pk, now);
             }
             let _ = app_handle.emit(
                 "ember:channel-message",
@@ -16195,11 +17674,8 @@ fn apply_xfer_block_request(
     send.enqueue(offset, count);
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn apply_xfer_block_data(
-    socket: &UdpSocket,
+fn apply_xfer_block_data(
     state: &mut NetworkState,
-    db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
@@ -16258,7 +17734,7 @@ async fn apply_xfer_block_data(
         );
     }
     if recv.is_complete() {
-        finish_xfer_recv(socket, state, db, app_handle, xfer_id).await;
+        finish_xfer_recv(state, xfer_id);
     }
 }
 
@@ -16298,72 +17774,113 @@ fn unique_download_path(path: &std::path::Path) -> std::path::PathBuf {
 /// The root is recomputed with the same [`ember::transfer::HashTree`] the
 /// sender used, so "the file I have" and "the file you offered" are compared
 /// by the same function rather than by two that merely agree today.
-async fn finish_xfer_recv(
+///
+/// Verification reads and hashes the entire file — `XFER_MAX_BYTES` is 100 MB —
+/// so it runs on the blocking pool and reports back through
+/// `NetworkState::xfer_finish_tx`. Done inline it froze the network task for
+/// the length of a whole-file read: every peer connection, DHT tick and
+/// datagram the loop owns stalled behind one completing transfer, and on a cold
+/// or spinning disk that is seconds, long enough to lose UDP to receive-buffer
+/// overrun across every unrelated peer.
+///
+/// The `RecvState` is taken out of `xfer_recv` before the hash starts, so the
+/// stall sweep in `drive_channel_transfers` cannot also retire it and a
+/// duplicate final block cannot start a second verification of the same file.
+fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
+    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
+        return;
+    };
+    let tx = state.xfer_finish_tx.clone();
+    state.xfer_finish_in_flight += 1;
+    tokio::task::spawn_blocking(move || {
+        let outcome = (|| -> std::io::Result<bool> {
+            recv.finish()?;
+            let file = std::fs::File::open(&recv.part_path)?;
+            let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
+            if tree.root_hash != recv.root {
+                return Ok(false);
+            }
+            if let Some(parent) = recv.final_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let target = unique_download_path(&recv.final_path);
+            std::fs::rename(&recv.part_path, &target)?;
+            Ok(true)
+        })();
+        let status = match outcome {
+            Ok(true) => "complete",
+            Ok(false) => {
+                // Content did not match what was offered. Keep nothing.
+                let _ = std::fs::remove_file(&recv.part_path);
+                tracing::warn!(
+                    "Ember Transfer: {} failed its hash check and was discarded",
+                    recv.name
+                );
+                "failed"
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&recv.part_path);
+                tracing::warn!(error = %e, "Ember Transfer: could not finalise {}", recv.name);
+                "failed"
+            }
+        };
+        let _ = tx.send(XferFinishResult {
+            xfer_id,
+            channel_id: recv.channel_id,
+            peer: recv.peer,
+            key: recv.key,
+            name: recv.name,
+            size: recv.size,
+            status,
+        });
+    });
+}
+
+/// Tell the sender how a transfer ended and update the UI.
+///
+/// Split from [`finish_xfer_recv`] because the verification between them runs
+/// off the event loop; this half needs the socket and the channel row, so it
+/// runs in the loop's `xfer_finish_rx` arm once the verdict is in.
+async fn apply_xfer_finish(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
-    xfer_id: [u8; 16],
+    result: XferFinishResult,
 ) {
-    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
-        return;
-    };
-    let (channel_id, peer, name, size) =
-        (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
-    let outcome = (|| -> std::io::Result<bool> {
-        recv.finish()?;
-        let file = std::fs::File::open(&recv.part_path)?;
-        let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
-        if tree.root_hash != recv.root {
-            return Ok(false);
-        }
-        if let Some(parent) = recv.final_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let target = unique_download_path(&recv.final_path);
-        std::fs::rename(&recv.part_path, &target)?;
-        Ok(true)
-    })();
-    let status = match outcome {
-        Ok(true) => "complete",
-        Ok(false) => {
-            // Content did not match what was offered. Keep nothing.
-            let _ = std::fs::remove_file(&recv.part_path);
-            tracing::warn!("Ember Transfer: {name} failed its hash check and was discarded");
-            "failed"
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&recv.part_path);
-            tracing::warn!(error = %e, "Ember Transfer: could not finalise {name}");
-            "failed"
-        }
-    };
+    state.xfer_finish_in_flight = state.xfer_finish_in_flight.saturating_sub(1);
+    let complete = result.status == "complete";
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its
     // own stall timer would eventually report a finished transfer as failed.
-    let plain = if status == "complete" {
-        ember::channel::encode_xfer_done(&recv.key, &state.local_ed25519_pubkey, &peer, &xfer_id)
+    let plain = if complete {
+        ember::channel::encode_xfer_done(
+            &result.key,
+            &state.local_ed25519_pubkey,
+            &result.peer,
+            &result.xfer_id,
+        )
     } else {
         ember::channel::encode_xfer_cancel(
-            &recv.key,
+            &result.key,
             &state.local_ed25519_pubkey,
-            &peer,
-            &xfer_id,
+            &result.peer,
+            &result.xfer_id,
             ember::channel::XferCancel::User,
         )
     };
-    send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
-    let done = if status == "complete" { size } else { 0 };
+    send_xfer_frame(socket, state, db, result.channel_id, result.peer, &plain).await;
+    let done = if complete { result.size } else { 0 };
     emit_xfer_update(
         app_handle,
-        &xfer_id,
-        &channel_id,
-        &peer,
+        &result.xfer_id,
+        &result.channel_id,
+        &result.peer,
         "receive",
-        &name,
-        size,
+        &result.name,
+        result.size,
         done,
-        status,
+        result.status,
     );
 }
 
@@ -16661,7 +18178,14 @@ async fn drive_channel_transfers(
         .collect();
     for xfer_id in stalled_recv {
         if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-            let _ = std::fs::remove_file(&recv.part_path);
+            // Detached: nothing below depends on the delete landing, and on
+            // Windows removing a large file whose handle was just released
+            // blocks on the antivirus filter driver — on the network task,
+            // once per stalled transfer.
+            let part_path = recv.part_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&part_path);
+            });
             let plain = ember::channel::encode_xfer_cancel(
                 &recv.key,
                 &me,
@@ -17219,6 +18743,16 @@ async fn note_connected_ember_peer(
         state.ember_payload_dirty = true;
     }
     if udp_port == 0 {
+        // The peer is now a known Ember host and will never be a DHT contact:
+        // the overlay rides the shared UDP socket, so with no port there is
+        // nothing to bridge to, and every later step keys on `(ip, udp_port)`.
+        // Silence here is what makes that indistinguishable from a bridge ping
+        // that was sent and ignored, which is a very different fault — one is
+        // the peer's hello, the other is the network in between.
+        debug!(
+            "Ember bridge: {ip} advertised no UDP port, so it can be a known peer \
+             but never a DHT contact"
+        );
         return;
     }
     record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
@@ -17226,10 +18760,12 @@ async fn note_connected_ember_peer(
         return;
     }
     let key = (ip, udp_port);
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
     if !bridge_retry_due(
         &state.ember_kad_bridge_attempted,
         &key,
         std::time::Instant::now(),
+        starved,
     ) {
         return;
     }
@@ -17297,6 +18833,238 @@ async fn send_ember_bridge_ping(
     sent
 }
 
+/// Ask live friend sessions for the Ember DHT contacts they hold.
+///
+/// A friend is the strongest bootstrap signal the app has, and almost none of
+/// it was used: the route from a friend to a DHT contact ran entirely through
+/// the eD2K hello's UDP port and a single bridge `PING`, so a friend whose
+/// hello named no port — or whose address `EmberPeerDiscovered`'s guards
+/// reject, which is the normal case for a relayed or NAT-traversed session —
+/// was never a candidate at all, and no retry policy helps something that is
+/// never attempted. Field evidence: a node holding three contacts sat beside a
+/// friend holding fourteen, over a working friend session, with `Known peers`
+/// at 0.
+///
+/// The overlay rides UDP, so a friend we cannot ping can never *be* a contact.
+/// It can still hand over the contacts it already has, and those enter as
+/// unverified leads through the same admission and probe path as any other
+/// gossip — nothing here is trusted further than a `FOUND_NODE` would be.
+///
+/// Only while the table is short of a working set, so a healthy node never
+/// spends a byte on this. Returns how many friends were asked.
+async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> usize {
+    if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        return 0;
+    }
+    let now = std::time::Instant::now();
+    let live: Vec<([u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+        let sessions = state.ember_sessions.read().await;
+        sessions
+            .iter()
+            .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
+            .map(|(eh, h)| (*eh, h.tx.clone()))
+            .collect()
+    };
+    let target = state.ember_dht.local_id();
+    let frame =
+        ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACT_REQ, &target.0);
+
+    let due = ember_friend_ask_order(live, &state.ember_friend_contacts_asked, now);
+    let mut asked = 0usize;
+    for (eh, tx) in due {
+        if asked >= EMBER_FRIEND_CONTACT_ASKS_PER_TICK {
+            break;
+        }
+        // A full queue means the session is already backed up; the next tick
+        // asks again, so nothing is lost by not waiting for room here.
+        if tx.try_send(frame.clone()).is_err() {
+            continue;
+        }
+        state.ember_friend_contacts_asked.insert(eh, now);
+        asked += 1;
+        state.ember_diagnostics.ember_dht_friend_contact_asks = state
+            .ember_diagnostics
+            .ember_dht_friend_contact_asks
+            .saturating_add(1);
+    }
+    if asked > 0 {
+        debug!("Ember DHT: asked {asked} friend session(s) for contacts while the table is thin");
+    }
+    asked
+}
+
+/// Friends due to be asked for contacts, least recently asked first.
+///
+/// The ordering is not cosmetic. [`EMBER_FRIEND_CONTACT_ASK_INTERVAL`] equals
+/// the maintenance tick, so every friend asked last cycle is due again this
+/// cycle — and taking the first [`EMBER_FRIEND_CONTACT_ASKS_PER_TICK`] in
+/// session-map order would then ask the same few for the life of the process
+/// while a fifth friend was never asked at all. `ember_dht_announce_targets`
+/// had the same failure for the same reason, and this is the same fix.
+///
+/// Never-asked friends come first, which `Option`'s own ordering gives for
+/// free (`None` before `Some`).
+fn ember_friend_ask_order<T>(
+    live: Vec<([u8; 16], T)>,
+    asked: &HashMap<[u8; 16], std::time::Instant>,
+    now: std::time::Instant,
+) -> Vec<([u8; 16], T)> {
+    let mut due: Vec<([u8; 16], T)> = live
+        .into_iter()
+        .filter(|(eh, _)| match asked.get(eh) {
+            Some(last) => now.saturating_duration_since(*last) >= EMBER_FRIEND_CONTACT_ASK_INTERVAL,
+            None => true,
+        })
+        .collect();
+    due.sort_by_key(|(eh, _)| asked.get(eh).copied());
+    due
+}
+
+/// The contacts to hand a friend that asked: closest to `target`, and only
+/// ones that have answered us.
+///
+/// `find_closest` already prefers verified contacts, but falls back to leads
+/// when it holds no verified ones at all — which is exactly the node whose
+/// leads are least worth passing on. Filtering after it is what makes a
+/// starved node answer with an empty list rather than with its own guesses,
+/// and an empty answer still tells the asker the difference between a friend
+/// that has nothing and a friend whose build predates the question.
+fn ember_friend_contact_answer(
+    routing: &ember::dht::routing::RoutingTable,
+    target: &ember::dht::EmberNodeId,
+) -> Vec<ember::dht::EmberContact> {
+    let mut contacts = routing.find_closest(target, ember::dht::MAX_CONTACTS_PER_RESPONSE);
+    contacts.retain(|c| c.is_verified());
+    contacts
+}
+
+/// Answer a friend's request for our Ember DHT contacts.
+///
+/// Passing on our own unverified leads would spread exactly the noise
+/// [`ember::dht::gossip`] exists to price, so only proven contacts travel —
+/// see [`ember_friend_contact_answer`].
+///
+/// `target` decides only *which* of our contacts are closest, so taking the
+/// asker's word for it grants nothing.
+async fn answer_friend_ember_contact_request(
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    target: Option<[u8; 16]>,
+    reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let now = std::time::Instant::now();
+    if let Some(last) = state.ember_friend_contacts_served.get(&friend) {
+        if now.saturating_duration_since(*last) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL {
+            return;
+        }
+    }
+    // Stamped before the work, not after a successful send. What this throttle
+    // protects is the table walk and the kilobyte it produces, and a friend
+    // whose writer queue is full would otherwise buy an unthrottled walk per
+    // request by never accepting the answer.
+    state.ember_friend_contacts_served.insert(friend, now);
+
+    let target = ember::dht::EmberNodeId(target.unwrap_or(state.ember_dht.local_id().0));
+    let contacts = ember_friend_contact_answer(state.ember_dht.routing(), &target);
+    let body = ember::dht::messages::encode_contact_list(&contacts);
+    let frame =
+        ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACTS, &body);
+    if reply_tx.try_send(frame).is_ok() {
+        debug!(
+            "Ember DHT: answered friend {} with {} verified contact(s)",
+            crate::security::short_hash(&friend),
+            contacts.len()
+        );
+    }
+}
+
+/// Fold a friend's answer into the routing table and probe what it named.
+///
+/// The contacts arrive unverified (the wire list carries no `last_seen`), so
+/// they go through `offer_contact` — the full IP policy and diversity gate —
+/// and then through the ordinary gossip probe.
+///
+/// Only ever an answer to a question we asked, inside
+/// [`EMBER_FRIEND_CONTACT_ANSWER_WINDOW`]. Acting on an unsolicited list would
+/// hand a friend the whole gossip probe budget on demand — the one thing
+/// [`ember::dht::gossip`] rations a DHT peer for. Requiring the ask is what
+/// lets a friend go unscored, and it also drops a list that arrives long after
+/// the table it was meant to fill.
+///
+/// No reputation record is kept for the friend, even though it could be: an
+/// Ember hash *is* a DHT node ID (`BLAKE3(ed25519_pub)[..16]` — see
+/// [`ember::dht::engine::EmberDht::new`]), so the two are the same namespace.
+/// Scoring is for a peer whose introductions we did not solicit; here the ask
+/// and its window are the bound, and rationing a friend we deliberately
+/// queried would only starve the path we opened it for.
+async fn ingest_friend_ember_contacts(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    body: &[u8],
+) {
+    let asked_recently = state
+        .ember_friend_contacts_asked
+        .get(&friend)
+        .is_some_and(|at| {
+            std::time::Instant::now().saturating_duration_since(*at)
+                < EMBER_FRIEND_CONTACT_ANSWER_WINDOW
+        });
+    if !asked_recently {
+        debug!(
+            "Ember DHT: ignoring a contact list from friend {} that answers no recent ask",
+            crate::security::short_hash(&friend)
+        );
+        return;
+    }
+    let contacts = match ember::dht::messages::decode_contact_list(body) {
+        Ok(contacts) => contacts,
+        Err(e) => {
+            debug!(
+                "Ember DHT: friend {} sent an undecodable contact list: {e}",
+                crate::security::short_hash(&friend)
+            );
+            return;
+        }
+    };
+    if contacts.is_empty() {
+        debug!(
+            "Ember DHT: friend {} has no verified contacts to share",
+            crate::security::short_hash(&friend)
+        );
+        return;
+    }
+    let local_id = state.ember_dht.local_id();
+    let mut learned = 0usize;
+    for contact in &contacts {
+        if contact.node_id == local_id {
+            continue;
+        }
+        let known = state.ember_dht.contact_for(&contact.node_id).is_some();
+        if matches!(
+            state.ember_dht.offer_contact(contact.clone()),
+            ember::dht::routing::AddResult::Added
+        ) && !known
+        {
+            learned += 1;
+        }
+    }
+    if learned > 0 {
+        state.ember_diagnostics.ember_dht_friend_contacts_learned = state
+            .ember_diagnostics
+            .ember_dht_friend_contacts_learned
+            .saturating_add(learned as u32);
+    }
+    info!(
+        "Ember DHT: friend {} shared {} contact(s), {learned} new",
+        crate::security::short_hash(&friend),
+        contacts.len()
+    );
+    // No introducer: see the note above. The probe budget and its one-second
+    // window still apply, so this cannot outspend ordinary gossip.
+    probe_ember_gossip_leads(socket, state, &contacts, None).await;
+}
+
 /// Pin connected eD2K Ember peers onto a FIND_VALUE walk. Their records live
 /// on that node; XOR-closest public contacts will not have them.
 fn seed_ember_session_search_contacts(state: &mut NetworkState, search_id: u32) {
@@ -17317,6 +19085,21 @@ fn start_ember_find_node(
     let search_id = state
         .ember_search
         .start_find_node(target, state.ember_dht.routing())?;
+    seed_ember_session_search_contacts(state, search_id);
+    Some(search_id)
+}
+
+/// [`start_ember_find_node`] for the maintenance tick's own walks — the
+/// self-lookup, bucket refresh and publish-target resolution. Each is re-queued
+/// and retried on the next tick, so they yield the reserve that keeps a slot
+/// available for whatever the user asked for. See `MAX_BACKGROUND_SEARCHES`.
+fn start_ember_background_find_node(
+    state: &mut NetworkState,
+    target: ember::dht::EmberNodeId,
+) -> Option<u32> {
+    let search_id = state
+        .ember_search
+        .start_background_find_node(target, state.ember_dht.routing())?;
     seed_ember_session_search_contacts(state, search_id);
     Some(search_id)
 }
@@ -17371,17 +19154,22 @@ async fn send_ember_announce_peer(
 
 /// Ping unverified gossip as soon as we hear it, so a PEER_LIST of the
 /// friend's other contacts does not sit idle until the next 60s tick.
+///
+/// `introducer` is the peer whose frame carried these leads: it is skipped if it
+/// named itself, and it is who the outcome of each probe is charged to. See
+/// [`ember::dht::gossip`].
 async fn probe_ember_gossip_leads(
     socket: &UdpSocket,
     state: &mut NetworkState,
     leads: &[ember::dht::EmberContact],
-    exclude: Option<ember::dht::EmberNodeId>,
+    introducer: Option<ember::dht::EmberNodeId>,
 ) {
     if leads.is_empty() {
         return;
     }
     let local_id = state.ember_dht.local_id();
-    let budget = if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    let budget = if starved {
         EMBER_MAINT_MAX_PINGS_STARVED
     } else {
         EMBER_MAINT_MAX_PINGS
@@ -17405,7 +19193,7 @@ async fn probe_ember_gossip_leads(
         if sent >= budget {
             break;
         }
-        if contact.node_id == local_id || Some(contact.node_id) == exclude {
+        if contact.node_id == local_id || Some(contact.node_id) == introducer {
             continue;
         }
         if contact.noise_pub == [0u8; 32] || contact.addr.port() == 0 {
@@ -17437,8 +19225,25 @@ async fn probe_ember_gossip_leads(
         if crate::security::is_bogus_v4(ip) {
             continue;
         }
+        // Whose word this is on, and whether that word has been worth a probe.
+        // Not asked while starved: a node with nothing has to try everything,
+        // because probing junk costs bandwidth and failing to join costs the
+        // overlay. Asked last, so a lead skipped for any of the reasons above
+        // does not read as an introducer being rationed.
+        if !starved {
+            if let Some(intro) = introducer {
+                if !state.ember_gossip_reputation.should_probe(&intro) {
+                    state.ember_diagnostics.ember_dht_gossip_leads_rationed = state
+                        .ember_diagnostics
+                        .ember_dht_gossip_leads_rationed
+                        .saturating_add(1);
+                    continue;
+                }
+            }
+        }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -17467,6 +19272,12 @@ async fn probe_ember_gossip_leads(
             }
             ember::transport::OutgoingResult::Queued => {
                 behind_handshake = true;
+                // See `probe_bucket_oldest`: a frame parked behind an XX dial
+                // may be discarded at flush rather than sent, so it is not
+                // booked and cannot fault the lead.
+                delivery_certain = state
+                    .ember_transport
+                    .queued_delivery_is_certain(contact.addr, &contact.noise_pub);
                 true
             }
             ember::transport::OutgoingResult::Error(e) => {
@@ -17477,7 +19288,11 @@ async fn probe_ember_gossip_leads(
                 false
             }
         };
-        if send_ok {
+        // `delivery_certain` is only ever false on the `Queued` path, so this
+        // is "the frame is on the wire, or will be when the handshake it is
+        // parked behind completes with the peer we addressed it to".
+        let issued = send_ok && delivery_certain;
+        if issued {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(
@@ -17493,6 +19308,28 @@ async fn probe_ember_gossip_leads(
             sent += 1;
             state.ember_gossip_probe_window.1 =
                 state.ember_gossip_probe_window.1.saturating_add(1);
+            // Attribution starts here rather than at the naming, so an
+            // introducer is never charged for a lead our own budget never
+            // reached.
+            if let Some(intro) = introducer {
+                state.ember_gossip_reputation.note_probe(
+                    intro,
+                    contact.node_id,
+                    std::time::Instant::now(),
+                );
+            }
+        } else if !starved {
+            // The probe never reached the wire — the send failed, or it was
+            // parked behind a handshake that may discard it. Either way the
+            // sampling slot `should_probe` spent to allow it bought nothing, so
+            // hand it back; otherwise a rationed introducer is held at arm's
+            // length by our own send failures rather than by anything it did.
+            // Gated on `!starved` because that is the only branch that calls
+            // `should_probe` at all — refunding a sample never spent would let
+            // the counter grant one early.
+            if let Some(intro) = introducer {
+                state.ember_gossip_reputation.refund_probe(&intro);
+            }
         }
     }
 }
@@ -18094,12 +19931,19 @@ fn fault_ember_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNode
     // Drop any Noise session with this peer. Sessions are one-sided state:
     // if the peer forgot its half (restart, eviction under session pressure,
     // the transport being toggled off) every frame we send is rejected as
-    // "no session", while each send refreshes our own idle timer so the
-    // session never expires on its own. Clearing it here means the next
-    // attempt re-handshakes instead of talking into a black hole.
+    // "no session". Clearing it here means the next attempt re-handshakes
+    // instead of talking into a black hole. `cleanup` would get there on its
+    // own — it ages a session from the last frame the *peer* sent — but only
+    // after `SESSION_TIMEOUT`, and a missed ping is the earlier, sharper
+    // signal for a peer we hold a contact for.
+    //
+    // Keyed by this contact's identity, not just its address: sessions are
+    // per `(addr, static key)` so peers sharing a NAT coexist, and an
+    // address-wide drop punished every one of them for this peer's silence.
     if let Some(contact) = state.ember_dht.contact_for(node_id) {
         let addr = contact.addr;
-        state.ember_transport.remove_session(&addr);
+        let noise_pub = contact.noise_pub;
+        state.ember_transport.remove_session_for(&addr, &noise_pub);
     }
     evict_ember_contact_if_dead(state, node_id, why);
 }
@@ -18426,6 +20270,51 @@ const EMBER_MAINT_MAX_ANNOUNCE_STARVED: usize = 16;
 /// in the wrong direction: one usable contact is too thin a frontier for a
 /// lookup to discover anyone new.
 const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
+
+/// Minimum spacing between asking one friend for its Ember DHT contacts.
+///
+/// Matches the maintenance tick, because the ask only happens below
+/// [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts and a starved node
+/// wants its next chance now rather than in five minutes — the same reasoning
+/// that flattened the bridge backoff while starved. One small packet per friend
+/// per minute, which stops entirely once the table is usable.
+const EMBER_FRIEND_CONTACT_ASK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How long after asking a friend we will act on its answer.
+///
+/// Held apart from the interval above because the two want different lengths:
+/// the ask stamp has to outlive its own interval for
+/// `ask_friends_for_ember_contacts` to rank by least-recently-asked, while the
+/// window in which an answer is still wanted is one round trip. Tying the
+/// acceptance window to however long the stamp happens to be kept is how a
+/// four-minute window would appear by accident.
+const EMBER_FRIEND_CONTACT_ANSWER_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How long an ask stamp is kept at all.
+///
+/// Longer than the interval on purpose. The stamp is the rotation key, and
+/// dropping it the moment it stops throttling would reset every friend to
+/// "never asked" each cycle — which is precisely how the four friends the
+/// per-tick budget reaches first keep reaching it first. Past this the map is
+/// bounded by forgetting, since a friend not asked in four minutes is not in a
+/// rotation that matters.
+const EMBER_FRIEND_CONTACT_STAMP_TTL: std::time::Duration =
+    std::time::Duration::from_secs(240);
+
+/// Minimum spacing between *answering* one friend's contact request.
+///
+/// Longer than the ask interval on purpose: answering costs a table walk and a
+/// kilobyte on the wire, and the asker's own schedule is not ours to trust. A
+/// friend that asks more often than this simply gets its extra asks dropped.
+const EMBER_FRIEND_CONTACT_SERVE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Friends asked per maintenance tick. A user with a large friends list should
+/// not turn a starved table into a burst of traffic; the ask walks through them
+/// over successive ticks instead, and one answer is enough to bootstrap.
+const EMBER_FRIEND_CONTACT_ASKS_PER_TICK: usize = 4;
 
 /// How often we re-advertise ourselves under the Ember rendezvous key.
 /// Deliberately the same 5 hours KAD itself uses for source records, so the
@@ -19450,11 +21339,18 @@ async fn enrich_and_emit_search_results(
     let analyzed_batch;
     let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
         if let Some(acc) = accumulated_batch {
-            let prev_colliding = acc.colliding_hashes();
+            // Only when something will read it. `colliding_hashes` walks every
+            // name and hash key in the batch — up to 4096 each — and clones a
+            // `String` per hash in every colliding bucket, and this runs on the
+            // network task for every inbound result packet. With the spam
+            // filter off or Relaxed the result was discarded, so a broad search
+            // paid that whole allocation on each of hundreds of packets for
+            // nothing.
+            let prev_colliding = (spam_enabled
+                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed)
+                .then(|| acc.colliding_hashes());
             acc.absorb(&results);
-            if spam_enabled
-                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
-            {
+            if let Some(prev_colliding) = prev_colliding {
                 let skip: std::collections::HashSet<String> = results
                     .iter()
                     .map(|r| r.file.hash.trim().to_ascii_lowercase())
@@ -19980,8 +21876,9 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
-    // eD2K-only sessions (KAD never connected) must re-arm the upload gate
-    // on server drop; otherwise peers keep uploading after we go offline.
+    // A session whose KAD side is disconnected has no other reason to be
+    // accepting inbound connections, so re-arm the upload gate on server
+    // drop; otherwise peers keep uploading after we go offline.
     if state.stats.status == NetworkStatus::Disconnected {
         state
             .upload_disconnected
@@ -20144,10 +22041,15 @@ async fn initiate_server_connect(
     state.preferred_ed2k_server = Some((ip.clone(), port));
     // Connecting to an eD2K server counts as being online for the upload
     // listener: allow peer uploads and (critically) the server's HighID
-    // TCP port-test. Without this, server-first sessions with KAD auto-
-    // connect off always rejected the port-test and got stuck on LowID.
+    // TCP port-test. Without this, joining a server after disconnecting KAD
+    // always rejected the port-test and got stuck on LowID.
     state
         .upload_disconnected
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Joining a server is a deliberate "come back online" too, so it lifts the
+    // outbound stop the same way `KadConnect` does.
+    state
+        .user_offline
         .store(false, std::sync::atomic::Ordering::Relaxed);
     // Explicit Connect should be allowed to retry a server that recently
     // failed auto-reconnect — keep fail counts for sort preference.
@@ -20613,6 +22515,20 @@ async fn try_start_pending_download_from_known_sources(
     file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
     epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
+    // The user asked activity to stop. Disconnect re-queues every active
+    // download as pending so it resumes on reconnect, but the Ember overlay
+    // keeps running and its source lookups call straight back into here — so
+    // without this gate a transfer the user just stopped could restart itself
+    // from an Ember source while the UI still read Disconnected. Checked here
+    // rather than at the five call sites so no future one can miss it.
+    if state
+        .user_offline
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        debug!("Not starting {transfer_id}: the user is offline");
+        return false;
+    }
+
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
             return false;
@@ -21044,26 +22960,60 @@ fn apply_persistent_ip_ban(
     }
 }
 
+/// Ceiling on the enforced ban set, above which it is rebuilt from durable
+/// sources rather than allowed to grow.
+const MAX_BANNED_IPS: usize = 10_000;
+
+/// The durable half of the ban-set rebuild: `(peers, auto-banned IPs)`.
+///
+/// Read on the blocking pool and delivered back to the loop, because
+/// `get_peers` and `get_banned_ips` are synchronous SQLite calls behind one
+/// process-wide connection mutex. Running them inline on the 60s reputation
+/// tick blocked the tokio worker driving the whole `select!` — UDP receive,
+/// KAD timers and IPC included — and every other `Database` user with it.
+type BannedIpsSyncInputs = (Vec<crate::types::PeerInfo>, Vec<Ipv4Addr>);
+
+/// Kick off the durable half of the ban-set rebuild on the blocking pool.
+///
+/// One outstanding read at a time, so a slow disk cannot queue a backlog of
+/// identical queries. A failed read is reported as `None` so the receiver
+/// keeps the current set instead of wiping bans.
+fn request_banned_ips_sync(
+    in_flight: &mut bool,
+    db: &Arc<Database>,
+    tx: &mpsc::UnboundedSender<Option<BannedIpsSyncInputs>>,
+) {
+    if *in_flight {
+        return;
+    }
+    *in_flight = true;
+    let db = db.clone();
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || match (db.get_peers(), db.get_banned_ips()) {
+        (Ok(peers), Ok(auto_bans)) => {
+            let _ = tx.send(Some((peers, auto_bans)));
+        }
+        _ => {
+            warn!("banned_ips sync skipped: DB read failed; keeping in-memory set");
+            let _ = tx.send(None);
+        }
+    });
+}
+
 /// Rebuild the in-memory enforced ban set from durable sources plus
 /// still-active reputation bans. This is what makes:
 /// - DB auto-ban TTLs actually expire in a long-running session (H2)
 /// - reputation 24h bans leave `banned_ips` after `lift_expired_bans` (H1)
 ///
-/// Fail-closed on DB errors: keep the current set rather than wiping bans.
-fn sync_enforced_banned_ips(
+/// Fail-closed on DB errors: the caller keeps the current set rather than
+/// wiping bans when the read half failed.
+fn apply_enforced_banned_ips(
     state: &mut NetworkState,
     shared_banned_ips: &ed2k::upload::SharedBannedIps,
-    db: &Arc<Database>,
+    peers: Vec<crate::types::PeerInfo>,
+    auto_bans: Vec<Ipv4Addr>,
     source_manager: &SourceManager,
 ) {
-    let (peers, auto_bans) = match (db.get_peers(), db.get_banned_ips()) {
-        (Ok(peers), Ok(auto_bans)) => (peers, auto_bans),
-        _ => {
-            warn!("banned_ips sync skipped: DB read failed; keeping in-memory set");
-            return;
-        }
-    };
-
     let mut rebuilt: HashSet<Ipv4Addr> = peers
         .iter()
         .filter(|p| p.banned)
@@ -21597,6 +23547,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_presence_buffer.clear();
     state.ember_pending_channel_presence.clear();
     state.channel_presence_fetch_at.clear();
+    state.channel_focused = None;
+    state.channel_beacon_beat_at.clear();
+    state.channel_beacons.clear();
+    state.channel_beacon_flood_at.clear();
+    state.channel_beacon_inserts.clear();
+    state.channel_presence_dirty.clear();
     state.ember_channel_moderation_searches.clear();
     state.ember_pending_channel_moderation.clear();
     state.channel_moderation_fetch_at.clear();
@@ -21630,9 +23586,6 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_source_publish_unix.clear();
     state.ember_keyword_publish_at.clear();
     state.ember_keyword_publish_unix.clear();
-    // Nothing of ours is live any more, so there is no compatibility trailer
-    // left for an endorsement to supersede.
-    state.ember_source_published_unendorsed = false;
     // Library badges must go dark with the feature: the records we placed
     // will age out of the network and we are no longer republishing them.
     state.ember_published_sources.clear();
@@ -21678,6 +23631,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_self_lookup_done = false;
     state.ember_last_self_lookup = 0;
     state.ember_last_inbound = None;
+    state.ember_rearmed_at = None;
     state.ember_last_overlay_contacts = 0;
     state.ember_empty_rearmed_at = 0;
     state.ember_publish_targets.clear();
@@ -22028,18 +23982,26 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     info!("UDP socket bound on port {udp_port}");
 
     // The connection broker binds a *second* UDP socket for QUIC on the
-    // configured `tcp_port`. If the user happens to set `tcp_port ==
-    // udp_port` (an easy mistake — old eMule habit, or copy-paste of
-    // the same number into both fields), QUIC will fail to bind to that
-    // port and `build_server_client_endpoint` will fall back to a
-    // neighbour. Warn loudly here so the user can either tolerate the
-    // fallback or pick distinct ports.
+    // configured `tcp_port`, so `tcp_port == udp_port` means QUIC loses that
+    // port to the Kad UDP socket bound above and
+    // `build_server_client_endpoint` takes the next free neighbour.
+    //
+    // Noted rather than warned about, and no advice offered. Setting both
+    // fields to one number is what a VPN forwarding a single port requires,
+    // and `wizard_ports_desc` tells users to do exactly that — telling them
+    // afterwards to pick distinct values asks for something their tunnel
+    // cannot give. Reachability does not depend on the fallback port being
+    // forwarded either: the endpoint STUN-probes its own public port and
+    // rendezvous advertises that, which is what a hole-punch dials whichever
+    // local port QUIC ended up on. The one thing worth having in a log is
+    // that port, because the Windows Firewall rule is added for the port QUIC
+    // actually bound rather than the one configured here.
     if settings.tcp_port == settings.udp_port {
-        warn!(
-            "Configured tcp_port and udp_port are identical ({}). \
-             QUIC will be unable to bind that port (Kad UDP got there first) \
-             and will fall back to a neighbouring port. Set them to distinct \
-             values in Settings to silence this warning.",
+        info!(
+            "tcp_port and udp_port are both {} — a single-port setup. Kad UDP \
+             holds that port, so QUIC will bind a neighbour and advertise its \
+             STUN-discovered public port; see the QUIC endpoint line below for \
+             which local port it took.",
             settings.tcp_port,
         );
     }
@@ -22306,6 +24268,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?
     };
 
+    // Verified channel transfers, hashed off the event loop. Created here
+    // rather than with the other result channels below because the sender
+    // lives in `NetworkState`, which is built next.
+    let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -22314,11 +24281,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         publish_manager,
         dht_store,
         stats: NetworkStats {
-            status: if settings.auto_connect_kad {
-                NetworkStatus::Connecting
-            } else {
-                NetworkStatus::Disconnected
-            },
+            // KAD always bootstraps on startup, so the node opens in
+            // `Connecting` rather than waiting to be asked. `Disconnected` is
+            // still reachable — an explicit `KadDisconnect` from the KAD
+            // Network page puts us there for the rest of the session — so
+            // every gate that checks for it below still earns its place.
+            status: NetworkStatus::Connecting,
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -22341,7 +24309,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache::new(),
-        ember_nodes_loaded: false,
+        ember_nodes_file: ember::dht::bootstrap::NodesFileState::Unread,
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
@@ -22501,6 +24469,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_self_lookup_done: false,
         ember_last_self_lookup: 0,
         ember_last_inbound: None,
+        ember_rearmed_at: None,
         ember_last_overlay_contacts: 0,
         ember_empty_rearmed_at: 0,
         ember_publish_targets: HashMap::new(),
@@ -22510,6 +24479,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
             ember_kad_bridge_attempted: HashMap::new(),
+        ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
+        ember_friend_contacts_asked: HashMap::new(),
+        ember_friend_contacts_served: HashMap::new(),
             ember_bridge_fast_at: None,
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
@@ -22530,20 +24502,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
-        // Mirror the `stats.status` initialization above: the upload
-        // listener binds and starts accepting TCP connections immediately
-        // (see `start_upload_server`), well before this task has actually
-        // reached KAD or an eD2K server. Defaulting this to `false`
-        // ("uploads allowed") left a fresh launch — or any session with
-        // auto-connect disabled — silently servable by any peer that
-        // already knows our IP:port from a prior session, even while the
-        // UI still read "Disconnected". Cleared by `KadConnect` or
-        // `initiate_server_connect` (eD2K Connect / auto-connect server).
-        // The eD2K server's HighID port-test is also exempted in the upload
-        // accept loop so server-first connect cannot get stuck on LowID.
-        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(
-            !settings.auto_connect_kad && !settings.auto_connect_server,
-        )),
+        // Mirror the `stats.status` initialization above. The upload listener
+        // binds and starts accepting TCP connections immediately (see
+        // `start_upload_server`), well before this task has actually reached
+        // KAD or an eD2K server, so this flag used to start `true` whenever
+        // no auto-connect was configured — otherwise a fresh launch was
+        // silently servable by any peer that remembered our IP:port from a
+        // prior session while the UI still read "Disconnected". Now that KAD
+        // always bootstraps there is no such session: startup is always a
+        // connect. `KadDisconnect` sets the flag, and `KadConnect` /
+        // `initiate_server_connect` clear it again.
+        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Starts false on purpose — see the field comment. "Has not connected
+        // yet" is not "was asked to go offline".
+        user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
@@ -22552,6 +24524,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         rendezvous_register_fail_streak: 0,
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
+        friend_search_initial_queue: Vec::new(),
         friend_search_started_at: None,
         friend_reconnect_last: HashMap::new(),
         tracker_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -22591,7 +24564,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
-        ember_source_published_unendorsed: false,
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_keyword_publish_unix: HashMap::new(),
@@ -22616,6 +24588,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         channel_presence_fetch_at: HashMap::new(),
+        channel_focused: None,
+        channel_beacon_beat_at: HashMap::new(),
+        channel_beacons: HashMap::new(),
+        channel_beacon_flood_at: HashMap::new(),
+        channel_beacon_inserts: HashMap::new(),
+        channel_presence_dirty: HashMap::new(),
         ember_channel_moderation_searches: HashMap::new(),
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
@@ -22633,6 +24611,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
         xfer_recv: HashMap::new(),
+        xfer_finish_tx,
+        xfer_finish_in_flight: 0,
+        channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_block_times: VecDeque::new(),
         xfer_upload_credit: 0,
@@ -22662,13 +24643,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // `std::fs` read inside an async fn that shares its runtime with the UI.
         let load_path = nodes_ember_path.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_nodes(&load_path)
+            ember::dht::bootstrap::load_nodes_with_state(&load_path)
         })
         .await;
         match loaded {
-            Ok(Ok(entries)) => {
+            Ok(Ok((entries, file_state))) => {
                 let n = entries.len();
-                state.ember_nodes_loaded = true;
+                state.ember_nodes_file = file_state;
                 state.ember_bootstrap_cache.load(entries);
                 // Through `seed_batch`, never straight from the file: the table
                 // has to receive every remembered peer as unproven, while the
@@ -22684,16 +24665,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &HashSet::new(),
                     EMBER_SEED_BATCH,
                 );
-                let seeded: Vec<ember::dht::EmberNodeId> =
-                    seed.iter().map(|c| c.node_id).collect();
-                state.ember_dht.load_contacts(seed);
-                // Whatever the table took is genuinely being tried this session,
-                // so its silence counts at shutdown. The bulk loader reports no
-                // per-contact result, hence asking the table afterwards.
-                let admitted: Vec<ember::dht::EmberNodeId> = seeded
-                    .into_iter()
-                    .filter(|id| state.ember_dht.contact_for(id).is_some())
-                    .collect();
+                // Only what took a bucket slot counts as tried, exactly as the
+                // maintenance top-up requires. This used to ask
+                // `contact_for` afterwards, which searches the replacement
+                // caches too — so a seed the IP policy or a diversity cap
+                // parked read back as admitted, and `charge_silent_session`
+                // charged a miss at shutdown to an address no packet was ever
+                // sent to. A miss also sinks an address in `seed_batch`
+                // ranking, so the error compounded: an untried peer became
+                // less likely to be tried on the next launch.
+                let admitted = state.ember_dht.load_contacts(seed);
                 state
                     .ember_bootstrap_cache
                     .note_offered(admitted.into_iter());
@@ -22719,7 +24700,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let quarantine = nodes_ember_path.with_extension(format!("dat.unreadable.{ts}"));
                 match std::fs::rename(&nodes_ember_path, &quarantine) {
                     Ok(()) => {
-                        state.ember_nodes_loaded = true;
+                        state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
                         warn!(
                             "Moved the unreadable nodes_ember.dat aside to {} so this node can \
                              remember peers again",
@@ -22739,7 +24720,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     } else {
         // Absent is not unreadable: there is nothing to preserve, so the save
         // path is free to write whatever this session learns.
-        state.ember_nodes_loaded = true;
+        state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
     state
@@ -22866,22 +24847,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let firewall_probe_ips: upload_server::FirewallProbeSet =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-    if settings.auto_connect_kad {
-        // Send bootstrap requests to initial contacts
-        for contact in &boot_contacts {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::BootstrapReq;
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, 0x01);
-                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                debug!("Sent bootstrap req to {addr}");
-            }
+    // Send bootstrap requests to initial contacts. Unconditional: KAD is the
+    // peer index everything else reads from, and making it opt-in mostly
+    // produced installs that looked broken. `boot_contacts` has already
+    // fallen back to the hardcoded list if nodes.dat was missing or empty,
+    // so there is always something to ask. The firewall check is deferred to
+    // the periodic bootstrap_timer recheck, which fires once we have verified
+    // contacts (table_size >= 10).
+    for contact in &boot_contacts {
+        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+        let msg = KadMessage::BootstrapReq;
+        if let Ok(packet) = messages::encode_packet(&msg) {
+            state.flood_protection.track_request(addr, 0x01);
+            let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+            debug!("Sent bootstrap req to {addr}");
         }
-
-        // Firewall check is deferred to the periodic bootstrap_timer recheck,
-        // which fires once we have verified contacts (table_size >= 10).
-    } else {
-        info!("KAD auto-connect disabled, skipping bootstrap (use Connect to start KAD)");
     }
 
     // Download / upload event channels.
@@ -23372,7 +25352,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     /// How often the queued-chat expiry sweep runs. The age ceiling it enforces
     /// is measured in days, so this only has to be small relative to that.
-    const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    /// Withdrawal dials started per sweep. Cancelling a batch of requests at
+    /// once should not turn one tick into a burst of connects to peers that are
+    /// probably still offline; the rest are picked up on the next tick.
+    const MAX_RETRACTION_RETRIES_PER_SWEEP: usize = 4;
     // `None` so the first cleanup tick sweeps, clearing anything left queued by
     // a previous run before the user has a chance to look at it.
     let mut last_chat_expiry_sweep: Option<std::time::Instant> = None;
@@ -23524,6 +25508,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // `(ed2k hash, digest)`.
     let (ember_digest_result_tx, mut ember_digest_result_rx) =
         mpsc::unbounded_channel::<([u8; 16], [u8; 32])>();
+    // Completed-download ed2k part hashsets, recomputed off the event loop for
+    // the same reason as the digests above. `(ed2k hash, part hashes)`.
+    let (part_hashset_result_tx, mut part_hashset_result_rx) =
+        mpsc::unbounded_channel::<([u8; 16], Vec<[u8; 16]>)>();
+    // Durable inputs for the enforced-ban rebuild, read off the event loop.
+    // `None` means the read failed and the current set must be kept.
+    let (banned_ips_sync_tx, mut banned_ips_sync_rx) =
+        mpsc::unbounded_channel::<Option<BannedIpsSyncInputs>>();
+    let mut banned_ips_sync_in_flight = false;
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
     let (udp_map_ka_result_tx, mut udp_map_ka_result_rx) =
         mpsc::unbounded_channel::<UdpMappingKeepaliveResult>();
@@ -23563,6 +25556,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut spam_save_started_at: Option<tokio::time::Instant> = None;
     let mut upnp_maintain_in_flight = false;
     let mut upnp_maintain_started_at: Option<tokio::time::Instant> = None;
+    // Handle on the detached UPnP pass, kept only so the watchdog can abort a
+    // stuck one. Clearing `upnp_maintain_in_flight` alone lets the next tick
+    // start a second pass while the first is still parked inside a SOAP call
+    // that may never return, and every ten minutes adds another — each holding
+    // a cloned `UpnpMappings` and its gateway socket for the life of the
+    // process. The calls themselves are bounded now (`upnp::SOAP_TIMEOUT`), so
+    // this is the backstop for anything that outlives its own timeout.
+    let mut upnp_maintain_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut rendezvous_register_in_flight = false;
     let mut rendezvous_register_started_at: Option<tokio::time::Instant> = None;
     let mut friend_relay_ticket_polls_in_flight = 0usize;
@@ -23918,7 +25919,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let tx = upnp_maintain_result_tx.clone();
                 upnp_maintain_in_flight = true;
                 upnp_maintain_started_at = Some(tokio::time::Instant::now());
-                tokio::spawn(async move {
+                upnp_maintain_handle = Some(tokio::spawn(async move {
                     mappings.setup().await;
                     let mapped = mappings.is_mapped();
                     if mapped {
@@ -23933,7 +25934,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         mappings,
                         mapped,
                     });
-                });
+                }));
             } else {
                 info!("UPnP disabled by user -- skipping port mapping");
             }
@@ -24807,9 +26808,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
             }
-            // Same trap as the NAT probe above, and for the same reason: with
-            // `auto_connect_kad` off the node is `Disconnected` for the whole
-            // session, so clearing unconditionally left the in-flight guard
+            // Same trap as the NAT probe above, and for the same reason: once
+            // the user disconnects KAD the node is `Disconnected` for the rest
+            // of the session, so clearing unconditionally left the in-flight guard
             // permanently false. The bootstrap timer then respawned
             // registration every tick, each spawn bumped
             // `rendezvous_register_generation`, and the result handler dropped
@@ -25346,13 +27347,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         .map(|record| record.part_hashes.clone())
                                         .unwrap_or_default()
                                 } else {
+                                    // Recompute off the loop and fold it in
+                                    // when it lands, exactly as the BLAKE3
+                                    // digest below does. Awaiting a sequential
+                                    // end-to-end read of a multi-GB file here
+                                    // suspended the whole `select!` — no UDP
+                                    // receive, no timers, no command handling —
+                                    // on every completion that arrives without
+                                    // a hashset (callback and single-source
+                                    // downloads, and restore re-verification).
                                     let hash_path = completed_path.clone();
+                                    let hashset_tx = part_hashset_result_tx.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                            .unwrap_or_default()
-                                    })
-                                    .await
-                                    .unwrap_or_default()
+                                        if let Ok(hashes) =
+                                            ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                        {
+                                            if !hashes.is_empty() {
+                                                let _ = hashset_tx.send((fh, hashes));
+                                            }
+                                        }
+                                    });
+                                    Vec::new()
                                 };
                                 let record = KnownFileRecord {
                                     file_hash: fh,
@@ -26073,6 +28088,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if !friend_hashes.read().await.contains(&friend_eh) {
                         continue;
                     }
+                    // The inbound counterpart to the ask on `EmberFriendConnected`:
+                    // a friend that dialled us never raises that event, and a
+                    // starved node should not wait out a 60s tick for the one
+                    // bootstrap path that does not need their UDP port.
+                    if settings.ember_native_enabled {
+                        ask_friends_for_ember_contacts(&mut state).await;
+                    }
                     let hash_hex = hex::encode(friend_eh);
                     let now = chrono::Utc::now().timestamp();
                     state.online_friends.insert(friend_eh, now);
@@ -26121,6 +28143,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let udp = advertised_udp_port(&state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
+                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let friend_addr = SocketAddr::new(v4.into(), port);
@@ -26133,7 +28156,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             tokio::spawn(async move {
                                 if let Err(e) = ed2k::friend_connect::connect_friend_with_fallback(
                                     friend_addr, friend_eh, our_uh, our_eh, nick,
-                                    cid, tcp, udp, obfs, sess, ultx, fh,
+                                    cid, tcp, udp, obfs, sess, offline, ultx, fh,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
                                     rv_url, nat_ctx,
                                 ).await {
@@ -26162,14 +28185,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // upload) are how Add Friend on the uploads pane
                     // delivers `OP_EMBER_FRIEND_REQ` when the peer is
                     // firewalled and FindFriendAndConnect cannot dial
-                    // back. `verified` is PoP/Noise; unverified rows
-                    // still queue for approval with the unverified badge.
+                    // back. `verified` is PoP/Noise; unverified *strangers*
+                    // still queue with the unverified badge. Reciprocal
+                    // accepts from someone we already added auto-confirm
+                    // when verified and are ignored when not.
                     process_inbound_friend_request(
                         &db,
                         &app_handle,
                         &mut state.online_friends,
                         &mutual_friend_hashes,
-                        settings.friend_require_approval,
                         ember_hash,
                         pubkey,
                         &nickname,
@@ -26978,11 +29002,40 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     .await;
                 }
 
+                // The friend contact exchange. Gated on the overlay being on,
+                // because with it off there is neither a table to share nor one
+                // to fill.
+                if let UploadEventKind::EmberDhtContactRequest { ember_hash, target, ref reply_tx } = event.kind {
+                    if settings.ember_native_enabled {
+                        answer_friend_ember_contact_request(
+                            &mut state,
+                            ember_hash,
+                            target,
+                            reply_tx,
+                        )
+                        .await;
+                    }
+                }
+
+                if let UploadEventKind::EmberDhtContacts { ember_hash, ref contacts } = event.kind {
+                    if settings.ember_native_enabled {
+                        ingest_friend_ember_contacts(
+                            &udp_socket,
+                            &mut state,
+                            ember_hash,
+                            contacts,
+                        )
+                        .await;
+                    }
+                }
+
                 // Any inbound friend activity implies they're online — update
                 // status if we haven't already so the UI card flips immediately.
                 {
                     let activity_eh = match &event.kind {
                         UploadEventKind::EmberChatMessage { ember_hash, .. }
+                        | UploadEventKind::EmberChatTyping { ember_hash, .. }
+                        | UploadEventKind::EmberChatRead { ember_hash, .. }
                         | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
                         | UploadEventKind::EmberBrowseResponse { ember_hash, .. }
                         | UploadEventKind::EmberFriendRequest { ember_hash, .. } => Some(*ember_hash),
@@ -27038,6 +29091,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 *ember_hash,
                             )
                             .await;
+                            if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
+                            {
+                                flush_pending_read_receipt(
+                                    &db,
+                                    &state.ember_sessions,
+                                    &ed25519_secret_key,
+                                    *ember_hash,
+                                )
+                                .await;
+                            }
                         }
                         if still_friend && !ip.is_unspecified() && *port > 0 {
                             let hash_hex = hex::encode(ember_hash);
@@ -27062,6 +29125,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 port,
                             )
                             .await;
+                        }
+                        // A friend session coming up is the moment a starved
+                        // table has something to ask, and waiting for the 60s
+                        // maintenance tick is most of a short visit. The ask
+                        // rate-limits per friend, so a session that flaps
+                        // cannot turn this into a burst.
+                        if still_friend && settings.ember_native_enabled {
+                            ask_friends_for_ember_contacts(&mut state).await;
                         }
                     }
                     UploadEventKind::FriendEndpointDiscovered {
@@ -27162,6 +29233,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 *ember_hash,
                             )
                             .await;
+                            if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
+                            {
+                                flush_pending_read_receipt(
+                                    &db,
+                                    &state.ember_sessions,
+                                    &ed25519_secret_key,
+                                    *ember_hash,
+                                )
+                                .await;
+                            }
                         }
                     _ => {}
                 }
@@ -27172,7 +29253,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &app_handle,
                         &mut state.online_friends,
                         &mutual_friend_hashes,
-                        settings.friend_require_approval,
                         req_hash,
                         pubkey,
                         nickname,
@@ -27181,6 +29261,34 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         verified,
                     )
                     .await;
+                }
+
+                if let UploadEventKind::EmberFriendRetract { ember_hash: retract_hash } = event.kind {
+                    let hash_hex = hex::encode(retract_hash);
+                    // Only the queued request goes. Reaching into `friends`
+                    // here would turn a withdrawal into a way to remove
+                    // yourself from someone else's friend list, and if they
+                    // accepted a moment ago there is simply no row left to
+                    // delete.
+                    let db_retract = db.clone();
+                    let h_retract = hash_hex.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_retract.remove_friend_request(&h_retract)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            info!("Cleared withdrawn friend request from {hash_hex}");
+                            let _ = app_handle.emit(
+                                "ember:friend-request-withdrawn",
+                                serde_json::json!({
+                                    "sender_hash": hash_hex,
+                                }),
+                            );
+                        }
+                        Ok(Err(e)) => warn!("Failed to clear withdrawn request from {hash_hex}: {e}"),
+                        Err(e) => warn!("Withdrawn-request task failed for {hash_hex}: {e}"),
+                    }
                 }
 
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
@@ -27235,12 +29343,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             )
                             .await
                             {
-                                Ok(()) => {
+                                Ok(id) => {
                                     state
                                         .recent_ember_chat
                                         .insert(chat_eh, (cleaned.clone(), now));
                                     let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                                         "user_hash": hash_hex,
+                                        "id": id,
                                         "message": cleaned,
                                         "direction": "received",
                                         "timestamp": now,
@@ -27253,6 +29362,56 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+
+                if let UploadEventKind::EmberChatTyping { ember_hash: typing_eh, typing } = event.kind {
+                    if !settings.friend_chat_disabled
+                        && friend_hashes.read().await.contains(&typing_eh)
+                    {
+                        let _ = app_handle.emit(
+                            "ember:chat-typing",
+                            serde_json::json!({
+                                "user_hash": hex::encode(typing_eh),
+                                "typing": typing,
+                            }),
+                        );
+                    }
+                }
+
+                if let UploadEventKind::EmberChatRead { ember_hash: read_eh, body_hash } = event.kind
+                {
+                    // Same gate as outbound send/flush: off means we neither
+                    // tell friends we have read nor record that they have read
+                    // us. Persisting while the setting is off would still paint
+                    // "Seen" the moment it is turned back on.
+                    if settings.friend_chat_disabled
+                        || !settings.friend_chat_read_receipts
+                        || !friend_hashes.read().await.contains(&read_eh)
+                    {
+                        continue;
+                    }
+                    let hash_hex = hex::encode(read_eh);
+                    let body_hex = hex::encode(body_hash);
+                    let db_seen = db.clone();
+                    let hash_for_db = hash_hex.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_seen.mark_sent_seen_by_hash(&hash_for_db, &body_hex)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some(until_id))) => {
+                            let _ = app_handle.emit(
+                                "ember:chat-read",
+                                serde_json::json!({
+                                    "user_hash": hash_hex,
+                                    "until_id": until_id,
+                                }),
+                            );
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => warn!("Failed to apply chat read receipt from {hash_hex}: {e}"),
+                        Err(e) => warn!("Chat read-receipt task failed for {hash_hex}: {e}"),
                     }
                 }
 
@@ -30376,8 +32535,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Only the KAD bootstrap below depends on KAD being up. The
                 // friend-presence and friend-search work after this block must
                 // not: `stats.status` is only ever advanced by KAD code paths,
-                // so an eD2K-only session (the default, `auto_connect_kad` is
-                // off) sits at `Disconnected` forever. Returning here left the
+                // so a session where the user disconnected KAD sits at
+                // `Disconnected` until they reconnect. Returning here left the
                 // connection broker unbuilt, no QUIC listener, and the node
                 // never registered with rendezvous — friends could not find it
                 // at all, with no event emitted to say so.
@@ -30937,7 +33096,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             upnp_maintain_in_flight = true;
                                             upnp_maintain_started_at =
                                                 Some(tokio::time::Instant::now());
-                                            tokio::spawn(async move {
+                                            upnp_maintain_handle = Some(tokio::spawn(async move {
                                                 let mapped = mappings.map_quic_port(bound_port).await;
                                                 if mapped {
                                                     tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
@@ -30947,7 +33106,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     mappings,
                                                     mapped,
                                                 });
-                                            });
+                                            }));
                                         }
                                     }
                                     Err(e) => {
@@ -31118,30 +33277,51 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
-                // Initial friend search burst: look up all offline friends
-                // via the rendezvous server as soon as we have a known IP.
+                // Startup presence sweep: every friend gets a rendezvous lookup
+                // once Ember has an external IP, so the friend list opens with
+                // real online state instead of whatever the last session left.
+                //
+                // Queued rather than searched outright, and drained a few per
+                // tick below. This used to look up three friends and call it a
+                // burst, which left everyone after the third looking offline
+                // until the five-minute auto-retry reached them — ten per
+                // sweep, so a forty-friend list took twenty minutes to
+                // resolve, and the log claimed all of them had been looked up.
                 if !state.friend_search_initial_done
                     && state.external_ip.is_some()
                 {
                     state.friend_search_initial_done = true;
                     state.friend_search_started_at = Some(std::time::Instant::now());
-
-                    let all_friends: Vec<[u8; 16]> = friend_hashes.read().await.iter().copied().collect();
-                    let sessions = state.ember_sessions.read().await;
-
-                    let mut search_targets: Vec<[u8; 16]> = Vec::new();
-                    for fh in &all_friends {
-                        if state.online_friends.contains_key(fh) { continue; }
-                        if sessions.get(fh).is_some_and(|h| h.is_fresh()) { continue; }
-                        if state.outbound_session_tasks.contains_key(fh) { continue; }
-                        search_targets.push(*fh);
+                    state.friend_search_initial_queue =
+                        friend_hashes.read().await.iter().copied().collect();
+                    if !state.friend_search_initial_queue.is_empty() {
+                        info!(
+                            "Startup friend presence sweep: {} friend(s) queued, {} per tick",
+                            state.friend_search_initial_queue.len(),
+                            INITIAL_FRIEND_SEARCH_PER_TICK,
+                        );
                     }
+                }
+
+                if !state.friend_search_initial_queue.is_empty() {
+                    let friends_now = friend_hashes.read().await.clone();
+                    let sessions = state.ember_sessions.read().await;
+                    // Drained into a local list first, because
+                    // `spawn_rendezvous_friend_lookup` borrows the whole state
+                    // and the queue cannot still be held open across it.
+                    let targets = drain_initial_friend_search(
+                        &mut state.friend_search_initial_queue,
+                        INITIAL_FRIEND_SEARCH_PER_TICK,
+                        |fh| {
+                            !friends_now.contains(fh)
+                                || state.online_friends.contains_key(fh)
+                                || sessions.get(fh).is_some_and(|h| h.is_fresh())
+                                || state.outbound_session_tasks.contains_key(fh)
+                        },
+                    );
                     drop(sessions);
 
-                    if !search_targets.is_empty() {
-                        info!("Initial friend search burst: looking up {} offline friend(s) via rendezvous", search_targets.len());
-                    }
-                    for target_hash in search_targets.iter().take(3) {
+                    for target_hash in &targets {
                         state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
                         let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                             "user_hash": hex::encode(target_hash),
@@ -32427,6 +34607,77 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         Ok(Err(e)) => debug!("Queued-chat expiry sweep failed: {e}"),
                         Err(e) => debug!("Queued-chat expiry sweep panicked: {e}"),
                     }
+
+                    // Same cadence, same reason: the ceiling is in days, and a
+                    // withdrawal nobody can deliver is holding the address of
+                    // someone the user removed.
+                    let db_retract = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_retract.expire_stale_friend_request_retractions()
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(dropped)) => debug!(
+                            "Gave up on {dropped} undelivered friend-request withdrawal(s)"
+                        ),
+                        Ok(Err(e)) => debug!("Withdrawal expiry sweep failed: {e}"),
+                        Err(e) => debug!("Withdrawal expiry sweep panicked: {e}"),
+                    }
+                }
+
+                // Retry withdrawals whose peer was unreachable when the user
+                // cancelled. Without this the request stays on their Friends
+                // page for good simply because they happened to be offline at
+                // that moment, which is the whole point of persisting the row.
+                {
+                    let db_pending = db.clone();
+                    let pending = tokio::task::spawn_blocking(move || {
+                        db_pending.pending_friend_request_retractions()
+                    })
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.ok())
+                    .unwrap_or_default();
+                    // Parse before taking, not after: a row whose hash will not
+                    // decode used to consume one of the attempt slots and starve
+                    // the deliverable rows behind it for as long as it sat there.
+                    // A missing address is no longer disqualifying, because the
+                    // rendezvous fallback can still find them.
+                    let deliverable = pending.into_iter().filter_map(|(hash_hex, ip, port)| {
+                        let target = hex::decode(&hash_hex)
+                            .ok()
+                            .and_then(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())?;
+                        let stored = ip
+                            .parse::<std::net::IpAddr>()
+                            .ok()
+                            .filter(|_| port > 0)
+                            .map(|ip| SocketAddr::new(ip, port));
+                        Some((hash_hex, target, stored))
+                    });
+                    for (hash_hex, target, stored) in
+                        deliverable.take(MAX_RETRACTION_RETRIES_PER_SWEEP)
+                    {
+                        tokio::spawn(deliver_friend_request_retraction(
+                            db.clone(),
+                            settings.rendezvous_url.clone(),
+                            hash_hex,
+                            target,
+                            stored,
+                            state.user_hash,
+                            ember_hash,
+                            settings.nickname.clone(),
+                            state
+                                .external_ip
+                                .map(|eip| u32::from_le_bytes(eip.octets()))
+                                .unwrap_or(0),
+                            advertised_tcp_port(&state),
+                            advertised_udp_port(&state),
+                            settings.friend_session_encryption,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
+                        ));
+                    }
                 }
 
                 // Disarm the punch serve role once the punch that justified it
@@ -32982,6 +35233,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Transfers whose hash finished on the blocking pool. Drained
+                // here for the same branch-budget reason as the pacing below,
+                // but ahead of both gates it sits under: the verification was
+                // started while Ember was enabled and the overlay connected,
+                // and the sender is waiting on a completion frame it has no
+                // other way to obtain. Dropping the verdict because a setting
+                // was toggled or the eMule side went down mid-hash would leave
+                // that peer to time the transfer out as failed after it had
+                // already succeeded.
+                while let Ok(finished) = xfer_finish_rx.try_recv() {
+                    apply_xfer_finish(&udp_socket, &mut state, &db, &app_handle, finished).await;
+                }
                 // Ember Transfer pacing shares this 100ms tick rather than
                 // taking its own arm — `tokio::select!` tops out at 64
                 // branches and this loop is already at the limit. It runs
@@ -33519,19 +35782,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 // Cap banned_ips to prevent unbounded growth: rebuild from
                 // durable sources + active reputation bans (same path as the
-                // periodic reputation-timer sync).
-                const MAX_BANNED_IPS: usize = 10_000;
+                // periodic reputation-timer sync). The rebuild is asynchronous
+                // now, so the over-cap check moved to where the result is
+                // applied.
                 if state.banned_ips.len() > MAX_BANNED_IPS {
-                    let sm = source_manager.read().await;
-                    let before = state.banned_ips.len();
-                    sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
-                    if state.banned_ips.len() > MAX_BANNED_IPS {
-                        warn!(
-                            "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
-                            before,
-                            state.banned_ips.len()
-                        );
-                    }
+                    request_banned_ips_sync(
+                        &mut banned_ips_sync_in_flight,
+                        &db,
+                        &banned_ips_sync_tx,
+                    );
                 }
 
                 // Sweep orphaned Ember ping waiters. Each entry is created
@@ -33563,6 +35822,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!(
                             "Ember: swept {} orphaned pending ping(s) older than {}s",
                             stale.len(),
+                            MAX_PING_AGE.as_secs(),
+                        );
+                    }
+
+                    // The dev-panel DHT harness has the same two maps and had
+                    // no sweep at all: `ember_dht_pending_pings` and
+                    // `ember_dht_pending_finds` were only ever drained by a
+                    // matching wire reply. Every probe that timed out — a peer
+                    // that never answered, or a send that only reached
+                    // `OutgoingResult::Queued` because the handshake never
+                    // completed, so nothing went on the wire to be answered —
+                    // left its entry behind. A thousand of those and
+                    // `MAX_EMBER_PENDING_PINGS` refuses every further DHT ping
+                    // and find for the rest of the run, which reads as the
+                    // dev panel being broken.
+                    let before = state.ember_dht_pending_pings.len()
+                        + state.ember_dht_pending_finds.len();
+                    state
+                        .ember_dht_pending_pings
+                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
+                    state
+                        .ember_dht_pending_finds
+                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
+                    let swept = before
+                        - (state.ember_dht_pending_pings.len()
+                            + state.ember_dht_pending_finds.len());
+                    if swept > 0 {
+                        debug!(
+                            "Ember: swept {swept} orphaned DHT harness waiter(s) older than {}s",
                             MAX_PING_AGE.as_secs(),
                         );
                     }
@@ -38980,13 +41268,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
                         return;
                     };
-                    let nodes_were_loaded = state.ember_nodes_loaded;
+                    let nodes_file_state = state.ember_nodes_file;
                     tokio::task::spawn_blocking(move || {
                         let _ownership = ownership;
                         if let Err(e) = ember::dht::bootstrap::save_nodes(
                             &ember_path,
                             &ember_contacts,
-                            nodes_were_loaded,
+                            nodes_file_state,
                         ) {
                             error!("Failed periodic nodes_ember.dat save: {e}");
                         }
@@ -39011,14 +41299,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let tx = upnp_maintain_result_tx.clone();
                     upnp_maintain_in_flight = true;
                     upnp_maintain_started_at = Some(tokio::time::Instant::now());
-                    tokio::spawn(async move {
+                    upnp_maintain_handle = Some(tokio::spawn(async move {
                         let mapped = mappings.maintain().await;
                         let _ = tx.send(UpnpMaintainResult {
                             revision,
                             mappings,
                             mapped,
                         });
-                    });
+                    }));
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -39030,6 +41318,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 upnp_maintain_in_flight = false;
                 upnp_maintain_started_at = None;
+                // The pass that produced this result has finished; dropping a
+                // completed handle is what keeps the watchdog from aborting
+                // whichever pass happens to be running next.
+                upnp_maintain_handle = None;
                 if result.revision == upnp_mappings.revision() {
                     let was_mapped = state.upnp_mapped;
                     upnp_mappings = result.mappings;
@@ -39496,6 +41788,49 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Ember digest for {hash_hex} computed after completion");
                     }
                 }
+                // Apply any enforced-ban rebuild whose DB reads finished on the
+                // blocking pool. A failed read arrives as `None` and keeps the
+                // current set (fail-closed) rather than wiping bans.
+                while let Ok(inputs) = banned_ips_sync_rx.try_recv() {
+                    banned_ips_sync_in_flight = false;
+                    if let Some((peers, auto_bans)) = inputs {
+                        let before = state.banned_ips.len();
+                        {
+                            let sm = source_manager.read().await;
+                            apply_enforced_banned_ips(
+                                &mut state,
+                                &shared_banned_ips,
+                                peers,
+                                auto_bans,
+                                &sm,
+                            );
+                        }
+                        if state.banned_ips.len() > MAX_BANNED_IPS {
+                            warn!(
+                                "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
+                                before,
+                                state.banned_ips.len()
+                            );
+                        }
+                    }
+                }
+                // Same deal for ed2k part hashsets recomputed after a
+                // completion that arrived without one: the record is written
+                // immediately with an empty hashset and patched here, so
+                // `known.met` gains the parts needed to serve the file without
+                // the completion path having blocked on the read.
+                while let Ok((hashset_hash, part_hashes)) = part_hashset_result_rx.try_recv() {
+                    if let Some(record) = known_files.find_by_hash_mut(&hashset_hash) {
+                        if record.part_hashes != part_hashes {
+                            record.part_hashes = part_hashes;
+                            known_files.mark_dirty();
+                            debug!(
+                                "ed2k hashset for {} computed after completion",
+                                hex::encode(hashset_hash)
+                            );
+                        }
+                    }
+                }
                 while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
                     apply_channel_neighbor_lookup(
                         &udp_socket,
@@ -39539,6 +41874,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // seconds, which a sixty-second caller rounds up to sixty
                     // whatever the constant says.
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
+                    // On the same tick and for the same reason: the beat is
+                    // tens of seconds, which a minute-granularity caller cannot
+                    // express. Its own per-room gate decides when one is due.
+                    maybe_beat_channel_presence(&udp_socket, &mut state, &db, &settings).await;
+                    // Ahead of the emit, so a member heard from during this
+                    // tick is reported on this tick rather than the next.
+                    flush_channel_member_touches(&mut state, &db);
+                    emit_channel_presence_deltas(&mut state, &app_handle);
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                     drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
                 }
@@ -39722,8 +42065,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.reputation.lift_expired_bans();
                 state.reputation.maybe_decay();
-                let sm = source_manager.read().await;
-                sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
+                // The durable half of the rebuild is read off the loop and
+                // applied when it lands (see `BannedIpsSyncInputs`).
+                request_banned_ips_sync(
+                    &mut banned_ips_sync_in_flight,
+                    &db,
+                    &banned_ips_sync_tx,
+                );
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'reputation_timer' panicked: {}", describe_panic(&*__p));
@@ -40341,6 +42689,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     drive_ember_search(&udp_socket, &mut state, search_id).await;
                 }
 
+                // 2b) Retire searches that have converged or run past
+                //     `SEARCH_TIMEOUT_SECS` without a wire event to notice it.
+                //     Completion was only ever re-evaluated on a response, an
+                //     expired query, or a dispatched batch, so a walk with
+                //     nothing outstanding — every send in its first batch
+                //     failed, or its last answer completed it — kept its search
+                //     slot until the 120 s backstop below, twice the timeout it
+                //     is backstopping. The slot is the scarce part: the cap
+                //     counts held searches, not active ones, and background
+                //     walkers alone (channel presence starts one a second, plus
+                //     source lookups and bucket refreshes) can hold all 64 while
+                //     most are already done, which then refuses the user's own
+                //     search. Placed before the backstop so a reaped search is
+                //     still streamed and emitted by steps 7 and 8 in this tick.
+                for search_id in state.ember_search.active_ids() {
+                    maybe_finish_ember_search(&mut state, search_id);
+                }
+
                 // 3) Backstop: reap searches the SearchManager considers
                 //    long-expired and fail their still-waiting callers so
                 //    no Tauri command hangs past the overall timeout. A
@@ -40452,6 +42818,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if !ember_ping_timeout_is_a_fault(last_seen, sent_unix) {
                         continue;
                     }
+                    // Silence is also the answer to "was this lead real?", so
+                    // it is charged to whoever named it. Only reached when the
+                    // peer has said nothing since we asked — a lead that spoke
+                    // was already credited where its frame arrived.
+                    state.ember_gossip_reputation.note_silent(&node_id);
                     fault_ember_contact(&mut state, &node_id, "unresponsive");
                 }
 
@@ -40992,6 +43363,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         );
                         if ingest.new_neighbors {
                             any_new = true;
+                            // Members we did not know a moment ago, who
+                            // therefore do not know us either. Clearing the
+                            // stamp beats at them on the next tick instead of
+                            // leaving both sides to wait out the interval —
+                            // which is the whole of the join case, since a
+                            // joiner has nobody to announce to until this walk
+                            // tells them who is there.
+                            state.channel_beacon_beat_at.remove(&channel_id);
                         }
                         if ingest.roster_changed {
                             updated_ids.insert(hex::encode(channel_id));
@@ -41106,12 +43485,42 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Ember peers learned from KAD source tags (dialed over Noise_IK)
                 // or from eD2K sessions (dialed over Noise_XX). An idle node with
                 // nothing to work with stays quiet.
-                if settings.ember_native_enabled
-                    && (state.ember_dht.contact_count() > 0
-                        || !state.ember_session_dht_contacts.is_empty()
-                        || !state.ember_noise_keys.is_empty()
-                        || !state.ember_keyless_peers.is_empty())
-                {
+                //
+                // The remembered address book counts as work on its own. Every
+                // other condition here is live state, and all of it is
+                // perishable: contacts fault out after three missed pings,
+                // `ember_noise_keys` expires on `KNOWN_EMBER_PEER_TTL`, keyless
+                // peers and friend sessions go with their eD2K sessions. A
+                // suspend/resume, an interface or VPN change, an `ipfilter.dat`
+                // reload or simply a long stretch offline can empty all of them
+                // together — and then the one thing that could still get us
+                // back, the book on disk, was unreachable, because the top-up
+                // that offers it and the `rearm_offers` that makes a spent book
+                // offerable again both run *inside* this cycle. Nothing outside
+                // it can add a contact when no peer knows us and the eD2K side
+                // is quiet too, so the node stayed dark until it was restarted.
+                // That is the restart-only ratchet `peer_cache` exists to break.
+                let mut ember_has_work = state.ember_dht.contact_count() > 0
+                    || !state.ember_session_dht_contacts.is_empty()
+                    || !state.ember_noise_keys.is_empty()
+                    || !state.ember_keyless_peers.is_empty()
+                    || state.ember_bootstrap_cache.remembered_len() > 0;
+                // A live friend session counts on its own. It is the one
+                // bootstrap path that needs no dialable address for the peer
+                // introducing us, so the node it matters most to — a cold join
+                // whose only peer is a friend behind a relayed session — has
+                // every condition above empty. Without this the friend ask
+                // could never fire in the case it exists for. Read last, so the
+                // lock is only taken when the cheap checks all missed.
+                if settings.ember_native_enabled && !ember_has_work {
+                    ember_has_work = state
+                        .ember_sessions
+                        .read()
+                        .await
+                        .values()
+                        .any(|h| h.is_fresh() && h.is_secure_v2());
+                }
+                if settings.ember_native_enabled && ember_has_work {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
                     maybe_publish_channel_presence(
                         &udp_socket,
@@ -41380,7 +43789,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if upnp_maintain_in_flight
                     && timed_out(upnp_maintain_started_at, PERIODIC_SAVE_WATCHDOG)
                 {
-                    warn!("Watchdog: UPnP maintenance exceeded timeout; allowing next retry");
+                    warn!("Watchdog: UPnP maintenance exceeded timeout; aborting it and allowing next retry");
+                    // Abort before clearing the flag. Left running it is
+                    // unobservable — nothing joins it and its result is
+                    // discarded on arrival by the revision check — so it would
+                    // only sit on a gateway socket while the pass we are about
+                    // to allow does the same work.
+                    if let Some(handle) = upnp_maintain_handle.take() {
+                        handle.abort();
+                    }
                     upnp_maintain_in_flight = false;
                     upnp_maintain_started_at = None;
                 }
@@ -42046,6 +44463,40 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         );
     }
 
+    // Apply any transfer verification the blocking pool is still working on,
+    // before anything below tears down the paths its completion frame needs.
+    // `finish_xfer_recv` renames the file into place on that pool, so the
+    // download itself survives a quit either way — what is lost by exiting
+    // early is the `XFER_DONE` frame, and the sender has no other way to learn
+    // the transfer succeeded: it answers block requests and then waits, so its
+    // own stall timer reports a file we actually received as failed.
+    //
+    // Runs before the QUIC endpoint closes because `send_xfer_frame` falls
+    // back to the relay for a peer we have no direct path to. Bounded, and
+    // deliberately tighter than the save phases below: this is a courtesy to
+    // the sender, and a 100 MB hash on a spinning disk is not worth delaying
+    // the writes that protect our own state.
+    let xfer_drain_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3));
+    while state.xfer_finish_in_flight > 0 {
+        match tokio::time::timeout_at(xfer_drain_deadline, xfer_finish_rx.recv()).await {
+            Ok(Some(finished)) => {
+                apply_xfer_finish(&udp_socket, &mut state, &db, &app_handle, finished).await;
+            }
+            // Only `state` holds a sender, so this cannot happen while the
+            // loop owns it — treat it as "nothing more is coming" regardless.
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    "{} Ember transfer verification(s) still hashing 3s into shutdown; \
+                     the file is already saved but the sender will time it out",
+                    state.xfer_finish_in_flight
+                );
+                break;
+            }
+        }
+    }
+
     // Abort pending server connection if any
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
@@ -42241,7 +44692,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(e) = ember::dht::bootstrap::save_nodes(
                     &ember_nodes_path,
                     &ember_contacts,
-                    state.ember_nodes_loaded,
+                    state.ember_nodes_file,
                 ) {
                     error!("Failed to save nodes_ember.dat on shutdown: {e}");
                 }
@@ -45718,36 +48169,6 @@ fn ember_named_source_buddy(
     buddy.is_routable().then_some(buddy)
 }
 
-/// The pre-endorsement trailer: the buddy's *observed* address, vouched for by
-/// nobody but us.
-///
-/// Only used when no candidate has endorsed an endpoint for us — a network
-/// still on builds that do not answer `BUDDY_ENDORSE_REQ`. No current-build
-/// searcher will dial this (`SourceBuddy::endorsement_covers` refuses it, which
-/// is the entire point), but an older one will, exactly as it does today. The
-/// alternative is publishing no firewalled source record at all, which takes a
-/// LowID seeder off the network for peers that could still reach it.
-///
-/// This is honest rather than merely permitted: we name a verified contact we
-/// are really talking to. It gives an attacker nothing, because forging a
-/// *victim's* trailer never needed our cooperation.
-fn ember_unendorsed_source_buddy(
-    contact: &ember::dht::EmberContact,
-) -> Option<ember::dht::publish::SourceBuddy> {
-    let std::net::IpAddr::V4(ip) = contact.addr.ip() else {
-        return None;
-    };
-    let buddy = ember::dht::publish::SourceBuddy {
-        ip,
-        udp_port: contact.addr.port(),
-        noise_pub: contact.noise_pub,
-        ed25519_pub: [0u8; 32],
-        endorsed_until: 0,
-        endorsement: [0u8; 64],
-    };
-    buddy.is_routable().then_some(buddy)
-}
-
 /// Whether consume should `CALLBACK_REQ` this source. Unusable, unendorsed,
 /// uncorroborated or locally blocked buddies fall through to the firewalled park
 /// path instead of being dropped.
@@ -45847,58 +48268,6 @@ fn pending_download_has_parked_ember_sources(state: &NetworkState, transfer_id: 
             )
         })
     })
-}
-
-/// Whether a source record names a buddy that never endorsed the endpoint —
-/// the compatibility trailer, which no current-build searcher will dial.
-///
-/// A record with no buddy at all is not a candidate: it is either a HighID
-/// record or a firewalled one nobody can proxy, and re-publishing it endorsed
-/// is not possible.
-fn ember_record_names_unendorsed_buddy(record: &ember::dht::publish::SignedRecord) -> bool {
-    record
-        .source_contact
-        .and_then(|sc| sc.buddy)
-        .is_some_and(|b| !b.has_identity())
-}
-
-/// A buddy has just endorsed an endpoint for us, so retire every source record
-/// we published with the compatibility trailer and publish them again endorsed.
-///
-/// Without this, the fallback wins the race with its own fix. The endorsement
-/// request and the compatibility publish go out on the same tick, so the reply
-/// arrives while those records are still queued for `PROXY_STORE_ACK`. Letting
-/// them land would set `ember_source_publish_at`, and
-/// [`ember_publish_staleness`] would then refuse to reselect the file until
-/// `EMBER_SOURCE_REPUBLISH` elapsed — two hours of publishing a trailer no
-/// current-build searcher will act on, while holding a usable endorsement.
-///
-/// Latched on `ember_source_published_unendorsed` so this is one-shot. Any real
-/// DHT node can send us a valid unsolicited self-endorsement, and without the
-/// latch each one would force a full source republish.
-fn ember_endorsement_supersedes_unendorsed_sources(state: &mut NetworkState) {
-    if !state.ember_source_published_unendorsed {
-        return;
-    }
-    state.ember_source_published_unendorsed = false;
-    let queued: Vec<(ember::dht::EmberNodeId, u32, EmberRecordRef)> = state
-        .ember_pending_proxy_overlay
-        .iter()
-        .filter(|(_, pending)| ember_record_names_unendorsed_buddy(&pending.record))
-        .map(|(k, pending)| (k.0, k.1, pending.reference))
-        .collect();
-    let dropped = queued.len();
-    for (buddy, rid, reference) in queued {
-        state.ember_pending_proxy_overlay.remove(&(buddy, rid));
-        untrack_ember_record_pending(state.publish_schedule(), reference);
-    }
-    // Everything already placed is stale for the same reason, so let the next
-    // tick reselect it. Republishing stays paced by `ember_source_files_per_tick`.
-    state.ember_source_publish_at.clear();
-    debug!(
-        "Ember DHT: endorsement received, dropped {dropped} unendorsed source record(s) \
-         and rescheduled source publish"
-    );
 }
 
 /// Drop publish-set entries whose source record has outlived
@@ -46077,7 +48446,6 @@ async fn maybe_publish_ember_sources(
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
     state.ember_diagnostics.ember_dht_waiting_buddy = false;
-    state.ember_diagnostics.ember_dht_buddy_unendorsed_publish = false;
 
     // TTL-expire source records still held for a buddy ACK, genuinely before
     // anything can return early. It needs no peers, no external IP and no TCP
@@ -46103,6 +48471,24 @@ async fn maybe_publish_ember_sources(
     // replica simply expired — so a node that lost its buddy kept reporting
     // those files as published for the rest of the session.
     prune_expired_ember_published_sources(state);
+
+    // Not serving: the upload listener is refusing every inbound connection,
+    // so a source record placed now names a node that will not hand the file
+    // over — and it outlives the decision by a full source TTL, which is DHT
+    // pollution rather than a local UX quirk.
+    //
+    // `upload_disconnected` is the right signal and `ember_tcp_firewalled` is
+    // not: `KadDisconnect` clears LowID and rebuilds the firewall checker, so
+    // the TCP verdict reads `Unknown` immediately afterwards and the node
+    // publishes itself as a *reachable* HighID source while rejecting every
+    // connect. The same flag also covers shutdown, where the listener is
+    // closed before the save sequence runs.
+    if state
+        .upload_disconnected
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
 
     if !settings.ember_native_enabled || tcp_port == 0 || ember_publishable_peer_count(state) == 0 {
         return;
@@ -46160,21 +48546,26 @@ async fn maybe_publish_ember_sources(
             match named {
                 Some(named) => Some(named),
                 None => {
-                    // Nobody has endorsed an endpoint for us yet. Ask the best
-                    // candidates, and meanwhile fall back to the trailer older
-                    // builds have always published so a LowID seeder is not
-                    // simply absent for the peers that can still use it.
+                    // Nobody has endorsed an endpoint for us yet, so there is
+                    // no buddy we may name. This used to fall back to the
+                    // pre-endorsement trailer, which named a verified contact's
+                    // observed address on nobody's authority but ours.
+                    //
+                    // That trailer has no consumer left. It shipped before wire
+                    // v4, so every peer that can still exchange frames with us
+                    // speaks endorsements, and a current-build searcher refuses
+                    // to dial an unendorsed buddy — the record was published,
+                    // proxied, replicated twenty ways and then parked by
+                    // everyone who found it. Publishing nothing this tick and
+                    // asking again is strictly cheaper, and the ask below is
+                    // answered in one round trip by any peer that could have
+                    // served as the buddy anyway.
+                    //
+                    // Nothing is stamped for a file we skip, so it stays due and
+                    // the next tick retries it; `ember_dht_waiting_buddy` is
+                    // what surfaces the wait.
                     ask_ember_buddy_endorsements(socket, state, &c).await;
-                    let fallback = c.iter().find_map(|contact| {
-                        ember_unendorsed_source_buddy(contact).map(|b| (contact.clone(), b))
-                    });
-                    state.ember_diagnostics.ember_dht_buddy_unendorsed_publish =
-                        fallback.is_some();
-                    // Latch it for `ember_endorsement_supersedes_unendorsed_sources`,
-                    // which is what stops these records pinning the file for
-                    // `EMBER_SOURCE_REPUBLISH` once an endorsement lands.
-                    state.ember_source_published_unendorsed |= fallback.is_some();
-                    fallback
+                    None
                 }
             }
         } else {
@@ -46685,7 +49076,7 @@ async fn start_ember_source_search(
     let Some(search_id) =
         state
             .ember_search
-            .start_find_value(target, Vec::new(), state.ember_dht.routing())
+            .start_background_find_value(target, Vec::new(), state.ember_dht.routing())
     else {
         return false;
     };
@@ -46759,6 +49150,7 @@ async fn probe_bucket_oldest(
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let sent =
             match state
                 .ember_transport
@@ -46789,6 +49181,14 @@ async fn probe_bucket_oldest(
                 }
                 ember::transport::OutgoingResult::Queued => {
                     behind_handshake = true;
+                    // Parked behind a handshake that may complete with someone
+                    // else, in which case this frame is discarded rather than
+                    // sent. Not booked, so its silence cannot fault a contact
+                    // we never actually probed; bucket pressure simply retries
+                    // on the next tick.
+                    delivery_certain = state
+                        .ember_transport
+                        .queued_delivery_is_certain(*oldest_addr, oldest_noise);
                     true
                 }
                 ember::transport::OutgoingResult::Error(e) => {
@@ -46796,7 +49196,7 @@ async fn probe_bucket_oldest(
                     false
                 }
             };
-        if sent {
+        if sent && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(*oldest_id, behind_handshake, now),
@@ -46805,6 +49205,17 @@ async fn probe_bucket_oldest(
                 .ember_diagnostics
                 .ember_dht_liveness_pings_sent
                 .saturating_add(1);
+        } else if !sent {
+            // A probe that never left the machine records no pending entry, so
+            // the timeout sweep cannot fault this contact either — and this is
+            // the path that services bucket pressure, so the newcomer waiting
+            // in the replacement cache is waiting on a promotion that can only
+            // come from the incumbent being faulted. An address family the
+            // socket cannot dial (an IPv6 contact learned by gossip on an IPv4
+            // socket) fails here every time, and the liveness sweep will not
+            // cover it while it is still recent enough not to be due a ping.
+            // Same reasoning as the unreachable arm in `ping_ember_contact`.
+            fault_ember_contact(state, oldest_id, "unreachable");
         }
     }
 }
@@ -46815,41 +49226,70 @@ async fn run_ember_kad_bridge(
     force: bool,
     max_pings: usize,
 ) -> usize {
+    // `starved` is what flattens the retry backoff, and it has to be the real
+    // table state: a forced run against a healthy table is still a healthy
+    // table, and letting `force` stand in for it re-dialled every address the
+    // backoff was resting.
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    if !(force || starved) {
+        return 0;
+    }
     let mut sent = 0usize;
+    let mut xx_sent = 0usize;
     // The budget has to be charged against peers *dialled*, not datagrams that
     // left. `send_ember_bridge_ping` returns false for a local send error too,
     // and a run of those would otherwise leave `max_pings` untouched and hand
-    // the XX pass a full second budget — up to twice the documented cap in one
-    // call, spent on the slower 2-RTT handshake.
+    // the next pass a full second budget — up to twice the documented cap in
+    // one call, spent on the slower 2-RTT handshake.
     let mut dialled = 0usize;
-    let bridging =
-        force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
-    if bridging {
-        let candidates = kad_bridge_candidates(
-            &state.ember_noise_keys,
-            &state.ember_kad_bridge_attempted,
-            max_pings,
-        );
-        for (ip, port, noise_pub) in candidates {
-            dialled += 1;
-            if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
-                sent += 1;
-            }
+
+    // XX first, up to its reserve, so the IK pass cannot crowd it out; see
+    // `EMBER_BRIDGE_XX_RESERVE_DIVISOR`. Whatever the reserve does not find a
+    // candidate for is still on the table for the IK pass below.
+    let reserve = xx_bridge_reserve(max_pings, !state.ember_keyless_peers.is_empty());
+    let reserved_xx = xx_bridge_candidates(
+        &state.ember_keyless_peers,
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        reserve,
+        starved,
+    );
+    for (ip, port) in &reserved_xx {
+        dialled += 1;
+        if send_ember_bridge_ping(socket, state, *ip, *port, None).await {
+            xx_sent += 1;
+            sent += 1;
         }
     }
-    let xx_budget = if bridging {
-        max_pings.saturating_sub(dialled)
-    } else {
-        0
-    };
+
+    let candidates = kad_bridge_candidates(
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        max_pings.saturating_sub(dialled),
+        starved,
+    );
+    for (ip, port, noise_pub) in candidates {
+        dialled += 1;
+        if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
+            sent += 1;
+        }
+    }
+
+    // Whatever the IK pass left over goes to the XX side as before. A peer the
+    // reserve already dialled is excluded explicitly rather than trusting the
+    // attempted set alone: a transport error there records no attempt, and the
+    // same address must not be charged twice in one pass.
     let xx_candidates = xx_bridge_candidates(
         &state.ember_keyless_peers,
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
-        xx_budget,
+        max_pings.saturating_sub(dialled),
+        starved,
     );
-    let mut xx_sent = 0usize;
     for (ip, port) in xx_candidates {
+        if reserved_xx.contains(&(ip, port)) {
+            continue;
+        }
         if send_ember_bridge_ping(socket, state, ip, port, None).await {
             xx_sent += 1;
             sent += 1;
@@ -46890,7 +49330,16 @@ async fn run_ember_maintenance(
         // from anyone is exactly the one that most needs the kick, and gating
         // on "we heard something once" skipped it entirely.
         let last_inbound = state.ember_last_inbound.unwrap_or(state.ember_started_at);
-        if now_secs.saturating_sub(last_inbound) > EMBER_DISCONNECT_SECS {
+        // Debounced against the last re-arm rather than against the inbound
+        // clock. Stamping `ember_last_inbound` here was what kept this from
+        // firing every tick, at the cost of telling the diagnostics we had just
+        // heard from someone when the whole reason we were here is that we had
+        // not. A separate stamp buys the same once-per-stretch behaviour and
+        // leaves the observation alone.
+        let last_rearm = state.ember_rearmed_at.unwrap_or(state.ember_started_at);
+        if now_secs.saturating_sub(last_inbound) > EMBER_DISCONNECT_SECS
+            && now_secs.saturating_sub(last_rearm) > EMBER_DISCONNECT_SECS
+        {
             info!(
                 "Ember DHT: no traffic for {}s, re-bootstrapping",
                 now_secs.saturating_sub(last_inbound)
@@ -46903,7 +49352,7 @@ async fn run_ember_maintenance(
             // lookups says nothing about the network we are rejoining.
             state.ember_rendezvous_empty_streak = 0;
             // Only re-arm once per silent stretch, not on every tick.
-            state.ember_last_inbound = Some(now_secs);
+            state.ember_rearmed_at = Some(now_secs);
         }
 
         let contacts = ember_overlay_contact_count(state);
@@ -46946,6 +49395,13 @@ async fn run_ember_maintenance(
     result.kad_bridge_pings_sent =
         run_ember_kad_bridge(socket, state, force, EMBER_KAD_BRIDGE_MAX_PINGS).await;
 
+    // 0a1) Ask friends for contacts, for the friends the bridge above can never
+    //      reach: the bridge dials an address from the eD2K hello, and a friend
+    //      that named no UDP port or sits behind a relayed session has no such
+    //      address. See `ask_friends_for_ember_contacts`. Self-limiting — it
+    //      stops entirely once the table holds a working set.
+    result.friend_contact_asks = ask_friends_for_ember_contacts(state).await;
+
     // 0b) Staleness purge. Liveness pings alone need three consecutive
     //     misses to evict, and the ping budget is small, so a contact that
     //     quietly disappeared could hold its slot for hours — blocking the
@@ -46960,6 +49416,68 @@ async fn run_ember_maintenance(
             .ember_diagnostics
             .ember_dht_contacts_evicted
             .saturating_add(purged as u32);
+    }
+
+    // 0b0) The same purge for the firsthand session contacts that sit beside
+    //      the table. Nothing removed one, ever: `record_ember_session_dht_contact`
+    //      bounds the map by an LRU at `MAX_EMBER_SESSION_DHT_CONTACTS` and two
+    //      ports per host, and the only wholesale clear is on the disable path
+    //      that settings can no longer reach. So a LAN peer that went away kept
+    //      being counted in the overlay figure the UI shows, kept being pinned
+    //      onto every search shortlist — `SearchManager` exempts these from the
+    //      k-trim on purpose — kept being offered as a publish target by
+    //      `ember_top_up_session_targets`, and kept its known-peer UDP handling,
+    //      because `ember_session_introduced` treats presence in this map as its
+    //      own justification. A quiet LAN host is the common case here, and 64
+    //      slots is few enough that the LRU would not reclaim them for a long
+    //      time.
+    //
+    //      Only contacts that have answered us are aged out. A copy learned from
+    //      a LAN `PEER_LIST` arrives with `last_seen == 0`, and that is not
+    //      silence — it is a peer we have not asked yet, which the LRU already
+    //      ranks first for eviction. Nothing here consults
+    //      `SearchManager::nodes_in_use`: a search pins its own copies of these
+    //      contacts onto its shortlist when it starts, so a walk in flight
+    //      cannot lose a branch to this sweep the way it could to the table's.
+    let session_extras_before = state.ember_session_dht_contacts.len();
+    state
+        .ember_session_dht_contacts
+        .retain(|_, c| ember_session_contact_is_live(c, now_secs));
+    let session_extras_purged = session_extras_before - state.ember_session_dht_contacts.len();
+    if session_extras_purged > 0 {
+        debug!(
+            "Ember DHT: purged {session_extras_purged} session contact(s) unheard for {}s",
+            EMBER_CONTACT_STALE_SECS
+        );
+    }
+
+    // 0b1) The other direction: residents a tier we have since grown into
+    //      would not admit today. Admission has always tightened as the table
+    //      fills, but nothing re-read a contact once it held a slot, so a peer
+    //      admitted under the cold-start allowance kept its share of a bucket
+    //      for the life of the process however crowded its /24 turned out to
+    //      be. Runs before the promotion below so the slots it frees are
+    //      available to the cache in the same tick.
+    // The STORE budget's tier, refreshed here rather than per datagram. It was
+    // recomputed on every inbound STORE, and `scale()` walks all 128 buckets —
+    // pure waste, since the tier only moves when the verified count crosses 10
+    // or 80 and this tick is where that changes. A minute of staleness on a
+    // limit that only ever tightens by a third is not worth a table scan per
+    // frame.
+    state
+        .ember_dht_protection
+        .set_scale(state.ember_dht.routing().scale());
+
+    let demoted = state.ember_dht.enforce_scale_quotas();
+    if demoted > 0 {
+        // Not `ember_dht_contacts_evicted`: these peers answered us and are
+        // still held in a replacement cache, so counting them as evictions made
+        // a table reclaiming its cold-start allowance read exactly like peers
+        // going dark.
+        state.ember_diagnostics.ember_dht_contacts_demoted = state
+            .ember_diagnostics
+            .ember_dht_contacts_demoted
+            .saturating_add(demoted as u32);
     }
 
     // Leads parked while the IP filter could not be consulted, plus any the
@@ -47087,7 +49605,7 @@ async fn run_ember_maintenance(
         && now_secs.saturating_sub(state.ember_last_self_lookup) >= EMBER_SELF_LOOKUP_REPEAT_SECS;
     if ember_overlay_contact_count(state) > 0 && (force || first_due || repeat_due) {
         let self_target = state.ember_dht.local_id();
-        if let Some(search_id) = start_ember_find_node(state, self_target) {
+        if let Some(search_id) = start_ember_background_find_node(state, self_target) {
             state.ember_self_lookup_done = true;
             state.ember_last_self_lookup = now_secs;
             result.buckets_refreshed += 1;
@@ -47107,7 +49625,7 @@ async fn run_ember_maintenance(
     );
     for bucket_idx in buckets {
         let target = state.ember_dht.random_target_in_bucket(bucket_idx);
-        if let Some(search_id) = start_ember_find_node(state, target) {
+        if let Some(search_id) = start_ember_background_find_node(state, target) {
             result.buckets_refreshed += 1;
             state.ember_diagnostics.ember_dht_refreshes = state
                 .ember_diagnostics
@@ -47136,7 +49654,7 @@ async fn run_ember_maintenance(
                 break;
             };
             let target = ember::dht::EmberNodeId(key);
-            match start_ember_find_node(state, target) {
+            match start_ember_background_find_node(state, target) {
                 Some(search_id) => {
                     state.ember_publish_target_lookups.insert(search_id, key);
                     drive_ember_search(socket, state, search_id).await;
@@ -47176,6 +49694,7 @@ async fn run_ember_maintenance(
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
+        let mut delivery_certain = true;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -47210,6 +49729,14 @@ async fn run_ember_maintenance(
             }
             ember::transport::OutgoingResult::Queued => {
                 behind_handshake = true;
+                // See `probe_bucket_oldest`: parked behind a handshake that may
+                // complete with a different identity, in which case this frame
+                // is dropped at flush rather than sent. Neither booked nor
+                // faulted — the next cycle re-pings it, by which time the
+                // handshake has resolved one way or the other.
+                delivery_certain = state
+                    .ember_transport
+                    .queued_delivery_is_certain(contact.addr, &contact.noise_pub);
                 true
             }
             ember::transport::OutgoingResult::Error(e) => {
@@ -47220,7 +49747,7 @@ async fn run_ember_maintenance(
                 false
             }
         };
-        if send_ok {
+        if send_ok && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
                 new_ember_maint_ping(contact.node_id, behind_handshake, now),
@@ -47230,7 +49757,7 @@ async fn run_ember_maintenance(
                 .ember_diagnostics
                 .ember_dht_liveness_pings_sent
                 .saturating_add(1);
-        } else {
+        } else if !send_ok {
             // A contact we cannot even transmit to is as dead as one that
             // never answers, and it is the only case the timeout sweep can't
             // see: with no pending entry recorded, nothing would ever fault
@@ -47380,6 +49907,28 @@ async fn run_ember_maintenance(
         state.ember_verified_highwater_dirty = false;
     }
 
+    // Introducer records only change on a probe outcome, and pruning them is
+    // per-cycle work, so the gauge is refreshed here rather than per frame.
+    let prune_now = std::time::Instant::now();
+    state.ember_gossip_reputation.prune(prune_now);
+    let introducers_rationed = state.ember_gossip_reputation.rationed_len() as u32;
+    state
+        .ember_diagnostics
+        .ember_dht_gossip_introducers_rationed = introducers_rationed;
+
+    // The friend contact-exchange throttles, by age rather than by which
+    // sessions are still live, so neither needs a session lock to bound. The
+    // ask side outlives its own interval because it doubles as the rotation
+    // key — see `EMBER_FRIEND_CONTACT_STAMP_TTL`. Runs outside the starved gate
+    // above, or a node that recovered would keep whatever it had asked for the
+    // life of the process.
+    state
+        .ember_friend_contacts_asked
+        .retain(|_, at| prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_STAMP_TTL);
+    state.ember_friend_contacts_served.retain(|_, at| {
+        prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL
+    });
+
     // Everything the overlay's health depends on, in one line. A node that is
     // not growing is the hard case to diagnose from the outside: "1 contact"
     // alone cannot distinguish "nobody is telling us about anyone" from "we
@@ -47388,7 +49937,8 @@ async fn run_ember_maintenance(
     let verified_now_len = state.ember_dht.routing().verified_len();
     info!(
         "Ember DHT cycle: contacts={} ({verified_now_len} verified, {} leads, {} session), \
-         announced={}, peer_lists={}, gossip={} (new {}, refused {}), pings={}, bridge={}, \
+         announced={}, peer_lists={}, gossip={} (new {}, refused {}, rationed {} from {} \
+         introducer(s)), pings={}, bridge={}, friend_asks={}, \
          noise_keys={}, keyless={}, records due={} selected={} queued={} re-armed={} \
          backlog={}",
         state.ember_dht.contact_count(),
@@ -47402,8 +49952,11 @@ async fn run_ember_maintenance(
         state.ember_diagnostics.ember_dht_gossip_contacts,
         state.ember_diagnostics.ember_dht_gossip_new,
         state.ember_diagnostics.ember_dht_gossip_refused,
+        state.ember_diagnostics.ember_dht_gossip_leads_rationed,
+        introducers_rationed,
         result.liveness_pings_sent,
         result.kad_bridge_pings_sent,
+        result.friend_contact_asks,
         state.ember_noise_keys.len(),
         state.ember_keyless_peers.len(),
         result.republish_due,
@@ -47443,10 +49996,19 @@ async fn handle_ember_dht_message(
             | ember::dht::messages::MSG_STORE_BATCH
     );
 
-    // Only STORE traffic needs the identity lookup and the scale refresh, and
-    // both walk the whole routing table. Doing them for every packet put a
-    // full table scan in front of the gate that exists to make junk cheap to
-    // reject, so an attacker could buy a scan per datagram.
+    // The flat per-address frame gate first, before anything expensive. Only
+    // STORE traffic needs the identity lookup below, and that walks the whole
+    // routing table: leaving it in front of the gate meant a peer already over
+    // its frame rate still bought a table scan per datagram, which is the
+    // opposite of what a gate that exists to make junk cheap to reject is for.
+    if !state.ember_dht_protection.allow_frame(from.ip()) {
+        state.ember_diagnostics.ember_dht_rate_limited = state
+            .ember_diagnostics
+            .ember_dht_rate_limited
+            .saturating_add(1);
+        return;
+    }
+
     let (known_sender, store_records) = if is_store {
         // Prefer the peer's cryptographic identity for the STORE budget when
         // we already know it, so several genuine peers behind one NAT do not
@@ -47468,9 +50030,6 @@ async fn handle_ember_dht_message(
             .contact_at(from)
             .filter(|c| c.is_verified() && c.noise_pub == remote_noise_pub)
             .map(|c| c.node_id.0);
-        state
-            .ember_dht_protection
-            .set_scale(state.ember_dht.routing().scale());
         // A batch's record count is its first payload byte. Reading it here
         // is what lets the budget be charged for the work the frame implies
         // rather than for the frame itself; the decoder re-validates it.
@@ -47486,7 +50045,7 @@ async fn handle_ember_dht_message(
 
     if !state
         .ember_dht_protection
-        .allow_message(from.ip(), msg_type, known_sender, store_records)
+        .allow_typed(from.ip(), msg_type, known_sender, store_records)
     {
         state.ember_diagnostics.ember_dht_rate_limited = state
             .ember_diagnostics
@@ -47531,6 +50090,12 @@ async fn handle_ember_dht_message(
         // way back.
         if let std::net::IpAddr::V4(v4) = from.ip() {
             state.ember_kad_bridge_attempted.remove(&(v4, from.port()));
+        }
+        // And if this peer was a lead somebody named, that name has just been
+        // shown to be worth something. Any signed frame counts, not only the
+        // `PONG`: what the probe was asking is whether the address is real.
+        if let Some(id) = inbound.sender_id {
+            state.ember_gossip_reputation.note_answered(&id);
         }
     }
     if let Some(contact) = inbound.sender_contact.clone() {
@@ -47842,10 +50407,6 @@ async fn handle_ember_dht_message(
         flush_ember_proxy_overlay_ack(socket, state, sender, rid).await;
     }
 
-    if inbound.buddy_endorsed {
-        ember_endorsement_supersedes_unendorsed_sources(state);
-    }
-
     // Encrypt and send any signed DHT replies (e.g. the PONG answering
     // a PING, the FOUND_NODE answering a FIND_NODE, or the STORE_ACK /
     // FOUND_VALUE answering a STORE / FIND_VALUE) back over the
@@ -47978,7 +50539,20 @@ async fn handle_ember_dht_message(
     // the contacts into the routing table. Unmatched request_ids are
     // unsolicited and ignored.
     if let Some((rid, contacts)) = inbound.found_node {
-        if let Some((_sent_at, tx)) = state.ember_dht_pending_finds.remove(&rid) {
+        // Bound to the address the query went to, like the PONG path above. A
+        // wrong-sender answer is put back rather than consumed, so the peer we
+        // actually asked can still resolve its own waiter.
+        let harness_waiter = match state.ember_dht_pending_finds.remove(&rid) {
+            Some((_sent_at, dest, tx)) if dest == from => Some(tx),
+            Some((sent_at, dest, tx)) => {
+                state
+                    .ember_dht_pending_finds
+                    .insert(rid, (sent_at, dest, tx));
+                None
+            }
+            None => None,
+        };
+        if let Some(tx) = harness_waiter {
             let local_id = state.ember_dht.local_id();
             let infos = contacts
                 .iter()
@@ -48694,10 +51268,10 @@ async fn handle_udp_packet_inner(
     // below is KAD's, and an unsolicited KAD packet must not be parsed or folded
     // into the routing table while KAD is disconnected, so the gate belongs here
     // rather than around the whole handler. It used to sit at the call site,
-    // which meant an eD2K-only session (the default: `auto_connect_kad` is off,
-    // and such a session never leaves `Disconnected`) discarded every inbound
-    // peer datagram while still sending reasks — queue ranks never updated,
-    // peers queued on us never got an ack, and the UDP port test always failed.
+    // which meant a session with KAD disconnected — eD2K-only, but still
+    // transferring — discarded every inbound peer datagram while still sending
+    // reasks, so queue ranks never updated, peers queued on us never got an
+    // ack, and the UDP port test always failed.
     if state.stats.status == NetworkStatus::Disconnected {
         debug!("Dropping KAD UDP packet from {from}: KAD is not connected");
         return;
@@ -51297,7 +53871,11 @@ async fn handle_download_event(
                 let db_for_progress = db.clone();
                 let transfer_id_for_progress = transfer_id.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Err(e) = db_for_progress.update_transfer_progress(
+                    // Guarded: this write is unsequenced and can be executed
+                    // after the completion write it was queued before, which
+                    // would leave a `completed` row showing the last
+                    // rate-limited percentage instead of 100%.
+                    if let Err(e) = db_for_progress.update_transfer_progress_if_active(
                         &transfer_id_for_progress,
                         capped_downloaded,
                         progress,
@@ -51622,40 +54200,15 @@ async fn handle_download_event(
             let completed_seq = status_writes.next_seq();
             let completed_clock = Arc::clone(status_writes);
             tokio::task::spawn_blocking(move || {
-                if let Some(total_size) = final_total {
-                    if let Err(e) = db_for_completion.update_transfer_progress(
-                        &completion_transfer_id,
-                        total_size,
-                        100.0,
-                        0,
-                    ) {
-                        warn!(
-                            "DB update_transfer_progress (final) failed for {completion_transfer_id}: {e}"
-                        );
-                    }
-                }
-                apply_transfer_status_write(
+                apply_transfer_completion_write(
                     &completed_clock,
                     &db_for_completion,
                     &completion_transfer_id,
-                    "completed",
+                    final_total,
+                    history_row,
+                    remove_finished,
                     completed_seq,
                 );
-                if let Some((file_hash, file_name, total_size)) = history_row {
-                    if let Err(e) = db_for_completion.record_download_history(
-                        &file_hash,
-                        &file_name,
-                        total_size,
-                        "completed",
-                    ) {
-                        tracing::warn!("Failed to record download history: {e}");
-                    }
-                }
-                if remove_finished {
-                    if let Err(e) = db_for_completion.remove_transfer(&completion_transfer_id) {
-                        warn!("DB remove_transfer failed for {completion_transfer_id}: {e}");
-                    }
-                }
             });
 
             let _ = app_handle.emit(
@@ -52069,6 +54622,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberPeerDiscovered { .. }
         | UploadEventKind::FriendSeen { .. }
         | UploadEventKind::EmberChatMessage { .. }
+        | UploadEventKind::EmberChatTyping { .. }
+        | UploadEventKind::EmberChatRead { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberBrowseSessionReady { .. }
@@ -52082,8 +54637,11 @@ async fn handle_upload_event(
         | UploadEventKind::EmberTransferAck { .. }
         | UploadEventKind::EmberFileOffer { .. }
         | UploadEventKind::EmberRelayOffer { .. }
+        | UploadEventKind::EmberDhtContactRequest { .. }
+        | UploadEventKind::EmberDhtContacts { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
-        | UploadEventKind::EmberFriendRequest { .. } => {
+        | UploadEventKind::EmberFriendRequest { .. }
+        | UploadEventKind::EmberFriendRetract { .. } => {
             // Handled directly in the network event loop.
         }
     }

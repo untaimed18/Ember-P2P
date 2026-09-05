@@ -124,7 +124,11 @@ impl WindowCounter {
             }
         }
 
-        let start = self.window_start.expect("set above");
+        // Every arm above sets it, so the fallback is unreachable — but this
+        // runs on the packet path, where a future regression that left it unset
+        // would panic the network task on every rate-limit check rather than
+        // mis-count one window.
+        let start = self.window_start.unwrap_or(now);
         let elapsed = now.saturating_duration_since(start).min(half);
         // Weight the previous half by how much of it still overlaps the
         // trailing `window` we are approximating.
@@ -210,25 +214,36 @@ impl DhtProtection {
         self.dropped_rate
     }
 
-    /// Returns true when the frame should be processed.
+    /// Both halves, in the order production runs them.
     ///
-    /// `sender_id` is the peer's verified node ID when one is already known
-    /// for this address; the STORE budget is keyed on it in preference to the
-    /// address.
-    /// `store_records` is how many records the frame carries — one for a
-    /// single `STORE_RECORD`, the batch count for a `STORE_BATCH`. The store
-    /// budget is charged per record because that is what the work scales
-    /// with: every record costs two Ed25519 verifications regardless of how
-    /// many share a datagram. Charging per frame let a batch packed with the
-    /// smallest legal records buy roughly twenty times the admitted work of a
-    /// well-behaved publisher.
-    pub fn allow_message(
+    /// Test-only: the packet path calls [`Self::allow_frame`] first and only
+    /// then does the work needed to describe the frame, so combining them
+    /// there would reinstate the table scan the split exists to move behind
+    /// the gate.
+    #[cfg(test)]
+    fn allow_message(
         &mut self,
         ip: IpAddr,
         msg_type: u8,
         sender_id: Option<[u8; 16]>,
         store_records: u32,
     ) -> bool {
+        self.allow_frame(ip) && self.allow_typed(ip, msg_type, sender_id, store_records)
+    }
+
+    /// The flat per-address frame gate on its own.
+    ///
+    /// Split out of [`Self::allow_message`] so a caller that has to do real
+    /// work to *describe* a frame can refuse an address already over its rate
+    /// before paying for it. Resolving the STORE budget's sender identity walks
+    /// the whole routing table, which put a full scan in front of the gate that
+    /// exists to make junk cheap to reject — so a peer holding one session
+    /// could buy a table scan per datagram right up to the cap, and then the
+    /// scan happened again for the frame the cap refused.
+    ///
+    /// Charges on success, so a caller must call this exactly once per frame
+    /// and pass only frames it admitted to [`Self::allow_typed`].
+    pub fn allow_frame(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
         self.maybe_trim(now);
 
@@ -246,6 +261,30 @@ impl DhtProtection {
             self.dropped_rate = self.dropped_rate.saturating_add(1);
             return false;
         }
+        true
+    }
+
+    /// The per-type budgets — STORE and lookup — for a frame that has already
+    /// passed [`Self::allow_frame`]. Returns true when it should be processed.
+    ///
+    /// `sender_id` is the peer's verified node ID when one is already known
+    /// for this address; the STORE budget is keyed on it in preference to the
+    /// address.
+    /// `store_records` is how many records the frame carries — one for a
+    /// single `STORE_RECORD`, the batch count for a `STORE_BATCH`. The store
+    /// budget is charged per record because that is what the work scales
+    /// with: every record costs two Ed25519 verifications regardless of how
+    /// many share a datagram. Charging per frame let a batch packed with the
+    /// smallest legal records buy roughly twenty times the admitted work of a
+    /// well-behaved publisher.
+    pub fn allow_typed(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+    ) -> bool {
+        let now = Instant::now();
 
         if matches!(
             msg_type,

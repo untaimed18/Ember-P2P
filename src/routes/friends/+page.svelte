@@ -29,12 +29,18 @@
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
+  import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
   let friends: FriendInfo[] = $state([]);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
+  /** Has `getFriends()` ever come back? An empty list only means "no friends
+   *  yet" once it has. Before that, an empty list is a load that failed or
+   *  hasn't landed, and pitching "add your first friend" at someone whose
+   *  friends simply didn't load tells them their list is gone. */
+  let friendsLoaded = $state(false);
   let successMsg: string | null = $state(null);
 
   let myHash = $state('');
@@ -48,6 +54,9 @@
 
   let confirmRemoveOpen = $state(false);
   let pendingRemove: FriendInfo | null = $state(null);
+  /** Display copy for the remove/withdraw dialog. Outlives `pendingRemove` so
+   *  the text stays put while the dialog animates out. */
+  let removeDialog: { name: string; mutual: boolean } = $state({ name: '', mutual: true });
 
   let confirmBlockOpen = $state(false);
   /** Either a friend or a stranger from the approval queue — blocking works
@@ -510,6 +519,7 @@
       const list = await getFriends();
       if (destroyed || seq !== loadFriendsSeq) return;
       friends = list;
+      friendsLoaded = true;
       retainChatTabs(list.map((f) => f.user_hash));
     } catch (e: unknown) {
       if (destroyed || seq !== loadFriendsSeq) return;
@@ -643,6 +653,13 @@
 
   function confirmRemoveFriend(f: FriendInfo) {
     pendingRemove = f;
+    // Held separately because `handleRemove` clears `pendingRemove` before the
+    // dialog finishes its outro, which would blank the name and flip the copy
+    // back to the established-friend wording mid-animation.
+    removeDialog = {
+      name: f.nickname || f.user_hash.slice(0, 8) + '\u2026',
+      mutual: f.mutual,
+    };
     confirmRemoveOpen = true;
   }
 
@@ -663,7 +680,12 @@
       // the user's friend list and silently fail to send.
       removeChatForFriend(f.user_hash);
       clearFileOffersForFriend(f.user_hash);
-      flash(m.friends_removed({ name: f.nickname || f.user_hash.slice(0, 8) + '\u2026' }));
+      const shown = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
+      flash(
+        f.mutual
+          ? m.friends_removed({ name: shown })
+          : m.friends_request_withdrawn({ name: shown }),
+      );
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
@@ -782,11 +804,16 @@
 
 </script>
 
+<!-- Someone who never accepted has no upload priority to lose and is not
+     really a friend being removed, so the established-friend wording would
+     describe a consequence that does not exist. -->
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
-  title={m.friends_confirm_remove_title()}
-  message={m.friends_confirm_remove_message({ name: pendingRemove ? (pendingRemove.nickname || pendingRemove.user_hash.slice(0, 8) + '\u2026') : '' })}
-  confirmLabel={m.common_remove()}
+  title={removeDialog.mutual ? m.friends_confirm_remove_title() : m.friends_confirm_withdraw_title()}
+  message={removeDialog.mutual
+    ? m.friends_confirm_remove_message({ name: removeDialog.name })
+    : m.friends_confirm_withdraw_message({ name: removeDialog.name })}
+  confirmLabel={removeDialog.mutual ? m.common_remove() : m.friends_withdraw_title()}
   danger={true}
   onconfirm={handleRemove}
 />
@@ -1005,6 +1032,11 @@
         <span class="requests-title">{m.friends_requests_title()}</span>
         <span class="requests-badge">{friendRequests.length}</span>
       </div>
+      <!-- The badges below are the most prominent thing on each card and read
+           as a verdict on the person. Say once, in the open, that they are a
+           statement about a signature — the distinction was only ever in a
+           tooltip nobody hovers. -->
+      <p class="requests-explainer">{m.friends_requests_verified_explainer()}</p>
       <div class="requests-list">
         {#each friendRequests as req (req.sender_hash)}
           <div
@@ -1129,7 +1161,9 @@
         <button onclick={handleAdd} disabled={!newHash.trim() || adding}>{adding ? m.friends_adding() : m.common_add()}</button>
       </div>
       {#if addError}
-        <div class="field-error">{addError}</div>
+        <!-- Announced: the field it belongs to is above it and keeps focus,
+             so a silent message is one a screen-reader user never hears. -->
+        <div class="field-error" role="alert">{addError}</div>
       {/if}
     </div>
   {/if}
@@ -1148,6 +1182,20 @@
     <div class="empty-state">
       <div class="spinner lg"></div>
       <p>{m.friends_loading()}</p>
+    </div>
+  {:else if friends.length === 0 && !friendsLoaded}
+    <!-- Nothing on screen and no successful load yet: it failed, or it is
+         still arriving. Either way this is not an empty friends list. -->
+    <div class="empty-state">
+      {#if error}
+        <p class="empty-title">{m.friends_load_failed()}</p>
+        <button class="empty-action" onclick={() => loadFriends()} disabled={loading}>
+          {loading ? m.common_loading() : m.common_retry()}
+        </button>
+      {:else}
+        <div class="spinner lg"></div>
+        <p>{m.friends_loading()}</p>
+      {/if}
     </div>
   {:else if friends.length === 0}
     <div class="empty-state">
@@ -1191,7 +1239,17 @@
             <circle cx="12" cy="8" r="4"/>
             <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
           </svg>
-          <span class="status-dot" class:dot-online={presence === 'online'} class:dot-offline={presence === 'offline'}></span>
+          <!-- Named rather than decorative: the status line below states
+               presence only when nothing higher-priority (searching, unread,
+               waiting-accept) has taken that slot, so on a busy card the dot
+               is the only place online/offline is said at all. -->
+          <span
+            class="status-dot"
+            class:dot-online={presence === 'online'}
+            class:dot-offline={presence === 'offline'}
+            role="img"
+            aria-label={presence === 'online' ? m.chat_online_label() : m.chat_offline_label()}
+          ></span>
         </div>
 
         <div class="card-identity">
@@ -1272,7 +1330,12 @@
                 <circle cx="12.5" cy="8" r="1.4"/>
               </svg>
             </summary>
-            <div class="card-more-menu" role="menu">
+            <div
+              class="card-more-menu"
+              role="menu"
+              tabindex="-1"
+              onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+            >
               <button
                 type="button"
                 role="menuitem"
@@ -1321,8 +1384,10 @@
                 role="menuitem"
                 class="menu-item-danger"
                 onclick={(e) => { closeCardMenu(e.currentTarget); confirmRemoveFriend(f); }}
-                aria-label={m.friends_remove_aria({ name: shortName })}
-              >{m.friends_remove_title()}</button>
+                aria-label={f.mutual
+                  ? m.friends_remove_aria({ name: shortName })
+                  : m.friends_withdraw_aria({ name: shortName })}
+              >{f.mutual ? m.friends_remove_title() : m.friends_withdraw_title()}</button>
               <button
                 type="button"
                 role="menuitem"
@@ -2188,6 +2253,87 @@
     }
   }
 
+  /*
+   * Narrow windows. Values match the shared `--bp-*` tokens in app.css
+   * (`@media` can't read custom properties, so they're written literally
+   * here the way every other page does it).
+   *
+   * The two horizontal bars are what break first: the ID card puts a
+   * 40-character hash next to a Copy button, and the controls bar puts a
+   * fixed 200px search box next to the online/total count. Both were still
+   * `justify-content: space-between` rows at any width, so the hash and the
+   * search field squeezed each other well before the sidebar collapsed.
+   */
+  @media (max-width: 980px) {
+    .my-id-card {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+    }
+
+    .my-id-copy {
+      justify-content: center;
+    }
+
+    .controls-bar {
+      flex-wrap: wrap;
+    }
+
+    .controls-right {
+      flex: 1;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .search-wrap {
+      flex: 1;
+      min-width: 160px;
+      width: auto;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .controls-bar,
+    .controls-left,
+    .controls-right {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .controls-right {
+      justify-content: stretch;
+    }
+
+    .search-wrap {
+      width: auto;
+    }
+
+    /* Name + status can take the full width; Chat and the overflow menu
+       drop underneath rather than crushing the nickname to a few glyphs. */
+    .friend-card {
+      flex-wrap: wrap;
+    }
+
+    .card-identity {
+      min-width: 0;
+      flex: 1 1 100%;
+      order: 1;
+    }
+
+    .card-avatar {
+      order: 0;
+    }
+
+    .card-controls {
+      order: 2;
+      margin-left: auto;
+    }
+
+    .add-form-inner input {
+      flex: 1 1 100%;
+    }
+  }
+
   /* --- Friend requests section --- */
   .requests-section {
     background: var(--bg-surface);
@@ -2211,6 +2357,13 @@
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-secondary);
+  }
+
+  .requests-explainer {
+    padding: 8px 16px 0;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.45;
   }
 
   .requests-badge {

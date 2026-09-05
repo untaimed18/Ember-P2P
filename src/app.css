@@ -15,6 +15,12 @@
   --accent-hover: #245f9a;
   --accent-dim: #d5e4f2;
   --accent-halo: #d5e4f2;
+  /* Wash used for selected rows, active chips, and checked filters.
+     Mixes the chromatic accent so it stays visible in both themes —
+     `--accent-dim` is an opaque navy in dark mode and disappears when
+     mixed with transparent the way light-mode selections do. */
+  --accent-fill: color-mix(in srgb, var(--accent) 16%, transparent);
+  --toggle-knob: #ffffff;
   --on-accent: #ffffff;
   --on-success: #ffffff;
   --on-warning: #1a1c24;
@@ -48,6 +54,7 @@
   --priority-low: #5599bb;
   --priority-auto: #7cb342;
   --stat-ratio: #9c27b0;
+  --ember-dht-color: #00838f;
 
   --border: #dadce0;
   --border-light: #c4c9d4;
@@ -112,6 +119,10 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+
+  /* Native <select> popups, number spinners, <audio>/<video> chrome,
+     and autofill follow the document theme instead of the OS. */
+  color-scheme: light;
 }
 
 /*
@@ -137,8 +148,10 @@
   /* Accent: desaturated sky-blue — legible, pro, not electric. */
   --accent: #6ea3dc;
   --accent-hover: #88b8ea;
-  --accent-dim: #1e3a5c;            /* muted navy for alt buttons / selection */
+  --accent-dim: #1e3a5c;            /* muted navy for alt buttons / avatars */
   --accent-halo: rgba(110, 163, 220, 0.26); /* translucent glow for focus rings */
+  --accent-fill: color-mix(in srgb, var(--accent) 22%, transparent);
+  --toggle-knob: #e8eaee;
   --on-accent: #10151b;
   --on-success: #10151b;
   --on-warning: #10151b;
@@ -167,6 +180,7 @@
   --priority-low: #7fb6d9;
   --priority-auto: #9ccc65;
   --stat-ratio: #c792d9;
+  --ember-dht-color: #4db6ac;
 
   /* Borders are barely there — 4–5% lighter than the bg they sit against. */
   --border: #2a3038;
@@ -183,6 +197,8 @@
 
   --bg-disabled: #1a1f25;
   --text-disabled: #565d68;
+
+  color-scheme: dark;
 }
 
 /*
@@ -418,6 +434,7 @@ input, select, textarea {
   font-size: inherit;
   background: var(--bg-input);
   color: var(--text-primary);
+  caret-color: var(--text-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
@@ -474,6 +491,20 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 
 input::placeholder {
   color: var(--text-muted);
+}
+
+/* Chromium/WebView2 paints autofill with a light-yellow sheet that
+   ignores `background` — punch a hole with an inset box-shadow so the
+   field stays on --bg-input in both themes. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-text-fill-color: var(--text-primary);
+  caret-color: var(--text-primary);
+  box-shadow: 0 0 0 1000px var(--bg-input) inset;
+  transition: background-color 99999s ease-out;
 }
 
 table {
@@ -695,6 +726,51 @@ tr:hover td {
 }
 
 /*
+ * Shared parts of an empty state: headline, supporting line, and the action
+ * that gets the user out of it. These were defined identically inside
+ * `friends` and `channels` and simply absent elsewhere — the Statistics load
+ * failure was styling its own message with an inline `color: var(--danger)`,
+ * which is how one page ended up with a red error and the rest with grey ones.
+ *
+ * Pages keep their scoped overrides (Library and KAD both want a tighter
+ * button). Those tie on specificity — Svelte's `.svelte-hash` makes a
+ * one-class rule count for two — and win on order, because a route's CSS
+ * chunk loads after the layout's. So these are defaults, not decrees.
+ */
+.empty-state .empty-title {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.empty-state .empty-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.empty-state .empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.empty-state .empty-action {
+  margin-top: 16px;
+  padding: 7px 20px;
+  font-size: 12px;
+}
+
+/* An action inside `.empty-actions` is already spaced by the row's margin. */
+.empty-state .empty-actions .empty-action {
+  margin-top: 0;
+}
+
+/*
  * Strip banners under page headers. Tinted fill + soft edge, matching
  * the badge/toast recipe, so errors don't read as a hard red rule.
  */
@@ -885,8 +961,12 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
  * reads as light-from-above and is what separates a flat dark UI from a
  * three-dimensional one.
  */
-[data-theme="dark"] :is(.confirm-overlay, .about-overlay) {
+[data-theme="dark"] :is(.confirm-overlay, .about-overlay, .share-overlay, .dnd-overlay) {
   background: var(--overlay-bg);
+  backdrop-filter: blur(6px) saturate(1.15);
+  -webkit-backdrop-filter: blur(6px) saturate(1.15);
+}
+[data-theme="dark"] .policy-reset-backdrop {
   backdrop-filter: blur(6px) saturate(1.15);
   -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }

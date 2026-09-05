@@ -219,7 +219,7 @@
     display: block;
     width: 100%;
     border-radius: calc(var(--radius-md) - 2px);
-    background: color-mix(in srgb, var(--bg-base, var(--bg-surface)) 70%, transparent);
+    background: color-mix(in srgb, var(--bg-primary) 70%, transparent);
   }
   .media-video {
     max-height: 220px;
@@ -232,7 +232,7 @@
   .media-error {
     margin: 0;
     font-size: 12px;
-    color: var(--danger, #c44);
+    color: var(--danger);
     line-height: 1.35;
   }
 </style>

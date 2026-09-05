@@ -1015,7 +1015,7 @@
       </div>
     </div>
 
-    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. On first launch Ember can seed a community <code>server.met</code> from emule-security.org; you connect to KAD and ED2K servers when you choose (or enable optional auto-connect in Settings).</p>
+    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup; ED2K servers are yours to choose, and on first launch Ember can seed a community <code>server.met</code> from emule-security.org.</p>
     <p>Ember also runs a network of its own. The <a href="#ember">Ember Network</a> is an encrypted overlay with no servers and no central directory: Ember nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. It is on by default and runs <em>alongside</em> KAD and eD2K, so you keep the whole eMule network as well.</p>
     <p>On top of that, <a href="#epx">EPX (Ember Peer Exchange)</a> speeds up source discovery between Ember peers on the ordinary eMule wire, and an Ember-exclusive <a href="#friends">Friends</a> system adds <strong>end-to-end encrypted</strong> chat, Noise-secured sessions, and privacy-preserving Friend Codes &mdash; all invisible to non-Ember clients.</p>
   </section>
@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.6.1</h3>
+      <h3>Get Ember 1.6.2</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1131,11 +1131,11 @@
       </li>
       <li>
         <strong>Setup Wizard</strong><br>
-        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; nickname, download folder, ports, speed limits, KAD auto-connect, and theme.</span>
+        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; nickname, download folder, ports, speed limits, and theme.</span>
       </li>
       <li>
         <strong>Connect</strong><br>
-        <span style="color: var(--text-secondary)">Press <strong>Connect</strong> on the KAD Network page and/or connect from the ED2K Servers page. Optionally enable Auto-Connect KAD and Auto-Connect Server in Settings (or the Setup Wizard) so Ember reconnects on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run. The <a href="#ember">Ember Network</a> needs no connect step &mdash; it is on by default and joins on its own, but it finds its first peers <em>through</em> KAD and eD2K, so keep at least one of them available on a fresh install.</span>
+        <span style="color: var(--text-secondary)">KAD connects on its own at every launch, so there is nothing to press; you can still disconnect for the current session from the KAD Network page. The <a href="#ember">Ember Network</a> needs no connect step either &mdash; it is on by default and finds its first peers <em>through</em> KAD. ED2K servers stay opt-in: connect from the ED2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run.</span>
       </li>
       <li>
         <strong>Share &amp; Download</strong><br>
@@ -1165,7 +1165,7 @@
     <h3>Networking</h3>
     <ul>
       <li><strong>Ember Network</strong> &mdash; Ember&rsquo;s own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. Always on, joins automatically, and runs alongside KAD and eD2K. See the <a href="#ember">Ember Network section</a>.</li>
-      <li><strong>KAD Network</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Optional Auto-Connect KAD in Settings; otherwise press Connect on the KAD Network page. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
+      <li><strong>KAD Network</strong> &mdash; The decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Bootstraps at startup with no setting to configure; the KAD Network page can disconnect it for the current session. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
       <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally Auto-Connect Server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
       <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
       <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
@@ -1216,10 +1216,10 @@
 
     <h3>User Experience</h3>
     <ul>
-      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, optional KAD auto-connect, and theme.</li>
+      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
       <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there.</li>
-      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, and Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages.</li>
+      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages, and Ctrl+, to open Settings.</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
       <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
@@ -1714,7 +1714,7 @@ npm run tauri build</code></pre>
         Is Ember compatible with regular eMule clients?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. Connect to KAD and/or an ED2K server from the app (or enable optional auto-connect in Settings). Ember&rsquo;s own additions &mdash; the <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> extension &mdash; only involve other Ember clients and are silently ignored by everything else.</div>
+      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup, and you can add an ED2K server from the app. Ember&rsquo;s own additions &mdash; the <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> extension &mdash; only involve other Ember clients and are silently ignored by everything else.</div>
     </div>
 
     <div class="faq-item">
@@ -1836,6 +1836,115 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.2" target="_blank" rel="noopener">Ember v1.6.2</a></h3>
+        <time class="release-date" datetime="2026-09-05">September 5, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.2" target="_blank" rel="noopener"><code>v1.6.2</code></a></p>
+      <div class="release-notes">
+        <p>Ember is what the app opens on now, and the networks it needs connect themselves. Two of the repairs matter more than the rest: a compromised interface could have read any file on your disk, and two downloads of one file could write to the same part file at once and corrupt it.</p>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Ember is the front door</h5>
+        <ul>
+          <li><strong>Ember opens on the Ember Network page.</strong> It used to open on a table of eMule DHT contacts &mdash; the second entry in its own sidebar &mdash; and the setup wizard never mentioned Ember at all. KAD has moved to its own page alongside the other networks, and old bookmarks still resolve</li>
+          <li><strong>KAD connects on launch, with no switch to forget.</strong> It defaulted to off, which left a fresh install disconnected from the network the rest of the app reads its peers from, while the setup wizard quietly answered the same question the other way. Connecting to an eD2K server stays opt-in, because that is one operator&rsquo;s machine seeing every request you make</li>
+          <li><strong>&ldquo;Can people reach me?&rdquo; is answerable without leaving the page you land on.</strong> External IP, firewall verdict, port state, port mapping, STUN and buddy now appear on both the Ember and KAD pages</li>
+        </ul>
+
+        <h5>Friends</h5>
+        <ul>
+          <li><strong>Accepting a friend request now finishes the friendship.</strong> Adding somebody is the approval, but their accept came back to you as a fresh request to approve a second time. The setting behind that is gone; requests from people you have not added still queue</li>
+          <li><strong>You are told when somebody accepts.</strong> The reply you were waiting for used to arrive with no sign at all</li>
+          <li><strong>Cancelling a friend request takes it off their screen.</strong> Cancelling was purely local, so the other person kept a prompt you could no longer answer, describing an upload priority that somebody who never accepted never had. If they are offline when you cancel, it is retried for up to seven days</li>
+          <li><strong>1:1 chat shows when a friend is typing, and whether they have read you.</strong> Receipts are on by default and the switch is symmetric &mdash; turning them off means you neither tell friends you have read theirs nor see when they have read yours</li>
+          <li><strong>Every friend is checked when Ember comes up,</strong> rather than the first three, so the list opens with real online state instead of filling itself in over the following twenty minutes</li>
+        </ul>
+
+        <h5>Channels</h5>
+        <ul>
+          <li><strong>Rooms have a live presence signal.</strong> Presence was inferred entirely from DHT polling, so somebody sitting quietly in a room showed offline, somebody arriving took up to five minutes to appear, and somebody who had left held a green dot for twenty. Talking masked it, which is why it was the quiet members who went dark</li>
+          <li><strong>The room list stays up when you walk into a room,</strong> and if you close it, it stays closed &mdash; including next time you open the app</li>
+        </ul>
+
+        <h5>The Ember Network page</h5>
+        <ul>
+          <li><strong>Seven counters that say why a routing table is not growing.</strong> A node stuck at three contacts looked identical whether its announcements were going unanswered, its peers had nobody to introduce, its IP filter was refusing what arrived, or the addresses it learned never answered &mdash; four faults with four different fixes and nothing to tell them apart</li>
+          <li><strong>The contact count is split into the three things it was quietly adding together,</strong> and now says when a peer can never become a contact at all. Only one of the three is ever liveness-checked, so the single headline number reported a healthier overlay than the one you had</li>
+          <li><strong>A cold node can join through a friend it is already talking to.</strong> A friend is the strongest signal the app has that somebody real is out there, but the only route from a friend to a DHT contact ran around the session rather than through it, so a friend reached over a relayed or NAT-traversed connection was never even attempted</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>Dark mode reaches the parts that were still light</strong> &mdash; window chrome, scrollbars, selected rows that vanished into the background, and white glyphs sitting on pale fills &mdash; and the window no longer flashes light before the first paint</li>
+          <li><strong>The network dots in the status bar go somewhere.</strong> A red dot is the app&rsquo;s commonest sign that something is wrong, and it was a dead end: the detail was tooltip-only, and you had to already know which of the three networks owned the problem before you could act on it</li>
+          <li><strong>An empty friends list is distinguishable from a list that failed to load,</strong> and silenced or removed rooms can be restored one at a time, rather than by a single Clear that wiped preferences you had built up a room at a time</li>
+          <li><strong>The keyboard shortcut sheet matches the shortcuts.</strong> It numbered them against the full sidebar while the app counted only the visible entries, so on a profile with the Ember overlay off it named the wrong page for everything below Channels. Settings was the only click-only page and takes <code>Ctrl/Cmd+,</code></li>
+          <li><strong>Screen readers get names for the things that only had a colour.</strong> Presence dots, progress bars, and Library&rsquo;s star rating, which announced &ldquo;black star&rdquo; and &ldquo;white star&rdquo; and never said what it was set to. &ldquo;Copied to clipboard&rdquo; no longer interrupts mid-sentence</li>
+        </ul>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.6.2, 1.6.1 and 1.6.0 all see each other on the overlay normally. This is a compatible update; anything older than 1.6.0 is still invisible to all three</li>
+          <li><strong>Typing indicators, read receipts and request cancellations only reach friends who are also on 1.6.2.</strong> Older builds ignore them rather than mishandling them, so nothing breaks in a mixed pair &mdash; you simply get no typing signal, no receipt, and a cancelled request stays on their screen until they update</li>
+          <li><strong>The friend approval setting is gone, and its toggle with it.</strong> It only ever gated the accept coming back from somebody you had added yourself, and it defaulted to on, which is what turned that accept into a second request. Requests from people you have not added always queue for approval</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Security and your data</h5>
+        <ul>
+          <li><strong>A compromised interface could have read any file on your disk.</strong> Offering a file to a room took a path from the interface layer and hashed and sent whatever it named, with no check that it sat inside a folder you had shared. Choosing a file is the permission, so the picker now runs in the core, where the rest of the app&rsquo;s file dialogs already were</li>
+          <li><strong>Two downloads of one file could write to the same part file at once.</strong> Restarting a download aborted the previous worker, but aborting does not close the file &mdash; the writer keeps the handle until it has drained and flushed, and six of the eight restart paths never waited for it. Two writers on one part file interleave, and the damage surfaced much later as a failed hash check and a full re-download</li>
+          <li><strong>A bootstrap list fetched from a URL could choose which peers this node trusts.</strong> Contacts from a downloaded file were taken as already verified and went straight into lookups and publishing without ever having answered us, which is the exact case the bootstrap path exists to prevent. They are unproven seeds now, promoted the ordinary way once they reply</li>
+          <li><strong>Disconnect said &ldquo;all activity stopped&rdquo; while it had not.</strong> The Ember overlay has no off switch by design and kept publishing, kept dialling friends, kept sending global searches to the server list, and could restart a download you had just stopped. It also reported friends as offline while chat and file offers went on working against them</li>
+          <li><strong>A finished download could be recorded as complete at 95%.</strong> Completion wrote its progress, status and history as four separate steps, and a periodic progress write queued beforehand could land after all of them &mdash; by which point the file that would have repaired the row was already deleted</li>
+          <li><strong>A relayed callback is refused for a file nobody asked this node to carry,</strong> and the long-lived keys behind Ember&rsquo;s encrypted connections are wiped from memory rather than left there until the process exits</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>A failed hash check repairs the part that failed instead of re-downloading the file.</strong> A part whose hash has just failed still has every byte on disk, so the file read as byte-complete for the whole of the round trip that would have narrowed the fault down, and the download aborted its own repair &mdash; turning a ~180 KiB re-fetch into a failed whole-file verification</li>
+          <li><strong>Preview stops copying the whole file.</strong> On a nearly finished download, the run of verified data it copied out was the entire thing</li>
+          <li><strong>A room transfer no longer freezes the app as it completes.</strong> The receiving side hashed the finished file on the same task that reads every datagram and runs every timer, so up to 100 MB of hashing on a cold disk cost traffic with peers that had nothing to do with it</li>
+          <li><strong>A room transfer that finishes as you quit is not reported to the sender as a failure.</strong> The file arrived intact, but the frame saying so was dropped during shutdown, and the sender has no other way to find out &mdash; so its own timer eventually called a completed transfer failed</li>
+        </ul>
+
+        <h5>The Ember network</h5>
+        <ul>
+          <li><strong>A connection to a peer that has restarted is no longer treated as live.</strong> Sessions aged from our last send rather than from the last thing we actually heard, so a peer that restarted or forgot its half stayed &ldquo;connected&rdquo; for as long as we kept talking at it</li>
+          <li><strong>One missed ping stops costing somebody else their neighbour.</strong> Dropping a silent contact tore down every session on that address, so two peers behind one NAT could lose a working link because of a third</li>
+          <li><strong>Peers behind a busy shared address stop getting stuck half-connected.</strong> When a per-address limit shed a session, the handshake answered anyway: the far side believed the link was up, everything it sent arrived here to no session, and it had no reason to handshake again something it thought was working</li>
+          <li><strong>A node that had a full overlay and then lost it recovers without a restart.</strong> Suspend, a new network, or a wave of evictions left it enforcing full-network limits against bootstrap-sized numbers for the life of the process</li>
+          <li><strong>A truncated contacts file stops making the loss permanent.</strong> Every launch that recovered fewer contacts than the one before wrote the smaller set back over the file</li>
+          <li><strong>Your own searches stop being refused in silence.</strong> Background work &mdash; room presence, source lookups, table refresh &mdash; could hold every search slot, and a keyword search you typed was turned away with nothing said. Background searches yield now, and a slot is released when its search finishes rather than held to the end</li>
+          <li><strong>A node trying to join retries in a minute rather than five.</strong> The slow back-off is right for a healthy node deciding what to keep spending on an address that will not answer, but below a working table those addresses are not one candidate among many, they are the whole join</li>
+        </ul>
+
+        <h5>Friends and rooms</h5>
+        <ul>
+          <li><strong>A read receipt no longer marks the wrong message.</strong> Receipts name a line by a hash of its text, and short replies repeat &mdash; &ldquo;ok&rdquo; sent twice resolved to the copy still waiting to go out, and flagged it and everything before it as read</li>
+          <li><strong>A cancelled friend request is not lost if the other person was offline.</strong> The cancellation cleared itself from the retry queue on a local write the far side may never have read</li>
+          <li><strong>The typing indicator stops vanishing on a stale online flag,</strong> and delivery status sits under the message rather than inside it</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>The app stops stalling on its own database.</strong> Every authenticated room datagram wrote a row of its own, bulk clear and cancel ran a transaction per row with no limit of their own, and compacting the database held the single connection the network loop also waits on</li>
+          <li><strong>A single forwarded port is no longer reported as a misconfiguration.</strong> Setting the TCP and UDP ports to one number is what a VPN forwarding one port requires, and what the setup wizard tells you to do &mdash; and the log then advised you to undo it</li>
+          <li><strong>Staying reachable between packets no longer lapses for two minutes at a time.</strong> The keep-alive that holds your public port open reused the same connection details every twenty seconds, against the two-minute cooling-off period Windows puts on a closed connection, so it locked itself out of its own targets</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.6.1...v1.6.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.6.1...v1.6.2</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-1">
       <div class="release-header">

@@ -15,7 +15,9 @@ use super::messages::*;
 use super::secure_stream;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
-use crate::network::ember::crypto::{decrypt_chat_payload, MAX_CHAT_WIRE_LEN};
+use crate::network::ember::crypto::{
+    decrypt_chat_payload, decrypt_chat_read, decrypt_chat_typing, MAX_CHAT_WIRE_LEN,
+};
 
 /// True when `existing` is safe to reuse as the canonical outbound router for
 /// a newly authenticated dial to the same friend identity.
@@ -27,6 +29,15 @@ fn reusable_secure_friend_session(existing: &EmberSessionHandle, peer_pk: &[u8; 
 pub struct FriendSessionHandle {
     pub session_id: u64,
 }
+
+/// Bounds on the withdrawal courier. Shorter than a friend dial's 15s: nothing
+/// waits on the result, an unreachable peer is retried on the next sweep, and
+/// these attempts run in bursts when several requests are cancelled at once.
+const RETRACTION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const RETRACTION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the courier holds the socket open after its last frame, waiting for
+/// the peer to hang up first. See the tail of [`send_friend_request_retraction`].
+const RETRACTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Establishes a persistent outbound friend session. Performs the full
 /// Hello/EmuleInfo handshake, sends a friend request, then runs a
@@ -59,6 +70,7 @@ pub async fn open_and_run_friend_session(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -83,12 +95,164 @@ pub async fn open_and_run_friend_session(
         udp_port,
         obfuscate,
         ember_sessions,
+        user_offline,
         ul_event_tx,
         friend_hashes,
         ed25519_pubkey,
         ed25519_secret_key,
     )
     .await
+}
+
+/// Tell `expected_ember_hash` that a friend request we sent is withdrawn, over
+/// a connection that exists for nothing else.
+///
+/// Deliberately not a friend session. By the time this runs the peer has been
+/// removed, so [`open_and_run_friend_session`] would refuse the dial on the
+/// membership guard below — and loosening that guard to let a withdrawal
+/// through would open the friend-session path to non-friends for the sake of a
+/// single packet. Instead this completes the same Noise IK handshake, writes one
+/// packet and waits for the peer to hang up: no `ember_sessions` entry, no read
+/// loop, no keepalive, so the peer is granted nothing by having answered.
+///
+/// The handshake is still what makes it safe in the other direction: the
+/// recipient only acts on a withdrawal whose sender proved possession of the
+/// identity that sent the request.
+///
+/// The eD2K greeting is not optional padding. A listener drops the connection
+/// outright if the first inner frame is anything other than `OP_HELLO`, so the
+/// withdrawal has to follow the same greeting every other dial sends — and the
+/// `OP_HELLOANSWER` is read before writing it, because that answer is the proof
+/// the peer accepted the greeting and is now dispatching frames.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_friend_request_retraction(
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let our_pk =
+        ed25519_pubkey.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+    let our_sk =
+        ed25519_secret_key.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+
+    let stream = tokio::time::timeout(RETRACTION_DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
+    super::multi_source::tune_peer_stream(&stream);
+    let (raw_r, raw_w) = stream.into_split();
+
+    // `initiate` refuses any peer whose authenticated static key does not match
+    // `expected_ember_hash`, so a stale address cannot make us announce a
+    // withdrawal to whoever happens to answer on it now.
+    let secure = tokio::time::timeout(
+        RETRACTION_HANDSHAKE_TIMEOUT,
+        secure_stream::initiate(
+            Box::new(raw_r),
+            Box::new(raw_w),
+            our_ember_hash,
+            expected_ember_hash,
+            our_pk,
+            our_sk,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("secure handshake timeout"))??;
+
+    let mut reader = tokio::io::BufReader::new(secure.reader);
+    let mut writer = tokio::io::BufWriter::new(secure.writer);
+
+    let hello_options = HelloOptions {
+        udp_port,
+        kad_port: udp_port,
+        supports_crypt_layer: obfuscate,
+        requests_crypt_layer: obfuscate,
+        requires_crypt_layer: false,
+        supports_direct_udp_callback:
+            crate::network::kad::firewall::advertised_direct_udp_callback(),
+        supports_captcha: false,
+        server_ip: 0,
+        server_port: 0,
+        kad_version: 0x09,
+    };
+    let hello_payload = build_hello_with_buddy_opts(
+        &our_user_hash,
+        our_client_id,
+        tcp_port,
+        &our_nickname,
+        None,
+        &hello_options,
+    );
+    write_packet(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload)
+        .await
+        .context("failed to greet the peer we are withdrawing from")?;
+
+    let (proto, opcode, _) = read_packet_with_timeout(&mut reader, 10)
+        .await
+        .context("waiting for HelloAnswer before withdrawing")?;
+    if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
+        anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+    }
+
+    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), None);
+    write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload)
+        .await
+        .context("failed to complete the eMule greeting")?;
+
+    write_packet(
+        &mut writer,
+        OP_EMULEPROT,
+        OP_EMBER_EXT,
+        &build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]),
+    )
+    .await
+    .context("failed to send friend-request withdrawal")?;
+
+    // This connection has said everything it was opened to say, but it is the
+    // peer that has to hang up first. TCP delivers in order, so the peer
+    // reaching end-of-stream means it has consumed everything ahead of it, the
+    // withdrawal included. Closing from this side was a race: the peer's own
+    // EmuleInfoAnswer, which this courier never reads, would land on our closed
+    // socket and be answered with a RST — and a RST makes the peer's kernel
+    // discard whatever it had received but not yet handed to the application.
+    // The withdrawal was the last frame we sent, so it was the one most likely
+    // to still be sitting there, and `Ok` here clears the retry queue, so a
+    // withdrawal lost that way was lost for good.
+    let _ = writer.shutdown().await;
+    match tokio::time::timeout(
+        RETRACTION_DRAIN_TIMEOUT,
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        // A reset before end-of-stream is the peer closing with our frames
+        // still unread, which is exactly the loss this waits to rule out.
+        // Leave the row queued so the next sweep tries again.
+        Ok(Err(e)) => {
+            anyhow::bail!("peer dropped the connection before reading the withdrawal: {e}")
+        }
+        // The peer answered the greeting, so it is reading; seconds of silence
+        // after our FIN means it consumed the frames ahead of it long ago and
+        // is merely slow to hang up. Failing here would re-dial a peer that
+        // has already acted on the withdrawal.
+        Err(_) => {
+            debug!("Peer at {addr} did not close after the withdrawal; treating it as delivered")
+        }
+    }
+    info!(
+        "Withdrew friend request at {} ({})",
+        addr,
+        crate::security::short_hash(&expected_ember_hash)
+    );
+    Ok(())
 }
 
 /// Like [`open_and_run_friend_session`] but drives the full Ember
@@ -116,6 +280,7 @@ pub async fn run_friend_session_over_transport(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -241,6 +406,24 @@ pub async fn run_friend_session_over_transport(
         EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
     {
         let mut sessions = ember_sessions.write().await;
+        // The user may have gone offline while this dial was in flight.
+        // `KadDisconnect` closes and clears every session and reports every
+        // friend offline, so inserting here afterwards would put a live one
+        // back into a map the UI has already emptied: chat would send
+        // successfully to a friend shown as offline, and `FindFriendAndConnect`
+        // would then skip the reconnect because a fresh session exists. Read
+        // under the same lock as the insert, so a disconnect cannot land
+        // between the check and the claim.
+        if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
+            ember_session_handle.close();
+            drop(sessions);
+            drop(reader);
+            drop(writer);
+            anyhow::bail!(
+                "went offline while dialling {}",
+                crate::security::short_hash(&peer_ember_hash)
+            );
+        }
         match sessions.get(&peer_ember_hash) {
             Some(existing) if reusable_secure_friend_session(existing, &peer_pk) => {
                 info!(
@@ -500,16 +683,16 @@ pub async fn run_friend_session_over_transport(
                                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                                     let nick =
                                         crate::security::normalize_inbound_friend_nickname(&payload);
-                                    // `verified` is the session-scoped
-                                    // `ember_hash_binding_verified`
-                                    // flag set during session setup.
-                                    // For Ember-to-Ember sessions
-                                    // this folds in the result of
-                                    // `perform_ember_auth` (a real
-                                    // Ed25519 proof of possession);
-                                    // for peers that didn't advertise
-                                    // a pubkey it falls back to the
-                                    // offline BLAKE3 binding check.
+                                    // Always true on this path, and a real
+                                    // proof of possession rather than the
+                                    // replayable binding check: the session
+                                    // exists only because `secure_stream::
+                                    // initiate` authenticated the responder's
+                                    // Noise IK static key against the key
+                                    // bound to `expected_ember_hash`. The
+                                    // recipient promotes an already-added
+                                    // friend to mutual on this flag, so it
+                                    // must not weaken to binding-only.
                                     debug!(
                                         "Received friend request on outbound friend session from {} (nickname_chars={}, verified={ember_hash_binding_verified})",
                                         addr,
@@ -614,6 +797,84 @@ pub async fn run_friend_session_over_transport(
                                                     kind: UploadEventKind::EmberRelayOffer {
                                                         ember_hash: peer_ember_hash,
                                                         attestations,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
+                                        Some((super::messages::EMBER_EXT_FRIEND_RETRACT, _)) => {
+                                            // They are taking back a request we
+                                            // have not answered. The session
+                                            // itself is the proof of possession
+                                            // this needs, and the handler only
+                                            // ever clears a queued request.
+                                            debug!(
+                                                "Friend {} withdrew its friend request",
+                                                crate::security::short_hash(&peer_ember_hash)
+                                            );
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendRetract {
+                                                    ember_hash: peer_ember_hash,
+                                                },
+                                            }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_CHAT_TYPING, body)) => {
+                                            if let Some(typing) = decrypt_chat_typing(
+                                                &session_our_ed25519_secret,
+                                                &session_peer_ember_pubkey,
+                                                body,
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberChatTyping {
+                                                        ember_hash: peer_ember_hash,
+                                                        typing,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
+                                        Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
+                                            if let Some(body_hash) = decrypt_chat_read(
+                                                &session_our_ed25519_secret,
+                                                &session_peer_ember_pubkey,
+                                                body,
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberChatRead {
+                                                        ember_hash: peer_ember_hash,
+                                                        body_hash,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
+                                        Some((super::messages::EMBER_EXT_DHT_CONTACT_REQ, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberDhtContactRequest {
+                                                    ember_hash: peer_ember_hash,
+                                                    target: body.try_into().ok(),
+                                                    reply_tx: session_ember_session_handle.tx.clone(),
+                                                },
+                                            }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_DHT_CONTACTS, body)) => {
+                                            // Refused by length before it is
+                                            // carried any further: no contact
+                                            // list can be this large, whatever
+                                            // it would decode to.
+                                            if body.len() > crate::network::ember::dht::messages::MAX_CONTACT_LIST_BYTES {
+                                                debug!(
+                                                    "Friend {} sent an oversized Ember contact list ({} bytes)",
+                                                    crate::security::short_hash(&peer_ember_hash),
+                                                    body.len()
+                                                );
+                                            } else {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberDhtContacts {
+                                                        ember_hash: peer_ember_hash,
+                                                        contacts: body.to_vec(),
                                                     },
                                                 }).await;
                                             }
@@ -785,6 +1046,7 @@ pub async fn connect_friend_with_fallback(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -803,6 +1065,7 @@ pub async fn connect_friend_with_fallback(
         udp_port,
         obfuscate,
         ember_sessions.clone(),
+        user_offline.clone(),
         ul_event_tx.clone(),
         friend_hashes.clone(),
         ed25519_pubkey,
@@ -815,6 +1078,13 @@ pub async fn connect_friend_with_fallback(
     };
 
     if rendezvous_url.is_empty() {
+        return Err(tcp_err);
+    }
+
+    // The insert site refuses an offline dial on its own, but the NAT
+    // fallback below is a punch registration plus a relay ticket — minutes of
+    // rendezvous round-trips whose only possible outcome is that same refusal.
+    if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(tcp_err);
     }
     info!(
@@ -879,6 +1149,7 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
+                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -905,6 +1176,7 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
+                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -2091,6 +2363,7 @@ mod tests {
                 4672,
                 false,
                 ember_sessions,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ul_tx,
                 friend_hashes,
                 None,
@@ -2306,6 +2579,169 @@ mod tests {
         }
     }
 
+    /// A listener drops the connection when the first inner frame is not
+    /// `OP_HELLO`, so a withdrawal that skipped the eD2K greeting was accepted
+    /// by the socket and silently discarded — the recipient kept the request on
+    /// screen and nothing reported a failure. This pins the whole sequence, and
+    /// asserts the withdrawal is an empty-bodied `OP_EMBER_EXT` sub-type rather
+    /// than a second friend request.
+    #[tokio::test]
+    async fn withdrawal_greets_the_peer_before_announcing_itself() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        // A real socket: the courier dials for itself, so there is no transport
+        // to inject.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut server_r, server_w) = tokio::io::split(stream);
+            let first = server_r.read_u8().await.expect("discriminator");
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .expect("secure accept");
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.expect("greeting");
+            assert_eq!(
+                (proto, opcode),
+                (OP_EDONKEYHEADER, OP_HELLO),
+                "a listener refuses anything but Hello first"
+            );
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .expect("hello answer");
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.expect("emule info");
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+
+            let (proto, opcode, payload) =
+                read_packet_inner(&mut server_r).await.expect("withdrawal");
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_EXT));
+            assert_eq!(
+                parse_ember_ext(&payload),
+                Some((EMBER_EXT_FRIEND_RETRACT, &[][..])),
+                "the withdrawal carries its sub-type and nothing else"
+            );
+        });
+
+        send_friend_request_retraction(
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        )
+        .await
+        .expect("withdrawal must reach a well-behaved peer");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+            .await
+            .expect("mock peer must not hang")
+            .expect("mock peer must not panic");
+    }
+
+    /// A stale address may now answer for somebody else. Announcing a
+    /// withdrawal to whoever picks up would tell an unrelated peer about a
+    /// friend request they were never part of.
+    #[tokio::test]
+    async fn withdrawal_refuses_a_peer_with_the_wrong_identity() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let squatter_sk = SigningKey::generate(&mut OsRng);
+        let squatter_pk_bytes = squatter_sk.verifying_key().to_bytes();
+        let squatter_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&squatter_sk.verifying_key());
+        let intended_hash = [0x5A; 16];
+        assert_ne!(squatter_ember_hash, intended_hash);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut server_r, server_w) = tokio::io::split(stream);
+            let first = server_r.read_u8().await.expect("discriminator");
+            // Whether this completes does not matter: the dialer must refuse
+            // the identity either way.
+            let _ = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                squatter_ember_hash,
+                squatter_pk_bytes,
+                squatter_sk.to_bytes(),
+            )
+            .await;
+        });
+
+        let result = send_friend_request_retraction(
+            addr,
+            intended_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a withdrawal must not be announced to an identity we did not ask for"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer).await;
+    }
+
     /// Regression guard for the "online_friends not updated on successful
     /// outbound rendezvous connect" gap: drives a full mock peer through
     /// the real Hello / EmuleInfo / OP_EMBER_HELLO / Ed25519 PoP handshake
@@ -2355,6 +2791,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -2499,6 +2936,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -2580,6 +3018,125 @@ mod tests {
         );
     }
 
+    /// A dial that was already in flight when the user hit Disconnect must not
+    /// hand back a live session afterwards. `KadDisconnect` closes and clears
+    /// every entry and reports every friend offline, so a late insert would
+    /// leave chat working against a friend the UI shows as offline — and would
+    /// block the reconnect, because `FindFriendAndConnect` skips a peer that
+    /// still has a fresh session.
+    #[tokio::test]
+    async fn a_dial_that_completes_after_going_offline_claims_no_session() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (mut server_r, server_w) = tokio::io::split(server);
+
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (ul_tx, _ul_rx) = tokio::sync::mpsc::channel(16);
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
+            peer_ember_hash,
+        ])));
+        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+
+        // Already offline by the time the handshake completes — the same state
+        // the dial would observe had Disconnect landed mid-flight.
+        let user_offline = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let session_task = tokio::spawn(run_friend_session_over_transport(
+            Box::new(client_r),
+            Box::new(client_w),
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            ember_sessions.clone(),
+            user_offline,
+            ul_tx,
+            friend_hashes,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        ));
+
+        // The peer plays the handshake through to the point where the dial
+        // would claim its slot, so the refusal is proven to happen at the
+        // claim and not earlier by accident.
+        let mock_peer = async {
+            let first = server_r.read_u8().await.unwrap();
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+            let info_answer = build_emule_info(4672, false, None, None);
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMULEINFOANSWER,
+                &info_answer,
+            )
+            .await
+            .unwrap();
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
+            .await
+            .expect("session task must not hang")
+            .expect("session task must not panic");
+        assert!(
+            result.is_err(),
+            "a dial completing while offline must not report a live session"
+        );
+        assert!(
+            ember_sessions.read().await.is_empty(),
+            "an offline dial must leave the session map as Disconnect left it"
+        );
+    }
+
     #[test]
     fn reusable_secure_session_requires_fresh_secure_matching_pubkey() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -2648,6 +3205,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),

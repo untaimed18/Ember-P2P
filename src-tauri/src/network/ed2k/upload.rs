@@ -1545,6 +1545,12 @@ pub enum UploadEventKind {
         peer_port: u16,
         verified: bool,
     },
+    /// The peer is withdrawing a friend request it sent us and we have not
+    /// answered. Only ever clears a queued request — never a friendship — so an
+    /// accept that beat it to the punch simply makes this a no-op.
+    EmberFriendRetract {
+        ember_hash: [u8; 16],
+    },
     /// An Ember friend was seen on an incoming connection (EmuleInfo exchange completed).
     FriendSeen {
         ember_hash: [u8; 16],
@@ -1555,6 +1561,16 @@ pub enum UploadEventKind {
     EmberChatMessage {
         ember_hash: [u8; 16],
         message: String,
+    },
+    /// Friend is composing (or just stopped) in our 1:1 chat. Live only.
+    EmberChatTyping {
+        ember_hash: [u8; 16],
+        typing: bool,
+    },
+    /// Friend has read our chat up through the message with this body hash.
+    EmberChatRead {
+        ember_hash: [u8; 16],
+        body_hash: [u8; 16],
     },
     /// Incoming Ember browse request from a friend.
     EmberBrowseRequest {
@@ -1617,6 +1633,27 @@ pub enum UploadEventKind {
     EmberRelayOffer {
         ember_hash: [u8; 16],
         attestations: Vec<crate::network::ember::RelayAttestation>,
+    },
+    /// A friend is asking for our Ember DHT contacts, so it can join the
+    /// overlay through a session that already works rather than through a
+    /// bridge `PING` its address may never allow. `target` is the asker's own
+    /// node ID when it sent one, which only decides *which* of our contacts
+    /// are closest and is therefore safe to take on its word.
+    EmberDhtContactRequest {
+        ember_hash: [u8; 16],
+        target: Option<[u8; 16]>,
+        /// The friend session this arrived on, so the answer goes back down the
+        /// same socket rather than to whatever holds that hash's slot by the
+        /// time the network loop gets here.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    /// A friend answered with its contacts. Carried as the raw wire list and
+    /// decoded in the network loop, which owns the routing table that has to
+    /// judge them — they are unverified leads, exactly like DHT gossip, and go
+    /// through the same admission and probe path.
+    EmberDhtContacts {
+        ember_hash: [u8; 16],
+        contacts: Vec<u8>,
     },
     /// A friend is offering to send us a file. Surfaced to the UI for an
     /// explicit accept — we never start a download because a peer asked us to.
@@ -10215,6 +10252,35 @@ impl UploadHandler {
                     }
                 }
 
+                // Withdrawal of a request we have not answered. Deliberately
+                // ahead of the general `OP_EMBER_EXT` arm below, which requires
+                // friend privileges: the sender of a *pending* request is by
+                // definition someone we have not added, so that arm would never
+                // fire for them.
+                //
+                // Gated on proof of possession alone, exactly as the friend
+                // request itself is. Binding would not be enough here: a peer
+                // that replayed a public (pubkey, ember_hash) pair could
+                // suppress requests it never sent.
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if secure_v2_authenticated
+                        && matches!(
+                            super::messages::parse_ember_ext(&payload),
+                            Some((super::messages::EMBER_EXT_FRIEND_RETRACT, _))
+                        ) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        debug!("Peer {peer_addr} withdrew its friend request ({})", hex::encode(eh));
+                        let _ = self
+                            .upload_event_tx
+                            .send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberFriendRetract { ember_hash: eh },
+                            })
+                            .await;
+                    }
+                }
+
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
                     if hello_caps.is_ember || secure_v2_authenticated =>
                 {
@@ -10634,6 +10700,95 @@ impl UploadHandler {
                                             kind: UploadEventKind::EmberRelayOffer {
                                                 ember_hash: eh,
                                                 attestations,
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_TYPING, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(typing) =
+                                        crate::network::ember::crypto::decrypt_chat_typing(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatTyping {
+                                                    ember_hash: eh,
+                                                    typing,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(body_hash) =
+                                        crate::network::ember::crypto::decrypt_chat_read(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatRead {
+                                                    ember_hash: eh,
+                                                    body_hash,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some((
+                                super::messages::EMBER_EXT_DHT_CONTACT_REQ,
+                                body,
+                            )) => {
+                                if let Some(reply_tx) =
+                                    ember_session_handle.as_ref().map(|h| h.tx.clone())
+                                {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtContactRequest {
+                                                ember_hash: eh,
+                                                target: body.try_into().ok(),
+                                                reply_tx,
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_DHT_CONTACTS, body)) => {
+                                // Refused by length before it is carried any
+                                // further: no contact list can be this large,
+                                // whatever it would decode to.
+                                if body.len()
+                                    > crate::network::ember::dht::messages::MAX_CONTACT_LIST_BYTES
+                                {
+                                    debug!(
+                                        "Friend {} sent an oversized Ember contact list ({} bytes)",
+                                        hex::encode(eh),
+                                        body.len()
+                                    );
+                                } else {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtContacts {
+                                                ember_hash: eh,
+                                                contacts: body.to_vec(),
                                             },
                                         })
                                         .await;

@@ -2603,7 +2603,7 @@
     historyEnabled={$appSettings?.save_search_history ?? true}
     maxLength={MAX_SEARCH_QUERY_LEN}
   />
-  <select class="type-select" bind:value={searchMethod} title={m.search_method_title()}>
+  <select class="type-select" bind:value={searchMethod} title={m.search_method_title()} aria-label={m.search_method_title()}>
     <option value="global">{m.search_method_global()}</option>
     <option value="kad">{m.search_method_kad_only()}</option>
     <option value="server">{m.search_method_server_only()}</option>
@@ -2611,7 +2611,7 @@
       <option value="ember">{m.search_method_ember_only()}</option>
     {/if}
   </select>
-  <select class="type-select" bind:value={searchFileType} title={m.search_filter_by_filetype()}>
+  <select class="type-select" bind:value={searchFileType} title={m.search_filter_by_filetype()} aria-label={m.search_filter_by_filetype()}>
     {#each FILE_TYPES as ft}
       <option value={ft.value}>{ft.label}</option>
     {/each}
@@ -2741,7 +2741,7 @@
     </button>
 
     {#if hasActiveFilters}
-      <button class="ghost clear-filters" onclick={clearFilters}>{m.library_clear_filters()}</button>
+      <button class="ghost clear-filters" onclick={clearFilters}>{m.common_clear_filters()}</button>
     {/if}
   </div>
 
@@ -2807,7 +2807,9 @@
             placeholder="—"
             bind:value={filterMinSize}
           />
-          <select bind:value={filterMinUnit}>
+          <!-- The visible label belongs to the number input beside it, so the
+               unit picker had no accessible name of its own. -->
+          <select bind:value={filterMinUnit} aria-label={m.search_min_size()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -2826,7 +2828,7 @@
             placeholder="—"
             bind:value={filterMaxSize}
           />
-          <select bind:value={filterMaxUnit}>
+          <select bind:value={filterMaxUnit} aria-label={m.search_max_size()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -3260,7 +3262,7 @@
     {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
         <p>{m.search_no_results_filters()}</p>
-        <button class="ghost" onclick={clearFilters}>{m.library_clear_filters()}</button>
+        <button class="ghost" onclick={clearFilters}>{m.common_clear_filters()}</button>
       </div>
     {/if}
 
@@ -3630,7 +3632,7 @@
   .search-tab.active .search-tab-meta {
     color: var(--text-accent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 58%, transparent);
+    background: var(--accent-fill);
   }
 
   .search-tab-spinner {
@@ -3660,7 +3662,7 @@
   }
 
   .search-tab.active .search-tab-actions {
-    background: color-mix(in srgb, var(--accent-dim) 28%, transparent);
+    background: var(--accent-fill);
   }
 
   .search-tab-action {
@@ -3705,7 +3707,7 @@
 
   .search-tab-close:hover,
   .search-tab-close:focus-visible {
-    color: #ffffff;
+    color: var(--on-danger);
     background: var(--danger);
     outline-color: var(--danger);
   }
@@ -4068,7 +4070,7 @@
     align-items: center;
     gap: 10px;
     padding: 8px 20px;
-    background: color-mix(in srgb, var(--accent-dim) 30%, var(--bg-secondary));
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
   }
 
@@ -4117,7 +4119,7 @@
   }
 
   :global(tr.row-checked td) {
-    background: color-mix(in srgb, var(--accent-dim) 25%, transparent) !important;
+    background: var(--accent-fill) !important;
   }
 
   .col-check {
@@ -4385,7 +4387,7 @@
   }
 
   .source-count.high-sources {
-    background: var(--accent-dim);
+    background: var(--accent-fill);
     color: var(--text-accent);
   }
 
@@ -4806,7 +4808,7 @@
 
   .filter-toggle:has(input:checked) {
     border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 38%, transparent);
+    background: var(--accent-fill);
     color: var(--text-primary);
   }
 

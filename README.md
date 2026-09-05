@@ -282,8 +282,8 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 ### Networking
 
 - **Ember Network** — Ember's own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. On by default, joins automatically, runs alongside KAD and eD2K (see [above](#ember-network)).
-- **KAD Network & eD2K Servers** — Connect to the decentralized KAD DHT and traditional eD2K servers for peer discovery and search. A community `server.met` can be downloaded from emule-security.org, and fresh KAD `nodes.dat` bootstrap contacts can be fetched from Settings → Network when KAD will not connect.
-- **Auto-Connect** — Optionally reconnect KAD and your last eD2K server on launch; with no server history, Auto-Connect Server falls back to eMule Sunrise.
+- **KAD Network & eD2K Servers** — The decentralized KAD DHT bootstraps on launch and needs no setup; traditional eD2K servers stay opt-in. A community `server.met` can be downloaded from emule-security.org, and fresh KAD `nodes.dat` bootstrap contacts can be fetched from Settings → Network when KAD will not connect.
+- **Auto-Connect Server** — Optionally reconnect your last eD2K server on launch; with no server history, it falls back to eMule Sunrise.
 - **EPX Source Exchange** — Ember peers share source lists with each other for faster downloads (see above).
 - **NAT Traversal** — UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID↔LowID paths when attestations allow.
 - **STUN Port Keep-Alive** — Periodic STUN plus a TCP hold from the listen port keeps NAT mappings alive and advertises the discovered public ports for HighID. Aimed at CGNAT and full-cone NAT without UPnP; auto-suspends on symmetric or unstable remapping.
@@ -323,10 +323,10 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 
 ### User experience
 
-- **First-Time Setup Wizard** — Guided configuration on first launch: nickname, download folder, ports, speed limits, KAD auto-connect, and theme.
+- **First-Time Setup Wizard** — Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.
 - **Backup & Restore** — Save your profile to a single passphrase-encrypted `.emberbackup` file and restore it on another machine or after a reinstall (Settings → Backup). Covers identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfers, server/Kad contacts, IP filter and learned spam data; excludes the shared files themselves and part-finished downloads. Identity keys are DPAPI-unwrapped into the encrypted archive and re-wrapped for the restoring Windows account, so a restore keeps your user hash, credits and friendships. Restores are staged and applied during the next launch, with the replaced files preserved in a `pre-restore-<timestamp>` folder.
 - **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way.
-- **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, and Alt+1–9 then Alt+0 jump to the first ten sidebar pages.
+- **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, Alt+1–9 then Alt+0 jump to the first ten sidebar pages, and Ctrl+, opens Settings.
 - **Statistics** — Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.
 - **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
 - **GeoIP** — Country identification for connected peers from a bundled MaxMind database.
@@ -339,9 +339,9 @@ Ember currently ships for **Windows 10 and Windows 11**. No external runtimes ar
 
 1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
 2. Run the installer (`.exe`).
-3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, KAD auto-connect, and theme.
-4. Press **Connect** on the KAD Network page and/or connect from the eD2K Servers page, or enable Auto-Connect KAD / Auto-Connect Server in Settings so Ember reconnects on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
-5. The [Ember Network](#ember-network) needs no connect step — it is on by default and joins on its own. It finds its first peers *through* KAD and eD2K, though, so keep at least one of them available on a fresh install.
+3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, and theme.
+4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
+5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
 6. Add folders to your library, search with the Global / KAD / Server / Ember methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
 7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features).
 8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms-beta).

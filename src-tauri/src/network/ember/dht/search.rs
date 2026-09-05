@@ -10,6 +10,18 @@ use super::{EmberContact, EmberNodeId, ALPHA, K_BUCKET_SIZE};
 /// Maximum concurrent searches.
 const MAX_ACTIVE_SEARCHES: usize = 64;
 
+/// How much of that pool automatic work may occupy.
+///
+/// The cap is one pool shared by everything, and almost every creator is
+/// background: channel presence starts a walk a second, download source
+/// lookups five a minute, bucket refresh and publish-target lookups six more.
+/// Each of those retries on its own tick, so a refusal costs them nothing. The
+/// user's keyword search has no second chance — `start_find_value` returning
+/// `None` drops the Ember leg for that query, the results arrive KAD-only, and
+/// nothing says so. Holding a quarter of the pool back means the one search
+/// somebody is actually waiting on is never the one turned away.
+const MAX_BACKGROUND_SEARCHES: usize = MAX_ACTIVE_SEARCHES * 3 / 4;
+
 /// How long a search can run before being considered timed out.
 const SEARCH_TIMEOUT_SECS: u64 = 60;
 
@@ -300,6 +312,14 @@ pub struct IterativeSearch {
     page_queue: VecDeque<(EmberNodeId, u16)>,
     /// Page follow-ups queued per node, against [`MAX_PAGES_PER_NODE`].
     pages_queued: HashMap<EmberNodeId, u8>,
+    /// Queries sent per `(node, offset)` page, against [`MAX_QUERY_ATTEMPTS`].
+    ///
+    /// Separate from `attempts`, which counts a node's opening query. A page is
+    /// retried on the offset it asked for rather than on the node, because the
+    /// node has already answered once and re-asking it from zero would re-send
+    /// records the search holds. Bounded by `pages_queued`, which caps the
+    /// distinct offsets one node may be asked for.
+    page_attempts: HashMap<(EmberNodeId, u16), u8>,
     /// Answers in a row that brought nothing closer than the best node already
     /// on the shortlist. See [`STALE_RESPONSES_TO_CONVERGE`].
     stale_responses: u8,
@@ -356,6 +376,7 @@ impl IterativeSearch {
             pending_requests: HashMap::new(),
             page_queue: VecDeque::new(),
             pages_queued: HashMap::new(),
+            page_attempts: HashMap::new(),
             next_request_id: 1,
             stale_responses: 0,
             seed_round_done: false,
@@ -433,6 +454,7 @@ impl IterativeSearch {
                 continue;
             };
             let req_id = self.take_request_id();
+            *self.page_attempts.entry((node_id, start)).or_insert(0) += 1;
             self.pending_requests.insert(
                 req_id,
                 PendingQuery {
@@ -865,9 +887,13 @@ impl IterativeSearch {
 
     /// Mark a node's request as failed (timeout, error).
     ///
-    /// Returns which node it was, so the caller can also hold the failure
-    /// against the routing table. Without that, a dead gossip lead stayed a
-    /// lookup seed until the liveness sweep happened to reach it.
+    /// Returns the node when the failure is evidence the *contact* is not
+    /// answering, so the caller can also hold it against the routing table.
+    /// Without that, a dead gossip lead stayed a lookup seed until the liveness
+    /// sweep happened to reach it.
+    ///
+    /// `None` for a page follow-up, which is a failure of one request and not of
+    /// the peer — see [`Self::mark_failed_with`].
     ///
     /// A node with attempts left goes back to `Pending` rather than `Failed`,
     /// so one lost datagram does not permanently remove it from this search.
@@ -900,6 +926,35 @@ impl IterativeSearch {
         // was: it has already answered this search at least once, so it is not a
         // dead contact, and returning it to `Pending` would have the walk re-ask
         // it from offset zero for records it has already handed us.
+        //
+        // The offset itself is retried instead. A first query gets
+        // `MAX_QUERY_ATTEMPTS` because one lost datagram is not evidence, and a
+        // page is no different — but dropping it silently was worse than
+        // dropping a first query, because nothing else will ever ask for that
+        // window: the node stays `Responded`, so the walk never revisits it, and
+        // the rest of its records are lost to this search. Popular keys are
+        // exactly the ones that page, and they serve about five records a
+        // datagram, so a single loss could cost most of a well-stocked peer's
+        // contribution.
+        //
+        // `NotSent` is excluded for the same reason it is on a first query: the
+        // send path registered no wire request, and re-queueing work that just
+        // failed to leave the host invites the driver to spin on it.
+        //
+        // A page is also never reported to the caller, because the caller's only
+        // use for the return is to charge a failure against the routing table.
+        // Doing that here contradicts the paragraph above — the search has just
+        // decided this peer is alive — and the guard on the timeout sweep cannot
+        // catch it: the answer that proves the peer alive arrives *before* the
+        // page is sent, so `last_seen < sent_unix` and the fault lands anyway.
+        // The incentive it created was backwards. Only a node holding more
+        // records than one datagram can carry is ever paged, so the peers
+        // serving most of a hot key were the ones most exposed to being evicted
+        // for a dropped UDP packet — at three strikes, and now two per lost
+        // window rather than one, since the retry above can miss as well. A
+        // genuinely dead peer is still caught, by the liveness ping that exists
+        // for exactly that and answers to nothing a searcher chose to ask.
+        let fault_worthy = !pending.is_page();
         if !pending.is_page() {
             let spent = self
                 .attempts
@@ -922,9 +977,24 @@ impl IterativeSearch {
                 // kept, so this can only happen `MAX_QUERY_ATTEMPTS` times.
                 self.queried.remove(&node_id);
             }
+        } else if failure == QueryFailure::TimedOut {
+            let start = pending.start_position;
+            let spent = self
+                .page_attempts
+                .get(&(node_id, start))
+                .copied()
+                .unwrap_or(MAX_QUERY_ATTEMPTS);
+            if spent < MAX_QUERY_ATTEMPTS {
+                // Back onto the queue at the same offset. `next_to_query`
+                // charges the attempt when it dispatches, so a node that never
+                // answers cannot be re-asked past the cap, and `check_complete`
+                // counts a queued page as outstanding work so the retry is not
+                // stranded behind an early completion.
+                self.page_queue.push_back((node_id, start));
+            }
         }
         self.check_complete();
-        Some(node_id)
+        fault_worthy.then_some(node_id)
     }
 
     /// Re-evaluate and return the completion state. Unlike the internal
@@ -1082,8 +1152,27 @@ impl SearchManager {
         target: EmberNodeId,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
+        self.start_find_node_within(target, routing_table, MAX_ACTIVE_SEARCHES)
+    }
+
+    /// [`Self::start_find_node`] for automatic work, which yields the reserve.
+    /// See [`MAX_BACKGROUND_SEARCHES`].
+    pub fn start_background_find_node(
+        &mut self,
+        target: EmberNodeId,
+        routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        self.start_find_node_within(target, routing_table, MAX_BACKGROUND_SEARCHES)
+    }
+
+    fn start_find_node_within(
+        &mut self,
+        target: EmberNodeId,
+        routing_table: &RoutingTable,
+        cap: usize,
+    ) -> Option<u32> {
         let initial = routing_table.find_closest_prefer_verified(&target, K_BUCKET_SIZE);
-        let id = self.alloc_id()?;
+        let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(id, SearchType::FindNode, target, vec![], initial);
         trace!("Starting FIND_NODE search {} for target {}", id, target);
         self.searches.insert(id, search);
@@ -1098,8 +1187,39 @@ impl SearchManager {
         keyword_hashes: Vec<[u8; 16]>,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
+        self.start_find_value_within(
+            primary_key,
+            keyword_hashes,
+            routing_table,
+            MAX_ACTIVE_SEARCHES,
+        )
+    }
+
+    /// [`Self::start_find_value`] for automatic work, which yields the reserve.
+    /// See [`MAX_BACKGROUND_SEARCHES`].
+    pub fn start_background_find_value(
+        &mut self,
+        primary_key: EmberNodeId,
+        keyword_hashes: Vec<[u8; 16]>,
+        routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        self.start_find_value_within(
+            primary_key,
+            keyword_hashes,
+            routing_table,
+            MAX_BACKGROUND_SEARCHES,
+        )
+    }
+
+    fn start_find_value_within(
+        &mut self,
+        primary_key: EmberNodeId,
+        keyword_hashes: Vec<[u8; 16]>,
+        routing_table: &RoutingTable,
+        cap: usize,
+    ) -> Option<u32> {
         let initial = routing_table.find_closest_prefer_verified(&primary_key, K_BUCKET_SIZE);
-        let id = self.alloc_id()?;
+        let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(
             id,
             SearchType::FindValue,
@@ -1219,6 +1339,19 @@ impl SearchManager {
         self.searches.len()
     }
 
+    /// Every search id currently held, so a caller can re-evaluate completion
+    /// without waiting for a wire event.
+    ///
+    /// [`Self::alloc_id`] refuses a new search once this map reaches
+    /// [`MAX_ACTIVE_SEARCHES`], and it counts entries rather than walks still
+    /// in flight — a search that has converged holds its slot until something
+    /// removes it. The only removal that did not need a response or an expired
+    /// query was [`Self::cleanup_expired`], at twice `SEARCH_TIMEOUT_SECS`, so
+    /// a finished walk could occupy one of the 64 slots for two minutes.
+    pub fn active_ids(&self) -> Vec<u32> {
+        self.searches.keys().copied().collect()
+    }
+
     /// Diagnostic snapshot of every in-flight iterative search (slice 16).
     pub fn snapshot(&self) -> Vec<SearchSnapshot> {
         self.searches
@@ -1276,12 +1409,22 @@ impl SearchManager {
             .collect()
     }
 
-    fn alloc_id(&mut self) -> Option<u32> {
-        if self.searches.len() >= MAX_ACTIVE_SEARCHES {
-            warn!(
-                "Too many active Ember searches ({}), rejecting new search",
-                self.searches.len()
-            );
+    fn alloc_id(&mut self, cap: usize) -> Option<u32> {
+        if self.searches.len() >= cap {
+            if cap < MAX_ACTIVE_SEARCHES {
+                // Routine and self-correcting: the caller re-queues whatever it
+                // was walking for and tries again next tick. Logging it as a
+                // warning would bury the one that is worth seeing.
+                debug!(
+                    "Ember search pool at its background ceiling ({}/{cap}); deferring",
+                    self.searches.len()
+                );
+            } else {
+                warn!(
+                    "Too many active Ember searches ({}), rejecting new search",
+                    self.searches.len()
+                );
+            }
             return None;
         }
         // Skip IDs that are already in use (defends against the
@@ -1594,6 +1737,81 @@ mod tests {
         );
     }
 
+    /// The active-search cap counts searches the manager still *holds*, not
+    /// walks still running, and until the sweep in the network loop's search
+    /// timer nothing removed a converged search without a wire event to notice
+    /// it — leaving the 120 s `cleanup_expired` backstop as the only reaper.
+    /// A node with several background walkers (channel presence alone starts
+    /// one a second, plus download source lookups and bucket refreshes) then
+    /// refuses the user's own search while most of the 64 slots are held by
+    /// searches that have already finished.
+    #[test]
+    fn a_converged_search_holds_its_slot_until_it_is_removed() {
+        let rt = RoutingTable::new(make_id(0x00), false);
+        let mut sm = SearchManager::new();
+
+        // Nobody to ask, so the walk is over the moment it is polled.
+        let sid = sm.start_find_node(make_id(0x7F), &rt).expect("slot");
+        assert!(
+            sm.get_mut(sid).expect("held").poll_complete(),
+            "a search with an empty shortlist has already converged"
+        );
+
+        assert_eq!(
+            sm.active_count(),
+            1,
+            "converging does not free the slot — something has to remove it"
+        );
+        assert_eq!(
+            sm.active_ids(),
+            vec![sid],
+            "so the sweep has to be able to enumerate it"
+        );
+
+        assert!(sm.remove(sid).is_some());
+        assert_eq!(sm.active_count(), 0);
+    }
+
+    /// Almost every search this node starts is automatic — channel presence
+    /// alone starts one a second — and all of them retry on their own tick. The
+    /// user's keyword search does not: a refusal drops the Ember leg for that
+    /// query with nothing said. Background work therefore yields a reserve it
+    /// cannot take.
+    #[test]
+    fn background_work_cannot_take_the_slots_held_for_the_user() {
+        let rt = RoutingTable::new(make_id(0x00), false);
+        let mut sm = SearchManager::new();
+
+        for i in 0..MAX_BACKGROUND_SEARCHES {
+            assert!(
+                sm.start_background_find_node(make_id(i as u8), &rt).is_some(),
+                "background walk {i} is within its ceiling"
+            );
+        }
+
+        assert!(
+            sm.start_background_find_node(make_id(0xAA), &rt).is_none(),
+            "background work must stop at its ceiling, not at the hard cap"
+        );
+        assert!(
+            sm.active_count() < MAX_ACTIVE_SEARCHES,
+            "which leaves the pool short of full"
+        );
+
+        // The reserve is what the person waiting on a search gets to use.
+        for i in MAX_BACKGROUND_SEARCHES..MAX_ACTIVE_SEARCHES {
+            assert!(
+                sm.start_find_node(make_id(i as u8), &rt).is_some(),
+                "user search {i} must still find a slot"
+            );
+        }
+        assert_eq!(sm.active_count(), MAX_ACTIVE_SEARCHES);
+        assert!(
+            sm.start_find_node(make_id(0xBB), &rt).is_none(),
+            "and the hard cap still binds once even the reserve is spent"
+        );
+    }
+
     /// Two peers holding the same record is the normal case for anything
     /// worth finding, and a walk asks twenty of them. Counting each copy
     /// against the result cap let one popular record end the search.
@@ -1811,6 +2029,168 @@ mod tests {
         assert_eq!(follow_up[0].start_position, 1);
     }
 
+    /// A first query gets a second attempt because one lost datagram is not
+    /// evidence. A page had none, and losing one cost strictly more: the node
+    /// stays `Responded`, so the walk never comes back to it, and the rest of
+    /// its window is gone for this search. Popular keys are exactly the ones
+    /// that page.
+    #[test]
+    fn a_lost_page_is_retried_at_the_offset_it_asked_for() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let first = search.next_to_query();
+        assert_eq!(first[0].start_position, 0);
+        search.process_response(
+            first[0].request_id,
+            &peer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 1)],
+            Some(ValuePage {
+                next_position: 4,
+                total_available: 40,
+            }),
+        );
+
+        let page = search.next_to_query();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].start_position, 4);
+
+        // The page datagram is lost. Reported as nobody's fault: the caller's
+        // only use for the return is to charge the routing table, and this peer
+        // answered moments ago.
+        assert_eq!(
+            search.mark_failed(page[0].request_id),
+            None,
+            "a lost page must not be charged against the contact"
+        );
+        assert!(
+            !search.poll_complete(),
+            "the search still owes this node's window"
+        );
+
+        let retry = search.next_to_query();
+        assert_eq!(retry.len(), 1, "the lost page is asked again");
+        assert_eq!(
+            retry[0].start_position, 4,
+            "at the offset it asked for, not from zero"
+        );
+
+        // A second loss is where it stops: the node is not answering, and the
+        // walk must not spend the rest of the search on it.
+        assert_eq!(search.mark_failed(retry[0].request_id), None);
+        assert!(
+            search
+                .next_to_query()
+                .iter()
+                .all(|q| q.start_position != 4),
+            "one retry, the same allowance a first query gets"
+        );
+    }
+
+    /// The return value is what the timeout sweep charges against the routing
+    /// table, so reporting a lost page as a contact failure evicted peers for
+    /// dropped UDP packets — at three strikes, and only ever the peers holding
+    /// more records than one datagram can carry, because those are the only ones
+    /// that get paged. The sweep's own guard cannot catch it: the answer proving
+    /// the peer alive arrives *before* the page is sent, so `last_seen` is older
+    /// than the page's `sent_unix` and the fault lands anyway.
+    #[test]
+    fn a_lost_page_is_not_charged_against_the_contact_but_a_lost_query_is() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let pager = make_contact(0xF0);
+        let quiet = make_contact(0xF1);
+        rt.add_contact(pager.clone());
+        rt.add_contact(quiet.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let opening = search.next_to_query();
+        let find = |id| {
+            opening
+                .iter()
+                .find(|q| q.contact.node_id == id)
+                .map(|q| q.request_id)
+                .expect("both nodes are queried")
+        };
+        let (pager_req, quiet_req) = (find(pager.node_id), find(quiet.node_id));
+
+        // A first query that goes unanswered is evidence about the contact, and
+        // has to stay so — this is the case the return value exists for.
+        assert_eq!(
+            search.mark_failed(quiet_req),
+            Some(quiet.node_id),
+            "an unanswered first query is still the contact's failure"
+        );
+
+        // The pager answers, then loses its page.
+        search.process_response(
+            pager_req,
+            &pager.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 1)],
+            Some(ValuePage {
+                next_position: 3,
+                total_available: 90,
+            }),
+        );
+        let page = search
+            .next_to_query()
+            .into_iter()
+            .find(|q| q.contact.node_id == pager.node_id)
+            .expect("the pager is asked for its next window");
+        assert_eq!(page.start_position, 3);
+        assert_eq!(
+            search.mark_failed(page.request_id),
+            None,
+            "a peer that just answered must not be faulted for a lost page"
+        );
+    }
+
+    /// A send that never left the host registers no wire request, so re-queueing
+    /// it invites the driver to spin on work it has just been told it cannot do.
+    /// The same reasoning already excludes a first query from retry.
+    #[test]
+    fn a_page_that_never_reached_the_wire_is_not_re_queued() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let first = search.next_to_query();
+        search.process_response(
+            first[0].request_id,
+            &peer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 1)],
+            Some(ValuePage {
+                next_position: 4,
+                total_available: 40,
+            }),
+        );
+        let page = search.next_to_query();
+        assert_eq!(page[0].start_position, 4);
+
+        search.mark_failed_with(page[0].request_id, QueryFailure::NotSent);
+        assert!(
+            search.next_to_query().is_empty(),
+            "nothing is re-queued for a query the host could not send"
+        );
+    }
+
     /// `next_position` and `total_available` are the responder's claims about
     /// its own store, and they are the only thing here that can make us send
     /// more traffic. A peer must not be able to buy unbounded queries with them.
@@ -1965,6 +2345,11 @@ mod tests {
     /// it had never replied: it would be re-asked from offset zero for records
     /// it has already handed over, and a well-stocked peer would be re-served
     /// its own first page for the life of the search.
+    ///
+    /// The lost window itself *is* retried — see
+    /// [`a_lost_page_is_retried_at_the_offset_it_asked_for`] — so what this pins
+    /// is the narrower property: every query after the first names the offset it
+    /// was owed, and the node never returns to `Pending`.
     #[test]
     fn an_unanswered_page_does_not_requery_the_node_from_the_start() {
         let target = keyword_target("ubuntu");
@@ -1989,12 +2374,26 @@ mod tests {
 
         let page = search.next_to_query();
         assert_eq!(page[0].start_position, 1);
-        assert_eq!(search.mark_failed(page[0].request_id), Some(peer.node_id));
+        assert_eq!(search.mark_failed(page[0].request_id), None);
 
-        assert!(
-            search.next_to_query().is_empty(),
-            "a timed-out page must not re-open the node's first query"
-        );
+        // Drive the rest of the walk out, failing everything, and check that
+        // nothing ever asks this node for its first page again.
+        let mut rounds = 0;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 16, "the walk has to terminate");
+            for query in batch {
+                assert_ne!(
+                    query.start_position, 0,
+                    "a node that has already answered must never be re-asked from the start"
+                );
+                search.mark_failed(query.request_id);
+            }
+        }
         assert!(search.poll_complete());
     }
 

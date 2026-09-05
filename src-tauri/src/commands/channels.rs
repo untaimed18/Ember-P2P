@@ -21,6 +21,7 @@ use crate::network::ember::dht::publish::{
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
 use crate::storage::database::{ChannelEditOutcome, StoredChannel, StoredChannelMember};
+use tauri_plugin_dialog::DialogExt;
 
 /// Room names are bounded by what a directory row can show rather than by what
 /// the record could carry: twenty characters fit the list at every width the
@@ -846,6 +847,12 @@ pub async fn create_channel(
         .try_send(NetworkCommand::RefreshChannelMembers {
             channel_id: ident.channel_id,
         });
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::AnnounceChannelPresence {
+            channel_id: ident.channel_id,
+            departed: false,
+        });
 
     let invite = ChannelInvite {
         channel_id: ident.channel_id,
@@ -1073,7 +1080,23 @@ async fn enter_stored_channel(
     if let Err(e) = record_self_member(state, channel_id, username, "channels_join_failed").await {
         let db = state.db.clone();
         let id = channel_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || db.set_channel_in_room(&id, false)).await;
+        // A rollback that itself fails leaves `in_room = true` for a join this
+        // call is about to report as failed, so the room reappears in
+        // `list_channels` as one the user never joined. Nothing here can undo
+        // that, but it must not be invisible.
+        match tokio::task::spawn_blocking(move || db.set_channel_in_room(&id, false)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(
+                channel_id = %channel_id,
+                %error,
+                "failed join left in_room set: rollback update failed"
+            ),
+            Err(error) => tracing::error!(
+                channel_id = %channel_id,
+                %error,
+                "failed join left in_room set: rollback task did not run"
+            ),
+        }
         return Err(e);
     }
     let Ok(id_bytes) = hex::decode(&row.channel_id) else {
@@ -1154,6 +1177,16 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         .try_send(NetworkCommand::RefreshChannelMembers {
             channel_id: invite.channel_id,
         });
+    // The DHT record above is the durable copy and the slow one: it has to be
+    // stored, then found by a walk somebody else runs on their own timer, so on
+    // its own it can be minutes before the room knows anyone arrived. This is
+    // the same signed fact taking the path chat takes.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::AnnounceChannelPresence {
+            channel_id: invite.channel_id,
+            departed: false,
+        });
 }
 
 #[tauri::command]
@@ -1182,6 +1215,16 @@ pub async fn leave_channel(
                 .try_send(NetworkCommand::DropChannelTransfers {
                     channel_id: id,
                     member: None,
+                });
+            // Tell the room now, on the mesh, rather than leaving everyone to
+            // notice we stopped beating. The DHT tombstone below is the copy
+            // that reaches members who are offline at this moment; this is the
+            // one that reaches the people currently looking at the roster.
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::AnnounceChannelPresence {
+                    channel_id: id,
+                    departed: true,
                 });
         }
     }
@@ -1409,6 +1452,55 @@ pub async fn list_channel_members(
             ChannelMemberInfo::from_stored(row, is_self)
         })
         .collect())
+}
+
+/// The presence windows the roster is drawn with.
+///
+/// Served from the backend rather than mirrored in the UI. These numbers decide
+/// which members a device gossips to as well as which ones it draws a dot
+/// beside, and a copy in the frontend is a copy that can drift from the one the
+/// protocol actually runs on — the roster would then disagree with the mesh
+/// about who is in the room, which is the class of bug this whole change is
+/// about.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelPresenceConfig {
+    /// Seen within this many seconds on the live mesh: online.
+    pub mesh_fresh_secs: i64,
+    /// Seen within this many seconds by any means: recently here, not online.
+    pub dht_fresh_secs: i64,
+    /// How often a member announces itself, so the UI can pick a sane redraw.
+    pub beat_secs: i64,
+}
+
+#[tauri::command]
+pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> {
+    Ok(ChannelPresenceConfig {
+        mesh_fresh_secs: channel::PRESENCE_MESH_FRESH_SECS,
+        dht_fresh_secs: channel::PRESENCE_FRESH_SECS,
+        beat_secs: channel::PRESENCE_BEAT_SECS,
+    })
+}
+
+/// Tell the network loop which room is on screen, or `None` when none is.
+///
+/// Presence costs are per room and a user who has joined thirty is reading one.
+/// Naming it is what lets that one be walked at the rate somebody watching it
+/// would expect without paying the same for the other twenty-nine.
+#[tauri::command]
+pub async fn set_channel_focus(
+    state: tauri::State<'_, AppState>,
+    channel_id: Option<String>,
+) -> Result<(), String> {
+    let parsed = match channel_id {
+        Some(id) => Some(channel_id_bytes(&parse_channel_id(&id)?)?),
+        None => None,
+    };
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::SetChannelFocus {
+            channel_id: parsed,
+        });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2024,7 +2116,22 @@ pub async fn send_channel_message(
         // with no resend, because a channel send never leaves a row to retry.
         let db = state.db.clone();
         let id = channel_id.clone();
-        let _ = tokio::task::spawn_blocking(move || db.delete_channel_message(&id, row_id)).await;
+        // If the take-back itself fails the sender keeps a line the room never
+        // received, and there is no resend to reconcile it — worth a log even
+        // though the send is already being reported as failed.
+        match tokio::task::spawn_blocking(move || db.delete_channel_message(&id, row_id)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(
+                channel_id = %channel_id,
+                %error,
+                "undelivered channel message left in the local transcript"
+            ),
+            Err(error) => tracing::error!(
+                channel_id = %channel_id,
+                %error,
+                "undelivered channel message left in the local transcript: task did not run"
+            ),
+        }
         refund_local_send(&channel_id);
         return Err(coded_ctx("network_busy", "Network busy", e));
     }
@@ -3900,13 +4007,31 @@ pub async fn gather_channels(
             crate::network::rendezvous::fetch_deleted_channel_ids(&url),
         ),
     );
+    // A rendezvous that is down or slow degrades Discover to whatever the DHT
+    // walks below turn up, which is the right behaviour — but it used to be
+    // indistinguishable from "the network has no rooms". Log it so an empty
+    // Discover can be told apart from an unreachable directory.
     let directory = match directory {
         Ok(Ok(list)) => list,
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "channel directory fetch failed; showing DHT results only");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("channel directory fetch timed out; showing DHT results only");
+            Vec::new()
+        }
     };
     let deleted: std::collections::HashSet<String> = match deleted {
         Ok(Ok(ids)) => ids,
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "deleted-channel list fetch failed; tombstoned rooms may still be listed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("deleted-channel list fetch timed out; tombstoned rooms may still be listed");
+            Vec::new()
+        }
     }
     .into_iter()
     .map(|id| id.to_ascii_lowercase())
@@ -4290,13 +4415,25 @@ pub async fn channel_member_friend_code(
 /// Nothing leaves this machine until they accept. The file is hashed here
 /// rather than in the network task so a 100 MB read never stalls the loop
 /// that is also carrying everyone's chat.
+///
+/// The file is chosen in a native dialog *here* rather than accepted as a path
+/// from the renderer, for the same reason as `pick_and_load_collection` and
+/// `pick_and_import_ipfilter_file`: picking a file in the OS dialog is the
+/// user's authorization, a path arriving over IPC is not. This command reads
+/// whatever it is handed and sends it to another person, and it is not scoped
+/// to the shared roots — so a renderer-supplied path meant any readable file
+/// (identity material, documents) could be exfiltrated to a room member, and
+/// on Windows a UNC path would additionally have been dialled by
+/// `canonicalize`.
+///
+/// `Ok(None)` means the user dismissed the picker.
 #[tauri::command]
-pub async fn offer_channel_transfer(
+pub async fn pick_and_offer_channel_transfer(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
-    path: String,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let peer = parse_member_pubkey(&member_pubkey)?;
@@ -4332,9 +4469,29 @@ pub async fn offer_channel_transfer(
         ));
     }
 
-    let path_for_hash = path.clone();
+    // Only prompt once the offer is known to have somewhere to go, so a
+    // dismissed dialog is the only reason this returns `Ok(None)`.
+    let picker = app.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title("Choose a file to send")
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("channels_xfer_failed", "Invalid file path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+
     let prepared = tokio::task::spawn_blocking(move || {
-        let canonical = std::path::PathBuf::from(&path_for_hash)
+        let canonical = picked
             .canonicalize()
             .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
         if !canonical.is_file() {
@@ -4400,7 +4557,7 @@ pub async fn offer_channel_transfer(
         })
         .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
     await_reply(rx, "channels_xfer_failed", "No response from network").await??;
-    Ok(hex::encode(xfer_id))
+    Ok(Some(hex::encode(xfer_id)))
 }
 
 /// Accept or decline an offer someone made you.
@@ -4456,14 +4613,16 @@ pub async fn list_channel_transfers(
         return Ok(Vec::new());
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if state
+    // An empty list here used to mean two different things: "nothing is in
+    // flight" and "the network task did not answer". The second one made live
+    // transfers disappear from the room instead of reporting a fault, and the
+    // bare `rx.await` could park this command forever. Every other channel
+    // command bounds both halves; so does this one now.
+    state
         .network_tx
         .try_send(NetworkCommand::ListChannelTransfers { tx })
-        .is_err()
-    {
-        return Ok(Vec::new());
-    }
-    Ok(rx.await.unwrap_or_default())
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await
 }
 
 fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {

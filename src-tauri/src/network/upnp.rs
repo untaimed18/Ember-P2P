@@ -16,6 +16,16 @@ const RENEW_AFTER: Duration = Duration::from_secs(45 * 60);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MAPPING_ENTRIES_TO_INSPECT: u32 = 256;
 const MAPPING_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on a single add/remove SOAP round-trip to the gateway.
+///
+/// `igd_next` applies no timeout of its own, so a gateway that completes the
+/// TCP connect and then never answers parks the caller forever — cheap IGD
+/// stacks do this, and so does a router rebooted mid-session. The maintenance
+/// pass runs detached on a timer, so a parked call is never observed: the
+/// watchdog only clears the in-flight flag, and the next tick spawns another
+/// one behind it. Generous, because this is a LAN round-trip and the cost of
+/// giving up too early is a mapping that silently stops being renewed.
+const SOAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MappingOwnership {
@@ -119,11 +129,30 @@ impl UpnpMappings {
         }
     }
 
+    /// `Gateway::add_port` under [`SOAP_TIMEOUT`]. `None` means it timed out.
+    async fn add_port_bounded(
+        gateway: &Gw,
+        protocol: igd_next::PortMappingProtocol,
+        port: u16,
+        local: SocketAddr,
+        lease: u32,
+        label: &str,
+    ) -> Option<Result<(), igd_next::AddPortError>> {
+        tokio::time::timeout(
+            SOAP_TIMEOUT,
+            gateway.add_port(protocol, port, local, lease, label),
+        )
+        .await
+        .ok()
+    }
+
     /// Add one port mapping, working around two common router quirks:
     /// error 725 (`OnlyPermanentLeasesSupported`) gets a retry with a
     /// permanent lease, and error 718 (`PortInUse`) — which some gateways
     /// return instead of refreshing a mapping we already own — gets a
     /// delete-then-re-add.
+    ///
+    /// Every gateway round-trip here is bounded; see [`SOAP_TIMEOUT`].
     async fn try_add_port(
         gateway: &Gw,
         protocol: igd_next::PortMappingProtocol,
@@ -136,22 +165,29 @@ impl UpnpMappings {
             igd_next::PortMappingProtocol::TCP => "TCP",
             igd_next::PortMappingProtocol::UDP => "UDP",
         };
-        match gateway
-            .add_port(protocol, port, local, LEASE_SECS, label)
-            .await
-        {
+        let Some(first) =
+            Self::add_port_bounded(gateway, protocol, port, local, LEASE_SECS, label).await
+        else {
+            debug!("UPnP: gateway did not answer the {proto} port {port} ({label}) mapping request");
+            return false;
+        };
+        match first {
             Ok(()) => {
                 info!("UPnP: mapped {proto} port {port} ({label})");
                 true
             }
             Err(igd_next::AddPortError::OnlyPermanentLeasesSupported) => {
-                match gateway.add_port(protocol, port, local, 0, label).await {
-                    Ok(()) => {
+                match Self::add_port_bounded(gateway, protocol, port, local, 0, label).await {
+                    Some(Ok(())) => {
                         info!("UPnP: mapped {proto} port {port} ({label}) with permanent lease");
                         true
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         debug!("UPnP: permanent-lease retry failed for {proto} port {port} ({label}): {e}");
+                        false
+                    }
+                    None => {
+                        debug!("UPnP: permanent-lease retry timed out for {proto} port {port} ({label})");
                         false
                     }
                 }
@@ -187,22 +223,35 @@ impl UpnpMappings {
                     }
                     MappingOwnership::EmberOwned => unreachable!("owned mapping is replaceable"),
                 }
-                if let Err(e) = gateway.remove_port(protocol, port).await {
-                    debug!("UPnP: failed to remove owned {proto} mapping on port {port}: {e}");
-                    return false;
+                match tokio::time::timeout(SOAP_TIMEOUT, gateway.remove_port(protocol, port)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!(
+                            "UPnP: failed to remove owned {proto} mapping on port {port}: {e}"
+                        );
+                        return false;
+                    }
+                    Err(_) => {
+                        debug!("UPnP: removing owned {proto} mapping on port {port} timed out");
+                        return false;
+                    }
                 }
-                match gateway
-                    .add_port(protocol, port, local, LEASE_SECS, label)
+                match Self::add_port_bounded(gateway, protocol, port, local, LEASE_SECS, label)
                     .await
                 {
-                    Ok(()) => {
+                    Some(Ok(())) => {
                         info!(
                             "UPnP: re-mapped {proto} port {port} ({label}) after mapping conflict"
                         );
                         true
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         debug!("UPnP: re-map after conflict failed for {proto} port {port} ({label}): {e}");
+                        false
+                    }
+                    None => {
+                        debug!("UPnP: re-map after conflict timed out for {proto} port {port} ({label})");
                         false
                     }
                 }

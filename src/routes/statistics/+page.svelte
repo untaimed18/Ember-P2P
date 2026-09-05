@@ -178,16 +178,20 @@
   // Render overhead rows in descending size so the biggest contributor
   // sits at the top. Zero-byte categories stay visible so a KAD/Ember
   // session still shows which pathways are silent versus active.
-  type OverheadRow = { key: string; label: string; value: number; cls: string };
+  // `help` is a hover explanation per category. "Source Exchange", "EPX",
+  // "File Requests" and "Ember DHT" are protocol vocabulary, and this section
+  // was six bar charts of it with nothing saying what any of them are or why
+  // a large number there is fine.
+  type OverheadRow = { key: string; label: string; help: string; value: number; cls: string };
   let overheadRows = $derived.by<OverheadRow[]>(() => {
     if (!stats) return [];
     const rows: OverheadRow[] = [
-      { key: 'server', label: m.stats_overhead_server(), value: stats.overhead_server, cls: 'oh-server' },
-      { key: 'kad', label: m.stats_overhead_kad(), value: stats.overhead_kad, cls: 'oh-kad' },
-      { key: 'srcex', label: m.stats_overhead_source_exchange(), value: stats.overhead_source_exchange, cls: 'oh-srcex' },
-      { key: 'freq', label: m.stats_overhead_file_requests(), value: stats.overhead_file_request, cls: 'oh-freq' },
-      { key: 'epx', label: m.stats_overhead_epx(), value: stats.overhead_epx ?? 0, cls: 'oh-epx' },
-      { key: 'emberdht', label: m.stats_overhead_ember_dht(), value: stats.overhead_ember_dht ?? 0, cls: 'oh-ember-dht' },
+      { key: 'server', label: m.stats_overhead_server(), help: m.stats_overhead_server_help(), value: stats.overhead_server, cls: 'oh-server' },
+      { key: 'kad', label: m.stats_overhead_kad(), help: m.stats_overhead_kad_help(), value: stats.overhead_kad, cls: 'oh-kad' },
+      { key: 'srcex', label: m.stats_overhead_source_exchange(), help: m.stats_overhead_source_exchange_help(), value: stats.overhead_source_exchange, cls: 'oh-srcex' },
+      { key: 'freq', label: m.stats_overhead_file_requests(), help: m.stats_overhead_file_requests_help(), value: stats.overhead_file_request, cls: 'oh-freq' },
+      { key: 'epx', label: m.stats_overhead_epx(), help: m.stats_overhead_epx_help(), value: stats.overhead_epx ?? 0, cls: 'oh-epx' },
+      { key: 'emberdht', label: m.stats_overhead_ember_dht(), help: m.stats_overhead_ember_dht_help(), value: stats.overhead_ember_dht ?? 0, cls: 'oh-ember-dht' },
     ];
     return rows.sort((a, b) => b.value - a.value);
   });
@@ -229,9 +233,12 @@
       <p>{m.stats_loading()}</p>
     </div>
   {:else if error}
+    <!-- `.empty-title` + `.empty-action`, like every other failed-load state.
+         This was the one that reached for an inline `style="color: danger"`,
+         which meant it alone ignored the theme's error treatment. -->
     <div class="empty-state">
-      <p style="color: var(--danger)">{error}</p>
-      <button onclick={() => loadStats({ force: true })}>{m.common_retry()}</button>
+      <p class="empty-title">{error}</p>
+      <button class="empty-action" onclick={() => loadStats({ force: true })}>{m.common_retry()}</button>
     </div>
   {:else if stats}
 
@@ -400,7 +407,7 @@
       <div class="overhead-bars">
         {#each overheadRows as row (row.key)}
           <div class="oh-row">
-            <span class="oh-label">{row.label}</span>
+            <span class="oh-label" title={row.help}>{row.label}</span>
             <div class="oh-track">
               <div
                 class="oh-fill {row.cls}"
@@ -693,8 +700,7 @@
   .oh-srcex  { background: var(--warning); }
   .oh-freq   { background: var(--stat-ratio); }
   .oh-epx    { background: var(--ember-color); }
-  .oh-ember-dht { background: #00838f; }
-  :global([data-theme="dark"]) .oh-ember-dht { background: #4db6ac; }
+  .oh-ember-dht { background: var(--ember-dht-color); }
   .oh-empty {
     text-align: center;
     color: var(--text-muted);
