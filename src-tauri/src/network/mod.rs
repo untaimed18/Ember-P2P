@@ -19078,6 +19078,11 @@ fn seed_ember_session_search_contacts(state: &mut NetworkState, search_id: u32) 
     }
 }
 
+/// Every FIND_NODE the app walks on its own is maintenance, which takes
+/// [`start_ember_background_find_node`] to yield the reserve. Only the debug
+/// diagnostics panel asks for one directly, so this is gated to match its
+/// single caller rather than riding along dead in release builds.
+#[cfg(debug_assertions)]
 fn start_ember_find_node(
     state: &mut NetworkState,
     target: ember::dht::EmberNodeId,

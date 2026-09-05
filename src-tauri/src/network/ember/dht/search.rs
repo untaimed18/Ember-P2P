@@ -1147,6 +1147,12 @@ impl SearchManager {
     /// Start a new FIND_NODE search.
     /// Returns `None` when the active-search cap is reached so the
     /// caller can surface a "busy" state instead of unbounded growth.
+    ///
+    /// Reaching for the whole pool is only ever the debug diagnostics panel;
+    /// the walks the app starts for itself are maintenance and take
+    /// [`Self::start_background_find_node`]. `test` keeps it alive for
+    /// `cargo test --release`, where `debug_assertions` is off.
+    #[cfg(any(debug_assertions, test))]
     pub fn start_find_node(
         &mut self,
         target: EmberNodeId,
