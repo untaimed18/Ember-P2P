@@ -512,6 +512,13 @@ export interface EmberDiagnostics {
    */
   ember_dht_published_files: number;
   /**
+   * Complete, publicly listable shared files Ember will advertise. The
+   * denominator for "published of total"; the gap vs
+   * `ember_dht_published_files` is files still waiting for a confirmed
+   * source record.
+   */
+  ember_dht_publishable_files?: number;
+  /**
    * Every source listed in an EPX payload we accepted, before filtering. The
    * denominator for EPX yield — compare against `epx_sources_received` on
    * `NetworkStats`, which counts only those that reached a live download.

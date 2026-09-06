@@ -190,6 +190,12 @@
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
   let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
+  let publishableCount = $derived(diag?.ember_dht_publishable_files ?? 0);
+  // Never show "200 of 50": a live advert can briefly outlast the share list
+  // (TTL) or the publish manager can still be empty while hydrated stamps
+  // already light badges.
+  let publishedTotal = $derived(Math.max(publishableCount, publishedCount));
+  let publishedInProgress = $derived(publishedTotal > 0 && publishedCount < publishedTotal);
   let joining = $derived(isActive && verifiedCount === 0 && !joinTimedOut);
   let isConnected = $derived(isActive && verifiedCount > 0);
 
@@ -281,23 +287,33 @@
   );
 
   let sharingPillLabel = $derived(
-    sharingPublished
-      ? m.ember_health_sharing_published_count({ count: publishedCount })
-      : m.ember_health_sharing_waiting(),
+    publishedTotal > 0
+      ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })
+      : sharingPublished
+        ? m.ember_health_sharing_published_count({ count: publishedCount })
+        : m.ember_health_sharing_waiting(),
   );
   // A green "Published" next to "Connecting…" is a contradiction: the count
   // is restored from the last successful STORE (still inside TTL) even
   // while this session has nobody who has answered. Warn until a live peer
   // exists so the badge is not read as "you are on the network".
   let sharingTone: PillTone = $derived(
-    !sharingPublished ? 'muted' : isConnected ? 'ok' : 'warn',
+    publishedTotal === 0 && !sharingPublished
+      ? 'muted'
+      : publishedInProgress || !isConnected
+        ? 'warn'
+        : 'ok',
   );
   let sharingHint = $derived(
-    !sharingPublished
+    publishedTotal === 0 && !sharingPublished
       ? m.ember_health_sharing_waiting_hint()
-      : isConnected
-        ? m.ember_health_sharing_published_hint()
-        : m.ember_health_sharing_published_rejoining_hint(),
+      : publishedInProgress && isConnected
+        ? m.ember_health_sharing_publishing_hint({
+            remaining: publishedTotal - publishedCount,
+          })
+        : isConnected
+          ? m.ember_health_sharing_published_hint()
+          : m.ember_health_sharing_published_rejoining_hint(),
   );
 
   // The estimate is a density measurement, so it is shown as approximate and
@@ -360,7 +376,7 @@
     { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
     { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
     { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },
-    { id: 'published-files', k: m.ember_stat_published_files(), v: String(diag?.ember_dht_published_files ?? 0) },
+    { id: 'published-files', k: m.ember_stat_published_files(), v: publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : String(publishedCount) },
     { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: String(diag?.ember_dht_stored_keys ?? 0) },
     { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: String(diag?.ember_dht_stored_for_others_records ?? 0) },
     { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
@@ -528,8 +544,14 @@
         </div>
         <div class="stat-label">{m.ember_overview_peers()}</div>
       </div>
-      <div class="stat">
-        <div class="stat-value">{publishedCount}</div>
+      <div class="stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
+        <div class="stat-value">
+          {#if publishedTotal > 0}
+            {m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })}
+          {:else}
+            {publishedCount}
+          {/if}
+        </div>
         <div class="stat-label">{m.ember_overview_published()}</div>
       </div>
     </section>

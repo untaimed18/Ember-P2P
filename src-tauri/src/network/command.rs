@@ -2043,6 +2043,7 @@ async fn handle_command_inner(
                 .unwrap_or(0);
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
             diag.ember_dht_published_files = state.ember_published_sources.len() as u32;
+            diag.ember_dht_publishable_files = state.publish_manager.complete_file_count() as u32;
             let (store_keys, store_records) = state.ember_dht.store_stats();
             diag.ember_dht_stored_keys = store_keys as u32;
             diag.ember_dht_stored_records = store_records as u32;

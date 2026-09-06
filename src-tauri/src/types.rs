@@ -997,6 +997,12 @@ pub struct EmberDiagnostics {
     /// set behind the Library's Ember badge, so the two cannot disagree.
     #[serde(default)]
     pub ember_dht_published_files: u32,
+    /// Complete, publicly listable shared files Ember will advertise. The
+    /// denominator for the Ember page's "published of total" readout; the
+    /// gap vs [`Self::ember_dht_published_files`] is files still waiting
+    /// for a confirmed source record.
+    #[serde(default)]
+    pub ember_dht_publishable_files: u32,
     /// Every source listed in an EPX payload we accepted, before any
     /// filtering. The denominator for EPX yield: compare against
     /// `NetworkStats::epx_sources_received`, which counts only the sources
