@@ -47225,8 +47225,13 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
     // by the record key(s) (the primary key plus any extra keyword hashes
     // for multi-keyword lookups), and a peer answers either with the
     // records (FOUND_VALUE) or the closest contacts (FOUND_NODE).
-    let (target, search_type, extra_keys) = match state.ember_search.get(search_id) {
-        Some(s) => (s.target, s.search_type, s.keyword_hashes.clone()),
+    let (target, search_type, extra_keys, constraints) = match state.ember_search.get(search_id) {
+        Some(s) => (
+            s.target,
+            s.search_type,
+            s.keyword_hashes.clone(),
+            s.value_constraints().clone(),
+        ),
         None => return,
     };
 
@@ -47294,7 +47299,9 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 keys.extend_from_slice(&extra_keys);
                 // Non-zero on a page follow-up: this node already answered and
                 // said it holds records past what its datagram could carry.
-                state.ember_dht.build_find_value(keys, start_position)
+                state
+                    .ember_dht
+                    .build_find_value(keys, start_position, constraints.clone())
             }
         };
 

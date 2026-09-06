@@ -40,10 +40,11 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
-Everything that needed no wire change is now done — items 3, 4, 5 and the tab
-overflow entry under 6. What is left is [item 1](#1-find_value-carries-no-constraints--the-real-recall-gap)
-and [item 2](#2-keyword-records-carry-no-metadata), both of which wait for the
-version move.
+Everything except [item 2](#2-keyword-records-carry-no-metadata) is done. The
+wire additions turned out not to need a version bump at all — see item 1 for why
+bumping would have been actively wrong — so what is left is item 2, which is
+blocked on something else entirely: media metadata is not persisted anywhere to
+publish *from*.
 
 - **`complete_sources` was `0` on every Ember row**, which every consumer reads as
   "none": the Min Complete filter silently dropped all of them, the Complete
@@ -58,7 +59,7 @@ version move.
 
 ---
 
-## 1. `FIND_VALUE` carries no constraints — the real recall gap
+## 1. `FIND_VALUE` carries no constraints — done, and without a version bump
 
 **Highest leverage item here.** KAD encodes the query's size / type / availability
 constraints into the search request (`build_search_expression_with_node`), and the
@@ -74,20 +75,33 @@ walk never got to. `kad/messages.rs` says this outright in the comment above its
 own constraint encoding — a purely client-side filter cannot recover what the
 remote already truncated away.
 
-**Plan.** Add an optional constraint block to `FIND_VALUE`; the responder applies
-it before packing `FOUND_VALUE`; the searcher keeps the emit-time filter as
-defence in depth against peers that ignore it (exactly KAD's arrangement).
+**Done.** `ValueConstraints` (min size, max size, file type) rides an optional
+TLV block trailing the `FIND_VALUE` payload; the responder applies it in
+`intersect_find_value_records` *before* packing, so `total_available` counts
+matches and a searcher pages through matches rather than through positions it
+would discard. A key where nothing matches is answered with contacts, exactly as
+a key we do not hold is. The searcher keeps `result_matches_client_filters` at
+emit as defence in depth, because the block is advisory.
 
-**Watch for:** the record body has no file-type tag, so a type constraint has to
-be derived from the extension in `file_name` — cheap on the responder, but it
-means "type" is inferred on both sides and the two inferences must agree
-(`infer_file_type`). Size and availability are already in the body.
+**Availability is deliberately not sent.** KAD can filter on it because its
+keyword entries carry a publisher-claimed `TAG_SOURCES`; an Ember record carries
+no source count, and the number the search page shows counts distinct publishers
+*across the network*, which no single responder can see. A constraint no
+responder could evaluate honestly is worse than none.
 
-**Cost:** wire version bump. This one is *additive*, so it can lower
-`EMBER_DHT_MIN_VERSION` instead of raising both — see
-[ember-dht.md item 2](ember-dht.md#2-wire-versioning-rejects-cleanly-but-cannot-negotiate).
-That makes it the first change in a while that need not partition the overlay,
-which is a good reason to do it before the next breaking one.
+**The version did not move, and must not have.** The plan assumed this needed a
+bump that could lower `EMBER_DHT_MIN_VERSION` instead of raising both. That was
+wrong in a way worth recording: `decode_message` range-checks the version byte on
+*receive*, so a frame stamped 5 is refused outright by every v4 build — bumping
+would have partitioned the overlay, which is the opposite of graceful. What makes
+this additive is the decoder, not the version: `MSG_FIND_VALUE` has always
+required only a *minimum* length and read its fields at fixed offsets, so bytes
+past `start_position` have always been valid and ignored. The block trails them,
+and an unconstrained query encodes byte-for-byte as it did before.
+
+Type inference is the one thing shared across the wire: both sides derive it from
+the name's extension with `search::index::infer_file_type`, so they cannot
+disagree about what `Video` means.
 
 ## 2. Keyword records carry no metadata
 
@@ -98,12 +112,29 @@ comment. `build_ember_keyword_built` sets `media`, `rating` and `comment` to
 `None` because there is nothing on the wire to fill them from.
 
 **Plan.** Extend the keyword record with an optional trailing tag area and publish
-the media fields the library already has. Keep it optional so an older record
-stays parseable and the change can ride the same additive version move as item 1.
+the media fields. The record side is additive on the same terms item 1 turned out
+to be: `parse_unverified` reads the name from its length prefix and does not
+length-check a keyword record, so an older build parses a longer body correctly
+and ignores the tail, and a storer relays the bytes it was given. The name budget
+has to charge the tag area, the way the channel trailer already does.
 
-**Watch for:** anything added here is publisher-controlled text that lands in the
-UI and in sorting, so it needs the same length caps and sanitisation the eD2K tag
-path applies, and it must not become a second name field that disagrees with
+**Blocked on where the metadata comes from.** "the media fields the library
+already has" was wrong — the library has none. `extract_media_metadata` in
+`commands/sharing.rs` is an on-demand `lofty` header read from a path, exposed for
+one file at a time by the `get_file_media_metadata` command, and nothing persists
+the result. Publishing it needs either a lofty read per file inside the publish
+tick (a blocking disk read on the network task, repeated every republish cycle) or
+somewhere to keep it — a `known.met` tag block or a table, filled by a background
+pass over the library. The second is the right shape and is most of the work.
+
+Worth noting this is not a gap against KAD as such: our own `build_keyword_entry`
+does not publish media tags either, so KAD-to-KAD is no better. Ember rows read
+empty where a *server* result would be populated, and doing it here would put
+Ember ahead rather than level.
+
+**Watch for:** anything added is publisher-controlled text that lands in the UI
+and in sort keys, so it needs the length caps and sanitisation the eD2K tag path
+applies, and it must not become a second name field that disagrees with
 `file_name`.
 
 ## 3. Per-node result ceiling is an eighth of KAD's — done
@@ -173,10 +204,14 @@ them.
 
 ## 6. Smaller items
 
-- **More than eight keywords lose wire intersection.** `MAX_FIND_VALUE_KEYS` is 8,
-  and `OR` queries send no extra keys at all (intersection would be AND
-  semantics). The local filename filter still applies, so this costs bandwidth
-  and responder work rather than recall. Low priority.
+- ~~More than eight keywords lose wire intersection.~~ **Done.**
+  `MAX_FIND_VALUE_KEYS` stays 8 and has to: a peer refuses a higher count at
+  decode and answers nothing, so raising it would cost the whole query timeout
+  against older builds. The surplus rides in the same constraint block instead
+  (`MAX_FIND_VALUE_EXTRA_KEYS`, 15, bounded by the one-byte TLV length), and the
+  responder merges both runs before intersecting, holding the total to
+  `MAX_FIND_VALUE_KEYS_TOTAL`. `OR` queries still send no extra keys, because
+  intersecting them would be AND semantics.
 - ~~Tab overflow evicts Ember rows first.~~ **Done.** Rows are ranked within
   their own origin class before shedding
   ([`searchOverflow.ts`](../src/lib/searchOverflow.ts)), so each class sheds its
@@ -202,11 +237,23 @@ them.
 
 ## What is left
 
-1. **Item 1** (wire constraints) — biggest remaining win; do it as the additive
-   version move so it lowers `EMBER_DHT_MIN_VERSION` instead of partitioning the
-   overlay.
-2. **Item 2** (record metadata) — same version move as item 1 if they land
-   together; otherwise it waits for the next one.
-3. The two entries still open under item 6 — the eight-key `FIND_VALUE` limit
-   (also a wire change) and the extension-index question, which needs a decision
-   about diverging from eMule's keyword index before it needs code.
+1. **Item 2** (record metadata), once there is somewhere to publish media from.
+   The record and wire work is small; persisting the metadata is the task.
+2. The extension-index question under item 6, which needs a decision about
+   diverging from eMule's keyword index before it needs code.
+
+## A note on future wire additions
+
+The version byte is range-checked on receive
+(`decode_message`, and [ember-dht.md item 2](ember-dht.md#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)),
+so raising `EMBER_DHT_VERSION` partitions the overlay on the day it ships
+regardless of where `EMBER_DHT_MIN_VERSION` sits — the *other* side is what
+refuses, and it is running the old range. Lowering the minimum only helps a build
+that already speaks the higher number.
+
+So a change that wants to stay compatible cannot advertise itself in the version
+byte. It has to go where an existing decoder does not look: after the fields a
+payload's parser reads at fixed offsets, or after a record's length-prefixed name.
+Both `FIND_VALUE` and keyword records have that room, which is why items 1 and 3
+landed without touching the version at all. A change that needs to alter an
+existing field still has no path but a bump, and that is still the standing gap.

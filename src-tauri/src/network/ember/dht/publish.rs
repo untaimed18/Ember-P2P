@@ -306,6 +306,59 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
 /// apart on where the name — and therefore the contact block — begins.
 pub(super) const RECORD_HEADER_LEN: usize = 1 + 16 + 16 + 32 + 8 + 32 + 8 + 2;
 
+/// Whether a packed record body satisfies a searcher's `FIND_VALUE`
+/// constraints, read at fixed offsets without parsing or verifying the record.
+///
+/// Cheap on purpose: this runs once per candidate record per inbound
+/// `FIND_VALUE`, on the task that also drives eD2K and KAD, and a hot key can
+/// hold a thousand of them. Size is a fixed offset; the type is inferred from the
+/// name's extension with the same function the searcher used to name it, so the
+/// two sides cannot disagree about what `Video` means.
+///
+/// Unverified bytes decide only what we *decline* to send. A forged body can
+/// therefore keep itself out of an answer, which costs it nothing it could not
+/// achieve by staying silent.
+pub(super) fn record_matches_constraints(
+    data: &[u8],
+    constraints: &super::messages::ValueConstraints,
+) -> bool {
+    if constraints.min_size.is_none()
+        && constraints.max_size.is_none()
+        && constraints.file_type.is_none()
+    {
+        return true;
+    }
+    if data.len() < RECORD_HEADER_LEN {
+        return false;
+    }
+    let Ok(size_bytes) = <[u8; 8]>::try_from(&data[65..73]) else {
+        return false;
+    };
+    let file_size = u64::from_le_bytes(size_bytes);
+    if constraints.min_size.is_some_and(|min| file_size < min) {
+        return false;
+    }
+    if constraints.max_size.is_some_and(|max| file_size > max) {
+        return false;
+    }
+    if let Some(want) = &constraints.file_type {
+        let name_len =
+            u16::from_le_bytes([data[RECORD_HEADER_LEN - 2], data[RECORD_HEADER_LEN - 1]]) as usize;
+        let Some(name) = data.get(RECORD_HEADER_LEN..RECORD_HEADER_LEN + name_len) else {
+            return false;
+        };
+        // Lossy is right here and not in `parse_unverified`: this only decides
+        // whether to serve the record, and a name with a broken byte in it still
+        // has a usable extension.
+        let name = String::from_utf8_lossy(name);
+        let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or_default();
+        if crate::search::index::infer_file_type(extension) != *want {
+            return false;
+        }
+    }
+    true
+}
+
 /// The file hash a packed record body is about, read at its fixed offset.
 /// `None` when the body is too short to hold one.
 ///

@@ -1691,20 +1691,36 @@ impl EmberDht {
     /// (`FOUND_VALUE`, or `FOUND_NODE` if the peer has no record) arrives
     /// via [`Self::handle_message`].
     ///
-    /// Keys past [`messages::MAX_FIND_VALUE_KEYS`] are dropped. A peer rejects
-    /// an over-long request at decode and answers nothing at all, so sending
-    /// one would cost the whole query timeout and return no contacts either;
-    /// callers pass keys most-selective-first, and the keywords dropped here
-    /// are still applied by the caller's own filename filter. Truncating is
-    /// therefore strictly better than letting a long query go unanswered.
+    /// Keys past [`messages::MAX_FIND_VALUE_KEYS`] move into the constraint
+    /// block rather than being dropped. That run's count byte cannot grow — a
+    /// peer refuses a higher count at decode and answers nothing at all, costing
+    /// the whole query timeout — but the block trails the fields an older decoder
+    /// reads, so it ignores the surplus instead of refusing the frame. A long
+    /// query therefore narrows on peers that understand it and is merely
+    /// unnarrowed on the ones that do not, where the caller's own filename filter
+    /// still applies. Anything past [`messages::MAX_FIND_VALUE_KEYS_TOTAL`] is
+    /// dropped; callers pass keys most-selective-first.
     pub fn build_find_value(
         &mut self,
         mut keys: Vec<[u8; 16]>,
         start_position: u16,
+        mut constraints: messages::ValueConstraints,
     ) -> (u32, Vec<u8>) {
-        keys.truncate(messages::MAX_FIND_VALUE_KEYS);
+        if keys.len() > messages::MAX_FIND_VALUE_KEYS {
+            let surplus = keys.split_off(messages::MAX_FIND_VALUE_KEYS);
+            constraints.extra_keys.extend(surplus);
+        }
+        constraints
+            .extra_keys
+            .truncate(messages::MAX_FIND_VALUE_EXTRA_KEYS);
         let request_id = self.next_request_id();
-        let msg = messages::build_find_value(self.local_id, request_id, keys, start_position);
+        let msg = messages::build_find_value(
+            self.local_id,
+            request_id,
+            keys,
+            start_position,
+            constraints,
+        );
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
@@ -2306,17 +2322,24 @@ impl EmberDht {
                 }
             }
             DhtPayload::FindValue {
-                keys,
+                mut keys,
                 start_position,
+                constraints,
             } => {
                 out.find_value_received = true;
+                // Keys the searcher could not fit in the count-prefixed run.
+                // Merged here so the intersection below cannot tell where a key
+                // travelled, and held to the total so a peer cannot buy an
+                // unbounded scan by naming keys in both places.
+                keys.extend_from_slice(&constraints.extra_keys);
+                keys.truncate(messages::MAX_FIND_VALUE_KEYS_TOTAL);
                 // Multi-keyword wire intersection (when `keys.len() > 1`):
                 // serve primary-key (`keys[0]`) records; when this node also
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
                 if let Some(reply) =
-                    intersect_find_value_records(&self.store, &keys, start_position)
+                    intersect_find_value_records(&self.store, &keys, start_position, &constraints)
                 {
                     out.find_value_hit = true;
                     out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
@@ -2564,8 +2587,25 @@ fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
     start_position: u16,
+    constraints: &messages::ValueConstraints,
 ) -> Option<FoundValueReply> {
-    let (primary, filtered) = intersect_live_records(store, keys)?;
+    let (primary, mut filtered) = intersect_live_records(store, keys)?;
+
+    // Before the packing below, which is the whole point: a constraint applied
+    // after truncation cannot recover the matching records that fell outside the
+    // page. `total_available` is then the count of records that *match*, so a
+    // searcher pages through the filtered list rather than through positions
+    // most of which it would discard.
+    if !constraints.is_empty() {
+        filtered
+            .retain(|record| super::publish::record_matches_constraints(&record.data, constraints));
+        if filtered.is_empty() {
+            // Nothing here for this searcher. Answering `FOUND_NODE` instead is
+            // what we already do for a key we do not hold, and it keeps the walk
+            // moving toward peers that may hold a match.
+            return None;
+        }
+    }
 
     // Pack records until the reply would stop fitting a datagram. A key can
     // legitimately hold far more records than one response can carry, and an
@@ -2759,7 +2799,7 @@ fn intersect_live_records<'a>(
 #[cfg(test)]
 impl EmberDht {
     fn build_find_value_page_one(&mut self, keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
-        self.build_find_value(keys, 0)
+        self.build_find_value(keys, 0, messages::ValueConstraints::default())
     }
 }
 
@@ -3605,6 +3645,174 @@ mod tests {
         assert_eq!(b.store_stats(), (1, 1), "the live store is unchanged");
     }
 
+    /// A query with more keywords than the count-prefixed run can name must still
+    /// intersect on all of them. The surplus rides in the constraint block, and
+    /// the responder merges the two runs before intersecting — so where a key
+    /// travelled cannot change the answer.
+    #[test]
+    fn keys_past_the_count_prefixed_run_still_intersect() {
+        let mut a = dht(70);
+        let mut b = dht(71);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(70, 4672);
+        let b_addr = addr(71, 4672);
+
+        // Ten words, so two have to travel in the block. Only one of the two
+        // files carries every word, and the odd one out is under the *last*
+        // word — the one that would be dropped if the surplus were truncated
+        // rather than carried.
+        let words: Vec<String> = (0..10).map(|i| format!("keyword{i}")).collect();
+        let wanted = [0x11u8; 16];
+        let other = [0x22u8; 16];
+        let mut stored = 0i64;
+        for (w, word) in words.iter().enumerate() {
+            let mut files = vec![wanted];
+            if w < words.len() - 1 {
+                files.push(other);
+            }
+            for file_hash in files {
+                let record =
+                    a.build_keyword_record(word, file_hash, [0u8; 32], 4096, "release.mkv");
+                let (_rid, bytes) = a.build_store(
+                    record.keyword_hash,
+                    record.data.clone(),
+                    record.signature,
+                );
+                assert!(b
+                    .handle_message(&bytes, a_addr, a_noise, 1000 + stored)
+                    .stored_record);
+                stored += 1;
+            }
+        }
+
+        let keys: Vec<[u8; 16]> = words
+            .iter()
+            .map(|w| super::super::search::keyword_hash(w))
+            .collect();
+        assert!(keys.len() > messages::MAX_FIND_VALUE_KEYS);
+
+        let (_rid, find) = a.build_find_value(keys, 0, messages::ValueConstraints::default());
+        let reply = b.handle_message(&find, a_addr, a_noise, 2000);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2001)
+            .found_value
+            .expect("FOUND_VALUE");
+        let hashes: Vec<[u8; 16]> = page
+            .records
+            .iter()
+            .filter_map(|blob| {
+                super::super::publish::SignedRecord::from_value_blob(blob).map(|r| r.file_hash)
+            })
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![wanted],
+            "the keyword carried in the block has to narrow the answer like any other"
+        );
+    }
+
+    /// The point of sending constraints at all: the responder has to drop what
+    /// the searcher cannot use *before* it packs a page, so a page carries
+    /// matches instead of whatever happened to sit at the front of the key.
+    ///
+    /// A datagram fits roughly five keyword records, so a key holding fifty
+    /// non-matching files ahead of the matches served the searcher pages of
+    /// nothing — and a search has a bounded budget, so those pages were spent.
+    #[test]
+    fn a_responder_applies_a_searchers_constraints_before_it_packs() {
+        let mut a = dht(60);
+        let mut b = dht(61);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(60, 4672);
+        let b_addr = addr(61, 4672);
+
+        // Fifty small files under one word, then the two the searcher wants.
+        // Order matters: the wanted files are last, so an unfiltered first page
+        // cannot reach them.
+        let mut key = [0u8; 16];
+        for i in 0..50u8 {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i;
+            let record =
+                a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 1024, "ubuntu-notes.txt");
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(b
+                .handle_message(&bytes, a_addr, a_noise, 1000 + i as i64)
+                .stored_record);
+        }
+        for (i, name) in ["ubuntu-release.mkv", "ubuntu-talk.mkv"].iter().enumerate() {
+            let mut file_hash = [0xF0u8; 16];
+            file_hash[0] = i as u8;
+            let record =
+                a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 700_000_000, name);
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(b
+                .handle_message(&bytes, a_addr, a_noise, 1100 + i as i64)
+                .stored_record);
+        }
+
+        // Unconstrained, the first page is all text files — the wanted ones are
+        // fifty positions away.
+        let (_rid, plain) = a.build_find_value(vec![key], 0, messages::ValueConstraints::default());
+        let reply = b.handle_message(&plain, a_addr, a_noise, 2000);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2001)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(page.total_available, 52);
+        assert!(
+            page.records.iter().all(|blob| {
+                super::super::publish::SignedRecord::from_value_blob(blob)
+                    .is_some_and(|r| r.file_name.ends_with(".txt"))
+            }),
+            "the front of the key is what an unconstrained page serves"
+        );
+
+        // Constrained on size and type, the same first page carries the matches
+        // and the total counts only them — so the searcher pages through matches
+        // rather than through positions it would throw away.
+        let constraints = messages::ValueConstraints {
+            min_size: Some(100_000_000),
+            file_type: Some("Video".to_string()),
+            ..Default::default()
+        };
+        let (_rid, narrow) = a.build_find_value(vec![key], 0, constraints);
+        let reply = b.handle_message(&narrow, a_addr, a_noise, 2002);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2003)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(
+            page.total_available, 2,
+            "the total has to count matches, or paging walks the discards"
+        );
+        assert_eq!(page.records.len(), 2);
+        for blob in &page.records {
+            let record =
+                super::super::publish::SignedRecord::from_value_blob(blob).expect("signed");
+            assert!(record.file_name.ends_with(".mkv"));
+            assert_eq!(record.file_size, 700_000_000);
+        }
+
+        // A constraint nothing under the key satisfies is answered the way a key
+        // we do not hold is: with contacts, so the walk keeps moving.
+        let impossible = messages::ValueConstraints {
+            min_size: Some(u64::MAX),
+            ..Default::default()
+        };
+        let (_rid, hopeless) = a.build_find_value(vec![key], 0, impossible);
+        let reply = b.handle_message(&hopeless, a_addr, a_noise, 2004);
+        assert!(
+            !reply.find_value_hit,
+            "no match must not be answered as a hit"
+        );
+    }
+
     /// A record too large for the budget *left* on a page must be reached by a
     /// later one. The packer keeps scanning past it for something that still
     /// fits, so the records a page serves are not always a contiguous run — and
@@ -3646,7 +3854,8 @@ mod tests {
         let mut seen: HashSet<[u8; 16]> = HashSet::new();
         let mut position = 0u16;
         for round in 0..12 {
-            let (_rid, find) = a.build_find_value(vec![key], position);
+            let (_rid, find) =
+                a.build_find_value(vec![key], position, messages::ValueConstraints::default());
             let reply = b.handle_message(&find, a_addr, a_noise, 2000 + round);
             assert!(reply.find_value_hit, "page at {position} must be served");
             let page = a
@@ -4036,7 +4245,11 @@ mod tests {
             }
             rounds += 1;
             assert!(rounds < 40, "paging must terminate");
-            let (_rid, next_find) = a.build_find_value(vec![key], page.next_position);
+            let (_rid, next_find) = a.build_find_value(
+                vec![key],
+                page.next_position,
+                messages::ValueConstraints::default(),
+            );
             let reply = b.handle_message(&next_find, a_addr, a_noise, 2000 + rounds);
             assert!(reply.find_value_hit, "a page inside the key must be served");
             page = a

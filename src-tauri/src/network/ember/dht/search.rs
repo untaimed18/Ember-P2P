@@ -333,6 +333,10 @@ pub struct IterativeSearch {
     pub target: EmberNodeId,
     /// For multi-keyword searches: additional keyword hashes to include.
     pub keyword_hashes: Vec<[u8; 16]>,
+    /// What this search will accept, sent with every `FIND_VALUE` so responders
+    /// can drop the rest before they pack a page. Empty for a lookup with no
+    /// filters, and for every kind of value lookup that is not a user search.
+    value_constraints: super::messages::ValueConstraints,
     shortlist: Vec<ShortlistEntry>,
     /// Collected value results (for FIND_VALUE searches).
     pub results: Vec<SearchResultRecord>,
@@ -461,6 +465,7 @@ impl IterativeSearch {
             seed_round_done: false,
             seeded_count: 0,
             budget_spent: HashSet::new(),
+            value_constraints: super::messages::ValueConstraints::default(),
         }
     }
 
@@ -1272,6 +1277,21 @@ impl IterativeSearch {
             .iter()
             .filter(|e| e.state == NodeState::Responded)
             .count()
+    }
+
+    /// Narrow every `FIND_VALUE` this search sends to what the user asked for.
+    ///
+    /// Set once, right after the search is started, by the keyword path only. The
+    /// other value lookups — source discovery, channel presence, the dev
+    /// commands — are asking for one specific record rather than browsing an
+    /// index, so there is nothing for a responder to filter.
+    pub fn set_value_constraints(&mut self, constraints: super::messages::ValueConstraints) {
+        self.value_constraints = constraints;
+    }
+
+    /// What to attach to this search's queries.
+    pub fn value_constraints(&self) -> &super::messages::ValueConstraints {
+        &self.value_constraints
     }
 
     /// Nodes this search has sent a query to, for the progress the search page
