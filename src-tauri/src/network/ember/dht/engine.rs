@@ -1859,6 +1859,28 @@ impl EmberDht {
         )
     }
 
+    /// The same, announcing the media metadata the publisher holds for the file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_keyword_record_with_media(
+        &self,
+        keyword: &str,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        file_size: u64,
+        file_name: &str,
+        media: Option<&crate::types::MediaMetadata>,
+    ) -> SignedRecord {
+        SignedRecord::keyword_with_media(
+            keyword,
+            file_hash,
+            ember_file_hash,
+            file_size,
+            file_name,
+            media,
+            &self.signing_key,
+        )
+    }
+
     /// Sign a source record advertising `contact` as a source for
     /// `file_hash`, ready to publish on the file's source key. The contact
     /// is part of the signed payload, so a downloader can dial it after

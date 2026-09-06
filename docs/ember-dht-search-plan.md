@@ -40,11 +40,19 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
-Everything except [item 2](#2-keyword-records-carry-no-metadata) is done. The
-wire additions turned out not to need a version bump at all — see item 1 for why
-bumping would have been actively wrong — so what is left is item 2, which is
-blocked on something else entirely: media metadata is not persisted anywhere to
-publish *from*.
+Every item is done. None of the three wire additions needed a version bump — see
+item 1 for why bumping would have been actively wrong — and the only thing left on
+the list is a product question (the extension-index one under item 6) rather than
+engineering.
+
+The two kinds of change this overlay is for, and which each item was:
+
+- **Parity with KAD**, where KAD was the baseline and Ember was behind: the
+  per-node result ceiling (item 3), wire-side constraints (item 1), the
+  complete-source count and search progress.
+- **Ahead of KAD**, doing something eMule has no answer for: media on keyword
+  records (item 2), a digest corroborated across publishers (item 4), availability
+  counted from signatures rather than claimed (item 5).
 
 - **`complete_sources` was `0` on every Ember row**, which every consumer reads as
   "none": the Min Complete filter silently dropped all of them, the Complete
@@ -103,7 +111,7 @@ Type inference is the one thing shared across the wire: both sides derive it fro
 the name's extension with `search::index::infer_file_type`, so they cannot
 disagree about what `Video` means.
 
-## 2. Keyword records carry no metadata — format done, publishing blocked
+## 2. Keyword records carry no metadata — done
 
 A record body is type, keyword hash, file hash, Ember digest, size, name. KAD
 rows arrive with media tags, so on an Ember-only hit the Length, Bitrate, Codec,
@@ -111,7 +119,7 @@ Artist, Album and Title columns are always empty, and there is no rating or
 comment. `build_ember_keyword_built` sets `media`, `rating` and `comment` to
 `None` because there is nothing on the wire to fill them from.
 
-**The record format is done, and the reader shipped first on purpose.** A keyword
+**The reader shipped one commit before the writer, on purpose.** A keyword
 record may now carry an optional media block after its name — `version(1)` then
 `tag/len/value` triples for duration, bitrate, codec, artist, album and title —
 parsed into `SignedRecord::media` and through to the row's `media`. Additive on
@@ -123,25 +131,29 @@ does, and the signature covers it so a relay cannot rewrite it.
 
 Shipping the reader before the writer is the right order for a wire change: by the
 time anything publishes a block, the builds that will receive it already
-understand it. Nothing writes one yet.
+understand it.
 
-**Publishing is blocked on where the metadata comes from.** "the media fields the
-library already has" was wrong — the library has none. `extract_media_metadata` in
-`commands/sharing.rs` is an on-demand `lofty` header read from a path, exposed one
-file at a time by `get_file_media_metadata`, and nothing persists the result.
+**Publishing it needed somewhere to publish *from*.** "the media fields the library
+already has" was wrong — the library had none. `extract_media_metadata` was an
+on-demand `lofty` header read, exposed one file at a time by
+`get_file_media_metadata`, and nothing kept the result.
 
-The agreed shape is to persist it: `known.met` has room (Ember-only tags run to
-`0xE5`; `0xE6` on is free) for duration, bitrate and the three text fields, plus a
-"scanned" marker so a file with no media is not re-probed every pass. Filling it
-wants the same treatment as the AICH and BLAKE3 top-ups, which already have a
-one-time migration path (`REHASH_ID_PREFIX`) — extract on first hash, and sweep
-existing shares in the background. Then the publish loop reads the record rather
-than touching a disk.
+It is now persisted in `known.met` under Ember-only tags `0xE6`–`0xEC`: duration,
+bitrate, codec, artist, album, title, and a **scanned marker**. The marker is the
+load-bearing part — most of a library has no media, so "probed, found nothing" has
+to be as durable as a positive result or every archive is re-read on every pass to
+learn the same nothing.
 
-Worth noting this is not a gap against KAD as such: our own `build_keyword_entry`
-does not publish media tags either, so KAD-to-KAD is no better. Ember rows read
-empty where a *server* result would be populated, and doing this puts Ember ahead
-rather than level.
+The probe rides the keyword publish tick rather than a second schedule beside it.
+That tick already selects a budgeted slice of due files
+(`ember_keyword_files_per_tick`), so it is a background pass with a rate limit
+someone already reasoned about; each file is read once, off-thread, ever. A rehash
+carries the result forward, because rehashing does not change the bytes' media.
+
+Not a gap against KAD as such: our own `build_keyword_entry` does not publish media
+tags either, so KAD-to-KAD is no better. Ember rows read empty where a *server*
+result would be populated, and this puts Ember ahead rather than level — the second
+kind of change this overlay is for.
 
 **Watch for:** the publisher-supplied strings are capped
 (`MEDIA_MAX_CODEC_BYTES` / `MEDIA_MAX_TEXT_BYTES`), refused rather than shown when
@@ -248,12 +260,10 @@ them.
 
 ## What is left
 
-1. **Publishing media** (the second half of item 2). The record format and the
-   reader are in; what remains is persisting the metadata — `known.met` tags from
-   `0xE6`, extraction on first hash, a background sweep for existing shares — and
-   then reading it in the keyword publish loop.
-2. The extension-index question under item 6, which needs a decision about
-   diverging from eMule's keyword index before it needs code.
+Only the extension-index question under item 6, which needs a decision about
+diverging from eMule's keyword index before it needs code: making `.mp3` a
+searchable term means indexing extensions, which the eMule keyword index
+deliberately does not. Everything else on this list has landed.
 
 ## A note on future wire additions
 

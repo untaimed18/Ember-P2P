@@ -5116,6 +5116,13 @@ async fn handle_command_inner(
                                     .as_ref()
                                     .map(|r| r.last_ember_keyword_publish)
                                     .unwrap_or(0),
+                                // A rehash does not change the bytes' media, so
+                                // carry the probe result rather than making the
+                                // publisher read the file again.
+                                media: existing.as_ref().and_then(|r| r.media.clone()),
+                                media_scanned: existing
+                                    .as_ref()
+                                    .is_some_and(|r| r.media_scanned),
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
                             // drop publish timers so the next tick advertises

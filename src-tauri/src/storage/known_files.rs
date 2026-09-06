@@ -56,6 +56,20 @@ const FT_EMBER_SOURCE_PUBLISH: u8 = 0xE4;
 /// restart that treated them as never-published would republish the whole
 /// library on launch.
 const FT_EMBER_KEYWORD_PUBLISH: u8 = 0xE5;
+/// Ember-only tags: media metadata read off the file once, so the Ember keyword
+/// publisher has something to announce without re-reading the disk on every
+/// republish cycle.
+///
+/// `SCANNED` is what makes "this file has no media" a durable answer. Without it
+/// every archive and installer in the library would be re-probed on every pass,
+/// forever, to learn the same nothing.
+const FT_EMBER_MEDIA_SCANNED: u8 = 0xE6;
+const FT_EMBER_MEDIA_DURATION: u8 = 0xE7;
+const FT_EMBER_MEDIA_BITRATE: u8 = 0xE8;
+const FT_EMBER_MEDIA_CODEC: u8 = 0xE9;
+const FT_EMBER_MEDIA_ARTIST: u8 = 0xEA;
+const FT_EMBER_MEDIA_ALBUM: u8 = 0xEB;
+const FT_EMBER_MEDIA_TITLE: u8 = 0xEC;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -65,6 +79,18 @@ const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 // with that supported scale instead of silently retaining only the first
 // folder's worth of mappings.
 const MAX_KNOWN_PATH_MAPPINGS: usize = 512 * 100_000;
+
+/// Set one field of a record's media, creating the struct on first sight.
+///
+/// The fields arrive as separate tags in whatever order they were written, and
+/// most records carry none at all, so the struct is built lazily rather than
+/// defaulted into every record that will never use it.
+fn media_field(
+    media: &mut Option<crate::types::MediaMetadata>,
+    set: impl FnOnce(&mut crate::types::MediaMetadata),
+) {
+    set(media.get_or_insert_with(Default::default));
+}
 
 #[derive(Debug, Clone)]
 pub struct KnownFileRecord {
@@ -104,6 +130,16 @@ pub struct KnownFileRecord {
     /// by a storer, unix seconds. See `FT_EMBER_KEYWORD_PUBLISH`. Zero means
     /// never published (or a known.met written before this field existed).
     pub last_ember_keyword_publish: u32,
+    /// Media metadata read off the file, for the Ember keyword publisher to
+    /// announce. `None` here does not mean "no media" — see
+    /// [`Self::media_scanned`] for that.
+    pub media: Option<crate::types::MediaMetadata>,
+    /// Whether this file has been probed for media at all.
+    ///
+    /// Separate from `media` being `Some` because "probed, found nothing" is the
+    /// answer for most of a library and has to be as durable as a positive one.
+    /// Collapsing the two would re-read every archive on every publish pass.
+    pub media_scanned: bool,
 }
 
 /// Per-physical-path metadata for a content-level known.met record. known.met
@@ -490,6 +526,8 @@ impl KnownFileList {
             complete_sources: 0,
             last_ember_source_publish: 0,
             last_ember_keyword_publish: 0,
+            media: None,
+            media_scanned: false,
         };
 
         for _ in 0..tag_count {
@@ -531,6 +569,18 @@ impl KnownFileList {
                         FT_FILENAME => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         FT_EMBER_FILE_HASH => record.ember_file_hash = s,
+                        FT_EMBER_MEDIA_CODEC => {
+                            media_field(&mut record.media, |m| m.codec = Some(s))
+                        }
+                        FT_EMBER_MEDIA_ARTIST => {
+                            media_field(&mut record.media, |m| m.artist = Some(s))
+                        }
+                        FT_EMBER_MEDIA_ALBUM => {
+                            media_field(&mut record.media, |m| m.album = Some(s))
+                        }
+                        FT_EMBER_MEDIA_TITLE => {
+                            media_field(&mut record.media, |m| m.title = Some(s))
+                        }
                         _ => {}
                     }
                 }
@@ -559,6 +609,13 @@ impl KnownFileList {
                         FT_EMBER_SOURCES => record.complete_sources = v,
                         FT_EMBER_SOURCE_PUBLISH => record.last_ember_source_publish = v,
                         FT_EMBER_KEYWORD_PUBLISH => record.last_ember_keyword_publish = v,
+                        FT_EMBER_MEDIA_SCANNED => record.media_scanned = v != 0,
+                        FT_EMBER_MEDIA_DURATION => {
+                            media_field(&mut record.media, |m| m.duration = Some(v))
+                        }
+                        FT_EMBER_MEDIA_BITRATE => {
+                            media_field(&mut record.media, |m| m.bitrate = Some(v))
+                        }
                         _ => {}
                     }
                 }
@@ -706,6 +763,35 @@ impl KnownFileList {
                 self.touch_dirty();
             }
         }
+    }
+
+    /// Record the result of probing a file for media, including the negative
+    /// result. No-op when the hash is unknown or nothing changed.
+    ///
+    /// `media` is what the probe found; `None` means the file has none. Either way
+    /// the file is marked scanned, so it is never probed again — the point of
+    /// persisting this is that a disk read per file per republish cycle is a cost
+    /// the publisher should pay once.
+    pub fn set_media(&mut self, hash: &[u8; 16], media: Option<crate::types::MediaMetadata>) {
+        if let Some(record) = self.files.get_mut(hash) {
+            if record.media_scanned && record.media == media {
+                return;
+            }
+            record.media = media;
+            record.media_scanned = true;
+            self.touch_dirty();
+        }
+    }
+
+    /// What a file's media probe found, and whether it has happened at all.
+    /// `None` for a hash known.met has never heard of.
+    pub fn media_for(
+        &self,
+        hash: &[u8; 16],
+    ) -> Option<(bool, Option<crate::types::MediaMetadata>)> {
+        self.files
+            .get(hash)
+            .map(|r| (r.media_scanned, r.media.clone()))
     }
 
     /// Persist an Ember keyword-publish timestamp without replacing the rest
@@ -1068,6 +1154,33 @@ impl KnownFileList {
                     record.last_ember_keyword_publish,
                 )?;
                 tag_count += 1;
+            }
+            // Written even when nothing was found: the marker is what stops the
+            // publisher re-probing a file that has no media to begin with.
+            if record.media_scanned {
+                write_u32_tag(&mut tags, FT_EMBER_MEDIA_SCANNED, 1)?;
+                tag_count += 1;
+            }
+            if let Some(media) = &record.media {
+                if let Some(duration) = media.duration {
+                    write_u32_tag(&mut tags, FT_EMBER_MEDIA_DURATION, duration)?;
+                    tag_count += 1;
+                }
+                if let Some(bitrate) = media.bitrate {
+                    write_u32_tag(&mut tags, FT_EMBER_MEDIA_BITRATE, bitrate)?;
+                    tag_count += 1;
+                }
+                for (id, text) in [
+                    (FT_EMBER_MEDIA_CODEC, &media.codec),
+                    (FT_EMBER_MEDIA_ARTIST, &media.artist),
+                    (FT_EMBER_MEDIA_ALBUM, &media.album),
+                    (FT_EMBER_MEDIA_TITLE, &media.title),
+                ] {
+                    if let Some(text) = text.as_deref().filter(|t| !t.is_empty()) {
+                        write_string_tag(&mut tags, id, text)?;
+                        tag_count += 1;
+                    }
+                }
             }
 
             buf.write_u32::<LittleEndian>(tag_count)?;
@@ -1580,6 +1693,8 @@ mod tests {
             complete_sources: 0,
             last_ember_source_publish: 0,
             last_ember_keyword_publish: 0,
+            media: None,
+            media_scanned: false,
         }
     }
 
@@ -2210,6 +2325,99 @@ mod tests {
             0,
             "the Ember tag must not be read as KAD's last_publish_src"
         );
+    }
+
+    /// Media is persisted so the Ember keyword publisher can announce it without
+    /// re-reading the file on every republish cycle, which means both halves have
+    /// to survive a round trip: what the probe found, and the fact that it ran.
+    ///
+    /// The second is the one that is easy to lose and expensive to lose. Most of a
+    /// library has no media, and without a durable "already looked" every archive
+    /// and installer is re-read on every pass to learn the same nothing.
+    #[test]
+    fn media_and_the_fact_it_was_probed_both_survive_a_round_trip() {
+        let media = crate::types::MediaMetadata {
+            duration: Some(214),
+            bitrate: Some(320),
+            codec: Some("mp3".into()),
+            artist: Some("Anne Müller".into()),
+            album: Some("Heliopause".into()),
+            title: Some("Drifting Circles".into()),
+        };
+
+        let mut kf = KnownFileList::new();
+        let with = sample_record();
+        let with_hash = with.file_hash;
+        kf.add_or_update(with);
+        let mut without = sample_record();
+        without.file_hash = [0x5A; 16];
+        // A distinct path as well as a distinct hash: `add_or_update` keys the
+        // companion path index too, so reusing the fixture's path replaces the
+        // record instead of adding a second one.
+        without.file_path = format!("{}.2", without.file_path);
+        let without_hash = without.file_hash;
+        kf.add_or_update(without);
+
+        kf.set_media(&with_hash, Some(media.clone()));
+        // The negative result, which has to be as durable as the positive one.
+        kf.set_media(&without_hash, None);
+        assert!(kf.is_dirty(), "a probe result must schedule a save");
+        assert_eq!(kf.media_for(&with_hash), Some((true, Some(media.clone()))));
+        assert_eq!(kf.media_for(&without_hash), Some((true, None)));
+        assert_eq!(
+            kf.media_for(&[0xEE; 16]),
+            None,
+            "a hash known.met never heard of is not 'scanned'"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_media_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        kf.save(&path).expect("save");
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.media_for(&with_hash),
+            Some((true, Some(media))),
+            "every media field has to come back, accents included"
+        );
+        assert_eq!(
+            loaded.media_for(&without_hash),
+            Some((true, None)),
+            "'probed, found nothing' has to survive or the file is re-read forever"
+        );
+    }
+
+    /// A record written before the media tags existed must read back as
+    /// *unprobed* rather than as "no media", or the publisher would announce
+    /// nothing for a whole library and never look.
+    #[test]
+    fn a_record_without_the_media_tags_reads_as_unprobed() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        assert!(r.media.is_none() && !r.media_scanned);
+        kf.add_or_update(r);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_no_media_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        kf.save(&path).expect("save");
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.media_for(&hash), Some((false, None)));
     }
 
     /// Retracting a publication has to reach disk, not just the live maps.

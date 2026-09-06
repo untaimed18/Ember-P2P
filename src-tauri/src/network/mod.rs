@@ -20216,6 +20216,8 @@ mod ember_publish_hydration_tests {
             complete_sources: 0,
             last_ember_source_publish: now,
             last_ember_keyword_publish: now,
+            media: None,
+            media_scanned: false,
         }
     }
 
@@ -28155,6 +28157,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         .as_ref()
                                         .map(|record| record.last_ember_keyword_publish)
                                         .unwrap_or(0),
+                                    media: existing.as_ref().and_then(|r| r.media.clone()),
+                                    media_scanned: existing
+                                        .as_ref()
+                                        .is_some_and(|r| r.media_scanned),
                                 };
                                 let completed_friends_only = record.friends_only;
                                 known_files.add_or_update(record.clone());
@@ -34229,7 +34235,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut state,
                     &settings,
                     &local_index,
-                    &known_files,
+                    &mut known_files,
                 )
                 .await;
 
@@ -48431,6 +48437,8 @@ mod known_friends_only_snapshot_tests {
             complete_sources: 0,
             last_ember_source_publish: 0,
             last_ember_keyword_publish: 0,
+            media: None,
+            media_scanned: false,
         }
     }
 
@@ -49678,7 +49686,7 @@ async fn maybe_publish_ember_keywords(
     state: &mut NetworkState,
     settings: &AppSettings,
     local_index: &Arc<RwLock<LocalIndex>>,
-    known_files: &KnownFileList,
+    known_files: &mut KnownFileList,
 ) {
     if !settings.ember_native_enabled || ember_publishable_peer_count(state) == 0 {
         return;
@@ -49688,7 +49696,9 @@ async fn maybe_publish_ember_keywords(
     }
 
     let now = std::time::Instant::now();
-    let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
+    // The path trails the fields the publish itself needs, for the one-time media
+    // probe below.
+    let due: Vec<([u8; 16], u64, String, [u8; 32], String)> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
         let restricted = collect_friends_only_hashes(&idx, known_files);
@@ -49740,6 +49750,7 @@ async fn maybe_publish_ember_keywords(
                     f.size,
                     f.name.clone(),
                     parse_ember_file_hash(&f.ember_file_hash),
+                    f.path.clone(),
                 ))
             })
             .collect()
@@ -49748,8 +49759,51 @@ async fn maybe_publish_ember_keywords(
         return;
     }
 
+    // Read the media off any of these files that has never been probed, and
+    // remember the answer — including "none", which is the answer for most of a
+    // library and has to be as durable as a positive one or every archive is
+    // re-read on every pass. Off-thread because it is a disk read, and bounded
+    // because `due` already is: this is the background pass, riding the schedule
+    // that exists rather than a second one alongside it.
+    let unscanned: Vec<([u8; 16], String)> = due
+        .iter()
+        .filter(|(hash, _, _, _, path)| {
+            !path.is_empty() && known_files.media_for(hash).is_some_and(|(seen, _)| !seen)
+        })
+        .map(|(hash, _, _, _, path)| (*hash, path.clone()))
+        .collect();
+    if !unscanned.is_empty() {
+        let probed = tokio::task::spawn_blocking(move || {
+            unscanned
+                .into_iter()
+                .map(|(hash, path)| {
+                    (
+                        hash,
+                        crate::commands::sharing::extract_media_metadata(&path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match probed {
+            Ok(results) => {
+                for (hash, media) in results {
+                    known_files.set_media(&hash, media);
+                }
+            }
+            Err(e) => debug!("Ember keyword publish: media probe task failed: {e}"),
+        }
+    }
+
     let mut files_with_no_keywords: Vec<[u8; 16]> = Vec::new();
-    for (file_hash, file_size, file_name, ember_file_hash) in due {
+    for (file_hash, file_size, file_name, ember_file_hash, _path) in due {
+        // Whatever the probe above (or an earlier pass) found. Announced with the
+        // record so an Ember-only search hit can fill the Length, Bitrate, Codec
+        // and tag columns a server result fills — something KAD has no room for
+        // in a keyword entry at all.
+        let media = known_files
+            .media_for(&file_hash)
+            .and_then(|(_, media)| media);
         // Same tokenization as KAD keyword publishing/search so an Ember
         // search hashes the identical keyword set.
         let keywords = kad::publish::extract_keywords(&file_name);
@@ -49766,12 +49820,13 @@ async fn maybe_publish_ember_keywords(
             Vec<ember::dht::EmberContact>,
         )> = Vec::new();
         for keyword in keywords {
-            let record = state.ember_dht.build_keyword_record(
+            let record = state.ember_dht.build_keyword_record_with_media(
                 &keyword,
                 file_hash,
                 ember_file_hash,
                 file_size,
                 &file_name,
+                media.as_ref(),
             );
             state.ember_dht.store_own_record(&record);
             let targets = ember_overlay_publish_targets(state, record.keyword_hash);

@@ -381,6 +381,8 @@ mod tests {
             complete_sources: 0,
             last_ember_source_publish: 0,
             last_ember_keyword_publish: 0,
+            media: None,
+            media_scanned: false,
         });
         known.save(&base.join("known.met")).unwrap();
 
