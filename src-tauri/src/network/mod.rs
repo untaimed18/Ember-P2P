@@ -2584,6 +2584,128 @@ mod server_search_phases_tests {
     }
 }
 
+/// Which legs of a search actually get asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchLegs {
+    /// The connected eD2k server, over its TCP session.
+    server: bool,
+    /// `OP_GLOBSEARCH` to the rest of the server list, over UDP.
+    udp: bool,
+    kad: bool,
+    ember: bool,
+}
+
+/// Work out which legs a search runs on.
+///
+/// `has_keyword_query` is whether a keyword leg has anything at all to send
+/// (terms, or filters that stand on their own); `has_keywords` is whether the
+/// parsed query left a positive term, which is what Kad and Ember look up.
+///
+/// The rule worth naming here: `Server` asks that one connection and nothing
+/// else. It is what keeps "Search Related Files" the server-side feature it is
+/// in eMule — the co-share request is a question only the connected server can
+/// answer, and the keyword half of a related plan is put to that same server
+/// rather than fanned out to Kad, the Ember DHT or the rest of the server
+/// list.
+fn search_legs(
+    method: SearchMethod,
+    has_keyword_query: bool,
+    has_keywords: bool,
+    user_offline: bool,
+) -> SearchLegs {
+    SearchLegs {
+        server: matches!(method, SearchMethod::Global | SearchMethod::Server),
+        // Global's UDP leg does not need a server *session*, so it kept
+        // spraying `OP_GLOBSEARCH` at the whole server list after the user had
+        // gone offline. Ember still answers a Global query, which is the
+        // documented offline fallback; talking to eD2K servers is not.
+        //
+        // `has_keyword_query` is what stops a co-share-only related search
+        // here: the search expression is empty in that case, and this leg
+        // would queue a keywordless `OP_GLOBSEARCH` to every server in the
+        // list. Only the one connected server can answer a co-share request,
+        // and it is asked over TCP.
+        udp: has_keyword_query && matches!(method, SearchMethod::Global) && !user_offline,
+        kad: has_keywords && matches!(method, SearchMethod::Global | SearchMethod::Kad),
+        ember: matches!(method, SearchMethod::Global | SearchMethod::Ember),
+    }
+}
+
+#[cfg(test)]
+mod search_legs_tests {
+    use super::{search_legs, SearchLegs, SearchMethod};
+
+    /// eMule's "Search Related Files" is server-side, and this is the gate that
+    /// keeps ours the same: a related search is issued as a `Server` search, so
+    /// neither half of its plan — not even the keyword query derived from the
+    /// seed's name — reaches Kad or the Ember DHT.
+    #[test]
+    fn server_asks_the_server_and_nothing_else() {
+        assert_eq!(
+            search_legs(SearchMethod::Server, true, true, false),
+            SearchLegs {
+                server: true,
+                udp: false,
+                kad: false,
+                ember: false,
+            },
+        );
+    }
+
+    #[test]
+    fn global_asks_every_leg_it_can() {
+        assert_eq!(
+            search_legs(SearchMethod::Global, true, true, false),
+            SearchLegs {
+                server: true,
+                udp: true,
+                kad: true,
+                ember: true,
+            },
+        );
+    }
+
+    #[test]
+    fn kad_and_ember_methods_stay_on_their_own_network() {
+        assert_eq!(
+            search_legs(SearchMethod::Kad, true, true, false),
+            SearchLegs {
+                server: false,
+                udp: false,
+                kad: true,
+                ember: false,
+            },
+        );
+        assert_eq!(
+            search_legs(SearchMethod::Ember, true, true, false),
+            SearchLegs {
+                server: false,
+                udp: false,
+                kad: false,
+                ember: true,
+            },
+        );
+    }
+
+    #[test]
+    fn going_offline_stops_the_ed2k_udp_spray_and_leaves_ember() {
+        let legs = search_legs(SearchMethod::Global, true, true, true);
+        assert!(!legs.udp, "no OP_GLOBSEARCH at the server list while offline");
+        assert!(legs.ember, "Ember is the documented offline fallback");
+    }
+
+    /// A co-share-only related search: the seed's name yielded no searchable
+    /// word, so there is nothing to put on a keyword leg and the hashes go to
+    /// the server on their own.
+    #[test]
+    fn a_search_with_no_keywords_asks_no_keyword_leg() {
+        let legs = search_legs(SearchMethod::Global, false, false, false);
+        assert!(!legs.udp, "a keywordless OP_GLOBSEARCH is not a search");
+        assert!(!legs.kad);
+        assert!(legs.server, "the co-share request still goes over TCP");
+    }
+}
+
 /// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
 /// (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {

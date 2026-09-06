@@ -205,10 +205,13 @@ async fn handle_command_inner(
             // the whole point is its global view of who shares what, which no
             // other leg of the search has. It is asked in *addition* to the
             // keyword query rather than instead of it; see the two-phase send
-            // below. The UDP global-search leg deliberately keeps the keyword
-            // expression: a server without `SRV_TCPFLG_RELATEDSEARCH` would
-            // read `related::<hash>` as a filename substring and answer with
-            // nothing useful.
+            // below. The co-share term goes on that one TCP expression only,
+            // never on the shared `search_expr`, because a server without
+            // `SRV_TCPFLG_RELATEDSEARCH` would read `related::<hash>` as a
+            // filename substring and answer with nothing useful. The UI runs a
+            // related search as a `Server`-method search — eMule's feature is
+            // server-side — so in practice no other leg ever sees one; the
+            // per-leg gates below stay honest rather than trusting that.
             let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
             {
                 None
@@ -278,28 +281,20 @@ async fn handle_command_inner(
                 &search_constraints,
             );
 
-            // --- TCP server search ---
-            let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
-            // Global's UDP leg does not need a server *session*, so it kept
-            // spraying `OP_GLOBSEARCH` at the whole server list after the user
-            // had gone offline. Ember still answers a Global query, which is
-            // the documented offline fallback; talking to eD2K servers is not.
-            //
-            // `has_keyword_query` matters here for a co-share-only related
-            // search: `search_expr` is empty then, and this leg would queue a
-            // keywordless `OP_GLOBSEARCH` to every server in the list. Only the
-            // one connected server can answer a co-share request, and it is
-            // asked over TCP below.
-            let run_udp = has_keyword_query
-                && matches!(method, SearchMethod::Global)
-                && !state
+            // Which networks this search is allowed to reach, and why, lives
+            // in `search_legs` — including the one rule a related search
+            // depends on: `Server` asks the connected server and nothing else.
+            let legs = search_legs(
+                method,
+                has_keyword_query,
+                !keywords.is_empty(),
+                state
                     .user_offline
-                    .load(std::sync::atomic::Ordering::Relaxed);
-            let run_kad =
-                !keywords.is_empty() && matches!(method, SearchMethod::Global | SearchMethod::Kad);
-            let run_ember = matches!(method, SearchMethod::Global | SearchMethod::Ember);
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
 
-            if run_server && state.server_connected {
+            // --- TCP server search ---
+            if legs.server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
                     // The co-share term must be wrapped as a `QueryExpr::Term`
                     // by hand rather than parsed: `:` is an eD2k keyword
@@ -354,7 +349,7 @@ async fn handle_command_inner(
             }
 
             // --- UDP global search ---
-            if run_udp {
+            if legs.udp {
                 let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
                 let connected_addr = state.server_addr;
                 let servers = state.server_list.servers().to_vec();
@@ -402,11 +397,11 @@ async fn handle_command_inner(
             // --- KAD search ---
             let mut kad_skip_phase: Option<&'static str> = None;
             let kad_started = 'kad: {
-                if !run_kad {
+                if !legs.kad {
                     break 'kad false;
                 }
                 // KAD needs the parsed boolean expression. Positive terms being
-                // present is already what gates `run_kad`, but guard here too —
+                // present is already what gates the Kad leg, but guard here too —
                 // before any side effects — so future logic drift degrades to a
                 // skipped KAD search instead of panicking the whole network task.
                 let Some(query_expr) = query_expr.clone() else {
@@ -510,7 +505,7 @@ async fn handle_command_inner(
             // completes immediately from whatever the local store holds
             // rather than being skipped, which keeps a momentarily empty
             // table from silently dropping the Ember leg of a search.
-            if run_ember && settings.ember_native_enabled {
+            if legs.ember && settings.ember_native_enabled {
                 let query = active_request.keywords.join(" ");
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {

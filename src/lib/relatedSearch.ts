@@ -1,6 +1,12 @@
 import { goto } from '$app/navigation';
 import { writable } from 'svelte/store';
-import { planRelatedSearch, type RelatedPlan, type RelatedSeed, type RelationKind } from '$lib/api/search';
+import {
+  planRelatedSearch,
+  type RelatedPlan,
+  type RelatedSeed,
+  type RelationKind,
+  type SearchMethod,
+} from '$lib/api/search';
 import { addToast } from '$lib/stores/toast';
 import { translateError } from '$lib/i18n';
 import * as m from '$lib/paraglide/messages';
@@ -20,6 +26,20 @@ import * as m from '$lib/paraglide/messages';
 export type PendingRelatedSearch = {
   plan: RelatedPlan;
 };
+
+/**
+ * The method a related search runs on, whatever the method dropdown says.
+ *
+ * eMule's "Search Related Files" is a server-side feature, and this keeps ours
+ * one too. The co-share request is a question only the connected eD2k server
+ * can answer — it alone has a view of who shares what alongside what, which is
+ * the whole point of the feature — and the keyword half of the plan goes to
+ * that same server rather than fanning out to Kad, the Ember DHT or the rest
+ * of the server list. So the one connection is asked both halves and nothing
+ * else is asked anything: a related search is not a general search that
+ * happens to have been derived from a file.
+ */
+export const RELATED_SEARCH_METHOD: SearchMethod = 'server';
 
 /** Set by [`startRelatedSearch`], consumed once by the search page. */
 export const pendingRelatedSearch = writable<PendingRelatedSearch | null>(null);

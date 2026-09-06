@@ -1,7 +1,12 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
   import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
-  import { pendingRelatedSearch, relationKindLabel, startRelatedSearch } from '$lib/relatedSearch';
+  import {
+    pendingRelatedSearch,
+    relationKindLabel,
+    startRelatedSearch,
+    RELATED_SEARCH_METHOD,
+  } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { getEmberDiagnostics } from '$lib/api/ember';
@@ -326,6 +331,11 @@
 
   // Shown when the user tries to search with no usable network connected.
   let networkAlertOpen = $state(false);
+  // Which method the refused search would have run on, which is not always the
+  // one in the dropdown: a related search always runs on the server, so the
+  // dialog has to ask for a server rather than explain a method that search
+  // was never going to use.
+  let networkAlertMethod = $state<SearchMethod>('global');
 
   function searchNetworkHint(method: SearchMethod): string {
     if (method === 'kad') return m.search_network_need_kad_hint();
@@ -1534,19 +1544,23 @@
    * is carrying the search.
    */
   async function handleSearch(query: string, plan?: RelatedPlan) {
+    // A related search runs on the server whatever the dropdown says — see
+    // `RELATED_SEARCH_METHOD` for why — so it also skips the gate below, which
+    // reads that dropdown. Its readiness is the server session, and it is
+    // checked by `methodAllowed` further down like any server search.
+    const method: SearchMethod = plan ? RELATED_SEARCH_METHOD : searchMethod;
     // The Search button is disabled in exactly these states, but pressing
     // Enter in the query box reaches this function directly — so without the
     // same gate, clicking did nothing while Enter popped the "no network"
     // dialog. The readiness hint above the results already explains every one
     // of these states on screen, so refusing quietly is the consistent
     // behaviour rather than a silent dead end.
-    if (searchSubmitBlocked) {
+    if (!plan && searchSubmitBlocked) {
       return;
     }
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
     const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
-    const method = searchMethod;
     // eMule/backend: Program clears the local type filter so Arc/Iso hits
     // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
     filterType = searchFileType === 'Pro' ? '' : searchFileType;
@@ -1596,6 +1610,7 @@
       if (emberIsTheOnlyCandidate && (emberJoining || emberNoPeers)) {
         return;
       }
+      networkAlertMethod = method;
       networkAlertOpen = true;
       return;
     }
@@ -1712,16 +1727,21 @@
    * A related search planned elsewhere (the Transfers or Library context menu,
    * or this page's own) arrives through `pendingRelatedSearch`.
    *
-   * It is held until the page will actually accept a search rather than
-   * consumed on arrival: navigating here from another page can land while
-   * network readiness is still resolving, and `handleSearch` refuses quietly in
-   * that window — which would drop the user's click with no explanation. While
-   * it waits, the readiness hint above the results already says why nothing is
-   * searching, and this re-runs the moment that changes.
+   * It is held while the server session is still coming up rather than
+   * consumed on arrival: navigating here from another page can land mid
+   * handshake, and starting then would raise the "no server" dialog on a
+   * server that is seconds from being connected. This re-runs the moment that
+   * resolves. A server that is simply not connected is not waited for — the
+   * dialog from `handleSearch` is the answer there, the same one a manual
+   * server search gets, and a related search cannot run without one.
+   *
+   * Deliberately not `searchSubmitBlocked`: that reads the method dropdown,
+   * which a related search ignores, so an Ember-only user sitting on Ember
+   * would have had theirs parked here indefinitely.
    */
   $effect(() => {
     const pending = $pendingRelatedSearch;
-    if (!pending || searchSubmitBlocked) return;
+    if (!pending || $serverStatus === 'connecting') return;
     pendingRelatedSearch.set(null);
     // Show the derived query so it is visible and editable — a related search
     // is otherwise the one case where results appear for a query the user
@@ -3613,7 +3633,7 @@
   bind:open={networkAlertOpen}
   alert
   title={m.search_no_network_title()}
-  message={searchNetworkAlertMessage(searchMethod)}
+  message={searchNetworkAlertMessage(networkAlertMethod)}
   confirmLabel={m.common_ok()}
 />
 
