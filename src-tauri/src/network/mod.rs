@@ -47836,6 +47836,12 @@ fn build_ember_keyword_built(
                 existing.availability = publisher_digests.len() as u32;
                 existing.file.complete_sources = publisher_digests.len() as u32;
                 existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
+                // First publisher to carry media decides the row's. Records from
+                // before the block existed have none, so a single peer that
+                // published it fills the columns for everyone.
+                if existing.media.is_none() {
+                    existing.media = rec.media.clone();
+                }
             }
             None => {
                 let extension = rec
@@ -47885,7 +47891,7 @@ fn build_ember_keyword_built(
                     source_addresses: Vec::new(),
                     rating: None,
                     comment: None,
-                    media: None,
+                    media: rec.media.clone(),
                     spam_rating: 0,
                     is_spam: false,
                     clean_name: String::new(),

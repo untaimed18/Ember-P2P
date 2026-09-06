@@ -103,7 +103,7 @@ Type inference is the one thing shared across the wire: both sides derive it fro
 the name's extension with `search::index::infer_file_type`, so they cannot
 disagree about what `Video` means.
 
-## 2. Keyword records carry no metadata
+## 2. Keyword records carry no metadata — format done, publishing blocked
 
 A record body is type, keyword hash, file hash, Ember digest, size, name. KAD
 rows arrive with media tags, so on an Ember-only hit the Length, Bitrate, Codec,
@@ -111,31 +111,42 @@ Artist, Album and Title columns are always empty, and there is no rating or
 comment. `build_ember_keyword_built` sets `media`, `rating` and `comment` to
 `None` because there is nothing on the wire to fill them from.
 
-**Plan.** Extend the keyword record with an optional trailing tag area and publish
-the media fields. The record side is additive on the same terms item 1 turned out
-to be: `parse_unverified` reads the name from its length prefix and does not
-length-check a keyword record, so an older build parses a longer body correctly
-and ignores the tail, and a storer relays the bytes it was given. The name budget
-has to charge the tag area, the way the channel trailer already does.
+**The record format is done, and the reader shipped first on purpose.** A keyword
+record may now carry an optional media block after its name — `version(1)` then
+`tag/len/value` triples for duration, bitrate, codec, artist, album and title —
+parsed into `SignedRecord::media` and through to the row's `media`. Additive on
+the same terms item 1 turned out to be: `parse_unverified` reads the name from its
+length prefix and does not length-check a keyword record, so an older build parses
+a longer body correctly and ignores the tail, and a storer relays the bytes it was
+handed. The name budget charges the block, the way the channel trailer already
+does, and the signature covers it so a relay cannot rewrite it.
 
-**Blocked on where the metadata comes from.** "the media fields the library
-already has" was wrong — the library has none. `extract_media_metadata` in
-`commands/sharing.rs` is an on-demand `lofty` header read from a path, exposed for
-one file at a time by the `get_file_media_metadata` command, and nothing persists
-the result. Publishing it needs either a lofty read per file inside the publish
-tick (a blocking disk read on the network task, repeated every republish cycle) or
-somewhere to keep it — a `known.met` tag block or a table, filled by a background
-pass over the library. The second is the right shape and is most of the work.
+Shipping the reader before the writer is the right order for a wire change: by the
+time anything publishes a block, the builds that will receive it already
+understand it. Nothing writes one yet.
+
+**Publishing is blocked on where the metadata comes from.** "the media fields the
+library already has" was wrong — the library has none. `extract_media_metadata` in
+`commands/sharing.rs` is an on-demand `lofty` header read from a path, exposed one
+file at a time by `get_file_media_metadata`, and nothing persists the result.
+
+The agreed shape is to persist it: `known.met` has room (Ember-only tags run to
+`0xE5`; `0xE6` on is free) for duration, bitrate and the three text fields, plus a
+"scanned" marker so a file with no media is not re-probed every pass. Filling it
+wants the same treatment as the AICH and BLAKE3 top-ups, which already have a
+one-time migration path (`REHASH_ID_PREFIX`) — extract on first hash, and sweep
+existing shares in the background. Then the publish loop reads the record rather
+than touching a disk.
 
 Worth noting this is not a gap against KAD as such: our own `build_keyword_entry`
 does not publish media tags either, so KAD-to-KAD is no better. Ember rows read
-empty where a *server* result would be populated, and doing it here would put
-Ember ahead rather than level.
+empty where a *server* result would be populated, and doing this puts Ember ahead
+rather than level.
 
-**Watch for:** anything added is publisher-controlled text that lands in the UI
-and in sort keys, so it needs the length caps and sanitisation the eD2K tag path
-applies, and it must not become a second name field that disagrees with
-`file_name`.
+**Watch for:** the publisher-supplied strings are capped
+(`MEDIA_MAX_CODEC_BYTES` / `MEDIA_MAX_TEXT_BYTES`), refused rather than shown when
+over-long, and required to be real UTF-8 — they decide sort keys and column widths.
+They must not become a second name field that disagrees with `file_name`.
 
 ## 3. Per-node result ceiling is an eighth of KAD's — done
 
@@ -237,8 +248,10 @@ them.
 
 ## What is left
 
-1. **Item 2** (record metadata), once there is somewhere to publish media from.
-   The record and wire work is small; persisting the metadata is the task.
+1. **Publishing media** (the second half of item 2). The record format and the
+   reader are in; what remains is persisting the metadata — `known.met` tags from
+   `0xE6`, extraction on first hash, a background sweep for existing shares — and
+   then reading it in the keyword publish loop.
 2. The extension-index question under item 6, which needs a decision about
    diverging from eMule's keyword index before it needs code.
 

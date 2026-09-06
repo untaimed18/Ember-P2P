@@ -306,6 +306,116 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
 /// apart on where the name — and therefore the contact block — begins.
 pub(super) const RECORD_HEADER_LEN: usize = 1 + 16 + 16 + 32 + 8 + 32 + 8 + 2;
 
+/// Version byte leading a keyword record's optional media block.
+const MEDIA_TRAILER_VERSION: u8 = 0x01;
+
+const MEDIA_TAG_DURATION: u8 = 0x01;
+const MEDIA_TAG_BITRATE: u8 = 0x02;
+const MEDIA_TAG_CODEC: u8 = 0x03;
+const MEDIA_TAG_ARTIST: u8 = 0x04;
+const MEDIA_TAG_ALBUM: u8 = 0x05;
+const MEDIA_TAG_TITLE: u8 = 0x06;
+
+/// Caps on the publisher-supplied strings a media block may carry.
+///
+/// These land in a results table and in its sort keys, so they are held to the
+/// same kind of bound the eD2K tag path applies rather than to whatever a
+/// publisher felt like sending. They also come out of the file name's budget (see
+/// [`SignedRecord::build`]), so generosity here is paid for in truncated names.
+const MEDIA_MAX_CODEC_BYTES: usize = 16;
+const MEDIA_MAX_TEXT_BYTES: usize = 64;
+
+/// Encode a keyword record's media block, or nothing when there is nothing worth
+/// sending. Shape: `version(1)` then `tag(1) len(1) value` triples.
+fn encode_media_trailer(media: Option<&crate::types::MediaMetadata>) -> Vec<u8> {
+    let Some(media) = media.filter(|m| !m.is_empty()) else {
+        return Vec::new();
+    };
+    let mut out = vec![MEDIA_TRAILER_VERSION];
+    let mut push = |tag: u8, value: &[u8]| {
+        if let Ok(len) = u8::try_from(value.len()) {
+            out.push(tag);
+            out.push(len);
+            out.extend_from_slice(value);
+        }
+    };
+    if let Some(duration) = media.duration {
+        push(MEDIA_TAG_DURATION, &duration.to_le_bytes());
+    }
+    if let Some(bitrate) = media.bitrate {
+        push(MEDIA_TAG_BITRATE, &bitrate.to_le_bytes());
+    }
+    for (tag, text, cap) in [
+        (MEDIA_TAG_CODEC, &media.codec, MEDIA_MAX_CODEC_BYTES),
+        (MEDIA_TAG_ARTIST, &media.artist, MEDIA_MAX_TEXT_BYTES),
+        (MEDIA_TAG_ALBUM, &media.album, MEDIA_MAX_TEXT_BYTES),
+        (MEDIA_TAG_TITLE, &media.title, MEDIA_MAX_TEXT_BYTES),
+    ] {
+        if let Some(text) = text.as_deref().filter(|t| !t.is_empty()) {
+            push(tag, truncate_utf8(text, cap).as_bytes());
+        }
+    }
+    // Version byte alone means every field was empty or unencodable.
+    if out.len() == 1 {
+        return Vec::new();
+    }
+    out
+}
+
+/// Read the media block trailing a keyword record's name, if there is one.
+///
+/// Lenient throughout: this is publisher-supplied display text, and a record
+/// whose block is malformed is still a perfectly good search hit. Anything
+/// unrecognised, truncated or over-long is dropped and the rest is kept.
+///
+/// Only ever called for `RECORD_TYPE_KEYWORD`, because on the other record types
+/// these bytes are the source contact block or the channel trailer.
+fn decode_media_trailer(data: &[u8]) -> Option<crate::types::MediaMetadata> {
+    if *data.first()? != MEDIA_TRAILER_VERSION {
+        return None;
+    }
+    let mut media = crate::types::MediaMetadata::default();
+    let tlv = &data[1..];
+    let mut i = 0usize;
+    while i + 2 <= tlv.len() {
+        let tag = tlv[i];
+        let len = tlv[i + 1] as usize;
+        let Some(value) = tlv.get(i + 2..i + 2 + len) else {
+            break;
+        };
+        let text = |cap: usize| -> Option<String> {
+            if value.len() > cap {
+                return None;
+            }
+            // Real UTF-8 rather than lossy: a mangled tag is better dropped than
+            // shown with replacement characters in a table.
+            std::str::from_utf8(value)
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        match tag {
+            MEDIA_TAG_DURATION => {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    media.duration = Some(u32::from_le_bytes(bytes));
+                }
+            }
+            MEDIA_TAG_BITRATE => {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    media.bitrate = Some(u32::from_le_bytes(bytes));
+                }
+            }
+            MEDIA_TAG_CODEC => media.codec = text(MEDIA_MAX_CODEC_BYTES),
+            MEDIA_TAG_ARTIST => media.artist = text(MEDIA_MAX_TEXT_BYTES),
+            MEDIA_TAG_ALBUM => media.album = text(MEDIA_MAX_TEXT_BYTES),
+            MEDIA_TAG_TITLE => media.title = text(MEDIA_MAX_TEXT_BYTES),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    media.into_option()
+}
+
 /// Whether a packed record body satisfies a searcher's `FIND_VALUE`
 /// constraints, read at fixed offsets without parsing or verifying the record.
 ///
@@ -714,6 +824,10 @@ pub struct SignedRecord {
     pub source_contact: Option<SourceContact>,
     /// Present only for `RECORD_TYPE_CHANNEL`.
     pub channel: Option<ChannelRecordMeta>,
+    /// Present only for `RECORD_TYPE_KEYWORD`, and only when the publisher had
+    /// media metadata to send. Display-only: length, bitrate, codec and tags,
+    /// so a search hit can fill the columns a server result fills.
+    pub media: Option<crate::types::MediaMetadata>,
 }
 
 impl SignedRecord {
@@ -726,8 +840,34 @@ impl SignedRecord {
         file_name: &str,
         signing_key: &SigningKey,
     ) -> Self {
+        Self::keyword_with_media(
+            keyword,
+            file_hash,
+            ember_file_hash,
+            file_size,
+            file_name,
+            None,
+            signing_key,
+        )
+    }
+
+    /// The same, carrying the media metadata the publisher holds for the file.
+    ///
+    /// Separate constructor rather than another argument on [`Self::keyword`]
+    /// because almost every caller — the tests, the dev command — has no media to
+    /// offer, and threading a `None` through all of them buys nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keyword_with_media(
+        keyword: &str,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        file_size: u64,
+        file_name: &str,
+        media: Option<&crate::types::MediaMetadata>,
+        signing_key: &SigningKey,
+    ) -> Self {
         let kw_hash = keyword_hash(keyword);
-        Self::build(
+        Self::build_with_media(
             RECORD_TYPE_KEYWORD,
             kw_hash,
             file_hash,
@@ -736,6 +876,7 @@ impl SignedRecord {
             file_name,
             None,
             None,
+            media,
             signing_key,
         )
     }
@@ -1103,6 +1244,9 @@ impl SignedRecord {
         }
     }
 
+    /// Every record type except a keyword record with media, which is the only
+    /// one with anything to put in the trailing block.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         record_type: u8,
         keyword_hash: [u8; 16],
@@ -1114,16 +1258,51 @@ impl SignedRecord {
         channel_extra: Option<Vec<u8>>,
         signing_key: &SigningKey,
     ) -> Self {
+        Self::build_with_media(
+            record_type,
+            keyword_hash,
+            file_hash,
+            ember_file_hash,
+            file_size,
+            file_name,
+            source_contact,
+            channel_extra,
+            None,
+            signing_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_media(
+        record_type: u8,
+        keyword_hash: [u8; 16],
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        file_size: u64,
+        file_name: &str,
+        source_contact: Option<SourceContact>,
+        channel_extra: Option<Vec<u8>>,
+        media: Option<&crate::types::MediaMetadata>,
+        signing_key: &SigningKey,
+    ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
         let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
+        // Encoded before the name is clamped, because its length is part of what
+        // the name has to fit around.
+        let media_trailer = if record_type == RECORD_TYPE_KEYWORD {
+            encode_media_trailer(media)
+        } else {
+            Vec::new()
+        };
         // The channel trailer is written below but was left out of the name
         // budget, so a record could be clamped to "fit" and then have up to two
-        // kilobytes appended past the cap. Both trailing blocks have to be
+        // kilobytes appended past the cap. Every trailing block has to be
         // charged here, since the name is the only part this can shorten.
         let trailer_bytes = channel_extra
             .as_ref()
-            .map_or(0, |extra| CHANNEL_TRAILER_MIN_LEN + extra.len());
+            .map_or(0, |extra| CHANNEL_TRAILER_MIN_LEN + extra.len())
+            + media_trailer.len();
         let file_name = clamp_name_to_record_budget(file_name, contact_bytes + trailer_bytes);
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len();
@@ -1147,6 +1326,14 @@ impl SignedRecord {
         if let Some(sc) = source_contact {
             encode_source_contact(&mut data, &sc);
         }
+
+        // A keyword record's media block goes in the same place, and is signed
+        // for the same reason. Older builds read the name from its length prefix
+        // and never check that the body ends there, so they parse this record
+        // correctly and ignore the block — which is what lets it be added without
+        // moving the wire version.
+        data.extend_from_slice(&media_trailer);
+        let media = decode_media_trailer(&media_trailer);
 
         let channel = if let Some(extra) = channel_extra {
             let extra_len = extra.len().min(u16::MAX as usize);
@@ -1199,6 +1386,7 @@ impl SignedRecord {
             signature,
             source_contact,
             channel,
+            media,
         }
     }
 
@@ -1435,6 +1623,16 @@ impl SignedRecord {
             None
         };
 
+        // Keyword records only: on the other types these bytes are the contact
+        // block or the channel trailer read above. Absent for every record
+        // written before the block existed, which is the whole body of the
+        // network today — hence `Option` rather than a default.
+        let media = if record_type == RECORD_TYPE_KEYWORD {
+            data.get(115 + name_len..).and_then(decode_media_trailer)
+        } else {
+            None
+        };
+
         Some(Self {
             record_type,
             keyword_hash,
@@ -1446,6 +1644,7 @@ impl SignedRecord {
             timestamp,
             data: data.to_vec(),
             signature,
+            media,
             source_contact,
             channel,
         })
@@ -2099,6 +2298,139 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    /// A keyword record's media block has to survive the wire, and — the property
+    /// that lets it exist at all — a build that has never heard of it has to
+    /// parse the record correctly anyway. That build is reproduced by comparing
+    /// against the same record without the block: the header and name are
+    /// byte-identical, so a reader that stops at the name cannot tell them apart.
+    #[test]
+    fn a_keyword_records_media_survives_the_wire_and_stays_ignorable() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let media = crate::types::MediaMetadata {
+            duration: Some(214),
+            bitrate: Some(320),
+            codec: Some("mp3".into()),
+            artist: Some("Anne Müller".into()),
+            album: Some("Heliopause".into()),
+            title: Some("Drifting Circles".into()),
+        };
+        let with = SignedRecord::keyword_with_media(
+            "heliopause",
+            [0xA1; 16],
+            [0xB2; 32],
+            9_000_000,
+            "anne-muller-heliopause.mp3",
+            Some(&media),
+            &sk,
+        );
+
+        let mut blob = with.data.clone();
+        blob.extend_from_slice(&with.signature);
+        let parsed = SignedRecord::from_value_blob(&blob).expect("verifies");
+        assert_eq!(parsed.media.as_ref(), Some(&media));
+        assert_eq!(parsed.file_name, "anne-muller-heliopause.mp3");
+
+        // What an older reader sees. It takes the name from its length prefix and
+        // never checks that the body ends there, so the bytes it reads are the
+        // same ones it would have read without the block.
+        let without = SignedRecord::keyword(
+            "heliopause",
+            [0xA1; 16],
+            [0xB2; 32],
+            9_000_000,
+            "anne-muller-heliopause.mp3",
+            &sk,
+        );
+        assert!(without.media.is_none());
+        let name_end = RECORD_HEADER_LEN + without.file_name.len();
+        assert_eq!(
+            with.data[..name_end],
+            without.data[..name_end],
+            "the block must trail the name, not move anything an older reader indexes"
+        );
+        assert_eq!(
+            without.data.len(),
+            name_end,
+            "a record with no media must not grow a block at all"
+        );
+        assert!(with.data.len() > name_end);
+
+        // And the signature covers the block, so a relay cannot rewrite it.
+        let mut tampered = with.data.clone();
+        *tampered.last_mut().unwrap() ^= 0xFF;
+        tampered.extend_from_slice(&with.signature);
+        assert!(
+            SignedRecord::from_value_blob(&tampered).is_none(),
+            "the media block is signed like the rest of the body"
+        );
+    }
+
+    /// The block is publisher-supplied display text, so a malformed one must cost
+    /// the record its media and nothing else — it is still a valid search hit.
+    #[test]
+    fn a_malformed_media_block_costs_only_the_media() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let base = SignedRecord::keyword("ubuntu", [0x11; 16], [0u8; 32], 4096, "ubuntu.iso", &sk);
+
+        for trailer in [
+            vec![0x00],                                                     // unknown version
+            vec![MEDIA_TRAILER_VERSION],                                    // version with no tags
+            vec![MEDIA_TRAILER_VERSION, 0x01],                              // tag with no length
+            vec![MEDIA_TRAILER_VERSION, MEDIA_TAG_DURATION, 0x09, 0x01],    // length overruns
+            vec![MEDIA_TRAILER_VERSION, MEDIA_TAG_CODEC, 0x02, 0xFF, 0xFE], // invalid UTF-8
+        ] {
+            let mut data = base.data.clone();
+            data.extend_from_slice(&trailer);
+            let signature = crypto::sign(&sk, &data);
+            let mut blob = data.clone();
+            blob.extend_from_slice(&signature);
+            let parsed = SignedRecord::from_value_blob(&blob)
+                .unwrap_or_else(|| panic!("{trailer:?} must still parse as a record"));
+            assert_eq!(parsed.file_name, "ubuntu.iso");
+            assert!(parsed.media.is_none(), "{trailer:?} must not become media");
+        }
+    }
+
+    /// Publisher-supplied strings decide sort keys and column widths, so an
+    /// over-long one is refused rather than shown. The encoder truncates its own
+    /// output; this pins the decoder against a body built by hand.
+    #[test]
+    fn over_long_media_text_is_dropped_by_the_reader_and_clamped_by_the_writer() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let long = "a".repeat(MEDIA_MAX_TEXT_BYTES + 40);
+        let written = SignedRecord::keyword_with_media(
+            "ubuntu",
+            [0x11; 16],
+            [0u8; 32],
+            4096,
+            "ubuntu.iso",
+            Some(&crate::types::MediaMetadata {
+                artist: Some(long.clone()),
+                ..Default::default()
+            }),
+            &sk,
+        );
+        let artist = written
+            .media
+            .as_ref()
+            .and_then(|m| m.artist.clone())
+            .expect("the writer keeps it, clamped");
+        assert_eq!(artist.len(), MEDIA_MAX_TEXT_BYTES);
+
+        // A hand-built body naming more than the cap: the reader drops that field
+        // rather than trusting the length it was handed.
+        let base = SignedRecord::keyword("ubuntu", [0x11; 16], [0u8; 32], 4096, "ubuntu.iso", &sk);
+        let mut data = base.data.clone();
+        let over = "b".repeat(MEDIA_MAX_TEXT_BYTES + 1);
+        data.extend_from_slice(&[MEDIA_TRAILER_VERSION, MEDIA_TAG_ARTIST, over.len() as u8]);
+        data.extend_from_slice(over.as_bytes());
+        let signature = crypto::sign(&sk, &data);
+        let mut blob = data.clone();
+        blob.extend_from_slice(&signature);
+        let parsed = SignedRecord::from_value_blob(&blob).expect("still a record");
+        assert!(parsed.media.is_none(), "an over-long field is not shown");
+    }
 
     #[test]
     fn signed_keyword_record_round_trip() {

@@ -392,7 +392,7 @@ pub enum SourceStatus {
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
 /// optional because a remote node only fills the ones it knows. Grouped into a
 /// single optional struct so a hit with no media info serializes to nothing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaMetadata {
     /// Playback length in whole seconds (eMule `FT_MEDIA_LENGTH`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
