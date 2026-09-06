@@ -1062,16 +1062,23 @@ mod tests {
         assert_eq!(&expr[3..], term.as_bytes());
     }
 
-    /// The co-share term has to survive as one wire string. Routing it through
-    /// the query parser splits it on `:`, and the server then sees a keyword
-    /// search for "related" instead of a co-share request.
+    /// The co-share term has to survive as one wire string wherever it is
+    /// built. `:` is a keyword separator here, so the parser used to split this
+    /// into `related` AND the hash and send the server a filename search that
+    /// matches nothing — the term was only safe because one call site hand-built
+    /// a `Term` and skipped the parser, which is a property no test could hold
+    /// on to. The parser now keeps a server directive whole, the way eMule's
+    /// scanner does, so the term round-trips byte-identically and the hazard is
+    /// gone rather than merely avoided.
     #[test]
-    fn co_share_term_must_not_be_routed_through_the_query_parser() {
+    fn co_share_term_survives_the_query_parser() {
         let term = co_share_term(&["aa".repeat(16)]).unwrap();
-        let parsed = crate::search::query::parse(&term).expect("parses, but wrongly");
-        assert!(
-            parsed.positive_terms().len() > 1,
-            "parser splits the term on ':' — callers must build a Term directly"
+        let parsed = crate::search::query::parse(&term).expect("a directive is a usable query");
+        assert_eq!(parsed.positive_terms(), vec![term.clone()]);
+        assert_eq!(
+            parsed.to_wire_bytes(),
+            crate::search::query::QueryExpr::Term(term).to_wire_bytes(),
+            "same bytes whether it came from the parser or was built by hand"
         );
     }
 

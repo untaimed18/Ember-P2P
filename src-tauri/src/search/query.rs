@@ -198,6 +198,14 @@ pub fn positive_terms_from_query(query: &str) -> Vec<String> {
 /// tokenized exactly like [`extract_keywords`] for full backward compatibility.
 pub fn parse(query: &str) -> Option<QueryExpr> {
     let query = clamp_query(query);
+    // A whole query that is nothing but a server directive is the common case
+    // — it is what eMule's "Search Related Files" is a shortcut for, and what
+    // a user pastes — and the operator-free path below tokenizes through the
+    // Kad publisher's splitter, which knows nothing about directives. Catch it
+    // here; `tokenize_term` handles one that appears alongside operators.
+    if let Some(term) = server_directive(query.trim()) {
+        return Some(QueryExpr::Term(term));
+    }
     if !has_operators(query) {
         return fold_and(
             extract_query_keywords(query)
@@ -269,10 +277,81 @@ fn fold_and(mut nodes: Vec<QueryExpr>) -> Option<QueryExpr> {
 /// 3-byte minimum as [`extract_keywords`], minus the whole-query de-dup and
 /// trailing-extension strip, which only make sense for an entire filename).
 fn tokenize_term(raw: &str) -> Vec<String> {
+    if let Some(term) = server_directive(raw) {
+        return vec![term];
+    }
     raw.split(is_keyword_separator)
         .filter(|w| w.len() >= 3)
         .map(|w| w.to_lowercase())
         .collect()
+}
+
+/// A term the eD2k server interprets itself rather than matching against
+/// filenames: `related::<hash>` (files commonly shared alongside that hash) and
+/// `ed2k::<hash>` (that exact file), both optionally naming a size as
+/// `related:<size>:<hash>`, and both accepting several hashes.
+///
+/// These have to survive tokenization whole. `:` is in our separator set, so
+/// `related::<hash>` would otherwise come apart into `related` AND the hash and
+/// go out as an ordinary filename search that matches nothing — which is how a
+/// directive typed into the search box, or a related search built anywhere that
+/// routes through this parser, turns silently into a search for nothing.
+///
+/// eMule keeps them whole by counting `:` as an ordinary keyword character
+/// (`Scanner.l`: `keywordchar` is `[^ \"()<>=]`), and its own scanner comment
+/// says so outright — "`ed2k::<hash>` is to be handled as any other string
+/// term". Its "Search Related Files" menu item is documented as nothing more
+/// than a shortcut for typing `related::<hash>` into the search field, and
+/// aMule documents the same syntax for users, so this is the form servers
+/// actually implement.
+///
+/// The hash is upper-cased to match the form eMule's own menu item generates
+/// (`md4str` uses an upper-case alphabet), since a server free to compare the
+/// hex as text rather than parse it would only ever have been tested against
+/// that.
+fn server_directive(raw: &str) -> Option<String> {
+    let (directive, rest) = raw
+        .split_once(':')
+        .map(|(head, rest)| (head.to_ascii_lowercase(), rest))?;
+    if directive != "related" && directive != "ed2k" {
+        return None;
+    }
+    // `related::<hash>` leaves the size field empty; `related:<size>:<hash>`
+    // fills it. Anything else is a word that merely began with "ed2k:".
+    let mut fields = rest.split(':');
+    let size = fields.next()?;
+    if !size.is_empty() && !size.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Each additional hash arrives as `::<hash>`, so the fields between them
+    // are empty — that second colon is a separator, not a field.
+    let hashes: Vec<String> = fields
+        .filter(|f| !f.is_empty())
+        .map(|h| h.to_ascii_uppercase())
+        .collect();
+    if hashes.is_empty() || !hashes.iter().all(|h| is_md4_hex(h)) {
+        return None;
+    }
+    // Rebuilt in the exact shape eMule writes: `related::H1::H2`, or
+    // `related:<size>:<hash>` where a size is given.
+    let mut term = directive;
+    let mut rest = hashes.as_slice();
+    if !size.is_empty() {
+        term.push(':');
+        term.push_str(size);
+        term.push(':');
+        term.push_str(&hashes[0]);
+        rest = &hashes[1..];
+    }
+    for hash in rest {
+        term.push_str("::");
+        term.push_str(hash);
+    }
+    Some(term)
+}
+
+fn is_md4_hex(hash: &str) -> bool {
+    hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_keyword_separator(c: char) -> bool {
@@ -503,6 +582,74 @@ mod tests {
 
     fn term(s: &str) -> QueryExpr {
         QueryExpr::Term(s.to_string())
+    }
+
+    const HASH: &str = "AABBCCDDEEFF00112233445566778899";
+
+    /// eMule's "Search Related Files" is documented as a shortcut for typing
+    /// `related::<hash>` into the search box, and aMule documents the syntax
+    /// for users, so it has to work typed as well as clicked. `:` being a
+    /// keyword separator here meant it came apart into `related` AND the hash
+    /// and went out as a filename search matching nothing.
+    #[test]
+    fn a_server_directive_stays_one_term() {
+        assert_eq!(parse(&format!("related::{HASH}")), Some(term(&format!("related::{HASH}"))));
+        assert_eq!(parse(&format!("ed2k::{HASH}")), Some(term(&format!("ed2k::{HASH}"))));
+        // eMule: "related::<file hash> or related:<file size>:<file hash>".
+        assert_eq!(
+            parse(&format!("related:1234:{HASH}")),
+            Some(term(&format!("related:1234:{HASH}")))
+        );
+        // Several hashes in one request (eserver 17.14 and later).
+        assert_eq!(
+            parse(&format!("related::{HASH}::{HASH}")),
+            Some(term(&format!("related::{HASH}::{HASH}")))
+        );
+    }
+
+    /// Upper-cased to match what eMule's own menu item puts on the wire
+    /// (`md4str` uses an upper-case alphabet), since a server that compares the
+    /// hex as text rather than parsing it would only have been tested on that.
+    #[test]
+    fn a_directive_hash_is_normalized_to_the_form_emule_sends() {
+        assert_eq!(
+            parse(&format!("RELATED::{}", HASH.to_lowercase())),
+            Some(term(&format!("related::{HASH}")))
+        );
+    }
+
+    /// A directive is only a directive when it really names hashes. Anything
+    /// else keeps the ordinary tokenization, including an ed2k link — which the
+    /// paste handler deals with, and which must not become one 100-byte term.
+    #[test]
+    fn near_misses_are_still_ordinary_keywords() {
+        for query in [
+            "related::not-a-hash",
+            "related::aabbcc",
+            "ed2k://|file|movie.mkv|734003200|AABBCCDDEEFF00112233445566778899|/",
+            "relatedness::stuff",
+            &format!("related:size:{HASH}"),
+        ] {
+            let parsed = parse(query).expect("still a usable keyword query");
+            assert!(
+                parsed.positive_terms().len() > 1 || !parsed.positive_terms()[0].contains("::"),
+                "{query} should tokenize normally, got {:?}",
+                parsed.positive_terms()
+            );
+        }
+    }
+
+    /// aMule documents combining a directive with other constraints, e.g.
+    /// `related::<hash> AND Video`, so it has to survive the operator path too
+    /// — that one tokenizes through `tokenize_term` rather than the flat
+    /// splitter the whole-query check covers.
+    #[test]
+    fn a_directive_survives_alongside_operators() {
+        let parsed = parse(&format!("related::{HASH} AND video")).expect("parses");
+        assert_eq!(
+            parsed.positive_terms(),
+            vec![format!("related::{HASH}"), "video".to_string()]
+        );
     }
 
     /// Mirror of the flat AND-tree the legacy path emits, for byte-compat checks.

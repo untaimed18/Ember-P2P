@@ -212,12 +212,37 @@ async fn handle_command_inner(
             // related search as a `Server`-method search — eMule's feature is
             // server-side — so in practice no other leg ever sees one; the
             // per-leg gates below stay honest rather than trusting that.
+            let server_flags = state
+                .server_connection
+                .as_ref()
+                .and_then(|c| c.session.as_ref())
+                .map(|s| s.server_flags);
             let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
             {
                 None
             } else {
                 crate::search::related::co_share_term(&related_hashes)
             };
+            // Which of the two questions a related search is about to ask, and
+            // on whose authority. Without this the log could not tell a
+            // co-share request from the keyword fallback — both appear as one
+            // `OP_SEARCHREQUEST` of unremarkable length — so "no results" gave
+            // no way to tell a server with nothing to say from a request that
+            // never asked the right question.
+            if !related_hashes.is_empty() {
+                match co_share_term.as_deref() {
+                    Some(term) => info!(
+                        "Related search: asking the server {term} (flags 0x{:04X})",
+                        server_flags.unwrap_or(0)
+                    ),
+                    None => info!(
+                        "Related search: no co-share request — server flags 0x{:04X} lack \
+                         SRV_TCPFLG_RELATEDSEARCH (0x{:04X}); falling back to keywords '{query}'",
+                        server_flags.unwrap_or(0),
+                        crate::network::ed2k::server::SRV_TCPFLG_RELATEDSEARCH,
+                    ),
+                }
+            }
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
             // explicit AND/OR/NOT, `-` negation, "quoted phrases", and
