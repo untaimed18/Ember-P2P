@@ -26,6 +26,7 @@
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
+  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -1884,20 +1885,16 @@
     closePaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 300 - margin));
-    ctxMenu = { x, y, transfer: t, section };
+    // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
+    // keeps it on screen.
+    ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
   }
   function onKnownCtx(e: MouseEvent, client: KnownClient) {
     e.preventDefault();
     closeCtx();
     closeColumnMenu();
     closePaneCtx();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 180 - margin));
-    knownCtxMenu = { x, y, client };
+    knownCtxMenu = { x: e.clientX, y: e.clientY, client };
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
   /// It acts on the whole visible list, and it is the only place two of these
@@ -1915,10 +1912,7 @@
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 240 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 340 - margin));
-    paneCtxMenu = { x, y };
+    paneCtxMenu = { x: e.clientX, y: e.clientY };
   }
 
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; }
@@ -2809,12 +2803,7 @@
     event.stopPropagation();
     closeCtx();
     closePaneCtx();
-    const margin = 8;
-    columnMenu = {
-      table,
-      x: Math.max(margin, Math.min(event.clientX, window.innerWidth - 240 - margin)),
-      y: Math.max(margin, Math.min(event.clientY, window.innerHeight - 360 - margin)),
-    };
+    columnMenu = { table, x: event.clientX, y: event.clientY };
   }
 
   function canDragColumn(table: TableKey, columnKey: string): boolean {
@@ -4568,15 +4557,18 @@
 {#if columnMenu}
   {@const menu = columnMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu column-menu" style="left: {menu.x}px; top: {menu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <div class="column-menu-title">{getColumnMenuTitle(menu.table)}</div>
+  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: menu.x, y: menu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-label">{getColumnMenuTitle(menu.table)}</div>
     {#each getColumnMenuColumns(menu.table) as column (column.key)}
-      <button class="ctx-item" onclick={() => toggleColumnVisibility(menu.table, column.key)}>
-        {isColumnHidden(menu.table, column.key) ? '☐' : '☑'} {column.label}
-      </button>
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!isColumnHidden(menu.table, column.key)}
+        onclick={() => toggleColumnVisibility(menu.table, column.key)}
+      >{column.label}</button>
     {/each}
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => resetColumnLayout(menu.table)}>{m.transfers_reset_columns()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" onclick={() => resetColumnLayout(menu.table)}>{m.transfers_reset_columns()}</button>
   </div>
 {/if}
 
@@ -4586,88 +4578,111 @@
        list, matching `globalDownloadTargets` — an "all" that reaches rows the
        user cannot see is how people lose downloads they meant to keep. -->
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu" style="left: {paneCtxMenu.x}px; top: {paneCtxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handlePauseAll(); }}>{m.transfers_pause_all()}</button>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleResumeAll(); }}>{m.transfers_resume_all()}</button>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleStopAll(); }}>{m.transfers_stop_all()}</button>
-    <button class="ctx-item danger" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
-    <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: paneCtxMenu.x, y: paneCtxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handlePauseAll(); }}>{m.transfers_pause_all()}</button>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleResumeAll(); }}>{m.transfers_resume_all()}</button>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleStopAll(); }}>{m.transfers_stop_all()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
       {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
     </button>
-    <button class="ctx-item" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
+    <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
   </div>
 {/if}
 
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-header">
+      <bdi dir="auto">{ctxTransfer.file_name}</bdi>
+    </div>
     {#if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
       {/if}
       {#if canStop(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
       {/if}
       {#if canResume(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
-      <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('toggle_preview_prio')}>
-        {ctxTransfer.preview_priority ? '✓ ' : ''}{m.transfers_ctx_preview_priority()}
-      </button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!!ctxTransfer.preview_priority}
+        onclick={() => ctxAction('toggle_preview_prio')}
+      >{m.transfers_ctx_preview_priority()}</button>
       {#if isArchive(ctxTransfer)}
-        <button class="ctx-item" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
+        <button class="ctx-item" role="menuitem" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
           {recoveringIds.has(ctxTransfer.id) ? m.transfers_ctx_recovering() : m.transfers_ctx_recover_archive()}
         </button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
-      <div class="ctx-sep"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
       <div class="ctx-submenu-wrap">
-        <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>
-          {m.transfers_ctx_priority()} ▶
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxPrioritySub}
+          aria-haspopup="menu"
+          aria-expanded={ctxPrioritySub}
+          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+        >
+          {m.transfers_ctx_priority()}
+          <span class="ctx-hint">{priorityLabel(ctxTransfer.priority)}</span>
         </button>
         {#if ctxPrioritySub}
-          <div class="ctx-submenu">
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each ['verylow', 'low', 'normal', 'high', 'auto', 'release'] as prio}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={ctxTransfer.priority === prio}
+                onclick={() => ctxAction('priority', prio)}
+              >{priorityLabel(prio)}</button>
+            {/each}
           </div>
         {/if}
       </div>
       <div class="ctx-submenu-wrap">
-        <button class="ctx-item has-sub" onclick={() => ctxCategorySub = !ctxCategorySub}>
-          {m.transfers_ctx_category()} ▶
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxCategorySub}
+          aria-haspopup="menu"
+          aria-expanded={ctxCategorySub}
+          onclick={() => ctxCategorySub = !ctxCategorySub}
+        >
+          {m.transfers_ctx_category()}
+          <span class="ctx-hint">{categoryLabel(ctxTransfer.category || 'None')}</span>
         </button>
         {#if ctxCategorySub}
-          <div class="ctx-submenu">
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             {#each CATEGORY_OPTIONS as cat}
               <button
                 class="ctx-item"
-                class:ctx-active={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
+                role="menuitemradio"
+                aria-checked={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
                 onclick={() => ctxAction('set_category', cat)}
               >{categoryLabel(cat)}</button>
             {/each}
           </div>
         {/if}
       </div>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
-      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
+      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section === 'completed'}
       <!--
         D26: also offer Open File for failed downloads that have produced a
@@ -4675,27 +4690,27 @@
         `open_file` command returns an error that surfaces via transferError.
       -->
       {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
-        <button class="ctx-item" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item danger" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
       <!-- Upload context menu -->
       {#if uploadFriendHash && ctxTransfer.client_software?.startsWith('Ember') && !friendHashSet.has(uploadFriendHash.toLowerCase())}
-        <button class="ctx-item" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
-        <div class="ctx-sep"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
+        <div class="ctx-sep" role="separator"></div>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
-        <div class="ctx-sep"></div>
-        <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
       {/if}
     {/if}
   </div>
@@ -4704,25 +4719,34 @@
 {#if knownCtxMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
-    class="context-menu"
-    style="left: {knownCtxMenu.x}px; top: {knownCtxMenu.y}px;"
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    use:ctxMenuPosition={{ x: knownCtxMenu.x, y: knownCtxMenu.y }}
     onclick={(e) => e.stopPropagation()}
   >
-    <button class="ctx-item" onclick={() => knownCtxAction('copy_user_hash')}>
+    <div class="ctx-header">
+      <bdi dir="auto">
+        {knownCtxMenu.client.nickname
+          || knownCtxMenu.client.last_known_ip
+          || knownCtxMenu.client.user_hash.slice(0, 12)}
+      </bdi>
+    </div>
+    <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('copy_user_hash')}>
       {m.transfers_ctx_copy_user_hash()}
     </button>
     {#if knownCtxMenu.client.ember_hash}
-      <button class="ctx-item" onclick={() => knownCtxAction('copy_ember_hash')}>
+      <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('copy_ember_hash')}>
         {m.transfers_ctx_copy_ember_hash()}
       </button>
       {#if !friendHashSet.has(knownCtxMenu.client.ember_hash.toLowerCase())}
-        <button class="ctx-item" onclick={() => knownCtxAction('add_friend')}>
+        <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('add_friend')}>
           {m.transfers_ctx_add_friend()}
         </button>
       {/if}
     {/if}
-    <div class="ctx-sep"></div>
-    <button class="ctx-item danger" onclick={() => knownCtxAction('ban_user')}>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
       {m.transfers_ctx_ban_user()}
     </button>
   </div>
@@ -5741,66 +5765,7 @@
     flex-shrink: 0;
   }
 
-  /* --- Context Menu --- */
-  .context-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 4px;
-    min-width: 180px;
-  }
-  .column-menu {
-    min-width: 220px;
-  }
-  .column-menu-title {
-    padding: 4px 14px 6px;
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .ctx-item {
-    display: flex;
-    width: 100%;
-    text-align: left;
-    padding: 4px 12px;
-    font-size: 11px;
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-  }
-  .ctx-item:hover:not(:disabled) { background: var(--bg-hover); }
-  .ctx-item:disabled { opacity: 0.5; cursor: default; }
-  .ctx-item.danger { color: var(--danger); }
-  .ctx-item.has-sub { display: flex; justify-content: space-between; }
-  .ctx-active { font-weight: 700; }
-  .ctx-sep {
-    height: 1px;
-    background: var(--border);
-    margin: 3px 0;
-  }
-  .ctx-submenu-wrap { position: relative; }
-  .ctx-submenu {
-    position: absolute;
-    left: 100%;
-    top: -4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 4px;
-    min-width: 100px;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   /* --- Expanded source rows (compact, eMule-like) --- */
   .dl-row.expanded {

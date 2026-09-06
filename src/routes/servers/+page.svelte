@@ -17,6 +17,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { copyToClipboard, formatCompactCount } from '$lib/utils';
+  import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { toastError } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -512,10 +513,7 @@
       selectedServer = server;
       lastClickedKey = key;
     }
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 200 - margin));
-    ctxMenu = { x, y, server };
+    ctxMenu = { x: e.clientX, y: e.clientY, server };
   }
 
   function closeContextMenu() {
@@ -1022,21 +1020,24 @@
 </div>
 
 {#if ctxMenu}
-  <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;">
+  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+    <div class="ctx-header">
+      <bdi dir="auto">{ctxMenu.server.name || `${ctxMenu.server.ip}:${ctxMenu.server.port}`}</bdi>
+    </div>
     {#if !isConnected(ctxMenu.server)}
-      <button class="ctx-item" onclick={() => ctxAction('connect')}>{m.servers_connect()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('connect')}>{m.servers_connect()}</button>
     {:else}
-      <button class="ctx-item" onclick={() => ctxAction('disconnect')}>{m.servers_disconnect()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('disconnect')}>{m.servers_disconnect()}</button>
     {/if}
-    <div class="ctx-sep"></div>
-    <button class="ctx-item danger" onclick={() => ctxAction('remove')}>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ed2k')}>{m.servers_copy_ed2k_link()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>
       {selectionCount > 1
         ? m.servers_remove_selected_count({ count: selectionCount })
         : m.servers_remove_server()}
     </button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
-    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>{m.servers_copy_ed2k_link()}</button>
   </div>
 {/if}
 
@@ -1478,45 +1479,7 @@
     color: var(--text-muted);
   }
 
-  /* Context menu */
-  .context-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 4px;
-    min-width: 180px;
-  }
-
-  .ctx-item {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 6px 12px;
-    font-size: 12px;
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .ctx-item:hover {
-    background: var(--bg-hover);
-  }
-
-  .ctx-item.danger {
-    color: var(--danger);
-  }
-
-  .ctx-sep {
-    height: 1px;
-    background: var(--border);
-    margin: 3px 0;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   .connect-spinner {
     display: inline-block;

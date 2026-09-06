@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { formatSize, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -438,11 +439,7 @@
   function openMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    const margin = 8;
-    colMenu = {
-      x: Math.max(margin, Math.min(e.clientX, window.innerWidth - 240 - margin)),
-      y: Math.max(margin, Math.min(e.clientY, window.innerHeight - 360 - margin)),
-    };
+    colMenu = { x: e.clientX, y: e.clientY };
   }
 
   function closeMenu() { colMenu = null; }
@@ -692,15 +689,18 @@
 
 {#if colMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="col-ctx-menu" style="left:{colMenu.x}px;top:{colMenu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <div class="col-ctx-title">{m.library_columns_title()}</div>
+  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: colMenu.x, y: colMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-label">{m.library_columns_title()}</div>
     {#each orderedColumns.filter(c => c.key !== FIXED_KEY) as col (col.key)}
-      <button class="col-ctx-item" onclick={() => toggleVisibility(col.key)}>
-        {colHidden[col.key] ? '\u2610' : '\u2611'} {col.label()}
-      </button>
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!colHidden[col.key]}
+        onclick={() => toggleVisibility(col.key)}
+      >{col.label()}</button>
     {/each}
-    <div class="col-ctx-sep"></div>
-    <button class="col-ctx-item" onclick={resetLayout}>{m.library_reset_columns()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" onclick={resetLayout}>{m.library_reset_columns()}</button>
   </div>
 {/if}
 
@@ -986,47 +986,5 @@
   .prio-release { color: var(--danger); font-weight: 600; }
   .prio-auto { color: var(--priority-auto); }
 
-  /* --- Column context menu --- */
-  .col-ctx-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 220px;
-    box-shadow: var(--shadow-lg);
-    font-size: 12px;
-  }
-  .col-ctx-title {
-    padding: 4px 14px 6px;
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .col-ctx-item {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 5px 16px;
-    cursor: pointer;
-    white-space: nowrap;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: inherit;
-    font: inherit;
-    font-size: 12px;
-  }
-  .col-ctx-item:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-  .col-ctx-sep {
-    height: 1px;
-    margin: 4px 0;
-    background: var(--border);
-  }
+  /* Column context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 </style>

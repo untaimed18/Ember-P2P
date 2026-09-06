@@ -34,6 +34,7 @@
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import IconX from '$lib/components/IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -2121,10 +2122,9 @@
 
   function showContextMenu(e: MouseEvent, result: SearchResult) {
     e.preventDefault();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 200 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 150 - margin));
-    contextMenu = { x, y, result };
+    // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
+    // keeps it on screen.
+    contextMenu = { x: e.clientX, y: e.clientY, result };
   }
 
   function closeContextMenu() {
@@ -3360,15 +3360,17 @@
     {#if contextMenu}
       <button
         type="button"
-        class="context-menu-backdrop"
+        class="ctx-backdrop"
         aria-label={m.search_close_context_menu()}
         onclick={closeContextMenu}
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
-      <div class="context-menu" role="menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
-        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
-        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
+      <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
+        <div class="ctx-header">
+          <bdi dir="auto">{contextMenu.result.file.name}</bdi>
+        </div>
         <button
+          class="ctx-item"
           role="menuitem"
           disabled={isInLibraryOnly(contextMenu.result) || !!getBlockingDownloadTransfer(contextMenu.result)}
           title={isInLibraryOnly(contextMenu.result)
@@ -3377,20 +3379,27 @@
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
-          <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
+          <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
+        {/if}
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
+        {#if checkedCount > 1}
+          <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
         {/if}
         <button
+          class="ctx-item"
           role="menuitem"
           onclick={() => { if (contextMenu) void findRelated(contextMenu.result); }}
           title={m.search_ctx_find_related_title()}
         >{m.search_ctx_find_related()}</button>
-        <button role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
-        {#if checkedCount > 1}
-          <button role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
-        {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
+          <div class="ctx-sep" role="separator"></div>
           <button
+            class="ctx-item ctx-danger"
             role="menuitem"
             onclick={() => { if (contextMenu) handleRemoveFromHistory(contextMenu.result); }}
             title={m.search_remove_from_history_title({ status: historyStatusLabel(downloadHistoryMap[contextMenu.result.file.hash]) })}
@@ -5019,54 +5028,7 @@
     background: color-mix(in srgb, var(--danger) 5%, transparent) !important;
   }
 
-  .context-menu-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 9998;
-    padding: 0;
-    margin: 0;
-    border: none;
-    background: transparent;
-    cursor: default;
-  }
-  .context-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 160px;
-    box-shadow: var(--shadow-md);
-    transform-origin: top left;
-    animation: context-menu-pop 0.12s ease;
-  }
-  @keyframes context-menu-pop {
-    from { opacity: 0; transform: scale(0.97); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  .context-menu button {
-    display: block;
-    width: 100%;
-    padding: 6px 12px;
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    font-size: 0.85rem;
-    text-align: left;
-    cursor: pointer;
-  }
-  .context-menu button:hover {
-    background: var(--bg-hover);
-  }
-  .context-menu button:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .context-menu button:disabled:hover {
-    background: none;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   @media (max-width: 1200px) {
     .search-area {

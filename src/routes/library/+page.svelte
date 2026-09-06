@@ -52,6 +52,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
   // All three are replace-only — never mutated in place — so `$state.raw`
@@ -1752,44 +1753,20 @@
       sendableFriends = [];
     }
   }
-  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
-  let ctxSubmenuLeft = $state(false);
-  let ctxSubmenuUp = $state(false);
-
-  async function positionCtxMenu() {
-    if (!ctxMenu) return;
-    await tick();
-    if (!ctxMenu || !ctxMenuEl) return;
-    const margin = 8;
-    // Use offsetWidth/offsetHeight (untransformed layout size) rather than
-    // getBoundingClientRect(), whose width/height reflect the entrance scale
-    // animation mid-flight and would clamp the menu a few px off near edges.
-    const menuW = ctxMenuEl.offsetWidth;
-    const menuH = ctxMenuEl.offsetHeight;
-    const x = Math.min(ctxMenu.x, Math.max(margin, window.innerWidth - menuW - margin));
-    const y = Math.min(ctxMenu.y, Math.max(margin, window.innerHeight - menuH - margin));
-    ctxSubmenuLeft = x + menuW * 2 > window.innerWidth - margin;
-    ctxSubmenuUp = y + 240 > window.innerHeight - margin;
-    if (x !== ctxMenu.x || y !== ctxMenu.y) {
-      ctxMenu = { ...ctxMenu, x, y };
-    }
-  }
-
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxPrioritySub = false;
     ctxCopySub = false;
     // Highlight the target row without opening the properties drawer
     // (drawer stays tied to left-click / Properties menu item).
+    // `ctxMenuPosition` measures the panel and keeps it inside the viewport;
+    // the submenus pick their own side via `ctxSubmenuPlacement`.
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
-    void positionCtxMenu();
   }
   function closeCtx() {
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
-    ctxSubmenuLeft = false;
-    ctxSubmenuUp = false;
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
@@ -3650,46 +3627,62 @@
 <!-- Context menu -->
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
-  <div bind:this={ctxMenuEl} class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
+  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+    <div class="ctx-header">
+      <bdi dir="auto">{ctxMenu.file.name}</bdi>
+    </div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
-    <div class="ctx-sep"></div>
+    <div class="ctx-sep" role="separator"></div>
     {#if fileHashed}
       <div
-        class="ctx-item ctx-sub-parent"
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxPrioritySub}
         role="menuitem"
         tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxPrioritySub}
         onmouseenter={() => ctxPrioritySub = true}
         onmouseleave={() => ctxPrioritySub = false}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
       >
-        {m.library_col_priority()} &raquo;
+        {m.library_col_priority()}
+        <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
         {#if ctxPrioritySub}
-          <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
-            <div class="ctx-sep"></div>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each ['verylow', 'low', 'normal', 'high', 'release'] as prio}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={ctxMenu.file.priority === prio}
+                onclick={() => ctxAction('priority', prio)}
+              >{priorityLabel(prio)}</button>
+            {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button
+              class="ctx-item"
+              role="menuitemradio"
+              aria-checked={ctxMenu.file.priority === 'auto'}
+              onclick={() => ctxAction('priority', 'auto')}
+            >{m.library_priority_auto()}</button>
           </div>
         {/if}
       </div>
-      <div class="ctx-sep"></div>
       <div
-        class="ctx-item ctx-sub-parent"
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxCopySub}
         role="menuitem"
         tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxCopySub}
         onmouseenter={() => ctxCopySub = true}
         onmouseleave={() => ctxCopySub = false}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxCopySub = true; }}
       >
-        {m.servers_copy_ed2k_link()} &raquo;
+        {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
-          <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.library_copy_link_plain()}</button>
             {#if ctxMenu.file.aich_hash}
               <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'aich')}>{m.library_copy_link_aich()}</button>
@@ -3704,19 +3697,22 @@
         onclick={() => ctxAction('find_related')}
         title={m.search_ctx_find_related_title()}
       >{m.search_ctx_find_related()}</button>
-      <div class="ctx-sep"></div>
+      <div class="ctx-sep" role="separator"></div>
       {#if ctxMenu.file.shared}
         <div
-          class="ctx-item ctx-sub-parent"
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxSendSub}
           role="menuitem"
           tabindex="0"
+          aria-haspopup="menu"
+          aria-expanded={ctxSendSub}
           onmouseenter={() => { ctxSendSub = true; void loadSendableFriends(); }}
           onmouseleave={() => ctxSendSub = false}
           onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') { ctxSendSub = true; void loadSendableFriends(); } }}
         >
-          {m.library_send_to_friend()} &raquo;
+          {m.library_send_to_friend()}
           {#if ctxSendSub}
-            <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+            <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
               {#if sendableFriends.length === 0}
                 <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_send_no_friends_online()}</button>
               {:else}
@@ -3739,8 +3735,8 @@
         >{m.library_republish_kad()}{$networkStats.status !== 'connected' ? m.library_republish_offline_suffix() : ''}</button>
         <button
           class="ctx-item"
-          role="menuitem"
-          class:ctx-checked={ctxMenu.file.friends_only}
+          role="menuitemcheckbox"
+          aria-checked={!!ctxMenu.file.friends_only}
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
@@ -3751,6 +3747,8 @@
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
   </div>
 {/if}
 
@@ -4435,70 +4433,7 @@
     white-space: nowrap;
   }
 
-  /* --- Context menu --- */
-  .ctx-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 180px;
-    box-shadow: var(--shadow-lg);
-    font-size: 12px;
-    transform-origin: top left;
-    animation: ctx-menu-pop 0.12s ease;
-  }
-  @keyframes ctx-menu-pop {
-    from { opacity: 0; transform: scale(0.97); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  .ctx-item {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 5px 16px;
-    cursor: pointer;
-    white-space: nowrap;
-    position: relative;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: inherit;
-    font: inherit;
-    font-size: 12px;
-    line-height: inherit;
-  }
-  .ctx-item:hover { background: var(--bg-hover); color: var(--text-primary); }
-  .ctx-item.ctx-danger { color: var(--danger); }
-  .ctx-item.ctx-danger:hover {
-    background: color-mix(in srgb, var(--danger) 14%, var(--bg-hover));
-    color: var(--danger);
-  }
-  .ctx-sep { height: 1px; margin: 4px 0; background: var(--border); }
-  .ctx-checked::before { content: '\2713  '; }
-  .ctx-sub-parent { padding-right: 24px; }
-  .ctx-disabled { color: var(--text-muted); cursor: default; }
-  .ctx-disabled:hover { background: none; color: var(--text-muted); }
-  .ctx-submenu {
-    position: absolute;
-    left: 100%;
-    top: 0;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 140px;
-    box-shadow: var(--shadow-lg);
-  }
-  .ctx-submenu.ctx-submenu-left {
-    left: auto;
-    right: 100%;
-  }
-  .ctx-submenu.ctx-submenu-up {
-    top: auto;
-    bottom: 0;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   /* --- Filter bar --- */
   .filter-bar {
