@@ -1348,6 +1348,8 @@
   "search_query_syntax_hint_ember": "Ember 搜索要求文件名包含每一个词。AND / OR / NOT 仅适用于 eD2K（KAD 和服务器）。",
   "search_query_syntax_min_term": "少于 3 个字符的词会被忽略——与 eD2K 发布端为文件名建立索引时相同。",
   "search_needs_keyword": "KAD 和 Ember 搜索需要至少 3 个字符的关键字。请加入关键字，或改用“所有网络 / 服务器”并搭配类型和大小筛选。",
+  "search_enter_query": "请输入要搜索的内容，或设置类型、大小或来源筛选。",
+  "search_directive_server_only": "ed2k:: 和 related:: 搜索由 eD2K 服务器应答。请切换到“所有网络”或“服务器”——KAD 与 Ember 索引的是文件名，而非这些内容。",
   "search_previous_stopped": "已停止上一次搜索——同一时间只能运行一个网络搜索。",
   "search_dl_searching": "搜索中",
   "search_dl_downloaded": "已完成",

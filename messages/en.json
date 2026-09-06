@@ -1348,6 +1348,8 @@
   "search_query_syntax_hint_ember": "Ember search matches every word in the filename. AND / OR / NOT apply on eD2K (KAD and servers) only.",
   "search_query_syntax_min_term": "Words shorter than 3 characters are ignored — the same rule eD2K publishers use when indexing names.",
   "search_needs_keyword": "KAD and Ember searches need a word of at least 3 characters. Add a keyword, or use All networks / Server with type and size filters.",
+  "search_enter_query": "Type something to search for, or set a file type, size or sources filter.",
+  "search_directive_server_only": "ed2k:: and related:: searches are answered by an eD2K server. Switch to All networks or Server — KAD and Ember index filenames, not these.",
   "search_previous_stopped": "Previous search stopped — only one network search can run at a time.",
   "search_dl_searching": "Searching",
   "search_dl_downloaded": "Done",

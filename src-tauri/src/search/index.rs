@@ -176,6 +176,14 @@ impl LocalIndex {
             .as_ref()
             .map(|e| e.positive_terms())
             .unwrap_or_default();
+        // `ed2k::<hash>` names files outright. The directive text appears in no
+        // filename, so the keyword path below could only ever answer "not
+        // shared" for a file that is sitting in the library — including the one
+        // whose own link the user just pasted.
+        let exact_hashes = expr
+            .as_ref()
+            .and_then(|e| e.exact_file_hashes())
+            .unwrap_or_default();
 
         let mut results: Vec<(usize, u32)> = self
             .files
@@ -194,6 +202,12 @@ impl LocalIndex {
                     file_extension,
                 ) {
                     return None;
+                }
+                if !exact_hashes.is_empty() {
+                    return exact_hashes
+                        .iter()
+                        .any(|hash| hash.eq_ignore_ascii_case(&file.hash))
+                        .then_some((idx, 1u32));
                 }
                 let expr = match expr.as_ref() {
                     None => return Some((idx, 1u32)),
@@ -1454,6 +1468,29 @@ mod local_index_tests {
         );
         assert_eq!(index.get_by_path("A/copy.bin").unwrap().priority, "high");
         assert_eq!(index.get_by_path("B/copy.bin").unwrap().priority, "high");
+    }
+
+    /// A pasted `ed2k::<hash>` asks about one exact file. Matching it as a
+    /// keyword tested the directive text against filenames it cannot appear
+    /// in, so the library answered "not shared" for a file it was sharing.
+    #[test]
+    fn an_ed2k_directive_matches_a_shared_file_by_hash() {
+        let hash = "abcdefabcdefabcdefabcdefabcdefab";
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/wanted.bin", hash, true, "normal"),
+            file("A/other.bin", &"f".repeat(32), true, "normal"),
+        ]);
+
+        // Upper-cased on the way in, the way eMule's own menu item writes it.
+        let hits = index.search(&format!("ed2k::{}", hash.to_uppercase()));
+        assert_eq!(hits.len(), 1, "the named file, and only it");
+        assert_eq!(hits[0].file.hash, hash);
+
+        assert!(
+            index.search(&format!("ed2k::{}", "b".repeat(32))).is_empty(),
+            "a hash we do not share must not match anything"
+        );
     }
 
     #[test]

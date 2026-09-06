@@ -30,6 +30,12 @@
     type RelatedSearchInfo,
     type SearchTab,
   } from '$lib/stores/search';
+  import {
+    MAX_SEARCH_QUERY_LEN,
+    clampQueryBytes,
+    isServerDirectiveQuery,
+    queryHasNetworkKeyword,
+  } from '$lib/searchQuery';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
@@ -57,10 +63,6 @@
    * getSettings() from re-arming the cancel watchdog after completion grace
    * is already in `searchTimeouts`. */
   const searchInvokeSettled = new Set<number>();
-
-  /// Upper bound on a search query length sent over IPC. Matches
-  /// `MAX_SEARCH_QUERY_LEN` in commands/search.rs (1024 bytes for ASCII).
-  const MAX_SEARCH_QUERY_LEN = 1024;
 
   let searchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
@@ -903,13 +905,6 @@
     }
   }
 
-  function queryHasNetworkKeyword(q: string): boolean {
-    // Same 3-byte floor as eD2K keyword indexing (UTF-8), so a 1–2 character
-    // CJK token is still a valid KAD/Ember key.
-    const encoder = new TextEncoder();
-    return q.split(/[\s()[\]{}<>,._\-!?:;\\/"']+/).some((t) => t && encoder.encode(t).length >= 3);
-  }
-
   function explainBatchFromTab(): { batchFileHashes: string[]; batchFileNames: string[] } {
     const tab = activeTab;
     const rows = (tab?.results ?? []).filter((r) => r.file.hash).slice(0, 256);
@@ -1102,13 +1097,20 @@
   });
 
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
+    // Positive numbers only, matching the wire and the backend's
+    // `has_usable_filters`: `build_search_expression_with_node` drops a zero
+    // numeric, so a `0` left in a size or sources box is not a constraint and
+    // cannot stand in for a query. Counting it as one started a search whose
+    // expression was empty, which the network answers by completing instantly
+    // with nothing.
+    const constrains = (v: number | undefined) => v !== undefined && Number.isFinite(v) && v > 0;
     return !!(
       fileType ||
       filters?.fileType ||
       filters?.fileExtension ||
-      filters?.minSize !== undefined ||
-      filters?.maxSize !== undefined ||
-      filters?.minAvailability !== undefined
+      constrains(filters?.minSize) ||
+      constrains(filters?.maxSize) ||
+      constrains(filters?.minAvailability)
     );
   }
 
@@ -1430,10 +1432,60 @@
     return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
   }
 
+  /** Split a byte count back into the number and unit the size boxes hold. */
+  function sizeToInput(
+    bytes: number | undefined,
+    fallbackUnit: number,
+  ): { value: number | null; unit: number } {
+    if (bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) {
+      return { value: null, unit: fallbackUnit };
+    }
+    // Largest unit that divides evenly, so 1 GB comes back as "1 GB" rather
+    // than "1073741824 B".
+    for (let i = SIZE_UNITS.length - 1; i >= 0; i--) {
+      const unit = SIZE_UNITS[i].value;
+      if (bytes % unit === 0) return { value: bytes / unit, unit };
+    }
+    return { value: bytes, unit: 1 };
+  }
+
+  /**
+   * Point the method dropdown, the wire file type and the size / extension /
+   * sources boxes back at the search the selected tab actually ran.
+   *
+   * These controls are shared by every tab, so leaving them alone meant the
+   * panel described the *last* search while the table showed a different one.
+   * That is not only confusing: the same boxes post-filter the rows on screen,
+   * so a narrowing left over from another tab silently hid hits this one had
+   * found, and pressing Search re-ran the dropdowns rather than the tab.
+   *
+   * The client-only view controls — text filter, min complete sources, column,
+   * hide spam — are left as the user set them. They are a lens over whatever is
+   * on screen rather than part of the search that was sent.
+   */
+  function restoreTabSearchParams(tab: SearchTab) {
+    searchMethod = tab.method;
+    searchFileType = tab.fileType ?? '';
+    // Same rule as `handleSearch`: Program clears the local type filter so the
+    // Arc/Iso hits a Pro-wire search brings back stay visible.
+    filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    filterExtension = tab.filters?.fileExtension ?? '';
+    const min = sizeToInput(tab.filters?.minSize, filterMinUnit);
+    filterMinSize = min.value;
+    filterMinUnit = min.unit;
+    const max = sizeToInput(tab.filters?.maxSize, filterMaxUnit);
+    filterMaxSize = max.value;
+    filterMaxUnit = max.unit;
+    filterMinSources = tab.filters?.minAvailability ?? null;
+  }
+
   function selectSearchTab(tabId: string) {
     setActiveSearchTab(tabId);
     const t = get(searchTabs).find((x) => x.id === tabId);
-    if (t) barQuery = t.query;
+    if (t) {
+      barQuery = t.query;
+      restoreTabSearchParams(t);
+    }
     selectedResultKey = null;
     notes = [];
     notesRequestId += 1;
@@ -1539,7 +1591,13 @@
     const next = get(activeSearchTabId);
     if (next) {
       const nt = get(searchTabs).find((x) => x.id === next);
-      if (nt) barQuery = nt.query;
+      if (nt) {
+        barQuery = nt.query;
+        // Closing a tab selects a neighbour, which is a tab switch by another
+        // route — so the panel has to follow it here too, or it would go on
+        // describing (and filtering by) the search that was just closed.
+        restoreTabSearchParams(nt);
+      }
     }
   }
 
@@ -1572,7 +1630,7 @@
     }
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
-    const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
+    const q = clampQueryBytes(query.trim());
     // A related search carries no filters, because eMule's carries none:
     // `CSearchResultsWnd::SearchRelatedFiles` fills in an expression and a tab
     // title and leaves every filter field of a fresh `SSearchParams` at zero.
@@ -1606,7 +1664,20 @@
     // alone, so it is exempt from the "type something" and "needs a keyword"
     // gates that a hand-typed query has to pass.
     const coShareOnly = !!plan && plan.co_share_hashes.length > 0 && !plan.query;
-    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, wireFileType)) return;
+    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, wireFileType)) {
+      // Pressing Search on an empty box used to do nothing at all — no tab, no
+      // message, indistinguishable from a broken button. The Search button is
+      // only disabled for a missing network, which the readiness hint explains
+      // on screen; this state has nothing else saying it.
+      addToast('warning', m.search_enter_query());
+      return;
+    }
+    // Checked before the keyword floor below, which a directive passes: its
+    // text tokenizes into `ed2k` plus the hash, both comfortably over 3 bytes.
+    if ((method === 'kad' || method === 'ember') && isServerDirectiveQuery(q)) {
+      addToast('warning', m.search_directive_server_only());
+      return;
+    }
     if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
       addToast('warning', m.search_needs_keyword());
       return;

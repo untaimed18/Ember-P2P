@@ -152,6 +152,38 @@ impl QueryExpr {
         }
     }
 
+    /// True when any term is a directive the eD2k server resolves itself
+    /// (`related::<hash>` / `ed2k::<hash>`).
+    ///
+    /// Such a query is a question only a server can answer, so the keyword
+    /// DHTs are left out of it (see `network::search_legs`). Both look a
+    /// keyword up by its MD4, and the MD4 of the string `ed2k::<hash>` is a
+    /// key no publisher has ever written — those legs would spend a search
+    /// slot walking to nothing while the server answers correctly. eMule's own
+    /// "Search Related Files" is server-side for the same reason; this is what
+    /// makes a directive the user typed or pasted behave the same way.
+    pub fn contains_server_directive(&self) -> bool {
+        match self {
+            QueryExpr::Term(s) => is_server_directive(s),
+            QueryExpr::And(l, r) | QueryExpr::Or(l, r) | QueryExpr::Not(l, r) => {
+                l.contains_server_directive() || r.contains_server_directive()
+            }
+        }
+    }
+
+    /// The files this query names outright, when it is nothing but an
+    /// `ed2k::<hash>` directive.
+    ///
+    /// Lets the local library answer a pasted hash by looking it up, rather
+    /// than testing the directive text against filenames it cannot appear in —
+    /// which could only ever report a file we do share as not shared.
+    pub fn exact_file_hashes(&self) -> Option<Vec<String>> {
+        match self {
+            QueryExpr::Term(s) => ed2k_directive_hashes(s),
+            _ => None,
+        }
+    }
+
     /// Remove every `Term` equal to `keyword` (case-sensitive; terms are already
     /// lowercased). Used for Kad AND-only restrictive trees: eMule strips the
     /// lookup keyword from the packet because the DHT target already selects
@@ -309,11 +341,21 @@ fn tokenize_term(raw: &str) -> Vec<String> {
 /// (`md4str` uses an upper-case alphabet), since a server free to compare the
 /// hex as text rather than parse it would only ever have been tested against
 /// that.
-fn server_directive(raw: &str) -> Option<String> {
-    let (directive, rest) = raw
+/// One parsed server directive: which one it is, and the files it names.
+struct ServerDirective<'a> {
+    /// `related` or `ed2k`, lower-cased.
+    name: String,
+    /// The file-size field, empty for the `related::<hash>` form.
+    size: &'a str,
+    /// Upper-case MD4 hex, in the order written.
+    hashes: Vec<String>,
+}
+
+fn parse_server_directive(raw: &str) -> Option<ServerDirective<'_>> {
+    let (name, rest) = raw
         .split_once(':')
         .map(|(head, rest)| (head.to_ascii_lowercase(), rest))?;
-    if directive != "related" && directive != "ed2k" {
+    if name != "related" && name != "ed2k" {
         return None;
     }
     // `related::<hash>` leaves the size field empty; `related:<size>:<hash>`
@@ -332,22 +374,43 @@ fn server_directive(raw: &str) -> Option<String> {
     if hashes.is_empty() || !hashes.iter().all(|h| is_md4_hex(h)) {
         return None;
     }
+    Some(ServerDirective { name, size, hashes })
+}
+
+fn server_directive(raw: &str) -> Option<String> {
+    let directive = parse_server_directive(raw)?;
     // Rebuilt in the exact shape eMule writes: `related::H1::H2`, or
     // `related:<size>:<hash>` where a size is given.
-    let mut term = directive;
-    let mut rest = hashes.as_slice();
-    if !size.is_empty() {
+    let mut term = directive.name;
+    let mut rest = directive.hashes.as_slice();
+    if !directive.size.is_empty() {
         term.push(':');
-        term.push_str(size);
+        term.push_str(directive.size);
         term.push(':');
-        term.push_str(&hashes[0]);
-        rest = &hashes[1..];
+        term.push_str(&directive.hashes[0]);
+        rest = &directive.hashes[1..];
     }
     for hash in rest {
         term.push_str("::");
         term.push_str(hash);
     }
     Some(term)
+}
+
+/// Whether `term` is a directive the eD2k server resolves from its own index
+/// rather than a word to match against filenames.
+pub fn is_server_directive(term: &str) -> bool {
+    parse_server_directive(term).is_some()
+}
+
+/// The files an `ed2k::<hash>` directive names, as upper-case MD4 hex.
+///
+/// `None` for anything else, `related::<hash>` included: that one asks what is
+/// shared *alongside* those hashes, which is a question about the server's
+/// index rather than a set of files to look up.
+pub fn ed2k_directive_hashes(term: &str) -> Option<Vec<String>> {
+    let directive = parse_server_directive(term)?;
+    (directive.name == "ed2k").then_some(directive.hashes)
 }
 
 fn is_md4_hex(hash: &str) -> bool {
@@ -650,6 +713,33 @@ mod tests {
             parsed.positive_terms(),
             vec![format!("related::{HASH}"), "video".to_string()]
         );
+    }
+
+    /// The keyword DHTs look a term up by its MD4, so they have to be able to
+    /// tell a directive from a word: hashing `ed2k::<hash>` targets a key no
+    /// publisher has ever written, and both legs would walk to nothing while
+    /// the server answered correctly.
+    #[test]
+    fn a_directive_is_recognized_as_server_side() {
+        let ed2k = parse(&format!("ed2k::{HASH}")).expect("parses");
+        assert!(ed2k.contains_server_directive());
+        assert_eq!(ed2k.exact_file_hashes(), Some(vec![HASH.to_string()]));
+
+        let related = parse(&format!("related::{HASH}")).expect("parses");
+        assert!(related.contains_server_directive());
+        // `related::` asks what is shared alongside the hash — the server's
+        // index to answer, not a file the library can look up.
+        assert_eq!(related.exact_file_hashes(), None);
+
+        let plain = parse("linux mint iso").expect("parses");
+        assert!(!plain.contains_server_directive());
+        assert_eq!(plain.exact_file_hashes(), None);
+
+        // Alongside operators the directive is one term of a larger tree: the
+        // query stays server-side, but it no longer names one exact file.
+        let mixed = parse(&format!("ed2k::{HASH} AND video")).expect("parses");
+        assert!(mixed.contains_server_directive());
+        assert_eq!(mixed.exact_file_hashes(), None);
     }
 
     /// Mirror of the flat AND-tree the legacy path emits, for byte-compat checks.

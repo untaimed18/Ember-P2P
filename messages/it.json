@@ -1348,6 +1348,8 @@
   "search_query_syntax_hint_ember": "La ricerca Ember richiede ogni parola nel nome del file. AND / OR / NOT valgono solo su eD2K (KAD e server).",
   "search_query_syntax_min_term": "Le parole più corte di 3 caratteri vengono ignorate — la stessa regola con cui eD2K indicizza i nomi.",
   "search_needs_keyword": "Le ricerche KAD ed Ember richiedono una parola di almeno 3 caratteri. Aggiungi una parola chiave oppure usa Tutte le reti / Server con filtri di tipo e dimensione.",
+  "search_enter_query": "Digita qualcosa da cercare, oppure imposta un filtro di tipo, dimensione o fonti.",
+  "search_directive_server_only": "Le ricerche ed2k:: e related:: sono gestite da un server eD2K. Passa a Tutte le reti o Server: KAD ed Ember indicizzano i nomi dei file, non questo.",
   "search_previous_stopped": "Ricerca precedente interrotta: può essere attiva una sola ricerca di rete alla volta.",
   "search_dl_searching": "Ricerca",
   "search_dl_downloaded": "Completato",

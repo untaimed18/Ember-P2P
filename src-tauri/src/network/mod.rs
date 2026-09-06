@@ -2599,7 +2599,10 @@ struct SearchLegs {
 ///
 /// `has_keyword_query` is whether a keyword leg has anything at all to send
 /// (terms, or filters that stand on their own); `has_keywords` is whether the
-/// parsed query left a positive term, which is what Kad and Ember look up.
+/// parsed query left a positive term *the keyword DHTs can look up*, which is
+/// what Kad and Ember walk to. A query that is nothing but a server directive
+/// (`ed2k::<hash>` / `related::<hash>`) leaves none: the term is an instruction
+/// to a server, so its MD4 is a key no publisher has ever written.
 ///
 /// The rule worth naming here: `Server` asks that one connection and nothing
 /// else. It is what keeps "Search Related Files" the server-side feature it is
@@ -2627,7 +2630,12 @@ fn search_legs(
         // and it is asked over TCP.
         udp: has_keyword_query && matches!(method, SearchMethod::Global) && !user_offline,
         kad: has_keywords && matches!(method, SearchMethod::Global | SearchMethod::Kad),
-        ember: matches!(method, SearchMethod::Global | SearchMethod::Ember),
+        // Gated on `has_keywords` for the same reason Kad is: the Ember DHT
+        // walks to a keyword hash, so with no lookupable term there is no walk
+        // to start. Starting one already required `compute_keyword_hashes` to
+        // yield a key, so this only makes the leg honest about it rather than
+        // leaving a leg claimed here and quietly abandoned there.
+        ember: has_keywords && matches!(method, SearchMethod::Global | SearchMethod::Ember),
     }
 }
 
@@ -2702,7 +2710,24 @@ mod search_legs_tests {
         let legs = search_legs(SearchMethod::Global, false, false, false);
         assert!(!legs.udp, "a keywordless OP_GLOBSEARCH is not a search");
         assert!(!legs.kad);
+        assert!(!legs.ember, "the Ember DHT walk needs a keyword hash");
         assert!(legs.server, "the co-share request still goes over TCP");
+    }
+
+    /// A query that is only an `ed2k::<hash>` / `related::<hash>` directive:
+    /// the servers resolve it from their own index, and the caller reports no
+    /// DHT-lookupable keyword so neither keyword DHT is sent after a key that
+    /// was never published.
+    #[test]
+    fn a_server_directive_query_asks_no_dht_leg() {
+        let legs = search_legs(SearchMethod::Global, true, false, false);
+        assert!(legs.server, "the directive goes to the connected server");
+        assert!(legs.udp, "the rest of the server list can resolve it too");
+        assert!(
+            !legs.kad,
+            "the MD4 of the directive text is not a published key"
+        );
+        assert!(!legs.ember);
     }
 }
 

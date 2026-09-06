@@ -66,7 +66,6 @@ const KNOWN_UNTRANSLATED = new Set([
   "search_note_publish_failed",
   "search_note_publish_unavailable",
   "search_notes_busy",
-  "search_source_search_busy",
   "search_spam_invalid_server_ip",
   "security_policy_reset_failed",
   "security_policy_reset_task_failed",

@@ -309,10 +309,22 @@ async fn handle_command_inner(
             // Which networks this search is allowed to reach, and why, lives
             // in `search_legs` — including the one rule a related search
             // depends on: `Server` asks the connected server and nothing else.
+            // `ed2k::<hash>` and `related::<hash>` are instructions to an eD2k
+            // server, not words to match against filenames, so the keyword
+            // DHTs have nothing to look up: Kad would walk to
+            // MD4("ed2k::<hash>") and Ember would hash the same text — keys no
+            // publisher has ever written. Reporting no lookupable keyword keeps
+            // both legs out of it and leaves the directive to the legs that
+            // resolve it from a server's own index. A related search already
+            // arrives as `SearchMethod::Server`; this is what makes a directive
+            // the user typed or pasted behave the same way.
+            let server_directive_query = query_expr
+                .as_ref()
+                .is_some_and(|expr| expr.contains_server_directive());
             let legs = search_legs(
                 method,
                 has_keyword_query,
-                !keywords.is_empty(),
+                !keywords.is_empty() && !server_directive_query,
                 state
                     .user_offline
                     .load(std::sync::atomic::Ordering::Relaxed),
