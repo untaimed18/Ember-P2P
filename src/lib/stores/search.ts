@@ -4,6 +4,7 @@ import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
+import { shedWeakestRows } from '$lib/searchOverflow';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
 
@@ -299,12 +300,7 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
     }
   }
   if (results.length > MAX_TAB_RESULTS) {
-    // Shed the least useful rows first. `availability` is the merged source
-    // count `mergeResult` maintains, so the rows dropped are the ones no peer
-    // claims to have — the ones a user can least act on. `sort` is stable, so
-    // ties keep the earlier-seen hit.
-    results.sort((a, b) => (b.availability || 0) - (a.availability || 0));
-    results.length = TAB_RESULTS_LOW_WATER;
+    shedWeakestRows(results, TAB_RESULTS_LOW_WATER);
     index.clear();
     for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
