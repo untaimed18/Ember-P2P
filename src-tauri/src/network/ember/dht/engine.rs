@@ -2543,15 +2543,7 @@ fn callback_tokens_match(expected: &[u8; 16], got: &[u8; 16]) -> bool {
     diff == 0
 }
 
-/// Extract `file_hash` from a packed Ember DHT record (`type || keyword_hash || file_hash || …`).
-fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
-    if data.len() < 33 {
-        return None;
-    }
-    let mut h = [0u8; 16];
-    h.copy_from_slice(&data[17..33]);
-    Some(h)
-}
+use super::publish::file_hash_from_record_data;
 
 /// Multi-keyword FIND_VALUE answer: primary-key blobs, optionally narrowed
 /// to `file_hash`es that also appear under a secondary key this node holds.

@@ -1751,11 +1751,7 @@ fn source_ip_from_record_data(data: &[u8]) -> Option<std::net::Ipv4Addr> {
 /// The eD2K file hash embedded in a record body, at the fixed offset that
 /// follows `record_type` and `keyword_hash`. Zero when the body is truncated.
 fn file_hash_from_record_data(data: &[u8]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    if data.len() >= 33 {
-        out.copy_from_slice(&data[17..33]);
-    }
-    out
+    super::publish::file_hash_from_record_data(data).unwrap_or([0u8; 16])
 }
 
 fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {

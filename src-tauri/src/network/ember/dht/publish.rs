@@ -306,6 +306,23 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
 /// apart on where the name — and therefore the contact block — begins.
 pub(super) const RECORD_HEADER_LEN: usize = 1 + 16 + 16 + 32 + 8 + 32 + 8 + 2;
 
+/// The file hash a packed record body is about, read at its fixed offset.
+/// `None` when the body is too short to hold one.
+///
+/// A caller holding a whole blob should prefer [`SignedRecord::from_value_blob`],
+/// which verifies as it parses. This exists for the paths that need nothing but
+/// the hash and cannot afford a parse to get it: the searcher's result budget,
+/// the store's replacement scan, and the peer-side keyword intersection, each of
+/// which reads it once per record on a key that may hold a thousand.
+pub(super) fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
+    if data.len() < 33 {
+        return None;
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&data[17..33]);
+    Some(hash)
+}
+
 /// DHT key under which a file's source records live: `BLAKE3(file_hash)[..16]`.
 ///
 /// Publish (`SignedRecord::source`) and find (the download source-lookup
