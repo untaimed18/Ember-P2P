@@ -184,6 +184,7 @@ async fn handle_command_inner(
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
                 ed2k_noted_availability: HashMap::new(),
+                dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),

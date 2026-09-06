@@ -2831,30 +2831,128 @@ fn mark_streamed_hashes(active: &mut ActiveSearchRequest, results: &[SearchResul
     }
 }
 
-/// Emit already-seen-hash updates without spam re-scoring. Ed2k rows update
-/// the cap map and carry **absolute** summed/max availability for the UI
-/// (frontend takes max). Kad rows only refresh availability/sources/origin.
-fn emit_search_resight_updates(
-    app_handle: &tauri::AppHandle,
-    request_id: u64,
-    updates: Vec<SearchResult>,
+/// Running per-file source totals for the DHT legs of one search.
+///
+/// Kept apart from `ed2k_noted_availability`, and from each other, because the
+/// rule for combining counts is per-leg: inside a leg the answers add up (each
+/// KAD node and each Ember publisher is a separate claim on a separate file),
+/// while across legs the biggest wins — a file on both the server and KAD is
+/// one swarm being counted twice, not twice the sources. Since the UI merges a
+/// row's counts by taking the max, holding the legs separately here is what
+/// keeps that cross-leg max from quietly becoming a sum.
+#[derive(Debug, Default, Clone, Copy)]
+struct DhtNotedAvailability {
+    kad: u32,
+    ember: u32,
+}
+
+/// How a DHT batch's counts relate to what its leg has already reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DhtBatchKind {
+    /// Records the leg has not handed over before — the cursor-advanced tail
+    /// slice both streaming paths send. Their counts add to the total.
+    Incremental,
+    /// A rebuild over every record the walk gathered, which is what the closing
+    /// batch of either leg is. It *is* the total, so it replaces rather than
+    /// adds — folding it in as an increment would double every count at the
+    /// exact moment the search finished.
+    Cumulative,
+}
+
+/// Fold a DHT batch into the request's running per-file totals for that leg,
+/// and put the total on each row.
+///
+/// Both DHT legs convert only the records they have not converted before, so a
+/// batch's `availability` counts that slice and nothing else: a file published
+/// by thirty KAD nodes arrives as a dozen small batches. The UI merges counts
+/// by max, so without a running total the row showed the largest single slice —
+/// three or four sources for a file with thirty — until the leg finished and
+/// pushed its rebuild over everything gathered. Which was correct, and up to a
+/// minute late on a cold routing table. The server legs never had this because
+/// they have kept a running total all along; this is that, for KAD and Ember.
+fn note_dht_availability(
     active: &mut ActiveSearchRequest,
+    results: &mut [SearchResult],
+    kind: DhtBatchKind,
+) {
+    for r in results {
+        if r.file.hash.is_empty() {
+            continue;
+        }
+        // Bounded the way `streamed_hashes` is: at the cap, files already being
+        // tracked keep accumulating and a new one simply goes untracked, which
+        // beats abandoning the totals for the rest of the search.
+        let noted = if active.dht_noted_availability.len() >= MAX_STREAMED_HASHES_SOFT_CAP {
+            active.dht_noted_availability.get_mut(&r.file.hash)
+        } else {
+            Some(
+                active
+                    .dht_noted_availability
+                    .entry(r.file.hash.clone())
+                    .or_default(),
+            )
+        };
+        let Some(noted) = noted else { continue };
+        let slot = match r.result_origin.as_str() {
+            crate::search::merge::ORIGIN_KAD => &mut noted.kad,
+            crate::search::merge::ORIGIN_EMBER => &mut noted.ember,
+            // Anything else is a server row (handled by the ed2k total) or an
+            // already-merged origin, which no streamed batch carries.
+            _ => continue,
+        };
+        *slot = match kind {
+            DhtBatchKind::Incremental => slot.saturating_add(r.availability),
+            DhtBatchKind::Cumulative => (*slot).max(r.availability),
+        }
+        .min(MAX_KAD_AVAILABILITY);
+        r.availability = r.availability.max(*slot);
+    }
+}
+
+/// Fold ed2k re-sights into the request's running per-file totals and put that
+/// **absolute** total on each row, which is what the UI's max-merge has to land
+/// on for a row to end up showing the sum of every server that answered.
+///
+/// Runs before the client-constraint filter, because a re-sight is an increment
+/// to a row that is already on screen — it only exists for a hash in
+/// `streamed_hashes`, which nothing enters until it has been emitted. Filtering
+/// it first compared "Min sources" against one server's slice instead of the
+/// file's count: a second server answering with 4 sources for a row already
+/// showing 25 was discarded under a minimum of 10, and its 4 left the total for
+/// good. Now the filter sees the summed count, so a displayed row's own number
+/// is what decides, and it can no longer drop its own increments.
+fn note_ed2k_resight_availability(
+    active: &mut ActiveSearchRequest,
+    updates: &mut [SearchResult],
     skip_hashes: &HashSet<String>,
 ) {
-    if updates.is_empty() {
-        return;
-    }
-    let mut updates = filter_results_by_client_constraints(updates, active);
-    if updates.is_empty() {
-        return;
-    }
-    for r in &mut updates {
+    for r in updates {
         if crate::search::merge::is_ed2k_network_origin(&r.result_origin) {
             let _ = note_ed2k_search_results(active, std::slice::from_ref(r), skip_hashes);
             if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
                 r.availability = total;
             }
         }
+    }
+}
+
+/// Emit already-seen-hash updates without spam re-scoring. Ed2k rows update
+/// the cap map and carry **absolute** summed/max availability for the UI
+/// (frontend takes max). Kad rows only refresh availability/sources/origin.
+fn emit_search_resight_updates(
+    app_handle: &tauri::AppHandle,
+    request_id: u64,
+    mut updates: Vec<SearchResult>,
+    active: &mut ActiveSearchRequest,
+    skip_hashes: &HashSet<String>,
+) {
+    if updates.is_empty() {
+        return;
+    }
+    note_ed2k_resight_availability(active, &mut updates, skip_hashes);
+    let updates = filter_results_by_client_constraints(updates, active);
+    if updates.is_empty() {
+        return;
     }
     emit_search_results_event(app_handle, request_id, &updates);
 }
@@ -7657,6 +7755,7 @@ mod tests {
             udp_search_sent_ips: HashSet::new(),
             ed2k_found_sources: 0,
             ed2k_noted_availability: HashMap::new(),
+            dht_noted_availability: HashMap::new(),
             file_type_filter: None,
             min_size: None,
             max_size: None,
@@ -7850,6 +7949,206 @@ mod tests {
         };
         assert!(!note_ed2k_search_results(&mut active, &[other], &skip));
         assert_eq!(active.ed2k_found_sources, 2);
+    }
+
+    /// A re-sight carries one server's slice; the row carries the file's total.
+    /// The absolute total is what the row must be emitted with, since the UI
+    /// merges by max and would otherwise keep whichever single server answered
+    /// with the most.
+    #[test]
+    fn a_resight_is_emitted_with_every_servers_sources_summed() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let first = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 25,
+            ..sample_search_result("hash1")
+        };
+        note_ed2k_search_results(&mut active, &[first], &none);
+
+        let mut resights = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 4,
+            ..sample_search_result("hash1")
+        }];
+        note_ed2k_resight_availability(&mut active, &mut resights, &none);
+        assert_eq!(resights[0].availability, 29);
+    }
+
+    /// The client-side "Min sources" filter drops rows, and a re-sight is not a
+    /// row — it is an increment to one already on screen. Filtering the
+    /// increment took a second server's sources off a file that plainly met the
+    /// minimum, so the ordering here is the fix: sum first, and let the filter
+    /// judge the total.
+    #[test]
+    fn min_sources_does_not_eat_the_sources_a_second_server_adds() {
+        let mut active = sample_active_search_request(1);
+        active.min_availability = Some(10);
+        let none = HashSet::new();
+        let first = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 25,
+            ..sample_search_result("hash1")
+        };
+        note_ed2k_search_results(&mut active, &[first], &none);
+
+        let mut resights = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 4,
+            ..sample_search_result("hash1")
+        }];
+        note_ed2k_resight_availability(&mut active, &mut resights, &none);
+        assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&29));
+        let kept = filter_results_by_client_constraints(resights, &active);
+        assert_eq!(
+            kept.len(),
+            1,
+            "a 4-source update to a 29-source row must survive a minimum of 10"
+        );
+        assert_eq!(kept[0].availability, 29);
+    }
+
+    /// Kad and Ember re-sights are left out of the ed2k total: folding them in
+    /// would count one swarm twice. They have a running total of their own.
+    #[test]
+    fn a_dht_resight_is_left_out_of_the_ed2k_total() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let mut resights = vec![
+            SearchResult {
+                result_origin: crate::search::merge::ORIGIN_KAD.to_string(),
+                availability: 6,
+                ..sample_search_result("hash1")
+            },
+            SearchResult {
+                result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+                availability: 2,
+                ..sample_search_result("hash1")
+            },
+        ];
+        note_ed2k_resight_availability(&mut active, &mut resights, &none);
+        assert_eq!(resights[0].availability, 6);
+        assert_eq!(resights[1].availability, 2);
+        assert!(active.ed2k_noted_availability.is_empty());
+        assert_eq!(active.ed2k_found_sources, 0);
+    }
+
+    fn kad_row(hash: &str, availability: u32) -> SearchResult {
+        SearchResult {
+            result_origin: crate::search::merge::ORIGIN_KAD.to_string(),
+            availability,
+            ..sample_search_result(hash)
+        }
+    }
+
+    /// Both DHT legs hand over only the records they have not converted before,
+    /// so the count on a row is that slice's. The row has to carry what the
+    /// slices add up to, or the UI's max-merge keeps the biggest single slice.
+    #[test]
+    fn kad_slices_add_up_to_a_running_total_as_they_arrive() {
+        let mut active = sample_active_search_request(1);
+        let mut first = vec![kad_row("hash1", 3)];
+        note_dht_availability(&mut active, &mut first, DhtBatchKind::Incremental);
+        assert_eq!(first[0].availability, 3);
+
+        let mut second = vec![kad_row("hash1", 5)];
+        note_dht_availability(&mut active, &mut second, DhtBatchKind::Incremental);
+        assert_eq!(
+            second[0].availability, 8,
+            "a file eight KAD nodes published must not read as five"
+        );
+
+        let mut third = vec![kad_row("hash1", 2)];
+        note_dht_availability(&mut active, &mut third, DhtBatchKind::Incremental);
+        assert_eq!(third[0].availability, 10);
+    }
+
+    /// The closing batch of either leg is a rebuild over every record gathered,
+    /// which is the same total the slices already added up to. Folding it in as
+    /// an increment would double every count as the search finished.
+    #[test]
+    fn the_closing_rebuild_replaces_the_total_rather_than_doubling_it() {
+        let mut active = sample_active_search_request(1);
+        for slice in [3, 5, 2] {
+            let mut batch = vec![kad_row("hash1", slice)];
+            note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
+        }
+
+        let mut closing = vec![kad_row("hash1", 10)];
+        note_dht_availability(&mut active, &mut closing, DhtBatchKind::Cumulative);
+        assert_eq!(closing[0].availability, 10);
+    }
+
+    /// A rebuild that comes back larger than the slices did (an entry the
+    /// streaming cursor passed over, say) is still authoritative.
+    #[test]
+    fn a_larger_rebuild_wins_over_what_the_slices_added_up_to() {
+        let mut active = sample_active_search_request(1);
+        let mut first = vec![kad_row("hash1", 4)];
+        note_dht_availability(&mut active, &mut first, DhtBatchKind::Incremental);
+
+        let mut closing = vec![kad_row("hash1", 9)];
+        note_dht_availability(&mut active, &mut closing, DhtBatchKind::Cumulative);
+        assert_eq!(closing[0].availability, 9);
+    }
+
+    /// Across legs the biggest count wins rather than the sum: a file on both
+    /// KAD and Ember is one swarm seen twice. Keeping a total per leg is what
+    /// stops the UI's max-merge from quietly adding them.
+    #[test]
+    fn one_file_on_two_dht_legs_keeps_a_total_per_leg() {
+        let mut active = sample_active_search_request(1);
+        let mut kad = vec![kad_row("hash1", 6)];
+        note_dht_availability(&mut active, &mut kad, DhtBatchKind::Incremental);
+        assert_eq!(kad[0].availability, 6);
+
+        let mut ember = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+            availability: 2,
+            ..sample_search_result("hash1")
+        }];
+        note_dht_availability(&mut active, &mut ember, DhtBatchKind::Incremental);
+        assert_eq!(
+            ember[0].availability, 2,
+            "Ember's two publishers must not inherit KAD's six nodes"
+        );
+
+        let noted = active.dht_noted_availability.get("hash1").copied().unwrap();
+        assert_eq!((noted.kad, noted.ember), (6, 2));
+    }
+
+    /// Server rows are the ed2k total's business; this pass must not touch them
+    /// or a file found on both a server and KAD would have the two added.
+    #[test]
+    fn a_server_row_is_left_to_the_ed2k_total() {
+        let mut active = sample_active_search_request(1);
+        let mut rows = vec![SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+            availability: 25,
+            ..sample_search_result("hash1")
+        }];
+        note_dht_availability(&mut active, &mut rows, DhtBatchKind::Incremental);
+        assert_eq!(rows[0].availability, 25);
+        assert!(active
+            .dht_noted_availability
+            .get("hash1")
+            .is_none_or(|n| n.kad == 0 && n.ember == 0));
+    }
+
+    /// Publisher counts are unverifiable claims arriving one node at a time, so
+    /// the running total is held to the same ceiling the per-batch tags are.
+    #[test]
+    fn the_running_total_is_capped_like_the_per_batch_counts() {
+        let mut active = sample_active_search_request(1);
+        for _ in 0..3 {
+            let mut batch = vec![kad_row("hash1", MAX_KAD_AVAILABILITY)];
+            note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
+            assert_eq!(batch[0].availability, MAX_KAD_AVAILABILITY);
+        }
+        assert_eq!(
+            active.dht_noted_availability.get("hash1").unwrap().kad,
+            MAX_KAD_AVAILABILITY
+        );
     }
 
     /// A batch with no matching active search (already replaced by a newer
@@ -12182,6 +12481,9 @@ struct ActiveSearchRequest {
     /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
     /// delta after summing, matching eMule `UpdateResultCount`).
     ed2k_noted_availability: HashMap<String, u32>,
+    /// The same running per-file total for the DHT legs; see
+    /// [`DhtNotedAvailability`] for why theirs is kept apart from the ed2k one.
+    dht_noted_availability: HashMap<String, DhtNotedAvailability>,
     file_type_filter: Option<String>,
     min_size: Option<u64>,
     max_size: Option<u64>,
@@ -12209,10 +12511,11 @@ struct ActiveSearchRequest {
     /// batch-local heuristics — `is_spam` can flip false→true (never back,
     /// since the frontend merges with OR) well after the row was already
     /// shown, making it vanish under "hide spam" and look like the same
-    /// file flickering. Once a hash has been streamed, further **Kad**
-    /// sightings are dropped (no re-score). Further **ed2k** (Server/UDP)
-    /// sightings are returned separately as lightweight availability/origin
-    /// updates (no spam re-score) so the UI can sum sources like eMule.
+    /// file flickering. Once a hash has been streamed, every further sighting
+    /// of it — Kad, Ember and ed2k (Server/UDP) alike — is returned separately
+    /// as a lightweight availability/origin update instead of a second row (no
+    /// spam re-score), which is what lets the UI sum sources like eMule and
+    /// show one row carrying every network that has the file.
     /// Bounded well below `MAX_STREAMED_HASHES_SOFT_CAP` in practice since
     /// KAD/TCP/UDP each cap their own result counts, but a hard cap keeps
     /// a pathological all-servers global search from growing this
@@ -12229,6 +12532,13 @@ struct ActiveSearchRequest {
     /// across UDP/Kad/server pages, not only inside one emit).
     batch_spam: crate::search::spam::BatchSpamContext,
 }
+
+/// Ceiling on the sources a single file may be credited with from one DHT leg,
+/// well under the u16 the ed2k wire uses. Publisher counts are unverifiable
+/// claims that arrive one node at a time, so the running total in
+/// `ActiveSearchRequest::dht_noted_availability` is held to the same number the
+/// per-batch tags are, and a Sybil cannot rank a file by asserting millions.
+const MAX_KAD_AVAILABILITY: u32 = 5_000;
 
 /// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, the set
 /// stops growing (bounding memory for a pathological all-servers global
@@ -21862,8 +22172,15 @@ fn finalize_removed_searches_with_keyword_results(
                     if !query_expr.is_trivial() {
                         network_results.retain(|r| query_expr.matches(&r.file.name.to_lowercase()));
                     }
-                    if let Some(active) = state.active_search_request.as_ref() {
+                    if let Some(active) = state.active_search_request.as_mut() {
                         if active.request_id == request_id {
+                            // Same rebuild as the completion path, reaching the
+                            // UI through the invoke reply instead of an event.
+                            note_dht_availability(
+                                active,
+                                &mut network_results,
+                                DhtBatchKind::Cumulative,
+                            );
                             network_results =
                                 filter_results_by_client_constraints(network_results, active);
                         }
@@ -30786,7 +31103,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             if !batch.is_empty() {
                                 let mut batch_spam =
                                     take_search_batch_spam(&state, pending_request_id);
-                                let emitted = enrich_and_emit_search_results(
+                                let mut emitted = enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
                                     &comment_manager,
@@ -30810,6 +31127,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == pending_request_id {
                                         mark_streamed_hashes(active, &emitted);
+                                        // Seeds the running total with this
+                                        // slice; the re-sights below carry what
+                                        // it has grown to.
+                                        note_dht_availability(
+                                            active,
+                                            &mut emitted,
+                                            DhtBatchKind::Incremental,
+                                        );
+                                        let mut resights = resights;
+                                        note_dht_availability(
+                                            active,
+                                            &mut resights,
+                                            DhtBatchKind::Incremental,
+                                        );
                                         // KAD origins never advance the ed2k stop
                                         // counter; skip set is unused for these rows.
                                         let no_skip = HashSet::new();
@@ -30825,6 +31156,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             } else if !resights.is_empty() {
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == pending_request_id {
+                                        let mut resights = resights;
+                                        note_dht_availability(
+                                            active,
+                                            &mut resights,
+                                            DhtBatchKind::Incremental,
+                                        );
                                         let no_skip = HashSet::new();
                                         emit_search_resight_updates(
                                             &app_handle,
@@ -31117,6 +31454,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         true
                                     }
                                 });
+                                // A rebuild over every entry the walk gathered,
+                                // so it replaces the running total rather than
+                                // adding to what the slices already contributed.
+                                note_dht_availability(
+                                    active,
+                                    &mut resights,
+                                    DhtBatchKind::Cumulative,
+                                );
+                                note_dht_availability(
+                                    active,
+                                    &mut network_results,
+                                    DhtBatchKind::Cumulative,
+                                );
                                 emit_search_resight_updates(
                                     &app_handle,
                                     request_id,
@@ -43622,9 +43972,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             request_id,
                             &mut results,
                         );
+                        // The closing batch is rebuilt from every record the walk
+                        // gathered (see `maybe_finish_ember_search`), so it is
+                        // the total rather than an addition to it.
+                        let batch_kind = if final_batch {
+                            DhtBatchKind::Cumulative
+                        } else {
+                            DhtBatchKind::Incremental
+                        };
                         if !results.is_empty() {
                             let mut batch_spam = take_search_batch_spam(&state, request_id);
-                            let emitted = enrich_and_emit_search_results(
+                            let mut emitted = enrich_and_emit_search_results(
                                 &app_handle,
                                 &spam_filter,
                                 &comment_manager,
@@ -43645,12 +44003,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             if let Some(active) = state.active_search_request.as_mut() {
                                 if active.request_id == request_id {
                                     mark_streamed_hashes(active, &emitted);
+                                    note_dht_availability(active, &mut emitted, batch_kind);
                                 }
                             }
                         }
                         if !resights.is_empty() {
                             if let Some(active) = state.active_search_request.as_mut() {
                                 if active.request_id == request_id {
+                                    let mut resights = resights;
+                                    note_dht_availability(active, &mut resights, batch_kind);
                                     // Ember origins never advance the ed2k stop
                                     // counter, so nothing is skipped here.
                                     let no_skip = HashSet::new();
@@ -55118,7 +55479,6 @@ fn convert_search_results(
     use crate::search::index::infer_file_type;
 
     const MAX_KAD_SOURCE_ADDRS: usize = 500;
-    const MAX_KAD_AVAILABILITY: u32 = 5_000;
 
     struct ParsedEntry {
         hash: String,
