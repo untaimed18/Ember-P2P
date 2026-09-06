@@ -88,6 +88,10 @@ const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
 /// Duplicates cannot fill the result budget this cap protects — dedup drops
 /// them before `MAX_SEARCH_RESULTS` sees them — so charging for them only ever
 /// cut a well-stocked storer off part-way through its own key.
+///
+/// Only the share while the walk still has somewhere to go — see
+/// [`IterativeSearch::per_node_result_allowance`] for the tier that applies once
+/// the shortlist is exhausted.
 const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 
 /// How many times one node may be queried within a single search.
@@ -158,6 +162,14 @@ const RECORDS_PER_UNFRAGMENTED_PAGE: usize = 5;
 /// answers a single request with up to 300 results, split across as many
 /// datagrams as they take.
 const MAX_PAGES_PER_NODE: u8 = (MAX_RESULTS_PER_NODE / RECORDS_PER_UNFRAGMENTED_PAGE) as u8;
+
+/// The same ceiling once the shortlist is exhausted, sized to the whole result
+/// budget for the same reason: the offer allowance should decide how much of a
+/// key one node serves, not the round trips. Reached only when there is nothing
+/// left to walk to, so the extra queries cannot come at the expense of a hop the
+/// search would otherwise have taken — and `SEARCH_TIMEOUT_SECS` still bounds
+/// how many of them actually fit.
+const MAX_PAGES_PER_NODE_EXHAUSTED: u8 = (MAX_SEARCH_RESULTS / RECORDS_PER_UNFRAGMENTED_PAGE) as u8;
 
 /// Nodes that must have answered before convergence may end a `FIND_NODE`.
 ///
@@ -469,6 +481,71 @@ impl IterativeSearch {
             || self.remote_blobs() >= MAX_SEARCH_RESULT_BLOBS
     }
 
+    /// Whether this walk still has somewhere to go.
+    ///
+    /// An unqueried shortlist entry is a hop it can still descend to, and an
+    /// outstanding query is an answer that may yet name one — a `FOUND_NODE` from
+    /// it can add entries. Both have to count, or a search whose last α queries
+    /// are in flight would look finished while the closer nodes it was reaching
+    /// for are exactly what has not answered yet.
+    fn can_still_descend(&self) -> bool {
+        self.shortlist.iter().any(|entry| {
+            entry.state == NodeState::InFlight
+                || (entry.state == NodeState::Pending
+                    && !self.queried.contains(&entry.contact.node_id))
+        })
+    }
+
+    /// Blobs one node may offer this search, and the pages it may be asked for.
+    ///
+    /// Two tiers. [`MAX_RESULTS_PER_NODE`] exists because filling the result
+    /// budget ends the walk, so a node allowed to fill it alone also decides how
+    /// far the search gets — but that cost only exists while there is a walk
+    /// left. Once the shortlist is exhausted and nothing is outstanding, there is
+    /// no hop the extra records could crowd out, and the only thing left to play
+    /// for is recall. A lone storer may then spend what remains of the global
+    /// budget.
+    ///
+    /// This is the case a young overlay is permanently in — one or two nodes hold
+    /// an unpopular keyword — and it was where the quarter share cost the most:
+    /// the tail of the only index that had the key, with nothing else on the
+    /// shortlist to make up the difference. KAD rations none of this
+    /// (`CIndexed::SendValidKeywordResult` answers one request with up to 300),
+    /// so the share was also the one axis where Ember recall sat below it.
+    fn per_node_result_allowance(&self) -> usize {
+        if self.can_still_descend() {
+            MAX_RESULTS_PER_NODE
+        } else {
+            MAX_SEARCH_RESULTS
+        }
+    }
+
+    /// Page follow-ups one node may be queued, on the same two tiers — but the
+    /// upper tier has to be *earned* rather than granted.
+    ///
+    /// Pages are the one mechanism where a responder's claim about its own store
+    /// makes us send traffic, so the ceiling exists to bound queries as well as
+    /// records. Simply handing an exhausted shortlist the full
+    /// [`MAX_PAGES_PER_NODE_EXHAUSTED`] would have quadrupled what a peer serving
+    /// one record per page while claiming sixty thousand can buy.
+    ///
+    /// So past the base ceiling a node earns one more page for every page's worth
+    /// of records it has actually delivered. A node genuinely serving full
+    /// datagrams earns a page per page and is never held by this at all — the
+    /// offer allowance stops it, which is the intent. A node drip-feeding one
+    /// record at a time earns a fifth of a page per page and runs out only a few
+    /// queries later than it used to.
+    fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
+        if self.can_still_descend() {
+            return MAX_PAGES_PER_NODE;
+        }
+        let delivered = self.offered_results.get(node).copied().unwrap_or(0);
+        let earned = u8::try_from(delivered / RECORDS_PER_UNFRAGMENTED_PAGE).unwrap_or(u8::MAX);
+        MAX_PAGES_PER_NODE
+            .saturating_add(earned)
+            .min(MAX_PAGES_PER_NODE_EXHAUSTED)
+    }
+
     /// Pull the next request id, keeping the counter monotonic within a search.
     fn take_request_id(&mut self) -> u32 {
         let req_id = self.next_request_id;
@@ -769,6 +846,10 @@ impl IterativeSearch {
             }
             page = None;
         }
+        // Read once, before the loop takes a borrow of `offered_results`: the
+        // shortlist states this reads cannot change inside it (the responder was
+        // marked above, and nothing here queries anyone).
+        let offer_allowance = self.per_node_result_allowance();
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -789,7 +870,7 @@ impl IterativeSearch {
             // so without this the node that answers first also decides how far
             // the search gets to go.
             let offered = self.offered_results.entry(*from_id).or_insert(0);
-            if *offered >= MAX_RESULTS_PER_NODE {
+            if *offered >= offer_allowance {
                 continue;
             }
             // Dedup before the cap, not after: counting copies against
@@ -963,11 +1044,13 @@ impl IterativeSearch {
         }
         // This node has already offered everything one peer is allowed to
         // contribute, so a further page could only be discarded.
-        if self.offered_results.get(node).copied().unwrap_or(0) >= MAX_RESULTS_PER_NODE {
+        let offered = self.offered_results.get(node).copied().unwrap_or(0);
+        if offered >= self.per_node_result_allowance() {
             return;
         }
+        let page_allowance = self.per_node_page_allowance(node);
         let queued = self.pages_queued.entry(*node).or_insert(0);
-        if *queued >= MAX_PAGES_PER_NODE {
+        if *queued >= page_allowance {
             return;
         }
         *queued += 1;
@@ -2342,10 +2425,18 @@ mod tests {
                 }),
             );
         }
-        assert_eq!(
-            pages as u8,
-            MAX_PAGES_PER_NODE + 1,
-            "the first query plus MAX_PAGES_PER_NODE follow-ups, and no more"
+        // A stingy pager earns almost nothing past the base ceiling: extra pages
+        // are granted per page's worth of records actually delivered, and this
+        // one delivers a fifth of that. It must stay far below what a node
+        // serving full datagrams is allowed, or the claim would be buying the
+        // queries again.
+        assert!(
+            pages <= MAX_PAGES_PER_NODE as u32 + 5,
+            "one record per page against a claimed 60,000 bought {pages} queries"
+        );
+        assert!(
+            (pages as u8) < MAX_PAGES_PER_NODE_EXHAUSTED,
+            "a drip-feeding peer must not reach the ceiling an honest storer earns"
         );
     }
 
@@ -3282,6 +3373,96 @@ mod tests {
             MAX_RESULTS_PER_NODE,
             "paging must reach every record the node was allowed to offer"
         );
+    }
+
+    /// The quarter share exists so one peer cannot end a walk that had further to
+    /// go. With the shortlist exhausted there is no further to go, and holding a
+    /// lone storer to a quarter of the budget then just discards the tail of the
+    /// only index that had the key — which is every unpopular keyword on a young
+    /// overlay. KAD rations none of it.
+    #[test]
+    fn a_lone_storer_may_spend_the_budget_once_the_shortlist_is_exhausted() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // More than one peer's old share, and more than the pages that share
+        // could have been spent in.
+        let total = MAX_SEARCH_RESULTS as u16;
+        let per_page = RECORDS_PER_UNFRAGMENTED_PAGE as u16;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            let query = &batch[0];
+            let page_end = (query.start_position + per_page).min(total);
+            let page: Vec<Vec<u8>> = (query.start_position..page_end)
+                .map(|i| signed_value_blob("ubuntu", i))
+                .collect();
+            search.process_response(
+                query.request_id,
+                &peer.node_id,
+                vec![],
+                page,
+                Some(ValuePage {
+                    next_position: page_end,
+                    total_available: total,
+                }),
+            );
+        }
+
+        assert!(
+            search.results.len() > MAX_RESULTS_PER_NODE,
+            "a sole storer was held to {MAX_RESULTS_PER_NODE} with nothing else to ask, \
+             collecting {} of the {total} records it offered",
+            search.results.len()
+        );
+        assert_eq!(
+            search.results.len(),
+            MAX_SEARCH_RESULTS,
+            "the global budget is what should stop it now"
+        );
+    }
+
+    /// The other half of the same rule, and the one that matters for abuse: while
+    /// any query is still outstanding the walk may yet be given a closer hop, so
+    /// the share still binds. Without the in-flight half of `can_still_descend`
+    /// the first responder of an α-wide round would look like the last node alive
+    /// and be handed the whole budget.
+    #[test]
+    fn the_share_still_binds_while_another_query_is_outstanding() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let flooder = make_contact(0xF0);
+        rt.add_contact(flooder.clone());
+        rt.add_contact(make_contact(0xE0));
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.query_pairs();
+        let (_, req_id) = batch
+            .iter()
+            .find(|(c, _)| c.node_id == flooder.node_id)
+            .expect("the flooder is queried");
+
+        let flood: Vec<Vec<u8>> = (0..(MAX_SEARCH_RESULTS as u16 + 20))
+            .map(|i| signed_value_blob("ubuntu", i))
+            .collect();
+        search.process_unpaged(*req_id, &flooder.node_id, vec![], flood);
+
+        assert_eq!(
+            search.results.len(),
+            MAX_RESULTS_PER_NODE,
+            "the second node has not answered, so the walk can still descend"
+        );
+        assert!(!search.complete);
     }
 
     /// A page already taken out of `page_queue` and sitting in
