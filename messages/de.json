@@ -1311,7 +1311,7 @@
   "search_phase_kad_busy": "KAD ist mit anderen Suchen beschäftigt",
   "search_no_results": "Keine Ergebnisse für diese Suche",
   "search_no_results_related": "Keine verwandten Dateien für diese Datei",
-  "search_no_results_related_hint": "Der Server beantwortet eine Suche nach verwandten Dateien nur für Dateien, die mehrere seiner Clients teilen — bei einer seltenen Datei kommt daher meist nichts zurück.",
+  "search_no_results_related_hint": "Der Server erfasst verwandte Dateien nur für Dateien, die von mindestens etwa fünf seiner Clients geteilt werden — bei einem Treffer mit wenigen Quellen kommt daher meist nichts zurück. Probieren Sie einen mit vielen Quellen.",
   "search_no_results_hint": "Versuchen Sie eine andere Suchanfrage oder andere Schlüsselwörter",
   "search_searching_indicator": "Suche läuft...",
   "search_showing_one": "1 Ergebnis wird angezeigt",

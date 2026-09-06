@@ -1311,7 +1311,7 @@
   "search_phase_kad_busy": "O KAD está ocupado com outras consultas",
   "search_no_results": "Nenhum resultado para esta busca",
   "search_no_results_related": "Nenhum arquivo relacionado a este arquivo",
-  "search_no_results_related_hint": "O servidor só responde a uma busca de arquivos relacionados para arquivos que vários de seus clientes compartilham, então um arquivo raro geralmente não retorna nada.",
+  "search_no_results_related_hint": "O servidor indexa arquivos relacionados apenas para arquivos compartilhados por pelo menos cerca de cinco de seus clientes, então um resultado com poucas fontes geralmente não retorna nada. Tente um com muitas fontes.",
   "search_no_results_hint": "Tente outra consulta ou palavras-chave diferentes",
   "search_searching_indicator": "Buscando...",
   "search_showing_one": "Exibindo 1 resultado",

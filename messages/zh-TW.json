@@ -1311,7 +1311,7 @@
   "search_phase_kad_busy": "KAD 正忙於其他查詢",
   "search_no_results": "此搜尋無結果",
   "search_no_results_related": "沒有與此檔案相關的檔案",
-  "search_no_results_related_hint": "伺服器只會回應有多個用戶端共用的檔案的相關檔案查詢，因此稀有檔案通常不會傳回任何結果。",
+  "search_no_results_related_hint": "伺服器只為至少約五個用戶端共用的檔案建立相關檔案索引，因此來源很少的結果通常不會傳回任何內容。請試試來源很多的檔案。",
   "search_no_results_hint": "嘗試其他關鍵詞或查詢",
   "search_searching_indicator": "搜尋中...",
   "search_showing_one": "顯示 1 個結果",

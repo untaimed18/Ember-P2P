@@ -1311,7 +1311,7 @@
   "search_phase_kad_busy": "KAD 正忙于其他查询",
   "search_no_results": "此搜索无结果",
   "search_no_results_related": "没有与此文件相关的文件",
-  "search_no_results_related_hint": "服务器只会回应有多个客户端共享的文件的相关文件查询，因此稀有文件通常不会返回任何结果。",
+  "search_no_results_related_hint": "服务器只为至少约五个客户端共享的文件建立相关文件索引，因此来源很少的结果通常不会返回任何内容。请试试来源很多的文件。",
   "search_no_results_hint": "尝试其他关键词或查询",
   "search_searching_indicator": "搜索中...",
   "search_showing_one": "显示 1 个结果",

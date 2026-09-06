@@ -1311,7 +1311,7 @@
   "search_phase_kad_busy": "KAD è occupato con altre ricerche",
   "search_no_results": "Nessun risultato per questa ricerca",
   "search_no_results_related": "Nessun file correlato a questo file",
-  "search_no_results_related_hint": "Il server risponde a una ricerca di file correlati solo per i file condivisi da diversi dei suoi client, quindi un file raro di solito non restituisce nulla.",
+  "search_no_results_related_hint": "Il server indicizza i file correlati solo per i file condivisi da almeno cinque dei suoi client circa, quindi un risultato con poche fonti di solito non restituisce nulla. Provane uno con molte fonti.",
   "search_no_results_hint": "Prova un'altra query o parole chiave diverse",
   "search_searching_indicator": "Ricerca...",
   "search_showing_one": "Visualizzato 1 risultato",

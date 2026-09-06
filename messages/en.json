@@ -1312,7 +1312,7 @@
   "search_no_results": "No results for this search",
   "search_no_results_hint": "Try another query or different keywords",
   "search_no_results_related": "No related files for this file",
-  "search_no_results_related_hint": "The server only answers a related-file lookup for files that several of its clients share, so a rare file usually comes back with nothing.",
+  "search_no_results_related_hint": "The server indexes related files only for files shared by at least about five of its clients, so a result with few sources usually comes back with nothing. Try one with many sources.",
   "search_searching_indicator": "Searching...",
   "search_showing_one": "Showing 1 result",
   "search_showing_other": "Showing {count} results",
