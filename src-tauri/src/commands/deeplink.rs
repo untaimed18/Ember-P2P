@@ -53,11 +53,19 @@ fn ed2k_segments(link: &str) -> Vec<&str> {
         .collect()
 }
 
+fn canonicalize_ed2k_payload(payload: &str) -> String {
+    if crate::network::ed2k::hash::looks_like_ed2k_uri(payload) {
+        crate::network::ed2k::hash::normalize_ed2k_uri(payload)
+    } else {
+        payload.trim().to_string()
+    }
+}
+
 pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview, String> {
-    let payload = payload.trim();
+    let payload = canonicalize_ed2k_payload(payload);
     let lower = payload.to_ascii_lowercase();
     if lower.starts_with("ed2k://|file|") {
-        let info = crate::commands::search::parse_ed2k_link(payload.to_string())?;
+        let info = crate::commands::search::parse_ed2k_link(payload)?;
         return Ok(DeepLinkPreview {
             kind: "file".into(),
             name: Some(crate::security::sanitize_remote_text(&info.name, 8192)),
@@ -69,7 +77,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
         });
     }
     if lower.starts_with("ed2k://|server|") {
-        let segments = ed2k_segments(payload);
+        let segments = ed2k_segments(&payload);
         let ip = segments.get(1).copied().unwrap_or_default();
         let port = segments
             .get(2)
@@ -90,7 +98,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
         });
     }
     if lower.starts_with("ed2k://|serverlist|") {
-        let segments = ed2k_segments(payload);
+        let segments = ed2k_segments(&payload);
         let url = segments.get(1).copied().unwrap_or_default();
         let parsed = url::Url::parse(url)
             .map_err(|_| coded("deeplink_terminal_invalid", "Invalid server-list deep link"))?;
@@ -116,14 +124,15 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             size: None,
             hash: None,
             ember: None,
-            endpoint: None,
+            // Validated HTTPS URL so the UI does not re-split a browser-encoded
+            // payload that still contains `%7C` instead of `|`.
+            endpoint: Some(url.to_string()),
             host: Some(host),
         });
     }
     if lower.starts_with("ember-channel:") {
-        let invite = crate::network::ember::channel::ChannelInvite::parse(payload).ok_or_else(
-            || coded("deeplink_terminal_invalid", "Invalid channel invite"),
-        )?;
+        let invite = crate::network::ember::channel::ChannelInvite::parse(&payload)
+            .ok_or_else(|| coded("deeplink_terminal_invalid", "Invalid channel invite"))?;
         let name = crate::security::sanitize_remote_text(&invite.name, 64);
         return Ok(DeepLinkPreview {
             kind: "channel".into(),
@@ -139,7 +148,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
         });
     }
     if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
-        let name = std::path::Path::new(payload)
+        let name = std::path::Path::new(&payload)
             .file_name()
             .map(|name| crate::security::sanitize_remote_text(&name.to_string_lossy(), 1024))
             .filter(|name| !name.is_empty());
@@ -244,11 +253,13 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
         })
 }
 
-/// True if `arg` looks like a deep link we should act on: an `ed2k://` URI or
-/// a path ending in `.emulecollection`.
+/// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
+/// (including browser-encoded `ed2k://%7Cfile%7C…` forms) or a path ending
+/// in `.emulecollection`.
 pub fn is_deep_link_payload(arg: &str) -> bool {
-    let lower = arg.trim().to_ascii_lowercase();
-    lower.starts_with("ed2k://") || lower.ends_with(".emulecollection")
+    let trimmed = arg.trim();
+    crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
+        || trimmed.to_ascii_lowercase().ends_with(".emulecollection")
 }
 
 /// Pull the deep-link payloads out of a process/instance argv.
@@ -263,6 +274,14 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
         .skip(1)
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty() && a.len() <= MAX_PAYLOAD_LEN && is_deep_link_payload(a))
+        .map(|a| {
+            if crate::network::ed2k::hash::looks_like_ed2k_uri(&a) {
+                crate::network::ed2k::hash::normalize_ed2k_uri(&a)
+            } else {
+                a
+            }
+        })
+        .filter(|a| !a.is_empty() && a.len() <= MAX_PAYLOAD_LEN)
         .collect()
 }
 
@@ -488,6 +507,14 @@ mod tests {
             preview_deep_link_payload("ed2k://|serverlist|https://example.test/server.met|/")
                 .unwrap();
         assert_eq!(list.host.as_deref(), Some("example.test"));
+        assert_eq!(
+            list.endpoint.as_deref(),
+            Some("https://example.test/server.met")
+        );
+
+        let encoded_server =
+            preview_deep_link_payload("ed2k://%7Cserver%7C203.0.113.8%7C4661%7C/").unwrap();
+        assert_eq!(encoded_server.endpoint.as_deref(), Some("203.0.113.8:4661"));
     }
 
     #[test]
@@ -495,6 +522,26 @@ mod tests {
         assert!(preview_deep_link_payload("ed2k://|server|not-an-ip|0|/").is_err());
         assert!(preview_deep_link_payload("ed2k://|serverlist|http://example.test/x|/").is_err());
         assert!(preview_deep_link_payload("ed2k://|unknown|value|/").is_err());
+    }
+
+    #[test]
+    fn browser_encoded_file_links_are_not_terminal_errors() {
+        let encoded = "ed2k://%7Cfile%7CComic%20#43%20Issue.cbr%7C26434789%7C0123456789abcdef0123456789abcdef%7C/";
+        let preview = preview_deep_link_payload(encoded).unwrap();
+        assert_eq!(preview.kind, "file");
+        assert_eq!(preview.name.as_deref(), Some("Comic #43 Issue.cbr"));
+        assert_eq!(preview.size, Some(26434789));
+    }
+
+    #[test]
+    fn extract_normalizes_browser_encoded_argv() {
+        let encoded = "ed2k://%7Cfile%7Cmovie.avi%7C1234%7C0123456789abcdef0123456789abcdef%7C/";
+        let args = vec!["ember.exe".to_string(), encoded.to_string()];
+        let payloads = extract_deep_link_payloads(&args);
+        assert_eq!(
+            payloads,
+            vec!["ed2k://|file|movie.avi|1234|0123456789abcdef0123456789abcdef|/".to_string()]
+        );
     }
 
     #[test]
@@ -543,10 +590,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pending_deep_links.json");
 
-        let queue = parking_lot::Mutex::new(vec![
-            sample_pending("ack-me"),
-            sample_pending("keep-me"),
-        ]);
+        let queue =
+            parking_lot::Mutex::new(vec![sample_pending("ack-me"), sample_pending("keep-me")]);
         persist_live_pending_queue_at(&path, &queue, Some("ack-me")).unwrap();
         let after_ack = load_persisted_queue(&path);
         assert!(after_ack.iter().all(|entry| entry.id != "ack-me"));

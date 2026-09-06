@@ -167,9 +167,19 @@
           );
         }
       } else if (preview.kind === 'server') {
-        const segs = ed2kSegments(payload); // ['server', ip, port]
-        const ip = segs[1] ?? '';
-        const port = parseInt(segs[2] ?? '', 10);
+        // Prefer the previewed endpoint so a browser-encoded argv payload
+        // (`%7C` instead of `|`) still connects after backend normalization.
+        let ip = '';
+        let port = NaN;
+        const cut = preview.endpoint?.lastIndexOf(':') ?? -1;
+        if (cut > 0 && preview.endpoint) {
+          ip = preview.endpoint.slice(0, cut);
+          port = parseInt(preview.endpoint.slice(cut + 1), 10);
+        } else {
+          const segs = ed2kSegments(payload); // ['server', ip, port]
+          ip = segs[1] ?? '';
+          port = parseInt(segs[2] ?? '', 10);
+        }
         if (!ip || !Number.isFinite(port) || port <= 0 || port > 65535) {
           toastError(
             !ip
@@ -190,7 +200,7 @@
         if (!destroyed) toastSuccess(msg);
       } else if (preview.kind === 'serverList') {
         const segs = ed2kSegments(payload); // ['serverlist', url]
-        const url = segs[1] ?? '';
+        const url = preview.endpoint || segs[1] || '';
         if (!isAllowedServerListUrl(url)) {
           // Match the backend's pinned-fetch policy: never silently turn an
           // OS-delivered deep link into an insecure HTTP server-list request.

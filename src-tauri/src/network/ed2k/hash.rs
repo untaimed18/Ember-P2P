@@ -505,6 +505,112 @@ pub fn percent_decode_str(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
+fn strip_ed2k_wrapper(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches('\u{feff}')
+        .trim_matches('"')
+        .trim_matches(['<', '>'])
+}
+
+fn strip_ed2k_scheme(s: &str) -> Option<&str> {
+    (s.len() >= 5 && s.as_bytes()[..5].eq_ignore_ascii_case(b"ed2k:")).then_some(&s[5..])
+}
+
+/// Skip the `//` (or `%2F%2F`) authority slashes browsers insert or encode
+/// after `ed2k:`. Walks only ASCII so `i` stays on a UTF-8 boundary.
+fn skip_ed2k_authority_slashes(rest: &str) -> &str {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        if i + 2 < bytes.len()
+            && bytes[i] == b'%'
+            && bytes[i + 1] == b'2'
+            && matches!(bytes[i + 2], b'F' | b'f')
+        {
+            i += 3;
+            continue;
+        }
+        break;
+    }
+    &rest[i..]
+}
+
+/// Browsers percent-encode `|` (a forbidden WHATWG host code point) as `%7C`
+/// before handing an `ed2k:` URI to the OS handler. Restore field separators
+/// without decoding other escapes — those belong to the name field.
+fn decode_encoded_pipes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len()
+            && bytes[i] == b'%'
+            && bytes[i + 1] == b'7'
+            && matches!(bytes[i + 2], b'C' | b'c')
+        {
+            out.push(b'|');
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn lowercase_ed2k_opcode(rest: &str) -> String {
+    let Some(s) = rest.strip_prefix('|') else {
+        return rest.to_string();
+    };
+    let Some((opcode, tail)) = s.split_once('|') else {
+        return rest.to_string();
+    };
+    if opcode.eq_ignore_ascii_case("file")
+        || opcode.eq_ignore_ascii_case("server")
+        || opcode.eq_ignore_ascii_case("serverlist")
+    {
+        format!("|{}|{tail}", opcode.to_ascii_lowercase())
+    } else {
+        rest.to_string()
+    }
+}
+
+/// True when `arg` is an `ed2k:` URI, including browser-encoded forms such as
+/// `ed2k://%7Cfile%7C…` that no longer contain a literal `ed2k://|` prefix.
+pub fn looks_like_ed2k_uri(arg: &str) -> bool {
+    strip_ed2k_scheme(strip_ed2k_wrapper(arg)).is_some()
+}
+
+/// Undo browser/OS rewriting of `ed2k:` URIs so a clicked link parses the
+/// same way as a clipboard paste of the original href.
+///
+/// Firefox 122+ uses the WHATWG URL parser, which treats `|` as a forbidden
+/// host code point. A click on `ed2k://|file|name|size|hash|/` therefore
+/// typically arrives as `ed2k://%7Cfile%7Cname%7Csize%7Chash%7C/` or
+/// `ed2k:///%7Cfile%7C…`. An unencoded `#` in the filename is a URL fragment;
+/// if the launcher still includes it in argv it is part of the ed2k name and
+/// must not be stripped.
+pub fn normalize_ed2k_uri(raw: &str) -> String {
+    let s = strip_ed2k_wrapper(raw);
+    let Some(rest) = strip_ed2k_scheme(s) else {
+        return s.to_string();
+    };
+    let rest = skip_ed2k_authority_slashes(rest);
+    let rest = decode_encoded_pipes(rest);
+    let rest = lowercase_ed2k_opcode(&rest);
+    format!("ed2k://{rest}")
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    (s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()))
+    .then_some(&s[prefix.len()..])
+}
+
 pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
 
 /// Strictly parse an ed2k link, distinguishing an absent AICH segment from a
@@ -514,12 +620,8 @@ pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
 /// `sources,...`, `s=<url>`, etc.) are tolerated; AICH and the Ember digest
 /// are surfaced so imported links can carry recovery / integrity data.
 pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str> {
-    let trimmed = link.trim();
-    if !trimmed.starts_with("ed2k://|file|") {
-        return Err("Not an ed2k file link");
-    }
-    let inner = trimmed
-        .strip_prefix("ed2k://|file|")
+    let normalized = normalize_ed2k_uri(link);
+    let inner = strip_prefix_ignore_ascii_case(&normalized, "ed2k://|file|")
         .ok_or("Not an ed2k file link")?;
     let mut parts = inner.split('|');
     let raw_name = parts.next().ok_or("Missing ed2k file name")?;
@@ -689,6 +791,57 @@ mod link_tests {
 
         let repeated = format!("ed2k://|file|a.bin|9|{HASH}|eh={first}|eh={first}|/");
         assert_eq!(parse_ed2k_link_strict(&repeated).unwrap().4, Some(first));
+    }
+
+    #[test]
+    fn browser_encoded_pipes_parse_like_the_raw_href() {
+        let classic = format!("ed2k://|file|movie.avi|1234|{HASH}|/");
+        let encoded = format!("ed2k://%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let extra_slash = format!("ed2k:///%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let no_slashes = format!("ed2k:%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let expected = parse_ed2k_link_strict(&classic).expect("classic");
+        for variant in [encoded, extra_slash, no_slashes] {
+            assert_eq!(parse_ed2k_link_strict(&variant).expect(&variant), expected);
+            assert_eq!(normalize_ed2k_uri(&variant), classic);
+        }
+        assert_eq!(normalize_ed2k_uri(&classic), classic);
+    }
+
+    #[test]
+    fn hash_in_filename_survives_browser_mangling() {
+        // Websites often leave `#` (issue numbers, etc.) unencoded in the href.
+        // Paste sees the raw string; a click arrives with `%7C` separators and
+        // the `#` still in the payload if the OS forwarded the fragment.
+        let aich = "A".repeat(32);
+        let classic = format!("ed2k://|file|Comic%20#43%20Issue.cbr|26434789|{HASH}|h={aich}|/");
+        let firefox =
+            format!("ed2k://%7Cfile%7CComic%20#43%20Issue.cbr%7C26434789%7C{HASH}%7Ch={aich}%7C/");
+        let mixed_fragment_pipes =
+            format!("ed2k://%7Cfile%7CComic%20#43%20Issue.cbr|26434789|{HASH}|h={aich}|/");
+        let wrapped = format!("<{firefox}>");
+        for variant in [&classic, &firefox, &mixed_fragment_pipes, &wrapped] {
+            let (name, size, hash, aich_hex, _) = parse_ed2k_link_strict(variant).expect(variant);
+            assert_eq!(name, "Comic #43 Issue.cbr");
+            assert_eq!(size, 26434789);
+            assert_eq!(hash, HASH);
+            assert_eq!(
+                aich_hex.as_deref(),
+                Some("0000000000000000000000000000000000000000")
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_ed2k_uri_accepts_encoded_and_quoted_forms() {
+        assert!(looks_like_ed2k_uri("ed2k://|file|a|1|aaaa|"));
+        assert!(looks_like_ed2k_uri("ED2K://%7Cfile%7Ca"));
+        assert!(looks_like_ed2k_uri(
+            "\"ed2k:%7Cserver%7C1.2.3.4%7C4661%7C/\""
+        ));
+        assert!(!looks_like_ed2k_uri("https://example.test/ed2k://|file|"));
+        assert!(!looks_like_ed2k_uri(
+            r"C:\Users\Ember\shared.emulecollection"
+        ));
     }
 }
 
