@@ -82,3 +82,18 @@ export function queryHasNetworkKeyword(query: string): boolean {
     .split(/[\s()[\]{}<>,._\-!?:;\\/"']+/)
     .some((token) => token && encoder.encode(token).length >= 3);
 }
+
+/**
+ * If the query is only a dotted three-letter extension (`.mp3`, `.mp4`,
+ * `.mkv`), return that extension in lowercase; otherwise `null`.
+ *
+ * Filename publishers drop a trailing 3-character / 3-byte token
+ * (`extract_keywords` with `strip_trailing_extension`), so a DHT walk for
+ * `mp3` almost never hits `Song.mp3` — only names that contain `mp3` as a
+ * real word. The search page uses this to explain a flood of library
+ * substring hits and a near-empty Ember/KAD list.
+ */
+export function extensionOnlyQueryToken(query: string): string | null {
+  const match = query.trim().match(/^\.([A-Za-z0-9]{3})$/);
+  return match ? match[1].toLowerCase() : null;
+}

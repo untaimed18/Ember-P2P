@@ -33,6 +33,7 @@
   import {
     MAX_SEARCH_QUERY_LEN,
     clampQueryBytes,
+    extensionOnlyQueryToken,
     isServerDirectiveQuery,
     queryHasNetworkKeyword,
   } from '$lib/searchQuery';
@@ -460,23 +461,14 @@
   // received (the count arrives on each hit as `file.complete_sources`).
   let filterMinComplete = $state<number | null>(null);
   let hideSpam = $state<boolean>(true);
-  /** True when the hit is only from the shared library (not merged with KAD/Server/UDP/Notes). */
-  function isLocalOnlySearchResult(r: SearchResult): boolean {
-    const o = (r.result_origin || '').trim();
-    if (!o) return r.peer_id === 'local';
-    const parts = o.split(' · ').map((s) => s.trim()).filter(Boolean);
-    if (parts.length === 0) return r.peer_id === 'local';
-    return parts.every((p) => p === 'Local');
-  }
 
   /**
-   * Whether a (visible) result is effectively "already in the library" with
-   * nothing to fetch. Pure-local rows are filtered out by
-   * `isLocalOnlySearchResult`, but a row can carry a mixed origin like
-   * `KAD · Local` when a file we share is also found on the network — those
-   * rows DO have downloadable network sources. This mirrors the exact early
-   * exit in `download()` so the in-library badge / disabled download button
-   * only show when the action would genuinely be a no-op.
+   * Whether a result is effectively "already in the library" with nothing
+   * to fetch. A row can carry a mixed origin like `KAD · Local` when a file
+   * we share is also found on the network — those rows DO have downloadable
+   * network sources. This mirrors the exact early exit in `download()` so the
+   * in-library badge / disabled download button only show when the action
+   * would genuinely be a no-op.
    */
   function isInLibraryOnly(r: SearchResult): boolean {
     if (!r.result_origin?.includes('Local')) return false;
@@ -1262,7 +1254,6 @@
     for (const r of visibleResults) {
       if (r.is_spam) spamCount++;
       if (spamHidden && r.is_spam) continue;
-      if (isLocalOnlySearchResult(r)) continue;
       if (hasType && resultType(r) !== filterType) continue;
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
@@ -2748,16 +2739,23 @@
     filterText !== ''
   );
 
-  // The visible result count and the raw search count can differ for
-  // two reasons that aren't covered by `hasActiveFilters`: the spam
-  // filter (`hideSpam`) and local-only entries that the pipeline always
-  // drops. When they differ, the "(filtered from N)" suffix should show
-  // even if no explicit filter chip is set, so the user understands why
-  // the table isn't showing the headline number.
+  // The visible result count and the raw search count can differ for a
+  // reason that isn't covered by `hasActiveFilters`: Hide spam. When they
+  // differ, the "(filtered from N)" suffix should show even if no explicit
+  // filter chip is set, so the user understands why the table isn't showing
+  // the headline number. Library-only hits stay in the table; Hide spam is
+  // the only visibility rule that drops rows on its own.
   // Both sides come from `visibleResults`, not the live store list: mixing a
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
   let resultsHidden = $derived(visibleResults.length - filteredResults.length);
+  // `.mp3` / `.mp4` on Ember or KAD walk a key publishers almost never
+  // write (trailing three-letter extensions are stripped from the index).
+  let extensionOnlyHintExt = $derived(
+    activeTab && (activeTab.method === 'ember' || activeTab.method === 'kad')
+      ? extensionOnlyQueryToken(activeTab.query)
+      : null,
+  );
 
   let advancedFilterCount = $derived(
     (filterColumn !== 'all' && filterText !== '' ? 1 : 0) +
@@ -2870,6 +2868,9 @@
       {#if searchMethod !== 'ember'}
         <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
         <p class="search-syntax-ed2k">{m.search_query_syntax_min_term()}</p>
+      {/if}
+      {#if searchMethod === 'kad' || searchMethod === 'ember' || searchMethod === 'global'}
+        <p class="search-syntax-ed2k">{m.search_query_syntax_extensions()}</p>
       {/if}
       {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
         <p class="search-syntax-ember">
@@ -3208,21 +3209,29 @@
            feature looking broken and looking finished. -->
       <p>{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
       <p class="hint">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      {#if extensionOnlyHintExt}
+        <p class="hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
+      {/if}
     </div>
   {:else}
     <div class="results-info">
-      <span>
-        {#if activeTab?.isSearching}
-          <span class="searching-indicator">{m.search_searching_indicator()}</span>
+      <div class="results-info-copy">
+        <span>
+          {#if activeTab?.isSearching}
+            <span class="searching-indicator">{m.search_searching_indicator()}</span>
+          {/if}
+          {#if filteredResults.length > 0}
+            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
+          {:else if visibleResults.length > 0}
+            {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
+          {:else}
+            {m.search_zero_results()}
+          {/if}
+        </span>
+        {#if extensionOnlyHintExt}
+          <p class="results-extension-hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
         {/if}
-        {#if filteredResults.length > 0}
-          {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
-        {:else if visibleResults.length > 0}
-          {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
-        {:else}
-          {m.search_zero_results()}
-        {/if}
-      </span>
+      </div>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>
           <summary class="column-menu-summary" title={m.search_columns_aria()} aria-haspopup="true">
@@ -4264,8 +4273,19 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
+    gap: 12px;
+  }
+
+  .results-info-copy {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .results-extension-hint {
+    margin: 6px 0 0;
+    line-height: 1.4;
   }
 
   .clear-results-btn {

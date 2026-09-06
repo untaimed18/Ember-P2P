@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_SEARCH_QUERY_LEN,
   clampQueryBytes,
+  extensionOnlyQueryToken,
   isServerDirectiveQuery,
   queryHasNetworkKeyword,
 } from './searchQuery';
@@ -134,5 +135,21 @@ describe('queryHasNetworkKeyword', () => {
     // though the string is long.
     expect(queryHasNetworkKeyword('a.b.c-d_e')).toBe(false);
     expect(queryHasNetworkKeyword('ab cd movie')).toBe(true);
+  });
+});
+
+describe('extensionOnlyQueryToken', () => {
+  it('recognises a dotted three-letter extension and nothing else', () => {
+    expect(extensionOnlyQueryToken('.mp3')).toBe('mp3');
+    expect(extensionOnlyQueryToken('  .MP4  ')).toBe('mp4');
+    expect(extensionOnlyQueryToken('.mkv')).toBe('mkv');
+    // No leading dot: this is an ordinary keyword, including names that
+    // really do contain the letters "mp3" as a word.
+    expect(extensionOnlyQueryToken('mp3')).toBeNull();
+    // Four-letter extensions are indexed (the publisher only strips 3/3).
+    expect(extensionOnlyQueryToken('.flac')).toBeNull();
+    expect(extensionOnlyQueryToken('.mp3 collection')).toBeNull();
+    expect(extensionOnlyQueryToken('song.mp3')).toBeNull();
+    expect(extensionOnlyQueryToken('')).toBeNull();
   });
 });

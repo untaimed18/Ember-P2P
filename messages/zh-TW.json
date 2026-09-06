@@ -1350,6 +1350,8 @@
   "search_query_syntax_hint": "使用 AND / OR / NOT 組合詞，用 ( ) 分組，用 \"引號\" 匹配短語，用 -詞 排除。",
   "search_query_syntax_hint_ember": "Ember 搜尋要求檔名包含每一個詞。AND / OR / NOT 僅適用於 eD2K（KAD 與伺服器）。",
   "search_query_syntax_min_term": "少於 3 個字元的詞會被忽略——與 eD2K 發佈端為檔名建立索引時相同。",
+  "search_query_syntax_extensions": "三字母副檔名（.mp3、.mp4、.mkv）會從已發佈的檔名中去掉，因此不能當關鍵字。請用檔名裡的詞搜尋。",
+  "search_extension_keyword_hint": "發佈端不會索引三字母副檔名。在 Ember 或 KAD 搜尋 .{ext} 找不到別人的 .{ext} 檔，只會比對名稱含有「{ext}」的項目，包括已在你媒體庫中的檔案。",
   "search_needs_keyword": "KAD 與 Ember 搜尋需要至少 3 個字元的關鍵字。請加入關鍵字，或改用「所有網路／伺服器」並搭配類型與大小篩選。",
   "search_enter_query": "請輸入要搜尋的內容，或設定類型、大小或來源篩選。",
   "search_directive_server_only": "ed2k:: 與 related:: 搜尋由 eD2K 伺服器回應。請切換到「所有網路」或「伺服器」——KAD 與 Ember 索引的是檔案名稱，而非這些內容。",
