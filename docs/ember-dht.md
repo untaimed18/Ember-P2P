@@ -769,6 +769,11 @@ settled.
 
 ### Search and publish
 
+The gaps against KAD's *keyword search* specifically have their own plan file:
+[ember-dht-search-plan.md](ember-dht-search-plan.md). Wire-side constraint
+filtering, record metadata, and the per-node result ceiling live there. This list
+stays the home for indexing ideas that are not gaps against KAD.
+
 - Richer keyword indexing (stemming, more than space-split tokens) if
   recall lags KAD on real libraries.
 - ~~Clearer search UI when Ember is joining (empty table) versus
