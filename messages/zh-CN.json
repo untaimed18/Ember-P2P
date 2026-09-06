@@ -1333,6 +1333,8 @@
   "search_col_type": "类型",
   "search_col_size": "大小",
   "search_col_sources": "源",
+  "search_sources_ember_hint": "有 {count} 位 Ember 用户发布了此文件。Ember 统计的是已确认的发布者，每位都拥有完整文件，而不是整个下载群的估算值，因此不能与 KAD 或服务器的数字相比。",
+  "search_sources_ember_mixed_hint": "在 Ember 和其他网络都找到了。此数字取各网络单独上报的最大值；Ember 统计已确认的发布者，其他网络估算整个下载群。",
   "search_col_source": "来源",
   "search_col_hash": "Hash",
   "search_col_all_fields": "全部字段",

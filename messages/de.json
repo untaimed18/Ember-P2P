@@ -1333,6 +1333,8 @@
   "search_col_type": "Typ",
   "search_col_size": "Größe",
   "search_col_sources": "Quellen",
+  "search_sources_ember_hint": "{count} Ember-Nutzer haben diese Datei veröffentlicht. Ember zählt bestätigte Anbieter, die jeweils die ganze Datei haben — keine Schätzung des gesamten Schwarms, also nicht mit einer KAD- oder Server-Zahl vergleichbar.",
+  "search_sources_ember_mixed_hint": "In Ember und anderswo gefunden. Die Zahl ist die höchste, die ein einzelnes Netzwerk gemeldet hat; Ember zählt bestätigte Anbieter, andere Netzwerke schätzen den gesamten Schwarm.",
   "search_col_source": "Quelle",
   "search_col_hash": "Hash",
   "search_col_all_fields": "Alle Felder",

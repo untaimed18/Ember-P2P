@@ -40,6 +40,11 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
+Everything that needed no wire change is now done — items 3, 4, 5 and the tab
+overflow entry under 6. What is left is [item 1](#1-find_value-carries-no-constraints--the-real-recall-gap)
+and [item 2](#2-keyword-records-carry-no-metadata), both of which wait for the
+version move.
+
 - **`complete_sources` was `0` on every Ember row**, which every consumer reads as
   "none": the Min Complete filter silently dropped all of them, the Complete
   column read as unknown, and `sort_search_results` ranks that field first and so
@@ -101,7 +106,7 @@ UI and in sorting, so it needs the same length caps and sanitisation the eD2K ta
 path applies, and it must not become a second name field that disagrees with
 `file_name`.
 
-## 3. Per-node result ceiling is an eighth of KAD's
+## 3. Per-node result ceiling is an eighth of KAD's — done
 
 Ember admits `MAX_RESULTS_PER_NODE` = `MAX_SEARCH_RESULTS / 4` = **75** distinct
 blobs from one node, paged at roughly 5 records per datagram
@@ -114,17 +119,18 @@ or two do — which is what a young overlay, or any unpopular keyword on a matur
 one, looks like. The comment on `MAX_PAGES_PER_NODE` already notes KAD does not
 ration this at all.
 
-**Plan.** Raise the per-node allowance, but not by simply enlarging the constant:
-the 300-file budget is shared, so one well-stocked node could take all of it and
-end the walk before it descends. Prefer a two-tier rule — the current allowance
-while the shortlist still has unqueried entries, the remainder of the budget
-available once it is exhausted. That keeps the descent funded and still drains a
-lone storer.
+**Done** as a two-tier rule: the quarter share while the shortlist holds an
+unqueried hop *or* a query is outstanding, the remainder of the budget once
+neither is true. With nothing left to walk to there is no hop the extra records
+can crowd out, which is the whole reason the share existed.
 
-**Cost:** no wire change. Constant plus budget-accounting logic in `search.rs`,
-with tests for both the "one storer holds everything" and "twenty storers" shapes.
+The page ceiling had to move with it, or round trips stay the binding limit. That
+half is earned rather than granted — past the base ceiling a node gets one more
+page per page's worth of records it has actually delivered — because handing an
+exhausted shortlist the full page allowance outright would have quadrupled what a
+peer serving one record per page while claiming sixty thousand can buy.
 
-## 4. A corrected digest does not reach the row
+## 4. A corrected digest does not reach the row — done
 
 `merge_into` fills `ember_file_hash` only when the existing one is empty. The
 closing batch deliberately rebuilds from *every* record the walk gathered, so it
@@ -137,13 +143,14 @@ This one matters more than its size suggests: the digest is what a transfer
 The corroboration rule (two agreeing publishers before automatic seeding) exists
 precisely to prevent that, and this bypasses it.
 
-**Plan.** Let a cumulative Ember batch replace the digest rather than only fill it,
-or carry the corrected value on the resight update. Pin it with a test where two
-publishers of one file arrive in different streamed batches.
+**Done.** The corrected value already reached the UI —
+`emit_search_resight_updates` emits whole rows — so only the merge rule needed
+changing. `pick_ember_digest` / `pickEmberDigest` now let a later network digest
+replace an earlier one, while a `Local` digest (computed from the bytes on this
+disk) still wins over any network claim. Both sides are pinned by
+`ember_digest_cases` in the shared merge contract.
 
-**Cost:** small, but it touches the enforcement path — worth doing on its own.
-
-## 5. "Sources" means two different things in one column
+## 5. "Sources" means two different things in one column — done
 
 Ember's `availability` is publishers; KAD's and the servers' is a swarm estimate.
 The column is labelled Sources for both, and the default sort is Sources
@@ -152,11 +159,17 @@ fifty regardless of which is actually fetchable. Min Sources reads as "minimum
 publishers" for an Ember-only row, both in the UI and in the backend
 `min_availability` filter.
 
-**Plan.** Decide between explaining it and normalising it. Explaining is a
-per-origin tooltip on the cell. Normalising means picking one meaning and
-converting — which we cannot honestly do, since the swarm size behind an Ember
-record is genuinely unknown. Leaning toward the tooltip plus an origin-aware tie
-in the sort.
+**Explained rather than normalised**, because normalising would mean inventing a
+swarm size for an Ember record and that number is genuinely unknown. An
+Ember-bearing row's Sources cell now carries a tooltip saying the count is
+confirmed publishers that each hold the whole file, with different wording when
+the row was also found elsewhere and the number is the highest any one network
+reported. Sorting by Sources breaks an exact tie toward the Ember row, on the
+grounds that N counted signatures is better evidence than N claimed peers.
+
+Still open by design: the primary sort order. An Ember row with three publishers
+sits below a KAD row claiming fifty, and there is no honest conversion between
+them.
 
 ## 6. Smaller items
 
@@ -164,33 +177,36 @@ in the sort.
   and `OR` queries send no extra keys at all (intersection would be AND
   semantics). The local filename filter still applies, so this costs bandwidth
   and responder work rather than recall. Low priority.
-- **Tab overflow evicts Ember rows first.** `mergeIntoTab` in
-  [`stores/search.ts`](../src/lib/stores/search.ts) sorts by `availability` and
-  truncates at 15 000 rows; Ember's publisher counts are small, so they go first.
-  Only reachable on a very broad global search.
+- ~~Tab overflow evicts Ember rows first.~~ **Done.** Rows are ranked within
+  their own origin class before shedding
+  ([`searchOverflow.ts`](../src/lib/searchOverflow.ts)), so each class sheds its
+  own weakest instead of Ember losing every row to a swarm estimate it cannot be
+  compared against.
 - **Extensions are not keywords.** Publishers strip a trailing three-character,
   three-byte token before indexing (`tokenize_keywords`), so `.mp3` and `.mp4`
   walk a key almost nobody has written. The search page now says so. A real fix
   means an extension or type index key, which diverges from eMule's keyword
   index — decide whether that divergence is wanted before building it.
-- **Spam heuristics have no Ember exemption.** `origin_is_kad_publisher_only`
-  exempts KAD-only rows from the hot-IP signal; Ember-only rows have no source
-  IPs either, and the batch same-name-many-hashes rule can still fire on them.
-  Consider widening that predicate to any DHT-publisher-only origin.
+- ~~Spam heuristics have no Ember exemption.~~ **Nothing to do — checked.**
+  `origin_is_kad_publisher_only` guards exactly two things, the hot-IP
+  accumulation loop in `absorb` and `source_concentrated`, and both walk
+  `source_addresses`. Ember keyword rows carry none, so neither can fire on them
+  and widening the predicate would be dead code. The batch
+  same-name-many-hashes rule *can* flag an Ember row, but it is not gated by
+  that predicate and treats KAD identically, so it is not an Ember gap.
 - **`CancelEmberSearch` is incomplete.** It clears `ember_search` but not
   `ember_keyword_searches` or buffered result batches. Debug-only command; the
   user-facing cancel path (`cancel_search_request`) is correct.
 
 ---
 
-## Suggested order
+## What is left
 
-1. **Item 4** (corrected digest) — smallest, and the only one touching download
-   verification.
-2. **Item 3** (per-node ceiling) — no wire change, direct recall win on a small
-   overlay, which is the overlay we have.
-3. **Item 1** (wire constraints) — biggest win; do it as the additive version move
-   so it lowers `EMBER_DHT_MIN_VERSION` instead of partitioning.
-4. **Item 2** (record metadata) — same version move as item 1 if they land
+1. **Item 1** (wire constraints) — biggest remaining win; do it as the additive
+   version move so it lowers `EMBER_DHT_MIN_VERSION` instead of partitioning the
+   overlay.
+2. **Item 2** (record metadata) — same version move as item 1 if they land
    together; otherwise it waits for the next one.
-5. **Items 5 and 6** — UI and cleanup, any time.
+3. The two entries still open under item 6 — the eight-key `FIND_VALUE` limit
+   (also a wire change) and the extension-index question, which needs a decision
+   about diverging from eMule's keyword index before it needs code.

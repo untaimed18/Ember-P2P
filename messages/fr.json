@@ -1333,6 +1333,8 @@
   "search_col_type": "Type",
   "search_col_size": "Taille",
   "search_col_sources": "Sources",
+  "search_sources_ember_hint": "{count} utilisateurs Ember ont publié ce fichier. Ember compte les éditeurs confirmés, qui possèdent chacun le fichier entier — ce n’est pas une estimation de l’essaim, donc ce n’est pas comparable à un décompte KAD ou serveur.",
+  "search_sources_ember_mixed_hint": "Trouvé sur Ember et ailleurs. Le nombre est le plus élevé rapporté par un seul réseau ; Ember compte les éditeurs confirmés, les autres réseaux estiment l’essaim entier.",
   "search_col_source": "Source",
   "search_col_hash": "Hash",
   "search_col_all_fields": "Tous les champs",

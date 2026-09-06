@@ -1333,6 +1333,8 @@
   "search_col_type": "Type",
   "search_col_size": "Size",
   "search_col_sources": "Sources",
+  "search_sources_ember_hint": "{count} Ember users have published this file. Ember counts confirmed publishers, each of which has the whole file — not an estimate of the whole swarm, so it is not comparable to a KAD or server count.",
+  "search_sources_ember_mixed_hint": "Found on Ember and elsewhere. The number is the highest any one network reported; Ember counts confirmed publishers, other networks estimate the whole swarm.",
   "search_col_source": "Source",
   "search_col_hash": "Hash",
   "search_col_all_fields": "All fields",

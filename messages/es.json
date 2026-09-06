@@ -1333,6 +1333,8 @@
   "search_col_type": "Tipo",
   "search_col_size": "Tamaño",
   "search_col_sources": "Fuentes",
+  "search_sources_ember_hint": "{count} usuarios de Ember han publicado este archivo. Ember cuenta editores confirmados, cada uno con el archivo completo — no es una estimación de todo el enjambre, así que no es comparable con un recuento de KAD o del servidor.",
+  "search_sources_ember_mixed_hint": "Encontrado en Ember y en otras redes. El número es el más alto que informó una sola red; Ember cuenta editores confirmados, las demás redes estiman todo el enjambre.",
   "search_col_source": "Origen",
   "search_col_hash": "Hash",
   "search_col_all_fields": "Todos los campos",

@@ -479,6 +479,23 @@
   function displayName(result: SearchResult): string {
     return result.clean_name || result.file.name;
   }
+
+  /**
+   * What the Sources number on a row actually counted.
+   *
+   * The column holds one field for every network, but the networks do not
+   * measure the same thing. eD2K servers and KAD report a swarm estimate they
+   * were told; Ember counts the distinct publishers that signed a record for the
+   * file, which is a handful even for something widely shared. Sorting puts them
+   * in one order regardless, so a row's own number needs to say which it is.
+   */
+  function sourceCountHint(r: SearchResult): string | undefined {
+    const origin = r.result_origin || '';
+    if (!origin.includes('Ember')) return undefined;
+    return origin === 'Ember'
+      ? m.search_sources_ember_hint({ count: r.availability })
+      : m.search_sources_ember_mixed_hint({ count: r.availability });
+  }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
       ?? 'balanced',
@@ -1277,7 +1294,14 @@
           cmp = sortCollator.compare(resultType(a), resultType(b));
           break;
         case 'sources':
-          cmp = a.availability - b.availability;
+          // Equal numbers are not equal evidence. Ember's count is confirmed
+          // publishers that each hold the whole file; every other network's is a
+          // swarm figure a peer reported and nobody checked. Break the tie
+          // toward the one that was counted rather than claimed.
+          cmp =
+            a.availability - b.availability ||
+            (a.result_origin?.includes('Ember') ? 1 : 0) -
+              (b.result_origin?.includes('Ember') ? 1 : 0);
           break;
         case 'origin':
           cmp = sortCollator.compare(a.result_origin || '', b.result_origin || '');
@@ -3429,7 +3453,7 @@
                 {'\u2014'}
               {/if}
             </td>
-            <td class="col-sources">
+            <td class="col-sources" title={sourceCountHint(result)}>
               <span class="source-count" class:high-sources={result.availability >= 10}>
                 {result.availability}
               </span>
