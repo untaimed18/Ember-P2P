@@ -2054,8 +2054,22 @@
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'find_related': {
+          // Tags earn a probe of their own, so it is worth one metadata read
+          // here: an album track's filename is often a bare track number, and
+          // the artist/album a search result carries in `result.media` is
+          // exactly what lets the planner ask for the rest of the album.
+          // `selectedMedia` is no use — it belongs to the selection, which a
+          // right-click need not have moved, and lands 200ms later anyway.
+          const media = await getFileMediaMetadata(f.path).catch(() => null);
           // Navigates to Search on success, so nothing after this runs here.
-          await startRelatedSearch([{ hash: f.hash, name: f.name }]);
+          await startRelatedSearch([
+            {
+              hash: f.hash,
+              name: f.name,
+              artist: media?.artist ?? null,
+              album: media?.album ?? null,
+            },
+          ]);
           break;
         }
         case 'delete': {

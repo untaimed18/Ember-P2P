@@ -160,6 +160,9 @@ async fn handle_command_inner(
                 cancel_search_request(state, app_handle, prior_id);
             }
             state.active_search_request = None;
+            // Any second server request still queued belongs to that prior
+            // search, which is now gone; this one queues its own below.
+            state.server_followup_search = None;
 
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
@@ -197,13 +200,14 @@ async fn handle_command_inner(
             };
 
             // eMule's native "Search Related Files": the connected server is
-            // asked for files commonly shared *alongside* these hashes rather
-            // than for a keyword match. Only that one server gets it, and only
-            // when it advertises support — the whole point is its global view
-            // of who shares what, which no other leg of the search has. The
-            // UDP global-search leg deliberately keeps the keyword expression:
-            // a server without `SRV_TCPFLG_RELATEDSEARCH` would read
-            // `related::<hash>` as a filename substring and answer with
+            // asked for files commonly shared *alongside* these hashes. Only
+            // that one server gets it, and only when it advertises support —
+            // the whole point is its global view of who shares what, which no
+            // other leg of the search has. It is asked in *addition* to the
+            // keyword query rather than instead of it; see the two-phase send
+            // below. The UDP global-search leg deliberately keeps the keyword
+            // expression: a server without `SRV_TCPFLG_RELATEDSEARCH` would
+            // read `related::<hash>` as a filename substring and answer with
             // nothing useful.
             let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
             {
@@ -301,23 +305,21 @@ async fn handle_command_inner(
                     // by hand rather than parsed: `:` is an eD2k keyword
                     // separator, so parsing `related::<hash>` would send the
                     // server a keyword search for "related".
-                    let server_expr = match co_share_term.as_deref() {
-                        Some(term) => {
-                            info!(
-                                "TCP server search is a co-share request for {} hash(es)",
-                                related_hashes.len()
-                            );
-                            kad::messages::build_search_expression_with_node(
-                                Some(
-                                    crate::search::query::QueryExpr::Term(term.to_string())
-                                        .to_wire_bytes(),
-                                ),
-                                &search_constraints,
-                            )
-                        }
-                        None => search_expr.clone(),
-                    };
-                    match conn.send_search_expr_bytes(&server_expr).await {
+                    let co_share_expr = co_share_term.as_deref().map(|term| {
+                        kad::messages::build_search_expression_with_node(
+                            Some(
+                                crate::search::query::QueryExpr::Term(term.to_string())
+                                    .to_wire_bytes(),
+                            ),
+                            &search_constraints,
+                        )
+                    });
+                    // Both questions are sent under the same `request_id`, so
+                    // both answers land in the same tab; the co-share request
+                    // goes out from the poll loop once the first has delivered.
+                    let (first_expr, followup_expr) =
+                        server_search_phases(&search_expr, co_share_expr, has_keyword_query);
+                    match conn.send_search_expr_bytes(&first_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
                             state.server_search_more_needed = false;
@@ -328,7 +330,20 @@ async fn handle_command_inner(
                                 request_id,
                             });
                             state.server_search_age = 0;
-                            info!("TCP server search started for '{query}'");
+                            // Queued only now that the first request is on the
+                            // wire: a write that failed leaves a connection in
+                            // no state to carry a second search, and nothing
+                            // else would ever retire the leg it opened.
+                            state.server_followup_search =
+                                followup_expr.map(|expr| (request_id, expr));
+                            if state.server_followup_search.is_some() {
+                                info!(
+                                    "TCP server search started for '{query}', co-share request for {} hash(es) queued behind it",
+                                    related_hashes.len()
+                                );
+                            } else {
+                                info!("TCP server search started for '{query}'");
+                            }
                         }
                         Err(e) => {
                             debug!("TCP server search failed to send: {e}");

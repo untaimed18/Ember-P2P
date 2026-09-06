@@ -2525,6 +2525,65 @@ mod server_search_age_limit_tests {
     }
 }
 
+/// Which search expression the connected server is asked first, and which — if
+/// any — is queued to follow it.
+///
+/// A related search has two questions for the one server it can put them to:
+/// the keyword query derived from the seed's filename, and eMule's co-share
+/// request for the seed hashes. A connection carries one search at a time, so
+/// they are sent in sequence; the keyword query leads because it is the half
+/// the user can see in the search box. Only when there are no keywords to send
+/// at all — a file named `S01E02.mkv` is all marker and no title — does the
+/// co-share request carry the whole search.
+fn server_search_phases(
+    keyword_expr: &[u8],
+    co_share_expr: Option<Vec<u8>>,
+    has_keyword_query: bool,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    match co_share_expr {
+        Some(co_share) if has_keyword_query => (keyword_expr.to_vec(), Some(co_share)),
+        Some(co_share) => (co_share, None),
+        None => (keyword_expr.to_vec(), None),
+    }
+}
+
+#[cfg(test)]
+mod server_search_phases_tests {
+    use super::server_search_phases;
+
+    const KEYWORD: &[u8] = b"keyword-expr";
+    const CO_SHARE: &[u8] = b"co-share-expr";
+
+    /// The bug this guards: a related search on a file with a usable title
+    /// asked the connected server *only* the co-share question, so the title
+    /// never reached the leg most likely to answer it. Worse where the seed is
+    /// a file the user already has — Library and Transfers — because the local
+    /// index's one match is the seed, which the plan withholds by design,
+    /// leaving the search with nothing to find at all.
+    #[test]
+    fn keyword_query_leads_and_the_co_share_request_follows_it() {
+        let (first, followup) = server_search_phases(KEYWORD, Some(CO_SHARE.to_vec()), true);
+        assert_eq!(first, KEYWORD);
+        assert_eq!(followup.as_deref(), Some(CO_SHARE));
+    }
+
+    #[test]
+    fn co_share_request_carries_a_search_that_has_no_keywords() {
+        let (first, followup) = server_search_phases(KEYWORD, Some(CO_SHARE.to_vec()), false);
+        assert_eq!(first, CO_SHARE);
+        assert!(followup.is_none(), "nothing left to ask after it");
+    }
+
+    /// No `SRV_TCPFLG_RELATEDSEARCH`, or no valid seed hash: an ordinary
+    /// one-phase keyword search, related or not.
+    #[test]
+    fn without_a_co_share_request_nothing_is_queued() {
+        let (first, followup) = server_search_phases(KEYWORD, None, true);
+        assert_eq!(first, KEYWORD);
+        assert!(followup.is_none());
+    }
+}
+
 /// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
 /// (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
@@ -12227,6 +12286,14 @@ struct NetworkState {
     /// eMule OP_QUERY_MORE_RESULT: capped follow-up requests for more server results.
     server_search_more_needed: bool,
     server_search_more_requests: u8,
+    /// A second TCP search to send this server once the current one finishes,
+    /// as `(request_id, wire expression)`. A related search has two different
+    /// questions for the one connected server — the keyword query the user can
+    /// see, and eMule's co-share request for the seed hashes — and a
+    /// connection carries one search at a time. Lives here beside
+    /// `server_search_more_needed` because it is sent from the same place, by
+    /// the same rule: queue it in the poll loop, send it on the next pass.
+    server_followup_search: Option<(u64, Vec<u8>)>,
     /// Counter for throttling server keep-alive (sent every N poll ticks)
     server_poll_count: u32,
     /// Counter for pending server search timeout (in poll ticks)
@@ -21541,6 +21608,43 @@ async fn enrich_and_emit_search_results(
     results
 }
 
+/// Whether a second TCP server search is queued for `request_id`.
+fn has_queued_server_followup(state: &NetworkState, request_id: u64) -> bool {
+    state
+        .server_followup_search
+        .as_ref()
+        .is_some_and(|(rid, _)| *rid == request_id)
+}
+
+/// Forget the queued second server search for `request_id`, for the paths that
+/// stop a search rather than let it run its course (the ed2k source cap, a
+/// silent server, cancel). Leaves a follow-up belonging to another request
+/// alone.
+fn drop_queued_server_followup(state: &mut NetworkState, request_id: u64) {
+    if has_queued_server_followup(state, request_id) {
+        state.server_followup_search = None;
+    }
+}
+
+/// End the TCP server leg for `request_id` now that its results are in — or
+/// keep it pending when a second request is queued for it, so the poll loop
+/// sends that before anything reports the search complete.
+fn end_or_continue_server_search_leg(
+    state: &mut NetworkState,
+    request_id: u64,
+    finished_search_requests: &mut Vec<u64>,
+) {
+    if has_queued_server_followup(state, request_id) {
+        return;
+    }
+    if let Some(active) = state.active_search_request.as_mut() {
+        if active.request_id == request_id {
+            active.server_pending = false;
+        }
+    }
+    finished_search_requests.push(request_id);
+}
+
 fn maybe_finish_active_search(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
@@ -21870,6 +21974,7 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
         }
         state.server_search_age = 0;
     }
+    drop_queued_server_followup(state, request_id);
 
     if state
         .active_search_request
@@ -21912,6 +22017,9 @@ fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHa
     state.server_poll_count = 0;
     state.server_search_more_needed = false;
     state.server_search_more_requests = 0;
+    // No session, no way to send it — and the flags mirror cleared above means
+    // the next plan will not count on a co-share request either.
+    state.server_followup_search = None;
     state.low_id = false;
     state.server_client_id = 0;
     // A new connection (even to the same server) is a fresh session that
@@ -24391,6 +24499,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         active_search_request: None,
         server_search_more_needed: false,
         server_search_more_requests: 0,
+        server_followup_search: None,
         server_poll_count: 0,
         server_search_age: 0,
         server_udp_search_age: 0,
@@ -38385,6 +38494,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     a.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
                                                 });
                                             if capped {
+                                                // The cap has stopped this sweep, so a
+                                                // queued co-share follow-up would only
+                                                // restart what we just decided to end.
+                                                drop_queued_server_followup(
+                                                    &mut state,
+                                                    request_id,
+                                                );
                                                 if let Some(active) =
                                                     state.active_search_request.as_mut()
                                                 {
@@ -38498,12 +38614,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     request_id,
                                                 });
                                             } else {
-                                                if let Some(active) = state.active_search_request.as_mut() {
-                                                    if active.request_id == request_id {
-                                                        active.server_pending = false;
-                                                    }
-                                                }
-                                                finished_search_requests.push(request_id);
+                                                end_or_continue_server_search_leg(
+                                                    &mut state,
+                                                    request_id,
+                                                    &mut finished_search_requests,
+                                                );
                                             }
                                             } // end !capped
                                         }
@@ -39078,6 +39193,61 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let _ = conn.request_more_results().await;
                         }
 
+                        // Second half of a related search's server leg: the
+                        // keyword query (and any More pages behind it) has
+                        // finished, so put the co-share request to the same
+                        // server under the same `request_id`. Asking only one of
+                        // the two, as this leg used to, meant a related search
+                        // with a usable title never put that title to the one
+                        // leg most likely to answer it. Gated on the leg still
+                        // being pending, which is a flag only a first request
+                        // that actually reached the wire ever set.
+                        let followup_ready = server_disconnect_reason.is_none()
+                            && state.pending_server_search.is_none()
+                            && match (&state.server_followup_search, &state.active_search_request) {
+                                (Some((rid, _)), Some(active)) => {
+                                    *rid == active.request_id && active.server_pending
+                                }
+                                _ => false,
+                            };
+                        if followup_ready {
+                            if let Some((followup_id, expr)) = state.server_followup_search.take() {
+                                match conn.send_search_expr_bytes(&expr).await {
+                                    Ok(()) => {
+                                        // Its own More budget: this is a second
+                                        // search, not another page of the first.
+                                        state.server_search_more_needed = false;
+                                        state.server_search_more_requests = 0;
+                                        state.pending_server_search = Some(PendingServerSearch {
+                                            tx: None,
+                                            results: Vec::new(),
+                                            request_id: followup_id,
+                                        });
+                                        state.server_search_age = 0;
+                                        info!(
+                                            "TCP server co-share request sent for search {followup_id}"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Nothing else will retire this leg: the
+                                        // first request already delivered, and
+                                        // only this send was holding it open.
+                                        debug!("TCP server co-share request failed to send: {e}");
+                                        if let Some(active) = state.active_search_request.as_mut() {
+                                            if active.request_id == followup_id {
+                                                active.server_pending = false;
+                                            }
+                                        }
+                                        maybe_finish_active_search(
+                                            &mut state,
+                                            &app_handle,
+                                            followup_id,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         if server_disconnect_reason.is_none() && state.server_connected {
                             state.server_poll_count += 1;
                             if state.server_poll_count >= 30 {
@@ -39159,6 +39329,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             if let Some(tx) = pending.tx.take() {
                                 let _ = tx.send(pending.results);
                             }
+                            // A server that went quiet for the whole window is
+                            // not worth a second question — chasing it would
+                            // buy another full timeout of spinner.
+                            drop_queued_server_followup(&mut state, request_id);
                             if let Some(active) = state.active_search_request.as_mut() {
                                 if active.request_id == request_id {
                                     active.server_pending = false;
