@@ -3821,6 +3821,25 @@ mod tests {
             assert_eq!(record.file_size, 700_000_000);
         }
 
+        // An extension constraint narrows the same way, which is how Ember
+        // answers "search by extension" without the extension being a key.
+        let by_extension = messages::ValueConstraints {
+            file_extension: Some("mkv".to_string()),
+            ..Default::default()
+        };
+        let (_rid, ask) = a.build_find_value(vec![key], 0, by_extension);
+        let reply = b.handle_message(&ask, a_addr, a_noise, 2010);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2011)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(page.total_available, 2);
+        assert!(page.records.iter().all(|blob| {
+            super::super::publish::SignedRecord::from_value_blob(blob)
+                .is_some_and(|r| r.file_name.ends_with(".mkv"))
+        }));
+
         // A constraint nothing under the key satisfies is answered the way a key
         // we do not hold is: with contacts, so the walk keeps moving.
         let impossible = messages::ValueConstraints {

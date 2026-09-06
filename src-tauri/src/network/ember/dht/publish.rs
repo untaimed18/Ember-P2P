@@ -435,6 +435,7 @@ pub(super) fn record_matches_constraints(
     if constraints.min_size.is_none()
         && constraints.max_size.is_none()
         && constraints.file_type.is_none()
+        && constraints.file_extension.is_none()
     {
         return true;
     }
@@ -451,7 +452,7 @@ pub(super) fn record_matches_constraints(
     if constraints.max_size.is_some_and(|max| file_size > max) {
         return false;
     }
-    if let Some(want) = &constraints.file_type {
+    if constraints.file_type.is_some() || constraints.file_extension.is_some() {
         let name_len =
             u16::from_le_bytes([data[RECORD_HEADER_LEN - 2], data[RECORD_HEADER_LEN - 1]]) as usize;
         let Some(name) = data.get(RECORD_HEADER_LEN..RECORD_HEADER_LEN + name_len) else {
@@ -462,8 +463,18 @@ pub(super) fn record_matches_constraints(
         // has a usable extension.
         let name = String::from_utf8_lossy(name);
         let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or_default();
-        if crate::search::index::infer_file_type(extension) != *want {
-            return false;
+        if let Some(want) = &constraints.file_type {
+            if crate::search::index::infer_file_type(extension) != *want {
+                return false;
+            }
+        }
+        if let Some(want) = &constraints.file_extension {
+            // The decoder already lowercased and de-dotted the constraint; this
+            // side has to match that, and the name's extension is whatever the
+            // publisher typed.
+            if !extension.eq_ignore_ascii_case(want) {
+                return false;
+            }
         }
     }
     true

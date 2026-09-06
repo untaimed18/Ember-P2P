@@ -581,6 +581,10 @@ async fn handle_command_inner(
                                 min_size: active_request.min_size,
                                 max_size: active_request.max_size,
                                 file_type: active_request.file_type_filter.clone(),
+                                // Ember's answer to "search by extension": a
+                                // constraint the responder applies, not a keyword
+                                // key. See `ValueConstraints::file_extension`.
+                                file_extension: active_request.file_extension.clone(),
                                 extra_keys: Vec::new(),
                             });
                         }

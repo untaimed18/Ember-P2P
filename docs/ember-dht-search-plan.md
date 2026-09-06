@@ -40,10 +40,10 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
-Every item is done. None of the three wire additions needed a version bump — see
-item 1 for why bumping would have been actively wrong — and the only thing left on
-the list is a product question (the extension-index one under item 6) rather than
-engineering.
+Every item is done, and the extension question is decided. None of the wire
+additions needed a version bump — see item 1 for why bumping would have been
+actively wrong. What remains is one *new* feature rather than a gap:
+[browse by type](#next-browse-by-type-off-the-dht).
 
 The two kinds of change this overlay is for, and which each item was:
 
@@ -240,11 +240,9 @@ them.
   ([`searchOverflow.ts`](../src/lib/searchOverflow.ts)), so each class sheds its
   own weakest instead of Ember losing every row to a swarm estimate it cannot be
   compared against.
-- **Extensions are not keywords.** Publishers strip a trailing three-character,
-  three-byte token before indexing (`tokenize_keywords`), so `.mp3` and `.mp4`
-  walk a key almost nobody has written. The search page now says so. A real fix
-  means an extension or type index key, which diverges from eMule's keyword
-  index — decide whether that divergence is wanted before building it.
+- ~~Extensions are not keywords.~~ **Decided** — they stay out of the index and
+  travel as a constraint instead. See
+  [Searching by extension](#searching-by-extension--decided-and-why-not-as-a-keyword).
 - ~~Spam heuristics have no Ember exemption.~~ **Nothing to do — checked.**
   `origin_is_kad_publisher_only` guards exactly two things, the hot-IP
   accumulation loop in `absorb` and `source_concentrated`, and both walk
@@ -258,12 +256,78 @@ them.
 
 ---
 
-## What is left
+## Searching by extension — decided, and why not as a keyword
 
-Only the extension-index question under item 6, which needs a decision about
-diverging from eMule's keyword index before it needs code: making `.mp3` a
-searchable term means indexing extensions, which the eMule keyword index
-deliberately does not. Everything else on this list has landed.
+Settled: an extension is a **constraint**, never a keyword key.
+
+Indexing it was the tempting version and it is the harmful one. A key holds
+`MAX_RECORDS_PER_KEY` = 1000 records, `MAX_RECORDS_PER_PUBLISHER_PER_KEY` = 150 per
+publisher, and `MD4("mp3")` would immediately be the hottest key on the network:
+every mp3 anyone shares competing for a thousand slots on the twenty nodes closest
+to one key. A full key *refuses* new records rather than evicting incumbents
+(`a_full_keyword_never_evicts_an_incumbent`), so most of those publishes would be
+rejected after spending publish budget; the results a searcher got back would be an
+arbitrary three hundred files out of millions, which reads as broken rather than
+thin; and it would park a permanent load hotspot on whichever peers are unlucky
+enough to sit near the key — a concentration worth an attacker's attention. On top
+of that it is one extra record per file against an
+`EMBER_KEYWORDS_PER_FILE_ESTIMATE` of eight, so ~12% more keyword publish traffic
+for the worst-behaved key we would own.
+
+As a `ValueConstraints` field it costs no key, no publish traffic and no hotspot:
+the searcher still walks a real word, and the responder drops everything that is
+not an `.mp3` before it packs a page. Ember-only by construction, since only Ember
+reads the block.
+
+A bare `.mp3` typed on Ember or KAD now moves itself into the Extension box and
+asks for a word, rather than running a search whose only hits can be the user's own
+library.
+
+**A quirk to know:** four-letter extensions already are keywords, by accident. The
+publisher strips a trailing token only when it is *exactly* three characters and
+three bytes, so `flac`, `webm` and `epub` are indexed while `mp3`, `mkv` and `avi`
+are not. "flac" as a query has always worked; "mp3" never has. Nothing here changes
+that, and the constraint makes both behave the same as a filter.
+
+## Next: browse by type, off the DHT
+
+What the constraint cannot do is answer "show me every `.mp3`" with no keyword at
+all. Kademlia has to walk *toward* something, and the only key such a query could
+name is the hotspot above — so if browsing by type is wanted, it should not be a
+DHT feature.
+
+The honest mechanism is a **filtered browse of peers we already have a session
+with**. eD2K has had the unfiltered form since forever
+(`OP_ASKSHAREDFILES` / `OP_ASKSHAREDFILESANSWER`, gated by the "allow others to
+view my shared files" setting, answered as one capped packet), so this is that
+request carrying a filter — bounded work, no key, no hotspot, and real answers
+instead of a random sample.
+
+Sketch:
+
+- Two new sub-types on the Ember extension wire, where `0x06` is the highest in use
+  (`EMBER_EXT_DHT_CONTACTS`): a share query carrying a `ValueConstraints`-shaped
+  filter, and its reply. Older peers ignore unknown sub-types, as that envelope
+  intends.
+- **Reuse the existing browse permission exactly.** A filtered browse must never
+  expose a file the unfiltered one would not, and a peer with browsing disabled must
+  refuse it the same way — an explicit denial, not a silent drop. Friends-only
+  shares stay invisible to non-friends on the same terms as everywhere else.
+- Reuse the per-file answer shape and its size cap, so a large library answers as
+  completely as one packet allows and no further.
+- Rate-limit per peer. A filter makes the request cheap to send and the answer
+  expensive to build, which is the wrong asymmetry to leave open.
+
+Open questions worth deciding before code:
+
+1. **Who may ask.** Every Ember session, or friends only? The eD2K setting is a
+   single global yes/no; "friends may browse, strangers may not" is a finer policy
+   than what exists and may deserve its own setting rather than being inferred.
+2. **Where it surfaces.** A search method beside "Ember Only", or its own view? It
+   is not a keyword search and pretending it is invites the comparison it will lose
+   — it can only ever show what the peers you are connected to hold.
+3. **How results merge.** They arrive per peer with no publisher corroboration, so
+   the availability and digest rules the DHT path relies on do not apply.
 
 ## A note on future wire additions
 

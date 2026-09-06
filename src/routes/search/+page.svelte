@@ -1697,6 +1697,20 @@
       addToast('warning', m.search_needs_keyword());
       return;
     }
+    // A bare `.mp3` names a token the publisher stripped before indexing, so on
+    // a keyword DHT it walks a key nobody wrote. The extension is still a usable
+    // *filter* — Ember sends it to the responders — so move it into the box it
+    // belongs in and ask for the word the walk needs, rather than running a
+    // search that can only return the user's own library.
+    {
+      const bare = method === 'kad' || method === 'ember' ? extensionOnlyQueryToken(q) : null;
+      if (bare) {
+        filterExtension = bare;
+        addToast('info', m.search_extension_moved_to_filter({ ext: bare }));
+        searchBar?.focusInput();
+        return;
+      }
+    }
     // Gate by the selected search method — KAD-only needs KAD, server-only
     // needs the eD2K server, Ember-only needs Ember enabled, global needs
     // any of KAD / server / Ember.

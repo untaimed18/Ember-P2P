@@ -127,9 +127,14 @@ const VALUE_EXT_TAG_MIN_SIZE: u8 = 0x01;
 const VALUE_EXT_TAG_MAX_SIZE: u8 = 0x02;
 const VALUE_EXT_TAG_FILE_TYPE: u8 = 0x03;
 const VALUE_EXT_TAG_EXTRA_KEYS: u8 = 0x04;
+const VALUE_EXT_TAG_FILE_EXTENSION: u8 = 0x05;
 
 /// Longest eMule file-type string (`EmuleCollection` is 15).
 const MAX_VALUE_FILE_TYPE_BYTES: usize = 16;
+
+/// Longest file extension a constraint may name. Generous next to real ones
+/// (`webm`, `flac`); the point is a bound, not a taxonomy.
+const MAX_VALUE_FILE_EXTENSION_BYTES: usize = 16;
 
 /// What a searcher will accept, evaluated by the responder against each record
 /// before it packs a page.
@@ -156,6 +161,16 @@ pub struct ValueConstraints {
     /// eMule file-type string (`Audio`, `Video`, …), inferred by both sides from
     /// the record's file name via `search::index::infer_file_type`.
     pub file_type: Option<String>,
+    /// A single file extension, without the dot and lowercased.
+    ///
+    /// This is how Ember answers "search by extension" without making the
+    /// extension a *keyword*. `MD4("mp3")` would be the hottest key on the
+    /// network — every mp3 anyone shares competing for one key's thousand
+    /// records, on the twenty nodes nearest it, where a full key refuses new
+    /// records rather than evicting incumbents. As a constraint it costs no key,
+    /// no publish traffic and no hotspot: the searcher still walks a real word and
+    /// the responder drops everything that is not an `.mp3` before it packs.
+    pub file_extension: Option<String>,
     /// Keyword hashes past the eight the count-prefixed run can name.
     pub extra_keys: Vec<[u8; 16]>,
 }
@@ -167,6 +182,7 @@ impl ValueConstraints {
         self.min_size.is_none()
             && self.max_size.is_none()
             && self.file_type.is_none()
+            && self.file_extension.is_none()
             && self.extra_keys.is_empty()
     }
 }
@@ -197,6 +213,13 @@ fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
         push(
             VALUE_EXT_TAG_FILE_TYPE,
             &bytes[..bytes.len().min(MAX_VALUE_FILE_TYPE_BYTES)],
+        );
+    }
+    if let Some(extension) = &constraints.file_extension {
+        let bytes = extension.as_bytes();
+        push(
+            VALUE_EXT_TAG_FILE_EXTENSION,
+            &bytes[..bytes.len().min(MAX_VALUE_FILE_EXTENSION_BYTES)],
         );
     }
     if !constraints.extra_keys.is_empty() {
@@ -260,6 +283,20 @@ fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
                     if let Ok(text) = std::str::from_utf8(value) {
                         if !text.is_empty() {
                             out.file_type = Some(text.to_string());
+                        }
+                    }
+                }
+            }
+            VALUE_EXT_TAG_FILE_EXTENSION => {
+                // Normalised here rather than trusted: the responder compares it
+                // against an extension it lowercases off a file name, and a
+                // constraint arriving as `MP3` or `.mp3` would silently match
+                // nothing instead of being obviously wrong.
+                if value.len() <= MAX_VALUE_FILE_EXTENSION_BYTES {
+                    if let Ok(text) = std::str::from_utf8(value) {
+                        let text = text.trim_start_matches('.').to_ascii_lowercase();
+                        if !text.is_empty() {
+                            out.file_extension = Some(text);
                         }
                     }
                 }
@@ -2675,6 +2712,7 @@ mod tests {
             min_size: Some(1024),
             max_size: Some(4 * 1024 * 1024 * 1024),
             file_type: Some("Video".to_string()),
+            file_extension: Some("mkv".to_string()),
             extra_keys: vec![[0xC1; 16], [0xC2; 16]],
         };
         let ask = build_find_value(id, 9, vec![[0xA1; 16]], 12, constraints.clone());
@@ -2743,6 +2781,14 @@ mod tests {
             // An unknown tag, which must be skipped by its own length rather
             // than abandoning the ones after it.
             vec![0xC1, 0xE5, 0x02, 0x00, 0x7F, 0x00],
+            // An extension longer than the cap, and an empty one: both dropped
+            // rather than matched against, since either would silently exclude
+            // every record.
+            vec![0xC1, 0xE5, 0x14, 0x00, VALUE_EXT_TAG_FILE_EXTENSION, 0x11]
+                .into_iter()
+                .chain(std::iter::repeat_n(b'a', 17))
+                .collect(),
+            vec![0xC1, 0xE5, 0x02, 0x00, VALUE_EXT_TAG_FILE_EXTENSION, 0x00],
         ] {
             let mut payload = base.clone();
             payload.extend_from_slice(&trailer);
@@ -2760,6 +2806,35 @@ mod tests {
                     );
                 }
                 other => panic!("{trailer:?} must still decode, got {other:?}"),
+            }
+        }
+    }
+
+    /// The extension constraint is compared against a name the responder
+    /// lowercases, so it is normalised on arrival: a peer naming `.MP3` or `MP3`
+    /// must not silently match nothing.
+    #[test]
+    fn an_extension_constraint_is_normalised_on_arrival() {
+        let (_, id) = test_keypair();
+        for written in ["MP3", ".mp3", ".MP3", "mp3"] {
+            let ask = build_find_value(
+                id,
+                1,
+                vec![[0xA1; 16]],
+                0,
+                ValueConstraints {
+                    file_extension: Some(written.to_string()),
+                    ..Default::default()
+                },
+            );
+            let payload = encode_payload(&ask.payload);
+            match decode_payload(MSG_FIND_VALUE, &payload).unwrap() {
+                DhtPayload::FindValue { constraints, .. } => assert_eq!(
+                    constraints.file_extension.as_deref(),
+                    Some("mp3"),
+                    "{written} must arrive as the extension a file name yields"
+                ),
+                other => panic!("expected FindValue, got {other:?}"),
             }
         }
     }

@@ -1354,6 +1354,7 @@
   "search_query_syntax_min_term": "Les mots de moins de 3 caractères sont ignorés — la même règle que les index eD2K.",
   "search_query_syntax_extensions": "Les extensions de trois lettres (.mp3, .mp4, .mkv) sont retirées des noms publiés, ce ne sont donc pas des mots-clés. Utilisez un mot du nom de fichier.",
   "search_extension_keyword_hint": "Les éditeurs n’indexent pas les extensions de trois lettres. Chercher .{ext} sur Ember ou KAD ne trouvera pas les .{ext} des autres — seulement les noms qui contiennent « {ext} », y compris les fichiers déjà dans votre bibliothèque.",
+  "search_extension_moved_to_filter": ".{ext} a été placé dans le filtre Extension. Ajoutez un mot du nom de fichier pour lancer la recherche — Ember ne renverra que des fichiers .{ext}.",
   "search_needs_keyword": "Les recherches KAD et Ember nécessitent un mot d’au moins 3 caractères. Ajoutez un mot-clé, ou utilisez Tous les réseaux / Serveur avec des filtres de type et de taille.",
   "search_enter_query": "Saisissez un terme à rechercher, ou définissez un filtre de type, de taille ou de sources.",
   "search_directive_server_only": "Les recherches ed2k:: et related:: sont traitées par un serveur eD2K. Passez à Tous les réseaux ou Serveur : KAD et Ember indexent les noms de fichiers, pas ceci.",
