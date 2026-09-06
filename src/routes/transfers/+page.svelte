@@ -3,7 +3,7 @@
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
@@ -706,6 +706,16 @@
   let selectedDownloadIds = $state<string[]>([]);
   let selectedDlIdSet = $derived(new Set(selectedDownloadIds));
   let lastClickedDlId = $state<string | null>(null);
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we — the search
+   * only ever asks that one connection (see `RELATED_SEARCH_METHOD`).
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
 
   // --- Uploads ---
   function isUploadFinished(t: Transfer): boolean {
@@ -2019,9 +2029,21 @@
           await pasteLinksFromClipboard();
           break;
         }
-        case 'find_related': {
+        case 'find_related':
+        case 'find_related_selected': {
+          // eMule's menu item acts on the whole selection — `DownloadListCtrl`
+          // hands `SearchRelatedFiles` its `selectedList` — and one co-share
+          // request can name several hashes. The clicked row leads, because the
+          // plan derives its keyword probes from the first seed's filename.
+          const alsoSelected =
+            action === 'find_related_selected'
+              ? selectedBatchTransfers.filter((s) => s.id !== t.id)
+              : [];
           // Navigates to Search on success, so nothing after this runs here.
-          await startRelatedSearch([{ hash: t.file_hash, name: t.file_name }]);
+          await startRelatedSearch([
+            { hash: t.file_hash, name: t.file_name },
+            ...alsoSelected.map((s) => ({ hash: s.file_hash, name: s.file_name })),
+          ]);
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
@@ -4679,7 +4701,23 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
-      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
+      {#if selectedDownloadCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          onclick={() => ctxAction('find_related_selected')}
+        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
@@ -4695,7 +4733,22 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
+      {#if selectedDownloadCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          onclick={() => ctxAction('find_related_selected')}
+        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
@@ -4707,7 +4760,13 @@
         <div class="ctx-sep" role="separator"></div>
       {/if}
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" role="menuitem" title={m.search_ctx_find_related_title()} onclick={() => ctxAction('find_related')}>{m.search_ctx_find_related()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
         <div class="ctx-sep" role="separator"></div>
         <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>

@@ -336,6 +336,15 @@ async fn handle_command_inner(
                                     "TCP server search started for '{query}', co-share request for {} hash(es) queued behind it",
                                     related_hashes.len()
                                 );
+                            } else if co_share_term.is_some() {
+                                // A co-share request carries the whole search,
+                                // so there is no `query` to name: logging one
+                                // printed `for ''` and made the only line a
+                                // related search produces unreadable.
+                                info!(
+                                    "TCP server co-share request started for {} hash(es)",
+                                    related_hashes.len()
+                                );
                             } else {
                                 info!("TCP server search started for '{query}'");
                             }

@@ -1717,6 +1717,7 @@ pub fn run() {
             commands::backup::discard_pending_restore,
             commands::search::search_files,
             commands::search::plan_related_search,
+            commands::search::related_search_supported,
             commands::search::cancel_search,
             commands::search::find_notes,
             commands::search::find_sources,

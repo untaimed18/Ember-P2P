@@ -37,7 +37,7 @@
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
@@ -1729,6 +1729,16 @@
 
   // --- Context menu ---
   let ctxMenu: { x: number; y: number; file: FileInfo } | null = $state(null);
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we — the search
+   * only ever asks that one connection (see `RELATED_SEARCH_METHOD`).
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
@@ -2053,7 +2063,8 @@
           break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
-        case 'find_related': {
+        case 'find_related':
+        case 'find_related_selected': {
           // Tags earn a probe of their own, so it is worth one metadata read
           // here: an album track's filename is often a bare track number, and
           // the artist/album a search result carries in `result.media` is
@@ -2061,6 +2072,15 @@
           // `selectedMedia` is no use — it belongs to the selection, which a
           // right-click need not have moved, and lands 200ms later anyway.
           const media = await getFileMediaMetadata(f.path).catch(() => null);
+          // eMule's menu item acts on the whole selection, and one co-share
+          // request can name several hashes. The clicked row leads: the plan
+          // derives its keyword probes from the first seed's name and tags, so
+          // that is the only file whose metadata is worth reading — the rest
+          // ride along as hashes for the server's co-share question.
+          const alsoChecked =
+            action === 'find_related_selected'
+              ? getCheckedFiles().filter((c) => c.path !== f.path)
+              : [];
           // Navigates to Search on success, so nothing after this runs here.
           await startRelatedSearch([
             {
@@ -2069,6 +2089,7 @@
               artist: media?.artist ?? null,
               album: media?.album ?? null,
             },
+            ...alsoChecked.map((c) => ({ hash: c.hash, name: c.name })),
           ]);
           break;
         }
@@ -3705,12 +3726,23 @@
           </div>
         {/if}
       </div>
+      <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
       <button
         class="ctx-item"
         role="menuitem"
+        disabled={!relatedSearchReady}
         onclick={() => ctxAction('find_related')}
-        title={m.search_ctx_find_related_title()}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
       >{m.search_ctx_find_related()}</button>
+      {#if checkedCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          onclick={() => ctxAction('find_related_selected')}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       {#if ctxMenu.file.shared}
         <div

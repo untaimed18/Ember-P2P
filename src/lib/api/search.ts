@@ -72,6 +72,15 @@ export async function planRelatedSearch(seeds: RelatedSeed[]): Promise<RelatedPl
   return invoke('plan_related_search', { seeds });
 }
 
+/**
+ * Whether the connected eD2k server advertises `SRV_TCPFLG_RELATEDSEARCH`, so a
+ * related search has somewhere to put its co-share question. False when no
+ * server is connected. Mirrors the condition eMule greys its menu item on.
+ */
+export async function relatedSearchSupported(): Promise<boolean> {
+  return invoke('related_search_supported');
+}
+
 export async function cancelSearch(requestId: number): Promise<void> {
   return invoke('cancel_search', { requestId });
 }

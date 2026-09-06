@@ -30,7 +30,7 @@
     type RelatedSearchInfo,
     type SearchTab,
   } from '$lib/stores/search';
-  import { networkStats, serverStatus } from '$lib/stores/network';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
@@ -366,6 +366,15 @@
   // Live network readiness used by hints (must stay reactive).
   let kadUpLive = $derived($networkStats.status === 'connected');
   let serverUpLive = $derived($serverStatus === 'connected');
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we.
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived(serverUpLive && $relatedSearchSupported !== false);
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -1475,10 +1484,13 @@
    *  has already had all of that metadata stripped off it. */
   function searchTabLabel(tab: SearchTab): string {
     if (!tab.related) return shortenTabLabel(tab.query);
-    // No derived title means the co-share request is the whole search, so there
-    // is nothing to name it after.
-    if (!tab.related.queryLabel) return m.search_related_tab_label();
-    return shortenTabLabel(m.search_related_tab_label_named({ title: tab.related.queryLabel }));
+    // No derived title means the co-share request is the whole search, which is
+    // the normal case on a server that can answer it. eMule names such a tab
+    // after the seed files ("Related: <names>", its `strSpecialTitle`), and so
+    // do we — it is the only thing left to tell two of them apart.
+    const title = tab.related.queryLabel || tab.related.seedLabel;
+    if (!title) return m.search_related_tab_label();
+    return shortenTabLabel(m.search_related_tab_label_named({ title }));
   }
 
   /** Tooltip for a tab: the query for a normal search, and for a related search
@@ -1561,26 +1573,40 @@
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
     const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
-    // eMule/backend: Program clears the local type filter so Arc/Iso hits
-    // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
-    filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    // A related search carries no filters, because eMule's carries none:
+    // `CSearchResultsWnd::SearchRelatedFiles` fills in an expression and a tab
+    // title and leaves every filter field of a fresh `SSearchParams` at zero.
+    // Ours share one filter panel across tabs, so a "Video" or a min-size left
+    // over from the last hand-typed search would narrow a related search twice
+    // over — as constraints on the wire, and again as the client-side filter
+    // over the results — and hide the very files the seed went looking for.
+    if (plan) {
+      clearRelatedSearchFilters();
+    } else {
+      // eMule/backend: Program clears the local type filter so Arc/Iso hits
+      // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
+      filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    }
+    const wireFileType = plan ? undefined : searchFileType || undefined;
     const parsedMinSize = filterMinSize !== null ? filterMinSize * filterMinUnit : undefined;
     const parsedMaxSize = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : undefined;
     const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
     // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
     // excludes both, unlike the previous `!isNaN` which let Infinity through.
-    const searchFilterSnapshot: import('$lib/api/search').SearchFilters = {
-      fileExtension: filterExtension.trim() || undefined,
-      minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
-      maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
-      minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
-    };
+    const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
+      ? {}
+      : {
+          fileExtension: filterExtension.trim() || undefined,
+          minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
+          maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
+          minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
+        };
     // A related search whose seed filename yielded no searchable word is still
     // runnable when the server can answer the co-share request from the hashes
     // alone, so it is exempt from the "type something" and "needs a keyword"
     // gates that a hand-typed query has to pass.
     const coShareOnly = !!plan && plan.co_share_hashes.length > 0 && !plan.query;
-    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, wireFileType)) return;
     if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
       addToast('warning', m.search_needs_keyword());
       return;
@@ -1629,7 +1655,7 @@
           kinds: plan.probes.map((p) => p.kind),
         }
       : undefined;
-    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot, relatedInfo);
+    const { requestId, stoppedOthers } = openSearchTab(q, method, wireFileType, searchFilterSnapshot, relatedInfo);
     if (stoppedOthers) {
       addToast('info', m.search_previous_stopped());
     }
@@ -1638,7 +1664,7 @@
     clearChecked();
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
-    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot, plan
+    const searchPromise = searchFiles(q, method, requestId, wireFileType, searchFilterSnapshot, plan
       ? { relatedHashes: plan.co_share_hashes, excludeHashes: plan.exclude_hashes }
       : undefined);
 
@@ -1743,24 +1769,45 @@
     const pending = $pendingRelatedSearch;
     if (!pending || $serverStatus === 'connecting') return;
     pendingRelatedSearch.set(null);
-    // Show the derived query so it is visible and editable — a related search
-    // is otherwise the one case where results appear for a query the user
-    // never saw.
+    // The keyword fallback's derived query goes in the box so it is visible and
+    // editable, since results for a query the user never saw are otherwise
+    // unexplainable. A co-share request has no such form: `related::<hash>` is
+    // what goes on the wire, and typing that back in would be shredded by the
+    // keyword parser — so the box is left empty and the tab label and tooltip
+    // carry the explanation instead.
     barQuery = pending.plan.query ?? '';
     void handleSearch(barQuery, pending.plan);
   });
 
+  /** One search result as a related-search seed. */
+  function relatedSeed(result: SearchResult) {
+    return {
+      hash: result.file.hash,
+      name: result.file.name,
+      artist: result.media?.artist ?? null,
+      album: result.media?.album ?? null,
+    };
+  }
+
   /** Find files related to `result` — the search-results context menu action. */
   async function findRelated(result: SearchResult) {
     closeContextMenu();
-    await startRelatedSearch([
-      {
-        hash: result.file.hash,
-        name: result.file.name,
-        artist: result.media?.artist ?? null,
-        album: result.media?.album ?? null,
-      },
-    ]);
+    await startRelatedSearch([relatedSeed(result)]);
+  }
+
+  /**
+   * Find files related to all the ticked rows at once.
+   *
+   * eMule's menu item works on the whole selection — `CSearchListCtrl` hands
+   * `SearchRelatedFiles` its `selectedList` — and one co-share request can name
+   * several hashes (eserver 17.14 and later), so the server is asked about them
+   * together rather than once per file.
+   */
+  async function findRelatedChecked() {
+    closeContextMenu();
+    await startRelatedSearch(
+      filteredResults.filter((r) => checkedKeys.has(resultKey(r))).map(relatedSeed),
+    );
   }
 
   // `tabId` defaults to the active tab (toolbar Stop button), but a search
@@ -2137,6 +2184,25 @@
     filterMinComplete = null;
     filterColumn = 'all';
     hideSpam = false;
+    clearFilterText();
+  }
+
+  /**
+   * Drop every result filter for an incoming related search.
+   *
+   * eMule shows a related search in a results tab of its own, whose filter box
+   * starts empty; the filter panel here is shared by all tabs, so it is emptied
+   * instead. Everything `clearFilters` does except the spam toggle, which is a
+   * standing preference about junk rather than a narrowing of this search.
+   */
+  function clearRelatedSearchFilters() {
+    filterType = '';
+    filterMinSize = null;
+    filterMaxSize = null;
+    filterExtension = '';
+    filterMinSources = null;
+    filterMinComplete = null;
+    filterColumn = 'all';
     clearFilterText();
   }
 
@@ -3064,8 +3130,13 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>{m.search_no_results()}</p>
-      <p class="hint">{m.search_no_results_hint()}</p>
+      <!-- A related search that came back empty is not a query to reword:
+           there is no query, only the co-share request, and the server
+           answering "nothing" is a fact about its index rather than something
+           the user can retype. Saying so is the difference between the
+           feature looking broken and looking finished. -->
+      <p>{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
+      <p class="hint">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
     </div>
   {:else}
     <div class="results-info">
@@ -3406,12 +3477,28 @@
         {#if checkedCount > 1}
           <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
         {/if}
+        <!--
+          Greyed out exactly where eMule greys it out — see
+          `relatedSearchReady`. A related search only ever asks the connected
+          eD2k server (see `RELATED_SEARCH_METHOD`), so off a server that can
+          answer the co-share question there is nobody to ask.
+        -->
         <button
           class="ctx-item"
           role="menuitem"
+          disabled={!relatedSearchReady}
           onclick={() => { if (contextMenu) void findRelated(contextMenu.result); }}
-          title={m.search_ctx_find_related_title()}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
         >{m.search_ctx_find_related()}</button>
+        {#if checkedCount > 1}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            disabled={!relatedSearchReady}
+            onclick={() => void findRelatedChecked()}
+            title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+        {/if}
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         <div class="ctx-sep" role="separator"></div>
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>

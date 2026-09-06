@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { DegradedReason, NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
+import { relatedSearchSupported as apiRelatedSearchSupported } from '$lib/api/search';
 import { withTimeout } from '$lib/utils';
 import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
@@ -61,6 +62,46 @@ let networkErrorIsTransient = false;
 export type ServerStatus = 'connected' | 'connecting' | 'disconnected';
 export const serverStatus = writable<ServerStatus>('disconnected');
 const KNOWN_SERVER_STATUSES = new Set<ServerStatus>(['connected', 'connecting', 'disconnected']);
+
+/**
+ * Whether the connected eD2k server can answer a co-share request, which is
+ * what "Find related files" needs and what eMule greys its menu item on
+ * (`CanSearchRelatedFiles()`).
+ *
+ * Re-read whenever the server status moves, since that is when the capability
+ * changes in practice: the backend takes the flag from the login handshake and
+ * clears it on disconnect. A server that changed its advertised capabilities
+ * mid-session without a reconnect would leave this stale until the next status
+ * change — harmless, because the planner reads the live flag and withholds the
+ * co-share request regardless of what the menu offered.
+ *
+ * `null` is "not answered yet", and callers treat it as allowed rather than
+ * unsupported. This started life as a plain `false` default, which meant any
+ * failed read — a dropped IPC, or a frontend running ahead of a backend that
+ * does not have the command yet — greyed out "Find related files" everywhere
+ * for the rest of the session, with a tooltip blaming the server. Nothing
+ * about a failed read says the server can't answer, and letting the click
+ * through costs nothing: the planner reads the live flag and is the one that
+ * decides.
+ */
+export const relatedSearchSupported = writable<boolean | null>(null);
+let lastServerStatus: ServerStatus = 'disconnected';
+
+async function refreshRelatedSearchSupport() {
+  try {
+    relatedSearchSupported.set(await apiRelatedSearchSupported());
+  } catch {
+    relatedSearchSupported.set(null);
+  }
+}
+
+/** Publish a server status, re-reading the co-share capability when it moves. */
+function setServerStatus(next: ServerStatus, force = false) {
+  const moved = lastServerStatus !== next;
+  lastServerStatus = next;
+  serverStatus.set(next);
+  if (moved || force) void refreshRelatedSearchSupport();
+}
 
 function narrowServerStatus(raw: unknown): ServerStatus | undefined {
   return typeof raw === 'string' && (KNOWN_SERVER_STATUSES as Set<string>).has(raw)
@@ -133,7 +174,7 @@ async function persistUpnpDisabled() {
 function syncServerStatus(stats: NetworkStats) {
   const s = stats.server_status;
   if (s === 'connected' || s === 'connecting' || s === 'disconnected') {
-    serverStatus.set(s);
+    setServerStatus(s);
   }
 }
 let lastNetworkUpdate = 0;
@@ -360,7 +401,11 @@ export async function initNetworkStore() {
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       const status = narrowServerStatus(event.payload?.status);
-      if (status) serverStatus.set(status);
+      // `force`: the backend takes the server's capability flags from the login
+      // handshake before it announces the connection, and re-announcing the
+      // same status is how a reconnect to a different server arrives — so every
+      // one of these is worth a re-read, not only the transitions.
+      if (status) setServerStatus(status, true);
     }));
     registered.push(await listen('server-auto-connect-failed', () => {
       toastWarning(m.toast_server_auto_connect_failed());
@@ -425,7 +470,9 @@ export function cleanupNetworkStore() {
     detachStatsVisibilityListener();
   }
   statsPollConsumers = 0;
+  lastServerStatus = 'disconnected';
   serverStatus.set('disconnected');
+  relatedSearchSupported.set(null);
   networkError.set(null);
   networkStats.set({
     connected_peers: 0, upload_speed: 0, download_speed: 0,

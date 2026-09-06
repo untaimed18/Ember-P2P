@@ -367,6 +367,18 @@ pub async fn plan_related_search(
     Ok(plan)
 }
 
+/// Whether "Find related files" has a server that can answer it.
+///
+/// eMule offers the menu item only while `CanSearchRelatedFiles()` holds — a
+/// connected server advertising `SRV_TCPFLG_RELATEDSEARCH` — and greys it out
+/// otherwise, which is what the UI uses this for. The flag mirror is updated on
+/// login, on every `OP_IDCHANGE` and on disconnect, so this is an atomic read
+/// rather than a round-trip to the network task.
+#[tauri::command]
+pub fn related_search_supported() -> bool {
+    crate::network::ed2k::server::related_search_supported()
+}
+
 /// Run a search across the selected networks.
 ///
 /// `related_hashes` / `exclude_hashes` are set only by a "find related files"

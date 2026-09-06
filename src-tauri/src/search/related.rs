@@ -4,32 +4,29 @@
 //! eMule has this feature as `Search Related Files`: it sends the literal
 //! string `related::<md4>` to the connected eD2k server, and the server — which
 //! knows every client's whole shared list — answers with files that tend to be
-//! shared alongside that hash. Two things make that unsatisfying in practice:
+//! shared alongside that hash. That request is the feature, and when the server
+//! can answer it (`SRV_TCPFLG_RELATEDSEARCH`, with the seed shared by at least
+//! ~5 clients there) it is the only thing this module asks for — see
+//! [`co_share_term`] and [`plan`]. Anything else on the wire beside it turns
+//! the results into a search *for the seed*, which is the one thing the user
+//! did not ask for: they already have that file, it is what they right-clicked.
 //!
-//! 1. It only works on a server advertising `SRV_TCPFLG_RELATEDSEARCH`, and the
-//!    seed file has to be shared by at least ~5 clients on it. Off such a
-//!    server eMule simply greys the menu item out, so the feature does nothing
-//!    at all most of the time.
-//! 2. Server co-share data answers "what do people who have this also have",
-//!    which is *not* the question a user asks when they right-click episode 2
-//!    of a series. They want episodes 1 and 3.
-//!
-//! So this module keeps the eD2k co-share request (it is genuinely good data
-//! when it is available — see [`co_share_term`]) but treats it as one signal
-//! among several, and adds the signal eMule never had: reading the filename.
-//! Release names are highly structured — `Title.S01E02.1080p.WEB-DL.x264-GRP`
-//! — so [`analyze`] can recover the title, the series/episode marker, the
-//! disc/part marker and the year, and [`plan`] can turn those into probes that
-//! find the other episodes, the other discs, or other releases of the same
-//! title. Those work on every network, with no server support and no protocol
-//! change.
+//! The rest of the module is the fallback for a server that cannot answer, the
+//! case where eMule greys its menu item out and does nothing. Release names are
+//! highly structured — `Title.S01E02.1080p.WEB-DL.x264-GRP` — so [`analyze`]
+//! can recover the title, the series/episode marker, the disc/part marker and
+//! the year, and [`plan`] can turn those into probes for the other episodes,
+//! the other discs, or other releases of the same title. Those need no server
+//! support and no protocol change, but they are a guess about what "related"
+//! means, so they only run when nobody can be asked the real question.
 //!
 //! The output of [`plan`] is deliberately just *a query string plus some
 //! hashes*: it feeds the ordinary search pipeline
 //! (`NetworkCommand::SearchFiles`), so a related search gets result streaming,
-//! spam scoring, dedup, cancellation and tabs for free, and each network does
-//! what it is best at within one request — capable eD2k servers get the native
-//! co-share request, Kad/Ember/local get the derived keyword query.
+//! spam scoring, dedup, cancellation and tabs for free. It runs as a
+//! `Server`-method search either way, because both the co-share request and the
+//! fallback are questions for the one connected server — see
+//! `RELATED_SEARCH_METHOD` in the frontend.
 
 use std::sync::LazyLock;
 
@@ -675,13 +672,26 @@ pub fn plan(seeds: &[SeedFile], co_share_available: bool) -> RelatedPlan {
         .filter(|h| is_md4_hex(h))
         .collect();
 
-    let keyword_probes = seeds
-        .first()
-        .map(|seed| dedupe_probes(probes_for(seed)))
-        .unwrap_or_default();
+    let co_share = co_share_available && !hashes.is_empty();
+
+    // When the server can answer the co-share question, that question is the
+    // whole search — eMule's `SearchRelatedFiles` builds its expression from
+    // `related::<hash>` per file and adds no keyword at all. Asking the seed's
+    // own derived title alongside it makes the tab look like a search *for that
+    // file*: the same release, other rips of it, the rest of the same season's
+    // pack. That is not what the user pressed the button for. So the derived
+    // probes are what a server that *cannot* answer the co-share question falls
+    // back to, never a supplement to one that can.
+    let keyword_probes = if co_share {
+        Vec::new()
+    } else {
+        seeds
+            .first()
+            .map(|seed| dedupe_probes(probes_for(seed)))
+            .unwrap_or_default()
+    };
     let query = combine_probe_queries(&keyword_probes);
 
-    let co_share = co_share_available && !hashes.is_empty();
     let mut probes = Vec::with_capacity(keyword_probes.len() + 1);
     if co_share {
         probes.push(RelatedProbe {
@@ -906,19 +916,28 @@ mod tests {
         assert!(plan.probes.len() <= MAX_PROBES);
     }
 
-    /// A capable server contributes the co-share signal on top of the keyword
-    /// probes, and it leads because it is the most specific claim.
+    /// A capable server gets eMule's question and only eMule's question.
+    ///
+    /// The bug this guards: the plan used to add the seed's derived title
+    /// alongside the co-share request, so the tab filled with hits for the seed
+    /// itself — the same release and other rips of it — and read as a search
+    /// *for that file* rather than for what is shared with it.
     #[test]
-    fn co_share_is_listed_first_when_the_server_supports_it() {
+    fn co_share_is_the_whole_plan_when_the_server_supports_it() {
         let plan = plan(&[seed("Show.Name.S01E02.1080p.mkv")], true);
-        assert_eq!(plan.probes[0].kind, RelationKind::CoShare);
+        assert_eq!(
+            plan.probes.iter().map(|p| p.kind).collect::<Vec<_>>(),
+            vec![RelationKind::CoShare]
+        );
         assert!(
             plan.probes[0].query.is_none(),
             "co-share is not a keyword search"
         );
         assert_eq!(plan.co_share_hashes.len(), 1);
-        // It must not leak into the keyword query.
-        assert_eq!(plan.query.as_deref(), Some("show name"));
+        assert!(
+            plan.query.is_none(),
+            "no keyword goes out beside the co-share request"
+        );
     }
 
     /// Without server support the hashes are withheld, so nothing can send a
@@ -1022,6 +1041,27 @@ mod tests {
         assert_eq!(term.matches("::").count(), MAX_CO_SHARE_HASHES);
     }
 
+    /// The bytes the server actually reads. eMule's flex scanner treats `:` as
+    /// an ordinary keyword character (`keywordchar` is `[^ \"()<>=]`), so
+    /// `related::<HASH>` reaches the wire as a single eD2k string leaf: type
+    /// byte, u16 length, then the term — 44 bytes for one seed. Anything
+    /// wrapping it, an AND node or a stray filter leaf, and the server stops
+    /// reading it as a related search and starts reading it as a filename.
+    /// That exact length is also how a co-share request is recognised in a
+    /// packet log.
+    #[test]
+    fn co_share_expression_is_one_string_leaf_on_the_wire() {
+        let term = co_share_term(&["aabbccddeeff00112233445566778899".to_string()]).unwrap();
+        let expr = crate::network::kad::messages::build_search_expression_with_node(
+            Some(crate::search::query::QueryExpr::Term(term.clone()).to_wire_bytes()),
+            &crate::network::kad::messages::SearchConstraints::default(),
+        );
+        assert_eq!(expr.len(), 44, "one string leaf, no wrapper");
+        assert_eq!(expr[0], 0x01, "eD2k string leaf");
+        assert_eq!(u16::from_le_bytes([expr[1], expr[2]]) as usize, term.len());
+        assert_eq!(&expr[3..], term.as_bytes());
+    }
+
     /// The co-share term has to survive as one wire string. Routing it through
     /// the query parser splits it on `:`, and the server then sees a keyword
     /// search for "related" instead of a co-share request.
@@ -1037,27 +1077,28 @@ mod tests {
 
     #[test]
     fn multi_seed_takes_all_hashes_but_only_the_first_filename() {
-        let plan = plan(
-            &[
-                SeedFile {
-                    hash: "a".repeat(32),
-                    name: "Show.Name.S01E02.mkv".to_string(),
-                    ..Default::default()
-                },
-                SeedFile {
-                    hash: "b".repeat(32),
-                    name: "Totally.Different.Movie.2019.mkv".to_string(),
-                    ..Default::default()
-                },
-            ],
-            true,
-        );
-        assert_eq!(plan.co_share_hashes.len(), 2);
-        assert_eq!(plan.query.as_deref(), Some("show name"));
+        let seeds = [
+            SeedFile {
+                hash: "a".repeat(32),
+                name: "Show.Name.S01E02.mkv".to_string(),
+                ..Default::default()
+            },
+            SeedFile {
+                hash: "b".repeat(32),
+                name: "Totally.Different.Movie.2019.mkv".to_string(),
+                ..Default::default()
+            },
+        ];
+        let with_co_share = plan(&seeds, true);
+        assert_eq!(with_co_share.co_share_hashes.len(), 2);
         assert_eq!(
-            plan.seed_label,
+            with_co_share.seed_label,
             "Show.Name.S01E02.mkv, Totally.Different.Movie.2019.mkv"
         );
+        // Only the keyword fallback derives a query, and only from the first
+        // seed: two unrelated filenames share no title, so OR-ing them would
+        // run two searches in one tab and call the results related.
+        assert_eq!(plan(&seeds, false).query.as_deref(), Some("show name"));
     }
 
     #[test]
