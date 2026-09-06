@@ -49759,17 +49759,28 @@ async fn maybe_publish_ember_keywords(
         return;
     }
 
-    // Read the media off any of these files that has never been probed, and
-    // remember the answer — including "none", which is the answer for most of a
-    // library and has to be as durable as a positive one or every archive is
-    // re-read on every pass. Off-thread because it is a disk read, and bounded
-    // because `due` already is: this is the background pass, riding the schedule
-    // that exists rather than a second one alongside it.
+    // Read the media off files that have never been probed, and remember the
+    // answer — including "none", which is the answer for most of a library and has
+    // to be as durable as a positive one or every archive is re-read on every
+    // pass.
+    //
+    // Held to a small slice of the tick rather than all of `due`. This is awaited
+    // from the network `select!`, so its duration is time eD2K, KAD and Ember are
+    // all suspended — the hazard the download path names explicitly where it
+    // refuses to await a file hash inline. `due` alone is not a tight enough
+    // bound: it reaches EMBER_KEYWORD_PUBLISH_MAX_PER_TICK, and 96 header reads on
+    // a slow or networked disk is a visible stall in every transfer.
+    //
+    // Nothing is lost by going slower. A file whose turn has not come publishes
+    // without media now and gains it on republish, and at this rate a library of
+    // several thousand is fully probed inside one republish interval anyway.
+    const MEDIA_PROBES_PER_TICK: usize = 8;
     let unscanned: Vec<([u8; 16], String)> = due
         .iter()
         .filter(|(hash, _, _, _, path)| {
             !path.is_empty() && known_files.media_for(hash).is_some_and(|(seen, _)| !seen)
         })
+        .take(MEDIA_PROBES_PER_TICK)
         .map(|(hash, _, _, _, path)| (*hash, path.clone()))
         .collect();
     if !unscanned.is_empty() {

@@ -144,11 +144,16 @@ load-bearing part — most of a library has no media, so "probed, found nothing"
 to be as durable as a positive result or every archive is re-read on every pass to
 learn the same nothing.
 
-The probe rides the keyword publish tick rather than a second schedule beside it.
-That tick already selects a budgeted slice of due files
-(`ember_keyword_files_per_tick`), so it is a background pass with a rate limit
-someone already reasoned about; each file is read once, off-thread, ever. A rehash
-carries the result forward, because rehashing does not change the bytes' media.
+The probe rides the keyword publish tick rather than a second schedule beside it,
+and is held to `MEDIA_PROBES_PER_TICK` (8) rather than to the tick's own budget.
+That second bound matters: the probe is awaited from the network `select!`, so its
+duration is time eD2K, KAD and Ember are all suspended, and the tick can select up
+to 96 files — 96 header reads on a slow or networked disk is a visible stall in
+every transfer. A file whose turn has not come publishes without media now and
+gains it on republish, so nothing is lost by going slower, and a library of several
+thousand is still fully probed inside one republish interval. Each file is read once,
+off-thread, ever; a rehash carries the result forward, because rehashing does not
+change the bytes' media.
 
 Not a gap against KAD as such: our own `build_keyword_entry` does not publish media
 tags either, so KAD-to-KAD is no better. Ember rows read empty where a *server*
