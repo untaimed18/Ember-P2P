@@ -106,6 +106,31 @@ function combineOrigin(a: string, b: string): string {
   return [...new Set(parts)].sort().join(' · ');
 }
 
+/**
+ * Which Ember content digest a merged row keeps.
+ *
+ * Deliberately not "first non-empty wins", which is what this used to be. An
+ * Ember keyword batch carries the plurality digest of the publishers in that
+ * batch, and the closing batch is rebuilt from every record the walk gathered —
+ * so the corrected value always arrives after the slice-local one it is meant to
+ * replace, and keeping the first pinned a row to a digest a minority of
+ * publishers claimed. That is what `startDownload` hands over as the digest to
+ * enforce at completion, and enforcing a wrong one fails verification on every
+ * retry.
+ *
+ * A `Local` digest still wins: it was computed from the bytes on this disk
+ * (known.met), so no network claim replaces it.
+ *
+ * Mirrors `pick_ember_digest` in `src-tauri/src/search/merge.rs`; pinned for both
+ * sides by `scripts/fixtures/merge-contract.json`. Keep it closed over nothing —
+ * `scripts/merge-contract.test.mjs` lifts this body out and runs it.
+ */
+function pickEmberDigest(existingDigest: string, existingOrigin: string, incomingDigest: string): string {
+  if (!incomingDigest) return existingDigest;
+  if (!existingDigest) return incomingDigest;
+  return existingOrigin.includes('Local') ? existingDigest : incomingDigest;
+}
+
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
@@ -181,8 +206,14 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
       size: existing.file.size || incoming.file.size,
       hash: incoming.file.hash || existing.file.hash,
       extension: incoming.file.extension || existing.file.extension,
+      // An AICH root is not voted on the way the Ember digest is — it arrives
+      // whole from an `h=` link or known.met — so first non-empty wins here.
       aich_hash: existing.file.aich_hash || incoming.file.aich_hash,
-      ember_file_hash: existing.file.ember_file_hash || incoming.file.ember_file_hash,
+      ember_file_hash: pickEmberDigest(
+        existing.file.ember_file_hash || '',
+        existing.result_origin || '',
+        incoming.file.ember_file_hash || '',
+      ),
       complete_sources: Math.min(
         Math.max(existing.file.complete_sources || 0, incoming.file.complete_sources || 0),
         MAX_PLAUSIBLE_SOURCES,

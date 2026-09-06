@@ -65,6 +65,12 @@ const combineOrigin = ruleFromStore(
   "a",
   "b",
 );
+const pickEmberDigest = ruleFromStore(
+  "function pickEmberDigest(existingDigest: string, existingOrigin: string, incomingDigest: string): string {",
+  "existingDigest",
+  "existingOrigin",
+  "incomingDigest",
+);
 const mergeResultBody = bodyFromStore(
   "function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {",
 );
@@ -83,6 +89,22 @@ test("combineOrigin agrees with the shared origin table", () => {
       combineOrigin(testCase.a, testCase.b),
       testCase.combined,
       `combineOrigin(${JSON.stringify(testCase.a)}, ${JSON.stringify(testCase.b)})`,
+    );
+  }
+});
+
+test("pickEmberDigest chooses the digest the Rust side chooses", () => {
+  // The digest a download enforces at completion, so a divergence here is a
+  // verification failure rather than a display bug.
+  for (const testCase of fixture.ember_digest_cases) {
+    assert.equal(
+      pickEmberDigest(
+        testCase.existing_digest,
+        testCase.existing_origin,
+        testCase.incoming_digest,
+      ),
+      testCase.chosen,
+      testCase.name,
     );
   }
 });
@@ -153,6 +175,7 @@ test("the fixture actually carries cases", () => {
   // check above pass by iterating nothing.
   assert.ok(fixture.result_key_cases.length >= 5, "too few resultKey cases");
   assert.ok(fixture.combine_origin_cases.length >= 8, "too few combineOrigin cases");
+  assert.ok(fixture.ember_digest_cases.length >= 6, "too few ember digest cases");
   assert.ok(
     fixture.clamp_source_count_cases.length >= 4,
     "too few source-count clamp cases",

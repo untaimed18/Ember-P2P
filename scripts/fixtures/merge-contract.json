@@ -80,6 +80,57 @@
     { "a": "KAD", "b": "KAD · Server", "combined": "KAD · Server" },
     { "a": "Server · UDP", "b": "Local · Notes", "combined": "Local · Notes · Server · UDP" }
   ],
+  "ember_digest_cases": [
+    {
+      "name": "an empty row takes the digest the network offered",
+      "existing_digest": "",
+      "existing_origin": "Ember",
+      "incoming_digest": "ab12",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a row with a digest keeps it when the other side has none",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember",
+      "incoming_digest": "",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a later Ember batch replaces an earlier slice-local plurality",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember",
+      "incoming_digest": "cd34",
+      "chosen": "cd34"
+    },
+    {
+      "name": "the library's own digest outranks a network claim",
+      "existing_digest": "ab12",
+      "existing_origin": "Local",
+      "incoming_digest": "cd34",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a row the library already contributed to is still protected",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember · Local",
+      "incoming_digest": "cd34",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a KAD row that somehow carries one is treated like any other claim",
+      "existing_digest": "ab12",
+      "existing_origin": "KAD",
+      "incoming_digest": "cd34",
+      "chosen": "cd34"
+    },
+    {
+      "name": "nothing on either side stays empty",
+      "existing_digest": "",
+      "existing_origin": "KAD",
+      "incoming_digest": "",
+      "chosen": ""
+    }
+  ],
   "clamp_source_count_cases": [
     { "count": 0, "clamped": 0 },
     { "count": 1, "clamped": 1 },

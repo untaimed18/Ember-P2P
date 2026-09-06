@@ -137,6 +137,44 @@ pub fn clamp_source_count(count: u32) -> u32 {
     count.min(MAX_PLAUSIBLE_SOURCES)
 }
 
+/// Which Ember content digest a merged row keeps.
+///
+/// Deliberately not "first non-empty wins", which is what this used to be. An
+/// Ember keyword batch carries the plurality digest of the publishers *in that
+/// batch*, and the closing batch is rebuilt from every record the walk gathered
+/// — so the corrected value always arrives *after* the slice-local one it is
+/// meant to replace, and keeping the first pinned a row to a digest a minority
+/// of publishers claimed. That is the digest a download enforces at completion
+/// on the user's click, and enforcing a wrong one fails verification on every
+/// retry.
+///
+/// The library's own digest still outranks any network claim: it was computed
+/// from the bytes on this disk (`known.met`), so a `Local` row is never
+/// overwritten. Automatic seeding of the map a transfer enforces *without* a
+/// click is unaffected — that still requires two publishers to agree
+/// (`corroborated_ember_digest`).
+///
+/// Mirrored by `pickEmberDigest` in `src/lib/stores/search.ts`, which merges the
+/// streamed batches a second time per tab, and pinned for both sides by
+/// `scripts/fixtures/merge-contract.json`.
+fn pick_ember_digest<'a>(
+    existing_digest: &'a str,
+    existing_origin: &str,
+    incoming_digest: &'a str,
+) -> &'a str {
+    if incoming_digest.is_empty() {
+        return existing_digest;
+    }
+    if existing_digest.is_empty() {
+        return incoming_digest;
+    }
+    if existing_origin.contains(ORIGIN_LOCAL) {
+        existing_digest
+    } else {
+        incoming_digest
+    }
+}
+
 /// Filename ballots for one merged row: name → (votes, first-seen order).
 ///
 /// eMule votes on the filename across the sources advertising a hash. The old
@@ -246,11 +284,14 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.file.name.is_empty() && !incoming.file.name.is_empty() {
         existing.file.name = incoming.file.name;
     }
-    // Prefer a real Ember content digest / AICH root when either side has one
-    // (network hits often arrive empty; local library hits carry known.met).
-    if existing.file.ember_file_hash.is_empty() && !incoming.file.ember_file_hash.is_empty() {
-        existing.file.ember_file_hash = incoming.file.ember_file_hash;
-    }
+    existing.file.ember_file_hash = pick_ember_digest(
+        &existing.file.ember_file_hash,
+        &prev_origin,
+        &incoming.file.ember_file_hash,
+    )
+    .to_string();
+    // An AICH root is not voted on the way the Ember digest is — it arrives
+    // whole from an `h=` link or known.met — so first non-empty still wins here.
     if existing.file.aich_hash.is_empty() && !incoming.file.aich_hash.is_empty() {
         existing.file.aich_hash = incoming.file.aich_hash;
     }
@@ -605,6 +646,58 @@ mod tests {
                 "combine_origin({a:?}, {b:?})"
             );
         }
+    }
+
+    #[test]
+    fn ember_digest_choice_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        let cases = fixture["ember_digest_cases"]
+            .as_array()
+            .expect("fixture has ember_digest_cases");
+        assert!(cases.len() >= 6, "fixture lost its ember_digest cases");
+        for case in cases {
+            let existing = case["existing_digest"].as_str().expect("case existing");
+            let origin = case["existing_origin"].as_str().expect("case origin");
+            let incoming = case["incoming_digest"].as_str().expect("case incoming");
+            assert_eq!(
+                pick_ember_digest(existing, origin, incoming),
+                case["chosen"].as_str().expect("case chosen"),
+                "{}",
+                case["name"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
+    /// The whole point of the rule: the closing batch of an Ember search rebuilds
+    /// the digest from every publisher the walk reached, and it arrives as a
+    /// merge into a row an earlier slice already gave a digest to.
+    #[test]
+    fn a_corrected_ember_digest_replaces_the_one_an_earlier_batch_set() {
+        let mut early = sample("aa", 1, ORIGIN_EMBER);
+        early.file.ember_file_hash = "ab".repeat(32);
+        let mut corrected = sample("aa", 2, ORIGIN_EMBER);
+        corrected.file.ember_file_hash = "cd".repeat(32);
+
+        let merged = merge_search_vecs(vec![early], vec![corrected]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].file.ember_file_hash,
+            "cd".repeat(32),
+            "the cumulative rebuild has to win over the slice it corrects"
+        );
+
+        // ...but never over the library's own digest.
+        let mut library = sample("bb", 1, ORIGIN_LOCAL);
+        library.file.ember_file_hash = "ab".repeat(32);
+        let mut network = sample("bb", 2, ORIGIN_EMBER);
+        network.file.ember_file_hash = "cd".repeat(32);
+        let merged = merge_search_vecs(vec![library], vec![network]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].file.ember_file_hash,
+            "ab".repeat(32),
+            "known.met beats a publisher plurality"
+        );
     }
 
     #[test]
