@@ -218,6 +218,26 @@ pub fn apply_search_enrichment_with_batch(
         &analyzed
     };
     for result in results.iter_mut() {
+        // Record which server the hit came from, not just score against it.
+        // Everything downstream of the emit re-derives from the row alone: the
+        // explain tooltip re-scores it, and marking it spam is what trains that
+        // server's reputation. Both read `origin_server_ip` (see
+        // `SpamFilter::explain_result` / `mark_spam`), so leaving it empty meant
+        // a tooltip that could not account for the score beside it, and a
+        // reputation that only ever decayed toward clean -- `record_server_clean_batch`
+        // has the batch's IP and redeems with it, while the user's own verdict
+        // arrived with nothing to attribute it to.
+        //
+        // Filled only when empty, and only from a batch that has an IP: a
+        // `rescore_search_results` pass re-enriches rows handed back by the UI
+        // with no server of its own, and must not strip what they already carry.
+        // First-seen-wins matches how both merge paths combine the field
+        // (`merge::merge_into`, `mergeResult` in `stores/search.ts`).
+        if result.origin_server_ip.is_none() {
+            if let Some(ip) = server_ip {
+                result.origin_server_ip = Some(ip.to_string());
+            }
+        }
         if spam_enabled {
             let cr = community
                 .get(&result.file.hash)
@@ -1639,5 +1659,133 @@ mod ed2k_paste_tests {
         assert_eq!(batch.links.len(), 1);
         assert_eq!(batch.links[0].hash, single.hash);
         assert_eq!(batch.links[0].size, single.size);
+    }
+}
+
+/// Which server a hit is attributed to, which the row has to carry for
+/// `SpamFilter::mark_spam` / `explain_result` to reach it after the emit.
+#[cfg(test)]
+mod result_attribution_tests {
+    use super::*;
+    use crate::search::spam::SpamFilter;
+    use crate::types::{FileInfo, SearchResult};
+
+    fn row(hash: &str, origin: &str) -> SearchResult {
+        SearchResult {
+            file: FileInfo {
+                id: hash.into(),
+                name: "a.bin".into(),
+                path: String::new(),
+                size: 1,
+                hash: hash.into(),
+                aich_hash: String::new(),
+                ember_file_hash: String::new(),
+                extension: "bin".into(),
+                modified_at: 0,
+                priority: "normal".into(),
+                requests: 0,
+                accepted: 0,
+                bytes_transferred: 0,
+                alltime_requests: 0,
+                alltime_accepted: 0,
+                alltime_transferred: 0,
+                complete_sources: 0,
+                folder: String::new(),
+                shared: false,
+                friends_only: false,
+                shared_kad: false,
+                shared_ed2k: false,
+                shared_ember: false,
+            },
+            peer_id: String::new(),
+            peer_name: String::new(),
+            availability: 1,
+            file_type: String::new(),
+            source_addresses: Vec::new(),
+            rating: None,
+            comment: None,
+            media: None,
+            spam_rating: 0,
+            is_spam: false,
+            clean_name: String::new(),
+            result_origin: origin.into(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
+        }
+    }
+
+    fn enrich(results: &mut [SearchResult], server_ip: Option<&str>) {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-attrib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let spam = SpamFilter::load(&dir);
+        apply_search_enrichment_with_batch(
+            results,
+            &spam,
+            &[],
+            server_ip,
+            false,
+            SpamFilterProfile::Balanced,
+            &[],
+            &HashMap::new(),
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn a_server_batch_stamps_the_server_it_came_from() {
+        let mut results = vec![row(&"1".repeat(32), crate::search::merge::ORIGIN_SERVER_TCP)];
+        enrich(&mut results, Some("93.184.216.34"));
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("93.184.216.34"),
+            "marking this hit spam has to be able to train the server that served it"
+        );
+    }
+
+    #[test]
+    fn a_dht_batch_leaves_the_row_unattributed() {
+        // KAD, Ember and local batches enrich with no server IP, and inventing
+        // one would train the reputation of a server that never sent the hit.
+        let mut results = vec![
+            row(&"2".repeat(32), crate::search::merge::ORIGIN_KAD),
+            row(&"3".repeat(32), crate::search::merge::ORIGIN_EMBER),
+        ];
+        enrich(&mut results, None);
+        assert!(results.iter().all(|r| r.origin_server_ip.is_none()));
+    }
+
+    #[test]
+    fn a_rescore_pass_keeps_the_server_the_row_arrived_with() {
+        // `rescore_search_results` re-enriches rows the UI hands back, with no
+        // server of its own; stamping unconditionally would strip attribution
+        // from every row on a spam-settings change.
+        let mut results = vec![row(&"4".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP)];
+        results[0].origin_server_ip = Some("198.51.100.7".to_string());
+        enrich(&mut results, None);
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn the_first_server_to_answer_owns_the_row() {
+        // Same rule as the two merge paths: a later leg does not re-attribute a
+        // row already credited to the server that first sent it.
+        let mut results = vec![row(&"5".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP)];
+        results[0].origin_server_ip = Some("198.51.100.7".to_string());
+        enrich(&mut results, Some("203.0.113.9"));
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("198.51.100.7")
+        );
     }
 }
