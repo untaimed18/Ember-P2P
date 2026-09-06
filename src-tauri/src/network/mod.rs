@@ -9451,11 +9451,20 @@ mod tests {
             a.source_addresses.is_empty(),
             "keyword hits carry no sources"
         );
+        // Only complete public shares are keyword-published, so each publisher
+        // is a complete source. Zero here read as "none" to every consumer of
+        // the field: the Min Complete filter dropped every Ember row, and
+        // `sort_search_results` ranks it first and put them last.
+        assert_eq!(
+            a.file.complete_sources, 2,
+            "each distinct publisher of a keyword record holds the whole file"
+        );
         let b = results
             .iter()
             .find(|r| r.file.hash == hex::encode(hash_b))
             .expect("file B present");
         assert_eq!(b.availability, 1);
+        assert_eq!(b.file.complete_sources, 1);
     }
 
     #[test]
@@ -20690,6 +20699,15 @@ struct EmberKeywordSearch {
     /// `IterativeSearch::results` is append-only and deduped before push, so
     /// everything past this index is new.
     last_streamed_count: usize,
+    /// Distinct eD2K file hashes this lookup has built a row for, for the
+    /// `results_so_far` the search page shows while the walk runs.
+    ///
+    /// Counted here rather than from `IterativeSearch::results`, which holds
+    /// one entry per *record*: a file three publishers announced is three
+    /// records and one result, so that length would over-report what the user
+    /// is about to see. Re-deriving it per tick instead would mean verifying
+    /// every gathered signature again once a second.
+    streamed_files: HashSet<String>,
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).
@@ -43886,8 +43904,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let search_ids: Vec<u32> =
                         state.ember_keyword_searches.keys().copied().collect();
                     for search_id in search_ids {
-                        let Some(gathered) =
-                            state.ember_search.get(search_id).map(|s| s.results.len())
+                        let Some((gathered, nodes_contacted)) = state
+                            .ember_search
+                            .get(search_id)
+                            .map(|s| (s.results.len(), s.queried_count()))
                         else {
                             continue;
                         };
@@ -43898,6 +43918,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         else {
                             continue;
                         };
+                        // Progress first, and on every tick rather than only
+                        // when a batch is due: an Ember-only search on a cold
+                        // table can walk most of the 60-second cap before its
+                        // first record, and the search page's spinner has
+                        // nothing else to say during it. KAD reports this from
+                        // its own sweep, so Ember-only searches were the one
+                        // case that showed a bare spinner.
+                        if let Some(kw) = state.ember_keyword_searches.get(&search_id) {
+                            let _ = app_handle.emit(
+                                "search-progress",
+                                SearchProgressEvent {
+                                    request_id: kw.request_id,
+                                    nodes_contacted,
+                                    results_so_far: kw.streamed_files.len(),
+                                    // The same two labels KAD's phases carry, so
+                                    // the page's existing strings cover this
+                                    // without a phase vocabulary of its own.
+                                    // Ember runs one combined walk, so the
+                                    // distinction is "has anything come back
+                                    // yet" rather than a state machine.
+                                    phase: if gathered == 0 { "Lookup" } else { "Fetch" }
+                                        .to_string(),
+                                },
+                            );
+                        }
                         let threshold = if cursor == 0 { 1 } else { 20 };
                         if gathered < cursor + threshold {
                             continue;
@@ -43922,6 +43967,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &kw.keywords,
                             kw.query_expr.as_ref(),
                         );
+                        for row in &built.results {
+                            kw.streamed_files.insert(row.file.hash.clone());
+                        }
                         for (ed2k, digest) in &built.corroborated {
                             state.ember_content_hashes.entry(*ed2k).or_insert(*digest);
                         }
@@ -47705,6 +47753,17 @@ struct EmberKeywordBuilt {
 /// keyword hit identifies the file, and source discovery runs separately
 /// via the slice-9 source lookup when a download starts.
 ///
+/// `complete_sources` is that same publisher count, not zero. Only complete
+/// public shares are keyword-published (`is_ember_publishable` requires a
+/// listable index row with a content digest), so every distinct publisher of
+/// a keyword record holds the whole file — the count is a floor on the
+/// complete sources rather than an unknown. Leaving it zero meant the Min
+/// Complete filter silently dropped every Ember row (0 is below any
+/// threshold), the Complete column read as unknown, and `sort_search_results`,
+/// which ranks that field first, put Ember last. It is also the honest side of
+/// the comparison with KAD, whose `TAG_COMPLETE_SOURCES` is one peer's claim
+/// about a swarm it cannot see; this one is counted from distinct signatures.
+///
 /// Each row's `ember_file_hash` is the plurality digest (shown so a click
 /// can pin a unique file). Automatic seeding of the enforced map uses only
 /// [`EmberKeywordBuilt::corroborated`].
@@ -47768,6 +47827,7 @@ fn build_ember_keyword_built(
                         .or_insert([0u8; 32]);
                 }
                 existing.availability = publisher_digests.len() as u32;
+                existing.file.complete_sources = publisher_digests.len() as u32;
                 existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
             }
             None => {
@@ -47803,7 +47863,7 @@ fn build_ember_keyword_built(
                         alltime_requests: 0,
                         alltime_accepted: 0,
                         alltime_transferred: 0,
-                        complete_sources: 0,
+                        complete_sources: 1,
                         folder: String::new(),
                         shared: false,
                         friends_only: false,

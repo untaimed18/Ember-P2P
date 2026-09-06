@@ -584,6 +584,7 @@ async fn handle_command_inner(
                                 file_extension: active_request.file_extension.clone(),
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
+                                streamed_files: HashSet::new(),
                             },
                         );
                         active_request.ember_pending = true;

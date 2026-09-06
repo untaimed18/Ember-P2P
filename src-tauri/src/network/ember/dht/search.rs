@@ -1191,6 +1191,18 @@ impl IterativeSearch {
             .count()
     }
 
+    /// Nodes this search has sent a query to, for the progress the search page
+    /// shows while a walk is still running. Counts nodes asked rather than
+    /// nodes that answered, matching the `nodes_contacted` KAD reports: a walk
+    /// waiting on silent peers is still making progress the user can see.
+    ///
+    /// A retry clears the node from `queried` so it can be picked again, so a
+    /// timed-out node briefly stops counting. The alternative — counting
+    /// attempts — would report more nodes than exist on a lossy path.
+    pub fn queried_count(&self) -> usize {
+        self.queried.len()
+    }
+
     /// Get the closest responded nodes (useful for FIND_NODE results).
     ///
     /// Capped at k. The shortlist keeps pinned session peers past rank k and
