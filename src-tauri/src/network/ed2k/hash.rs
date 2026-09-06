@@ -513,7 +513,7 @@ fn strip_ed2k_wrapper(raw: &str) -> &str {
 }
 
 fn strip_ed2k_scheme(s: &str) -> Option<&str> {
-    (s.len() >= 5 && s.as_bytes()[..5].eq_ignore_ascii_case(b"ed2k:")).then_some(&s[5..])
+    strip_prefix_ignore_ascii_case(s, "ed2k:")
 }
 
 /// Skip the `//` (or `%2F%2F`) authority slashes browsers insert or encode
@@ -606,9 +606,18 @@ pub fn normalize_ed2k_uri(raw: &str) -> String {
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()))
-    .then_some(&s[prefix.len()..])
+    // `bool::then_some` takes its value by argument, so the slice used to be
+    // evaluated whatever the length test said: anything shorter than the
+    // prefix panicked instead of returning `None`, and `ed2k://` on its own is
+    // shorter. Indexing has to happen after the check, and on bytes — a string
+    // slice at `prefix.len()` also panics when a multi-byte character straddles
+    // that offset.
+    let head = s.as_bytes().get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
+    }
+    // Every prefix byte matched an ASCII one, so this offset is a char boundary.
+    Some(&s[prefix.len()..])
 }
 
 pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
@@ -842,6 +851,32 @@ mod link_tests {
         assert!(!looks_like_ed2k_uri(
             r"C:\Users\Ember\shared.emulecollection"
         ));
+    }
+
+    /// Input shorter than the prefix being tested, and input whose byte at the
+    /// prefix length sits inside a multi-byte character, both used to panic:
+    /// the length test and the slice were arguments to the same
+    /// `bool::then_some`, so the slice ran either way. Every one of these
+    /// reaches the parser from argv or the clipboard, so the panic was a crash
+    /// on a malformed link rather than a rejection.
+    #[test]
+    fn a_truncated_or_non_ascii_link_is_rejected_rather_than_panicking() {
+        for raw in [
+            "", "e", "ed2", "ed2k", "ed2k:", "ed2k:/", "ed2k://", "ed2k://|", "ed2k://|f",
+            // Byte 5 and byte 13 land mid-character.
+            "ed2ké", "ed2k://|fileé", "ed2k://|file|é", "é",
+        ] {
+            assert!(
+                parse_ed2k_link_strict(raw).is_err(),
+                "{raw:?} is not a complete file link"
+            );
+            // Neither of these may panic; the verdict itself is only
+            // interesting for the ones that carry the scheme.
+            let _ = looks_like_ed2k_uri(raw);
+            let _ = normalize_ed2k_uri(raw);
+        }
+        assert!(looks_like_ed2k_uri("ed2k:"));
+        assert!(!looks_like_ed2k_uri("ed2k"));
     }
 }
 
