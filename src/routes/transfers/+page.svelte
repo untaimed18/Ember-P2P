@@ -2260,22 +2260,21 @@
     }
   }
 
+  /** Ask every connected network for this file's sources.
+   *
+   *  The reply says which networks the ask reached, not what they found: each
+   *  one answers on its own schedule, and its answer arrives as a
+   *  `transfer:source-search` event that replaces the status below ("KAD found
+   *  3 sources", "Server returned no sources") and as sources on the row. So a
+   *  network that is down is reported here, once, and never waited on. */
   async function runFindSourcesWithStatus(t: Transfer): Promise<void> {
-    searchStatus.set(t.id, m.transfers_src_kad_search());
+    searchStatus.set(t.id, m.transfers_src_asking());
     searchStatus = new Map(searchStatus);
-    const found = await findSources(t.file_hash, t.total_size);
-    if (found.length > 0) {
-      searchFoundIds.add(t.id);
-      searchStatus.set(
-        t.id,
-        found.length === 1
-          ? m.transfers_src_kad_found_one()
-          : m.transfers_src_kad_found_other({ count: found.length }),
-      );
-    } else if (!searchFoundIds.has(t.id)) {
-      searchStatus.set(t.id, m.transfers_src_kad_empty());
+    const ask = await findSources(t.id, t.file_hash, t.total_size);
+    if (!ask.kad && !ask.ember && !ask.server && !ask.server_udp) {
+      searchStatus.set(t.id, m.transfers_src_asking_none());
+      searchStatus = new Map(searchStatus);
     }
-    searchStatus = new Map(searchStatus);
   }
 
   /** One footer action at a time. Pause and Stop in particular are slow enough

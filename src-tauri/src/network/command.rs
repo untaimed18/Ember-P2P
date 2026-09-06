@@ -1429,137 +1429,48 @@ async fn handle_command_inner(
 
                 // ─── Source-discovery fan-out for new downloads ──────────────
                 //
-                // Without these three dispatches a download added with a
-                // single seed peer (the common path: user clicks Download
-                // on a search result, frontend passes the first
-                // `source_addresses` entry) would only see that one peer
-                // until the next periodic sweep — the source_retry_timer
-                // for KAD (15s+ on `active_download_kad_interval(0)`)
-                // and the 4-minute TCP `OP_GETSOURCES` batch. A search
-                // result reporting "27 sources" then looked like it had
-                // exactly one in the transfer view, and a single failed
-                // connection left the file stuck. Match the
-                // `has_source = false` branch's behavior so the moment a
-                // download starts, every source-discovery channel is
-                // already in flight.
+                // Without this a download added with a single seed peer
+                // (the common path: user clicks Download on a search
+                // result, frontend passes the first `source_addresses`
+                // entry) would only see that one peer until the next
+                // periodic sweep — the source_retry_timer for KAD (15s+
+                // on `active_download_kad_interval(0)`) and the 4-minute
+                // TCP `OP_GETSOURCES` batch. A search result reporting
+                // "27 sources" then looked like it had exactly one in the
+                // transfer view, and a single failed connection left the
+                // file stuck. Match the `has_source = false` branch's
+                // behavior so the moment a download starts, every
+                // source-discovery channel is already in flight.
                 let now_ts = chrono::Utc::now().timestamp();
-                let kad_available = kad_ready_for_sources(state);
-                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                let ask = ask_networks_for_sources(
+                    socket,
+                    state,
+                    app_handle,
+                    stats_manager,
+                    settings,
+                    &transfer_id,
+                    hash_bytes,
+                    file_size,
+                )
+                .await;
 
-                let initial_kad_search_started = if kad_available {
-                    let mut closest = state
-                        .routing_table
-                        .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                        let sid = start_kad_search(
-                            state,
-                            app_handle,
-                            kad_hash,
-                            SearchType::FindSource { file_size },
-                            closest,
-                        );
-                        if sid != SearchId(0) {
-                            state
-                                .download_source_searches
-                                .insert(sid, (transfer_id.clone(), hash_bytes));
-                            info!(
-                                "Started KAD source search {} for new active download {}",
-                                sid.0, transfer_id
-                            );
-                            let _ = app_handle.emit(
-                                "transfer:source-search",
-                                serde_json::json!({
-                                    "transfer_id": &transfer_id,
-                                    "kind": "kad_search",
-                                }),
-                            );
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Seed `active_kad_search_state` so the periodic sweep
-                // schedules the next KAD search on its normal cadence
-                // (~30s after this one when count==1) instead of
-                // re-firing immediately. When the initial dispatch
-                // didn't run (no KAD contacts / KAD disconnected) we
-                // fall back to (now, 0) which lets the sweep retry as
-                // soon as KAD is available again.
-                state.active_kad_search_state.insert(
-                    transfer_id.clone(),
-                    (now_ts, if initial_kad_search_started { 1 } else { 0 }),
-                );
+                // Seed both sweeps so they schedule their next lookup on the
+                // normal cadence (~30s for KAD when count==1) instead of
+                // re-firing immediately. A leg with nowhere to send this ask
+                // records (now, 0), which lets its sweep retry as soon as that
+                // network is available again.
+                state
+                    .active_kad_search_state
+                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.kad)));
+                state
+                    .ember_source_search_state
+                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.ember)));
                 // Empty-seed pending was inserted with search_count=0; stamp the
                 // fan-out so the 5s retry timer does not start a duplicate FindSource.
-                if initial_kad_search_started {
+                if ask.kad {
                     if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                         pd.search_count = pd.search_count.max(1);
                         pd.last_search_at = now_ts;
-                    }
-                }
-
-                // Ember DHT source discovery for the new download (slice 9):
-                // independent of KAD, so it fires even on a KAD-less network.
-                // Mirrors the KAD seed above so the periodic source-retry sweep
-                // schedules the next lookup on the normal backoff instead of
-                // re-firing immediately.
-                let initial_ember_search_started =
-                    if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
-                        start_ember_source_search(socket, state, &transfer_id, hash_bytes).await
-                    } else {
-                        false
-                    };
-                state.ember_source_search_state.insert(
-                    transfer_id.clone(),
-                    (now_ts, if initial_ember_search_started { 1 } else { 0 }),
-                );
-
-                // Immediate TCP `OP_GETSOURCES` to the connected eD2K
-                // server after post-login settle (Lugdunum drops early asks).
-                if server_source_settle_elapsed(state) {
-                    if let Some(conn) = state.server_connection.as_mut() {
-                        if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
-                                );
-                                let _ = app_handle.emit(
-                                    "transfer:source-search",
-                                    serde_json::json!({
-                                        "transfer_id": &transfer_id,
-                                        "kind": "server_query",
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // UDP fan-out to every eligible known server, paced via
-                // `udp_source_queue` so we don't burst-send on add.
-                if network_ready_for_sources(state) {
-                    let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
-                    if !packets.is_empty() {
-                        let room =
-                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        debug!(
-                            "Queuing {}/{} UDP source requests for new active download {}",
-                            packets.len().min(room),
-                            packets.len(),
-                            transfer_id
-                        );
-                        state
-                            .udp_source_queue
-                            .extend(packets.into_iter().take(room));
                     }
                 }
             } else {
@@ -1572,16 +1483,8 @@ async fn handle_command_inner(
                         return;
                     }
                 };
-                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-
-                let mut closest = state
-                    .routing_table
-                    .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                if closest.is_empty() {
-                    debug!(
-                        "No routing table contacts for source search, download will retry later"
-                    );
-                }
+                let mut file_hash_arr = [0u8; 16];
+                file_hash_arr.copy_from_slice(&hash_bytes);
 
                 let now = chrono::Utc::now().timestamp();
 
@@ -1670,39 +1573,28 @@ async fn handle_command_inner(
                     });
                 }
 
-                let kad_search_started = if kad_ready_for_sources(state) && !closest.is_empty() {
-                    closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                    let sid = start_kad_search(
-                        state,
-                        app_handle,
-                        kad_hash,
-                        SearchType::FindSource { file_size },
-                        closest,
-                    );
-                    if sid != SearchId(0) {
-                        let mut fh = [0u8; 16];
-                        fh.copy_from_slice(&hash_bytes[..16]);
-                        state
-                            .download_source_searches
-                            .insert(sid, (transfer_id.clone(), fh));
-                        info!(
-                            "Started source search {} for download {}",
-                            sid.0, transfer_id
-                        );
-                        let _ = app_handle.emit(
-                            "transfer:source-search",
-                            serde_json::json!({
-                                "transfer_id": &transfer_id,
-                                "kind": "kad_search",
-                            }),
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                let ask = ask_networks_for_sources(
+                    socket,
+                    state,
+                    app_handle,
+                    stats_manager,
+                    settings,
+                    &transfer_id,
+                    file_hash_arr,
+                    file_size,
+                )
+                .await;
+                // Seed the Ember sweep so it re-asks on the normal backoff
+                // rather than immediately. A leg with nowhere to send this ask
+                // records (now, 0), which lets the sweep try again as soon as
+                // Ember is available. `active_kad_search_state` is deliberately
+                // left alone: this download has no sources yet, so its KAD
+                // retries are the pending-download timer's business below, and
+                // an entry here would look to the active sweep like a turn
+                // already taken once the download starts moving.
+                state
+                    .ember_source_search_state
+                    .insert(transfer_id.clone(), (now, u32::from(ask.ember)));
 
                 // Look up actual priority from the transfer manager if this
                 // is a promoted/re-started download, otherwise default to normal.
@@ -1722,70 +1614,11 @@ async fn handle_command_inner(
                         file_size,
                         expected_aich,
                         control,
-                        search_count: if kad_search_started { 1 } else { 0 },
-                        last_search_at: if kad_search_started { now } else { 0 },
+                        search_count: u32::from(ask.kad),
+                        last_search_at: if ask.kad { now } else { 0 },
                         priority: pending_priority,
                     },
                 );
-
-                // Kick an immediate Ember DHT source search too (slice 9),
-                // mirroring the KAD seed above so a download started purely by
-                // hash can discover sources on a KAD-less network. The periodic
-                // sweep re-asks on the normal backoff afterwards.
-                if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
-                    let mut fh = [0u8; 16];
-                    fh.copy_from_slice(&hash_bytes);
-                    let ember_started =
-                        start_ember_source_search(socket, state, &transfer_id, fh).await;
-                    state.ember_source_search_state.insert(
-                        transfer_id.clone(),
-                        (now, if ember_started { 1 } else { 0 }),
-                    );
-                }
-
-                // Request sources from the connected ed2k server (non-blocking)
-                // after post-login settle so Lugdunum does not drop the ask.
-                if server_source_settle_elapsed(state) {
-                    if let Some(conn) = &mut state.server_connection {
-                        let mut file_hash_arr = [0u8; 16];
-                        file_hash_arr.copy_from_slice(&hash_bytes);
-                        if let Ok(bytes) = conn.send_get_sources(&file_hash_arr, file_size).await {
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
-                                );
-                                let _ = app_handle.emit(
-                                    "transfer:source-search",
-                                    serde_json::json!({
-                                        "transfer_id": &transfer_id,
-                                        "kind": "server_query",
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Queue UDP source requests to ALL eligible servers (paced via udp_source_queue)
-                if network_ready_for_sources(state) {
-                    let mut file_hash_arr = [0u8; 16];
-                    file_hash_arr.copy_from_slice(&hash_bytes);
-                    let packets = build_all_getsources_packets(state, &file_hash_arr, file_size);
-                    if !packets.is_empty() {
-                        let room =
-                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        debug!(
-                            "Queuing {}/{} UDP source requests for new download",
-                            packets.len().min(room),
-                            packets.len()
-                        );
-                        state
-                            .udp_source_queue
-                            .extend(packets.into_iter().take(room));
-                    }
-                }
             }
 
             if let Ok(hb) = hex::decode(&file_hash) {
@@ -3404,11 +3237,10 @@ async fn handle_command_inner(
             if let Some(removed) = state.search_manager.remove(&sid) {
                 // Beyond the in-use refs, a cancelled search can still have
                 // pending IPC oneshots (`pending_keyword_searches` /
-                // `pending_source_searches` / `pending_notes_searches`) and
-                // bookkeeping entries (`download_source_searches`,
-                // `store_keyword_searches`, `store_source_searches`,
-                // `pending_note_publishes`) keyed on this `sid`. Without
-                // this, callers of `find_notes`/`find_sources`/global
+                // `pending_notes_searches`) and bookkeeping entries
+                // (`download_source_searches`, `store_keyword_searches`,
+                // `store_source_searches`, `pending_note_publishes`) keyed on
+                // this `sid`. Without this, callers of `find_notes`/global
                 // search hang until their own IPC timeout instead of
                 // resolving immediately, and `active_search_request.kad_pending`
                 // can be left stuck set so `search-complete` never fires.
@@ -3471,36 +3303,45 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::FindSources {
+            transfer_id,
             file_hash,
             file_size,
-            request_id,
             tx,
         } => {
-            let closest = state
-                .routing_table
-                .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
-
-            if closest.is_empty() {
-                let _ = tx.send(Ok(Vec::new()));
-                return;
-            }
-
-            let sid = start_kad_search(
+            let outcome = ask_networks_for_sources(
+                socket,
                 state,
                 app_handle,
+                stats_manager,
+                settings,
+                &transfer_id,
                 file_hash,
-                SearchType::FindSource { file_size },
-                closest,
-            );
-
-            if sid == SearchId(0) {
-                warn!("FindSources rejected: active search cap reached");
-                let _ = tx.send(Err(
-                    "Source search busy: too many active KAD searches".to_string()
-                ));
-                return;
+                file_size,
+            )
+            .await;
+            let now_ts = chrono::Utc::now().timestamp();
+            // Stamp both sweeps so the ask the user just made counts as this
+            // round's ask: without it the periodic sweep sees a file it has not
+            // asked about recently and immediately asks again, which on a
+            // repeatedly clicked button is how one file talks over every other
+            // download's turn.
+            state
+                .active_kad_search_state
+                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.kad)));
+            state
+                .ember_source_search_state
+                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.ember)));
+            if outcome.kad {
+                if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                    pd.search_count = pd.search_count.max(1);
+                    pd.last_search_at = now_ts;
+                }
             }
-            state.pending_source_searches.insert(sid, (request_id, tx));
+            info!(
+                "Find sources for {transfer_id}: asked KAD={} Ember={} server={} server UDP={}",
+                outcome.kad, outcome.ember, outcome.server, outcome.server_udp
+            );
+            let _ = tx.send(outcome);
         }
 
         NetworkCommand::BootstrapContacts { contacts, tx } => {
@@ -4017,9 +3858,6 @@ async fn handle_command_inner(
             ) in state.pending_keyword_searches.drain()
             {
                 let _ = tx.send(local_results);
-            }
-            for (_, (_, tx)) in state.pending_source_searches.drain() {
-                let _ = tx.send(Ok(Vec::new()));
             }
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Ok(Vec::new()));

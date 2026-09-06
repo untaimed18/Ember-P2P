@@ -1582,6 +1582,8 @@
   "transfers_src_kad_indirect_one": "KAD 找到 1 个间接来源",
   "transfers_src_kad_indirect_other": "KAD 找到 {count} 个间接来源",
   "transfers_src_kad_empty": "KAD 未返回任何来源",
+  "transfers_src_asking": "正在向所有已连接的网络查询来源",
+  "transfers_src_asking_none": "没有已连接的网络可查询来源",
   "transfers_src_unknown": "正在搜索源",
   "transfers_src_rejected": "已拒绝",
   "transfers_src_timed_out": "已超时",

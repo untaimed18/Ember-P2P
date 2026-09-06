@@ -14,6 +14,11 @@ use std::collections::HashMap;
 
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
+/// How long `find_sources` waits for the network task to send the asks. It
+/// does not wait for answers, so this only has to cover the task getting to
+/// the command and one TCP write to the server — long enough that a busy tick
+/// isn't reported as a failure, short enough that a wedged task is.
+const SOURCE_ASK_TIMEOUT_SECS: u64 = 15;
 const LINK_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Maximum query length accepted from the frontend. eMule keyword
@@ -647,55 +652,45 @@ pub async fn find_notes(
     Ok(results)
 }
 
+/// Ask every connected network for the sources of one transfer's file.
+///
+/// Resolves once the asks are away, which is what the returned outcome
+/// describes — one flag per network, `false` for each one that had nowhere to
+/// send it. The sources themselves arrive on each network's own schedule and go
+/// straight into the transfer, so there is nothing to wait for here and no
+/// timeout worth imposing beyond the network task picking the command up.
 #[tauri::command]
 pub async fn find_sources(
     state: tauri::State<'_, AppState>,
+    transfer_id: String,
     file_hash: String,
     file_size: u64,
-) -> Result<Vec<(String, u16)>, String> {
-    let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
+) -> Result<crate::types::SourceAskOutcome, String> {
+    let hash = parse_exact_file_hash(&file_hash)?;
 
     let (tx, rx) = oneshot::channel();
-    let request_id: u64 = rand::random();
-
     state
         .network_tx
         .try_send(NetworkCommand::FindSources {
-            file_hash: kad_hash,
+            transfer_id,
+            file_hash: hash,
             file_size,
-            request_id,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let timeout_secs = {
-        let c = state.config.read().await;
-        c.settings
-            .search_timeout_secs
-            .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(Ok(results))) => Ok(results),
-        Ok(Ok(Err(msg))) => Err(coded_ctx(
-            "search_source_search_busy",
-            msg,
-            "kad search capacity",
-        )),
+    match tokio::time::timeout(std::time::Duration::from_secs(SOURCE_ASK_TIMEOUT_SECS), rx).await {
+        Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(e)) => Err(coded_ctx(
             "search_source_search_failed",
             "Source search failed",
             e,
         )),
-        Err(_) => {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::CancelSearch { request_id });
-            Err(coded_ctx(
-                "search_timed_out",
-                format!("Source search timed out after {timeout_secs}s"),
-                timeout_secs,
-            ))
-        }
+        Err(_) => Err(coded_ctx(
+            "search_timed_out",
+            format!("Source search timed out after {SOURCE_ASK_TIMEOUT_SECS}s"),
+            SOURCE_ASK_TIMEOUT_SECS,
+        )),
     }
 }
 

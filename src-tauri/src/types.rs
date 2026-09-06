@@ -432,6 +432,28 @@ impl MediaMetadata {
     }
 }
 
+/// Which networks a source ask actually reached.
+///
+/// A `false` leg was skipped, and always for the same kind of reason: nowhere
+/// to send it. No KAD session or no contacts close to the hash, Ember disabled
+/// or no overlay peers, no eD2K server session (or one still inside its
+/// post-login settle), no eligible servers for the UDP fan-out. Skipping never
+/// stops the remaining legs from being asked.
+///
+/// What each leg *finds* is not in here. Answers arrive on each network's own
+/// schedule, are written into the transfer by the same paths the periodic
+/// source sweeps use, and are reported to the UI by `transfer:source-search`
+/// events as they land.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SourceAskOutcome {
+    pub kad: bool,
+    pub ember: bool,
+    /// The connected eD2K server, asked over TCP.
+    pub server: bool,
+    /// The other eligible servers, asked over UDP.
+    pub server_udp: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file: FileInfo,

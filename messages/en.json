@@ -1582,6 +1582,8 @@
   "transfers_src_kad_indirect_one": "KAD found 1 indirect source",
   "transfers_src_kad_indirect_other": "KAD found {count} indirect sources",
   "transfers_src_kad_empty": "KAD returned no sources",
+  "transfers_src_asking": "Asking every connected network for sources",
+  "transfers_src_asking_none": "No connected network to ask for sources",
   "transfers_src_unknown": "Searching sources",
   "transfers_src_rejected": "rejected",
   "transfers_src_timed_out": "timed out",

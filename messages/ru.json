@@ -1582,6 +1582,8 @@
   "transfers_src_kad_indirect_one": "KAD нашёл 1 косвенный источник",
   "transfers_src_kad_indirect_other": "KAD нашёл косвенных источников: {count}",
   "transfers_src_kad_empty": "KAD не вернул источников",
+  "transfers_src_asking": "Запрос источников во всех подключённых сетях",
+  "transfers_src_asking_none": "Нет подключённой сети, у которой можно запросить источники",
   "transfers_src_unknown": "Поиск источников",
   "transfers_src_rejected": "отклонено",
   "transfers_src_timed_out": "таймаут",

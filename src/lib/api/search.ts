@@ -163,8 +163,27 @@ export async function parseEd2kLinks(text: string): Promise<Ed2kLinkBatch> {
   return invoke('parse_ed2k_links', { text });
 }
 
-export async function findSources(fileHash: string, fileSize: number): Promise<[string, number][]> {
-  return invoke('find_sources', { fileHash, fileSize });
+/** Which networks a source ask reached. A `false` leg had nowhere to send it. */
+export type SourceAskOutcome = {
+  kad: boolean;
+  ember: boolean;
+  /** The connected eD2k server, asked over TCP. */
+  server: boolean;
+  /** The other eligible servers, asked over UDP. */
+  server_udp: boolean;
+};
+
+/**
+ * Ask every connected network for the sources of a transfer's file. Resolves
+ * once the asks are away; what they find goes into the transfer itself and is
+ * reported per network by `transfer:source-search` events.
+ */
+export async function findSources(
+  transferId: string,
+  fileHash: string,
+  fileSize: number,
+): Promise<SourceAskOutcome> {
+  return invoke('find_sources', { transferId, fileHash, fileSize });
 }
 
 export async function findNotes(fileHash: string, fileSize: number): Promise<SearchResult[]> {

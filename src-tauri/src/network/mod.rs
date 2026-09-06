@@ -11009,11 +11009,15 @@ pub enum NetworkCommand {
     RepublishFile {
         file_hash_hex: String,
     },
+    /// Ask every connected network for the sources of one file, on behalf of
+    /// the transfer that wants them. Replies as soon as the asks are away —
+    /// what they find is written into the transfer as it arrives, not returned
+    /// here. See [`ask_networks_for_sources`].
     FindSources {
-        file_hash: KadId,
+        transfer_id: String,
+        file_hash: [u8; 16],
         file_size: u64,
-        request_id: u64,
-        tx: oneshot::Sender<Result<Vec<(String, u16)>, String>>,
+        tx: oneshot::Sender<crate::types::SourceAskOutcome>,
     },
     BanPeer {
         peer_id_hex: String,
@@ -12425,12 +12429,6 @@ struct NetworkState {
     /// Throttled UDP global search queue: packets to send one-at-a-time at
     /// 750ms intervals (eMule UDPSEARCHSPEED = SEC2MS(3)/4).
     udp_search_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
-    /// Pending source searches: search_id -> (request_id, response sender).
-    /// `request_id` (caller-generated) lets `NetworkCommand::CancelSearch`
-    /// cancel a `find_sources` call on IPC timeout, same as it already does
-    /// for `search_files`'s keyword searches.
-    pending_source_searches:
-        HashMap<SearchId, PendingHelperSearchTx<Result<Vec<(String, u16)>, String>>>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -12552,7 +12550,9 @@ struct NetworkState {
     /// Store-source searches: search_id -> (file_hash, publish message)
     store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
     /// Pending notes searches: search_id -> (request_id, response sender).
-    /// See `pending_source_searches` for why `request_id` is carried here.
+    /// `request_id` (caller-generated) lets `NetworkCommand::CancelSearch`
+    /// cancel a `find_notes` call on IPC timeout, same as it already does for
+    /// `search_files`'s keyword searches.
     pending_notes_searches:
         HashMap<SearchId, PendingHelperSearchTx<Result<Vec<SearchResult>, String>>>,
     /// Pending note publishes, including the exact StorePacket payload used by
@@ -21854,25 +21854,6 @@ fn finalize_removed_searches_with_keyword_results(
             }
             maybe_finish_active_search(state, app_handle, request_id);
         }
-        if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
-            // Prefer delivering collected sources; otherwise signal busy so
-            // callers do not treat capacity eviction as an empty success (S8).
-            if let Some(entries) = preserved_results.get(sid) {
-                let all = extract_kad_sources(entries);
-                let established = ember_established_addrs(state);
-                harvest_ember_noise_keys(&mut state.ember_noise_keys, &all, &established);
-                let sources: Vec<(String, u16)> = all
-                    .into_iter()
-                    .filter(|s| !is_self_source(s, state))
-                    .map(|s| (s.ip.to_string(), s.tcp_port))
-                    .collect();
-                let _ = tx.send(Ok(sources));
-            } else {
-                let _ = tx.send(Err(
-                    "Source search busy: KAD search capacity reached".to_string()
-                ));
-            }
-        }
         // Ember rendezvous lookup: nobody is waiting on the result, the point
         // is purely the Noise keys it carries. Clear the slot either way so a
         // later tick can retry.
@@ -22022,24 +22003,16 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
             .retain(|_, r| r.search_id != sid);
     }
 
-    // Match by `request_id` across all three IPC-facing search kinds that
-    // carry one (keyword `search_files`, plus `find_sources`/`find_notes`,
-    // which used to have no cancel path at all and so kept their KAD search
-    // alive — wasting a routing-table in-use slot and a search-manager slot
-    // — until the search's own lifetime expired well after the IPC caller
-    // had already timed out and moved on).
+    // Match by `request_id` across both IPC-facing search kinds that carry one
+    // (keyword `search_files` and `find_notes`, which used to have no cancel
+    // path at all and so kept their KAD search alive — wasting a routing-table
+    // in-use slot and a search-manager slot — until the search's own lifetime
+    // expired well after the IPC caller had already timed out and moved on).
     let cancelled: Vec<SearchId> = state
         .pending_keyword_searches
         .iter()
         .filter(|(_, pending)| pending.request_id == request_id)
         .map(|(sid, _)| *sid)
-        .chain(
-            state
-                .pending_source_searches
-                .iter()
-                .filter(|(_, (rid, _))| *rid == request_id)
-                .map(|(sid, _)| *sid),
-        )
         .chain(
             state
                 .pending_notes_searches
@@ -22071,9 +22044,6 @@ fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle
         // cancelled search can't leave dangling channels/entries behind. Mirrors
         // `finalize_removed_searches`; idempotent (each lookup is a no-op when
         // absent).
-        if let Some((_, tx)) = state.pending_source_searches.remove(sid) {
-            let _ = tx.send(Ok(Vec::new()));
-        }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             let _ = tx.send(Ok(Vec::new()));
         }
@@ -24626,7 +24596,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_search_age: 0,
         server_udp_search_age: 0,
         udp_search_queue: VecDeque::new(),
-        pending_source_searches: HashMap::new(),
         download_source_searches: HashMap::new(),
         source_search_stream_cursor: HashMap::new(),
         pending_downloads: HashMap::new(),
@@ -31209,69 +31178,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             peers.len(),
                             state.ember_noise_keys.len()
                         );
-                    } else if let Some((_, tx)) = state.pending_source_searches.remove(&sid) {
-                        let sources = if let Some(search) = state.search_manager.get(&sid) {
-                            let all = extract_kad_sources(&search.results);
-                            // Learn each peer's Noise pubkey so the DHT bridge can
-                            // dial its Ember-native UDP transport. Harvested
-                            // *before* filtering self-sources, because we want to
-                            // learn about peers from every search response, not
-                            // just the ones handed back to the caller.
-                            let established = ember_established_addrs(&state);
-                            harvest_ember_noise_keys(&mut state.ember_noise_keys, &all, &established);
-                            let before = all.len();
-                            let filtered: Vec<(String, u16)> = all
-                                .into_iter()
-                                .filter(|s| !is_self_source(s, &state))
-                                .map(|s| (s.ip.to_string(), s.tcp_port))
-                                .collect();
-                            if filtered.len() != before {
-                                debug!(
-                                    "Source search {}: dropped {} self-sources",
-                                    sid.0,
-                                    before - filtered.len()
-                                );
-                            }
-                            filtered
-                        } else {
-                            Vec::new()
-                        };
-                        info!("Source search {} completed: {} sources found", sid.0, sources.len());
-                        let _ = tx.send(Ok(sources.clone()));
-
-                        // Connect found sources to any pending download with a
-                        // matching file hash so "Find More Sources" actually
-                        // starts the download instead of discarding results.
-                        if !sources.is_empty() {
-                            if let Some(search) = state.search_manager.get(&sid) {
-                                let raw_hash = kad_id_to_md4_bytes(&search.target);
-                                let hash_hex = hex::encode(raw_hash);
-                                let matching_tid = state.pending_downloads.iter()
-                                    .find(|(_, pd)| pd.file_hash == hash_hex)
-                                    .map(|(tid, _)| tid.clone());
-                                if let Some(transfer_id) = matching_tid {
-                                    // Re-insert as a download_source_searches so
-                                    // the normal download-start logic handles it
-                                    // on the next search completion or trigger an
-                                    // immediate retry by resetting the search timer.
-                                    if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
-                                        pd.last_search_at = 0;
-                                        info!(
-                                            "Find More Sources found {} sources for pending download {}, triggering immediate retry",
-                                            sources.len(), transfer_id
-                                        );
-                                        // Register sources in SourceManager so the
-                                        // periodic retry loop picks them up.
-                                        let mut sm = source_manager.write().await;
-                                        for (ip_str, port) in &sources {
-                                            if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
-                                                sm.register_source(raw_hash, v4, *port);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     } else if let Some((transfer_id, search_file_hash)) = state.download_source_searches.remove(&sid) {
                         // `transfer_id` gets moved into `pending_downloads`
                         // in several of the branches below; keep an owned
@@ -31280,12 +31186,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let refresh_transfer_id = transfer_id.clone();
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
-                            // Same cache update as the pending_source_searches branch:
-                            // learn the peer's Noise pubkey so Ember-native dialing
-                            // doesn't require a separate exchange. Doing this in both
-                            // branches (rather than once inside `extract_kad_sources`)
-                            // keeps that helper a pure function with no `state`
-                            // dependency.
+                            // Learn the peer's Noise pubkey so Ember-native
+                            // dialing doesn't require a separate exchange.
+                            // Done here rather than inside
+                            // `extract_kad_sources` to keep that helper a pure
+                            // function with no `state` dependency.
                             let established = ember_established_addrs(&state);
                             for s in &all {
                                 if !s.ip.is_unspecified() && s.tcp_port != 0 {
@@ -49452,6 +49357,131 @@ async fn maybe_publish_ember_keywords(
     }
 
     flush_ember_batch_publish(socket, state).await;
+}
+
+/// Ask every network that has somewhere to send it for the sources of one file.
+///
+/// The four legs are independent, and a leg with no route is skipped rather
+/// than allowed to hold up the others: KAD with no contacts or no session,
+/// Ember disabled or with no overlay peers, no eD2K server session (or one too
+/// fresh to ask — Lugdunum drops a `GETSOURCES` sent before login settles), no
+/// eligible servers for the UDP fan-out. What comes back arrives on each
+/// network's own schedule, through the same paths the periodic sweeps use.
+///
+/// This is what a download's opening fan-out does and what the Transfers
+/// "find sources" button does, which is the reason it is one function: three
+/// call sites drifting apart is how a network quietly stops being asked.
+/// Callers keep their own bookkeeping around it — `active_kad_search_state`,
+/// `ember_source_search_state`, `PendingDownload::search_count` — which is what
+/// the returned outcome is for.
+async fn ask_networks_for_sources(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    stats_manager: &mut StatsManager,
+    settings: &AppSettings,
+    transfer_id: &str,
+    file_hash: [u8; 16],
+    file_size: u64,
+) -> crate::types::SourceAskOutcome {
+    let mut outcome = crate::types::SourceAskOutcome::default();
+    let kad_hash = md4_bytes_to_kad_id(&file_hash);
+
+    // KAD: the closest contacts we know of, reachable ones first — a
+    // firewalled contact can only answer through a callback, so it is the
+    // least useful place to spend one of the opening queries.
+    if kad_ready_for_sources(state) {
+        let mut closest = state
+            .routing_table
+            .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+        if closest.is_empty() {
+            debug!(
+                "No KAD contacts to ask for sources of {}",
+                hex::encode(file_hash)
+            );
+        } else {
+            closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
+            let sid = start_kad_search(
+                state,
+                app_handle,
+                kad_hash,
+                SearchType::FindSource { file_size },
+                closest,
+            );
+            if sid != SearchId(0) {
+                // Filed under `download_source_searches`, which is the
+                // completion branch that writes what it finds into the
+                // transfer. A manual ask that resolved an IPC oneshot instead
+                // told the user sources existed and left the download no
+                // better off.
+                state
+                    .download_source_searches
+                    .insert(sid, (transfer_id.to_string(), file_hash));
+                info!(
+                    "Started KAD source search {} for download {}",
+                    sid.0, transfer_id
+                );
+                let _ = app_handle.emit(
+                    "transfer:source-search",
+                    serde_json::json!({
+                        "transfer_id": transfer_id,
+                        "kind": "kad_search",
+                    }),
+                );
+                outcome.kad = true;
+            }
+        }
+    }
+
+    // Ember: independent of KAD, so it is asked even on a KAD-less network.
+    if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
+        outcome.ember = start_ember_source_search(socket, state, transfer_id, file_hash).await;
+    }
+
+    // The connected eD2K server, over TCP.
+    if server_source_settle_elapsed(state) {
+        if let Some(conn) = state.server_connection.as_mut() {
+            if let Ok(bytes) = conn.send_get_sources(&file_hash, file_size).await {
+                if bytes > 0 {
+                    stats_manager.add_overhead(
+                        crate::storage::statistics::OverheadCategory::SourceExchange,
+                        crate::storage::statistics::OverheadDirection::Upload,
+                        bytes,
+                    );
+                    let _ = app_handle.emit(
+                        "transfer:source-search",
+                        serde_json::json!({
+                            "transfer_id": transfer_id,
+                            "kind": "server_query",
+                        }),
+                    );
+                    outcome.server = true;
+                }
+            }
+        }
+    }
+
+    // Every other eligible server, over UDP, paced through the queue so this
+    // never becomes a burst of datagrams.
+    if network_ready_for_sources(state) {
+        let packets = build_all_getsources_packets(state, &file_hash, file_size);
+        if !packets.is_empty() {
+            let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
+            let queued = packets.len().min(room);
+            debug!(
+                "Queuing {}/{} UDP source requests for download {}",
+                queued,
+                packets.len(),
+                transfer_id
+            );
+            state
+                .udp_source_queue
+                .extend(packets.into_iter().take(room));
+            outcome.server_udp = queued > 0;
+        }
+    }
+
+    outcome
 }
 
 /// Start an Ember DHT `FIND_VALUE` for the sources of `file_hash` on behalf

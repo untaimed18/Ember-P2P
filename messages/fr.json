@@ -1582,6 +1582,8 @@
   "transfers_src_kad_indirect_one": "KAD a trouvé 1 source indirecte",
   "transfers_src_kad_indirect_other": "KAD a trouvé {count} sources indirectes",
   "transfers_src_kad_empty": "KAD n'a renvoyé aucune source",
+  "transfers_src_asking": "Recherche de sources auprès de tous les réseaux connectés",
+  "transfers_src_asking_none": "Aucun réseau connecté à interroger pour des sources",
   "transfers_src_unknown": "Recherche de sources",
   "transfers_src_rejected": "rejeté",
   "transfers_src_timed_out": "expiré",

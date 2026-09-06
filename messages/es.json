@@ -1582,6 +1582,8 @@
   "transfers_src_kad_indirect_one": "KAD encontró 1 fuente indirecta",
   "transfers_src_kad_indirect_other": "KAD encontró {count} fuentes indirectas",
   "transfers_src_kad_empty": "KAD no devolvió fuentes",
+  "transfers_src_asking": "Consultando fuentes a todas las redes conectadas",
+  "transfers_src_asking_none": "Ninguna red conectada a la que consultar fuentes",
   "transfers_src_unknown": "Buscando fuentes",
   "transfers_src_rejected": "rechazada",
   "transfers_src_timed_out": "tiempo agotado",
