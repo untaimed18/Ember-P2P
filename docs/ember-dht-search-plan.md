@@ -40,12 +40,13 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
-Every item is done bar one loose end, and the extension question is decided. None
-of the wire additions needed a version bump — see item 1 for why bumping would
-have been actively wrong. What remains is one *new* feature rather than a gap
-([browse by type](#next-browse-by-type-off-the-dht)), plus the
-`CancelEmberSearch` tidy still listed under item 6 — a debug-only command, which
-is why it keeps being left.
+Every item here is done and the extension question is decided. None of the wire
+additions needed a version bump — see item 1 for why bumping would have been
+actively wrong. What remains is one *new* feature rather than a gap
+([browse by type](#next-browse-by-type-off-the-dht)). The `CancelEmberSearch`
+tidy that used to be listed under item 6 is closed too, though not by anything
+in this pass — see there for which half was fixed elsewhere and which half turned
+out to be unreachable.
 
 The two kinds of change this overlay is for, and which each item was:
 
@@ -258,9 +259,33 @@ them.
   and widening the predicate would be dead code. The batch
   same-name-many-hashes rule *can* flag an Ember row, but it is not gated by
   that predicate and treats KAD identically, so it is not an Ember gap.
-- **`CancelEmberSearch` is incomplete.** It clears `ember_search` but not
-  `ember_keyword_searches` or buffered result batches. Debug-only command; the
-  user-facing cancel path (`cancel_search_request`) is correct.
+- ~~**`CancelEmberSearch` is incomplete.**~~ **Closed, and it was closed
+  elsewhere.** The claim was that it clears `ember_search` but not
+  `ember_keyword_searches` or buffered result batches. The first half is gone:
+  cancel and the expiry backstop now share `release_ember_search_state`, which
+  drops the keyword entry, clears `ember_pending` and re-checks
+  `search-complete` — it had to, because `alloc_id` only refuses ids still
+  present in `searches`, so releasing the slot alone let the same id be handed
+  to an unrelated walk whose records were then delivered into the abandoned
+  caller's map. That is a worse bug than the one this bullet described, and
+  fixing it subsumed it.
+
+  The second half is unreachable rather than fixed, which is worth writing down
+  so nobody adds a guard for it. Buffered batches do not survive between ticks:
+  the sweep's streaming step queues them and its emit step drains all of them
+  with `mem::take` in the same tick, and the sweep cannot skip that step while
+  the buffer is non-empty because `ember_pending_keyword_results.is_empty()` is
+  one of the conditions in its own idle early-return. The one queue that does
+  cross a tick is the closing batch from `maybe_finish_ember_search` — and that
+  removes the search from `ember_keyword_searches` before pushing, so a cancel
+  arriving behind it finds no keyword entry, takes neither branch, and leaves
+  the batch to emit and clear `ember_pending` on its own terms.
+
+  Worth noting the command is no longer debug-only either: a channel presence
+  probe that outruns its timeout cancels through it (`find_raw_keys_within`),
+  which is why the shared teardown matters rather than a reason to leave it
+  thin. Nothing on that path queues keyword batches, so the unreachable half
+  stays unreachable.
 
 ---
 
