@@ -504,11 +504,12 @@ input[type="checkbox"], input[type="radio"] {
   accent-color: var(--accent);
   cursor: pointer;
 }
+/* No focus ring: a click focuses the control, and Chromium treats that
+   as :focus-visible, so the ring would linger until the next click. */
 input[type="checkbox"]:focus, input[type="radio"]:focus,
 input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   box-shadow: none;
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: none;
 }
 
 input::placeholder {
