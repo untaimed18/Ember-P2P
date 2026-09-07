@@ -821,6 +821,7 @@ pub fn run() {
                         );
                     }
                 }
+                commands::backup::sweep_orphaned_scratch(&data_dir);
             }
 
             // Allow WebView media playback for files under shared/download dirs.

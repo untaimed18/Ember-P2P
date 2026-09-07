@@ -1489,11 +1489,32 @@ impl Database {
                 conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
                 info!("Enabled incremental auto_vacuum on existing database (v21)");
             }
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS transfers_v5_backup;
-                 DROP TABLE IF EXISTS shared_files_v7_backup;
-                 DROP TABLE IF EXISTS settings_v7_backup;",
-            )?;
+            // Only drop a legacy snapshot this database already carried when
+            // it was opened.
+            //
+            // `version` is read once, before any block runs, so a database
+            // upgrading from below v6 or v8 in one jump executes the block
+            // that *creates* these tables and this one that removes them
+            // inside the same call. Dropping unconditionally therefore
+            // destroyed the snapshot in the very upgrade that made it, which
+            // is the opposite of what v6 and v8 promise: v8 says outright that
+            // it preserves the rows "so users upgrading from v<8 aren't
+            // silently wiped". Gating on the entry version means a snapshot is
+            // only reclaimed once the user has had a session in which it could
+            // have been recovered.
+            let mut reclaim = String::new();
+            if version >= 6 {
+                reclaim.push_str("DROP TABLE IF EXISTS transfers_v5_backup;");
+            }
+            if version >= 8 {
+                reclaim.push_str(
+                    "DROP TABLE IF EXISTS shared_files_v7_backup;
+                     DROP TABLE IF EXISTS settings_v7_backup;",
+                );
+            }
+            if !reclaim.is_empty() {
+                conn.execute_batch(&reclaim)?;
+            }
             let tx = conn.unchecked_transaction()?;
             set_version(&tx, 21)?;
             tx.commit()?;
@@ -8544,6 +8565,96 @@ mod tests {
             .expect("version");
         assert_eq!(version, MAX_SUPPORTED_SCHEMA_VERSION);
         drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// v6 and v8 snapshot the rows they are about to rewrite or replace, and
+    /// v8 says outright it does so "so users upgrading from v<8 aren't
+    /// silently wiped". Because `version` is read once and every block then
+    /// runs in ascending order in the same call, a database entering below v6
+    /// or v8 creates those snapshots and reaches v21's reclaim in the same
+    /// upgrade — so v21 has to leave them alone.
+    #[test]
+    fn a_one_jump_upgrade_keeps_the_legacy_snapshots_v8_promises() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-legacy-snapshot-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // A pre-v6 profile: the three legacy tables, each carrying a row the
+        // snapshot is supposed to preserve, and a version that predates them.
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO schema_version (version) VALUES (5);
+                 CREATE TABLE transfers (id TEXT, status TEXT, direction TEXT);
+                 INSERT INTO transfers VALUES ('t1', '\"done\"', '\"down\"');
+                 CREATE TABLE shared_files (path TEXT, size INTEGER);
+                 INSERT INTO shared_files VALUES ('C:\\x.bin', 7);
+                 CREATE TABLE settings (key TEXT, value TEXT);
+                 INSERT INTO settings VALUES ('nick', 'Ada');",
+            )
+            .expect("seed a pre-v6 profile");
+        }
+
+        let db = Database::open_at(&path).expect("migrate from v5");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+
+        let rows_in = |table: &str| -> Option<i64> {
+            db.conn
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .ok()
+        };
+        assert_eq!(
+            rows_in("shared_files_v7_backup"),
+            Some(1),
+            "the v8 shared-file snapshot must survive a v5 -> latest upgrade"
+        );
+        assert_eq!(
+            rows_in("settings_v7_backup"),
+            Some(1),
+            "the v8 settings snapshot must survive a v5 -> latest upgrade"
+        );
+        assert_eq!(
+            rows_in("transfers_v5_backup"),
+            Some(1),
+            "the v6 transfers snapshot must survive a v5 -> latest upgrade"
+        );
+
+        // A profile that already carried the snapshots on entry is past the
+        // window they exist for, so the reclaim still runs for it.
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (20);",
+            )
+            .expect("roll back to v20");
+        }
+        drop(db);
+        let reopened = Database::open_at(&path).expect("migrate from v20");
+        let gone = |table: &str| -> bool {
+            reopened
+                .conn
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .is_err()
+        };
+        assert!(gone("shared_files_v7_backup"), "reclaimed at v20 -> latest");
+        assert!(gone("settings_v7_backup"), "reclaimed at v20 -> latest");
+        assert!(gone("transfers_v5_backup"), "reclaimed at v20 -> latest");
+
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
