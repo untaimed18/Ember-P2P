@@ -16,7 +16,7 @@
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
-  import { getPeerReputation, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
+  import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
     formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
@@ -809,17 +809,6 @@
   let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
   const KNOWN_POLL_INTERVAL_MS = 8000;
-  // Upper bound on Trust badges force-refreshed per poll. Each one is a
-  // backend command, not a local read, so this cannot scale with the
-  // 1,000-row display limit.
-  const KNOWN_REPUTATION_REFRESH_MAX = 100;
-  // Where the next poll's window starts. The budget above has to rotate
-  // rather than sit on the first hundred rows: this sweep is the only thing
-  // that ever populates `reputationMap` for the table, so a fixed window left
-  // every row past it showing "—" with a "Fetching…" tooltip forever, however
-  // long the tab stayed open. Rotating covers a full 1,000-row ledger in
-  // about eighty seconds while keeping each poll's cost flat.
-  let knownReputationCursor = 0;
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
@@ -880,27 +869,18 @@
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
       // Force-refresh Trust badges so manual bans / score changes appear
-      // without leaving the tab — but only for a bounded slice.
+      // without leaving the tab.
       //
-      // `getPeerReputation` is not a local read: each call is pushed onto the
-      // bounded network command channel and fails with `network_busy` when it
-      // is full. Forcing all 1,000 displayed rows every 8 seconds put ~1,000
-      // commands per cycle through the same channel that serves transfers,
-      // search and server operations, so unrelated actions intermittently
-      // failed with "Network busy". Chunking bounds concurrency, not volume.
+      // Every displayed row, every poll: `getPeerReputationBatch` is one
+      // command for the whole page, so the cost no longer scales with the row
+      // count and there is nothing left to ration. The rotating window this
+      // replaces existed only to bound a per-row fan-out, and its side effect
+      // was that rows outside the current slice sat on "—" with a "Fetching…"
+      // tooltip for up to eighty seconds.
       if (refreshBadges) {
         const hashes = displayedKnownClients.map((k) => k.user_hash);
         if (hashes.length > 0) {
-          const start = knownReputationCursor % hashes.length;
-          const window =
-            hashes.length <= KNOWN_REPUTATION_REFRESH_MAX
-              ? hashes
-              : [...hashes.slice(start), ...hashes.slice(0, start)].slice(
-                  0,
-                  KNOWN_REPUTATION_REFRESH_MAX,
-                );
-          knownReputationCursor = (start + window.length) % hashes.length;
-          void refreshReputations(window, true);
+          void refreshReputations(hashes, true);
         }
       }
     } catch (e) {
@@ -929,8 +909,6 @@
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
 
-  const REPUTATION_FETCH_CONCURRENCY = 16;
-
   async function refreshReputations(hashes: string[], force = false) {
     // Skip hashes currently in flight. Non-null cache entries are
     // re-fetched when `force` is set (Known Clients poll) so score /
@@ -941,31 +919,28 @@
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
-    // Chunked rather than one flat `Promise.all`: each call takes a slot in the
-    // backend's bounded network command channel, so an unbounded fan-out over a
-    // large credit ledger starves unrelated commands into "Network busy".
-    const results: (readonly [string, PeerReputationInfo | null])[] = [];
-    for (let i = 0; i < targets.length; i += REPUTATION_FETCH_CONCURRENCY) {
-      const chunk = targets.slice(i, i + REPUTATION_FETCH_CONCURRENCY);
-      results.push(
-        ...(await Promise.all(
-          chunk.map(async (h) => {
-            try {
-              return [h, await getPeerReputation(h)] as const;
-            } catch {
-              return [h, null] as const;
-            }
-          }),
-        )),
-      );
+    // One command for the whole set. Every answer comes from the same
+    // in-memory tracker, so the per-hash fan-out this replaces bought nothing
+    // and cost a slot in the backend's bounded command channel per row — which
+    // is what surfaced as unrelated actions failing with "Network busy" while
+    // this tab was open.
+    let fetched: Record<string, PeerReputationInfo | null> = {};
+    try {
+      fetched = await getPeerReputationBatch(targets);
+    } catch (e) {
+      // Leave the cache as it was; the poll retries. Clearing entries here
+      // would flash every badge back to "unknown" on one transient failure.
+      console.warn('Failed to refresh peer reputations:', e);
     }
     // Always clear in-flight markers — an early unmount return used to
     // leak hashes permanently blocked from future fetches.
-    for (const [h] of results) reputationInFlight.delete(h);
+    for (const h of targets) reputationInFlight.delete(h);
     if (!mounted) return;
+    // A hash the backend could not parse is absent from the response rather
+    // than null, so only assign what came back.
     const next = { ...reputationMap };
-    for (const [h, rep] of results) {
-      next[h] = rep;
+    for (const h of targets) {
+      if (h in fetched) next[h] = fetched[h];
     }
     reputationMap = next;
   }

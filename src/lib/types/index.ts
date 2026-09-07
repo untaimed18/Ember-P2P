@@ -830,7 +830,15 @@ export interface AppSettings {
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
-  /** Rendezvous server URL for Ember friend discovery */
+  /**
+   * Rendezvous server URL for Ember friend discovery.
+   *
+   * Backend-owned: `update_settings` restores the stored value over whatever
+   * the renderer sends, because registration POSTs our public key, public IP
+   * and listening port to this host. No Settings control binds it — it lives in
+   * `config.json` — so writes from here are silently ignored rather than
+   * rejected.
+   */
   rendezvous_url: string;
   /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
    *  Always on: the DHT bootstraps from other clients rather than a

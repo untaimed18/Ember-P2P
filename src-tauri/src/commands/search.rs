@@ -2,7 +2,7 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::network::{NetworkCommand, SearchMethod};
@@ -786,11 +786,15 @@ pub async fn cancel_search(
     state: tauri::State<'_, AppState>,
     request_id: u64,
 ) -> Result<(), String> {
-    state
-        .network_tx
-        .try_send(NetworkCommand::CancelSearch { request_id })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    Ok(())
+    // `bounded_send`, not `try_send`. A cancel that never reaches the network
+    // task leaves the KAD and Ember walks running to their own 60s expiry,
+    // holding routing-table in-use slots and search-manager slots the next
+    // query needs — and the frontend, which rotates the tab's request id on the
+    // strength of this call, would already have stopped associating results
+    // with it. The channel is most likely full precisely when the event loop is
+    // busy, which is exactly when a dropped cancel costs the most, so this
+    // waits briefly rather than failing instantly.
+    bounded_send(&state.network_tx, NetworkCommand::CancelSearch { request_id }).await
 }
 
 /// Compute the ed2k hash of raw bytes (for in-memory content).

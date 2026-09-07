@@ -608,9 +608,23 @@
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let loadGen = 0;
 
+  /** Coalescing window for `shared-files-changed` while a scan is running.
+   *
+   *  A refresh re-fetches the *entire* library over IPC — `get_shared_files`
+   *  returns every indexed row, and discovery allows up to 100,000 per folder —
+   *  then recomputes every derived view over it. Hashing emits
+   *  `shared-files-changed` continuously, so the 300 ms window meant a large
+   *  library was serialised, transferred and re-derived three times a second
+   *  for the whole run. Nothing on screen changes usefully at that rate: the
+   *  scan banner has its own progress events, and the scan-completion poll
+   *  pulls a final snapshot regardless. */
+  const SCAN_REFRESH_DEBOUNCE_MS = 3000;
+  const IDLE_REFRESH_DEBOUNCE_MS = 300;
+
   function debouncedRefresh() {
     if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
+    const delay = scanning ? SCAN_REFRESH_DEBOUNCE_MS : IDLE_REFRESH_DEBOUNCE_MS;
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, delay);
   }
 
   async function refresh(force = false) {

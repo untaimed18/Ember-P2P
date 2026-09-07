@@ -911,6 +911,7 @@
       case 'Fetch': return m.search_phase_fetch();
       case 'KadNoContacts': return m.search_phase_kad_no_contacts();
       case 'KadBusy': return m.search_phase_kad_busy();
+      case 'EmberBusy': return m.search_phase_ember_busy();
       default: return null;
     }
   }
@@ -2164,21 +2165,45 @@
   let downloadPending: Record<string, boolean> = $state({});
 
   /**
-   * Pick the first syntactically valid address from the candidate list.
-   * Returns `{ ip: '', port: 0 }` when nothing parses — the backend then
-   * performs full KAD/server source discovery on its own. Previously we
-   * passed `addresses[0]` blindly, which could pin the transfer's first
-   * source to a bad peer when the list was unordered.
+   * Pick the first *dialable* address from the candidate list.
+   *
+   * Returns `{ ip: '', port: 0 }` when nothing qualifies — the backend then
+   * performs full KAD/server source discovery on its own, which is a working
+   * download, just a slower start. Previously we passed `addresses[0]`
+   * blindly, which could pin the transfer's first source to a bad peer when
+   * the list was unordered.
+   *
+   * IPv4 only, and that matters: the eD2K download transport cannot use an
+   * IPv6 peer, so `start_download` rejects an IPv6 primary outright. Taking
+   * the first syntactically valid address therefore failed the *entire*
+   * enqueue whenever a swarm happened to list an IPv6 peer first — including
+   * when the very next address was a perfectly good IPv4 one. Skipping them
+   * here costs nothing: the extras list drops IPv6 at the IPC boundary too.
    */
   function pickInitialSource(addresses: string[]): { ip: string; port: number } {
     for (const addr of addresses) {
       if (!addr) continue;
       const { ip, port } = parseAddress(addr);
-      if (ip && port > 0 && ip !== '0.0.0.0') {
+      if (ip && port > 0 && ip !== '0.0.0.0' && isIpv4(ip)) {
         return { ip, port };
       }
     }
     return { ip: '', port: 0 };
+  }
+
+  /**
+   * Dotted-quad check, matching what the backend will accept as a primary.
+   *
+   * Leading zeros are rejected because Rust's `Ipv4Addr` parser rejects them
+   * (they are octal-ambiguous), and this predicate is only useful if it agrees
+   * with the parser that decides the enqueue. Addresses reaching us are
+   * rendered by that same type so they never carry one, but a predicate that
+   * claims to mirror the backend has to actually mirror it.
+   */
+  function isIpv4(ip: string): boolean {
+    const parts = ip.split('.');
+    if (parts.length !== 4) return false;
+    return parts.every((p) => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255);
   }
 
   function parseAddress(addr: string): { ip: string; port: number } {

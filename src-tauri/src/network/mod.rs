@@ -1916,7 +1916,7 @@ const MAX_EMBER_CONTENT_HASHES: usize = 20_000;
 /// the wrong rule — it would drop the entry for the longest download. Instead
 /// this keeps every digest referenced by a live transfer or by the library and
 /// discards the rest, which are search results nothing acted on.
-async fn prune_ember_content_hashes(
+fn prune_ember_content_hashes(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
@@ -1924,13 +1924,25 @@ async fn prune_ember_content_hashes(
     if state.ember_content_hashes.len() <= MAX_EMBER_CONTENT_HASHES {
         return;
     }
+    // `try_read`, not `read().await`. This runs inside the network `select!`,
+    // and a library scan holds the index write lock across `rebuild_indices` —
+    // so blocking here parked UDP receive, every timer and every IPC request
+    // behind a full re-index. The prune is a soft bound on a map that is merely
+    // larger than it needs to be: skipping a tick costs a few more megabytes
+    // until the next one, whereas dropping an entry because a lock was busy
+    // would silently disable the content check for a running download.
+    let Ok(mgr) = transfer_manager.try_read() else {
+        debug!("Ember content digests: transfer manager busy, deferring the prune");
+        return;
+    };
+    let Ok(idx) = local_index.try_read() else {
+        debug!("Ember content digests: library index busy, deferring the prune");
+        return;
+    };
     let mut keep: HashSet<[u8; 16]> = HashSet::new();
-    {
-        let mgr = transfer_manager.read().await;
-        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-            if let Some(hash) = parse_ed2k_hash16(&transfer.file_hash) {
-                keep.insert(hash);
-            }
+    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+        if let Some(hash) = parse_ed2k_hash16(&transfer.file_hash) {
+            keep.insert(hash);
         }
     }
     for hash in state.pending_downloads.values() {
@@ -1938,14 +1950,13 @@ async fn prune_ember_content_hashes(
             keep.insert(parsed);
         }
     }
-    {
-        let idx = local_index.read().await;
-        for file in idx.all_files() {
-            if let Some(hash) = parse_ed2k_hash16(&file.hash) {
-                keep.insert(hash);
-            }
+    for file in idx.all_files() {
+        if let Some(hash) = parse_ed2k_hash16(&file.hash) {
+            keep.insert(hash);
         }
     }
+    drop(idx);
+    drop(mgr);
     let before = state.ember_content_hashes.len();
     state
         .ember_content_hashes
@@ -6230,9 +6241,31 @@ async fn persist_chat_history_message(
         .map_err(|error| format!("Failed to persist chat history: {error}"))
 }
 
+/// Ceiling on marking a chat outbox row delivered, measured from the network
+/// task.
+///
+/// Bounded because the loop should not wait indefinitely on `Database`'s
+/// `Mutex<Connection>` — the insert itself is sub-millisecond, but a library
+/// scan or statistics flush already inside that mutex holds the loop for as
+/// long as it takes. Safe to bound here specifically because a timeout is
+/// reported as `ChatAlreadyQueued`, the packet has already been handed to the
+/// session writer, and the abandoned write marking the row delivered later is
+/// the outcome we wanted anyway.
+const CHAT_OUTBOX_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Create a durable outbox row before handing a chat packet to a session
 /// writer. The row makes a failed writer handoff recoverable on the next
 /// session instead of leaving a peer-visible message with no local history.
+///
+/// Deliberately *not* bounded by [`CHAT_OUTBOX_WRITE_TIMEOUT`], unlike its
+/// sibling. `spawn_blocking` cannot be cancelled, so a timeout here would
+/// abandon an insert that then lands anyway — while the error it returns sends
+/// `send_chat_message` down its "could not reach them right now" path, which
+/// inserts a pending row of its own. Two rows for one message means the next
+/// session flush delivers it twice. The write therefore stays unbounded: this
+/// is one insert, ordered before the handoff on purpose, and a duplicate
+/// message the user never typed is a worse failure than a loop that waits out
+/// whatever else is holding the connection.
 async fn queue_outbound_chat_message(
     db: Arc<Database>,
     user_hash: String,
@@ -6247,13 +6280,19 @@ async fn queue_outbound_chat_message(
 /// Mark an outbox row delivered only after its packet was accepted by the
 /// current live session's writer queue.
 async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+    let write = tokio::task::spawn_blocking(move || {
         db.set_chat_delivery(message_id, crate::storage::database::CHAT_DELIVERED)
-    })
-    .await
-    .map_err(|error| format!("Chat delivery persistence task failed: {error}"))?
-    .map(|_| ())
-    .map_err(|error| format!("Failed to mark chat delivered: {error}"))
+    });
+    // Same reasoning as `CHAT_OUTBOX_WRITE_TIMEOUT`. A timeout here leaves the
+    // row pending, which the caller surfaces as "already queued" — the message
+    // is on the wire either way, and the flush path treats a pending row as
+    // something to retry rather than as loss.
+    tokio::time::timeout(CHAT_OUTBOX_WRITE_TIMEOUT, write)
+        .await
+        .map_err(|_| "Chat delivery write did not complete in time".to_string())?
+        .map_err(|error| format!("Chat delivery persistence task failed: {error}"))?
+        .map(|_| ())
+        .map_err(|error| format!("Failed to mark chat delivered: {error}"))
 }
 
 /// Handle an inbound Ember friend request, shared by the download-side and
@@ -9251,7 +9290,7 @@ mod tests {
             built
                 .corroborated
                 .iter()
-                .all(|(hash, _)| *hash != poisoned),
+                .all(|(hash, _, _)| *hash != poisoned),
             "an uncorroborated digest must not auto-seed the enforced map"
         );
 
@@ -9269,7 +9308,9 @@ mod tests {
             built
                 .corroborated
                 .iter()
-                .any(|(hash, digest)| *hash == agreed && *digest == real),
+                .any(|(hash, digest, publishers)| {
+                    *hash == agreed && *digest == real && *publishers == 2
+                }),
             "a corroborated digest is what automatic seeding may pin"
         );
     }
@@ -9765,7 +9806,15 @@ mod tests {
             &mut content_hashes,
         );
         assert_eq!(sources.len(), 3, "every contact stays connectable");
-        assert_eq!(content_hashes.get(&file_hash), Some(&honest_digest));
+        assert_eq!(
+            content_hashes.get(&file_hash).map(|pin| pin.digest),
+            Some(honest_digest)
+        );
+        assert_eq!(
+            content_hashes.get(&file_hash).map(|pin| pin.provenance),
+            Some(EmberDigestProvenance::Corroborated(2)),
+            "the pin records how many publishers stood behind it"
+        );
     }
 
     #[test]
@@ -9904,7 +9953,13 @@ mod tests {
         ];
         let mut diag = crate::types::EmberDiagnostics::default();
         let mut noise_keys = HashMap::new();
-        let mut content_hashes: HashMap<[u8; 16], [u8; 32]> = HashMap::from([(file_hash, trusted)]);
+        let mut content_hashes: HashMap<[u8; 16], EmberDigestPin> = HashMap::from([(
+            file_hash,
+            EmberDigestPin {
+                digest: trusted,
+                provenance: EmberDigestProvenance::Local,
+            },
+        )]);
         parse_ember_source_records(
             &blobs,
             file_hash,
@@ -9914,7 +9969,85 @@ mod tests {
             &HashSet::new(),
             &mut content_hashes,
         );
-        assert_eq!(content_hashes.get(&file_hash), Some(&trusted));
+        assert_eq!(
+            content_hashes.get(&file_hash).map(|pin| pin.digest),
+            Some(trusted)
+        );
+    }
+
+    /// Which digest a transfer enforces has to be decided by evidence, not by
+    /// which walk happened to answer first.
+    ///
+    /// Two publishers agreeing inside one incremental `FIND_VALUE` page is
+    /// enough to corroborate *within that page*, so a partial answer could pin
+    /// a digest the finished walk went on to contradict — and, once pinned,
+    /// nothing could correct it. Worse, the digest on the row the user actually
+    /// clicked lost to whatever that page had already seeded, so an explicit
+    /// choice was overridden by a guess.
+    #[test]
+    fn a_better_supported_ember_digest_supersedes_a_weaker_pin() {
+        let mut pins: HashMap<[u8; 16], EmberDigestPin> = HashMap::new();
+        let file = [0x5Au8; 16];
+        let early = [0xAAu8; 32];
+        let plurality = [0xBBu8; 32];
+        let clicked = [0xCCu8; 32];
+        let hashed_here = [0xDDu8; 32];
+
+        seed_ember_content_hash(
+            &mut pins,
+            file,
+            early,
+            EmberDigestProvenance::Corroborated(2),
+        );
+        assert_eq!(pins[&file].digest, early);
+
+        // An equal number of publishers must not flip a live pin, or two rival
+        // pairs would fight over it for the length of the download.
+        seed_ember_content_hash(
+            &mut pins,
+            file,
+            plurality,
+            EmberDigestProvenance::Corroborated(2),
+        );
+        assert_eq!(pins[&file].digest, early, "equal evidence keeps the incumbent");
+
+        seed_ember_content_hash(
+            &mut pins,
+            file,
+            plurality,
+            EmberDigestProvenance::Corroborated(3),
+        );
+        assert_eq!(
+            pins[&file].digest, plurality,
+            "a larger plurality is what the completed walk found"
+        );
+
+        seed_ember_content_hash(&mut pins, file, clicked, EmberDigestProvenance::UserSelected);
+        assert_eq!(
+            pins[&file].digest, clicked,
+            "the row the user clicked outranks any DHT plurality"
+        );
+
+        seed_ember_content_hash(&mut pins, file, hashed_here, EmberDigestProvenance::Local);
+        assert_eq!(
+            pins[&file].digest, hashed_here,
+            "bytes hashed on this machine outrank everything remote"
+        );
+
+        seed_ember_content_hash(
+            &mut pins,
+            file,
+            plurality,
+            EmberDigestProvenance::Corroborated(9),
+        );
+        assert_eq!(
+            pins[&file].digest, hashed_here,
+            "and no amount of remote agreement displaces a local hash"
+        );
+
+        // "No claim" is not a claim.
+        seed_ember_content_hash(&mut pins, [0x11u8; 16], [0u8; 32], EmberDigestProvenance::Local);
+        assert!(!pins.contains_key(&[0x11u8; 16]));
     }
 
     #[test]
@@ -11589,8 +11722,14 @@ pub enum NetworkCommand {
         /// connection that never happened.
         tx: oneshot::Sender<Result<String, String>>,
     },
-    KadBootstrapUrl {
-        url: String,
+    /// Contacts already downloaded and parsed by the IPC task
+    /// (`kad_bootstrap_url`). Only the routing-table insert and the bootstrap
+    /// datagrams need the network task's state, so the HTTP fetch and the
+    /// synchronous `nodes.dat` parse deliberately do not happen here — running
+    /// them inside the `select!` stalled all networking for the length of the
+    /// download. Contacts arrive marked unproven.
+    KadBootstrapContacts {
+        contacts: Vec<kad::types::KadContact>,
         tx: oneshot::Sender<Result<String, String>>,
     },
     KadBootstrapClients {
@@ -11787,6 +11926,19 @@ pub enum NetworkCommand {
     GetPeerReputation {
         user_hash: [u8; 16],
         tx: oneshot::Sender<Option<PeerReputationInfo>>,
+    },
+    /// Reputation for many peers at once, keyed by lowercase hex user hash.
+    ///
+    /// The Known Clients tab needs a Trust badge per visible row and refreshes
+    /// them on a timer. Asking one command per hash put a hundred entries into
+    /// the bounded command channel every eight seconds, which is what made
+    /// unrelated actions fail with "Network busy" while that tab was open — the
+    /// answers all come from the same in-memory tracker, so one round trip is
+    /// enough. Absent peers are reported as `None` rather than omitted, so the
+    /// caller can tell "no record" from "not asked".
+    GetPeerReputationBatch {
+        user_hashes: Vec<[u8; 16]>,
+        tx: oneshot::Sender<HashMap<String, Option<PeerReputationInfo>>>,
     },
     GetReputationStats {
         tx: oneshot::Sender<ReputationStatsInfo>,
@@ -13819,8 +13971,11 @@ struct NetworkState {
     ember_dht_protection: ember::dht::protection::DhtProtection,
     /// Slice 19: observed-IP voting from PONG payloads (NAT self-discovery).
     ember_observed_votes: ember::dht::observed::EmberObservedIpVotes,
-    /// Expected Ember BLAKE3 digests learned from DHT records (ed2k -> blake3).
-    ember_content_hashes: HashMap<[u8; 16], [u8; 32]>,
+    /// Expected Ember BLAKE3 digests a transfer will enforce at completion
+    /// (ed2k -> digest plus the evidence behind it). Seeded from DHT records,
+    /// from the row the user clicked, and from locally hashed files; conflicts
+    /// are resolved by [`seed_ember_content_hash`], never by arrival order.
+    ember_content_hashes: HashMap<[u8; 16], EmberDigestPin>,
     /// Pending Ember DHT `PING` requests awaiting a `PONG`, keyed by the
     /// wire `request_id`. Mirrors `ember_pending_pings` (the control
     /// ping map) and is bounded by `MAX_EMBER_PENDING_PINGS`.
@@ -22559,6 +22714,87 @@ fn start_kad_search(
     sid
 }
 
+/// Split a `Transfer::peer_id` into its address and port halves.
+///
+/// `peer_id` is a display string, not a parsed socket address, and it can carry
+/// a bracketed IPv6 literal (`[2001:db8::1]:4662`). Splitting on the *first*
+/// colon turned that into address `"[2001"` and a port that does not parse, so
+/// a resume-after-restart or a disk-full promotion rebuilt `StartDownload` with
+/// an address nothing could dial — and it failed quietly, surfacing only as a
+/// transfer that never found a source. Parsing as a `SocketAddr` first and
+/// falling back to the *last* colon handles both forms; the IPv4-only download
+/// path then rejects an IPv6 address on its own terms rather than on a
+/// tokenizing accident. Mirrors `parse_peer_ip` / `parse_peer_port` in the IPC
+/// layer.
+fn split_peer_id(peer_id: &str) -> (String, u16) {
+    if let Ok(addr) = peer_id.parse::<SocketAddr>() {
+        return (addr.ip().to_string(), addr.port());
+    }
+    match peer_id.rsplit_once(':') {
+        Some((ip, port)) => (
+            ip.trim_start_matches('[').trim_end_matches(']').to_string(),
+            port.parse().unwrap_or(0),
+        ),
+        None => (String::new(), 0),
+    }
+}
+
+/// Release every piece of state keyed by an Ember `search_id` and settle
+/// whatever was waiting on it.
+///
+/// Shared by the expiry backstop and `CancelEmberSearch` so the two cannot
+/// drift — and they had. Cancel dropped only the search slot and the dev value
+/// waiter, leaving the keyword, claim, epoch, moderation, handoff,
+/// publish-target and download-source entries behind. `alloc_id` only refuses
+/// ids still present in `searches`, so releasing the slot alone let the very
+/// same id be handed to an unrelated walk, whose records were then delivered
+/// into the abandoned caller's map.
+fn release_ember_search_state(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    search_id: u32,
+) {
+    // A given id is either a node- or a value-lookup; draining both maps
+    // resolves whichever waiter exists.
+    if let Some(tx) = state.ember_dht_pending_lookups.remove(&search_id) {
+        let _ = tx.send(Vec::new());
+    }
+    if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
+        let _ = tx.send(Vec::new());
+    }
+    // An abandoned download source lookup just means "no sources found this
+    // round"; drop its bookkeeping so the map cannot leak across a
+    // long-running download.
+    state.ember_download_source_searches.remove(&search_id);
+    // A user keyword lookup (slice 10) must still clear `ember_pending` and
+    // re-check `search-complete`, or the UI spins forever on the Ember leg.
+    if let Some(kw) = state.ember_keyword_searches.remove(&search_id) {
+        if let Some(active) = state.active_search_request.as_mut() {
+            if active.request_id == kw.request_id {
+                active.ember_pending = false;
+            }
+        }
+        maybe_finish_active_search(state, app_handle, kw.request_id);
+    }
+    if let Some(channel_id) = state.ember_channel_presence_searches.remove(&search_id) {
+        flush_channel_presence_if_idle(state, channel_id);
+    }
+    state.ember_channel_moderation_searches.remove(&search_id);
+    state.ember_channel_handoff_searches.remove(&search_id);
+    state.ember_channel_epoch_searches.remove(&search_id);
+    state.ember_channel_claim_searches.remove(&search_id);
+    // A publish-target lookup can end here rather than through
+    // `maybe_finish_ember_search`: if every send in its first batch fails, the
+    // whole shortlist goes back to Pending, so the search never reports
+    // complete, and with no wire request registered nothing re-drives it. The
+    // key recovers on its own — the next publish re-queues it.
+    state.ember_publish_target_lookups.remove(&search_id);
+    state.ember_search.remove(search_id);
+    state
+        .ember_dht_search_requests
+        .retain(|_, r| r.search_id != search_id);
+}
+
 fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     // Drop in-flight Ember DHT keyword lookups for this request so a
     // cancelled search stops walking (not just unmapping bookkeeping while
@@ -23495,6 +23731,42 @@ async fn try_start_pending_download_from_known_sources(
         ) as u32;
     {
         let mut mgr = transfer_manager.write().await;
+        // Re-check under the same write lock that flips the row to Active.
+        // Every step since the gate at the top of this function awaited, and
+        // Pause/Stop lands from another task: `pause_transfers_batch` pauses and
+        // cancels the control and writes Paused *before* the network task even
+        // sees `PauseDownload`. A pause that arrived during those awaits used to
+        // be overwritten right here, and the worker below then started on an
+        // already-cancelled control, exited immediately, and left the row Active
+        // with nothing behind it — while `PauseDownload` only aborted a handle
+        // and never restored Paused. Checking the control and the status
+        // together, holding the lock, is what makes the two arrival orders
+        // equivalent.
+        if pending.control.is_paused() || pending.control.is_cancelled() {
+            debug!("Not starting {transfer_id}: paused or cancelled while collecting sources");
+            drop(mgr);
+            state
+                .pending_downloads
+                .insert(transfer_id.to_string(), pending);
+            return false;
+        }
+        let still_startable = mgr.active.get(transfer_id).is_some_and(|t| {
+            matches!(
+                t.status,
+                TransferStatus::Searching
+                    | TransferStatus::Active
+                    | TransferStatus::Hashing
+                    | TransferStatus::Queued
+            )
+        });
+        if !still_startable {
+            debug!("Not starting {transfer_id}: no longer in a startable state");
+            drop(mgr);
+            state
+                .pending_downloads
+                .insert(transfer_id.to_string(), pending);
+            return false;
+        }
         mgr.update_status(transfer_id, TransferStatus::Active);
         mgr.update_sources(transfer_id, source_count, 0, 0);
     }
@@ -23615,7 +23887,7 @@ async fn try_start_pending_download_from_known_sources(
         ember_file_hash: state
             .ember_content_hashes
             .get(&hash_bytes)
-            .copied()
+            .map(|pin| pin.digest)
             .unwrap_or([0u8; 32]),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
@@ -23653,27 +23925,36 @@ async fn try_start_pending_download_from_known_sources(
         // defensible to skip it here because a worker reaching this point had
         // almost certainly already exited — but a transfer whose only peers are
         // parked now starts a worker that deliberately stays alive waiting for
-        // a connect-back, so this can genuinely abort a live one. Aborting the
-        // parent does not reach its detached per-source tasks, and the new
-        // `PartFileWriter` must not open the `.part` while the old one's writes
-        // are still in flight.
+        // a connect-back, so this can genuinely abort a live one.
+        //
+        // The waits run off the network task, matching `CancelDownload` and
+        // `PauseDownload`: `abort()` cannot pre-empt a worker parked in
+        // `spawn_blocking` (final verify, MD4, fsync), so joining it inline held
+        // UDP receive, every timer and every IPC snapshot for up to 7 s. The
+        // `.part` hand-off does not rely on this wait — `PART_WRITER_GATES` in
+        // the write coordinator holds the new `PartFileWriter` until the old
+        // writer thread has closed its handle, whichever start path spawned it.
         old_handle.abort();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle).await;
-        if let Some(tracker) = old_tracker {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    let idle = {
-                        let t = tracker.read().await;
-                        t.in_progress_part_count() == 0 && t.write_reservation_count() == 0
-                    };
-                    if idle {
-                        break;
+        let teardown_tid = dl_tid2.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle).await;
+            if let Some(tracker) = old_tracker {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let idle = {
+                            let t = tracker.read().await;
+                            t.in_progress_part_count() == 0 && t.write_reservation_count() == 0
+                        };
+                        if idle {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            })
-            .await;
-        }
+                })
+                .await;
+            }
+            debug!("Previous download worker for {teardown_tid} finished teardown");
+        });
     }
     let handle = tokio::spawn(async move {
         if let Err(e) = ms_download.run(tx).await {
@@ -24298,6 +24579,21 @@ async fn known_clients_snapshot(
     // Stable, useful default order: most-recently-seen first. The UI
     // can re-sort by any column.
     out.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
+    // Bound what crosses IPC. The credit ledger holds up to
+    // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
+    // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
+    // on a repeating timer for a table that renders a thousand rows. Trimming
+    // the *oldest* entries is the right end to lose: they are the peers a
+    // lifetime-view is least likely to be asked about, and the sort above has
+    // already put everything recent first.
+    const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
+    if out.len() > MAX_KNOWN_CLIENT_ROWS {
+        debug!(
+            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
+            out.len()
+        );
+        out.truncate(MAX_KNOWN_CLIENT_ROWS);
+    }
     out
 }
 
@@ -28264,7 +28560,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         let ember_hex = state
                                             .ember_content_hashes
                                             .get(&fh)
-                                            .filter(|d| **d != [0u8; 32])
+                                            .map(|pin| pin.digest)
+                                            .filter(|d| *d != [0u8; 32])
                                             .map(hex::encode)
                                             .or_else(|| {
                                                 existing.as_ref().and_then(|record| {
@@ -28701,6 +28998,38 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         || failure_code == ed2k::transfer::TransferFailureCode::AichHashMismatch;
                     if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel {
                         state.pending_downloads.remove(transfer_id);
+                        // A remote-derived digest that fails the content check is
+                        // worse than no digest at all: every later start for this
+                        // hash re-reads it from the map, so the file can never
+                        // complete however many honest sources turn up, and the
+                        // ed2k/AICH hashes that *did* match count for nothing.
+                        // Drop it so a better-corroborated walk — or an explicit
+                        // click — can pin again. A digest computed from local
+                        // bytes stays: that one is evidence the downloaded bytes
+                        // are wrong, not evidence the pin is.
+                        if is_ember_pin_fail {
+                            let file_hash = {
+                                let mgr = transfer_manager.read().await;
+                                mgr.get_transfer(transfer_id)
+                                    .and_then(|t| hex::decode(&t.file_hash).ok())
+                                    .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+                            };
+                            if let Some(fh) = file_hash {
+                                let remote_pin = state
+                                    .ember_content_hashes
+                                    .get(&fh)
+                                    .is_some_and(|pin| {
+                                        pin.provenance != EmberDigestProvenance::Local
+                                    });
+                                if remote_pin {
+                                    state.ember_content_hashes.remove(&fh);
+                                    warn!(
+                                        "Cleared unverifiable Ember digest pin for {} after a content mismatch",
+                                        hex::encode(fh)
+                                    );
+                                }
+                            }
+                        }
                         info!(
                             "{} pin failed for {transfer_id} — not re-queuing",
                             if is_ember_pin_fail { "Ember BLAKE3" } else { "AICH" }
@@ -29501,14 +29830,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let mut mgr = transfer_manager.write().await;
                         mgr.register_control(&t.id, control.clone());
                     }
+                    let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
                         NetworkCommand::StartDownload {
                             file_hash: t.file_hash.clone(),
                             file_name: t.file_name.clone(),
                             file_size: t.total_size,
-                            peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
-                            peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            peer_ip: resume_peer_ip,
+                            peer_port: resume_peer_port,
                             extra_sources: Vec::new(),
                             ember_file_hash: t.ember_file_hash.clone().unwrap_or_default(),
                             expected_aich: t.expected_aich.clone(),
@@ -30817,7 +31147,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     if bytes.len() == 16 {
                                         let mut uh = [0u8; 16];
                                         uh.copy_from_slice(&bytes);
-                                        let peer_ip = t.peer_id.split(':').next().and_then(|s| s.parse::<Ipv4Addr>().ok());
+                                        let peer_ip =
+                                            split_peer_id(&t.peer_id).0.parse::<Ipv4Addr>().ok();
                                         Some((uh, peer_ip))
                                     } else {
                                         None
@@ -30917,14 +31248,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let mut mgr = transfer_manager.write().await;
                         mgr.register_control(&t.id, control.clone());
                     }
+                    let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
                         NetworkCommand::StartDownload {
                             file_hash: t.file_hash.clone(),
                             file_name: t.file_name.clone(),
                             file_size: t.total_size,
-                            peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
-                            peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            peer_ip: resume_peer_ip,
+                            peer_port: resume_peer_port,
                             extra_sources: Vec::new(),
                             ember_file_hash: t.ember_file_hash.clone().unwrap_or_default(),
                             expected_aich: t.expected_aich.clone(),
@@ -32732,7 +33064,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         trusted_aich_master: expected_aich_master
                                             .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
                                         expected_aich_master,
-                                        ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                                        ember_file_hash: state.ember_content_hashes.get(&hash_bytes).map(|pin| pin.digest).unwrap_or([0u8; 32]),
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
@@ -33909,6 +34241,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             relay_mgr,
                                             quic_cb_tx,
                                             friend_hashes.clone(),
+                                            // The accept task cannot reach
+                                            // `NetworkState`, so the operator's
+                                            // filter and ban list travel to it
+                                            // as the same shared handles the
+                                            // eD2K listener reads. Without
+                                            // them the Ember transport ignored
+                                            // both, and a relay target — an
+                                            // address a remote peer names for
+                                            // us to dial — was checked only
+                                            // for being publicly routable.
+                                            ember::relay::RelayAddressPolicy {
+                                                ip_filter: state.shared_ip_filter.clone(),
+                                                banned_ips: shared_banned_ips.clone(),
+                                                filter_incoming: state
+                                                    .filter_incoming_shared
+                                                    .clone(),
+                                            },
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
 
@@ -35224,12 +35573,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         packet.push(ed2k::messages::OP_EMBER_EXT);
                         packet.extend_from_slice(&payload);
 
-                        let live: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+                        // Friends only, matching who the relay will actually
+                        // serve. `run_quic_accept_loop` admits a RELAY_REQUEST
+                        // only from a friend, so offering to every
+                        // authenticated session advertised a service that
+                        // answers `REJECT_AUTH` — and a rejected relay
+                        // candidate is one the requester spent a QUIC
+                        // handshake to discover was useless. The field name has
+                        // always said friends; the send did not.
+                        // Two sequential reads rather than one nested pair.
+                        // Holding a `friend_hashes` guard across an
+                        // `ember_sessions` acquisition would introduce a lock
+                        // order that no other site follows, and tokio's
+                        // `RwLock` is fair — a queued writer makes even
+                        // read-on-read nesting deadlockable if some other task
+                        // takes the two the other way round. Neither critical
+                        // section is long enough for the split to matter.
+                        let candidates: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
                             let sessions = state.ember_sessions.read().await;
                             sessions
                                 .iter()
                                 .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
                                 .map(|(eh, h)| (*eh, h.session_id(), h.tx.clone()))
+                                .collect()
+                        };
+                        let live: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+                            let friends = friend_hashes.read().await;
+                            candidates
+                                .into_iter()
+                                .filter(|(eh, _, _)| friends.contains(eh))
                                 .collect()
                         };
                         for (eh, session_id, tx) in live {
@@ -37545,7 +37917,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             trusted_aich_master: expected_aich_master
                                 .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
                             expected_aich_master,
-                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).map(|pin| pin.digest).unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -37768,7 +38140,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             trusted_aich_master: expected_aich_master
                                 .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
                             expected_aich_master,
-                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+                            ember_file_hash: state.ember_content_hashes.get(&hash_bytes).map(|pin| pin.digest).unwrap_or([0u8; 32]),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
@@ -37883,20 +38255,47 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             && state.server_connection.is_some()
                             && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
                         {
+                            // Bounded, and it stops at the first write failure.
+                            // Each `send_get_sources` is a TCP write on the
+                            // network task with a 30 s timeout
+                            // (`SERVER_WRITE_TIMEOUT_SECS`), and resuming a
+                            // session can warm-start thousands of rows
+                            // (`MAX_PENDING_DOWNLOADS` is 10,000). Walking that
+                            // list one blocking write at a time against a server
+                            // that has stopped reading parked all networking for
+                            // hours. The periodic sweep below carries whatever
+                            // this tick does not reach, which is why dropping
+                            // the tail costs nothing but a few seconds of
+                            // discovery latency.
+                            const MAX_WARM_START_GETSOURCES_PER_TICK: usize = 10;
                             if let Some(conn) = state.server_connection.as_mut() {
-                                for (tid, fh, file_size) in &targets {
-                                    if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
-                                        if bytes > 0 {
-                                            stats_manager.add_overhead(
-                                                crate::storage::statistics::OverheadCategory::SourceExchange,
-                                                crate::storage::statistics::OverheadDirection::Upload,
-                                                bytes,
+                                for (tid, fh, file_size) in
+                                    targets.iter().take(MAX_WARM_START_GETSOURCES_PER_TICK)
+                                {
+                                    match conn.send_get_sources(fh, *file_size).await {
+                                        Ok(bytes) => {
+                                            if bytes > 0 {
+                                                stats_manager.add_overhead(
+                                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                                    crate::storage::statistics::OverheadDirection::Upload,
+                                                    bytes,
+                                                );
+                                                info!(
+                                                    "Warm-start: sent OP_GETSOURCES to server for resumed download {} ({})",
+                                                    tid,
+                                                    hex::encode(fh),
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // One timed-out write means the
+                                            // server is not draining; the rest
+                                            // of the batch would each cost
+                                            // another full timeout.
+                                            warn!(
+                                                "Warm-start OP_GETSOURCES for {tid} failed: {e} — abandoning the rest of this batch"
                                             );
-                                            info!(
-                                                "Warm-start: sent OP_GETSOURCES to server for resumed download {} ({})",
-                                                tid,
-                                                hex::encode(fh),
-                                            );
+                                            break;
                                         }
                                     }
                                 }
@@ -38486,18 +38885,32 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     {
                         if let Some(conn) = state.server_connection.as_mut() {
                             for (tid, fh, file_size) in &starved {
-                                if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
-                                    if bytes > 0 {
-                                        stats_manager.add_overhead(
-                                            crate::storage::statistics::OverheadCategory::SourceExchange,
-                                            crate::storage::statistics::OverheadDirection::Upload,
-                                            bytes,
+                                // Stop at the first failed write: these are
+                                // sequential 30 s-timeout TCP writes on the
+                                // network task, so a server that has stopped
+                                // reading turns a capped batch into
+                                // `MAX_STARVED_REASK_PER_TICK` back-to-back
+                                // stalls of everything else.
+                                match conn.send_get_sources(fh, *file_size).await {
+                                    Ok(bytes) => {
+                                        if bytes > 0 {
+                                            stats_manager.add_overhead(
+                                                crate::storage::statistics::OverheadCategory::SourceExchange,
+                                                crate::storage::statistics::OverheadDirection::Upload,
+                                                bytes,
+                                            );
+                                            info!(
+                                                "Starved re-ask: sent OP_GETSOURCES to server for active download {} ({})",
+                                                tid,
+                                                hex::encode(fh),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Starved re-ask OP_GETSOURCES for {tid} failed: {e} — abandoning the rest of this batch"
                                         );
-                                        info!(
-                                            "Starved re-ask: sent OP_GETSOURCES to server for active download {} ({})",
-                                            tid,
-                                            hex::encode(fh),
-                                        );
+                                        break;
                                     }
                                 }
                             }
@@ -39427,7 +39840,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 // These sources deliberately do *not* reach the
                                                 // Ember broker: a relay request needs a dialable
                                                 // `target_ip:target_port`, and the relay-side SSRF
-                                                // guard (`is_public_relay_target`) rejects
+                                                // guard (`relay_target_refusal`) rejects
                                                 // `0.0.0.0:0` on both its port and address checks.
                                                 // Brokering them would require discovering an
                                                 // address first — i.e. a KAD buddy record, which is
@@ -41354,7 +41767,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     ember_file_hash: state
                                         .ember_content_hashes
                                         .get(&file_hash)
-                                        .copied()
+                                        .map(|pin| pin.digest)
                                         .unwrap_or([0u8; 32]),
                                     geoip: geoip.clone(),
                                     tracker_registry: Some(state.tracker_registry.clone()),
@@ -41657,7 +42070,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 trusted_aich_master: expected_aich_master
                                     .or_else(|| state.aich_root_map.get(&parts.file_hash).copied()),
                                 expected_aich_master,
-                                ember_file_hash: state.ember_content_hashes.get(&parts.file_hash).copied().unwrap_or([0u8; 32]),
+                                ember_file_hash: state.ember_content_hashes.get(&parts.file_hash).map(|pin| pin.digest).unwrap_or([0u8; 32]),
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
                                 file_req_overhead: stats_manager.file_req_counters.clone(),
@@ -42687,7 +43100,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Drained here rather than in its own `select!` arm because
                 // this loop is already at tokio's 64-branch ceiling.
                 while let Ok((digest_hash, digest)) = ember_digest_result_rx.try_recv() {
-                    state.ember_content_hashes.insert(digest_hash, digest);
+                    // Hashed from the completed bytes on this disk, so it
+                    // outranks any DHT claim about the same file.
+                    seed_ember_content_hash(
+                        &mut state.ember_content_hashes,
+                        digest_hash,
+                        digest,
+                        EmberDigestProvenance::Local,
+                    );
                     let digest_hex = hex::encode(digest);
                     if let Some(record) = known_files.find_by_hash_mut(&digest_hash) {
                         if record.ember_file_hash != digest_hex {
@@ -43390,7 +43810,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.ember_noise_keys.contains_key(key)
                         || state.ember_keyless_peers.contains_key(key)
                 });
-                prune_ember_content_hashes(&mut state, &transfer_manager, &local_index).await;
+                prune_ember_content_hashes(&mut state, &transfer_manager, &local_index);
                 let pruned_after = state.known_ember_peers.len();
                 if pruned_after != pruned_before {
                     state.stats.ember_peers = pruned_after as u32;
@@ -43630,49 +44050,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 //    both maps resolves whichever waiter exists.
                 for search in state.ember_search.cleanup_expired() {
                     record_ember_find_value_quality(&mut state.ember_diagnostics, &search);
-                    let search_id = search.id;
-                    if let Some(tx) = state.ember_dht_pending_lookups.remove(&search_id) {
-                        let _ = tx.send(Vec::new());
-                    }
-                    if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
-                        let _ = tx.send(Vec::new());
-                    }
-                    // A timed-out download source lookup just means "no sources
-                    // found this round"; drop its bookkeeping so the map can't
-                    // leak across a long-running download.
-                    state.ember_download_source_searches.remove(&search_id);
-                    // A timed-out user keyword lookup (slice 10) must still
-                    // clear `ember_pending` and re-check `search-complete`, or
-                    // the UI would spin forever waiting on the Ember leg.
-                    if let Some(kw) = state.ember_keyword_searches.remove(&search_id) {
-                        if let Some(active) = state.active_search_request.as_mut() {
-                            if active.request_id == kw.request_id {
-                                active.ember_pending = false;
-                            }
-                        }
-                        maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
-                    }
-                    if let Some(channel_id) =
-                        state.ember_channel_presence_searches.remove(&search_id)
-                    {
-                        flush_channel_presence_if_idle(&mut state, channel_id);
-                    }
-                    state.ember_channel_moderation_searches.remove(&search_id);
-                    state.ember_channel_handoff_searches.remove(&search_id);
-                    state.ember_channel_epoch_searches.remove(&search_id);
-                    state.ember_channel_claim_searches.remove(&search_id);
-                    // A publish-target lookup can end here rather than through
-                    // `maybe_finish_ember_search`: if every send in its first
-                    // batch fails, the whole shortlist goes back to Pending, so
-                    // the search never reports complete, and with no wire request
-                    // registered nothing re-drives it. This was the one
-                    // search-keyed map the sweep did not drain, so the entry
-                    // outlived the process. The key recovers on its own — the
-                    // next publish re-queues it.
-                    state.ember_publish_target_lookups.remove(&search_id);
-                    state
-                        .ember_dht_search_requests
-                        .retain(|_, r| r.search_id != search_id);
+                    release_ember_search_state(&mut state, &app_handle, search.id);
                 }
 
                 // 4) Same lifecycle for publishes: expire unanswered
@@ -44193,9 +44571,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         for row in &built.results {
                             kw.streamed_files.insert(row.file.hash.clone());
                         }
-                        for (ed2k, digest) in &built.corroborated {
-                            state.ember_content_hashes.entry(*ed2k).or_insert(*digest);
-                        }
+                        // Streamed pages deliberately do not seed the enforced
+                        // digest map. Corroboration is computed per batch, so a
+                        // slice holding two early publishers "agrees" on a digest
+                        // the finished walk may well contradict — and the closing
+                        // batch below re-derives every plurality across *all*
+                        // records anyway. Pinning here only risked enforcing the
+                        // partial answer, which fails completion for good.
                         let batch = EmberKeywordResultBatch {
                             request_id: kw.request_id,
                             results: built.results,
@@ -44938,17 +45320,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     for i in 0..batch_size {
                         let idx = (cursor + i) % total;
                         let (_, ref fh, file_size, _) = all_downloads[idx];
-                        if let Ok(bytes) = conn.send_get_sources(fh, file_size).await {
-                            if bytes > 0 { sent += 1; }
-                            // Periodic TCP source-asking sweep also counts as
-                            // SourceExchange overhead — same wire flow as the
-                            // login-time and on-demand requests below.
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
+                        match conn.send_get_sources(fh, file_size).await {
+                            Ok(bytes) => {
+                                if bytes > 0 {
+                                    sent += 1;
+                                    // Periodic TCP source-asking sweep also counts as
+                                    // SourceExchange overhead — same wire flow as the
+                                    // login-time and on-demand requests below.
+                                    stats_manager.add_overhead(
+                                        crate::storage::statistics::OverheadCategory::SourceExchange,
+                                        crate::storage::statistics::OverheadDirection::Upload,
+                                        bytes,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // Sequential 30 s-timeout TCP writes on the
+                                // network task: continuing past a failure makes
+                                // the whole frame cost `batch_size` timeouts
+                                // with nothing to show for it. The cursor still
+                                // advances, so the next sweep starts elsewhere.
+                                warn!(
+                                    "TCP source batch: OP_GETSOURCES write failed: {e} — abandoning the rest of this frame"
                                 );
+                                break;
                             }
                         }
                     }
@@ -47805,8 +48200,13 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // availability update carrying these corrected values.
                 let built =
                     build_ember_keyword_built(&records, &kw.keywords, kw.query_expr.as_ref());
-                for (ed2k, digest) in &built.corroborated {
-                    state.ember_content_hashes.entry(*ed2k).or_insert(*digest);
+                for (ed2k, digest, publishers) in &built.corroborated {
+                    seed_ember_content_hash(
+                        &mut state.ember_content_hashes,
+                        *ed2k,
+                        *digest,
+                        EmberDigestProvenance::Corroborated(*publishers),
+                    );
                 }
                 let results = built.results;
                 state
@@ -47887,7 +48287,7 @@ fn parse_ember_source_records(
     diag: &mut crate::types::EmberDiagnostics,
     noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     established: &HashSet<(Ipv4Addr, u16)>,
-    content_hashes: &mut HashMap<[u8; 16], [u8; 32]>,
+    content_hashes: &mut HashMap<[u8; 16], EmberDigestPin>,
 ) -> Vec<ember::dht::publish::DiscoveredSource> {
     let mut out = Vec::new();
     // Expected-digest votes, keyed by publisher. A source record is signed
@@ -47945,27 +48345,30 @@ fn parse_ember_source_records(
                 .unwrap_or([0u8; 16]),
         });
     }
-    // Fill a gap, never correct one, and only on corroboration. This map is the
-    // digest the transfer enforces at completion, so overwriting an entry fails
-    // the verify, leaves `corrupt_part_indices_on_disk` nothing to point at, and
-    // re-downloads every part forever.
-    //
-    // What is already in the map is *not* necessarily trusted, which an earlier
-    // version of this comment claimed: a keyword search pre-seeds the same map
-    // from corroborated results a little further up, so a gap can be filled by
-    // remote data either way. `or_insert` on `StartDownload` never overwrites
-    // a pin that is already there.
-    if let Some(digest) = corroborated_ember_digest(&publisher_digests) {
-        content_hashes.entry(file_hash).or_insert(digest);
+    // Only ever on corroboration, and only if this plurality rests on more
+    // publishers than whatever is already pinned. This map is the digest the
+    // transfer enforces at completion, so a careless overwrite fails the verify,
+    // leaves `corrupt_part_indices_on_disk` nothing to point at, and re-downloads
+    // every part forever — which is why `seed_ember_content_hash` demands
+    // strictly better evidence rather than taking the newest claim.
+    if let Some((digest, publishers)) = corroborated_ember_digest_with_count(&publisher_digests) {
+        seed_ember_content_hash(
+            content_hashes,
+            file_hash,
+            digest,
+            EmberDigestProvenance::Corroborated(publishers),
+        );
     }
     out
 }
 
 struct EmberKeywordBuilt {
     results: Vec<SearchResult>,
-    /// Digests at least two publishers agree on — safe to `or_insert` into
-    /// `ember_content_hashes` without a user click.
-    corroborated: Vec<([u8; 16], [u8; 32])>,
+    /// Digests at least [`MIN_EMBER_DIGEST_PUBLISHERS`] publishers agree on,
+    /// with the number that agreed — safe to seed into `ember_content_hashes`
+    /// without a user click. The count travels with the digest so a later or
+    /// more complete walk can supersede a pin made on thinner evidence.
+    corroborated: Vec<([u8; 16], [u8; 32], usize)>,
 }
 
 /// Build search rows from Ember DHT keyword `FIND_VALUE` blobs (slice 10).
@@ -48136,8 +48539,8 @@ fn build_ember_keyword_built(
         result.file.ember_file_hash = majority_ember_digest(votes)
             .map(hex::encode)
             .unwrap_or_default();
-        if let Some(digest) = corroborated_ember_digest(votes) {
-            corroborated.push((*hash, digest));
+        if let Some((digest, publishers)) = corroborated_ember_digest_with_count(votes) {
+            corroborated.push((*hash, digest, publishers));
         }
     }
     EmberKeywordBuilt {
@@ -48187,10 +48590,88 @@ fn majority_ember_digest_with_count(
 const MIN_EMBER_DIGEST_PUBLISHERS: usize = 2;
 
 /// The plurality digest, but only once [`MIN_EMBER_DIGEST_PUBLISHERS`] agree.
+///
+/// Runtime callers need the agreeing-publisher count as well, so they use
+/// [`corroborated_ember_digest_with_count`]; this is the shape the corroboration
+/// tests assert against.
+#[cfg(test)]
 fn corroborated_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
+    corroborated_ember_digest_with_count(publisher_digests).map(|(digest, _)| digest)
+}
+
+/// [`corroborated_ember_digest`] plus how many publishers agreed.
+///
+/// The count is what lets a later, more complete walk supersede a pin an
+/// earlier one made on thinner evidence — see [`EmberDigestProvenance`].
+fn corroborated_ember_digest_with_count(
+    publisher_digests: &HashMap<[u8; 32], [u8; 32]>,
+) -> Option<([u8; 32], usize)> {
     majority_ember_digest_with_count(publisher_digests)
         .filter(|(_, agreeing)| *agreeing >= MIN_EMBER_DIGEST_PUBLISHERS)
-        .map(|(digest, _)| digest)
+}
+
+/// How much evidence stands behind an entry in
+/// [`NetworkState::ember_content_hashes`].
+///
+/// That map is what a transfer *enforces* at completion, so which of several
+/// competing digests wins has to be decided by evidence, not by arrival order.
+/// Ordering by arrival was wrong in two ways at once. An incremental
+/// `FIND_VALUE` page corroborates within its own slice, so two early publishers
+/// could pin a digest that the finished walk then contradicts — and once pinned,
+/// nothing could correct it. And the digest on the row the user actually clicked
+/// lost to whatever a partial page had already seeded, so an explicit choice was
+/// silently overridden by a guess.
+///
+/// Derived `Ord` is the precedence, so variants are declared weakest first:
+/// more agreeing publishers beat fewer, an explicit user pick beats any DHT
+/// plurality, and bytes hashed on this machine beat everything remote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EmberDigestProvenance {
+    /// Plurality agreement among this many distinct DHT publishers. Publisher
+    /// keys are free to mint, so this only ranks claims against each other; it
+    /// is not a trust anchor.
+    Corroborated(usize),
+    /// The digest carried by the search row the user clicked to download. One
+    /// publisher is enough here because the user chose it.
+    UserSelected,
+    /// Computed from bytes on this machine — known.met, the library index, or a
+    /// completed local hash. Nothing remote may outrank it.
+    Local,
+}
+
+/// An expected Ember BLAKE3 together with the evidence behind it.
+#[derive(Clone, Copy, Debug)]
+struct EmberDigestPin {
+    digest: [u8; 32],
+    provenance: EmberDigestProvenance,
+}
+
+/// Record `digest` as the expected content hash for `file_hash`, keeping
+/// whichever of the incumbent and the newcomer rests on better evidence.
+///
+/// Replacement is strict: equal evidence leaves the incumbent alone, so two
+/// publishers asserting a rival digest cannot flip a live pin back and forth
+/// mid-transfer. An all-zero digest means "no claim" and is ignored.
+fn seed_ember_content_hash(
+    pins: &mut HashMap<[u8; 16], EmberDigestPin>,
+    file_hash: [u8; 16],
+    digest: [u8; 32],
+    provenance: EmberDigestProvenance,
+) {
+    if digest == [0u8; 32] {
+        return;
+    }
+    let pin = EmberDigestPin { digest, provenance };
+    match pins.entry(file_hash) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(pin);
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            if provenance > slot.get().provenance {
+                slot.insert(pin);
+            }
+        }
+    }
 }
 
 /// Send everything the batch publisher has queued, one or more `STORE_BATCH`

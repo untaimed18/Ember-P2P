@@ -34,7 +34,6 @@
   } from '$lib/utils';
   import { openExternalUrl } from '$lib/api/settings';
   import { toast, toastError } from '$lib/stores/toast';
-  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
 
@@ -1581,20 +1580,22 @@
     });
   });
 
-  let pendingLink = $state('');
-  let linkConfirmOpen = $state(false);
-
-  function askOpenLink(href: string) {
-    pendingLink = href;
-    linkConfirmOpen = true;
-  }
-
-  async function openPendingLink() {
-    const url = pendingLink;
-    pendingLink = '';
-    if (!url) return;
+  /**
+   * Hand a link in a message to the backend, which decides whether it may be
+   * opened and asks the user itself.
+   *
+   * No prompt here. `open_external_url` shows a native confirmation naming the
+   * host before anything reaches the browser, and that is the one that counts:
+   * a renderer under someone else's control simply would not run a prompt of
+   * its own. Asking twice for the same decision trained people to click
+   * through the dialog that actually protects them.
+   *
+   * Declining the native dialog resolves as success — nothing happened, which
+   * is what the user asked for — so there is no toast for a cancelled open.
+   */
+  async function askOpenLink(href: string) {
     try {
-      await openExternalUrl(url);
+      await openExternalUrl(href);
     } catch (e) {
       toast(translateError(e));
     }
@@ -1800,7 +1801,7 @@
                   type="button"
                   class="bubble-link"
                   title={seg.href}
-                  onclick={() => askOpenLink(seg.href!)}
+                  onclick={() => void askOpenLink(seg.href!)}
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
@@ -2049,18 +2050,6 @@
     </div>
   {/if}
 </div>
-
-<!-- `isolateMessage` so a link cannot reorder the dialog's own text around it. -->
-<ConfirmDialog
-  bind:open={linkConfirmOpen}
-  title={m.chat_link_open_title()}
-  message={pendingLink}
-  isolateMessage
-  confirmLabel={m.chat_link_open_confirm()}
-  onconfirm={openPendingLink}
-  oncancel={() => (pendingLink = '')}
-  ondismiss={() => (pendingLink = '')}
-/>
 
 <style>
   .conversation {

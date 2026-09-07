@@ -17,7 +17,7 @@
     "ordering there (JS sorts by UTF-16 code unit, Rust by byte)."
   ],
   "max_plausible_sources": 65535,
-  "max_source_addrs": 500,
+  "max_source_addrs": 64,
   "result_key_cases": [
     {
       "name": "the ed2k hash wins over every fallback",

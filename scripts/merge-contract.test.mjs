@@ -200,16 +200,36 @@ test("the Rust side derives its ceiling from the same wire limit", () => {
 });
 
 test("the source-address cap matches the fixture on both sides", () => {
-  assert.equal(fixture.max_source_addrs, 500);
+  // Unlike MAX_PLAUSIBLE_SOURCES, this number is not fixed by the wire format
+  // — it is a tuning choice, so the fixture holds it and neither
+  // implementation is allowed its own copy.
   const rust = readFileSync(rustMergePath, "utf8");
-  assert.match(
-    rust,
-    /const MAX_SOURCE_ADDRS: usize = 500;/,
-    "src-tauri/src/search/merge.rs no longer pins MAX_SOURCE_ADDRS at 500",
+  const rustDeclared = rust.match(/const MAX_SOURCE_ADDRS: usize = (\d+);/);
+  assert.ok(
+    rustDeclared,
+    "src-tauri/src/search/merge.rs no longer declares MAX_SOURCE_ADDRS",
   );
+  assert.equal(Number(rustDeclared[1]), fixture.max_source_addrs);
   const declared = store.match(/const MAX_SOURCE_ADDRS = (\d+)/);
   assert.ok(declared, "MAX_SOURCE_ADDRS is no longer declared in src/lib/stores/search.ts");
   assert.equal(Number(declared[1]), fixture.max_source_addrs);
+});
+
+test("the source-address cap stays within what a download will accept", () => {
+  // The cap exists to bound a payload, so it must not sit above the point
+  // where the addresses stop being usable: `start_download` truncates the
+  // frontend's extras at MAX_EXTRA_SOURCES_IPC. Anything past that is merged,
+  // held for up to 15,000 rows per tab and serialised on every
+  // `search-results` batch, only to be discarded on arrival.
+  const ipcPath = join(root, "src-tauri", "src", "commands", "transfers.rs");
+  const ipcCap = readFileSync(ipcPath, "utf8").match(
+    /const MAX_EXTRA_SOURCES_IPC: usize = ([\d_]+);/,
+  );
+  assert.ok(ipcCap, "MAX_EXTRA_SOURCES_IPC is no longer declared in commands/transfers.rs");
+  assert.ok(
+    fixture.max_source_addrs <= Number(ipcCap[1].replaceAll("_", "")),
+    `max_source_addrs (${fixture.max_source_addrs}) exceeds MAX_EXTRA_SOURCES_IPC (${ipcCap[1]})`,
+  );
 });
 
 test("the fixture actually carries cases", () => {

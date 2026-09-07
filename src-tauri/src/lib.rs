@@ -1831,6 +1831,7 @@ pub fn run() {
             commands::peers::get_kad_searches,
             commands::peers::kad_cancel_search,
             commands::peers::get_peer_reputation,
+            commands::peers::get_peer_reputation_batch,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
             commands::peers::ember_ping_peer,

@@ -153,9 +153,16 @@ export async function openEmberShare(target: EmberShareTarget, text: string): Pr
  *
  * Unlike every other opener here this one takes a URL, because the URL is
  * whatever somebody typed into a room. The backend allows only `http` and
- * `https` and refuses embedded credentials, control characters and bidi
- * overrides; callers are still expected to confirm the destination with the
- * user first, because a link and where it goes are different things.
+ * `https`, refuses embedded credentials, control characters and bidi
+ * overrides, rejects hosts that are — or resolve to — loopback, private or
+ * link-local space, and then asks the user to confirm with a native dialog
+ * naming the host.
+ *
+ * Callers must not add a confirmation of their own. The native one cannot be
+ * skipped by a compromised renderer, which is the whole point of it, and a
+ * second prompt for the same decision only teaches people to dismiss both.
+ * A declined dialog resolves successfully: nothing was opened, which is not
+ * an error.
  */
 export async function openExternalUrl(url: string): Promise<void> {
   return invoke('open_external_url', { url });

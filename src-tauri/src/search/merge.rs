@@ -114,7 +114,17 @@ pub fn combine_origin(a: &str, b: &str) -> String {
     parts.join(" · ")
 }
 
-const MAX_SOURCE_ADDRS: usize = 500;
+/// Peer addresses carried on a single search row.
+///
+/// Sized to what a download can actually consume, not to what the network can
+/// report. `start_download` truncates the frontend's extras at
+/// `MAX_EXTRA_SOURCES_IPC` (64) and the network task's seeding stops at
+/// `MAX_SEED_EXTRA_SOURCES` (49), so every address past the sixty-fourth was
+/// discarded on arrival — while still being merged, deduped, held in memory for
+/// up to 15,000 rows per tab, and serialised across IPC on every
+/// `search-results` batch. Source discovery finds the rest of a swarm anyway;
+/// these are only the seeds that save it a round trip.
+const MAX_SOURCE_ADDRS: usize = 64;
 
 /// Plausibility ceiling for peer-reported swarm counts.
 ///

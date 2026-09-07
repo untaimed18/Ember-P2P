@@ -185,6 +185,43 @@ pub struct PartTracker {
     save_generation: Arc<AtomicU64>,
 }
 
+/// Parts the tracker will model for `file_size`, or `None` when the size is
+/// outside anything an ed2k client can represent.
+///
+/// Two ways the naive `((file_size + PARTSIZE - 1) / PARTSIZE)` kills the
+/// process, both reachable from a `.part.met` a crash truncated or a hostile
+/// peer's metadata shaped:
+///   * `file_size + PARTSIZE - 1` overflows `u64` for any size within one part
+///     of `u64::MAX`, and the release profile sets `overflow-checks = true`
+///     (see `Cargo.toml`), so the addition *panics* rather than wrapping.
+///     `div_ceil` cannot overflow and removes that.
+///   * a merely absurd size — `1 << 60`, say — survives `div_ceil` and then
+///     aborts one line later instead, because every per-part vector in the
+///     tracker is sized from this count and a hundred billion parts is a
+///     hundred billion elements to allocate.
+///
+/// Live download workers filter implausible sizes first, against
+/// `AppSettings::ed2k_download_limits` (whose ceiling is 593 GiB, comfortably
+/// under `ED2K_MAX_FILE_SIZE_BYTES`). The tracker constructors, the
+/// restore-from-disk path and `commands::transfers::verify_recovery_ranges`
+/// are all reachable without ever passing that gate.
+fn tracked_part_count(file_size: u64, part_file: &Path) -> Option<usize> {
+    if file_size == 0 {
+        return Some(0);
+    }
+    if file_size > super::messages::ED2K_MAX_FILE_SIZE_BYTES {
+        tracing::warn!(
+            "part.met: file size {file_size} exceeds the ed2k ceiling of {} bytes — \
+             tracking zero parts for {}, so no part is selectable for download and \
+             no byte range is serveable",
+            super::messages::ED2K_MAX_FILE_SIZE_BYTES,
+            part_file.display()
+        );
+        return None;
+    }
+    Some(file_size.div_ceil(PARTSIZE) as usize)
+}
+
 impl PartTracker {
     pub fn new(file_size: u64, part_file: &Path) -> Self {
         Self::new_with_identity(file_size, part_file, [0u8; 16])
@@ -205,11 +242,8 @@ impl PartTracker {
         part_file: &Path,
         expected_file_hash: [u8; 16],
     ) -> Self {
-        let part_count = if file_size == 0 {
-            0
-        } else {
-            ((file_size + PARTSIZE - 1) / PARTSIZE) as usize
-        };
+        let tracked = tracked_part_count(file_size, part_file);
+        let part_count = tracked.unwrap_or(0);
 
         let met_path = part_file.with_extension("part.met");
 
@@ -232,18 +266,24 @@ impl PartTracker {
             save_generation: Arc::new(AtomicU64::new(0)),
         };
 
-        tracker.load();
+        // A size the tracker refused to model must not adopt resume state
+        // either. `load_emule_format` accepts a tag set with no gap entries as
+        // a complete-but-unverified candidate, so a sidecar naming an absurd
+        // size would come back claiming that whole size is already on disk, and
+        // every verified bit it restores is a bit the upload serve gate would
+        // otherwise have to trust. Leaving the untouched `(0, file_size)` gap in
+        // place is the only honest answer for a size we cannot index: the file
+        // stays permanently incomplete and permanently unserveable.
+        if tracked.is_some() {
+            tracker.load();
+        }
         tracker
     }
 
     /// Create a fresh tracker that ignores any existing `.part.met` on disk.
     /// Used when the `.part` data file is missing but a stale `.part.met` exists.
     pub fn new_empty(file_size: u64, part_file: &Path) -> Self {
-        let part_count = if file_size == 0 {
-            0
-        } else {
-            ((file_size + PARTSIZE - 1) / PARTSIZE) as usize
-        };
+        let part_count = tracked_part_count(file_size, part_file).unwrap_or(0);
         let met_path = part_file.with_extension("part.met");
         PartTracker {
             file_size,
@@ -2192,5 +2232,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&met_path);
+    }
+
+    /// The part count used to be `((file_size + PARTSIZE - 1) / PARTSIZE)`,
+    /// which panics under the release profile's `overflow-checks` for any size
+    /// within one part of `u64::MAX`, and for a merely absurd size produced a
+    /// count whose per-part vectors cannot be allocated. Neither input is
+    /// theoretical: `.part.met` restore and the archive-recovery verification
+    /// path both build a tracker straight from a stored size without passing
+    /// `ed2k_download_limits`, so one truncated or hostile sidecar record is
+    /// enough. Such a size has to fail closed — nothing selectable to download,
+    /// nothing serveable, and no claim of progress — rather than crash.
+    #[test]
+    fn an_unrepresentable_file_size_is_refused_instead_of_panicking() {
+        let part_path = temp_part_path("oversize");
+        for file_size in [
+            u64::MAX,
+            u64::MAX - PARTSIZE / 2,
+            1u64 << 60,
+            super::super::messages::ED2K_MAX_FILE_SIZE_BYTES + 1,
+        ] {
+            let tracker = PartTracker::new(file_size, &part_path);
+            assert_eq!(tracker.part_count, 0, "size {file_size}");
+            assert_eq!(tracker.gap_list(), &[(0, file_size)], "size {file_size}");
+            assert!(!tracker.all_complete(), "size {file_size}");
+            assert_eq!(tracker.completed_bytes(), 0, "size {file_size}");
+            assert!(tracker.needed_parts(&[]).is_empty(), "size {file_size}");
+            assert!(tracker.completed_parts().is_empty(), "size {file_size}");
+            assert!(tracker.serveable_parts().is_empty(), "size {file_size}");
+            assert!(
+                !tracker.is_range_safe_to_serve(0, PARTSIZE),
+                "size {file_size}"
+            );
+            assert_eq!(
+                PartTracker::new_empty(file_size, &part_path).part_count,
+                0,
+                "size {file_size}"
+            );
+        }
+
+        // The largest size that IS representable keeps every one of its parts —
+        // the rejection must not creep down into files the app will really take.
+        let max = super::super::messages::ED2K_MAX_FILE_SIZE_BYTES;
+        assert_eq!(
+            PartTracker::new_empty(max, &part_path).part_count,
+            super::super::messages::ed2k_part_count_for_size(max)
+        );
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }
 }

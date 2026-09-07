@@ -11183,7 +11183,12 @@ fn compute_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 16]>
 
     file.seek(SeekFrom::Start(0))?;
     let file_size = file.metadata()?.len();
-    let num_parts = ((file_size + PARTSIZE - 1) / PARTSIZE) as usize;
+    // `div_ceil`, not `(size + PARTSIZE - 1) / PARTSIZE`: the release profile
+    // sets `overflow-checks`, so that addition panics rather than wraps. A size
+    // this close to `u64::MAX` cannot come from a real file's metadata, but the
+    // part tracker shares this arithmetic and is reachable from a truncated
+    // `.part.met`, so the two should not differ on which sizes are survivable.
+    let num_parts = file_size.div_ceil(PARTSIZE) as usize;
 
     let mut hashes = Vec::with_capacity(num_parts + 1);
     let mut buf = vec![0u8; 64 * 1024];

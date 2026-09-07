@@ -565,11 +565,34 @@ async fn handle_command_inner(
                         &hashed,
                         !query_expr.as_ref().is_some_and(|e| e.contains_or()),
                     );
-                    if let Some(search_id) = state.ember_search.start_find_value(
+                    let ember_search_id = state.ember_search.start_find_value(
                         ember::dht::EmberNodeId(*primary_hash),
                         extras.clone(),
                         state.ember_dht.routing(),
-                    ) {
+                    );
+                    if ember_search_id.is_none() {
+                        // The pool holds a quarter of its slots back for user
+                        // searches (`MAX_BACKGROUND_SEARCHES`), so reaching this
+                        // means even the reserve is spent. Say so: this leg
+                        // silently vanishing is indistinguishable from "the
+                        // Ember network has nothing", which sent people looking
+                        // for a fault in their DHT setup that was not there.
+                        // Mirrors the `KadBusy` notice above.
+                        warn!(
+                            "Ember search pool exhausted ({} active); this query runs without its Ember leg",
+                            state.ember_search.active_count()
+                        );
+                        let _ = app_handle.emit(
+                            "search-progress",
+                            SearchProgressEvent {
+                                request_id,
+                                nodes_contacted: 0,
+                                results_so_far: 0,
+                                phase: "EmberBusy".to_string(),
+                            },
+                        );
+                    }
+                    if let Some(search_id) = ember_search_id {
                         // Hand the size and type limits to the responders, so a
                         // narrow search does not spend its result budget on
                         // records it would discard at emit. Availability is not
@@ -864,6 +887,35 @@ async fn handle_command_inner(
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
                 });
             }
+            // Assert the invariant the UI depends on: a paused row has no
+            // worker, so it must not still read Active. `pause_transfers_batch`
+            // pauses the control and writes Paused under the manager's write
+            // lock before this command is enqueued, so normally there is nothing
+            // to repair — but this handler is the last step of a pause, and an
+            // Active row with no worker behind it is a dead end for the user:
+            // the transfer view offers the controls for a running transfer and
+            // none of them apply. Cheaper to re-establish it here than to trust
+            // every start path forever.
+            {
+                let mut mgr = transfer_manager.write().await;
+                let stale_active = mgr
+                    .get_transfer(&transfer_id)
+                    .is_some_and(|t| matches!(t.status, TransferStatus::Active));
+                if stale_active {
+                    warn!(
+                        "Pause left {transfer_id} marked Active with no worker; restoring Paused"
+                    );
+                    mgr.update_status(&transfer_id, TransferStatus::Paused);
+                    drop(mgr);
+                    let _ = app_handle.emit(
+                        "transfer-status",
+                        serde_json::json!({
+                            "id": transfer_id,
+                            "status": "paused",
+                        }),
+                    );
+                }
+            }
             // Drop KAD-callback placeholder timestamps: the manager
             // clears `source_details` for this transfer on pause
             // (see `TransferManager::pause`), so any pending_since
@@ -933,22 +985,47 @@ async fn handle_command_inner(
             // we already hashed this file before.
             if let Ok(bytes) = hex::decode(file_hash.trim()) {
                 if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                    // Provenance, not arrival order, decides which digest a
+                    // transfer enforces. The caller's digest is the row the user
+                    // clicked, so it outranks any plurality a background walk
+                    // seeded; known.met and the library index are bytes hashed
+                    // here, so they outrank everything remote.
                     let mut digest = parse_ember_file_hash(&ember_file_hash);
+                    let mut provenance = EmberDigestProvenance::UserSelected;
                     if digest == [0u8; 32] {
                         if let Some(rec) = known_files.find_by_hash(&ed2k) {
                             digest = parse_ember_file_hash(&rec.ember_file_hash);
+                            provenance = EmberDigestProvenance::Local;
                         }
                     }
                     if digest == [0u8; 32] {
+                        // `try_read`: a library scan holds this lock across
+                        // `rebuild_indices`, and this arm runs inside the
+                        // network `select!`, so waiting for it stalled all
+                        // networking behind a full re-index. Missing the
+                        // fallback is survivable — the digest is only a
+                        // second-guess after known.met, ed2k and AICH still
+                        // verify the file, and the completed-file hash seeds
+                        // the map for next time — whereas blocking here is not.
                         let hash_hex = hex::encode(ed2k);
-                        let idx = local_index.read().await;
-                        if let Some(f) = idx.get_by_hash(&hash_hex) {
-                            digest = parse_ember_file_hash(&f.ember_file_hash);
+                        match local_index.try_read() {
+                            Ok(idx) => {
+                                if let Some(f) = idx.get_by_hash(&hash_hex) {
+                                    digest = parse_ember_file_hash(&f.ember_file_hash);
+                                    provenance = EmberDigestProvenance::Local;
+                                }
+                            }
+                            Err(_) => debug!(
+                                "Library index busy; starting {transfer_id} without its local Ember digest"
+                            ),
                         }
                     }
-                    if digest != [0u8; 32] {
-                        state.ember_content_hashes.entry(ed2k).or_insert(digest);
-                    }
+                    seed_ember_content_hash(
+                        &mut state.ember_content_hashes,
+                        ed2k,
+                        digest,
+                        provenance,
+                    );
                 }
             }
 
@@ -1375,7 +1452,7 @@ async fn handle_command_inner(
                         ember_file_hash: state
                             .ember_content_hashes
                             .get(&hash_bytes)
-                            .copied()
+                            .map(|pin| pin.digest)
                             .unwrap_or([0u8; 32]),
                         geoip: geoip.clone(),
                         tracker_registry: Some(state.tracker_registry.clone()),
@@ -1413,31 +1490,47 @@ async fn handle_command_inner(
                             "Aborting existing download task for {tid2} before starting new one"
                         );
                         old_handle.abort();
-                        // Parent Drop now aborts child AbortHandles. Wait for
-                        // the worker, then for in-progress claims so the new
-                        // PartFileWriter does not overlap the old one.
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
-                            .await;
-                        if let Some(tracker) = old_tracker {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                async {
-                                    loop {
-                                        let idle = {
-                                            let t = tracker.read().await;
-                                            t.in_progress_part_count() == 0
-                                                && t.write_reservation_count() == 0
-                                        };
-                                        if idle {
-                                            break;
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(20))
+                        // Joined off the network task, matching `CancelDownload`
+                        // and `PauseDownload`. `abort()` cannot pre-empt a worker
+                        // parked in `spawn_blocking` (final verify, MD4, fsync),
+                        // so waiting here held UDP receive, every timer and every
+                        // IPC snapshot for up to 7 s — on the very path a user
+                        // hits by resuming a download. Ordering of the `.part`
+                        // hand-off does not depend on this wait:
+                        // `PART_WRITER_GATES` in the write coordinator holds the
+                        // new `PartFileWriter` until the old writer thread has
+                        // closed its handle, whichever start path spawned it.
+                        let teardown_tid = tid2.clone();
+                        tokio::spawn(async move {
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
+                                    .await;
+                            if let Some(tracker) = old_tracker {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        loop {
+                                            let idle = {
+                                                let t = tracker.read().await;
+                                                t.in_progress_part_count() == 0
+                                                    && t.write_reservation_count() == 0
+                                            };
+                                            if idle {
+                                                break;
+                                            }
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(20),
+                                            )
                                             .await;
-                                    }
-                                },
-                            )
-                            .await;
-                        }
+                                        }
+                                    },
+                                )
+                                .await;
+                            }
+                            debug!(
+                                "Previous download worker for {teardown_tid} finished teardown"
+                            );
+                        });
                     }
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
@@ -1892,12 +1985,45 @@ async fn handle_command_inner(
                 }
                 for ip in &ips_to_ban {
                     state.banned_ips.insert(*ip);
-                    // Persist the IP against this peer so the ban survives a
-                    // restart (boot rebuilds banned_ips from banned peers'
-                    // addresses) and so unban_peer — which walks the peer's
-                    // addresses — clears it again. Keeps ban/unban symmetric.
-                    if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
-                        warn!("Failed to persist banned IP {ip} for peer {peer_id_hex}: {e}");
+                }
+                // Persist each IP against this peer so the ban survives a
+                // restart (boot rebuilds banned_ips from banned peers'
+                // addresses) and so unban_peer — which walks the peer's
+                // addresses — clears it again. Keeps ban/unban symmetric.
+                //
+                // One blocking hop for the whole address set, rather than a
+                // synchronous `rusqlite` write per IP on this thread: a peer
+                // seen at many addresses turned a single ban into an N-deep
+                // stall, each element of it waiting on `Database`'s
+                // `Mutex<Connection>` while holding the runtime worker that
+                // runs this loop. Off-thread, the worker is free to drive other
+                // tasks for the duration instead.
+                //
+                // Awaited, not fire-and-forget, and that is load-bearing.
+                // `add_banned_peer_address` upserts with `banned = 1`, while the
+                // unban path writes `banned = 0` from the *IPC* task
+                // (`commands::peers::unban_peer` persists before it notifies us),
+                // so the two are not ordered by anything. Detached, a ban write
+                // still sitting in a blocking-pool queue — behind library
+                // hashing, say — could land after an unban and silently re-ban
+                // the peer in the database while every in-memory set says
+                // otherwise, until the next restart rebuilt the bans from disk.
+                {
+                    let ban_db = db.clone();
+                    let ban_peer = peer_id_hex.clone();
+                    let ban_ips = ips_to_ban.clone();
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        for ip in ban_ips {
+                            if let Err(e) = ban_db.add_banned_peer_address(&ban_peer, ip) {
+                                warn!(
+                                    "Failed to persist banned IP {ip} for peer {ban_peer}: {e}"
+                                );
+                            }
+                        }
+                    })
+                    .await;
+                    if let Err(e) = persisted {
+                        warn!("Ban persistence task for {peer_id_hex} failed: {e}");
                     }
                 }
                 if let Ok(mut shared) = shared_banned_ips.write() {
@@ -2747,7 +2873,12 @@ async fn handle_command_inner(
             let primary_hash = keys[0];
             let extras: Vec<[u8; 16]> = keys.iter().skip(1).copied().collect();
             let primary = ember::dht::EmberNodeId(primary_hash);
-            let search_id = match state.ember_search.start_find_value(
+            // Background pool, not the user reserve. Channel Discover and the
+            // other raw-key gathers behind this command retry on their own
+            // ticks, so a refusal costs them a few seconds; a keyword search
+            // has no second chance. Taking the reserve here is what made the
+            // user's Ember leg disappear while automatic work filled the pool.
+            let search_id = match state.ember_search.start_background_find_value(
                 primary,
                 extras.clone(),
                 state.ember_dht.routing(),
@@ -2778,15 +2909,12 @@ async fn handle_command_inner(
             // than let FIND_VALUE run to SEARCH_TIMEOUT_SECS (60s) after a
             // 6s Discover probe. Completing would only send to a dropped
             // oneshot; the slot is what matters.
-            state.ember_dht_pending_value_lookups.remove(&search_id);
-            state.ember_search.remove(search_id);
-            state
-                .ember_dht_search_requests
-                .retain(|_, r| r.search_id != search_id);
-            if let Some(channel_id) = state.ember_channel_presence_searches.remove(&search_id)
-            {
-                flush_channel_presence_if_idle(state, channel_id);
-            }
+            //
+            // Same teardown as the expiry backstop. Releasing the slot without
+            // releasing everything else keyed by this id let `alloc_id` hand the
+            // id straight to another walk, which then delivered its records into
+            // the abandoned caller's map.
+            release_ember_search_state(state, app_handle, search_id);
         }
 
         NetworkCommand::FanoutChannelGossip { body } => {
@@ -3229,10 +3357,29 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
-            let snap =
-                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip, db)
-                    .await;
-            let _ = tx.send(snap);
+            // Built off the network task. The snapshot joins a `spawn_blocking`
+            // SQLite read for friend metadata and then walks every persisted
+            // credit record — up to `MAX_CREDIT_RECORDS`, 50,000 — and the
+            // Known Clients tab polls it every 8 s for as long as it is open,
+            // so awaiting it inline was a periodic stall of UDP receive, all
+            // the timers and every other IPC request. Each handle is an `Arc`,
+            // so the clones are cheap and the task borrows nothing from `state`.
+            let credit_manager = credit_manager.clone();
+            let friend_hashes = friend_hashes.clone();
+            let upload_queue = upload_queue.clone();
+            let geoip = geoip.clone();
+            let db = db.clone();
+            tokio::spawn(async move {
+                let snap = known_clients_snapshot(
+                    &credit_manager,
+                    &friend_hashes,
+                    &upload_queue,
+                    &geoip,
+                    &db,
+                )
+                .await;
+                let _ = tx.send(snap);
+            });
         }
 
         NetworkCommand::GetAntiLeechSnapshot { tx } => {
@@ -4247,134 +4394,39 @@ async fn handle_command_inner(
             let _ = tx.send(outcome);
         }
 
-        NetworkCommand::KadBootstrapUrl { url, tx } => {
-            info!("KAD bootstrap from URL: {url}");
-            const MAX_NODES_BYTES: usize = 10 * 1024 * 1024;
-            // `fetch_pinned_get` re-validates the URL and every redirect hop
-            // against the private-IP rules, so a malicious redirect can't
-            // pivot the bootstrap fetch onto an internal host.
-            let outcome: Result<String, String> = match crate::security::fetch_pinned_get(&url)
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        Err(format!("HTTP {} from {}", resp.status().as_u16(), url))
-                    } else {
-                        let download_result: Result<Vec<u8>, String> = {
-                            use futures::StreamExt;
-                            let mut body = Vec::new();
-                            let mut stream = resp.bytes_stream();
-                            let mut err: Option<String> = None;
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(data) => {
-                                        body.extend_from_slice(&data);
-                                        if body.len() > MAX_NODES_BYTES {
-                                            err = Some(format!(
-                                                "Response exceeded {} byte cap",
-                                                MAX_NODES_BYTES
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        err = Some(format!("Download failed: {e}"));
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Some(e) = err {
-                                Err(e)
-                            } else {
-                                Ok(body)
-                            }
-                        };
-                        match download_result {
-                            Ok(bytes) => {
-                                let tmp_dir = std::env::temp_dir();
-                                let tmp_path = tmp_dir.join(format!(
-                                    "ember-nodes-{}.dat",
-                                    chrono::Utc::now().timestamp()
-                                ));
-                                match tokio::fs::write(&tmp_path, &bytes).await {
-                                    Err(e) => Err(format!("Failed to write temp nodes.dat: {e}")),
-                                    Ok(_) => {
-                                        let parse_res = bootstrap::load_nodes_dat(&tmp_path);
-                                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                                        match parse_res {
-                                                    Err(e) => Err(format!(
-                                                        "Parsed {} bytes but file is not a valid nodes.dat: {e}",
-                                                        bytes.len()
-                                                    )),
-                                                    Ok(mut contacts) => {
-                                                        // K3: a URL-supplied file is an unproven
-                                                        // seed list whatever its verified bytes
-                                                        // claim. Honouring them would let one
-                                                        // pasted link put contacts straight into
-                                                        // lookup and publish target selection.
-                                                        bootstrap::mark_contacts_unproven(
-                                                            &mut contacts,
-                                                        );
-                                                        let count = contacts.len();
-                                                        if count == 0 {
-                                                            Err("Downloaded nodes.dat contained no contacts".into())
-                                                        } else {
-                                                            for c in &contacts {
-                                                                state.routing_table.insert(c.clone());
-                                                            }
-                                                            for contact in contacts.iter().take(20) {
-                                                                let addr = SocketAddr::new(
-                                                                    contact.ip.into(),
-                                                                    contact.udp_port,
-                                                                );
-                                                                let msg = KadMessage::BootstrapReq;
-                                                                if let Ok(packet) =
-                                                                    messages::encode_packet(&msg)
-                                                                {
-                                                                    state
-                                                                        .flood_protection
-                                                                        .track_request(addr, 0x01);
-                                                                    let _ = socket
-                                                                        .send_to(&packet, addr)
-                                                                        .await;
-                                                                }
-                                                            }
-                                            info!(
-                                                "Loaded {count} contacts from URL, bootstrapping"
-                                            );
-                                            if state.stats.status
-                                                == NetworkStatus::Disconnected
-                                            {
-                                                state.stats.status =
-                                                    NetworkStatus::Connecting;
-                                                // See `KadBootstrapIp`: keep
-                                                // the upload gate in sync
-                                                // with every path off
-                                                // Disconnected.
-                                                state.upload_disconnected.store(
-                                                    false,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                            }
-                                            Ok(format!(
-                                                "Loaded {count} contacts from nodes.dat"
-                                            ))
-                                                        }
-                                                    }
-                                                }
-                                    }
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                }
-                Err(e) => Err(format!("KAD bootstrap fetch failed: {e}")),
-            };
-            if let Err(ref e) = outcome {
-                warn!("KAD bootstrap from {url} failed: {e}");
+        NetworkCommand::KadBootstrapContacts { contacts, tx } => {
+            // The download and the `nodes.dat` parse already happened on the
+            // IPC task (`kad_bootstrap_url`); only these two steps need the
+            // network task, and both are cheap. Contacts arrive unproven —
+            // K3: a URL-supplied file is an unproven seed list whatever its
+            // verified bytes claim, because honouring them would let one
+            // pasted link put contacts straight into lookup and publish
+            // target selection.
+            let count = contacts.len();
+            info!("KAD bootstrap from {count} downloaded contact(s)");
+            for c in &contacts {
+                state.routing_table.insert(c.clone());
             }
-            let _ = tx.send(outcome);
+            for contact in contacts.iter().take(20) {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::BootstrapReq;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    // K17: track outgoing bootstrap requests so the periodic
+                    // sweeps do not double-send to the same contact.
+                    state.flood_protection.track_request(addr, 0x01);
+                    let _ = socket.send_to(&packet, addr).await;
+                }
+            }
+            if state.stats.status == NetworkStatus::Disconnected {
+                state.stats.status = NetworkStatus::Connecting;
+                // See `KadBootstrapIp`: keep the upload gate in sync with
+                // every path off Disconnected.
+                state
+                    .upload_disconnected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            info!("Loaded {count} contacts from URL, bootstrapping");
+            let _ = tx.send(Ok(format!("Loaded {count} contacts from nodes.dat")));
         }
 
         NetworkCommand::KadBootstrapClients { tx } => {
@@ -5378,8 +5430,29 @@ async fn handle_command_inner(
                 rating,
                 comment.clone(),
             );
-            if let Err(e) = db.save_file_comment(&file_hash, rating, &comment) {
-                warn!("Failed to save comment: {e}");
+            // `save_file_comment` is a synchronous `rusqlite` write behind
+            // `Database`'s `Mutex<Connection>`, so calling it on this thread
+            // held the runtime worker running this loop for however long
+            // another writer (library scan, statistics flush) was already
+            // inside that mutex. Moving it to the blocking pool frees the
+            // worker to drive other tasks while it waits.
+            //
+            // Awaited rather than detached, because the row is an upsert keyed
+            // by file hash: two detached writes for the same file complete in
+            // whatever order the pool schedules them, so editing a comment
+            // twice in quick succession could persist the *older* text and only
+            // reveal it after a restart, once the in-memory manager that had
+            // the right answer was gone.
+            let comment_db = db.clone();
+            let comment_hash = file_hash.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                if let Err(e) = comment_db.save_file_comment(&comment_hash, rating, &comment) {
+                    warn!("Failed to save comment for {comment_hash}: {e}");
+                }
+            })
+            .await;
+            if let Err(e) = saved {
+                warn!("Comment persistence task for {file_hash} failed: {e}");
             }
         }
 
@@ -6585,6 +6658,51 @@ async fn handle_command_inner(
                 None => None,
             };
             let _ = tx.send(info);
+        }
+
+        NetworkCommand::GetPeerReputationBatch { user_hashes, tx } => {
+            // Decay once for the whole batch, for the same reason the
+            // single-peer arm does it: the UI should see the score the tracker
+            // would act on.
+            state.reputation.maybe_decay();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Read the manual-ban set once rather than per hash: it is behind a
+            // `std::sync::RwLock` shared with the upload server.
+            let manual_bans = shared_banned_hashes.read().ok();
+            let mut out: HashMap<String, Option<PeerReputationInfo>> =
+                HashMap::with_capacity(user_hashes.len());
+            for user_hash in user_hashes {
+                let manual_banned = manual_bans
+                    .as_ref()
+                    .map(|s| s.contains(&user_hash))
+                    .unwrap_or(false);
+                let info = match state.reputation.get_peer(&user_hash) {
+                    Some(p) => Some(PeerReputationInfo {
+                        score: p.score,
+                        successful_transfers: p.successful_transfers,
+                        failed_transfers: p.failed_transfers,
+                        is_banned: p.is_banned(now) || manual_banned,
+                        first_seen: p.first_seen,
+                        last_interaction: p.last_interaction,
+                    }),
+                    // Manual ban with no tracker history still needs a row so
+                    // the Known Clients Trust column shows "banned".
+                    None if manual_banned => Some(PeerReputationInfo {
+                        score: 0,
+                        successful_transfers: 0,
+                        failed_transfers: 0,
+                        is_banned: true,
+                        first_seen: now,
+                        last_interaction: now,
+                    }),
+                    None => None,
+                };
+                out.insert(hex::encode(user_hash), info);
+            }
+            let _ = tx.send(out);
         }
 
         NetworkCommand::GetReputationStats { tx } => {

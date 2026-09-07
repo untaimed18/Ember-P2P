@@ -66,6 +66,39 @@ static PART_WRITER_GATES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<Sema
 /// retried, whereas opening anyway is the corruption this gate exists to stop.
 const WRITER_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Budget for one write / read / MD4 round-trip, covering both the enqueue and
+/// the acknowledgement.
+///
+/// Both halves need bounding. The queue is bounded too, so a worker parked
+/// inside a `WriteFile` the volume will never answer blocks `Sender::send` as
+/// soon as `WRITER_QUEUE_CAPACITY` operations have piled up behind it — and an
+/// unbounded wait on either half parks the download worker permanently, with no
+/// way out: the I/O runs on a `std::thread`, so `abort()`ing the task that owns
+/// the writer cannot interrupt it.
+///
+/// Sized off the worst *legitimate* wait, which is queue drain and not the
+/// operation itself. A caller's acknowledgement also waits out everything the
+/// serial worker still has in front of it: up to `WRITER_QUEUE_CAPACITY` (4096)
+/// queued eD2K blocks of `EMBLOCKSIZE` (180 KiB), about 720 MB, plus this
+/// operation's own ≤ `MAX_WRITER_IO_BYTES` (16 MiB). Even a 5 MB/s SMB share
+/// over a saturated WAN link drains that in roughly 150 s, and the enqueue and
+/// the acknowledgement are each at most one such drain, so 300 s covers the
+/// pathological-but-working case end to end. What is left over the line is a
+/// volume that has stopped answering rather than answering slowly: an unmounted
+/// network share, a spun-down or hung external disk, a cloud-sync placeholder
+/// whose provider is offline.
+const WRITER_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Budget for `sync_data`, double [`WRITER_IO_TIMEOUT`].
+///
+/// `fsync` is legitimately the slowest thing the worker does and the one
+/// operation that cannot be split into `MAX_WRITER_IO_BYTES` pieces: it has to
+/// push every dirty page of a `.part` that may be tens of GB, and on a
+/// multi-source download it is called with the whole file's write history
+/// behind it. Healthy storage still answers in seconds — ten minutes means the
+/// volume is neither completing the request nor failing it.
+const WRITER_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The gate for `path`, creating it if this is the first writer.
 ///
 /// Entries are held by `Weak`, and an `OwnedSemaphorePermit` keeps its
@@ -134,6 +167,14 @@ struct Inner {
     /// deleted. A plain cancel (Pause / Stop) deliberately leaves this unset,
     /// so those paths still get a drained queue and a trailing fsync.
     discard: Option<Arc<AtomicBool>>,
+    /// Set the first time an operation exceeds its budget — i.e. once the
+    /// volume has stopped answering. Shared with the worker thread so it can
+    /// drop the rest of its queue instead of replaying operations whose callers
+    /// have already been told they failed.
+    wedged: Arc<AtomicBool>,
+    /// The `.part` this writer owns, so the one warning below names the volume
+    /// that wedged rather than leaving the user to guess which download stalled.
+    path: PathBuf,
 }
 
 impl Inner {
@@ -142,11 +183,60 @@ impl Inner {
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
+
+    /// Declare the writer dead because an operation blew its budget, and return
+    /// the error to hand the caller.
+    ///
+    /// There is nothing to cancel: the operation is sitting in a syscall on the
+    /// worker's own `std::thread` and will return when (or if) the volume
+    /// answers. All this can do is stop further work queueing behind it and get
+    /// the file handle released, so the transfer fails and retries instead of
+    /// holding a download slot and a `.part` handle forever.
+    fn poison(&self, stage: &str) -> io::Error {
+        if !self.wedged.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "part file writer for {} stopped answering while trying to {stage} an operation \
+                 — failing this and every later operation instead of parking the download worker",
+                self.path.display()
+            );
+            // The worker only re-reads the flag between operations, so this is
+            // what wakes it when its queue is empty. Best-effort on purpose: a
+            // queue already full of stalled writes has no room, and the flag
+            // alone still makes the worker exit when it next dequeues.
+            let _ = self.tx.try_send(WriteOp::Abandon);
+        }
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "part file writer stopped answering for {}",
+                self.path.display()
+            ),
+        )
+    }
+
+    /// Fail fast once poisoned. Without this every subsequent block from every
+    /// remaining source would wait out a fresh full budget, so a download with
+    /// a deep pipeline would take hours to give up on a dead volume instead of
+    /// one timeout.
+    fn wedged_error(&self) -> Option<io::Error> {
+        self.wedged.load(Ordering::Acquire).then(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "part file writer already stopped answering for {}",
+                    self.path.display()
+                ),
+            )
+        })
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.should_abandon() {
+        // A wedged writer gets the same treatment as a discard: draining and
+        // fsyncing is exactly what it can no longer do, and the queued writes
+        // behind the stall have already been failed to their callers.
+        if self.should_abandon() || self.wedged.load(Ordering::Acquire) {
             let _ = self.tx.try_send(WriteOp::Abandon);
             return;
         }
@@ -236,6 +326,8 @@ impl PartFileWriter {
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
         let discard_for_loop = discard.clone();
+        let wedged = Arc::new(AtomicBool::new(false));
+        let wedged_for_loop = wedged.clone();
 
         std::thread::Builder::new()
             .name(format!(
@@ -249,7 +341,7 @@ impl PartFileWriter {
                 // until `writer_loop` has returned, which is after it has
                 // fsynced and dropped the file handle.
                 let _permit = permit;
-                writer_loop(file, &mut rx, discard_for_loop)
+                writer_loop(file, &mut rx, discard_for_loop, wedged_for_loop)
             })
             .map_err(|e| {
                 io::Error::other(format!("spawn writer thread: {e}"))
@@ -281,8 +373,57 @@ impl PartFileWriter {
         }
 
         Ok(Self {
-            inner: Arc::new(Inner { tx, discard }),
+            inner: Arc::new(Inner {
+                tx,
+                discard,
+                wedged,
+                path,
+            }),
         })
+    }
+
+    /// Hand `op` to the worker and wait for its acknowledgement, both under one
+    /// `budget`.
+    ///
+    /// A single deadline rather than one per half: each half is at most one
+    /// queue drain (see [`WRITER_IO_TIMEOUT`]), and giving them separate
+    /// budgets would double how long a caller can park on a dead volume for no
+    /// gain in tolerance.
+    ///
+    /// A timed-out operation is *not* cancelled — see [`Inner::poison`]. When
+    /// the abandoned write eventually lands, the bytes it carries are bytes the
+    /// caller has already released back to the gap list, so nothing on disk is
+    /// claimed as present that is not, and the worker exits before touching
+    /// anything queued behind it (see `writer_loop`), so a stale write can
+    /// never overwrite a newer one for the same range.
+    async fn submit<T>(
+        &self,
+        budget: std::time::Duration,
+        op: WriteOp,
+        ack_rx: oneshot::Receiver<io::Result<T>>,
+    ) -> io::Result<T> {
+        if let Some(err) = self.inner.wedged_error() {
+            return Err(err);
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        match tokio::time::timeout_at(deadline, self.inner.tx.send(op)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "writer task closed",
+                ))
+            }
+            Err(_) => return Err(self.inner.poison("queue")),
+        }
+        match tokio::time::timeout_at(deadline, ack_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer dropped ack",
+            )),
+            Err(_) => Err(self.inner.poison("complete")),
+        }
     }
 
     /// Write `data` at `offset`. Awaits the worker's confirmation that the
@@ -290,14 +431,12 @@ impl PartFileWriter {
     pub async fn write(&self, offset: u64, data: Vec<u8>) -> io::Result<()> {
         validate_range(offset, data.len())?;
         let (ack, ack_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(WriteOp::Write { offset, data, ack })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer task closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
+        self.submit(
+            WRITER_IO_TIMEOUT,
+            WriteOp::Write { offset, data, ack },
+            ack_rx,
+        )
+        .await
     }
 
     /// Read `len` bytes starting at `offset`.
@@ -305,14 +444,12 @@ impl PartFileWriter {
     pub async fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         validate_range(offset, len)?;
         let (ack, ack_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(WriteOp::Read { offset, len, ack })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer task closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
+        self.submit(
+            WRITER_IO_TIMEOUT,
+            WriteOp::Read { offset, len, ack },
+            ack_rx,
+        )
+        .await
     }
 
     /// Read `len` bytes at `offset` AND compute their MD4 hash on the
@@ -322,14 +459,12 @@ impl PartFileWriter {
     pub async fn hash_part_md4(&self, offset: u64, len: usize) -> io::Result<(Vec<u8>, [u8; 16])> {
         validate_range(offset, len)?;
         let (ack, ack_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(WriteOp::HashPartMd4 { offset, len, ack })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer task closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
+        self.submit(
+            WRITER_IO_TIMEOUT,
+            WriteOp::HashPartMd4 { offset, len, ack },
+            ack_rx,
+        )
+        .await
     }
 
     /// Flush kernel buffers to storage (`fsync`-equivalent). Used once
@@ -338,14 +473,8 @@ impl PartFileWriter {
     /// disk image is canonical before the read-back.
     pub async fn sync_data(&self) -> io::Result<()> {
         let (ack, ack_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(WriteOp::SyncData { ack })
+        self.submit(WRITER_SYNC_TIMEOUT, WriteOp::SyncData { ack }, ack_rx)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer task closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
     }
 }
 
@@ -395,6 +524,7 @@ fn writer_loop(
     mut file: std::fs::File,
     rx: &mut mpsc::Receiver<WriteOp>,
     discard: Option<Arc<AtomicBool>>,
+    wedged: Arc<AtomicBool>,
 ) {
     fn discarding(discard: &Option<Arc<AtomicBool>>) -> bool {
         discard
@@ -412,6 +542,20 @@ fn writer_loop(
         let Some(op) = rx.blocking_recv() else {
             break;
         };
+        // Checked between operations, which is the first moment after a wedged
+        // syscall finally returns. Every caller still in this queue has already
+        // been handed a `TimedOut` (or a `BrokenPipe` when its ack sender drops
+        // with `rx` below) and has released its write reservation, so those
+        // bytes are back to being gaps. Executing them anyway would put data on
+        // disk that no gap list accounts for, and — because the retry is free to
+        // re-reserve the same ranges the moment the transfer restarts — an
+        // ancient queued block could land on top of a newer one for the same
+        // offsets: precisely the torn part `PART_WRITER_GATES` exists to stop,
+        // reintroduced inside a single writer. Drop the handle instead.
+        if wedged.load(Ordering::Acquire) {
+            abandon = true;
+            break;
+        }
         match op {
             WriteOp::Write { offset, data, ack } => {
                 let res = (|| -> io::Result<()> {
@@ -726,5 +870,63 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("paused writer lost its queued bytes for {}", path.display());
+    }
+
+    /// A volume that stops answering — an unmounted network share, a hung
+    /// external disk, an offline cloud-sync placeholder — leaves the worker
+    /// inside a syscall nothing can cancel, and because the I/O is on a
+    /// `std::thread` rather than the runtime, aborting the download task cannot
+    /// free it either. Once one acknowledgement has blown its budget, every
+    /// later operation has to fail immediately instead of parking its caller
+    /// for a fresh full budget, and the worker has to release the `.part`
+    /// handle rather than replay a queue whose callers were already told their
+    /// writes failed.
+    #[tokio::test]
+    async fn a_wedged_writer_fails_fast_and_releases_the_file() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("wedged");
+        let writer = PartFileWriter::open(
+            path.clone(),
+            OpenMode::CreateOrOpen {
+                set_len_to: Some(4096),
+                truncate_existing: true,
+            },
+            allowed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Exactly the state an expired acknowledgement leaves behind, without
+        // having to wedge a real volume for five minutes.
+        assert_eq!(
+            writer.inner.poison("complete").kind(),
+            io::ErrorKind::TimedOut
+        );
+
+        let started = std::time::Instant::now();
+        let err = writer
+            .write(0, vec![0xCDu8; 64])
+            .await
+            .expect_err("a wedged writer must refuse further writes");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            writer.sync_data().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "operations after the first timeout must fail fast, not wait out fresh budgets"
+        );
+
+        drop(writer);
+        for _ in 0..50 {
+            if std::fs::remove_file(&path).is_ok() {
+                let _ = std::fs::remove_dir_all(base);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("wedged writer did not release {}", path.display());
     }
 }

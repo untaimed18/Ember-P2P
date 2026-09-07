@@ -108,6 +108,16 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // renderer still must not clear it (it would re-run the migration).
     "ember_default_on_migrated",
     "ember_native_enabled",
+    // No Settings control binds this: the field exists in `AppSettings` for
+    // `config.json` only, so every renderer payload carrying it is an echo of
+    // what `get_settings` handed out. Owning it here is what stops a
+    // compromised webview from repointing friend registration — which POSTs
+    // our public key, public IP and listening port to `/register` (see
+    // `network::rendezvous`) — at a host of its choosing. Noise still prevents
+    // impersonation, so the loss would be identity plus address disclosure and
+    // a friend lookup that silently stops working, which is exactly the kind
+    // of change no renderer needs to make.
+    "rendezvous_url",
 ];
 
 fn merge_renderer_settings(
@@ -185,6 +195,106 @@ fn download_root_was_picked(path: &std::path::Path) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&key)
+}
+
+/// Decide whether an incoming `reapprove_download_root` flag may be honored.
+///
+/// Re-approval re-captures the identity of whatever object currently sits at
+/// the configured download path. That is the only way back for a root revoked
+/// because the user genuinely moved or reconnected the folder, and it is also
+/// exactly what an attacker wants after swapping a junction or a removable
+/// drive in underneath it. The flag itself arrives over IPC and the Settings
+/// page sets it on every save, so the flag cannot be the authorization —
+/// provenance is. Either this session's own picker produced that exact path,
+/// or the user answers a dialog the renderer can neither draw nor dismiss.
+///
+/// Fails closed: a dismissed dialog, a closed window, or a panicked dialog
+/// thread all leave the root revoked, which keeps downloads failing rather
+/// than granting the sandbox to an unverified object.
+async fn download_root_reapproval_authorized(
+    app: &tauri::AppHandle,
+    registry: std::sync::Arc<crate::security::filesystem::ApprovedRootRegistry>,
+    download_folder: &str,
+) -> bool {
+    if download_folder.is_empty() {
+        return false;
+    }
+    // Picking the folder in the OS dialog *is* the user's authorization, and
+    // it is the flow the Settings page steers people through, so the common
+    // recovery never sees a second prompt.
+    if download_root_was_picked(std::path::Path::new(download_folder)) {
+        return true;
+    }
+    let confirm_app = app.clone();
+    let folder = download_folder.to_string();
+    let prompt = format!(
+        "Ember no longer recognises the folder at:\n\n{}\n\nRe-approve it only if you moved this folder or reconnected the drive yourself. If something else was put at this path, re-approving gives Ember's downloads access to whatever is there now.",
+        elide_for_dialog(download_folder)
+    );
+    // `None` means there is nothing to authorize, which is the ordinary case:
+    // the Settings page sends the flag on every save and almost every save
+    // finds the root intact.
+    let answer = tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&folder);
+        // An absent root keeps its record (`build_next` retains it on
+        // `NotFound`) and a root whose identity still matches needs no grant,
+        // so neither is worth a prompt.
+        if std::fs::symlink_metadata(path).is_err() || registry.verify_root(path).is_ok() {
+            return None;
+        }
+        // `blocking_show` parks this thread until the main thread pumps the
+        // dialog, which is why every native dialog in this crate is reached
+        // through `spawn_blocking` instead of running on the command's task.
+        Some(
+            confirm_app
+                .dialog()
+                .message(prompt)
+                .title("Re-approve download folder?")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                    "Re-approve".to_string(),
+                    "Keep blocked".to_string(),
+                ))
+                .blocking_show(),
+        )
+    })
+    .await;
+    match answer {
+        Ok(Some(true)) => true,
+        // Withholding the grant rather than deferring to the persistence
+        // closure's own repeat of the same test: if the path changes between
+        // the two, "nothing was pending" would otherwise become a silent
+        // re-approval of whatever appeared in between.
+        Ok(None) => false,
+        Ok(Some(false)) => {
+            warn!(
+                "Ignoring reapprove_download_root: the download folder was not chosen with the native picker this session and the re-approval prompt was declined"
+            );
+            false
+        }
+        Err(error) => {
+            warn!("Ignoring reapprove_download_root: confirmation task failed: {error}");
+            false
+        }
+    }
+}
+
+/// Shorten a string for a native dialog body.
+///
+/// Dialog text is not scrollable on every platform, so a pathological value —
+/// a 2048-byte URL, a deeply nested path — can push the buttons off screen or
+/// bury the part the user is supposed to read. Keeps the head, where the
+/// scheme and host or the drive and first folders live.
+///
+/// Shared with the IP-filter override prompt in `commands::security`, so the
+/// two security confirmations cannot be made unreadable by different means.
+pub(crate) fn elide_for_dialog(value: &str) -> String {
+    const MAX_DIALOG_CHARS: usize = 180;
+    if value.chars().count() <= MAX_DIALOG_CHARS {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(MAX_DIALOG_CHARS).collect();
+    format!("{head}…")
 }
 
 /// Open a trusted native directory picker for the download folder.
@@ -1034,6 +1144,31 @@ pub async fn update_settings(
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
     }
 
+    // `rendezvous_url` is backend-owned, so `merge_renderer_settings` has
+    // already restored the authoritative value and this comparison cannot fire
+    // from IPC as things stand. It is the save-time gate that keeps the
+    // guarantee if the field is ever made writable again, because the checks
+    // in `validate_settings` only establish shape: an `https://` URL with a
+    // host and no userinfo can still name loopback, RFC1918 space, or
+    // `169.254.169.254`. `validate_fetch_url` resolves the host and rejects
+    // every private answer, which is the same bar `network::rendezvous`
+    // applies before it registers — so accepting anything weaker here would
+    // only defer the refusal to a background task that has no way to report
+    // it to the person who made the change.
+    if settings.rendezvous_url != old_settings.rendezvous_url
+        && !settings.rendezvous_url.is_empty()
+    {
+        crate::security::validate_fetch_url(&settings.rendezvous_url)
+            .await
+            .map_err(|error| {
+                coded_ctx(
+                    "security_url_validation_failed",
+                    "Rendezvous URL validation failed",
+                    error,
+                )
+            })?;
+    }
+
     if settings.channel_username != old_settings.channel_username {
         if settings.channel_username.is_empty() {
             if !old_settings.channel_username.is_empty() {
@@ -1127,15 +1262,28 @@ pub async fn update_settings(
         // re-picking the same folder is not an addition, so it never reaches
         // `explicit_additions` and every download keeps failing.
         //
-        // Deliberately narrow. `reapprove_download_root` is set only by the
-        // Settings page's own save button, because `update_settings` is also
-        // reached from background paths with no user present — the UPnP
-        // auto-disable handler persists through it from a network event — and
-        // re-approval grants the sandbox to whatever object now sits at the
-        // path. It is also skipped unless something is actually there: a root
-        // that is merely offline (unplugged drive, disconnected share) must
-        // keep its record, which `build_next` retains on `NotFound`, rather
-        // than be re-captured and lost.
+        // Deliberately narrow. Re-approval grants the sandbox to whatever
+        // object now sits at the path, and `update_settings` is also reached
+        // from background paths with no user present — the UPnP auto-disable
+        // handler persists through it from a network event. The flag says the
+        // Settings save button was pressed, but it travels over IPC and the
+        // page sets it on every save, so it is treated as a request rather
+        // than as consent and `download_root_reapproval_authorized` decides.
+        // It is also skipped unless something is actually there: a root that
+        // is merely offline (unplugged drive, disconnected share) must keep
+        // its record, which `build_next` retains on `NotFound`, rather than be
+        // re-captured and lost.
+        //
+        // Resolved before the persistence task starts: the authorization may
+        // need a native dialog, and that must not run inside the closure that
+        // holds the approved-root transaction open.
+        let reapprove_download_root = reapprove_download_root
+            && download_root_reapproval_authorized(
+                &app,
+                registry.clone(),
+                &settings.download_folder,
+            )
+            .await;
         let download_folder = settings.download_folder.clone();
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
@@ -1818,15 +1966,164 @@ fn validate_external_url(raw: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
+/// How long to wait for a resolver before refusing the link.
+///
+/// A click should not hang. Matches the deadline `security::validate_fetch_url`
+/// uses for the same reason.
+const EXTERNAL_URL_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Refuse a link whose host is — or resolves to — something other than a
+/// public internet destination.
+///
+/// [`validate_external_url`] settles the shape; this settles the destination.
+/// `opener::open` hands the URL to the user's default browser, which will
+/// cheerfully fetch `http://127.0.0.1:8080/admin`, `http://192.168.1.1/` or
+/// `http://169.254.169.254/latest/meta-data/` — a service bound to loopback, a
+/// router's admin page, a cloud metadata endpoint — carrying whatever ambient
+/// cookies and LAN position the user has. A link in a room is written by
+/// whoever is in the room, so a literal address is the obvious attempt and a
+/// domain whose A record points into private space is the quieter one; the
+/// same policy the HTTP fetch path enforces has to apply here too.
+///
+/// Every resolved address is checked rather than the first, because a host
+/// answering with one public and one loopback record would otherwise pass or
+/// fail on whatever order the resolver happened to return.
+///
+/// This cannot pin DNS the way [`crate::security::build_pinned_client`] does
+/// for our own fetches: the browser is a separate process and resolves the
+/// name again itself, so a resolver under the attacker's control can answer
+/// differently a moment later. That residual is why the confirmation in
+/// [`open_external_url`] names the host — the resolution check removes the
+/// destinations a user cannot be expected to judge, and the dialog covers the
+/// judgement that is left.
+async fn reject_non_public_external_host(validated: &str) -> Result<(), String> {
+    let invalid = || {
+        coded(
+            "settings_open_link_invalid",
+            "That link cannot be opened safely",
+        )
+    };
+    // Re-parsed rather than threaded through: `validated` is already this
+    // parser's own output, so this agrees with what will actually be opened.
+    let parsed = url::Url::parse(validated).map_err(|_| invalid())?;
+    let Some(host) = parsed.host() else {
+        return Err(invalid());
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return Err(invalid());
+    };
+    match host {
+        // `Url::host` yields the address already parsed, so a bracketed IPv6
+        // literal or a shortened/zero-compressed form cannot arrive here as a
+        // string that the range checks would fail to recognise.
+        url::Host::Ipv4(v4) => {
+            if crate::security::is_special_use_v4(v4) {
+                return Err(invalid());
+            }
+        }
+        url::Host::Ipv6(v6) => {
+            if crate::security::is_private_ip(std::net::IpAddr::V6(v6)) {
+                return Err(invalid());
+            }
+        }
+        url::Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            // RFC 6761: `localhost` and every name under it are loopback by
+            // definition. Browsers short-circuit them without consulting a
+            // resolver, so the lookup below would never get the chance to
+            // object.
+            if lowered == "localhost" || lowered.ends_with(".localhost") {
+                return Err(invalid());
+            }
+            // `spawn_blocking(ToSocketAddrs)` cannot be cancelled: a resolver
+            // that accepts queries and never answers would strand one blocking
+            // worker per clicked link. Tokio's lookup future is cancellable,
+            // so the deadline actually releases the task.
+            let addrs = tokio::time::timeout(
+                EXTERNAL_URL_DNS_TIMEOUT,
+                tokio::net::lookup_host((lowered.as_str(), port)),
+            )
+            .await
+            .map_err(|_| invalid())?
+            .map_err(|_| invalid())?
+            .collect::<Vec<std::net::SocketAddr>>();
+            // A name that resolves to nothing is not a destination we can
+            // vouch for, and handing it over anyway just moves the lookup into
+            // the browser where this check cannot see the answer.
+            if addrs.is_empty() {
+                return Err(invalid());
+            }
+            if addrs
+                .iter()
+                .any(|addr| crate::security::is_private_ip(addr.ip()))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ask the user, natively, before handing a link to the browser.
+///
+/// The renderer already prompts, but a renderer under someone else's control
+/// simply does not run its own prompt before calling this command, so the
+/// answer that authorizes the open has to be collected somewhere the webview
+/// cannot reach. The host is shown on a line of its own because it is the part
+/// that decides where the click goes, and the part that link text is written
+/// to disagree with.
+///
+/// Returns false for a dismissed or closed dialog, so anything other than an
+/// explicit "open" leaves the browser untouched.
+async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
+    let host = url::Url::parse(validated)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(String::from))
+        .unwrap_or_default();
+    let prompt = format!(
+        "{}\n\nThis will open {} in your browser.\n\nOpen it only if you recognise where it goes — the text of a link and its destination do not have to match.",
+        elide_for_dialog(validated),
+        elide_for_dialog(&host)
+    );
+    let confirm_app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task; see `pick_download_folder`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title("Open this link?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Open link".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Open a link found in a message, in the default browser.
 ///
-/// The renderer asks the user to confirm the destination first — the text of a
-/// link and where it points are different strings, and in a room full of
-/// strangers they will sometimes disagree on purpose. This end does not rely
-/// on that: see [`validate_external_url`].
+/// Nothing about the request is trusted: the string is the least trusted one
+/// in the application, and the confirmation the renderer shows is the
+/// renderer's own and can simply be skipped. So the shape is checked
+/// ([`validate_external_url`]), the destination is checked
+/// ([`reject_non_public_external_host`]), and the consent is collected
+/// natively ([`confirm_external_url`]) before anything is handed to the shell.
 #[tauri::command]
-pub async fn open_external_url(url: String) -> Result<(), String> {
+pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let safe = validate_external_url(&url)?;
+    reject_non_public_external_host(&safe).await?;
+    if !confirm_external_url(&app, &safe).await {
+        // Declining is not a failure. Every native dialog in this crate
+        // reports a dismissal as "nothing happened" (`pick_download_folder`,
+        // `pick_and_import_ipfilter_file` both return `Ok(None)`), and an
+        // error toast after someone deliberately chose Cancel is noise.
+        info!("External link was not opened: the native confirmation was declined");
+        return Ok(());
+    }
     opener::open(&safe).map_err(|e| {
         coded_ctx(
             "settings_open_link_failed",

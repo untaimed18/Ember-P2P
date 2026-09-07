@@ -143,8 +143,11 @@ const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number;
  * count as a u16 on the wire, so anything above it is a claim no honest peer can
  * make. */
 const MAX_PLAUSIBLE_SOURCES = 65535;
-/** Pin with `scripts/fixtures/merge-contract.json` / `MAX_SOURCE_ADDRS` in merge.rs. */
-const MAX_SOURCE_ADDRS = 500;
+/** Pin with `scripts/fixtures/merge-contract.json` / `MAX_SOURCE_ADDRS` in merge.rs.
+ * Sized to what `start_download` will actually accept (its `MAX_EXTRA_SOURCES_IPC`
+ * is 64, and the network task seeds at most 49); addresses beyond that were kept
+ * and shipped over IPC only to be dropped on arrival. */
+const MAX_SOURCE_ADDRS = 64;
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])])).slice(0, MAX_SOURCE_ADDRS);
@@ -398,6 +401,35 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
  *  up to `MAX_TAB_RESULTS` rows. */
 const MAX_SEARCH_TABS = 20;
 
+/**
+ * Cancel a search, retrying briefly when the network task is busy.
+ *
+ * A tab's request id is rotated the moment it stops being the active search,
+ * so a cancel that never lands is invisible from here: nothing waits on it and
+ * no late result will be attributed to the old id. What does not go away is the
+ * walk — KAD and Ember keep querying until their own 60s expiry, holding
+ * routing-table and search-manager slots the *next* search needs. `cancelSearch`
+ * fails when the command channel is saturated, which is exactly when those
+ * slots are scarcest, so one attempt is not enough.
+ */
+async function cancelSearchWithRetry(requestId: number): Promise<void> {
+  const delaysMs = [0, 250, 1000];
+  let lastError: unknown = null;
+  for (const delay of delaysMs) {
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      await cancelSearch(requestId);
+      return;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  console.warn(
+    `Failed to cancel search ${requestId}; its DHT walks will expire on their own`,
+    lastError,
+  );
+}
+
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
 export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters, related?: RelatedSearchInfo): { tabId: string; requestId: number; stoppedOthers: boolean } {
   const requestId = newSearchNonce();
@@ -434,7 +466,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     }
     for (const rid of searchingIds) {
       pendingByRequest.delete(rid);
-      void cancelSearch(rid).catch(() => { /* best effort */ });
+      void cancelSearchWithRetry(rid);
     }
     return next;
   });
@@ -452,11 +484,7 @@ export async function closeSearchTab(tabId: string): Promise<void> {
   if (idx === -1) return;
   const tab = tabs[idx];
   if (tab.isSearching) {
-    try {
-      await cancelSearch(tab.requestId);
-    } catch {
-      /* best effort */
-    }
+    await cancelSearchWithRetry(tab.requestId);
   }
   const currentTabs = get(searchTabs);
   const currentIdx = currentTabs.findIndex((t) => t.id === tabId);
