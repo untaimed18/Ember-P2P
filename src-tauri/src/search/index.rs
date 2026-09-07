@@ -86,17 +86,52 @@ impl LocalIndex {
         }
     }
 
+    /// Insert or update a batch, patching the lookup maps as it goes.
+    ///
+    /// This used to upsert every row against a freshly built path snapshot and
+    /// then call `rebuild_indices()`: two full passes over the whole index, the
+    /// second of which re-lowercases and re-tokenizes every stored name and
+    /// rebuilds four maps from scratch. Both ran with the index write lock
+    /// held, and tokio's `RwLock` is fair, so a queued writer blocks new
+    /// readers — a folder add on a large library stalled upload hash
+    /// resolution and every index-reading command for the length of the
+    /// rebuild, with no `.await` inside to yield the worker thread either.
+    ///
+    /// Cost is now proportional to the batch rather than to the index. That
+    /// rests on `path_map` being authoritative for a *miss*, which it is:
+    /// every method that mutates `files` reconciles the maps before it
+    /// returns, so a key absent from `path_map` is absent from the index. A
+    /// stale *hit* is still verified against the row it names.
     pub fn add_files(&mut self, files: Vec<FileInfo>) {
-        let mut lookup = self.path_lookup();
         for file in files {
-            self.upsert_file_with_lookup(file, &mut lookup);
+            let key = normalize_path_key(&file.path);
+            let existing = match self.path_map.get(&key) {
+                Some(&pos)
+                    if self
+                        .files
+                        .get(pos)
+                        .is_some_and(|f| normalize_path_key(&f.path) == key) =>
+                {
+                    Some(pos)
+                }
+                // A map entry naming a row that no longer holds this path.
+                Some(_) => self
+                    .files
+                    .iter()
+                    .position(|f| normalize_path_key(&f.path) == key),
+                None => None,
+            };
+            self.place_file_indexed(file, existing);
         }
-        self.rebuild_indices();
     }
 
+    /// Insert or update one file, patching the maps for just its slot.
+    ///
+    /// The download-completion path calls this with the index write lock held
+    /// on the network task, so the full `rebuild_indices()` this used to end
+    /// with re-tokenized the entire library for every finished transfer.
     pub fn add_file(&mut self, file: FileInfo) {
-        self.upsert_file(file);
-        self.rebuild_indices();
+        self.upsert_file_indexed(file);
     }
 
     /// Insert/update a file and incrementally patch `path_map`/`hash_map`/
@@ -127,18 +162,22 @@ impl LocalIndex {
                 .iter()
                 .map(|file| normalize_path_key(&file.path))
                 .collect();
+            let before = self.files.len();
             self.files.retain(|file| {
                 !folders
                     .iter()
                     .any(|folder| crate::security::path_matches_dir(&file.path, folder))
                     || discovered_keys.contains(&normalize_path_key(&file.path))
             });
+            // `retain` closes the gaps it leaves, so every position after the
+            // first dropped row moved and the maps no longer describe `files`.
+            // `add_files` reads `path_map` as authoritative, so the maps have
+            // to be put right *before* the batch rather than after it.
+            if self.files.len() != before {
+                self.rebuild_indices();
+            }
         }
-        let mut lookup = self.path_lookup();
-        for file in discovered {
-            self.upsert_file_with_lookup(file, &mut lookup);
-        }
-        self.rebuild_indices();
+        self.add_files(discovered);
     }
 
     /// Cap on local-library hits returned for one query. Network search is
@@ -951,18 +990,20 @@ impl LocalIndex {
 
     /// Like `upsert_file`, but keeps `path_map`/`hash_map`/`name_tokens`
     /// consistent for the affected slot so no full rebuild is required.
-    fn upsert_file_indexed(&mut self, mut file: FileInfo) {
+    fn upsert_file_indexed(&mut self, file: FileInfo) {
         let key = normalize_path_key(&file.path);
-        // `path_map` is authoritative here: the one caller
-        // (`finalize_pending_hash`) arrives straight after
-        // `swap_remove_indexed`, which patches the map incrementally. The scan
-        // this replaces recomputed `normalize_path_key` (two heap allocations on
-        // Windows) for every stored row, per hashed file, with the index write
-        // lock held — ~15ms at `MAX_DISCOVERED_FILES`, blocking upload hash
-        // resolution and the UI's queries for the length of a scan. Keep the
-        // scan as a fallback for a map that has drifted, and verify the hit
-        // actually points at this path so a stale entry cannot overwrite an
-        // unrelated row.
+        // `path_map` is authoritative here: `finalize_pending_hash` arrives
+        // straight after `swap_remove_indexed`, which patches the map
+        // incrementally. The scan this replaces recomputed
+        // `normalize_path_key` (two heap allocations on Windows) for every
+        // stored row, per hashed file, with the index write lock held — ~15ms
+        // at `MAX_DISCOVERED_FILES`, blocking upload hash resolution and the
+        // UI's queries for the length of a scan. Keep the scan as a fallback
+        // for a map that has drifted, and verify the hit actually points at
+        // this path so a stale entry cannot overwrite an unrelated row.
+        //
+        // Unlike `add_files`, a miss here still scans: this is the single-file
+        // path, so the fallback costs one pass rather than one per row.
         let existing = match self.path_map.get(&key) {
             Some(&pos)
                 if self
@@ -977,7 +1018,15 @@ impl LocalIndex {
                 .iter()
                 .position(|f| normalize_path_key(&f.path) == key),
         };
+        self.place_file_indexed(file, existing);
+    }
+
+    /// Write `file` into the row at `existing` (or append it) and patch the
+    /// four lookup maps for just that row.
+    fn place_file_indexed(&mut self, mut file: FileInfo, existing: Option<usize>) {
         if let Some(pos) = existing {
+            // `remove_index_entries` only touches the maps, so `files[pos]` is
+            // still the outgoing row and can be read for its runtime state.
             let old = self.files[pos].clone();
             self.remove_index_entries(pos, &old);
             preserve_runtime_state(&self.files[pos], &mut file);
@@ -1043,51 +1092,6 @@ impl LocalIndex {
         for token in tokenize(&name_lower) {
             self.name_tokens.entry(token).or_default().push(pos);
         }
-    }
-
-    /// Snapshot `normalize_path_key -> position` for the current `files`.
-    ///
-    /// Batch inserts keep this alive across the whole loop and patch it as
-    /// they go. `path_map` cannot be used directly because it is only
-    /// reconciled by `rebuild_indices` after the loop finishes.
-    fn path_lookup(&self) -> HashMap<String, usize> {
-        self.files
-            .iter()
-            .enumerate()
-            .map(|(idx, file)| (normalize_path_key(&file.path), idx))
-            .collect()
-    }
-
-    /// `upsert_file` against a caller-maintained lookup, so a batch insert is
-    /// linear rather than quadratic.
-    ///
-    /// The scan this replaces recomputed `normalize_path_key` (two heap
-    /// allocations: a separator rewrite and a lowercase) for every stored row
-    /// on every insert. A full-library load or reload therefore cost O(n²)
-    /// allocations while holding the index write lock — minutes of apparent
-    /// hang on a large share, with every reader (upload hash resolution, the
-    /// UI's shared-file queries) blocked behind it.
-    fn upsert_file_with_lookup(&mut self, mut file: FileInfo, lookup: &mut HashMap<String, usize>) {
-        // Match by the same case-normalized key used for `path_map` (lowercased
-        // on Windows). Comparing raw path strings let the same file re-appear
-        // under different casing (e.g. C:\Foo vs c:\foo), which pushed a
-        // duplicate entry while the index silently collapsed them onto one key.
-        let key = normalize_path_key(&file.path);
-        match lookup.get(&key) {
-            Some(&pos) => {
-                preserve_runtime_state(&self.files[pos], &mut file);
-                self.files[pos] = file;
-            }
-            None => {
-                lookup.insert(key, self.files.len());
-                self.files.push(file);
-            }
-        }
-    }
-
-    fn upsert_file(&mut self, file: FileInfo) {
-        let mut lookup = self.path_lookup();
-        self.upsert_file_with_lookup(file, &mut lookup);
     }
 
     fn rebuild_indices(&mut self) {
@@ -1308,6 +1312,83 @@ mod local_index_tests {
             shared_kad: false,
             shared_ed2k: false,
             shared_ember: false,
+        }
+    }
+
+    /// `add_files` patches the four lookup maps as it goes instead of clearing
+    /// and rebuilding them, and reads `path_map` to decide new-versus-existing.
+    /// So a batch has to leave exactly what a rebuild would have: one row per
+    /// path, replacements in place, and every lookup resolving.
+    #[test]
+    fn a_batch_replaces_known_paths_and_appends_new_ones() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/one.bin", &"a".repeat(32), true, "normal"),
+            file("A/two.bin", &"b".repeat(32), true, "normal"),
+        ]);
+
+        // Second batch: one path already indexed (with a new hash), one new.
+        // Casing differs on the known path, which must still match it rather
+        // than push a duplicate.
+        index.add_files(vec![
+            file("a/ONE.bin", &"c".repeat(32), true, "high"),
+            file("A/three.bin", &"d".repeat(32), true, "normal"),
+        ]);
+
+        assert_eq!(index.all_files().len(), 3, "no duplicate row for one.bin");
+        // Replaced in place, and reachable under its new hash but not its old.
+        assert_eq!(
+            index.get_by_hash(&"c".repeat(32)).map(|f| f.path.clone()),
+            Some("a/ONE.bin".to_string())
+        );
+        assert!(index.get_by_hash(&"a".repeat(32)).is_none());
+        assert!(index.get_by_hash(&"d".repeat(32)).is_some());
+        // Untouched rows keep resolving.
+        assert!(index.get_by_hash(&"b".repeat(32)).is_some());
+        // Every map entry still names the row that holds that path.
+        for (key, &pos) in &index.path_map {
+            let row = index
+                .all_files()
+                .get(pos)
+                .expect("path_map entry points inside files");
+            assert_eq!(&super::normalize_path_key(&row.path), key);
+        }
+    }
+
+    /// A batch arriving after rows were dropped is the case `path_map` cannot
+    /// speak for on its own: `retain` closes the gaps it leaves, so the maps
+    /// have to be rebuilt before the batch reads them.
+    #[test]
+    fn a_batch_after_a_removal_still_resolves_every_row() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/one.bin", &"a".repeat(32), true, "normal"),
+            file("A/two.bin", &"b".repeat(32), true, "normal"),
+            file("A/three.bin", &"c".repeat(32), true, "normal"),
+        ]);
+        // Drops `A/two.bin`, which moves `A/three.bin` down a slot.
+        index.reconcile_files_for_folders(
+            &["A".to_string()],
+            vec![
+                file("A/one.bin", &"a".repeat(32), true, "normal"),
+                file("A/three.bin", &"c".repeat(32), true, "normal"),
+            ],
+            true,
+        );
+        assert_eq!(index.all_files().len(), 2);
+        assert!(index.get_by_hash(&"b".repeat(32)).is_none());
+
+        index.add_files(vec![file("A/four.bin", &"d".repeat(32), true, "normal")]);
+        assert_eq!(index.all_files().len(), 3);
+        for hash in ["a", "c", "d"] {
+            assert!(
+                index.get_by_hash(&hash.repeat(32)).is_some(),
+                "{hash} lost after a removal followed by a batch"
+            );
+        }
+        for (key, &pos) in &index.path_map {
+            let row = index.all_files().get(pos).expect("in range");
+            assert_eq!(&super::normalize_path_key(&row.path), key);
         }
     }
 

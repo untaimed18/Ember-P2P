@@ -3137,17 +3137,35 @@ async fn handle_command_inner(
                 let temp_dir = download_folder.join("Temp");
                 let done_dir = download_folder.join("Downloads");
                 let part_path = temp_dir.join(format!("ember-xfer-{}.part", hex::encode(xfer_id)));
-                let prepared = std::fs::create_dir_all(&temp_dir)
-                    .and_then(|_| std::fs::create_dir_all(&done_dir))
-                    .and_then(|_| {
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .read(true)
-                            .truncate(true)
-                            .open(&part_path)
-                    });
-                let file = match prepared {
+                // Two directory creations and a truncating open, off the
+                // network task. The download folder can be a network share or
+                // a spinning disk behind a virus scanner, where these are
+                // hundreds of milliseconds — and this task also drives UDP
+                // receive, every timer and every IPC snapshot. Nothing else
+                // can touch `state` while we await here (the loop is one task
+                // and this handler holds `&mut`), so the capacity and ban
+                // checks above still hold on the far side.
+                let prepared = tokio::task::spawn_blocking({
+                    let done_dir = done_dir.clone();
+                    let part_path = part_path.clone();
+                    move || {
+                        std::fs::create_dir_all(&temp_dir)
+                            .and_then(|_| std::fs::create_dir_all(&done_dir))
+                            .and_then(|_| {
+                                std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .write(true)
+                                    .read(true)
+                                    .truncate(true)
+                                    .open(&part_path)
+                            })
+                    }
+                })
+                .await;
+                let file = match prepared
+                    .map_err(|e| e.to_string())
+                    .and_then(|opened| opened.map_err(|e| e.to_string()))
+                {
                     Ok(file) => file,
                     Err(e) => {
                         let _ = tx.send(Err(coded_ctx(

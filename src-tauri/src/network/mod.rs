@@ -14117,6 +14117,9 @@ struct NetworkState {
     channel_origin_retry: VecDeque<(std::time::Instant, Vec<u8>)>,
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
+    /// Room row plus derived content keys, memoised for the packet paths.
+    /// See [`cached_channel_view`].
+    channel_view_cache: HashMap<[u8; 16], CachedChannelView>,
     /// Inbound chat timestamps keyed by (room, signed author), so one member
     /// cannot flood a room by spreading the load across many hops.
     channel_gossip_author_times:
@@ -14735,6 +14738,86 @@ fn channel_gossip_inbound_ok(
         .entry(from_id.0)
         .or_default();
     ember::channel::rate_window_allow(times, now, CHANNEL_GOSSIP_RATE_WINDOW, limit)
+}
+
+/// A room's identity and reading keys, as the packet paths need them.
+#[derive(Clone)]
+struct CachedChannelView {
+    fetched_at: std::time::Instant,
+    row: crate::storage::database::StoredChannel,
+    content_keys: Vec<[u8; 32]>,
+}
+
+/// How long a memoised room view is served before it is read again.
+///
+/// Deliberately short. The alternative — invalidating on every write to
+/// `channels` — is self-defeating here, because storing a received message
+/// updates `last_active` on the very path this cache exists to keep out of
+/// the database.
+///
+/// Every consequence of a window this size is self-correcting, which is what
+/// makes a time bound the right instrument:
+/// - A room left moments ago ingests up to a second more of its own traffic.
+/// - A key epoch that rotated moments ago fails the AEAD, which is already an
+///   expected outcome here (`channel_content_keys` returns a *window* of
+///   epochs precisely because in-flight frames are sealed under older ones).
+///   The frame is dropped and forgotten, so the sender's retry and history
+///   sync both still deliver it.
+///
+/// None of it stands in for an authorization check: transfer frames are
+/// authenticated to the pair under `derive_xfer_key`, and bans are re-read
+/// from the database where they are enforced.
+const CHANNEL_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Rooms held in [`NetworkState::channel_view_cache`].
+///
+/// Joining is deliberately uncapped, so this has to sit well clear of any
+/// plausible join list rather than at the cap of something else: past it the
+/// map is dropped and every room pays its query again, which is the behaviour
+/// this cache exists to remove. An entry is on the order of a kilobyte.
+const CHANNEL_VIEW_CACHE_MAX: usize = 256;
+
+/// Room row and content keys for a packet path, from cache when fresh.
+///
+/// Every distinct inbound channel frame used to pay `get_channel` — a query
+/// carrying two correlated `COUNT(*)` subqueries — plus, for a private room,
+/// `load_channel_key_epochs` and `load_channel_join_secret`. The dedup gate
+/// upstream makes retransmits free, but Ember Transfer blocks each carry a
+/// unique `msg_id`, so one person receiving room attachments drove hundreds of
+/// these a second, each taking the process's single SQLite connection on the
+/// network task and blocking every IPC handler's blocking-pool query behind it.
+fn cached_channel_view(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+) -> Option<CachedChannelView> {
+    let now = std::time::Instant::now();
+    if let Some(hit) = state.channel_view_cache.get(&channel_id) {
+        if now.saturating_duration_since(hit.fetched_at) < CHANNEL_VIEW_TTL {
+            return Some(hit.clone());
+        }
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    // A miss caches nothing: a frame for a room this device has not joined is
+    // exactly what an attacker can send an unbounded number of, and caching
+    // absence would let them size this map.
+    let row = db.get_channel_lite(&channel_id_hex).ok().flatten()?;
+    let content_keys = channel_content_keys(db, &row);
+    let view = CachedChannelView {
+        fetched_at: now,
+        row,
+        content_keys,
+    };
+    if state.channel_view_cache.len() >= CHANNEL_VIEW_CACHE_MAX {
+        state
+            .channel_view_cache
+            .retain(|_, v| now.saturating_duration_since(v.fetched_at) < CHANNEL_VIEW_TTL);
+        if state.channel_view_cache.len() >= CHANNEL_VIEW_CACHE_MAX {
+            state.channel_view_cache.clear();
+        }
+    }
+    state.channel_view_cache.insert(channel_id, view.clone());
+    Some(view)
 }
 
 /// Content keys this room can be read with, newest epoch first.
@@ -15416,6 +15499,16 @@ fn collect_channel_neighbor_caps(
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
     let mut members_by_channel = Vec::new();
     for ch in db.list_channels_lite()? {
+        // `rendezvous_neighbor_targets` keeps the first
+        // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
+        // the rest, so stopping here is what that cap already means — and it
+        // is the difference between one roster query per *selected* room and
+        // one per *joined* room. Joining is deliberately uncapped, and this
+        // runs on the network loop once a second, so the uncapped shape put a
+        // user-controlled number of synchronous queries on the reactor.
+        if members_by_channel.len() >= ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS {
+            break;
+        }
         if !ch.in_room_now() {
             continue;
         }
@@ -15620,7 +15713,7 @@ async fn maybe_refresh_channel_moderation(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let mut started = 0usize;
@@ -15743,7 +15836,7 @@ async fn maybe_publish_owned_channel_records(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let mut started = 0usize;
@@ -16109,7 +16202,7 @@ async fn maybe_refresh_channel_key_epoch(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let our_pk = identity.ed25519_public_key;
@@ -16256,7 +16349,7 @@ async fn maybe_refresh_channel_handoff(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let mut started = 0usize;
@@ -16976,6 +17069,15 @@ async fn ping_ember_udp_peer(
 const CHANNEL_RELAY_OFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const CHANNEL_RELAY_WS_MAGIC: &[u8; 4] = b"ECR1";
 const MAX_CHANNEL_RELAY_SESSIONS: usize = 8;
+/// How long a relay counterpart has to exchange the 4-byte magic once the
+/// WebSocket upgrade completes.
+///
+/// Bounded because everything a session costs is claimed on the far side of
+/// it: one of [`MAX_CHANNEL_RELAY_SESSIONS`] outbox slots, and on the
+/// responder path one `friend_relay_ticket_sessions_in_flight` entry that is
+/// only released after the session returns. A peer that upgrades and then
+/// says nothing used to hold both for the life of the process.
+const CHANNEL_RELAY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn maybe_offer_channel_relay(
     state: &mut NetworkState,
@@ -17069,6 +17171,42 @@ async fn run_channel_relay_session(
     event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(ws);
+
+    // Handshake first, under a deadline, and only then announce the outbox.
+    //
+    // Announcing it first meant a counterpart that completed the WebSocket
+    // upgrade and then went silent parked here forever holding a session slot
+    // and (on the responder path) an in-flight ticket, because `Closed` is
+    // only sent from paths this one never reached. Worse, room messages were
+    // `try_send` into that outbox and counted as delivered while nothing was
+    // ever going to read them — the exact failure the delivery accounting
+    // exists to prevent. Nothing is claimed until the peer has proved it
+    // speaks this protocol, so giving up here has nothing to release.
+    let handshake = tokio::time::timeout(CHANNEL_RELAY_HANDSHAKE_TIMEOUT, async {
+        writer.write_all(CHANNEL_RELAY_WS_MAGIC).await?;
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic).await?;
+        if magic != *CHANNEL_RELAY_WS_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "channel relay magic mismatch",
+            ));
+        }
+        Ok(())
+    })
+    .await;
+    match handshake {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            debug!("Ember channel relay handshake failed: {e}");
+            return;
+        }
+        Err(_) => {
+            debug!("Ember channel relay handshake timed out");
+            return;
+        }
+    }
+
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(32);
     if event_tx
         .send(ChannelRelayEvent::Opened {
@@ -17079,16 +17217,39 @@ async fn run_channel_relay_session(
     {
         return;
     }
-    if writer.write_all(CHANNEL_RELAY_WS_MAGIC).await.is_err() {
-        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
-        return;
-    }
-    let mut magic = [0u8; 4];
-    if reader.read_exact(&mut magic).await.is_err() || magic != *CHANNEL_RELAY_WS_MAGIC {
-        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
-        return;
-    }
-    let mut len_buf = [0u8; 4];
+
+    // Framing lives in its own task, for the reason `upload.rs` spells out at
+    // its own reader: a frame is a 4-byte length prefix followed by a body,
+    // and `read_exact` is not cancellation-safe. Racing it directly against
+    // `outbound_rx.recv()` in an unbiased `select!` meant that a prefix split
+    // across reads — which `WsStream::poll_read` produces whenever a frame
+    // straddles a WebSocket frame boundary, since it returns `Ready` after a
+    // partial fill — lost the bytes already consumed the moment the write arm
+    // won the race. The next iteration then read a length from the middle of a
+    // frame: usually nonsense that killed the session, otherwise a plausible
+    // figure that left the stream permanently misaligned. Whole bodies arrive
+    // over a channel here, which is trivially cancel-safe.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(4);
+    let reader_task = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if reader.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len == 0 || len > ember::dht::messages::MAX_DHT_PAYLOAD {
+                break;
+            }
+            let mut body = vec![0u8; len];
+            if reader.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            if frame_tx.send(body).await.is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             body = outbound_rx.recv() => {
@@ -17101,18 +17262,11 @@ async fn run_channel_relay_session(
                     break;
                 }
             }
-            read = reader.read_exact(&mut len_buf) => {
-                if read.is_err() {
-                    break;
-                }
-                let len = u32::from_le_bytes(len_buf) as usize;
-                if len == 0 || len > ember::dht::messages::MAX_DHT_PAYLOAD {
-                    break;
-                }
-                let mut body = vec![0u8; len];
-                if reader.read_exact(&mut body).await.is_err() {
-                    break;
-                }
+            // `None` once the reader task has stopped, which is how a closed
+            // or desynced stream ends the session now that the read no longer
+            // happens here.
+            frame = frame_rx.recv() => {
+                let Some(body) = frame else { break; };
                 if event_tx
                     .send(ChannelRelayEvent::Frame {
                         peer_pubkey,
@@ -17125,6 +17279,7 @@ async fn run_channel_relay_session(
             }
         }
     }
+    reader_task.abort();
     let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
 }
 
@@ -17256,11 +17411,8 @@ async fn fanout_channel_gossip_retry(
         return;
     };
     let channel_id_hex = hex::encode(gossip.channel_id);
-    let in_room = db
-        .get_channel(&channel_id_hex)
-        .ok()
-        .flatten()
-        .is_some_and(|ch| ch.in_room_now());
+    let in_room = cached_channel_view(state, db, gossip.channel_id)
+        .is_some_and(|view| view.row.in_room_now());
     if !in_room {
         return;
     }
@@ -17471,11 +17623,8 @@ async fn handle_inbound_channel_relay(
         return;
     }
     let channel_id_hex = hex::encode(channel_id);
-    let in_room = db
-        .get_channel(&channel_id_hex)
-        .ok()
-        .flatten()
-        .is_some_and(|ch| ch.in_room_now());
+    let in_room = cached_channel_view(state, db, channel_id)
+        .is_some_and(|view| view.row.in_room_now());
     let roster = if in_room {
         channel_member_pubkeys(db, &channel_id_hex)
     } else {
@@ -17543,10 +17692,11 @@ async fn handle_inbound_channel_gossip(
         return;
     }
     let channel_id_hex = hex::encode(gossip.channel_id);
-    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+    let Some(view) = cached_channel_view(state, db, gossip.channel_id) else {
         forget_channel_gossip(state, &gossip.msg_id);
         return;
     };
+    let ch = view.row;
     if !ch.in_room_now() {
         forget_channel_gossip(state, &gossip.msg_id);
         return;
@@ -17554,7 +17704,8 @@ async fn handle_inbound_channel_gossip(
     // Decrypt may succeed under an older epoch; that key is only used to
     // *read*. Replies (history sync) are sealed under the current epoch so a
     // banned member who still holds a retired key cannot be handed new chat.
-    let Some((_opened_key, plain)) = channel_content_keys(db, &ch)
+    let Some((_opened_key, plain)) = view
+        .content_keys
         .into_iter()
         .find_map(|candidate| gossip.decrypt(&candidate).map(|plain| (candidate, plain)))
     else {
@@ -18242,10 +18393,12 @@ async fn send_xfer_frame(
     plain: &[u8],
 ) -> bool {
     let channel_id_hex = hex::encode(channel_id);
-    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+    let Some(view) = cached_channel_view(state, db, channel_id) else {
         return false;
     };
-    let Some(key) = channel_content_key(db, &ch) else {
+    // `content_keys` is newest-epoch-first, so the head is what
+    // `channel_content_key` would have returned.
+    let Some(key) = view.content_keys.into_iter().next() else {
         return false;
     };
     // TTL 1: addressed, so no one should ever relay it onward as gossip.
@@ -25754,6 +25907,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_local_times: VecDeque::new(),
         channel_origin_retry: VecDeque::new(),
         channel_gossip_from_times: HashMap::new(),
+        channel_view_cache: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
@@ -34615,13 +34769,22 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // The server only sees identities, not local friend
                 // relationships. Filter offers locally, then keep at most the
                 // accepted-ticket capacity worth of join/session tasks alive.
+                //
+                // Rosters are read at most once per room per response. A peer
+                // that can enqueue many tickets for one room used to turn a
+                // single poll into one `list_channel_members` query per
+                // ticket, each taking the global connection lock on the
+                // network loop.
+                let mut rosters: HashMap<[u8; 16], Vec<[u8; 32]>> = HashMap::new();
                 for offer in offers {
                     if let Some(channel_id) = offer.channel_id {
                         if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
                             continue;
                         }
-                        let members = channel_member_pubkeys(&db, &hex::encode(channel_id));
-                        let Some(peer_pubkey) = members.into_iter().find(|pk| {
+                        let members = rosters.entry(channel_id).or_insert_with(|| {
+                            channel_member_pubkeys(&db, &hex::encode(channel_id))
+                        });
+                        let Some(peer_pubkey) = members.iter().copied().find(|pk| {
                             let hash = ember::channel::channel_id_from_pubkey(pk);
                             rendezvous::hashed_id(&hash)
                                 .eq_ignore_ascii_case(&offer.initiator_id)

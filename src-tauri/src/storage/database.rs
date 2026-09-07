@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 45;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 46;
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -2199,6 +2199,40 @@ impl Database {
                 Self::backfill_chat_body_hashes(&tx, key)?;
             }
             set_version(&tx, 45)?;
+            tx.commit()?;
+        }
+
+        if version < 46 {
+            // The unread tally in `get_channel`/`list_channels` filters
+            // `read = 0 AND direction = 'received'`, and until now neither
+            // column was indexed: SQLite seeked `channel_id` and then read
+            // every message row for the room out of the table to test the two
+            // predicates. At `MAX_MESSAGES_PER_CHANNEL` that is a 5,000-row
+            // scan per room per call, which the once-a-second network tick
+            // paid for every joined room. `chat_messages` has had
+            // `idx_chat_messages_read` since v14; the channel table never got
+            // the equivalent.
+            //
+            // Column order is `(channel_id, read, direction)` rather than
+            // `(channel_id, direction, read)` so the `(channel_id, read)`
+            // prefix also covers `mark_channel_messages_read`'s UPDATE. Both
+            // shapes serve the COUNT equally (all three terms are equalities);
+            // only this one serves both callers.
+            //
+            // The second index serves `channel_member_flags`, which answers
+            // "am I banned / a moderator" for every room in one statement.
+            // `channel_members` is keyed `(channel_id, member_pubkey)`, so
+            // asking by member alone had no index to use and would scan the
+            // whole roster table. `last_seen` is not in either index, so the
+            // per-beacon presence touches do not pay to maintain them.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_channel_messages_unread
+                    ON channel_messages(channel_id, read, direction);
+                 CREATE INDEX IF NOT EXISTS idx_channel_members_member
+                    ON channel_members(member_pubkey);",
+            )?;
+            set_version(&tx, 46)?;
             tx.commit()?;
         }
 
@@ -4908,6 +4942,28 @@ impl Database {
         Self::get_channel_locked(&conn, channel_id)
     }
 
+    /// One channel row without the two `COUNT(*)` subqueries, for the same
+    /// reason [`Self::list_channels_lite`] exists: the packet paths need the
+    /// room's identity, keys and in-room flag, and never read `member_count`
+    /// or `unread`. Both are reported as `0`.
+    pub fn get_channel_lite(&self, channel_id: &str) -> anyhow::Result<Option<StoredChannel>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                        c.joined_at, c.last_active, 0, 0,
+                        c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
+                        c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
+                        c.moderation_updated_at, c.moderation_checked_at,
+                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                 FROM channels c WHERE c.channel_id = ?1",
+                params![channel_id],
+                Self::stored_channel_from_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     fn get_channel_locked(
         conn: &Connection,
         channel_id: &str,
@@ -5942,6 +5998,39 @@ impl Database {
             )
             .optional()?;
         Ok(banned.map(|flag| flag != 0))
+    }
+
+    /// `(banned, moderator)` per room for one member, keyed by `channel_id`.
+    ///
+    /// The room list needs both flags for every row, and asking per row cost
+    /// two statements per room — each retaking the single connection lock the
+    /// network loop is also contending for. Both flags live in the same
+    /// roster row, and a member has at most one row per room, so the whole
+    /// answer is one indexed scan. A room with no roster row for this member
+    /// is simply absent; callers read that as "neither flag set".
+    pub fn channel_member_flags(
+        &self,
+        member_pubkey: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, (bool, bool)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, banned, moderator FROM channel_members WHERE member_pubkey = ?1",
+        )?;
+        let rows = stmt.query_map(params![member_pubkey], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                ),
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (channel_id, flags) = row?;
+            out.insert(channel_id, flags);
+        }
+        Ok(out)
     }
 
     pub fn channel_member_is_moderator(
@@ -8454,6 +8543,212 @@ mod tests {
             )
             .expect("version");
         assert_eq!(version, MAX_SUPPORTED_SCHEMA_VERSION);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A fresh database runs every migration block, so it proves the v46 block
+    /// works on an empty schema but not that it works on an *existing* one.
+    /// Rolling the version back and dropping what it created reproduces the
+    /// upgrade a user actually performs, including re-running a block whose
+    /// work is already partly present.
+    #[test]
+    fn the_v46_indexes_are_created_on_an_existing_database() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-upgrade-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let index_count = |db: &Database| -> i64 {
+            db.conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_channel_messages_unread', 'idx_channel_members_member')",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("index count")
+        };
+
+        let db = Database::open_at(&path).expect("open db");
+        assert_eq!(db.schema_version(), 46);
+        assert_eq!(index_count(&db), 2, "fresh database gets both indexes");
+
+        // Back to a v45 profile: version rolled back and the indexes gone.
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "DROP INDEX idx_channel_messages_unread;
+                 DROP INDEX idx_channel_members_member;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (45);",
+            )
+            .expect("roll back to v45");
+        }
+        drop(db);
+
+        let upgraded = Database::open_at(&path).expect("reopen and migrate");
+        assert_eq!(upgraded.schema_version(), 46);
+        assert_eq!(index_count(&upgraded), 2, "upgrade recreates both indexes");
+
+        // Idempotent: opening again must not fail on indexes that now exist.
+        drop(upgraded);
+        let again = Database::open_at(&path).expect("reopen at v46");
+        assert_eq!(again.schema_version(), 46);
+        assert_eq!(index_count(&again), 2);
+
+        drop(again);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// An index only helps if the planner picks it, and the unread tally is
+    /// the one that used to fall back to reading every message row for a room
+    /// out of the table. Asserting the plan is the only way to know the v46
+    /// migration did what it was added for.
+    #[test]
+    fn the_unread_tally_and_member_flags_are_index_driven() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-plan-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let plan_for = |sql: &str| -> String {
+            let conn = db.conn.lock();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan text");
+            rows.join(" | ")
+        };
+
+        let unread = plan_for(
+            "SELECT COUNT(*) FROM channel_messages msg \
+             WHERE msg.channel_id = 'x' AND msg.read = 0 AND msg.direction = 'received'",
+        );
+        assert!(
+            unread.contains("idx_channel_messages_unread"),
+            "unread tally is not using its index: {unread}"
+        );
+        assert!(
+            !unread.contains("SCAN channel_messages"),
+            "unread tally still scans the table: {unread}"
+        );
+
+        // The mark-as-read UPDATE is why the index is ordered
+        // `(channel_id, read, direction)` rather than the other way round.
+        let mark_read =
+            plan_for("SELECT id FROM channel_messages WHERE channel_id = 'x' AND read = 0");
+        assert!(
+            mark_read.contains("idx_channel_messages_unread"),
+            "mark-read predicate is not using the index prefix: {mark_read}"
+        );
+
+        let flags =
+            plan_for("SELECT channel_id, banned, moderator FROM channel_members WHERE member_pubkey = 'x'");
+        assert!(
+            flags.contains("idx_channel_members_member"),
+            "batched member flags are not using their index: {flags}"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// `get_channel_lite` is what the packet paths read, and `list_channels`
+    /// reads both membership flags for every room in one statement. Neither
+    /// may disagree with the per-row queries they replaced.
+    #[test]
+    fn lite_channel_reads_agree_with_the_per_row_queries() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-lite-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let room_a = "aa".repeat(16);
+        let room_b = "bb".repeat(16);
+        let me = "cd".repeat(32);
+        let other = "ef".repeat(32);
+        for (id, pk) in [(&room_a, &me), (&room_b, &me)] {
+            db.insert_channel(id, pk, "Lobby", "private", true, None, Some(&[0x22u8; 32]))
+                .expect("insert channel");
+        }
+        db.upsert_channel_member(&room_a, &me, "Ada", 100, None)
+            .unwrap();
+        db.upsert_channel_member(&room_a, &other, "Bob", 100, None)
+            .unwrap();
+        // Banned in one room, a moderator in neither, absent from the other.
+        db.apply_channel_moderation(
+            &room_a,
+            "topic",
+            "welcome",
+            50,
+            &[hex::decode(&me).unwrap().try_into().unwrap()],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Every field the packet paths read must match, counts aside.
+        let full = db.get_channel(&room_a).unwrap().unwrap();
+        let lite = db.get_channel_lite(&room_a).unwrap().unwrap();
+        assert_eq!(lite.channel_id, full.channel_id);
+        assert_eq!(lite.pubkey, full.pubkey);
+        assert_eq!(lite.visibility, full.visibility);
+        assert_eq!(lite.key_epoch, full.key_epoch);
+        assert_eq!(lite.in_room, full.in_room);
+        assert_eq!(lite.deleted, full.deleted);
+        assert_eq!(lite.in_room_now(), full.in_room_now());
+        assert_eq!(lite.member_count, 0, "counts are deliberately not read");
+        assert_eq!(lite.unread, 0);
+        assert!(db.get_channel_lite(&"99".repeat(16)).unwrap().is_none());
+
+        // The batched flags must equal what the two per-row queries answer,
+        // including for a room this member has no roster row in.
+        let flags = db.channel_member_flags(&me).unwrap();
+        for room in [&room_a, &room_b] {
+            let (banned, moderator) = flags.get(room).copied().unwrap_or((false, false));
+            assert_eq!(banned, db.channel_member_is_banned(room, &me).unwrap());
+            assert_eq!(
+                moderator,
+                db.channel_member_is_moderator(room, &me).unwrap()
+            );
+        }
+        assert!(flags.get(&room_a).copied().unwrap().0, "banned in room A");
+        assert!(!flags.contains_key(&room_b), "no roster row in room B");
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

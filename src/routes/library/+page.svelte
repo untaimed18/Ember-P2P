@@ -62,7 +62,21 @@
   // switch back to `$state` rather than mutating these.
   let folders: string[] = $state.raw([]);
   let folderPriorities: Record<string, string> = $state.raw({});
-  let files: FileInfo[] = $state.raw([]);
+  /** A library row plus the three keys the filter chain would otherwise derive
+   *  from it on every pass.
+   *
+   *  `matchName`, `matchType` and `matchPath` are pure functions of fields that
+   *  never change without a whole new `files` array arriving, but the filter
+   *  re-ran on every keystroke and every filter toggle — allocating a
+   *  lowercased name, a separator-rewritten lowercased path, and re-walking six
+   *  extension sets, once per row per pass. Deriving them where the array is
+   *  assigned makes those passes read instead of allocate. */
+  type LibraryRow = FileInfo & {
+    matchName: string;
+    matchType: TypeFilter | '';
+    matchPath: string;
+  };
+  let files: LibraryRow[] = $state.raw([]);
   let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
   let scanTruncated = $state(false);
@@ -539,6 +553,22 @@
       || normalizedFilePath.startsWith(`${normalizedFolderPath}/`);
   }
 
+  /** Attach the filter chain's derived keys to a freshly fetched row. */
+  function withMatchKeys(f: FileInfo): LibraryRow {
+    return {
+      ...f,
+      matchName: f.name.toLowerCase(),
+      matchType: fileTypeKey(f.extension),
+      matchPath: normalizePathForMatch(f.path),
+    };
+  }
+
+  /** `isPathInFolder` against a row whose path is already normalized. */
+  function rowInFolder(row: LibraryRow, normalizedFolder: string): boolean {
+    return row.matchPath === normalizedFolder
+      || row.matchPath.startsWith(`${normalizedFolder}/`);
+  }
+
   function pathsEqualForFolder(a: string, b: string): boolean {
     return normalizePathForMatch(a) === normalizePathForMatch(b);
   }
@@ -663,7 +693,7 @@
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
-      files = newFiles;
+      files = newFiles.map(withMatchKeys);
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
@@ -1012,10 +1042,13 @@
     const dupOnly = showDuplicatesOnly;
     const missOnly = showMissingOnly;
     if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly) return files;
+    // Normalized once per pass rather than once per row: `isPathInFolder`
+    // re-derived it from `folder` on every call.
+    const normalizedFolder = hasFolder ? normalizePathForMatch(folder!) : '';
     return files.filter((f) => {
-      if (hasFolder && !isPathInFolder(f.path, folder!)) return false;
-      if (hasQuery && !f.name.toLowerCase().includes(q)) return false;
-      if (hasType && fileTypeKey(f.extension) !== typeFilter) return false;
+      if (hasFolder && !rowInFolder(f, normalizedFolder)) return false;
+      if (hasQuery && !f.matchName.includes(q)) return false;
+      if (hasType && f.matchType !== typeFilter) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
       return true;
@@ -1448,7 +1481,7 @@
       sizes.set(folder, 0);
     }
     for (const f of files) {
-      const np = normalizePathForMatch(f.path);
+      const np = f.matchPath;
       for (const { folder, norm } of normalizedFolders) {
         if (np === norm || np.startsWith(`${norm}/`)) {
           counts.set(folder, (counts.get(folder) ?? 0) + 1);

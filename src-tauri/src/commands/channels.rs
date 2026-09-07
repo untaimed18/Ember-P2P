@@ -607,14 +607,29 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || {
         let rows = db.list_channels()?;
+        // Both flags for every room in one statement. Asking per row made the
+        // command `1 + 2N` statements, and while it runs on the blocking pool
+        // rather than the reactor, each one still takes the single SQLite
+        // connection the network loop needs — and the page calls this on every
+        // channel event.
+        //
+        // Propagated rather than defaulted, as the per-row reads were: showing
+        // a banned member an unbanned composer hands them a box whose sends
+        // every peer will drop, so a failed read must not read as "not banned".
+        let flags = db.channel_member_flags(&our_pk)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            // Not `unwrap_or(false)`: reporting a banned member as unbanned
-            // hands them a composer whose sends every peer will drop. Owners
-            // are exempt for the reasons in `self_banned_from`.
-            let you_are_banned =
-                !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
-            let you_are_moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
+            // No roster row in a room means neither flag is set there. That is
+            // the absent entry, not a failure — the query above already spoke
+            // for the whole table.
+            let (banned, moderator) = flags
+                .get(&row.channel_id)
+                .copied()
+                .unwrap_or((false, false));
+            // Owners are exempt from their own room's bans, for the reasons in
+            // `self_banned_from`.
+            let you_are_banned = !row.is_owner && banned;
+            let you_are_moderator = moderator;
             let moderation_updated_at = row.moderation_updated_at;
             let moderation_checked_at = row.moderation_checked_at;
             out.push(
@@ -4022,13 +4037,38 @@ fn listings_from_blobs(
         out.push(GatheredChannelInfo {
             channel_id: id_hex.clone(),
             pubkey: hex::encode(rec.ember_file_hash),
-            name: rec.file_name,
+            name: discovered_room_name(&rec.file_name, &id_hex),
             private,
             joined: joined_ids.contains(&id_hex),
             member_count: None,
         });
     }
     out
+}
+
+/// Display name for a room nobody here has joined, from a name its publisher
+/// chose.
+///
+/// Discover is the one route into the room list that does not pass through
+/// `accept_invite`, so it has to do the same trimming that path does. The
+/// record's own cap is a kilobyte and says nothing about characters, which
+/// leaves an unfiltered name free to run past every column the page has and
+/// to carry zero-width and bidi controls — a listing that reads as a
+/// well-known room while pointing somewhere else. The identity underneath is
+/// verified (`channel_id == BLAKE3(pubkey)`), so only the label is at stake,
+/// but the label is what the user clicks.
+///
+/// A name that sanitizes away to nothing falls back to the short id, which is
+/// what a room that never had a name already shows.
+fn discovered_room_name(raw: &str, channel_id_hex: &str) -> String {
+    let cleaned = crate::security::sanitize_remote_text(raw, MAX_CHANNEL_NAME_CHARS);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    channel_id_hex
+        .get(..8)
+        .unwrap_or(channel_id_hex)
+        .to_string()
 }
 
 fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
@@ -4166,11 +4206,12 @@ pub async fn gather_channels(
             continue;
         }
         seen.insert(id.clone());
+        let name = discovered_room_name(&listing.name, &id);
         out.push(GatheredChannelInfo {
             joined: joined_ids.contains(&id),
             channel_id: id,
             pubkey: pubkey_hex,
-            name: listing.name,
+            name,
             private: false,
             member_count: None,
         });
@@ -4742,6 +4783,32 @@ mod tests {
         assert_eq!(sanitize_channel_username("Ada").unwrap(), "Ada");
         assert_eq!(sanitize_channel_username("Ada1").unwrap(), "Ada1");
         assert_eq!(username_claim_key("Ada"), "ada");
+    }
+
+    /// Discover names come from whoever published the record, which is the one
+    /// route into the room list that does not go through `accept_invite`.
+    #[test]
+    fn discovered_room_names_are_trimmed_like_invited_ones() {
+        let id = "ab".repeat(16);
+
+        assert_eq!(discovered_room_name("Lobby", &id), "Lobby");
+
+        // Capped at the same length the compose form and invites enforce.
+        let long = "x".repeat(200);
+        assert_eq!(
+            discovered_room_name(&long, &id).chars().count(),
+            MAX_CHANNEL_NAME_CHARS
+        );
+
+        // Zero-width and bidi controls are what make one room's label
+        // indistinguishable from another's.
+        let spoof = "Lo\u{200B}bby\u{202E}";
+        assert_eq!(discovered_room_name(spoof, &id), "Lobby");
+
+        // Nothing left to draw falls back to the short id, which is what a
+        // room that never had a name already shows.
+        assert_eq!(discovered_room_name("\u{200B}\u{FEFF}", &id), &id[..8]);
+        assert_eq!(discovered_room_name("", &id), &id[..8]);
     }
 }
 
