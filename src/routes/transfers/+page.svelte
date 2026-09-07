@@ -29,6 +29,7 @@
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
+  import { serviceAvailableFor } from '$lib/webServices';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -4646,12 +4647,15 @@
       onclick={() => (ctxWebSub = !ctxWebSub)}
     >{m.webservices_ctx_menu()}</button>
     {#if ctxWebSub}
+      {@const hash = ctxTransfer?.file_hash ?? ''}
       <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
         {#each webServices as service, index (service.url)}
+          {@const usable = serviceAvailableFor(service.url, hash)}
           <button
             class="ctx-item"
             role="menuitem"
-            title={service.url}
+            disabled={!usable}
+            title={usable ? service.url : m.webservices_ctx_no_hash()}
             onclick={() => ctxAction('web_service', String(index))}
           ><bdi dir="auto">{service.name}</bdi></button>
         {/each}

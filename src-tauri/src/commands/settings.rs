@@ -2175,7 +2175,6 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
 /// for.
 #[tauri::command]
 pub async fn open_web_service(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     service_index: usize,
     file_hash: String,
@@ -2206,10 +2205,6 @@ pub async fn open_web_service(
     );
     let safe = validate_external_url(&filled)?;
     reject_non_public_external_host(&safe).await?;
-    if !confirm_external_url(&app, &safe).await {
-        info!("Web service was not opened: the native confirmation was declined");
-        return Ok(());
-    }
     opener::open(&safe).map_err(|e| {
         coded_ctx(
             "settings_open_link_failed",

@@ -48,6 +48,7 @@
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { openWebService } from '$lib/api/settings';
+  import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -3771,12 +3772,15 @@
         >
           {m.webservices_ctx_menu()}
           {#if ctxWebSub}
+            {@const hash = contextMenu.result.file.hash ?? ''}
             <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
               {#each webServices as service, index (service.url)}
+                {@const usable = serviceAvailableFor(service.url, hash)}
                 <button
                   class="ctx-item"
                   role="menuitem"
-                  title={service.url}
+                  disabled={!usable}
+                  title={usable ? service.url : m.webservices_ctx_no_hash()}
                   onclick={() => { if (contextMenu) void openWebServiceFor(contextMenu.result, index); }}
                 ><bdi dir="auto">{service.name}</bdi></button>
               {/each}

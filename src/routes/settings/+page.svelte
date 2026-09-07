@@ -14,6 +14,7 @@
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
+  import type { WebService } from '$lib/types';
   import {
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
@@ -162,6 +163,17 @@
       })
       .catch(() => {
         // Only the displayed path is lost; the button still works.
+      });
+  });
+
+  $effect(() => {
+    getExampleWebService()
+      .then((service) => {
+        exampleWebService = service;
+      })
+      .catch(() => {
+        // Only the "add the example" shortcut is lost; the list and the manual
+        // add form are unaffected.
       });
   });
 
@@ -1275,6 +1287,19 @@
   let newWebServiceName = $state('');
   let newWebServiceUrl = $state('');
   let webServiceMessage: { kind: 'ok' | 'err'; text: string } | null = $state(null);
+  // Loaded from the backend so the offer cannot drift from the validator, and
+  // so the button can hide itself once the entry is present rather than being
+  // clickable only to report a duplicate.
+  let exampleWebService: WebService | null = $state(null);
+  // Narrowed via local consts first, for the reason `antileechDraftDirty`
+  // records: TS does not reliably narrow a `$state`-backed getter read inside
+  // an expression the way it would a plain variable.
+  let canAddExample = $derived.by(() => {
+    const example = exampleWebService;
+    const current = settings;
+    if (!example || !current) return false;
+    return !current.web_services.some((s) => s.url === example.url);
+  });
 
   function looksLikeWebServiceUrl(url: string): boolean {
     // A template's `#hashid` is a URL fragment until it is substituted, so the
@@ -1328,11 +1353,10 @@
     webServiceMessage = null;
   }
 
-  async function addExampleWebService() {
+  function addExampleWebService() {
     try {
-      // Read from the backend rather than hardcoded here, so the string stored
-      // is the reviewed one and the offer cannot drift from the validator.
-      const example = await getExampleWebService();
+      const example = exampleWebService;
+      if (!example) return;
       const outcome = addWebServiceEntry(example.name, example.url);
       webServiceMessage =
         outcome === 'duplicate'
@@ -2264,9 +2288,11 @@
             <span class="hint">{m.webservices_placeholders()}</span>
 
             <div class="webservice-actions">
-              <button class="action-btn ghost" onclick={addExampleWebService}>
-                {m.webservices_add_example()}
-              </button>
+              {#if canAddExample}
+                <button class="action-btn ghost" onclick={addExampleWebService}>
+                  {m.webservices_add_example()}
+                </button>
+              {/if}
               <button class="action-btn ghost" onclick={handleImportWebServices}>
                 {m.webservices_import()}
               </button>

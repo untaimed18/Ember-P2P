@@ -92,6 +92,23 @@ fn default_true() -> bool {
     true
 }
 
+/// Web services a fresh profile starts with.
+///
+/// The availability lookup ships configured rather than empty. The feature
+/// exists to answer "why will this download not finish?", and a lookup you have
+/// to go and set up before you can ask is a lookup you will not use on the day
+/// you need it. It costs nothing until it is clicked: nothing is contacted, and
+/// nothing about it runs in the background.
+///
+/// This is also what an existing profile picks up, since a `config.json`
+/// written before the field existed has no key for `serde` to read.
+fn default_web_services() -> Vec<crate::webservices::WebService> {
+    vec![crate::webservices::WebService {
+        name: crate::webservices::EXAMPLE_SERVICE_NAME.to_string(),
+        url: crate::webservices::EXAMPLE_SERVICE_URL.to_string(),
+    }]
+}
+
 fn default_filename_cleanups() -> String {
     crate::search::cleanup::DEFAULT_CLEANUP_STRINGS.to_string()
 }
@@ -1273,11 +1290,12 @@ pub struct AppSettings {
     /// specific file from its context menu, with the file's hash, name or size
     /// substituted into a URL template.
     ///
-    /// Empty by default, and deliberately so. Opening one tells a third-party
-    /// site which file this user is looking for, which is a choice to make
-    /// rather than a default to inherit — Settings offers the example from the
-    /// request this feature came from as a one-click add instead.
-    #[serde(default)]
+    /// Ships with the availability lookup already configured — see
+    /// [`default_web_services`]. Opening one does tell that site which file you
+    /// are looking for, which is why it only ever happens on an explicit click
+    /// and why the list is editable; but it is a lookup a user reaches for when
+    /// a download is stuck, and it has to be there at that moment.
+    #[serde(default = "default_web_services")]
     pub web_services: Vec<crate::webservices::WebService>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
@@ -1871,8 +1889,7 @@ impl Default for AppSettings {
             ip_filter_enabled: true,
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
-            // Empty rather than seeded: see the field.
-            web_services: Vec::new(),
+            web_services: default_web_services(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,
@@ -1991,6 +2008,60 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh profile can answer "why will this download not finish?" without
+    /// being set up first, which is the whole point of shipping the lookup
+    /// configured. Pinned end to end — valid by the validator's rules, and
+    /// producing a real URL for a real hash — because a default that exists but
+    /// does not work would look identical from the settings page.
+    #[test]
+    fn a_fresh_profile_has_a_working_availability_lookup() {
+        let services = AppSettings::default().web_services;
+        assert_eq!(services.len(), 1, "exactly one, so no menu clutter");
+
+        let service = crate::webservices::validate_service_template(
+            &services[0].name,
+            &services[0].url,
+        )
+        .expect("the shipped default must survive our own validation");
+
+        let filled = crate::webservices::substitute_placeholders(
+            &service.url,
+            &crate::webservices::FileFacts {
+                hash: "ffdd6a41a2b30f27a1c3858a433b9822",
+                name: "some movie.avi",
+                size: 700,
+            },
+        );
+        assert!(
+            filled.ends_with("FFDD6A41A2B30F27A1C3858A433B9822"),
+            "the hash has to reach the URL, upper-cased: {filled}"
+        );
+        assert!(!filled.contains('#'), "no placeholder left behind: {filled}");
+    }
+
+    /// A profile written before the field existed has no key for `serde` to
+    /// read, so it inherits the default rather than an empty list. That is the
+    /// only reason an upgrading user gets the feature at all.
+    #[test]
+    fn a_config_predating_web_services_inherits_the_default() {
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        // Simulate a config written before the field existed: the key is simply
+        // absent, which is what makes `serde` fall back to the default rather
+        // than to an empty list.
+        value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object")
+            .remove("web_services");
+        let parsed: AppSettings =
+            serde_json::from_value(value).expect("an older config still loads");
+        assert_eq!(
+            parsed.web_services.len(),
+            1,
+            "an upgrading profile picks up the lookup"
+        );
+    }
 
     /// Configs from a newer build may include unknown keys. Those must be
     /// ignored on downgrade rather than failing deserialize (which would
