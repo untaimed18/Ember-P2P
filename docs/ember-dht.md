@@ -276,10 +276,87 @@ friend holding fourteen, over a working friend session, with `Known peers` at 0
 The gossip machinery itself was fine, and said so: 190 gossip contacts seen, 0
 refused, 0 new, which is three peers describing each other in a loop.
 
+### 2b. Meeting a friend we cannot dial — designed, not started
+
 Still open on this path: nothing uses the friend session to carry a *live*
-introduction the other way, so two friends who can each reach a third party but
-not each other still do not meet over the overlay. That needs relay, not
-another ask.
+introduction, so a friend we cannot dial never becomes an overlay contact however
+long the session lasts. This section used to say "that needs relay, not another
+ask". Having costed the relay, that conclusion was wrong, and the cheaper
+mechanism is also the better one.
+
+**What is actually blocked.** `note_connected_ember_peer` returns at
+`udp_port == 0` — "the peer is now a known Ember host and will never be a DHT
+contact: the overlay rides the shared UDP socket, so with no port there is nothing
+to bridge to". That is the normal case for a friend reached by relay or NAT
+traversal, and it is a dead end rather than a slow path: no retry policy helps
+something that is never attempted. A friend that *did* advertise a port but sits
+behind a NAT that drops unsolicited datagrams is the same dead end one step later,
+because the bridge ping is unsolicited by definition.
+
+**Why not relay.** Three reasons, in increasing order of how much they cost:
+
+- The DHT does not need direct pairs. A record is found on whichever nodes are
+  closest to its key, so A does not need B as a contact to find B's files — it
+  needs *any* twenty working nodes. Making two specific peers contacts of each
+  other is close to worthless on its own.
+- A relayed contact is a fiction the routing table cannot hold. `is_verified()`
+  means we heard a signed frame *directly*; refreshing `last_seen` from relayed
+  traffic tells the liveness model an address works when it does not, and the
+  address is then gossiped onward in `FOUND_NODE` to peers for whom it certainly
+  does not.
+- It would duplicate the channel relay for the only population that genuinely
+  cannot punch — both ends symmetric — and that population already has the friend
+  session itself for chat, browse and file offers, plus the channel relay for
+  rooms. The marginal gain is a routing-table entry nobody can use.
+
+**The mechanism instead: a friend-coordinated simultaneous open.** The friend
+session is an authenticated, live, bidirectional channel to exactly the peer we
+want to meet. That is all a UDP simultaneous open needs, and it needs no third
+party, no rendezvous server and no new trust relationship.
+
+One new `EMBER_EXT` sub-type (`0x07`; `0x06` is the highest in use), sent over the
+friend session: *"I am sending you a DHT `PING` from my Ember UDP socket now — send
+me one too."* Both sides send immediately, each outbound datagram opens the return
+path through its own NAT, and whichever `PING` lands first is answered with a
+signed `PONG` that folds the sender into the routing table through the ordinary
+path. Nothing new touches the table.
+
+Four details carry the design:
+
+- **Observed IP, claimed port.** Take the friend's IP from the TCP connection we
+  are already talking to them on, and the UDP port from the payload — the port
+  cannot be observed and must be asserted, exactly as `BUDDY_ENDORSE` has a buddy
+  assert its own endpoint. Never take the IP from the payload; that is the rule
+  `CALLBACK` states as "a claimed address would let anyone aim the publisher at a
+  third party", and it applies here for the same reason.
+- **The frame grants nothing.** It is a request to *try*, not an introduction to
+  be believed. Only a real `PONG` creates a contact, so a friend that lies about
+  its port costs us one datagram and gets nothing — no table entry, no session, no
+  gossip.
+- **Fire it when it can help, not on a timer.** The condition is precise: we hold
+  no verified contact for this friend. That is cheaper than the starvation gate the
+  contact ask uses (`verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS`) and correct
+  at any table size. Add a per-friend interval on the same stamp-before-send
+  pattern as `EMBER_FRIEND_CONTACT_ASK_INTERVAL`, and the same
+  least-recently-asked rotation, so a handful of friends cannot monopolise it.
+- **It composes with the ask already there.** A friend hands over the contacts it
+  holds *and* can now become one. For a small overlay that is the difference
+  between a friend being a phone book and being a peer.
+
+**Where it stops.** Both-ends-symmetric fails a simultaneous open, and that is
+where this design ends rather than falling back. `NatType::can_punch_with` already
+states that case as unpunchable, and the live gate is narrower still — it checks
+only that *our own* type is not `Symmetric`, because the peer's type is not known
+until a punch is already in flight. Worth knowing when reading that predicate: STUN
+here only ever assigns `Open`, `Symmetric`, `PortRestricted` or `Unknown`, so
+`FullCone` and `RestrictedCone` are dead branches and the common real answer is
+`PortRestricted`, which punches.
+
+Diagnostics, mirroring `ember_dht_friend_contact_asks` against
+`ember_dht_friend_contacts_learned`: meets attempted against contacts gained. Those
+two are also the evidence that would justify revisiting the relay — a population
+whose attempts never convert is the both-symmetric case, measured rather than
+assumed.
 
 ### 3. Cold join when eMule is not available
 
@@ -472,8 +549,9 @@ together, since one bump pays for both and item 2 was only worth having once ite
 
 **Every item in this list is now done.** What remains for the overlay is the
 standing work in the sections above (native transfers, routing a wire change
-around old peers now that they advertise, cold join without eMule, validation
-past the happy path) and the "Future improvements" below — not this comparison.
+around old peers now that they advertise, meeting a friend we cannot dial, cold
+join without eMule, validation past the happy path) and the "Future improvements"
+below — not this comparison.
 
 ### 1. The serving ceiling — done (wire v3)
 

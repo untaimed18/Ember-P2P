@@ -42,11 +42,12 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 Every item here is done and the extension question is decided. None of the wire
 additions needed a version bump — see item 1 for why bumping would have been
-actively wrong. What remains is one *new* feature rather than a gap
-([browse by type](#next-browse-by-type-off-the-dht)). The `CancelEmberSearch`
-tidy that used to be listed under item 6 is closed too, though not by anything
-in this pass — see there for which half was fixed elsewhere and which half turned
-out to be unreachable.
+actively wrong. What remains is one *new* feature rather than a gap, now designed
+rather than sketched:
+[filter the friend browse on the wire](#next-filter-the-friend-browse-on-the-wire--designed-not-started).
+The `CancelEmberSearch` tidy that used to be listed under item 6 is closed too,
+though not by anything in this pass — see there for which half was fixed elsewhere
+and which half turned out to be unreachable.
 
 The two kinds of change this overlay is for, and which each item was:
 
@@ -322,45 +323,121 @@ three bytes, so `flac`, `webm` and `epub` are indexed while `mp3`, `mkv` and `av
 are not. "flac" as a query has always worked; "mp3" never has. Nothing here changes
 that, and the constraint makes both behave the same as a filter.
 
-## Next: browse by type, off the DHT
+## Next: filter the friend browse on the wire — designed, not started
 
 What the constraint cannot do is answer "show me every `.mp3`" with no keyword at
 all. Kademlia has to walk *toward* something, and the only key such a query could
-name is the hotspot above — so if browsing by type is wanted, it should not be a
-DHT feature.
+name is the hotspot above — so if browsing by type is wanted, it must not be a DHT
+feature.
 
-The honest mechanism is a **filtered browse of peers we already have a session
-with**. eD2K has had the unfiltered form since forever
-(`OP_ASKSHAREDFILES` / `OP_ASKSHAREDFILESANSWER`, gated by the "allow others to
-view my shared files" setting, answered as one capped packet), so this is that
-request carrying a filter — bounded work, no key, no hotspot, and real answers
-instead of a random sample.
+**The three open questions this section used to carry are answered by where the
+feature has to live**, so they are recorded as decided rather than left open.
 
-Sketch:
+`OP_EMBER_EXT` — the envelope the sketch proposed — is gated on
+`friend_privileges_allowed(secure_v2_authenticated, is_ember_friend)`, so an
+ember-ext sub-type is friends-only with proof of possession *by construction*. And
+a dedicated friend browse already exists beside it: `OP_EMBER_BROWSE_REQ` (0xF2) /
+`OP_EMBER_BROWSE_RES` (0xF3), over a secure-v2 friend session, gated on mutual
+friendship and `friend_browse_disabled`, answering with the `EBR1` format that
+carries AICH roots and Ember digests. So:
 
-- Two new sub-types on the Ember extension wire, where `0x06` is the highest in use
-  (`EMBER_EXT_DHT_CONTACTS`): a share query carrying a `ValueConstraints`-shaped
-  filter, and its reply. Older peers ignore unknown sub-types, as that envelope
-  intends.
-- **Reuse the existing browse permission exactly.** A filtered browse must never
-  expose a file the unfiltered one would not, and a peer with browsing disabled must
-  refuse it the same way — an explicit denial, not a silent drop. Friends-only
-  shares stay invisible to non-friends on the same terms as everywhere else.
-- Reuse the per-file answer shape and its size cap, so a large library answers as
-  completely as one packet allows and no further.
-- Rate-limit per peer. A filter makes the request cheap to send and the answer
-  expensive to build, which is the wrong asymmetry to leave open.
+1. **Who may ask** — friends, and only friends. Not a new policy and not a new
+   setting: a stranger cannot get the frame past the opcode gate. Mutual friends
+   already see `friends_only` shares (`is_friend_visible()` is `shared` alone,
+   against `is_public_listable()`'s `shared && !friends_only`), so the filter
+   exposes nothing a friend could not already ask for.
+2. **Where it surfaces** — in the Friend Browse dialog, which is where browse
+   already lives. Not a search method: presenting it beside "Ember Only" invites
+   the comparison it loses, because it can only show what one friend holds.
+3. **How results merge** — they do not. One friend's answer is one friend's list,
+   so no availability semantics, no publisher corroboration, no digest rules.
 
-Open questions worth deciding before code:
+**What the user actually gains**, which is the reason to build it: the friend
+browse answer is capped at `MAX_BROWSE_ANSWER_FILES` = 1000 files and
+`MAX_BROWSE_ANSWER_BYTES` = 400 KiB, and the parse and UI sides cap at 1000 too
+(`MAX_BROWSE_ENTRIES`, `MAX_BROWSE_FILES`). The filter that exists today is
+*client-side*, so browsing a friend with 40,000 shared files filters an arbitrary
+thousand of them. Filtering before the cap is what turns "some of your friend's
+files" into "your friend's FLACs".
 
-1. **Who may ask.** Every Ember session, or friends only? The eD2K setting is a
-   single global yes/no; "friends may browse, strangers may not" is a finer policy
-   than what exists and may deserve its own setting rather than being inferred.
-2. **Where it surfaces.** A search method beside "Ember Only", or its own view? It
-   is not a keyword search and pretending it is invites the comparison it will lose
-   — it can only ever show what the peers you are connected to hold.
-3. **How results merge.** They arrive per peer with no publisher corroboration, so
-   the availability and digest rules the DHT path relies on do not apply.
+### The trap: the request marker is compared for equality
+
+`browse_request_supports_v1` is `payload == BROWSE_RESPONSE_V1_MAGIC` — an exact
+comparison of the whole payload, not a prefix test. So appending a filter block to
+the existing request does **not** read as additive: an unpatched answerer sees a
+payload that is not exactly `EBR1`, decides the requester is a legacy peer, and
+replies in the pre-v1 format *without* AICH roots or Ember digests. A new client
+browsing an old friend would get a worse answer than it gets today.
+
+That is the same class of mistake the trailing-block trick avoids everywhere else,
+and it does not apply here, because there is no field in front of the marker for a
+block to trail.
+
+### The prerequisite: the friend handshake cannot advertise anything
+
+There is no feature or protocol version in `PeerCapabilities` — only `is_ember`,
+`ember_hash` and `ember_pubkey`. The ext envelope degrades well for *unknown
+sub-types* (they are logged and ignored, which is the whole point of it), but
+nothing lets a sender know in advance whether a peer speaks one, so every new
+sub-type is fire-and-forget. That is the same gap the DHT wire had until `PING`
+and `PONG` began carrying a version range, and it wants the same shape of fix.
+
+`OP_EMBER_HELLO` can carry it additively. `parse_ember_hello` reads
+`version(1) ‖ flags(1) ‖ ember_hash(16) ‖ len-prefixed mod_version ‖
+len-prefixed nickname ‖ optional ed25519_pubkey(32)`, taking every field from a
+length prefix or a flag bit and **never checking that the payload ends** — so
+bytes past the pubkey are already valid and ignored by every build. Only bit 0 of
+`flags` is in use.
+
+So: **set `flags` bit 1 and append a feature-bits field.** An older peer ignores
+it; a newer peer learns what this one speaks before it sends anything. Do this
+first, and the browse filter becomes a plain negotiated feature instead of an
+optimistic guess with a fallback dance. It is also reusable by every friend-session
+feature after this one, which is most of the value.
+
+### Design
+
+1. **Feature bits on the Ember hello.** `flags & 0x02` ⇒ a `u32` LE of feature
+   bits follows the optional pubkey. Bit 0 = filtered browse. Surface it on
+   `PeerCapabilities` beside `is_ember`. Pin the additivity the way the DHT block
+   is pinned: a test asserting that a hello carrying feature bits parses
+   identically on the field-for-field path an older build takes.
+2. **A new request marker, sent only to a peer that advertised the bit.**
+   `EBR2` ‖ filter block. Keep `browse_request_supports_v1`'s exact comparison
+   untouched, and add an exact comparison for `EBR2`; do not loosen either to a
+   prefix test, or the next addition inherits this same trap.
+3. **Reuse `ValueConstraints` for the filter.** Its four content fields —
+   `min_size`, `max_size`, `file_type`, `file_extension` — are exactly the
+   browse filter, and its encoder already skips unknown tags, truncates
+   over-long strings and writes *nothing* when the filter is empty. `extra_keys`
+   is DHT-specific and stays unset. One encoder and one decoder then serve both
+   the keyword walk and the browse, which is the only way the two stay agreed on
+   what `Video` means — both must derive type from the extension with
+   `search::index::infer_file_type`, as the DHT path already does.
+4. **Apply the filter before the caps, and report the total.** Filtering after
+   the 1000-file cap would reproduce the bug being fixed. The answer carries
+   `total_matched` alongside the entries, so the dialog can say "showing 1000 of
+   3400 — narrow the filter" instead of silently truncating. That is `FOUND_VALUE`'s
+   `total_available` reasoning applied to a browse, and it is cheaper than paging.
+5. **Rate-limit the answer, stamped before the work.** A filter makes the request
+   cheap to send and the answer expensive to build — an index walk over every
+   shared file — which is the wrong asymmetry to leave open. Copy
+   `EMBER_FRIEND_CONTACT_SERVE_INTERVAL` exactly, including recording the stamp
+   *before* the walk rather than after a successful send, so a friend whose writer
+   queue is full cannot buy an unthrottled walk per request.
+
+**Not a confidentiality change, and worth saying so explicitly** so nobody
+"hardens" it later by accident: a mutual friend can already see every `shared`
+file, `friends_only` included. What the filter changes is how much of that they can
+retrieve per request, so the rate limit is about CPU and bandwidth, not about
+exposure.
+
+**Deliberately out of scope:** filtering the *vanilla* `OP_ASKSHAREDFILES` browse.
+That one answers any peer, is off by default (`allow_shared_files_browse`),
+excludes `friends_only`, and refuses explicitly with `OP_ASKSHAREDDENIEDANS`. A
+filter there would let a stranger enumerate a library far past the single capped
+packet the setting was reasoned about, which is a genuine exposure change and a
+separate decision.
 
 ## A note on future wire additions
 
