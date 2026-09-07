@@ -1050,7 +1050,7 @@
       <div class="hl-card">
         <div class="hl-icon">&#x1F50D;</div>
         <h4>Advanced Search</h4>
-        <p>Global, Server, KAD, and Ember keyword search with multi-tab results, type/size/source/extension filters, and built-in spam detection.</p>
+        <p>Global, Server, KAD, and Ember keyword search with multi-tab results, type/size/source/extension filters, related-file lookup from any row, and built-in spam detection.</p>
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x1F6E1;</div>
@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.6.2</h3>
+      <h3>Get Ember 1.6.3</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1139,7 +1139,7 @@
       </li>
       <li>
         <strong>Share &amp; Download</strong><br>
-        <span style="color: var(--text-secondary)">Add folders to your library, search with Global / Server / KAD methods, open <code>ed2k://</code> links, and start downloading. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
+        <span style="color: var(--text-secondary)">Add folders to your library, search with the Global / Server / KAD / Ember methods, open <code>ed2k://</code> links, and start downloading. Right-click a result to look for related files or to look the file up on a web service. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
       </li>
       <li>
         <strong>Add Friends (optional)</strong><br>
@@ -1177,7 +1177,8 @@
     <h3>Transfers</h3>
     <ul>
       <li><strong>Multi-Source Downloads</strong> &mdash; Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.</li>
-      <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery.</li>
+      <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery. The Sources column reads the way eMule&rsquo;s does, counting peers holding a place in a remote queue and showing how many are actually transferring in parentheses.</li>
+      <li><strong>Find Sources</strong> &mdash; Ask every connected network for more sources for one download &mdash; KAD, the Ember DHT, the connected eD2K server over TCP, and the rest of the server list over UDP. Each leg answers on its own schedule and what it finds goes straight into the transfer; legs with nowhere to send the question are reported rather than waited on.</li>
       <li><strong>Bulk Transfer Actions</strong> &mdash; Tick rows (or use the header checkbox) to pause, resume, stop or cancel many downloads at once, or use the Pause / Resume / Stop / Cancel All commands in the toolbar's More menu. Completed and failed rows can be selected the same way and removed from the list together; the files themselves are kept.</li>
       <li><strong>Upload Speed Sense (USS)</strong> &mdash; Optionally adjusts upload speed from network latency to reduce congestion (requires an upload speed limit).</li>
       <li><strong>AICH</strong> &mdash; Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</li>
@@ -1186,6 +1187,8 @@
     <h3>Search &amp; Library</h3>
     <ul>
       <li><strong>Advanced Search</strong> &mdash; Global, KAD Only, Server Only, and Ember Only keyword search with multi-tab results plus type, size, source, and extension filters. Global runs every network that is up, so Ember results arrive alongside KAD and server hits, de-duplicated into one list.</li>
+      <li><strong>Related Files</strong> &mdash; Right-click a search result, a transfer or a shared file to look for the rest of what it belongs to. eMule&rsquo;s version asks the connected server and is unavailable unless that server advertises support, which most do not; Ember keeps that request as one signal and also reads the season and episode marker, disc or part marker, year and title out of the file&rsquo;s own name, so the search runs on every network with no server support. The tab is named after what it went looking for.</li>
+      <li><strong>Web Services</strong> &mdash; eMule&rsquo;s right-click &gt; Web services: open a site with a file&rsquo;s details substituted in, most usefully one that reports how many complete sources the network has seen. All six eMule placeholders are supported and an existing <code>webservices.dat</code> can be imported. An availability lookup ships configured; nothing is contacted until you click one, adding a site asks for confirmation, and the list is editable in Settings &gt; Downloads.</li>
       <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with balanced and aggressive profiles. Configurable spam threshold and automatic result hiding.</li>
       <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
       <li><strong>Copy eD2K Links from Search</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole result list at once, from the context menu, the selection toolbar, or Ctrl+C.</li>
@@ -1206,6 +1209,7 @@
     <ul>
       <li><strong>Signed Anti-Rollback Updates</strong> &mdash; In-app updates are cryptographically signed and gated by security epochs, so installs only advance when the signed epoch allows it.</li>
       <li><strong>Safer File Opens</strong> &mdash; Deep links require confirm / review; Library drag-and-drop shared folders ask for a system folder-picker confirmation; media and upload paths pin approved handles to avoid path-swap races.</li>
+      <li><strong>Confirmed External Links</strong> &mdash; A link in a room or a message is opened only after a confirmation Ember draws itself, showing the destination host, and only after the host is checked: anything that is or resolves to a loopback, private or link-local address is refused, so a link cannot reach your router&rsquo;s admin page or a cloud metadata endpoint. Web services collect the same confirmation once, when a site is added to the list.</li>
       <li><strong>Security Page</strong> &mdash; A dedicated page for IP filter management: download the default list, import a file, fetch from an HTTPS URL, enable or disable filtering, add and remove custom ranges, and review how many times each range has actually blocked something.</li>
       <li><strong>IP Filtering</strong> &mdash; Load ipfilter.dat / ipfilter.zip with automatic update support. Incoming connection filtering is off by default because VPN IP ranges commonly appear in ipfilter.dat hosting blocks, silently blocking legitimate peers. Outbound filtering remains active regardless of this setting.</li>
       <li><strong>Anti-Leech Filter</strong> &mdash; Reject incoming connections from known leech client patterns (customizable regex list in Settings).</li>
@@ -1275,7 +1279,10 @@
     <p>The files you share are published to the Ember DHT as keyword records (so people can find them by name) and source records (so people can fetch them). Publishing happens automatically once the node has peers, and republishes on a cycle to stay alive.</p>
     <ul>
       <li><strong>Searching</strong> &mdash; The Search page has an <strong>Ember Only</strong> method, and <strong>Global</strong> queries Ember alongside KAD and servers, merging everything into one de-duplicated result list. If KAD and eD2K are both offline, Global quietly falls back to Ember alone.</li>
-      <li><strong>Source lookup</strong> &mdash; Downloads ask the Ember DHT for sources in addition to KAD and servers, so a file can gain Ember sources even if you found it elsewhere.</li>
+      <li><strong>What a result carries</strong> &mdash; A keyword record holds the file&rsquo;s media details (duration, bitrate, codec, artist, album, title) alongside its name and size, so an Ember hit fills the same columns an eD2K server hit fills. Your library is probed once and the answer is persisted &mdash; including &ldquo;nothing to find&rdquo;, which is the answer for most of a library and has to be as durable as a positive one.</li>
+      <li><strong>Complete sources</strong> &mdash; Only complete public shares are keyword-published, so the count of distinct publishers who signed a record is a floor on the complete sources. That is a firmer number than a server or KAD swarm estimate, which is one peer&rsquo;s claim about a swarm it cannot see &mdash; and the Sources column says which of the two it is showing.</li>
+      <li><strong>Filters that cost the network nothing</strong> &mdash; Size, type and extension travel with the query as constraints the responder applies before it packs an answer, rather than as published keys. An indexed <code>.mp3</code> would be the hottest key on the network, with every mp3 anyone shares competing for one key&rsquo;s slots on the twenty nodes nearest it.</li>
+      <li><strong>Source lookup</strong> &mdash; Downloads ask the Ember DHT for sources in addition to KAD and servers, so a file can gain Ember sources even if you found it elsewhere. Find Sources on a transfer asks every network that is connected.</li>
       <li><strong>Publish badge</strong> &mdash; The Library marks a shared file with an <strong>Ember</strong> badge once it has a source record placed on the network, which is the point at which other Ember users can actually fetch it.</li>
       <li><strong>Publishing while firewalled</strong> &mdash; A node that cannot be reached directly publishes through a buddy relay instead, so sharing still works behind a restrictive router.</li>
       <li><strong>BLAKE3 integrity</strong> &mdash; Ember records carry a BLAKE3 digest, and a download verifies against it whenever one is known (from a search hit, a DHT source record, or your own library). A match shows an Ember badge on the finished row; a mismatch fails the download instead of retrying parts that already matched. Links opened without a digest still download normally and are hashed for future sharing.</li>
@@ -1316,6 +1323,8 @@
       </tbody>
     </table>
 
+    <p>The full wire format &mdash; every frame and its encoding, the signing and session rules, the version negotiation, and the storage and admission limits &mdash; is written up in the <a href="ember-dht-specification.html">EmberDHT Protocol Specification</a>, also available as a <a href="ember-dht-specification.pdf">PDF</a>. It is written against wire version 4, as implemented in this release, and marks each change since v3 as additive or breaking, which is the distinction another implementation needs.</p>
+
     <h3 id="ember-status">The Ember Network page</h3>
     <p>The page leads with the questions a user actually has &mdash; is it on, am I connected, can people reach me, are my shared files findable &mdash; and keeps the protocol detail behind a disclosure.</p>
     <ul>
@@ -1329,7 +1338,7 @@
     <p>The overlay is always on and in daily use, but these are the things it does not do yet:</p>
     <ul>
       <li><strong>Bootstrap depends on eMule</strong> &mdash; A first run with KAD off and no servers cannot join, as described above.</li>
-      <li><strong>Version mismatches are silent</strong> &mdash; Incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never appear in each other&rsquo;s routing tables.</li>
+      <li><strong>A peer that needs to update cannot be told so</strong> &mdash; Incompatible peers refuse each other cleanly at the version byte. Your side is not in the dark about it: refusals are counted, split into peer-older and peer-newer, and the Ember page raises a banner while older peers are being turned away. The other half cannot be fixed from here, because the peer that needs to update is by definition the one that cannot decode anything we send. Builds now advertise which versions they can decode on <code>PING</code> and <code>PONG</code>, so a future change to an existing frame can be negotiated rather than partitioning the overlay on the day it ships &mdash; but that only helps between peers that both carry it.</li>
       <li><strong>Multi-keyword recall is approximate</strong> &mdash; See the note above.</li>
       <li><strong>A busy keyword is answered a page at a time</strong> &mdash; One packet still only carries a few records, but a searcher can ask the same peer for the next page, so recall under a common word is bounded by how many peers the search walks and how deep it pages rather than by one datagram. A peer is held to a quarter of a search&rsquo;s budget while the walk still has somewhere to go, and may serve the rest of it once there is nothing left to ask &mdash; so a single node holding an uncommon word can hand over its whole index instead of the first slice of it. Publishing has its own ceiling: a key holds 1000 records and any one publisher at most 150 of them, matching KAD&rsquo;s numbers, so if you share far more than 150 files under one common word not all of them are findable under it. The Ember page counts how often an answer was truncated or records were withheld.</li>
       <li><strong>Gossip is unverified until it answers</strong> &mdash; A peer another node told us about is a lead, not a fact, until it replies directly. The Ember page, status bar, and Search readiness wait for a verified answer before calling the overlay connected, so a table full of gossip does not look like a successful join. Admission caps bound the damage, but there is no reputation scoring on gossip itself.</li>
@@ -1667,6 +1676,9 @@ peer_count    (u16 LE)
   <section id="developers">
     <h2>For Developers</h2>
 
+    <h3>Protocol documentation</h3>
+    <p>Ember&rsquo;s eMule-side behaviour follows the published eD2K and KAD protocols. Its own overlay is specified in the <a href="ember-dht-specification.html">EmberDHT Protocol Specification</a> (<a href="ember-dht-specification.pdf">PDF</a>) &mdash; wire version 4, as implemented in this release &mdash; which is enough to write an independent implementation that joins the same network.</p>
+
     <h3>Prerequisites</h3>
     <ul>
       <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.94+)</li>
@@ -1836,6 +1848,113 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-3">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.3" target="_blank" rel="noopener">Ember v1.6.3</a></h3>
+        <time class="release-date" datetime="2026-09-07">September 7, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.3" target="_blank" rel="noopener"><code>v1.6.3</code></a></p>
+      <div class="release-notes">
+        <p>Finding things is the theme. Ember can look for the other episodes of what you are watching, ask an availability site why a download will not finish, and return search rows that fill the same columns an eD2K server fills. The repair that matters most is older than any of it: a failed hash check was re-downloading the whole file instead of the small piece the recovery data had already narrowed it to.</p>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Related files</h5>
+        <ul>
+          <li><strong>Search Related, without needing a server that supports it.</strong> eMule sends the request to your connected server and greys the menu out unless that server advertises support, which most do not &mdash; so the feature usually does nothing. Ember keeps that request as one signal and adds the one eMule never had: release names are structured, so the season and episode marker, the disc or part marker, the year and the title are read out of the file&rsquo;s own name and turned into searches that run on every network. Right-click a search result, a transfer or a shared file; the tab is named after what it went looking for, and the seed is kept out of its own results</li>
+        </ul>
+
+        <h5>Web services</h5>
+        <ul>
+          <li><strong>Look a file up on the web, the way eMule does.</strong> Right-click &gt; Web services opens a site with the file&rsquo;s details filled in &mdash; most usefully one that reports how many complete sources the network has seen, which is the question a stuck download raises and the one Ember could not answer from inside the app. All six of eMule&rsquo;s placeholders work, and an existing <code>webservices.dat</code> can be imported</li>
+          <li><strong>An availability lookup is configured out of the box,</strong> because a lookup you have to go and set up first is one you will not have on the day you need it. Nothing is contacted until you click it, adding a site of your own asks you to confirm it once, and any entry can be changed or removed in Settings</li>
+        </ul>
+
+        <h5>Ember search</h5>
+        <ul>
+          <li><strong>Ember results fill the columns a server result fills.</strong> Duration, bitrate, codec, artist, album and title now travel with a published keyword record, so an Ember hit is no longer the row with the blank Length and Bitrate. Your library is probed once and the answer is kept &mdash; including &ldquo;nothing to find&rdquo;, which is the answer for most of a library</li>
+          <li><strong>Ember hits report complete sources.</strong> Only complete public shares are published under a keyword, so the number of distinct publishers who signed a record is a floor on the complete sources &mdash; a firmer number than a swarm estimate one peer passed on. They used to report zero, which the Min Complete filter read as none and dropped, and which sorted every Ember row to the bottom</li>
+          <li><strong>The Sources column says what it counted.</strong> One column, two measurements: a server or KAD node reports a swarm estimate it was told, while Ember counts publishers it verified. Three next to fifty read as a file barely anyone has, when the three are confirmed to hold all of it</li>
+          <li><strong>Searching by extension no longer needs the extension to be indexed.</strong> <code>.mp3</code> as a published key would be the hottest key on the network, competing for one key&rsquo;s slots on the twenty nodes nearest it. It travels as a constraint on the search instead, which costs no key, no publish traffic, and no hotspot</li>
+          <li><strong>A busy keyword is answered a page at a time.</strong> One datagram carries only a few records, so a searcher can now ask the same peer for the next page. A peer is held to a quarter of the search while the walk still has somewhere to go, and may serve the rest once there is nothing left to ask &mdash; so a single node holding an uncommon word can hand over its whole index rather than the first slice of it</li>
+          <li><strong>An Ember-only search reports its progress,</strong> rather than sitting behind a bare spinner for up to a minute on a cold routing table</li>
+        </ul>
+
+        <h5>Search, everywhere</h5>
+        <ul>
+          <li><strong>Results already in your library are shown instead of counted and hidden.</strong> The table dropped every hit whose only source was your own library while the tab badge still counted them, so a search reporting 31 results displayed 13, and one reporting 605 displayed 3</li>
+          <li><strong>A row shows every source its networks found,</strong> not the largest single batch one of them sent. A file thirty KAD nodes published arrives as a dozen small batches, and the row read three or four sources until the search finished</li>
+          <li><strong>A hit says which server sent it,</strong> and <code>ed2k::</code> and related lookups go only to the servers that can resolve them &mdash; both used to be walked to the DHTs as if they were ordinary words, spending a search slot to answer nothing</li>
+          <li><strong>Find Sources asks every connected network</strong> and puts what they find into the download. It only ever asked KAD, and then handed the addresses back to the interface rather than to the transfer, so the row said &ldquo;KAD found 3 sources&rdquo; while the download stayed on the sources it already had. It also held the toolbar disabled for the whole search &mdash; up to two minutes</li>
+        </ul>
+
+        <h5>Interface</h5>
+        <ul>
+          <li><strong>Every right-click menu has one look and one placement rule.</strong> Six menus each carried their own copy of the styling and their own hardcoded guess at their own height, so a menu opened near the bottom of the window was placed at the pointer and lost everything below the fold. They now measure the panel that actually rendered, flip when there is no room, group their entries so each separator means something, and keep destructive actions at the bottom</li>
+          <li><strong>The Ember page counts published files against the total to publish</strong> &mdash; &ldquo;200 out of 1,240&rdquo; &mdash; so a library that has finished announcing itself is distinguishable from one that has barely started, and the peer count says it is peers connected</li>
+        </ul>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.6.3, 1.6.2, 1.6.1 and 1.6.0 all see each other on the overlay normally. This is a compatible update; anything older than 1.6.0 is still invisible to all four</li>
+          <li><strong>Media on search results needs both sides on 1.6.3.</strong> Older builds ignore the block rather than mishandling it, so nothing breaks &mdash; you simply see no duration or bitrate on their files, and they see none on yours, until they update</li>
+          <li><strong>A web service is configured by default.</strong> Opening one tells that site which file you are looking for, which is why nothing contacts it until you click it; remove it in Settings &gt; Downloads if you would rather it were not there</li>
+          <li><strong>A moderator ban in a private room is refused while the room owner is offline.</strong> Only the owner can issue a new key, so the ban was being presented as an eviction while the banned member went on decrypting everything sent afterwards. Refusing says something true; the ban works as soon as the owner is reachable</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Security</h5>
+        <ul>
+          <li><strong>The peer relay would carry traffic for strangers.</strong> Relaying defaults to on, and a signed relay request only had to name a public address &mdash; but the attestation it signs travels onward in ordinary peer-exchange blocks, so anyone who had ever seen one could have your node dial an address of their choosing, four sessions wide, two hours and eight gigabytes a direction. A request is now admitted only when the connection&rsquo;s proven identity <em>is</em> the one that signed it and that identity is a friend, and targets are refused for port 0, non-public space and self-bridging</li>
+          <li><strong>The one transport that could be told to dial an arbitrary host was the one ignoring your block lists.</strong> Ember&rsquo;s QUIC accept path held no handle on <code>ipfilter.dat</code> or the ban set; it reads both now, on the way in and on the way out</li>
+          <li><strong>Opening a link from a message asks you natively first,</strong> and refuses hosts that are &mdash; or resolve to &mdash; loopback, private or link-local addresses, so a link cannot reach your router&rsquo;s admin page or a cloud metadata endpoint. The prompt the interface used to draw is gone, because a compromised one would simply not draw it</li>
+          <li><strong>Re-approving your download folder needs this session&rsquo;s file picker or a native confirmation,</strong> rather than a flag the interface can set on any save. Re-approval re-captures whatever object now sits at that path</li>
+          <li><strong>Replacing your IP filter from a URL says how many entries it is about to install</strong> and waits for an answer, since replaced wholesale means unprotected for that one file</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>A failed hash check repairs the part that failed, for real this time.</strong> 1.6.2 shipped this fix on the wrong branch &mdash; every download that actually runs took the other one &mdash; so the completion check still tore down the recovery round-trip it was waiting on, turning a re-fetch of about 180 KiB into a failed whole-file verification and a fresh 9 MB part</li>
+          <li><strong>Pausing a download can no longer leave it Active with no worker,</strong> where it sat doing nothing until the app was restarted</li>
+          <li><strong>The Sources column counts the way eMule does.</strong> It read active and total off the transfer worker, which only knows about peers whose connection got as far as a request &mdash; so peers sitting on a remote queue were missing, and a download with seven of them reported 2/14. Peers on queue are counted, the transferring number is in parentheses, and the total can no longer render below the count beside it</li>
+          <li><strong>A wedged disk fails the download and releases the part file</strong> instead of parking it forever on a write that cannot be cancelled, and a file whose size is not representable is refused rather than crashing the app</li>
+          <li><strong>Trust badges no longer break unrelated actions.</strong> They were one request per row against a queue the rest of the app shares, which surfaced as other things failing with &ldquo;Network busy&rdquo;; batching them also let the rotating window go, so rows stop sitting on &ldquo;--&rdquo; for eighty seconds</li>
+        </ul>
+
+        <h5>Backup and restore</h5>
+        <ul>
+          <li><strong>A restore that failed part-way came back as a half-applied profile.</strong> Staged files were moved into place rather than copied, so when one failed &mdash; an antivirus holding the database is enough &mdash; the rollback put the originals back but the staged copies were already gone. The retry could not tell &ldquo;rolled back&rdquo; from &ldquo;already applied&rdquo;, skipped them, reported success, and left your machine&rsquo;s own identity beside the backup&rsquo;s database: orphaning exactly the credits and friendships the feature exists to carry over</li>
+          <li><strong>A restore that will not fit is refused before it starts,</strong> and says how much room it needs, instead of failing halfway through</li>
+        </ul>
+
+        <h5>Search and links</h5>
+        <ul>
+          <li><strong>A truncated <code>ed2k://</code> link is rejected instead of crashing Ember.</strong> Anything shorter than the prefix being tested &mdash; <code>ed2k://</code> on its own, or a link cut off mid-character &mdash; reached the parser from the clipboard or from a click</li>
+          <li><strong>An <code>ed2k://</code> link on a website imports when you click it.</strong> Modern Firefox percent-encodes the separators before handing the link to the OS, so what arrived did not look like a link at all and had to be copied and pasted by hand</li>
+          <li><strong>A crowded results tab stops discarding every Ember row first,</strong> and a corrected Ember digest replaces one an earlier batch had guessed &mdash; which used to fail the file&rsquo;s content check on every retry, permanently</li>
+        </ul>
+
+        <h5>Channels and rooms</h5>
+        <ul>
+          <li><strong>Rooms stop stalling the app.</strong> Eleven defects in one subsystem: a relay session that lost bytes whenever a message length arrived split across two reads, a counterpart that finished connecting and then went silent while holding one of the room&rsquo;s relay slots for the life of the process, and room views rebuilt from the database on every poll</li>
+          <li><strong>An edit or a reaction takes its place in the queue before the write it cannot undo,</strong> so a busy moment is a refusal rather than a message only its author can see</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>The same two search results merge the same way</strong> whichever half of the app merged them. File type, rating, comment and the recovery hash were resolved in opposite directions by the interface and the core, so the answer depended on which one got there first</li>
+          <li><strong>A checkbox stops keeping its focus ring after a click,</strong> which left a stray outline on rows you had merely ticked</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.6.2...v1.6.3" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.6.2...v1.6.3</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-2">
       <div class="release-header">
