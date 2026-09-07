@@ -466,11 +466,18 @@
 
   /**
    * Whether a result is effectively "already in the library" with nothing
-   * to fetch. A row can carry a mixed origin like `KAD · Local` when a file
-   * we share is also found on the network — those rows DO have downloadable
-   * network sources. This mirrors the exact early exit in `download()` so the
-   * in-library badge / disabled download button only show when the action
-   * would genuinely be a no-op.
+   * to fetch.
+   *
+   * Keyed on the addresses rather than on the origin alone, because a row can
+   * carry a mixed origin like `KAD · Local` when a file we share is also found
+   * on the network. Where such a row names peers, it is downloadable and this
+   * returns false; where it names none — which is the ordinary shape of an
+   * Ember hit, and common for KAD and server hits, since they report
+   * availability without embedding IPs — starting a download would fetch a file
+   * this library already holds.
+   *
+   * Mirrors the exact early exit in `download()`, so the in-library badge and
+   * the disabled button always agree with what the action would do.
    */
   function isInLibraryOnly(r: SearchResult): boolean {
     if (!r.result_origin?.includes('Local')) return false;
@@ -2370,7 +2377,9 @@
     // Empty `source_addresses` is fine when we have a hash: KAD/server
     // results often report availability without embedding peer IPs. The
     // backend starts with `{ ip: '', port: 0 }` and runs full source
-    // discovery. Only local-only hits (handled above) should short-circuit.
+    // discovery. The one case handled above is the row this library can
+    // already satisfy: an addressless hit for a file we share is a download
+    // of a file we hold, whichever network also reported it.
 
     downloadPending[key] = true;
     try {

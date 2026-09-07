@@ -1990,6 +1990,23 @@ async fn handle_command_inner(
                 for ip in &ips_to_ban {
                     state.banned_ips.insert(*ip);
                 }
+                // Published before the persistence below rather than after it.
+                // The upload accept path, the download workers and the Ember
+                // relay all gate on these shared sets, and none of them are on
+                // this loop — so leaving the sync behind an awaited SQLite write
+                // left a window, as long as that write takes under a library
+                // scan, in which the peer the user just banned could still be
+                // admitted. Nothing in the write depends on the sets.
+                if let Ok(mut shared) = shared_banned_ips.write() {
+                    *shared = state.banned_ips.clone();
+                }
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.insert(kad_id.0);
+                }
+                // Keep ReputationManager in sync so Trust badges and
+                // reputation-gated connect paths see the manual ban
+                // immediately (UnbanPeer already cleared this side).
+                state.reputation.apply_manual_ban(&kad_id.0);
                 // Persist each IP against this peer so the ban survives a
                 // restart (boot rebuilds banned_ips from banned peers'
                 // addresses) and so unban_peer — which walks the peer's
@@ -2004,14 +2021,17 @@ async fn handle_command_inner(
                 // tasks for the duration instead.
                 //
                 // Awaited, not fire-and-forget, and that is load-bearing.
-                // `add_banned_peer_address` upserts with `banned = 1`, while the
-                // unban path writes `banned = 0` from the *IPC* task
-                // (`commands::peers::unban_peer` persists before it notifies us),
-                // so the two are not ordered by anything. Detached, a ban write
-                // still sitting in a blocking-pool queue — behind library
-                // hashing, say — could land after an unban and silently re-ban
-                // the peer in the database while every in-memory set says
-                // otherwise, until the next restart rebuilt the bans from disk.
+                // `add_banned_peer_address` upserts with `banned = 1`, so
+                // detached it could land behind a later command's write and
+                // re-ban a peer on disk that every in-memory set reports as
+                // clear, until the next restart rebuilt the bans from it.
+                //
+                // Awaiting orders this against the *commands* that follow, which
+                // is what `UnbanPeer` needs — but not against the IPC task,
+                // which writes `banned = 0` itself before it enqueues that
+                // command. That half is closed at the other end: `UnbanPeer`
+                // re-asserts the row rather than trusting a write it did not
+                // sequence.
                 {
                     let ban_db = db.clone();
                     let ban_peer = peer_id_hex.clone();
@@ -2030,21 +2050,38 @@ async fn handle_command_inner(
                         warn!("Ban persistence task for {peer_id_hex} failed: {e}");
                     }
                 }
-                if let Ok(mut shared) = shared_banned_ips.write() {
-                    *shared = state.banned_ips.clone();
-                }
-                // Also add user hash to upload-only banned set
-                if let Ok(mut set) = shared_banned_hashes.write() {
-                    set.insert(kad_id.0);
-                }
-                // Keep ReputationManager in sync so Trust badges and
-                // reputation-gated connect paths see the manual ban
-                // immediately (UnbanPeer already cleared this side).
-                state.reputation.apply_manual_ban(&kad_id.0);
             }
         }
 
         NetworkCommand::UnbanPeer { peer_id_hex } => {
+            // `commands::peers::unban_peer` already cleared the row before it
+            // enqueued this, so the write below is normally a no-op — but the
+            // two are not ordered by anything. `BanPeer` upserts `banned = 1`
+            // from a blocking task this loop awaits, and the IPC unban writes
+            // `banned = 0` concurrently with it, so an unban issued while a ban
+            // was still queued behind a busy database could be overwritten by
+            // the ban it was answering. On disk the peer then stayed banned
+            // while every in-memory set said otherwise, and the next launch
+            // rebuilt the bans from the row.
+            //
+            // Re-asserting here fixes that because the loop *does* order this
+            // against `BanPeer`: that handler cannot still be persisting when
+            // this one runs. Awaited for the same reason it is there — the
+            // point of the blocking hop is to free the worker, not to give up
+            // the ordering.
+            {
+                let unban_db = db.clone();
+                let unban_peer = peer_id_hex.clone();
+                let cleared =
+                    tokio::task::spawn_blocking(move || unban_db.unban_peer(&unban_peer)).await;
+                match cleared {
+                    Ok(Err(e)) => {
+                        warn!("Failed to clear the persisted ban for {peer_id_hex}: {e}")
+                    }
+                    Err(e) => warn!("Unban persistence task for {peer_id_hex} failed: {e}"),
+                    Ok(Ok(())) => {}
+                }
+            }
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
                 if let Some(contact) = state.routing_table.get_contact(&kad_id) {
                     state.banned_ips.remove(&contact.ip);
@@ -3506,6 +3543,30 @@ async fn handle_command_inner(
             file_size,
             tx,
         } => {
+            // The renderer names the transfer and the file separately, and this
+            // is the only caller that can make them disagree — the two internal
+            // ones derive the hash from the download they are starting. What
+            // arrives here decides both which peers get asked and which
+            // transfer's source list the answers are written into, so an
+            // unmatched pair would attach peers holding one file to a download
+            // of another. Refused rather than reconciled: a pair the UI never
+            // produces is a bug or a forgery, and neither half is the one to
+            // trust.
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(transfer) = mgr.get_transfer(&transfer_id) {
+                    if !transfer
+                        .file_hash
+                        .eq_ignore_ascii_case(&hex::encode(file_hash))
+                    {
+                        warn!(
+                            "Find sources for {transfer_id} named a different file than the transfer holds; refusing"
+                        );
+                        let _ = tx.send(crate::types::SourceAskOutcome::default());
+                        return;
+                    }
+                }
+            }
             let outcome = ask_networks_for_sources(
                 socket,
                 state,

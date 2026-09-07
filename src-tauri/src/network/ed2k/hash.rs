@@ -539,6 +539,25 @@ fn skip_ed2k_authority_slashes(rest: &str) -> &str {
     &rest[i..]
 }
 
+/// Whether this URI's pipes were rewritten by a browser on the way here.
+///
+/// The tell is the opcode delimiter. Every `ed2k:` URI opens with one — `|file|`,
+/// `|server|` — and a browser that encoded the separators encoded that one too,
+/// because it treats the whole run as an authority and rewrites all of it. So an
+/// arriving `|` means the pipes were left alone, and any `%7C` further along is
+/// a *name* that contains a pipe rather than a separator.
+///
+/// This has to be decided for the URI as a whole rather than per escape, because
+/// after the fact the two are the same three characters. Deciding it from the
+/// one field that is always structural is what keeps
+/// `ed2k://|file|Track%7C01.mp3|123|<hash>|/` — a legitimate link to a file
+/// named `Track|01.mp3` — from splitting into fields at the name, which
+/// rejected the link when the fragment after it did not parse as a size, and
+/// silently read a different hash when it did.
+fn pipes_were_percent_encoded(rest: &str) -> bool {
+    !rest.starts_with('|')
+}
+
 /// Browsers percent-encode `|` (a forbidden WHATWG host code point) as `%7C`
 /// before handing an `ed2k:` URI to the OS handler. Restore field separators
 /// without decoding other escapes — those belong to the name field.
@@ -593,14 +612,24 @@ pub fn looks_like_ed2k_uri(arg: &str) -> bool {
 /// typically arrives as `ed2k://%7Cfile%7Cname%7Csize%7Chash%7C/` or
 /// `ed2k:///%7Cfile%7C…`. An unencoded `#` in the filename is a URL fragment;
 /// if the launcher still includes it in argv it is part of the ed2k name and
-/// must not be stripped.
+/// must not be stripped — which is also why the encoding can arrive mixed, the
+/// pipes before the `#` rewritten and the ones after it left alone.
+///
+/// Restoring separators is therefore gated on
+/// [`pipes_were_percent_encoded`]: a paste carries its pipes literally, so a
+/// `%7C` in one is the name's own and decoding it would split the link at the
+/// filename.
 pub fn normalize_ed2k_uri(raw: &str) -> String {
     let s = strip_ed2k_wrapper(raw);
     let Some(rest) = strip_ed2k_scheme(s) else {
         return s.to_string();
     };
     let rest = skip_ed2k_authority_slashes(rest);
-    let rest = decode_encoded_pipes(rest);
+    let rest = if pipes_were_percent_encoded(rest) {
+        decode_encoded_pipes(rest)
+    } else {
+        rest.to_string()
+    };
     let rest = lowercase_ed2k_opcode(&rest);
     format!("ed2k://{rest}")
 }
@@ -838,6 +867,32 @@ mod link_tests {
                 Some("0000000000000000000000000000000000000000")
             );
         }
+    }
+
+    /// A pasted link keeps its pipes, so `%7C` inside one is a pipe in the
+    /// *file name* — the only way to write one, since the character is the
+    /// field separator. Decoding it unconditionally split the link at the name:
+    /// here the tail parses as a size and a hash, so the link stopped being
+    /// rejected and quietly resolved to a different file than it names.
+    #[test]
+    fn an_encoded_pipe_in_a_pasted_name_is_not_a_separator() {
+        let other = "b".repeat(32);
+        let pasted = format!("ed2k://|file|Safe.mp4%7C734003200%7C{other}|734003200|{HASH}|/");
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&pasted).expect("pasted");
+        assert_eq!(
+            name,
+            format!("Safe.mp4|734003200|{other}"),
+            "the name field ends at the first literal pipe"
+        );
+        assert_eq!(size, 734003200);
+        assert_eq!(hash, HASH, "the hash is the link's own third field");
+
+        // The ordinary shape of this: a file whose name contains a pipe.
+        let named = format!("ed2k://|file|Track%7C01.mp3|4096|{HASH}|/");
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&named).expect("named");
+        assert_eq!(name, "Track|01.mp3");
+        assert_eq!(size, 4096);
+        assert_eq!(hash, HASH);
     }
 
     #[test]

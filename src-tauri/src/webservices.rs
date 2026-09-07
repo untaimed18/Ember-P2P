@@ -10,10 +10,16 @@
 //! somebody arriving from eMule has that file already.
 //!
 //! Everything here is pure. Opening a URL is
-//! [`crate::commands::settings::open_external_url`]'s job, and it applies the
-//! scheme allowlist, the private-host refusal and the native confirmation that
-//! any externally-opened link in this application goes through. This module
-//! only decides *what* URL that is.
+//! [`crate::commands::settings::open_web_service`]'s job, and it applies the
+//! same scheme allowlist and private-host refusal that any externally-opened
+//! link in this application goes through. This module only decides *what* URL
+//! that is.
+//!
+//! Consent sits on the *list* rather than on each open. A service is asked
+//! about once, natively, when it joins the list ([`newly_added`]), because the
+//! question — "may this site learn which files you are looking for?" — is a
+//! property of the site, and a prompt on a diagnostic clicked repeatedly while
+//! triaging one download is a prompt people learn to dismiss.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,12 +59,14 @@ pub const MAX_SERVICE_URL_BYTES: usize = 512;
 /// with no upside.
 pub const MAX_WEBSERVICES_FILE_BYTES: u64 = 256 * 1024;
 
-/// The example offered in Settings, from the request this feature came from.
+/// The example offered in Settings, and what a fresh profile starts with.
 ///
 /// Held here rather than in the renderer so the string that gets stored is the
-/// one that was reviewed. Deliberately *not* installed by default: opening it
-/// tells a third-party site which file this user is looking for, and that is a
-/// choice to make rather than a default to inherit.
+/// one that was reviewed — which is also what makes it defensible as a default
+/// (see `AppSettings::default_web_services`): it ships because this exact
+/// destination was reviewed, and nothing contacts it until a user clicks it.
+/// A service the *user* adds has no such review behind it, so that path asks
+/// natively instead; see [`newly_added`].
 pub const EXAMPLE_SERVICE_NAME: &str = "ed2k stats (shortypower)";
 pub const EXAMPLE_SERVICE_URL: &str = "https://ed2k.shortypower.org/?hash=#hashid";
 
@@ -289,12 +297,90 @@ pub fn sanitize_services(input: Vec<WebService>) -> (Vec<WebService>, Vec<(Strin
     (accepted, rejected)
 }
 
+/// Entries in `proposed` naming a site `current` does not already hold.
+///
+/// This is the set a save has to collect consent for, and the reason consent is
+/// scoped to additions rather than to "the list changed". Removing a service,
+/// renaming one, or reordering the menu cannot send anything anywhere it could
+/// not already go; introducing a *destination* can. Keyed by URL because that
+/// is what gets opened — a name is a menu label, and treating a rename as a new
+/// site would ask about a site already approved.
+///
+/// Called with the sanitized list, so every entry here is one
+/// [`validate_service_template`] has already accepted.
+pub fn newly_added(current: &[WebService], proposed: &[WebService]) -> Vec<WebService> {
+    proposed
+        .iter()
+        .filter(|candidate| !current.iter().any(|held| held.url == candidate.url))
+        .cloned()
+        .collect()
+}
+
+/// The site a template names, for a consent prompt.
+///
+/// The host rather than the whole template, because the host is what learns the
+/// lookup and the rest is placeholders. Falls back to the raw string only if the
+/// URL will not parse, which [`validate_service_template`] has already ruled out
+/// for anything reaching a prompt.
+pub fn service_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(String::from))
+        .unwrap_or_else(|| url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn facts<'a>(hash: &'a str, name: &'a str, size: u64) -> FileFacts<'a> {
         FileFacts { hash, name, size }
+    }
+
+    fn service(name: &str, url: &str) -> WebService {
+        WebService {
+            name: name.to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    /// The gate exists for one thing: a destination that was not there before.
+    #[test]
+    fn only_a_new_destination_needs_consent() {
+        let held = vec![service("Stats", "https://a.test/?hash=#hashid")];
+
+        assert!(
+            newly_added(&held, &held).is_empty(),
+            "an unchanged list must not ask"
+        );
+        assert!(
+            newly_added(&held, &[]).is_empty(),
+            "removing a service cannot send anything anywhere"
+        );
+        assert!(
+            newly_added(&held, &[service("Renamed", "https://a.test/?hash=#hashid")]).is_empty(),
+            "a rename reaches the same site the user already approved"
+        );
+
+        let added = newly_added(
+            &held,
+            &[
+                service("Stats", "https://a.test/?hash=#hashid"),
+                service("Other", "https://b.test/?hash=#hashid"),
+            ],
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].url, "https://b.test/?hash=#hashid");
+    }
+
+    /// A prompt names the site, not the template: `#hashid` is noise to the
+    /// question being asked, and the host is the part that learns the lookup.
+    #[test]
+    fn a_prompt_names_the_site() {
+        assert_eq!(
+            service_host("https://ed2k.shortypower.org/?hash=#hashid"),
+            "ed2k.shortypower.org"
+        );
     }
 
     /// The case this feature was asked for, end to end: the request's own

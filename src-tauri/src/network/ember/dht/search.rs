@@ -383,6 +383,16 @@ pub struct IterativeSearch {
     /// Blobs each node has offered, against [`MAX_RESULTS_PER_NODE`]. Bounded
     /// by the number of nodes that answer, which the shortlist bounds.
     offered_results: HashMap<EmberNodeId, usize>,
+    /// Of those, the ones that carried a valid publisher signature.
+    ///
+    /// Separate from `offered_results` because the two answer different
+    /// questions. The offer allowance charges junk deliberately — a forged blob
+    /// costs a dedup slot and a signature check either way, so leaving it free
+    /// would let a peer that sends nothing else page forever without ever
+    /// reaching its own limit. Earning pages is the opposite case: it is a
+    /// reward for *delivering*, and a blob that fails verification delivered
+    /// nothing. See [`IterativeSearch::per_node_page_allowance`].
+    delivered_results: HashMap<EmberNodeId, usize>,
     /// Nodes with a query currently outstanding or permanently given up on.
     /// A node that failed but has attempts left is removed, which is what
     /// makes it eligible to be picked again.
@@ -484,6 +494,7 @@ impl IterativeSearch {
             results: Vec::new(),
             seen_results: HashSet::new(),
             offered_results: HashMap::new(),
+            delivered_results: HashMap::new(),
             queried: HashSet::new(),
             attempts: HashMap::new(),
             started_at: Instant::now(),
@@ -572,6 +583,12 @@ impl IterativeSearch {
     /// answer and never notices this; a node answering one record at a time is
     /// below it from its first answer and stops at the base ceiling. The offer
     /// allowance remains what actually ends an honest node's paging.
+    ///
+    /// Counted from `delivered_results` rather than `offered_results`, because
+    /// forging the blobs is cheaper than holding the records: well-framed junk
+    /// carrying the target's sixteen bytes is free to produce, and charging it
+    /// to the offer cap — which is right, since checking it costs us either way
+    /// — meant it also bought the tier the cap exists to ration.
     fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
         if self.can_still_descend() {
             return MAX_PAGES_PER_NODE;
@@ -583,7 +600,7 @@ impl IterativeSearch {
         // Pages this node has actually answered: the opening query, then one per
         // follow-up queued.
         let served = usize::from(queued).saturating_add(1);
-        let delivered = self.offered_results.get(node).copied().unwrap_or(0);
+        let delivered = self.delivered_results.get(node).copied().unwrap_or(0);
         if delivered >= served.saturating_mul(MIN_RECORDS_PER_PAGE_TO_CONTINUE) {
             MAX_PAGES_PER_NODE_EXHAUSTED
         } else {
@@ -947,6 +964,7 @@ impl IterativeSearch {
                 );
                 continue;
             }
+            *self.delivered_results.entry(*from_id).or_insert(0) += 1;
             if !self.value_budget_full() {
                 self.budget_spent
                     .insert(budget_identity(&data, &blob_digest));
@@ -2522,6 +2540,84 @@ mod tests {
         assert!(
             (pages as u8) < MAX_PAGES_PER_NODE_EXHAUSTED,
             "a drip-feeding peer must not reach the ceiling an honest storer earns"
+        );
+    }
+
+    /// The tier past the base ceiling is earned by *delivering* records, and a
+    /// blob that fails verification delivered nothing. Forging one is free —
+    /// [`forged_value_blob`] is a real record with one signature bit flipped, so
+    /// it clears every framing check — which made two a page the cheapest thing
+    /// on the wire that looks like an honest storer keeping pace.
+    ///
+    /// The drip-feeder test above covers the peer that sends too few records;
+    /// this one covers the peer that sends enough of the wrong ones.
+    #[test]
+    fn forged_records_do_not_earn_the_exhausted_page_tier() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let mut pages = 0u32;
+        let mut filler = 0u16;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            let query = &batch[0];
+            pages += 1;
+            assert!(
+                pages < MAX_PAGES_PER_NODE_EXHAUSTED as u32 + 10,
+                "paging must terminate"
+            );
+            // Exactly the floor the earning rule asks for, and every one of them
+            // junk. Distinct fillers so dedup — which runs before the signature
+            // check — cannot be what turns them away.
+            let blobs = (0..MIN_RECORDS_PER_PAGE_TO_CONTINUE)
+                .map(|_| {
+                    filler = filler.saturating_add(1);
+                    forged_value_blob("ubuntu", filler)
+                })
+                .collect();
+            search.process_response(
+                query.request_id,
+                &peer.node_id,
+                vec![],
+                blobs,
+                Some(ValuePage {
+                    next_position: filler,
+                    total_available: 60_000,
+                }),
+            );
+        }
+
+        assert!(
+            search.results.is_empty(),
+            "nothing forged may reach the caller"
+        );
+        assert_eq!(
+            pages,
+            MAX_PAGES_PER_NODE as u32 + 1,
+            "junk at the earning rate bought {pages} queries"
+        );
+        assert_eq!(
+            search
+                .offered_results
+                .get(&peer.node_id)
+                .copied()
+                .unwrap_or(0),
+            pages as usize * MIN_RECORDS_PER_PAGE_TO_CONTINUE,
+            "junk is still charged to the offer allowance, which is what stops it being free"
+        );
+        assert_eq!(
+            search.delivered_results.get(&peer.node_id).copied(),
+            None,
+            "and delivered nothing"
         );
     }
 

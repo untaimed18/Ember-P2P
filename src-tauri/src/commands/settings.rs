@@ -1208,6 +1208,41 @@ pub async fn update_settings(
             "Settings changed in another window or command; reload and apply your changes again",
         ));
     }
+
+    // A web service is a destination this app hands to the browser, and unlike
+    // `rendezvous_url` it cannot be backend-owned: curating the list is the
+    // whole feature. So the renderer may propose one and the user approves it
+    // natively, once, here — which is what lets `open_web_service` skip a
+    // prompt of its own, and what stops a compromised webview from turning that
+    // command into a confirm-free opener for a URL it wrote itself.
+    //
+    // Only additions ask. Removals and renames reach nothing new, and a save
+    // that changes something else entirely must not raise a dialog about a list
+    // it did not touch.
+    //
+    // Below the revision check, for the reason the re-approval prompt is: a save
+    // that is going to be refused as stale must not collect consent first, since
+    // the caller retries and the user would answer the same question twice.
+    let added_web_services =
+        crate::webservices::newly_added(&old_settings.web_services, &settings.web_services);
+    if !added_web_services.is_empty()
+        && !confirm_web_service_additions(&app, &added_web_services).await
+    {
+        // Declining drops the new destinations and keeps the rest of the save,
+        // rather than failing it: the payload carries every other setting on
+        // the page, and this command answers with the settings it actually
+        // persisted, so the list the user sees corrects itself.
+        settings.web_services.retain(|candidate| {
+            old_settings
+                .web_services
+                .iter()
+                .any(|held| held.url == candidate.url)
+        });
+        info!(
+            "{} web service(s) were not added: the native confirmation was declined",
+            added_web_services.len()
+        );
+    }
     let (removed_shared_folders, added_shared_folders) =
         shared_folder_changes(&old_settings.shared_folders, &settings.shared_folders);
     // Per-folder defaults, pending file intents, and page cursors have no
@@ -2118,6 +2153,63 @@ async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Ask, natively, before a site joins the web-services list.
+///
+/// The list decides where [`open_web_service`] may send the user, and that
+/// command deliberately does not prompt: a diagnostic clicked several times
+/// while triaging one download would teach people to dismiss the dialog that
+/// matters. Consent has to sit somewhere, though, because `web_services` is not
+/// backend-owned — a compromised webview can put a URL in an `update_settings`
+/// payload — so it sits here, on the one event that introduces a destination.
+///
+/// Asking on the addition rather than on the open is also the more useful
+/// question: "may this site learn which files you look up" is a property of the
+/// site, asked once, rather than of the file, asked forever.
+///
+/// Returns false for a dismissed or closed dialog, so anything other than an
+/// explicit "add" leaves the stored list alone.
+async fn confirm_web_service_additions(
+    app: &tauri::AppHandle,
+    added: &[crate::webservices::WebService],
+) -> bool {
+    let sites = added
+        .iter()
+        .map(|service| {
+            format!(
+                "{} — {}",
+                elide_for_dialog(&service.name),
+                elide_for_dialog(&crate::webservices::service_host(&service.url))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "{sites}\n\nOpening a web service for a file tells that site which file you are looking for. Ember asks once, here, and not again each time you use it.\n\nAdd it only if you recognise the site."
+    );
+    let title = if added.len() == 1 {
+        "Add this web service?"
+    } else {
+        "Add these web services?"
+    };
+    let confirm_app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task; see `pick_download_folder`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title(title)
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Add".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Open a link found in a message, in the default browser.
 ///
 /// Nothing about the request is trusted: the string is the least trusted one
@@ -2164,15 +2256,23 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
 /// parses as a URL with an empty query and a fragment of `hashid`. Nothing
 /// about the destination can be judged until the placeholders are gone.
 ///
-/// Once they are, it is an ordinary external link and goes through the same
-/// three gates as one pasted into a room: the shape
-/// ([`validate_external_url`]), the destination
-/// ([`reject_non_public_external_host`]), and native consent
-/// ([`confirm_external_url`]). Reusing them is deliberate — a configured
-/// service is more trustworthy than a stranger's link, but the *file name* fed
-/// into it is peer-supplied text, and the confirmation is also the only place
-/// the user is told which third party is about to learn what they are looking
-/// for.
+/// Once they are, it is an ordinary external link and goes through two of the
+/// three gates a link pasted into a room does: the shape
+/// ([`validate_external_url`]) and the destination
+/// ([`reject_non_public_external_host`]). The third — native consent — was
+/// collected when the site joined the list ([`confirm_web_service_additions`]),
+/// rather than here, because this is a diagnostic clicked several times while
+/// triaging one download and a dialog on each use is a dialog people learn to
+/// dismiss.
+///
+/// That trade only holds while the list is genuinely the user's, so the two
+/// renderer-supplied halves are both bounded: the site comes from settings by
+/// index, and `file_hash` has to *be* a hash. Without that second check a
+/// compromised webview could still pick an approved site and use `#hashid` as a
+/// query parameter of its own, which is a channel out of a renderer whose CSP
+/// gives it none. `file_name` is peer-supplied text by design — it is the file's
+/// name — and reaches the URL percent-encoded, inside the length
+/// [`validate_external_url`] enforces.
 #[tauri::command]
 pub async fn open_web_service(
     state: tauri::State<'_, AppState>,
@@ -2181,6 +2281,17 @@ pub async fn open_web_service(
     file_name: String,
     file_size: u64,
 ) -> Result<(), String> {
+    let file_hash = file_hash.trim();
+    // Empty is ordinary: a file still being hashed, or a search hit that
+    // arrived without one. Anything else has to be an eD2K hash.
+    if !file_hash.is_empty()
+        && (file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(coded(
+            "settings_web_service_bad_hash",
+            "That file has no usable eD2K hash",
+        ));
+    }
     let template = {
         let config = state.config.read().await;
         config
@@ -2198,7 +2309,7 @@ pub async fn open_web_service(
     let filled = crate::webservices::substitute_placeholders(
         &template,
         &crate::webservices::FileFacts {
-            hash: file_hash.trim(),
+            hash: file_hash,
             name: file_name.trim(),
             size: file_size,
         },

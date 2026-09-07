@@ -278,6 +278,17 @@ impl KnownFileList {
                 if live.complete_sources == 0 {
                     live.complete_sources = record.complete_sources;
                 }
+                // Keyed on `media_scanned` rather than on `media` being `Some`,
+                // for the reason the field exists: "probed, found nothing" is a
+                // real answer and most of a library's answer. A placeholder row
+                // is unprobed, so it has neither — and letting it win discarded
+                // the probe *and* its marker, which is worse than the counters
+                // above, because the next publish tick then re-reads every media
+                // file in the library to learn what disk already knew.
+                if !live.media_scanned && record.media_scanned {
+                    live.media = record.media;
+                    live.media_scanned = true;
+                }
                 continue;
             }
             if !record.file_path.is_empty() {
@@ -2186,6 +2197,13 @@ mod tests {
         real.all_time_accepted = 1_234;
         real.last_publish_src = 1_700_000_900;
         real.complete_sources = 17;
+        real.media = Some(crate::types::MediaMetadata {
+            duration: Some(212),
+            bitrate: Some(320),
+            codec: Some("mp3".to_string()),
+            ..Default::default()
+        });
+        real.media_scanned = true;
         disk.add_or_update(real);
         disk.authoritative = true;
 
@@ -2206,6 +2224,15 @@ mod tests {
             2,
             "per-part MD4 hashsets must survive — nothing recomputes them \
              without a full re-hash, so losing them silently breaks AICH recovery"
+        );
+        assert!(
+            merged.media_scanned,
+            "losing the probe marker re-reads every media file in the library"
+        );
+        assert_eq!(
+            merged.media.as_ref().and_then(|m| m.bitrate),
+            Some(320),
+            "media the publisher announces must survive, like the counters above"
         );
         assert!(!merged.aich_hash.is_empty(), "AICH root must be restored");
         assert!(
