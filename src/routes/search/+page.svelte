@@ -638,6 +638,34 @@
     return t.split(/\s+/).filter((s) => s !== '' && s !== '-');
   });
 
+  /** Lowercased searchable text for one row, under the active filter column.
+   *
+   *  `getColumnText` formats a size, resolves a type label and splits an
+   *  origin string, then joins the lot and lowercases it — all pure functions
+   *  of the row. It was doing that per row on every filter pass, and the
+   *  filter re-derives on each streamed batch as well as each debounced
+   *  keystroke, so typing into a large tab redid the whole thing several times
+   *  a second.
+   *
+   *  Keyed on the row object, which `mergeIntoTab` replaces whenever the row's
+   *  data changes, so there is nothing to invalidate by hand. The whole map is
+   *  dropped when the column changes, since every entry describes one column's
+   *  text. A locale change cannot strand it: `setLocale` reloads the page. */
+  let haystackCache = new WeakMap<SearchResult, string>();
+  let haystackColumn: FilterColumn | null = null;
+
+  function filterHaystack(result: SearchResult, column: FilterColumn): string {
+    if (haystackColumn !== column) {
+      haystackCache = new WeakMap();
+      haystackColumn = column;
+    }
+    const cached = haystackCache.get(result);
+    if (cached !== undefined) return cached;
+    const text = getColumnText(result, column).toLowerCase();
+    haystackCache.set(result, text);
+    return text;
+  }
+
   function isFilteredByText(result: SearchResult): boolean {
     const tokens = filterTokens;
     if (tokens.length === 0) return false;
@@ -665,7 +693,7 @@
       return false;
     }
 
-    const target = getColumnText(result, filterColumn).toLowerCase();
+    const target = filterHaystack(result, filterColumn);
 
     for (const token of tokens) {
       const isNot = token.startsWith('-');
@@ -823,53 +851,81 @@
     return `nohash:${result.file.name}:${result.file.size}`;
   }
 
-  function inferSearchTypeFromExtension(extension: string | null | undefined): string {
-    // Keep in sync with `search::index::infer_file_type` (eMule ED2KFT_*).
-    const ext = (extension ?? '').toLowerCase();
-    if ([
+  // Built once, and as sets rather than arrays.
+  //
+  // These were array literals inside `inferSearchTypeFromExtension`, so every
+  // call allocated up to eight arrays and scanned them linearly. The backend
+  // leaves `file_type` empty for KAD/Ember hits — which is why that function
+  // exists — so sorting by the Type column ran it twice per comparison: at the
+  // 15,000-row tab cap, on the order of 400,000 calls and millions of array
+  // allocations per sort, repeated on every `visibleResults` sync while a
+  // search streamed. `sortField` is persisted, so once a user sorted by Type
+  // every later search stayed wedged.
+  // Keep in sync with `search::index::infer_file_type` (eMule ED2KFT_*).
+  const EXT_TYPE_SETS: ReadonlyArray<readonly [ReadonlySet<string>, string]> = [
+    [new Set([
       'aac', 'ac3', 'aif', 'aifc', 'aiff', 'amr', 'ape', 'au', 'aud', 'audio',
       'cda', 'dmf', 'dsm', 'dts', 'far', 'flac', 'it', 'm1a', 'm2a', 'm4a', 'mdl',
       'med', 'mid', 'midi', 'mka', 'mod', 'mp1', 'mp2', 'mp3', 'mpa', 'mpc',
       'mtm', 'ogg', 'opus', 'psm', 'ptm', 'ra', 'rmi', 's3m', 'snd', 'stm', 'umx',
       'wav', 'wma', 'xm',
-    ].includes(ext)) return 'Audio';
-    if ([
+    ]), 'Audio'],
+    [new Set([
       '3g2', '3gp', '3gp2', '3gpp', 'amv', 'asf', 'avi', 'bik', 'divx', 'dvr-ms',
       'flc', 'fli', 'flic', 'flv', 'hdmov', 'ifo', 'm1v', 'm2t', 'm2ts', 'm2v',
       'm4b', 'm4v', 'mkv', 'mov', 'movie', 'mp1v', 'mp2v', 'mp4', 'mpe', 'mpeg',
       'mpg', 'mpv', 'mpv1', 'mpv2', 'ogm', 'pva', 'qt', 'ram', 'ratdvd', 'rm',
       'rmm', 'rmvb', 'rv', 'smil', 'smk', 'swf', 'tp', 'ts', 'vid', 'video',
       'vob', 'vp6', 'webm', 'wm', 'wmv', 'xvid',
-    ].includes(ext)) return 'Video';
-    if ([
+    ]), 'Video'],
+    [new Set([
       'bmp', 'emf', 'gif', 'ico', 'jfif', 'jpe', 'jpeg', 'jpg', 'pct', 'pcx', 'pic',
       'pict', 'png', 'psd', 'psp', 'svg', 'tga', 'tif', 'tiff', 'webp', 'wmf',
       'wmp', 'xif',
-    ].includes(ext)) return 'Image';
-    if ([
+    ]), 'Image'],
+    [new Set([
       'bat', 'cmd', 'com', 'exe', 'hta', 'js', 'jse', 'msc', 'vbe', 'vbs', 'wsf',
       'wsh', 'apk', 'app', 'deb', 'rpm', 'scr',
-    ].includes(ext)) return 'Pro';
-    if ([
+    ]), 'Pro'],
+    [new Set([
       'chm', 'css', 'diz', 'doc', 'dot', 'hlp', 'htm', 'html', 'nfo', 'pdf', 'pps',
       'ppt', 'ps', 'rtf', 'text', 'txt', 'wri', 'xls', 'xml', 'docx', 'xlsx',
       'pptx', 'odt', 'ods', 'odp', 'epub', 'djvu', 'lit', 'mobi', 'azw',
-    ].includes(ext)) return 'Doc';
-    if ([
+    ]), 'Doc'],
+    [new Set([
       '7z', 'ace', 'alz', 'arc', 'arj', 'bz2', 'cab', 'cbr', 'cbz', 'gz', 'hqx',
       'lha', 'lzh', 'msi', 'pak', 'par', 'par2', 'rar', 'sit', 'sitx', 'tar',
       'tbz2', 'tgz', 'xpi', 'xz', 'z', 'zip',
-    ].includes(ext)) return 'Arc';
-    if ([
+    ]), 'Arc'],
+    [new Set([
       'bin', 'bwa', 'bwi', 'bws', 'bwt', 'ccd', 'cue', 'dmg', 'img', 'iso', 'mdf',
       'mds', 'nrg', 'sub', 'toast',
-    ].includes(ext)) return 'Iso';
-    if (ext === 'emulecollection') return 'EmuleCollection';
+    ]), 'Iso'],
+    [new Set(['emulecollection']), 'EmuleCollection'],
+  ];
+
+  function inferSearchTypeFromExtension(extension: string | null | undefined): string {
+    const ext = (extension ?? '').toLowerCase();
+    for (const [exts, label] of EXT_TYPE_SETS) {
+      if (exts.has(ext)) return label;
+    }
     return '';
   }
 
+  /** Resolved type per result row.
+   *
+   *  Memoised because the sort comparator, the filter haystack and the type
+   *  label all ask for it, and it is a pure function of fields that never
+   *  change without `mergeIntoTab` replacing the row object — which is exactly
+   *  what a `WeakMap` key tracks, with no pruning to get wrong. */
+  const resultTypeCache = new WeakMap<SearchResult, string>();
+
   function resultType(result: SearchResult): string {
-    return result.file_type || inferSearchTypeFromExtension(result.file.extension);
+    const cached = resultTypeCache.get(result);
+    if (cached !== undefined) return cached;
+    const resolved = result.file_type || inferSearchTypeFromExtension(result.file.extension);
+    resultTypeCache.set(result, resolved);
+    return resolved;
   }
 
   function resultTypeLabel(result: SearchResult): string {
@@ -1013,11 +1069,27 @@
     // broken service — and only declare readiness unknown once the command has
     // been unreachable for several ticks in a row.
     let emberDiagFailures = 0;
+    // Guards this poll the way every other poll in the app is guarded.
+    //
+    // Without the visibility gate a minimized client kept asking every three
+    // seconds for a strip nobody could see. Without the in-flight guard, the
+    // 10 s timeout on `getEmberDiagnostics` let up to four requests overlap
+    // with no ordering, so an older response could land after a newer one —
+    // and `emberContacts` feeds `emberSearchUsable` → `searchSubmitBlocked`,
+    // so a stale `0` disabled the Search button until the next tick.
+    let emberDiagInFlight = false;
+    let emberDiagMissedWhileHidden = false;
     const refreshEmber = () => {
       if (!$appSettings?.ember_native_enabled) {
         emberContacts = 0;
         return;
       }
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        emberDiagMissedWhileHidden = true;
+        return;
+      }
+      if (emberDiagInFlight) return;
+      emberDiagInFlight = true;
       getEmberDiagnostics()
         .then((d) => {
           emberContacts = d.ember_dht_verified_contacts ?? 0;
@@ -1028,8 +1100,22 @@
           emberDiagFailures += 1;
           if (emberDiagFailures >= EMBER_DIAG_FAILURE_THRESHOLD) emberDiagnosticsStale = true;
           console.error('Failed to poll Ember DHT readiness:', e);
+        })
+        .finally(() => {
+          emberDiagInFlight = false;
         });
     };
+    // Catch up on return rather than waiting out a full tick with a figure
+    // that went stale while the window was away.
+    const emberDiagOnVisible = () => {
+      if (document.visibilityState === 'visible' && emberDiagMissedWhileHidden) {
+        emberDiagMissedWhileHidden = false;
+        refreshEmber();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', emberDiagOnVisible);
+    }
     refreshEmber();
     emberPoll = setInterval(refreshEmber, 3000);
     joinPoll = setInterval(() => recomputeEmberJoinState(), 1000);
@@ -1055,6 +1141,9 @@
       unlistenHistory?.();
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', emberDiagOnVisible);
+      }
     };
   });
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
@@ -2309,7 +2398,12 @@
     filterMinSources = null;
     filterMinComplete = null;
     filterColumn = 'all';
-    hideSpam = false;
+    // `hideSpam` is deliberately not cleared, for the reason
+    // `clearRelatedSearchFilters` gives: it is a standing preference about
+    // junk rather than a narrowing of this search. It defaults to on and is
+    // persisted, so clearing it here turned one click of a button — which
+    // `hasActiveFilters` can show for an entirely unrelated filter — into
+    // spam hiding being off for every future session.
     clearFilterText();
   }
 

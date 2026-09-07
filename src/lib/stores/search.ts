@@ -567,6 +567,17 @@ function scheduleFlush() {
   flushScheduled = true;
   if (typeof requestAnimationFrame === 'function' && typeof document !== 'undefined' && document.visibilityState === 'visible') {
     flushRaf = requestAnimationFrame(flushSearchResults);
+    // Armed alongside the frame, not instead of it.
+    //
+    // The choice above is made when the batch arrives, and browsers do not run
+    // frame callbacks for a hidden document — so a window minimized after a
+    // frame was requested but before it fired left `flushScheduled` true with
+    // nothing to clear it. Every later batch then appended to
+    // `pendingByRequest` and returned here immediately, and because the
+    // `MAX_TAB_RESULTS` ceiling lives inside `mergeIntoTab`, the buffer that
+    // stopped draining was the one thing nothing else bounds. Whichever of the
+    // two fires first flushes; `flushSearchResults` cancels the other.
+    flushTimeout = setTimeout(flushSearchResults, 250);
   } else {
     // Hidden tab or non-DOM host (SSR / tests): fall back to a macrotask so we
     // still coalesce but don't hang the burst waiting for a visibilitychange
@@ -594,9 +605,15 @@ async function rescoreOpenTabs() {
       searchTabs.update((current) => {
         const i = current.findIndex((t) => t.id === tabId);
         if (i === -1) return current;
-        const byHash = new Map(scored.map((r) => [r.file.hash, r]));
+        // Keyed by `resultKey`, not `file.hash`. Hashless rows are a supported
+        // case — `resultKey` has dedicated `nohash-id:` / `nohash-path:` /
+        // `nohash:` branches for pending library entries and path-only local
+        // hits — and every one of them keys to `''`, so a hash-keyed map kept
+        // only the last and every other hashless row in the tab then adopted
+        // that one row's spam verdict.
+        const byKey = new Map(scored.map((r) => [resultKey(r), r]));
         const results = current[i].results.map((r) => {
-          const n = byHash.get(r.file.hash);
+          const n = byKey.get(resultKey(r));
           if (!n) return r;
           const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
           return {

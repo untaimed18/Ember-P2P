@@ -123,6 +123,16 @@ pub fn suppress_met_saves(met_path: &Path) {
     mark_met_saves_suppressed(met_path);
     let path_guard = save_path_guard(met_path);
     drop(path_guard.lock());
+    // Taking the guard above *inserts* it, and this is a pre-deletion call by
+    // contract, so without evicting it here the map kept an entry for every
+    // download that ended without `delete_met` running — pause, stop, failed,
+    // and cleanup after cancel. `delete_met` is the only other eviction site,
+    // and it only runs on completion or cancel-with-delete.
+    //
+    // Safe for the same reason it is safe there: the suppression tombstone is
+    // already set, so a writer that later takes a fresh guard for this path
+    // bails on `is_met_save_suppressed` before it writes anything.
+    evict_save_path_guard(met_path);
 }
 
 /// Drop the per-path guard once its `.part.met` is deleted, or the map grows

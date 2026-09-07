@@ -2350,9 +2350,22 @@ impl MultiSourceDownload {
                     while pending_futs.next().await.is_some() {}
                     return Err(disk_full_error());
                 }
+                // Settled, not merely byte-complete — the same predicate, and
+                // for the same reason, as the `else` branch below. Every
+                // production caller passes `new_source_rx: Some(..)`, so this
+                // is the branch that actually runs, and it was the one still
+                // breaking on `all_complete()`: the bytes of a part whose MD4
+                // has just failed are all present, so the gap has not
+                // reappeared yet and the file looks finished while an AICH
+                // round-trip is still in flight. Breaking here reached the
+                // unconditional aborts below and killed the repair, turning a
+                // ~180 KiB re-fetch into a failed whole-file verification and
+                // a re-download. The other two exits from this loop both
+                // require `pending_futs.is_empty()`, so no repair can be in
+                // flight at either of them.
                 let all_done = {
                     let t = tracker.read().await;
-                    t.all_complete()
+                    t.all_complete_and_settled()
                 };
                 if all_done {
                     break;
@@ -7271,21 +7284,6 @@ async fn download_parts_from_source(
                         .collect();
                     let needs_large_offsets =
                         all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                    if needs_large_offsets && !peer_supports_large_files {
-                        // Gating `needs_i64` on the peer's capability alone sent
-                        // the 32-bit request anyway, and `build_request_parts`
-                        // clamps with `min(u32::MAX)` behind a `debug_assert`
-                        // that does nothing in release — so both ends of a
-                        // past-4 GiB range collapsed to 0xFFFFFFFF and the peer
-                        // was asked for zero bytes. It sends nothing, we burn the
-                        // whole initial-data budget plus the re-assert rounds
-                        // holding a connection slot, and the source stays in the
-                        // pool to be re-dialled after its cooldown. Refuse it up
-                        // front: it genuinely cannot serve this range.
-                        anyhow::bail!(
-                            "source does not support large files but part {part_idx} lies past 4 GiB"
-                        );
-                    }
                     (
                         all_blocks,
                         batches,
@@ -7294,6 +7292,31 @@ async fn download_parts_from_source(
                         Vec::new(),
                     )
                 };
+
+            // Checked for both paths, not just the freshly computed one.
+            //
+            // Gating `needs_i64` on the peer's capability alone sent the
+            // 32-bit request anyway, and `build_request_parts` clamps with
+            // `min(u32::MAX)` behind a `debug_assert` that does nothing in
+            // release — so both ends of a past-4 GiB range collapsed to
+            // 0xFFFFFFFF and the peer was asked for zero bytes. It sends
+            // nothing, we burn the whole initial-data budget plus the
+            // re-assert rounds holding a file slot and a global connection
+            // permit, and the source stays in the pool to be re-dialled after
+            // its cooldown. Refuse it up front: it genuinely cannot serve
+            // this range.
+            //
+            // The resumed path is covered here because it arrives carrying a
+            // `needs_i64` computed elsewhere, and trusting that flag is what
+            // let the cross-part pipeline hand this worker a target the peer
+            // cannot address.
+            if all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64)
+                && !peer_supports_large_files
+            {
+                anyhow::bail!(
+                    "source does not support large files but part {part_idx} lies past 4 GiB"
+                );
+            }
 
             // Claim the part (idempotent per source — the pipelined state
             // already claimed it, and another source may hold its own claim
@@ -8869,6 +8892,21 @@ async fn download_parts_from_source(
                                 "DIAG: source {} ({}) cross-part pipeline target part {} has no remaining gaps — skipping",
                                 _src_idx, addr, target_part_idx,
                             );
+                            } else if !peer_supports_large_files
+                                && target_blocks.iter().any(|&(_, end)| end > u32::MAX as u64)
+                            {
+                                // `pre_pipeline_next_part_ms` applies this
+                                // filter, but the already-queued branch above
+                                // only asks whether the part is still needed —
+                                // so a part past 4 GiB could be pipelined to a
+                                // peer that cannot address it. Skipping keeps
+                                // the source on the parts it can actually
+                                // serve, rather than pipelining a request it
+                                // will answer with nothing.
+                                info!(
+                                "DIAG: source {} ({}) cannot address part {} past 4 GiB — not pipelining",
+                                _src_idx, addr, target_part_idx,
+                            );
                             } else {
                                 let target_batches: Vec<Vec<(u64, u64)>> = target_blocks
                                     .chunks(MAX_BLOCKS_PER_REQUEST)
@@ -9083,9 +9121,22 @@ async fn download_parts_from_source(
 
             // Verify part hash before marking complete
             let part_hash_outcome = {
-                let ph = shared_part_hashes.read().await;
-                if part_idx < ph.len() {
-                    let expected_hash = ph[part_idx];
+                // Copied out under a short read, so the guard drops here.
+                //
+                // It used to be held for the whole of this block, which spans
+                // the MD4 read (a 300 s budget) and the AICH round-trip (8 s).
+                // tokio's `RwLock` is write-preferring, so one source parked
+                // in that wait blocked a second source's
+                // `install_verified_part_hashes` write — and every other
+                // source's hashset read then queued behind that writer for the
+                // duration. Not a deadlock (nothing takes `tracker` before
+                // this lock), but a self-inflicted multi-second stall of the
+                // hashset stage across every source worker.
+                let expected_part_hash = {
+                    let ph = shared_part_hashes.read().await;
+                    ph.get(part_idx).copied()
+                };
+                if let Some(expected_hash) = expected_part_hash {
                     let t = tracker.read().await;
                     let (ps, pe) = t.part_range(part_idx);
                     let part_len = (pe - ps) as usize;

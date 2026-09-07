@@ -1318,6 +1318,11 @@
         if (!liveIds.has(id)) speedHistory.delete(id);
       }
     }
+    if (uploadTooltipCache.size > liveIds.size) {
+      for (const id of Array.from(uploadTooltipCache.keys())) {
+        if (!liveIds.has(id)) uploadTooltipCache.delete(id);
+      }
+    }
   });
   const EWMA_ALPHA = 0.3;
   const SPEED_STALE_MS = 12_000;
@@ -1783,13 +1788,44 @@
     return n;
   }
 
+  /** Memo for [`uploadPartsTooltip`], keyed by transfer id and invalidated by
+   *  the bitmaps it was built from.
+   *
+   *  The tooltip is a plain template expression, and `flushProgress` replaces
+   *  the row object on every coalesced progress batch, so it recomputed at
+   *  flush rate — two `slice` + `parseInt` per part, per visible upload row,
+   *  for a string that almost never changes (a 4 GB file is ~441 parts). The
+   *  bar beside it already memoizes the identical decode through `$derived` on
+   *  the bitmap strings; this gives the tooltip the same treatment. Pruned by
+   *  the `speedHistory` sweep below, which walks the same live-id set. */
+  const uploadTooltipCache: Map<
+    string,
+    { served?: string; peer?: string; total: number; text: string }
+  > = new Map();
+
   /** Tooltip for the upload parts bar: parts we've sent this session, plus the
    *  count the downloader already had (eMule `m_abyUpPartStatus`) when present. */
   function uploadPartsTooltip(t: Transfer): string {
     const total = t.up_part_count ?? 0;
+    const cached = uploadTooltipCache.get(t.id);
+    if (
+      cached
+      && cached.total === total
+      && cached.served === t.up_part_status
+      && cached.peer === t.up_peer_part_status
+    ) {
+      return cached.text;
+    }
     const base = m.transfers_parts({ have: countServedParts(t.up_part_status), total });
     const peerOnly = countPeerOnlyParts(t.up_peer_part_status, t.up_part_status, total);
-    return peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    const text = peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    uploadTooltipCache.set(t.id, {
+      served: t.up_part_status,
+      peer: t.up_peer_part_status,
+      total,
+      text,
+    });
+    return text;
   }
 
   function ulStatusLabel(t: Transfer): string {
@@ -1973,7 +2009,11 @@
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
         case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
-        case 'remove': await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        // `markDownloadRemoved` before the store edit, as `removeTransfersBatch`
+        // does: a `getTransfers()` snapshot already in flight when the backend
+        // drops the row still carries it, and without the tombstone the next
+        // merge pushed the row straight back for a poll cycle.
+        case 'remove': markDownloadRemoved(t.id); await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
@@ -4854,7 +4894,7 @@
     ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); for (const id of ids) markDownloadRemoved(id); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->
