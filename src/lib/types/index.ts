@@ -74,6 +74,18 @@ export interface KadSearchEntry {
   started_at: number;
 }
 
+/** One configured eMule-style web service.
+ *
+ *  `url` is a template, not a URL: it may contain eMule's placeholders
+ *  (`#hashid`, `#filename`, `#cleanfilename`, `#name`, `#cleanname`,
+ *  `#filesize`), which the backend fills and validates at open time. Note that
+ *  `#hashid` makes the template parse as a URL with a fragment, which is why
+ *  the renderer never builds the final URL itself. */
+export interface WebService {
+  name: string;
+  url: string;
+}
+
 export interface Transfer {
   id: string;
   file_name: string;
@@ -788,6 +800,10 @@ export interface AppSettings {
    *  default. Unrelated to `friend_browse_disabled`, which gates the
    *  separate Ember-only friend browse feature. */
   allow_shared_files_browse: boolean;
+  /** eMule-style web services: sites openable for one file from its context
+   *  menu, with the file's facts substituted into a URL template. Empty by
+   *  default — opening one tells a third party which file you are after. */
+  web_services: WebService[];
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;

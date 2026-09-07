@@ -1098,6 +1098,20 @@ pub async fn update_settings(
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
+    // Web services are URL templates the user curates, so they are normalised
+    // here rather than trusted: each is checked for a http/https scheme, a host
+    // and no embedded credentials, duplicates by URL are dropped, and the list
+    // is truncated. Rejected rows are discarded rather than failing the save —
+    // the rest of the settings payload is unrelated, and the form reports what
+    // it kept. The strict check that guards the shell still runs later, on the
+    // substituted URL, because a template's `#hashid` is a URL fragment until
+    // it is replaced.
+    let (kept_services, rejected_services) =
+        crate::webservices::sanitize_services(std::mem::take(&mut settings.web_services));
+    for (name, reason) in &rejected_services {
+        warn!("Dropping web service {name:?} from settings: {reason}");
+    }
+    settings.web_services = kept_services;
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -2131,6 +2145,185 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
             e,
         )
     })
+}
+
+/// Open a configured web service for one file.
+///
+/// This is eMule's right-click → *Web services*: a curated site is asked about
+/// a specific file, most usefully "how many complete sources has the network
+/// seen", which is the question a download that will not finish raises.
+///
+/// The renderer names *which* service by index and supplies the file's facts;
+/// the template itself is read from settings here, so the URL that gets opened
+/// is one the user stored rather than one the webview composed.
+///
+/// **Substitution has to happen before validation, and that ordering is the
+/// whole reason this command exists** rather than the renderer building a URL
+/// and calling [`open_external_url`]. A template's placeholder is written
+/// `#hashid`, and `#` starts a URL fragment — so `https://x.test/?hash=#hashid`
+/// parses as a URL with an empty query and a fragment of `hashid`. Nothing
+/// about the destination can be judged until the placeholders are gone.
+///
+/// Once they are, it is an ordinary external link and goes through the same
+/// three gates as one pasted into a room: the shape
+/// ([`validate_external_url`]), the destination
+/// ([`reject_non_public_external_host`]), and native consent
+/// ([`confirm_external_url`]). Reusing them is deliberate — a configured
+/// service is more trustworthy than a stranger's link, but the *file name* fed
+/// into it is peer-supplied text, and the confirmation is also the only place
+/// the user is told which third party is about to learn what they are looking
+/// for.
+#[tauri::command]
+pub async fn open_web_service(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    service_index: usize,
+    file_hash: String,
+    file_name: String,
+    file_size: u64,
+) -> Result<(), String> {
+    let template = {
+        let config = state.config.read().await;
+        config
+            .settings
+            .web_services
+            .get(service_index)
+            .map(|service| service.url.clone())
+            .ok_or_else(|| {
+                coded(
+                    "settings_web_service_missing",
+                    "That web service is no longer configured",
+                )
+            })?
+    };
+    let filled = crate::webservices::substitute_placeholders(
+        &template,
+        &crate::webservices::FileFacts {
+            hash: file_hash.trim(),
+            name: file_name.trim(),
+            size: file_size,
+        },
+    );
+    let safe = validate_external_url(&filled)?;
+    reject_non_public_external_host(&safe).await?;
+    if !confirm_external_url(&app, &safe).await {
+        info!("Web service was not opened: the native confirmation was declined");
+        return Ok(());
+    }
+    opener::open(&safe).map_err(|e| {
+        coded_ctx(
+            "settings_open_link_failed",
+            "Failed to open the link",
+            e,
+        )
+    })
+}
+
+/// Read an eMule `webservices.dat` the user picks, and return what it holds.
+///
+/// Deliberately returns the parsed entries instead of writing them: the
+/// Settings form merges them into its list and saves through
+/// [`update_settings`] like any other edit, so there is one persistence path
+/// rather than two that can disagree.
+///
+/// The file is chosen in a native dialog *here* rather than accepted as a path
+/// from the renderer, for the reason `pick_and_import_ipfilter_file` and
+/// `pick_and_load_collection` both give: picking a file in the OS dialog is the
+/// user's authorization, and a path arriving over IPC is not.
+///
+/// `Ok(None)` means the user dismissed the picker.
+#[tauri::command]
+pub async fn pick_and_import_webservices_file(
+    app: tauri::AppHandle,
+) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
+    let picker = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title("Choose an eMule webservices.dat")
+            .add_filter("eMule web services", &["dat", "txt"])
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path().map_err(|e| {
+                    coded_ctx(
+                        "settings_webservices_import_failed",
+                        "Could not read that file",
+                        e,
+                    )
+                })
+            })
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "settings_webservices_import_failed",
+            "Could not read that file",
+            e,
+        )
+    })?;
+    let Some(path) = selected.transpose()? else {
+        return Ok(None);
+    };
+
+    let services = tokio::task::spawn_blocking(move || -> Result<Vec<_>, String> {
+        let meta = std::fs::metadata(&path).map_err(|e| {
+            coded_ctx(
+                "settings_webservices_import_failed",
+                "Could not read that file",
+                e,
+            )
+        })?;
+        // A real webservices.dat is a few lines of text. The cap is here
+        // because the picker hands back whatever was selected, and reading an
+        // arbitrarily large file to find at most a handful of entries is work
+        // with no upside.
+        if meta.len() > crate::webservices::MAX_WEBSERVICES_FILE_BYTES {
+            return Err(coded(
+                "settings_webservices_too_large",
+                "That file is too large to be a webservices.dat",
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| {
+            coded_ctx(
+                "settings_webservices_import_failed",
+                "Could not read that file",
+                e,
+            )
+        })?;
+        // Lossy on purpose: eMule wrote these in the local code page for years,
+        // so a stray byte in a service *name* should cost that character rather
+        // than the whole import. A mangled URL is refused by validation anyway.
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(crate::webservices::parse_webservices_dat(&text))
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "settings_webservices_import_failed",
+            "Could not read that file",
+            e,
+        )
+    })??;
+
+    info!(
+        "Imported {} web service(s) from a picked webservices.dat",
+        services.len()
+    );
+    Ok(Some(services))
+}
+
+/// The example service offered in Settings, as `(name, url)`.
+///
+/// Read from the core rather than typed into the renderer so the string that
+/// gets stored is the one that was reviewed, and so the offer and the validation
+/// cannot drift apart.
+#[tauri::command]
+pub fn get_example_web_service() -> crate::webservices::WebService {
+    crate::webservices::WebService {
+        name: crate::webservices::EXAMPLE_SERVICE_NAME.to_string(),
+        url: crate::webservices::EXAMPLE_SERVICE_URL.to_string(),
+    }
 }
 
 /// Where `ember.log` and its rotated copies live.

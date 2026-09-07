@@ -8,6 +8,8 @@
     getLogFolderPath,
     openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
+    importWebServicesFile,
+    getExampleWebService,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
@@ -1259,6 +1261,116 @@
   // trip. The textarea below is bound to `antileechDraft` (newline-
   // joined patterns); we only push to the backend when the user clicks
   // Save, so the pattern list isn't recompiled on every keystroke.
+  // Mirrors `webservices::MAX_WEB_SERVICES`. The backend truncates regardless;
+  // this is only so the form can say why an add did nothing.
+  const MAX_WEB_SERVICES = 32;
+
+  // --- Web services (eMule's right-click → Web services) ---
+  //
+  // Edited straight into `settings.web_services`, so the page's own Save,
+  // Ctrl+S, dirty tracking and Discard all apply without a second persistence
+  // path. The backend re-validates and de-duplicates on save regardless; the
+  // checks here exist to give a reason next to the field the user typed in
+  // rather than a silent drop.
+  let newWebServiceName = $state('');
+  let newWebServiceUrl = $state('');
+  let webServiceMessage: { kind: 'ok' | 'err'; text: string } | null = $state(null);
+
+  function looksLikeWebServiceUrl(url: string): boolean {
+    // A template's `#hashid` is a URL fragment until it is substituted, so the
+    // strict check belongs at open time in the backend. This only rules out
+    // what could never work.
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return false;
+    if (/[\s\u0000-\u001f]/.test(trimmed)) return false;
+    try {
+      const parsed = new URL(trimmed);
+      return Boolean(parsed.host) && !parsed.username && !parsed.password;
+    } catch {
+      return false;
+    }
+  }
+
+  function addWebServiceEntry(name: string, url: string): 'added' | 'duplicate' | 'invalid' | 'full' {
+    const current = settings;
+    if (!current) return 'invalid';
+    const trimmedName = name.trim();
+    const trimmedUrl = url.trim();
+    if (!trimmedName || !looksLikeWebServiceUrl(trimmedUrl)) return 'invalid';
+    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
+    if (current.web_services.some((s) => s.url === trimmedUrl)) return 'duplicate';
+    current.web_services = [...current.web_services, { name: trimmedName, url: trimmedUrl }];
+    return 'added';
+  }
+
+  function addWebService() {
+    switch (addWebServiceEntry(newWebServiceName, newWebServiceUrl)) {
+      case 'added':
+        newWebServiceName = '';
+        newWebServiceUrl = '';
+        webServiceMessage = null;
+        break;
+      case 'duplicate':
+        webServiceMessage = { kind: 'err', text: m.webservices_import_duplicate() };
+        break;
+      case 'full':
+        webServiceMessage = { kind: 'err', text: m.webservices_full({ max: MAX_WEB_SERVICES }) };
+        break;
+      default:
+        webServiceMessage = { kind: 'err', text: m.webservices_invalid() };
+    }
+  }
+
+  function removeWebService(index: number) {
+    const current = settings;
+    if (!current) return;
+    current.web_services = current.web_services.filter((_, i) => i !== index);
+    webServiceMessage = null;
+  }
+
+  async function addExampleWebService() {
+    try {
+      // Read from the backend rather than hardcoded here, so the string stored
+      // is the reviewed one and the offer cannot drift from the validator.
+      const example = await getExampleWebService();
+      const outcome = addWebServiceEntry(example.name, example.url);
+      webServiceMessage =
+        outcome === 'duplicate'
+          ? { kind: 'err', text: m.webservices_import_duplicate() }
+          : outcome === 'full'
+            ? { kind: 'err', text: m.webservices_full({ max: MAX_WEB_SERVICES }) }
+            : null;
+    } catch (e: unknown) {
+      webServiceMessage = { kind: 'err', text: translateError(e) };
+    }
+  }
+
+  async function handleImportWebServices() {
+    try {
+      const imported = await importWebServicesFile();
+      // Null is a dismissed picker, which is not a failure and not worth a
+      // message.
+      if (imported === null) return;
+      let added = 0;
+      for (const service of imported) {
+        if (addWebServiceEntry(service.name, service.url) === 'added') added += 1;
+      }
+      if (added === 0) {
+        webServiceMessage = {
+          kind: 'err',
+          text: imported.length === 0 ? m.webservices_import_none() : m.webservices_import_duplicate(),
+        };
+      } else {
+        webServiceMessage = {
+          kind: 'ok',
+          text: added === 1 ? m.webservices_imported_one() : m.webservices_imported_other({ count: added }),
+        };
+      }
+    } catch (e: unknown) {
+      webServiceMessage = { kind: 'err', text: translateError(e) };
+    }
+  }
+
   let antileechSnapshot: AntiLeechSnapshot | null = $state(null);
   let antileechDraft = $state('');
   let antileechSaving = $state(false);
@@ -2094,6 +2206,75 @@
             {/if}
             {#if historyClearMsg}
               <span class="hint">{historyClearMsg}</span>
+            {/if}
+          </div>
+
+          <div class="divider"></div>
+
+          <!-- eMule's web services, reached from a file's right-click menu.
+               Lives under Downloads because the question it answers is "why
+               will this not finish?". -->
+          <div class="field">
+            <span class="toggle-title">{m.webservices_title()}</span>
+            <span class="hint">{m.webservices_desc()}</span>
+            <span class="hint">{m.webservices_privacy_note()}</span>
+
+            {#if settings.web_services.length === 0}
+              <span class="hint">{m.webservices_empty()}</span>
+            {:else}
+              <ul class="webservice-list">
+                {#each settings.web_services as service, index (service.url)}
+                  <li class="webservice-row">
+                    <div class="webservice-text">
+                      <span class="webservice-name"><bdi dir="auto">{service.name}</bdi></span>
+                      <span class="hint webservice-url">{service.url}</span>
+                    </div>
+                    <button
+                      class="action-btn ghost"
+                      onclick={() => removeWebService(index)}
+                    >{m.webservices_remove()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+
+            <div class="webservice-add">
+              <label class="webservice-field">
+                <span class="hint">{m.webservices_name_label()}</span>
+                <input
+                  type="text"
+                  bind:value={newWebServiceName}
+                  maxlength="64"
+                  spellcheck="false"
+                  placeholder={m.webservices_name_placeholder()}
+                />
+              </label>
+              <label class="webservice-field webservice-field-url">
+                <span class="hint">{m.webservices_url_label()}</span>
+                <input
+                  type="text"
+                  bind:value={newWebServiceUrl}
+                  maxlength="512"
+                  spellcheck="false"
+                  placeholder={m.webservices_url_placeholder()}
+                />
+              </label>
+              <button class="action-btn" onclick={addWebService}>{m.webservices_add()}</button>
+            </div>
+            <span class="hint">{m.webservices_placeholders()}</span>
+
+            <div class="webservice-actions">
+              <button class="action-btn ghost" onclick={addExampleWebService}>
+                {m.webservices_add_example()}
+              </button>
+              <button class="action-btn ghost" onclick={handleImportWebServices}>
+                {m.webservices_import()}
+              </button>
+            </div>
+            {#if webServiceMessage}
+              <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
+                {webServiceMessage.text}
+              </span>
             {/if}
           </div>
         </div>
@@ -4008,6 +4189,83 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+  }
+  /* Web services list + add form. */
+  .webservice-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .webservice-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .webservice-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+  }
+  .webservice-name {
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* A URL is long and is the part worth inspecting, so it truncates rather
+     than wrapping the row to three lines. The full value is in the title
+     attribute on the context-menu item that uses it. */
+  .webservice-url {
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .webservice-add {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+  .webservice-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 140px;
+  }
+  .webservice-field-url {
+    flex: 1;
+    min-width: 220px;
+  }
+  .webservice-field input {
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    padding: 6px 8px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .webservice-field input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .webservice-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
   }
   .antileech-path {
     font-size: 11px;

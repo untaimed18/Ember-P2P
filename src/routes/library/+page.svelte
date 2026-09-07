@@ -53,6 +53,8 @@
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
   // All three are replace-only — never mutated in place — so `$state.raw`
@@ -1789,6 +1791,10 @@
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
+  let ctxWebSub = $state(false);
+  // Empty until settings load, so the submenu shows its "configure in Settings"
+  // hint rather than a stale list.
+  let webServices = $derived($appSettings?.web_services ?? []);
   /** Friends currently online, so "Send to Friend" only lists reachable ones. */
   let sendableFriends: { user_hash: string; nickname: string }[] = $state([]);
 
@@ -1824,6 +1830,7 @@
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
+    ctxWebSub = false;
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
@@ -2110,6 +2117,16 @@
           break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
+        // The backend reads the template from settings by index and does the
+        // substituting, and collects the native confirmation — so there is
+        // deliberately no prompt here and no URL built in this renderer.
+        case 'web_service': {
+          if (!extra) break;
+          const index = Number(extra);
+          if (!Number.isInteger(index)) break;
+          await openWebService(index, f.hash, f.name, f.size);
+          break;
+        }
         case 'find_related':
         case 'find_related_selected': {
           // Tags earn a probe of their own, so it is worth one metadata read
@@ -3781,6 +3798,36 @@
         onclick={() => ctxAction('find_related')}
         title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
       >{m.search_ctx_find_related()}</button>
+      <!-- eMule's right-click → Web services. Shown even when nothing is
+           configured, so the feature is discoverable from the file it applies
+           to rather than only from Settings. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <div
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxWebSub}
+        role="menuitem"
+        tabindex="-1"
+        aria-haspopup="menu"
+        aria-expanded={ctxWebSub}
+        onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+      >
+        {m.webservices_ctx_menu()}
+        {#if ctxWebSub}
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each webServices as service, index (service.url)}
+              <button
+                class="ctx-item"
+                role="menuitem"
+                title={service.url}
+                onclick={() => ctxAction('web_service', String(index))}
+              ><bdi dir="auto">{service.name}</bdi></button>
+            {/each}
+            {#if webServices.length === 0}
+              <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.webservices_ctx_none()}</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
       {#if checkedCount > 1}
         <button
           class="ctx-item"

@@ -31,6 +31,7 @@ pub mod security;
 mod sharing;
 mod storage;
 mod types;
+mod webservices;
 
 use futures::FutureExt;
 use tauri::Emitter;
@@ -1895,6 +1896,9 @@ pub fn run() {
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,
             commands::settings::open_external_url,
+            commands::settings::open_web_service,
+            commands::settings::pick_and_import_webservices_file,
+            commands::settings::get_example_web_service,
             commands::settings::get_log_folder_path,
             commands::settings::open_log_folder,
             commands::security::get_security_policy_state,

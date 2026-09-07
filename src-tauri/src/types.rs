@@ -1269,6 +1269,16 @@ pub struct AppSettings {
     /// matching real eMule's "deny" behavior.
     #[serde(default)]
     pub allow_shared_files_browse: bool,
+    /// eMule-style web services: external sites that can be opened for a
+    /// specific file from its context menu, with the file's hash, name or size
+    /// substituted into a URL template.
+    ///
+    /// Empty by default, and deliberately so. Opening one tells a third-party
+    /// site which file this user is looking for, which is a choice to make
+    /// rather than a default to inherit — Settings offers the example from the
+    /// request this feature came from as a one-click add instead.
+    #[serde(default)]
+    pub web_services: Vec<crate::webservices::WebService>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -1861,6 +1871,8 @@ impl Default for AppSettings {
             ip_filter_enabled: true,
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
+            // Empty rather than seeded: see the field.
+            web_services: Vec::new(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,

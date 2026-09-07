@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings } from '$lib/types';
+import type { AppSettings, WebService } from '$lib/types';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -166,4 +166,57 @@ export async function openEmberShare(target: EmberShareTarget, text: string): Pr
  */
 export async function openExternalUrl(url: string): Promise<void> {
   return invoke('open_external_url', { url });
+}
+
+/**
+ * Open a configured web service for one file — eMule's right-click → Web
+ * services.
+ *
+ * The service is named by its index in `AppSettings.web_services` rather than
+ * by URL: the backend reads the template from settings, so what opens is a URL
+ * the user stored rather than one this renderer composed. It also has to be
+ * that way round, because a template's `#hashid` parses as a URL fragment and
+ * only becomes a destination once the placeholders are filled.
+ *
+ * Goes through the same native confirmation as {@link openExternalUrl}, which
+ * is also where the user is told which third party is about to learn what they
+ * are looking for. Do not add a confirmation of your own. A declined dialog
+ * resolves successfully.
+ */
+export async function openWebService(
+  serviceIndex: number,
+  fileHash: string,
+  fileName: string,
+  fileSize: number,
+): Promise<void> {
+  return invoke('open_web_service', {
+    serviceIndex,
+    fileHash,
+    fileName,
+    fileSize,
+  });
+}
+
+/**
+ * Let the user pick an eMule `webservices.dat` and return what it holds.
+ *
+ * Returns `null` if the picker was dismissed. Nothing is persisted: merge the
+ * result into the settings list and save it like any other change, so there is
+ * one persistence path. The file is chosen by a native dialog in the backend,
+ * because picking a file is the authorization and a path from this renderer
+ * would not be.
+ */
+export async function importWebServicesFile(): Promise<WebService[] | null> {
+  return invoke('pick_and_import_webservices_file');
+}
+
+/**
+ * The example service Settings offers as a one-click add.
+ *
+ * Read from the backend rather than hardcoded here so the string that gets
+ * stored is the reviewed one, and so the offer cannot drift from what the
+ * validator accepts.
+ */
+export async function getExampleWebService(): Promise<WebService> {
+  return invoke('get_example_web_service');
 }

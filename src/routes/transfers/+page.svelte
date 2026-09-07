@@ -27,6 +27,8 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -1899,7 +1901,11 @@
   });
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
+  let ctxWebSub = $state(false);
   const CATEGORY_OPTIONS = ['None', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  // Empty until settings load, which is the honest default: the submenu then
+  // shows its "configure these in Settings" hint rather than a stale list.
+  let webServices = $derived($appSettings?.web_services ?? []);
 
   function onCtx(e: MouseEvent, t: Transfer, section: 'active' | 'completed' | 'upload') {
     e.preventDefault();
@@ -1908,6 +1914,7 @@
     closePaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
+    ctxWebSub = false;
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
@@ -1938,7 +1945,7 @@
     paneCtxMenu = { x: e.clientX, y: e.clientY };
   }
 
-  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; }
+  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
@@ -2023,6 +2030,18 @@
           } catch (e: unknown) {
             transferError = toErrorMsg(e);
           }
+          break;
+        }
+        // The backend reads the template from settings by index and does the
+        // substituting, so a peer-supplied file name never reaches a URL this
+        // renderer assembled. It also collects the native confirmation, which
+        // is where the user is told which third party is about to learn what
+        // they are looking for — so there is deliberately no prompt here.
+        case 'web_service': {
+          if (!extra) break;
+          const index = Number(extra);
+          if (!Number.isInteger(index)) break;
+          await openWebService(index, t.file_hash, t.file_name, t.total_size);
           break;
         }
         case 'preview': await previewFile(t.id); break;
@@ -4611,6 +4630,39 @@
   </div>
 {/if}
 
+<!-- eMule's right-click → Web services, shared by the active and completed
+     download menus. Rendered even with nothing configured, because a submenu
+     that only appears once you have already found the setting cannot tell you
+     the feature exists. Uploads are left out: the question it answers is about
+     a file you are trying to get, and a file you are sharing is the Library's. -->
+{#snippet webServicesSubmenu()}
+  <div class="ctx-submenu-wrap" role="presentation">
+    <button
+      class="ctx-item ctx-sub"
+      class:ctx-sub-open={ctxWebSub}
+      role="menuitem"
+      aria-haspopup="menu"
+      aria-expanded={ctxWebSub}
+      onclick={() => (ctxWebSub = !ctxWebSub)}
+    >{m.webservices_ctx_menu()}</button>
+    {#if ctxWebSub}
+      <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+        {#each webServices as service, index (service.url)}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            title={service.url}
+            onclick={() => ctxAction('web_service', String(index))}
+          ><bdi dir="auto">{service.name}</bdi></button>
+        {/each}
+        {#if webServices.length === 0}
+          <span class="ctx-label" role="presentation">{m.webservices_ctx_none()}</span>
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <!-- Context Menu -->
 {#if paneCtxMenu}
   <!-- Downloads pane background menu. Every "All" here is the visible, filtered
@@ -4731,6 +4783,7 @@
         title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
         onclick={() => ctxAction('find_related')}
       >{m.search_ctx_find_related()}</button>
+      {@render webServicesSubmenu()}
       {#if selectedDownloadCount > 1}
         <button
           class="ctx-item"
@@ -4762,6 +4815,7 @@
         title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
         onclick={() => ctxAction('find_related')}
       >{m.search_ctx_find_related()}</button>
+      {@render webServicesSubmenu()}
       {#if selectedDownloadCount > 1}
         <button
           class="ctx-item"
