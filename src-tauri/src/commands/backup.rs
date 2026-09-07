@@ -1518,6 +1518,40 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         return Ok(None);
     }
 
+    // Room for the copies before any of them is attempted.
+    //
+    // `copy_into_place` keeps each staged file until the whole set has landed,
+    // which is what makes a retry after a rollback start from a complete
+    // profile — but it also means the staged set, the live copies and the
+    // displaced originals all exist at once, where the previous rename
+    // consumed staging as it went. On a nearly-full disk that turns a restore
+    // that used to squeeze through into one that fails part-way. The rollback
+    // handles that correctly now, but an upfront refusal that keeps staging
+    // intact is a better answer than a mid-apply abort.
+    let staged_bytes: u64 = pending
+        .files
+        .iter()
+        .filter_map(|name| std::fs::metadata(staging.join(name)).ok())
+        .map(|meta| meta.len())
+        .sum();
+    if let Ok(free) = fs2::available_space(data_dir) {
+        // The originals are moved aside rather than copied, so one further
+        // copy of the staged set is what this actually needs; the margin
+        // covers the database's WAL and SHM sidecars.
+        let needed = staged_bytes.saturating_add(staged_bytes / 4);
+        if free < needed {
+            tracing::error!(
+                "Not applying the staged restore: it needs about {} MiB free in {} and only {} MiB \
+                 is available. It stays staged - free some space and relaunch, or discard it from \
+                 Settings > Backup.",
+                needed / (1024 * 1024),
+                data_dir.display(),
+                free / (1024 * 1024)
+            );
+            return Ok(None);
+        }
+    }
+
     let backup_dir = data_dir.join(format!("pre-restore-{}", chrono::Utc::now().timestamp()));
     std::fs::create_dir_all(&backup_dir)?;
     crate::security::restrict_file_permissions(&backup_dir);

@@ -2522,6 +2522,101 @@ fn server_search_age_limit(search_timeout_secs: u64) -> u32 {
 }
 
 #[cfg(test)]
+mod channel_view_cache_tests {
+    use super::{
+        make_room_in_channel_view_cache, CachedChannelView, CHANNEL_VIEW_CACHE_MAX,
+        CHANNEL_VIEW_TTL,
+    };
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    fn view(fetched_at: Instant) -> CachedChannelView {
+        CachedChannelView {
+            fetched_at,
+            row: crate::storage::database::StoredChannel {
+                channel_id: String::new(),
+                pubkey: String::new(),
+                name: String::new(),
+                visibility: "public".into(),
+                is_owner: false,
+                topic: String::new(),
+                welcome: String::new(),
+                joined_at: 0,
+                last_active: 0,
+                member_count: 0,
+                unread: 0,
+                successor_id: String::new(),
+                predecessor_id: String::new(),
+                owner_pubkey: String::new(),
+                key_epoch: 0,
+                successor_nominee: String::new(),
+                claim_after_days: 0,
+                key_epoch_wanted: 0,
+                moderation_updated_at: 0,
+                moderation_checked_at: 0,
+                in_room: true,
+                deleted: false,
+                invites_owner_only: false,
+                slow_mode_secs: 0,
+            },
+            content_keys: Vec::new(),
+        }
+    }
+
+    fn fill(cache: &mut HashMap<[u8; 16], CachedChannelView>, count: usize, at: Instant) {
+        for i in 0..count {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            cache.insert(id, view(at));
+        }
+    }
+
+    /// Below the bound nothing is touched, however old the entries are: the
+    /// per-lookup TTL decides what is *served*, and evicting a stale entry
+    /// early would only force the query this cache exists to avoid.
+    #[test]
+    fn a_cache_under_its_bound_is_left_alone() {
+        let now = Instant::now();
+        let stale = now - CHANNEL_VIEW_TTL * 10;
+        let mut cache = HashMap::new();
+        fill(&mut cache, CHANNEL_VIEW_CACHE_MAX - 1, stale);
+        make_room_in_channel_view_cache(&mut cache, now);
+        assert_eq!(cache.len(), CHANNEL_VIEW_CACHE_MAX - 1);
+    }
+
+    /// At the bound, stale entries are what gets reclaimed — the fresh ones
+    /// are the rooms currently carrying traffic.
+    #[test]
+    fn reaching_the_bound_reclaims_the_stale_entries_first() {
+        let now = Instant::now();
+        let stale = now - CHANNEL_VIEW_TTL * 10;
+        let mut cache = HashMap::new();
+        fill(&mut cache, CHANNEL_VIEW_CACHE_MAX, stale);
+        // One fresh room among them, which must survive.
+        let fresh_id = [0xFFu8; 16];
+        cache.insert(fresh_id, view(now));
+
+        make_room_in_channel_view_cache(&mut cache, now);
+
+        assert_eq!(cache.len(), 1, "only the fresh room should remain");
+        assert!(cache.contains_key(&fresh_id));
+    }
+
+    /// A cache that is at its bound and entirely fresh cannot be trimmed by
+    /// age, so it is dropped wholesale rather than allowed to grow.
+    #[test]
+    fn an_all_fresh_cache_at_the_bound_is_dropped_rather_than_grown() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        fill(&mut cache, CHANNEL_VIEW_CACHE_MAX, now);
+        make_room_in_channel_view_cache(&mut cache, now);
+        assert!(cache.is_empty());
+        // Which leaves room for the insert that follows in `cached_channel_view`.
+        assert!(cache.len() < CHANNEL_VIEW_CACHE_MAX);
+    }
+}
+
+#[cfg(test)]
 mod server_search_age_limit_tests {
     use super::server_search_age_limit;
 
@@ -14808,16 +14903,32 @@ fn cached_channel_view(
         row,
         content_keys,
     };
-    if state.channel_view_cache.len() >= CHANNEL_VIEW_CACHE_MAX {
-        state
-            .channel_view_cache
-            .retain(|_, v| now.saturating_duration_since(v.fetched_at) < CHANNEL_VIEW_TTL);
-        if state.channel_view_cache.len() >= CHANNEL_VIEW_CACHE_MAX {
-            state.channel_view_cache.clear();
-        }
-    }
+    make_room_in_channel_view_cache(&mut state.channel_view_cache, now);
     state.channel_view_cache.insert(channel_id, view.clone());
     Some(view)
+}
+
+/// Keep [`NetworkState::channel_view_cache`] under its bound before an insert.
+///
+/// Split from [`cached_channel_view`] so the bound can be tested without a
+/// `NetworkState`, which has no constructor outside `start_network`.
+///
+/// Stale entries go first; only if that frees nothing does the whole map go.
+/// Dropping everything is the deliberately blunt fallback — past the bound
+/// every room pays its query again, which is what this cache exists to stop,
+/// so the bound is set well clear of any plausible join list rather than at
+/// the cap of something else.
+fn make_room_in_channel_view_cache(
+    cache: &mut HashMap<[u8; 16], CachedChannelView>,
+    now: std::time::Instant,
+) {
+    if cache.len() < CHANNEL_VIEW_CACHE_MAX {
+        return;
+    }
+    cache.retain(|_, v| now.saturating_duration_since(v.fetched_at) < CHANNEL_VIEW_TTL);
+    if cache.len() >= CHANNEL_VIEW_CACHE_MAX {
+        cache.clear();
+    }
 }
 
 /// Content keys this room can be read with, newest epoch first.
