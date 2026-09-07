@@ -860,7 +860,17 @@ pub struct EmberDiagnostics {
     /// have all been confirmed stored by a peer.
     #[serde(default)]
     pub ember_dht_keywords_published: u32,
-    /// Slice 14: inbound Ember DHT frames dropped by per-IP rate limits.
+    /// Slice 14: inbound Ember DHT frames dropped by the rate limiter, for any
+    /// of its five reasons — a full address table, the per-address frame
+    /// window, the per-node STORE budget, the aggregate per-address STORE
+    /// ceiling, or the lookup window.
+    ///
+    /// Declared long before anything filled it in, which is what left
+    /// `DhtProtection::dropped_rate_limited` marked dead with a comment saying
+    /// it was "kept for the diagnostics surface to report drops". Now populated,
+    /// and only worth reading beside `ember_dht_store_addr_ceiling`: this total
+    /// climbing while that stays flat is ordinary pacing, and the two climbing
+    /// together is one address flooding the store under rotating identities.
     #[serde(default)]
     pub ember_dht_rate_limited: u32,
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
@@ -984,6 +994,18 @@ pub struct EmberDiagnostics {
     /// dropping self. A gauge, not a counter.
     #[serde(default)]
     pub ember_dht_rendezvous_last_peers: u32,
+    /// Highest load any storer has reported for the Ember rendezvous key this
+    /// session, on the eMule 0–100 scale.
+    ///
+    /// The tripwire for sharding the rendezvous key space. That work is due
+    /// "once one bucket's 1000-entry cap is in sight", and no lookup can see
+    /// it: `ember_dht_rendezvous_last_peers` counts what one source search
+    /// returned, and such a search stops querying at 20 results. A storer's
+    /// load byte is its own report of how full it is for the key — the same
+    /// signal the keyword publish path already backs off on at 90 — so this is
+    /// what actually answers the question. Read 90 or above as due.
+    #[serde(default)]
+    pub ember_dht_rendezvous_key_load: u32,
     /// Slice 19: observed-IP votes recorded from PONG payloads.
     #[serde(default)]
     pub ember_dht_observed_votes: u32,
@@ -1056,6 +1078,30 @@ pub struct EmberDiagnostics {
     /// STORE records for keys this node is not close enough to hold.
     #[serde(default)]
     pub ember_dht_store_reject_proximity: u32,
+    /// Searches where both keyword DHT legs ran, so the three counts below have
+    /// a denominator.
+    #[serde(default)]
+    pub ember_dht_recall_searches: u32,
+    /// Files both keyword DHTs found, across those searches.
+    #[serde(default)]
+    pub ember_dht_recall_both: u32,
+    /// Files only KAD found. This pulling ahead of `ember_only` is Ember's
+    /// recall lagging, which is the trigger for richer keyword indexing.
+    #[serde(default)]
+    pub ember_dht_recall_kad_only: u32,
+    /// Files only Ember found — worth knowing before anyone tunes the Ember
+    /// tokenizer toward KAD's.
+    #[serde(default)]
+    pub ember_dht_recall_ember_only: u32,
+    /// Frames refused by the aggregate per-address STORE ceiling.
+    ///
+    /// The store's per-publisher shares are keyed on the publisher's key, so a
+    /// flood spending a fresh keypair per record is never over its share and
+    /// that rule never fires. This ceiling is keyed on the address instead, so
+    /// it is where such a flood becomes visible. Zero means the proof-of-work
+    /// question is still hypothetical.
+    #[serde(default)]
+    pub ember_dht_store_addr_ceiling: u32,
     /// Peers that have told us which wire versions they can decode.
     ///
     /// Read against `ember_dht_verified_contacts`: while this trails it, a frame

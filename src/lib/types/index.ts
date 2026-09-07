@@ -560,6 +560,18 @@ export interface EmberDiagnostics {
   ember_dht_keyword_key_off_name?: number;
   /** Peers that have told us which wire versions they can decode. */
   ember_dht_version_advertisers?: number;
+  /** Frames refused by the aggregate per-address STORE ceiling. */
+  ember_dht_store_addr_ceiling?: number;
+  /** Highest load a storer has reported for the rendezvous key (0-100); 90+ means sharding is due. */
+  ember_dht_rendezvous_key_load?: number;
+  /** Searches where both keyword DHT legs ran — the denominator for the three below. */
+  ember_dht_recall_searches?: number;
+  /** Files both keyword DHTs found. */
+  ember_dht_recall_both?: number;
+  /** Files only KAD found; ahead of ember_only means Ember's recall is lagging. */
+  ember_dht_recall_kad_only?: number;
+  /** Files only Ember found. */
+  ember_dht_recall_ember_only?: number;
   /** Completed FIND_VALUE searches this session (hits, misses, and timeouts). */
   ember_dht_search_outcomes?: number;
   /** Sum of shortlist nodes that answered across those searches. */

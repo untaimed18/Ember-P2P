@@ -180,6 +180,8 @@ async fn handle_command_inner(
                 kad_pending: false,
                 udp_pending: false,
                 ember_pending: false,
+                kad_ran: false,
+                ember_ran: false,
                 udp_search_deadline: 0,
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
@@ -508,6 +510,7 @@ async fn handle_command_inner(
                     search.search_terms_data = kad_search_expr;
                 }
                 active_request.kad_pending = true;
+                active_request.kad_ran = true;
                 let Some(search_tx) = tx.take() else {
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
@@ -625,6 +628,7 @@ async fn handle_command_inner(
                             },
                         );
                         active_request.ember_pending = true;
+                        active_request.ember_ran = true;
                         drive_ember_search(socket, state, search_id).await;
                     }
                 }

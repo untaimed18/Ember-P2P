@@ -171,6 +171,19 @@ pub struct DhtProtection {
     /// [`MAX_LOOKUPS_PER_WINDOW`].
     lookup_counters: HashMap<StoreBudgetKey, WindowCounter>,
     dropped_rate: u64,
+    /// Frames refused by the aggregate per-address STORE ceiling alone, split
+    /// out of [`Self::dropped_rate`] because that lumps five unrelated causes
+    /// together and this is the only one that means anything on its own.
+    ///
+    /// It is the tripwire for the one Sybil pressure the store's own caps cannot
+    /// price. `MAX_RECORDS_PER_PUBLISHER_PER_KEY` and its siblings are keyed on
+    /// `publisher_key`, so a flood spending a fresh keypair per record is never
+    /// over its share and that rule never engages; this ceiling is keyed on the
+    /// address, so it is the only place such a flood shows up as a refusal
+    /// rather than as ordinary traffic. Zero is the evidence that the
+    /// proof-of-work note in `docs/ember-dht.md` is still hypothetical, and a
+    /// number that climbs is what would justify paying for it.
+    dropped_store_addr_ceiling: u64,
     /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
     /// routing table's view of network size.
     max_stores: u32,
@@ -189,6 +202,7 @@ impl DhtProtection {
             store_counters: HashMap::new(),
             lookup_counters: HashMap::new(),
             dropped_rate: 0,
+            dropped_store_addr_ceiling: 0,
             max_stores: super::scale::NetworkScale::Bootstrap.max_stores_per_minute(),
         }
     }
@@ -207,11 +221,21 @@ impl DhtProtection {
         self.max_stores = max;
     }
 
-    /// Count of frames refused by the rate limiter. Read by this module's
-    /// tests; kept for the diagnostics surface to report drops.
-    #[allow(dead_code)]
+    /// Count of frames refused by the rate limiter, for any of its reasons: a
+    /// full address table, the per-address frame window, the per-node STORE
+    /// budget, the aggregate per-address STORE ceiling, or the lookup window.
+    ///
+    /// Deliberately lumped, and only useful as a denominator. Read it beside
+    /// [`Self::dropped_store_addr_ceiling`], which is the one cause worth
+    /// reading alone — a total that climbs while that stays flat is ordinary
+    /// pacing, and the two climbing together is a flood from one address.
     pub fn dropped_rate_limited(&self) -> u64 {
         self.dropped_rate
+    }
+
+    /// Frames refused by the aggregate per-address STORE ceiling. See the field.
+    pub fn dropped_store_addr_ceiling(&self) -> u64 {
+        self.dropped_store_addr_ceiling
     }
 
     /// Both halves, in the order production runs them.
@@ -361,6 +385,8 @@ impl DhtProtection {
                     );
                 if !addr_ok {
                     self.dropped_rate = self.dropped_rate.saturating_add(1);
+                    self.dropped_store_addr_ceiling =
+                        self.dropped_store_addr_ceiling.saturating_add(1);
                     return false;
                 }
             }
@@ -586,6 +612,54 @@ mod tests {
             Some([0xFE; 16]),
             50
         ));
+    }
+
+    /// The ceiling is the only refusal in this module that says something on its
+    /// own, so it has to be countable on its own. Everything else lands in the
+    /// lumped total, and a flood from one address rotating identities is
+    /// invisible in that total against ordinary pacing.
+    #[test]
+    fn the_address_ceiling_is_counted_apart_from_every_other_refusal() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(50);
+        let ip = IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7));
+
+        for id in 0..MAX_STORE_IDENTITIES_PER_ADDR as u8 {
+            assert!(p.allow_message(ip, MSG_STORE_BATCH, Some([id; 16]), 50));
+        }
+        assert_eq!(
+            p.dropped_store_addr_ceiling(),
+            0,
+            "nothing has hit the ceiling yet"
+        );
+
+        // A fresh identity with an untouched per-node budget: the ceiling is the
+        // only thing that can refuse it.
+        assert!(!p.allow_message(ip, MSG_STORE_BATCH, Some([0xFF; 16]), 1));
+        assert_eq!(p.dropped_store_addr_ceiling(), 1);
+        assert_eq!(
+            p.dropped_rate_limited(),
+            1,
+            "and it is counted in the total as well, so the two can be read as a ratio"
+        );
+
+        // A refusal from a different cause moves the total and leaves the
+        // ceiling alone — the property that makes the split worth having.
+        let mut q = DhtProtection::new();
+        q.set_max_stores_for_test(1);
+        let solo = IpAddr::V4(Ipv4Addr::new(7, 7, 7, 8));
+        let one = Some([0x11; 16]);
+        assert!(q.allow_message(solo, MSG_STORE_RECORD, one, 1));
+        assert!(
+            !q.allow_message(solo, MSG_STORE_RECORD, one, 1),
+            "the per-node budget is spent"
+        );
+        assert_eq!(q.dropped_rate_limited(), 1);
+        assert_eq!(
+            q.dropped_store_addr_ceiling(),
+            0,
+            "one identity over its own budget is pacing, not a rotating flood"
+        );
     }
 
     /// Both STORE windows are consulted before either is charged. Charging the

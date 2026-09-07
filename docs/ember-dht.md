@@ -841,6 +841,21 @@ settled.
   data).
 - Shard the rendezvous key space. The derivation is already versioned for
   this; it matters once one KAD bucket's 1000-entry cap is in sight.
+
+  **Its trigger is now observable, and the obvious gauge could not see it.**
+  `ember_dht_rendezvous_last_peers` counts what one lookup *returned*, and a
+  KAD source search stops querying at `SOURCE_SEARCH_STOP_THRESHOLD` (20) — so
+  it saturates two orders of magnitude below `MAX_ENTRIES_PER_KEY` (1000) and
+  can never report approaching it. That gauge is a bootstrap canary ("did a cold
+  lookup find anyone"), not an occupancy one.
+
+  What can see it is the storer's own load byte, which already arrives on every
+  advert we place and is the same signal the keyword publish path backs off on
+  at 90. `ember_dht_rendezvous_key_load` is the highest any storer has reported
+  for the rendezvous key this session — highest rather than latest, because the
+  twenty nodes closest to the key fill at different rates and the first one to
+  run out is what decides whether the advert still lands. Read 90 or above as
+  due.
 - Table quality: tune announce versus bucket-refresh balance under load.
 
 ### Search and publish
@@ -852,6 +867,23 @@ stays the home for indexing ideas that are not gaps against KAD.
 
 - Richer keyword indexing (stemming, more than space-split tokens) if
   recall lags KAD on real libraries.
+
+  **That condition is now measured**, which it was not: the search-quality
+  averages describe how a walk ran — nodes answered, milliseconds, records
+  returned — not whether Ember found the files KAD did. For searches where both
+  legs actually ran (`ember_dht_recall_searches`, the denominator), each file is
+  scored as found by both, by KAD only, or by Ember only. `both` climbing with
+  the two `_only` counts near zero is the tokenizers agreeing and the case for
+  doing nothing; `kad_only` pulling ahead is the lag this item is conditional
+  on, and by how much.
+
+  `ember_only` is the half worth having before anyone tunes the Ember tokenizer
+  toward KAD's — Ember already indexes four-letter extensions that KAD strips
+  (`flac`, `webm`, `epub`), so the two are not ordered by quality and "fixing"
+  one toward the other can lose recall. Presence rather than availability, so
+  Ember counting publishers where KAD counts a claimed swarm does not matter;
+  the sample is bounded by what `note_dht_availability` tracks, which caps the
+  cost of a diagnostic nobody is waiting on.
 - ~~Clearer search UI when Ember is joining (empty table) versus
   enabled-but-quiet.~~ Search, the Ember page, and the status bar wait for
   a verified contact; gossip-only no longer looks connected. After the
@@ -990,6 +1022,18 @@ stays the home for indexing ideas that are not gaps against KAD.
   keep the damage to bandwidth and memory rather than correctness. Nothing here
   is a correctness break today: a flood cannot forge a record, displace a validly
   signed one, or make a search return something unsigned.
+
+  **"If abuse appears" is now a number rather than a judgement.**
+  `MAX_STORE_IDENTITIES_PER_ADDR` (8) is the only cap keyed on something a
+  keypair cannot mint, so it is the only place a rotating-identity flood shows
+  up as a refusal rather than as ordinary traffic — and every refusal in
+  `protection.rs` used to land in one lumped `dropped_rate`, itself never
+  surfaced (`dropped_rate_limited` carried a stale `#[allow(dead_code)]` saying
+  it was "kept for the diagnostics surface to report drops"). Both are now on
+  `/ember`: `ember_dht_store_addr_ceiling` for that cap alone and
+  `ember_dht_rate_limited` for the total. The total climbing while the ceiling
+  stays flat is pacing; the two climbing together is the case proof-of-work
+  would be for.
 
 ### Product / UX
 

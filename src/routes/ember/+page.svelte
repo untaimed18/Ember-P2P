@@ -408,6 +408,7 @@
     { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
     { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
     { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
+    { id: 'rendezvous-key-load', k: m.ember_stat_rendezvous_key_load(), v: String(diag?.ember_dht_rendezvous_key_load ?? 0) },
     { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
     { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
@@ -425,6 +426,12 @@
     { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
     { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: String(diag?.ember_dht_keyword_key_off_name ?? 0) },
     { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: String(diag?.ember_dht_version_advertisers ?? 0) },
+    { id: 'recall-searches', k: m.ember_stat_recall_searches(), v: String(diag?.ember_dht_recall_searches ?? 0) },
+    { id: 'recall-both', k: m.ember_stat_recall_both(), v: String(diag?.ember_dht_recall_both ?? 0) },
+    { id: 'recall-kad-only', k: m.ember_stat_recall_kad_only(), v: String(diag?.ember_dht_recall_kad_only ?? 0) },
+    { id: 'recall-ember-only', k: m.ember_stat_recall_ember_only(), v: String(diag?.ember_dht_recall_ember_only ?? 0) },
+    { id: 'rate-limited', k: m.ember_stat_rate_limited(), v: String(diag?.ember_dht_rate_limited ?? 0) },
+    { id: 'store-addr-ceiling', k: m.ember_stat_store_addr_ceiling(), v: String(diag?.ember_dht_store_addr_ceiling ?? 0) },
     ];
   });
 

@@ -7885,6 +7885,8 @@ mod tests {
             kad_pending: true,
             udp_pending: false,
             ember_pending: false,
+            kad_ran: true,
+            ember_ran: false,
             udp_search_deadline: 0,
             udp_search_sent_ips: HashSet::new(),
             ed2k_found_sources: 0,
@@ -12872,6 +12874,15 @@ struct ActiveSearchRequest {
     /// `search-complete`; cleared when the Ember results are emitted or the
     /// lookup expires.
     ember_pending: bool,
+    /// Whether each keyword DHT leg was actually started for this request, as
+    /// opposed to merely permitted by the search method.
+    ///
+    /// The `*_pending` flags cannot answer this at completion, because by then
+    /// both are false whether the leg ran and finished or never ran at all.
+    /// Only a request where both ran can say anything about their relative
+    /// recall — see `note_dht_recall_sample`.
+    kad_ran: bool,
+    ember_ran: bool,
     /// Absolute unix timestamp after which the UDP global-search leg is
     /// force-completed regardless of `server_udp_search_age`. That age
     /// counter resets to 0 every time a non-empty `SearchResult` batch
@@ -22758,6 +22769,49 @@ fn end_or_continue_server_search_leg(
     finished_search_requests.push(request_id);
 }
 
+/// Fold one finished search into the Ember-versus-KAD recall tally.
+///
+/// The tripwire for "richer keyword indexing (stemming, more than space-split
+/// tokens) **if recall lags KAD on real libraries**". Nothing measured that:
+/// the search-quality averages describe how a walk *ran* — nodes answered,
+/// milliseconds, records returned — not whether Ember found the files KAD did.
+///
+/// Read as a triple. `both` climbing with the two `_only` counts near zero is
+/// the tokenizers agreeing, which is the case for doing nothing. `kad_only`
+/// pulling ahead of `ember_only` is recall lagging, and by how much; the
+/// reverse is Ember finding files KAD's index missed, which is worth knowing
+/// before anyone "fixes" the tokenizer toward KAD's.
+///
+/// Only counted when both legs actually ran, or an Ember-only search would
+/// report every file as `ember_only` and an unavailable KAD leg would look like
+/// Ember winning. Presence, not availability: a leg's count for a file is zero
+/// or it is not, so it does not matter that Ember counts publishers where KAD
+/// counts a claimed swarm. The sample is bounded by whatever
+/// `note_dht_availability` was able to track, which is deliberate — it caps the
+/// per-search cost of a diagnostic nobody is waiting on.
+fn note_dht_recall_sample(state: &mut NetworkState) {
+    let Some(active) = state.active_search_request.as_ref() else {
+        return;
+    };
+    if !(active.kad_ran && active.ember_ran) {
+        return;
+    }
+    let (mut both, mut kad_only, mut ember_only) = (0u32, 0u32, 0u32);
+    for seen in active.dht_noted_availability.values() {
+        match (seen.kad > 0, seen.ember > 0) {
+            (true, true) => both += 1,
+            (true, false) => kad_only += 1,
+            (false, true) => ember_only += 1,
+            (false, false) => {}
+        }
+    }
+    let diag = &mut state.ember_diagnostics;
+    diag.ember_dht_recall_searches = diag.ember_dht_recall_searches.saturating_add(1);
+    diag.ember_dht_recall_both = diag.ember_dht_recall_both.saturating_add(both);
+    diag.ember_dht_recall_kad_only = diag.ember_dht_recall_kad_only.saturating_add(kad_only);
+    diag.ember_dht_recall_ember_only = diag.ember_dht_recall_ember_only.saturating_add(ember_only);
+}
+
 fn maybe_finish_active_search(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
@@ -22771,6 +22825,8 @@ fn maybe_finish_active_search(
             && !active.ember_pending
     });
     if should_complete {
+        // Before the request is dropped: it owns the per-leg tallies.
+        note_dht_recall_sample(state);
         state.active_search_request = None;
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
@@ -52147,6 +52203,11 @@ async fn handle_ember_dht_message(
         state.ember_dht.keyword_key_off_name() as u32;
     state.ember_diagnostics.ember_dht_version_advertisers =
         state.ember_dht.peers_advertising_versions() as u32;
+    // Cumulative on the limiter, so this mirrors rather than accumulates.
+    state.ember_diagnostics.ember_dht_rate_limited =
+        state.ember_dht_protection.dropped_rate_limited() as u32;
+    state.ember_diagnostics.ember_dht_store_addr_ceiling =
+        state.ember_dht_protection.dropped_store_addr_ceiling() as u32;
 
     if let Some(version) = inbound.version_mismatch {
         state.ember_diagnostics.ember_dht_version_mismatch = state
@@ -54569,6 +54630,26 @@ async fn handle_udp_packet_inner(
                 if is_source_publish {
                     if let Some(count) = state.source_publish_acks.get_mut(&publish_file_hash) {
                         *count = count.saturating_add(1);
+                    }
+                    // The one place the rendezvous key's occupancy is
+                    // observable. Sharding it is meant to happen "once one
+                    // bucket's 1000-entry cap is in sight", and nothing local
+                    // can see that: `ember_dht_rendezvous_last_peers` counts
+                    // what a lookup *returned*, and a source search stops
+                    // querying at `SOURCE_SEARCH_STOP_THRESHOLD` (20), so it
+                    // saturates two orders of magnitude below the cap and can
+                    // never report approaching it.
+                    //
+                    // A storer's load byte can. It is that node's own answer to
+                    // "how full am I for this key", already the signal the
+                    // keyword path backs off on at 90, and it arrives on every
+                    // advert we place. Highest rather than latest: the twenty
+                    // nodes closest to the key fill at different rates, and the
+                    // first one to run out is what decides whether the advert
+                    // still lands.
+                    if target == kad::publish::ember_rendezvous_key() {
+                        let seen = &mut state.ember_diagnostics.ember_dht_rendezvous_key_load;
+                        *seen = (*seen).max(load as u32);
                     }
                 } else {
                     state
