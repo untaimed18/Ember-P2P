@@ -29458,7 +29458,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 "connecting" => pfs.set_connecting(v4, port, None),
                                 "queued" => pfs.set_on_queue(v4, port, *queue_rank, None),
                                 "queue_full" => pfs.set_on_queue(v4, port, None, None),
-                                "transferring" => pfs.set_downloading(v4, port, None),
+                                // Slot granted, waiting on the first block —
+                                // eMule is already DS_DOWNLOADING here.
+                                "stalled" | "transferring" => pfs.set_downloading(v4, port, None),
                                 "completed" => {}
                                 "failed" => {
                                     if state.banned_ips.contains(&v4) {
@@ -55577,8 +55579,12 @@ async fn handle_download_event(
         } => {
             let (payload, promoted_active) = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_source_live(&transfer_id, active, queued);
-                mgr.update_source_total(&transfer_id, total);
+                mgr.apply_source_column_counts(&transfer_id, Some(total), Some((active, queued)));
+                // The column count the row ended up with, which can exceed the
+                // worker's own `active` — see `apply_source_column_counts`.
+                let effective_active = mgr
+                    .source_counts(&transfer_id)
+                    .map_or(active, |(_, active_sources, _)| active_sources);
                 // Reflect live download activity in the overall status. The
                 // status is only set to Active when the multi-source worker
                 // first starts, so a download that began while every source was
@@ -55590,7 +55596,7 @@ async fn handle_download_event(
                 // Terminal / user-controlled states (Paused, Stopped, Verifying,
                 // etc.) are deliberately left untouched.
                 let current_status = mgr.active.get(&transfer_id).map(|t| t.status.clone());
-                let promoted_active = if active > 0
+                let promoted_active = if effective_active > 0
                     && matches!(
                         current_status,
                         Some(crate::types::TransferStatus::Queued)
@@ -55703,8 +55709,9 @@ async fn handle_download_event(
             } else {
                 None
             };
-            let placeholder_removed = {
+            let (placeholder_removed, source_payload) = {
                 let mut mgr = transfer_manager.write().await;
+                let counts_before = mgr.source_counts(&transfer_id);
                 // Drop any other row representing this same peer: one carrying
                 // the same user hash at a different port/IP-key (this coalesces
                 // the ephemeral live row with the listening/placeholder row —
@@ -55730,7 +55737,24 @@ async fn handle_download_event(
                         user_hash: live_hash,
                     },
                 );
-                removed
+                // This row just changed a peer's state, which is exactly what
+                // eMule's `xx`/`zz` count — and the worker atomics cannot see
+                // a queue slot whose socket is gone. Only emit when the column
+                // actually moved: source details fire per peer per state
+                // change, and the UI already redraws off the detail event.
+                mgr.apply_source_column_counts(&transfer_id, None, None);
+                let payload = mgr
+                    .source_counts(&transfer_id)
+                    .filter(|counts| Some(*counts) != counts_before)
+                    .map(|(sources, active_sources, queued_sources)| {
+                        crate::types::TransferSourcesPayload {
+                            id: transfer_id.as_str(),
+                            sources,
+                            active_sources,
+                            queued_sources,
+                        }
+                    });
+                (removed, payload)
             };
             for (rem_ip, rem_port) in placeholder_removed {
                 callback_row_pending_since.remove(&(transfer_id.clone(), rem_ip.clone(), rem_port));
@@ -55780,6 +55804,9 @@ async fn handle_download_event(
                     "country_code": country_code,
                 }),
             );
+            if let Some(payload) = source_payload {
+                let _ = app_handle.emit("transfer-sources", &payload);
+            }
         }
         DownloadEvent::Completed {
             transfer_id,

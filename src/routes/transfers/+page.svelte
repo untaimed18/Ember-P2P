@@ -1719,22 +1719,24 @@
   }
 
   function sourcesLabel(t: Transfer): string {
-    const active = t.active_sources || 0;
+    // eMule DownloadListCtrl: xx/yy+aa (zz) [max]
+    // xx = on-queue + downloading, yy = srclist size, zz = transferring.
+    const transferring = t.active_sources || 0;
     const queued = t.queued_sources || 0;
-    const current = active + queued;
-    if (!t.sources) {
-      // L11: if the backend reports 0 known sources but there's live
-      // activity (active/queued > 0), show what's live rather than an
-      // em-dash that disagrees with the tooltip.
-      return current > 0 ? `${current}` : '\u2014';
+    const current = transferring + queued;
+    const total = t.sources || 0;
+    if (!total && current === 0) {
+      return '\u2014';
     }
+    const yy = total || current;
     let label: string;
-    if (current > 0 && current !== t.sources) {
-      label = `${current}/${t.sources}`;
+    if (current !== yy) {
+      label = `${current}/${yy}`;
     } else {
-      label = `${t.sources}`;
+      label = `${yy}`;
     }
     if (t.a4af_sources > 0) label += `+${t.a4af_sources}`;
+    if (transferring > 0) label += ` (${transferring})`;
     if (t.max_sources > 0) label += ` [${t.max_sources}]`;
     return label;
   }
@@ -3111,12 +3113,13 @@
   }
 
   function sourcesTooltip(t: Transfer): string {
-    const active = t.active_sources || 0;
+    const transferring = t.active_sources || 0;
     const queued = t.queued_sources || 0;
-    const current = active + queued;
+    const current = transferring + queued;
     if (!t.sources && current === 0) return m.transfers_sources_tooltip_none();
     const parts: string[] = [];
-    parts.push(m.transfers_sources_tooltip_active({ count: active }));
+    parts.push(m.transfers_sources_tooltip_useful({ count: current }));
+    parts.push(m.transfers_sources_tooltip_active({ count: transferring }));
     parts.push(m.transfers_sources_tooltip_queued({ count: queued }));
     parts.push(m.transfers_sources_tooltip_total({ count: t.sources || current }));
     if (t.ember_sources > 0) parts.push(m.transfers_sources_tooltip_ember({ count: t.ember_sources }));

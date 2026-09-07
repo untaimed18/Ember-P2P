@@ -788,25 +788,86 @@ impl TransferManager {
         }
     }
 
-    /// Bump the known-source total without touching live active/queued
-    /// counters. Used by KAD/server discovery while a download is already
-    /// running so we don't zero out the live counts the multi-source worker
-    /// is actively maintaining.
-    pub fn update_source_total(&mut self, id: &str, total: u32) {
-        if let Some(transfer) = self.get_transfer_mut(id) {
-            // Replace, don't ratchet upward forever — discovery can shrink
-            // when sources expire or a file loses availability.
-            transfer.sources = total;
+    /// `xx` and `zz` of eMule's Sources column, read off the live per-source
+    /// rows: `xx` = on-queue + downloading, `zz` = downloading
+    /// (`DownloadListCtrl.cpp` case 6). `yy` is the discovered-source total,
+    /// which is tracked separately and not derived from these rows.
+    fn emule_counts_from_details(rows: &[crate::types::SourceInfo]) -> (u32, u32) {
+        let mut transferring = 0u32;
+        let mut current = 0u32;
+        for s in rows {
+            match s.status {
+                // Both are eMule's DS_DOWNLOADING: `Stalled` is the granted
+                // slot before the first block lands, not a state of its own.
+                SourceStatus::Transferring | SourceStatus::Stalled => {
+                    transferring += 1;
+                    current += 1;
+                }
+                // OP_QUEUEFULL parks the peer on the remote queue, which is
+                // how `set_on_queue` records it in the per-file source list.
+                SourceStatus::Queued | SourceStatus::QueueFull => current += 1,
+                _ => {}
+            }
         }
+        (current, transferring)
     }
 
-    /// Update only the live active/queued counters reported by the
-    /// multi-source download worker.
-    pub fn update_source_live(&mut self, id: &str, active: u32, queued: u32) {
-        if let Some(transfer) = self.get_transfer_mut(id) {
-            transfer.active_sources = active;
-            transfer.queued_sources = queued;
+    /// Publish the eMule Sources-column counts (`xx/yy (zz)`) onto the row.
+    ///
+    /// The worker atomics only see TCP tasks that got as far as
+    /// `StartUploadReq`, so a peer eMule still counts as `DS_ONQUEUE` — one
+    /// held on the remote queue after its socket was dropped (Path B detach
+    /// or UDP reask) — goes missing from them. The per-source rows do carry
+    /// it, so they decide `xx`/`zz`; the worker snapshot only raises them,
+    /// covering a source that started before its first row was written.
+    pub fn apply_source_column_counts(
+        &mut self,
+        id: &str,
+        total: Option<u32>,
+        worker_live: Option<(u32, u32)>,
+    ) {
+        // An empty row set is "nothing known yet", not "nothing live" — the
+        // map holds an entry from the first `update_source_detail` call. An
+        // all-failed set is different, and does correctly report zero.
+        let detail_counts = self
+            .source_details
+            .get(id)
+            .filter(|rows| !rows.is_empty())
+            .map(|rows| Self::emule_counts_from_details(rows));
+        let Some(t) = self.get_transfer_mut(id) else {
+            return;
+        };
+        if let Some(total) = total {
+            t.sources = total;
         }
+        let (worker_xx, worker_zz) = match worker_live {
+            Some((active, queued)) => (active.saturating_add(queued), active),
+            None => (0, 0),
+        };
+        if let Some((dx, dz)) = detail_counts {
+            t.active_sources = dz.max(worker_zz);
+            t.queued_sources = dx.max(worker_xx).saturating_sub(t.active_sources);
+        } else if worker_live.is_some() {
+            t.active_sources = worker_zz;
+            t.queued_sources = worker_xx.saturating_sub(worker_zz);
+        }
+        // `yy` is discovery bookkeeping while `xx` comes from the live rows.
+        // The two are maintained by different paths, and a total that has yet
+        // to catch up must not render as "7/2".
+        t.sources = t
+            .sources
+            .max(t.active_sources.saturating_add(t.queued_sources));
+    }
+
+    /// Bump the known-source total (`yy`) without supplying a worker
+    /// snapshot, so the live `xx`/`zz` the multi-source worker is
+    /// maintaining are left to the per-source rows. Used by KAD/server
+    /// discovery while a download is already running.
+    ///
+    /// Replaces rather than ratchets — discovery can shrink when sources
+    /// expire or a file loses availability — but never drops below `xx`.
+    pub fn update_source_total(&mut self, id: &str, total: u32) {
+        self.apply_source_column_counts(id, Some(total), None);
     }
 
     pub fn source_counts(&self, id: &str) -> Option<(u32, u32, u32)> {
@@ -1691,6 +1752,59 @@ mod tests {
 
     fn ids(transfers: &[Transfer]) -> Vec<&str> {
         transfers.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    fn src(ip: &str, status: SourceStatus) -> crate::types::SourceInfo {
+        crate::types::SourceInfo {
+            ip: ip.to_string(),
+            port: 4662,
+            status,
+            queue_rank: None,
+            speed: 0,
+            transferred: 0,
+            client_software: String::new(),
+            peer_name: String::new(),
+            available_parts: None,
+            total_parts: None,
+            country_code: None,
+            user_hash: None,
+        }
+    }
+
+    #[test]
+    fn source_column_counts_include_onqueue_peers_the_worker_no_longer_holds() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+        for i in 0..5 {
+            manager.update_source_detail("a", src(&format!("10.0.0.{i}"), SourceStatus::Queued));
+        }
+        manager.update_source_detail("a", src("10.0.0.5", SourceStatus::Transferring));
+        manager.update_source_detail("a", src("10.0.0.6", SourceStatus::Transferring));
+        for i in 7..14 {
+            manager.update_source_detail("a", src(&format!("10.0.0.{i}"), SourceStatus::Failed));
+        }
+        // Worker snapshot under-counts (2 transferring, 0 queued) the way
+        // TCP-held StartUploadReq atomics do. The column must still report
+        // eMule's 7/14 (2): five Path-B OnQueue rows plus two downloading.
+        manager.apply_source_column_counts("a", Some(14), Some((2, 0)));
+        let t = manager.get_transfer("a").expect("row stays tracked");
+        assert_eq!(t.active_sources, 2, "zz is transferring");
+        assert_eq!(t.queued_sources, 5, "xx-zz is still on-queue");
+        assert_eq!(t.sources, 14, "yy is the discovered total");
+
+        // A discovery refresh that reports fewer sources than the rows show
+        // would otherwise render as "7/3".
+        manager.apply_source_column_counts("a", Some(3), None);
+        let t = manager.get_transfer("a").expect("row stays tracked");
+        assert_eq!(t.sources, 7, "yy is floored at xx");
+
+        // Peers leaving must bring the count back down, not latch it.
+        manager.update_source_detail("a", src("10.0.0.0", SourceStatus::Failed));
+        manager.update_source_detail("a", src("10.0.0.1", SourceStatus::Failed));
+        manager.apply_source_column_counts("a", None, None);
+        let t = manager.get_transfer("a").expect("row stays tracked");
+        assert_eq!(t.active_sources, 2);
+        assert_eq!(t.queued_sources, 3);
     }
 
     #[test]
