@@ -558,6 +558,8 @@ export interface EmberDiagnostics {
   ember_dht_store_reject_proximity?: number;
   /** Verified inbound keyword records whose key no word in their own signed name hashes to. */
   ember_dht_keyword_key_off_name?: number;
+  /** Peers that have told us which wire versions they can decode. */
+  ember_dht_version_advertisers?: number;
   /** Completed FIND_VALUE searches this session (hits, misses, and timeouts). */
   ember_dht_search_outcomes?: number;
   /** Sum of shortlist nodes that answered across those searches. */

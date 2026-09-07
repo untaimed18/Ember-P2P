@@ -514,11 +514,17 @@ pub struct BatchedRecord {
 /// Payload variants for each message type.
 #[derive(Debug, Clone)]
 pub enum DhtPayload {
-    Ping,
+    Ping {
+        /// The wire versions the sender says it can decode, when it said so.
+        /// `None` is a build predating the block — every peer today — and
+        /// means "assume `EMBER_DHT_VERSION` and nothing else".
+        versions: Option<VersionRange>,
+    },
     /// Optional observed address of the ping sender (slice 19). Empty
     /// payload decodes as `None` for backward compatibility.
     Pong {
         observed: Option<SocketAddr>,
+        versions: Option<VersionRange>,
     },
     FindNode {
         target: EmberNodeId,
@@ -782,6 +788,99 @@ pub fn unsupported_dht_version(data: &[u8]) -> Option<u8> {
     }
 }
 
+/// The span of wire versions a peer says it can decode.
+///
+/// The gap this closes: the version byte says what a frame *is*, never what its
+/// sender could have accepted. So a change to the shape of an existing frame
+/// partitions the overlay on the day it ships — the other side is the one who
+/// refuses, and it is running the old range — and lowering
+/// [`EMBER_DHT_MIN_VERSION`] only ever helps a build that already speaks the
+/// higher number. Both v3 and v4 had to be flag days for exactly this reason.
+///
+/// Knowing the range lets the *sender* decide, one peer at a time, which is the
+/// half that was missing: a future v5 frame can be sent only to peers that said
+/// they can read it, with v4 for everyone else, and no flag day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl VersionRange {
+    /// Whether `version` is inside the range the peer advertised.
+    pub fn accepts(&self, version: u8) -> bool {
+        version >= self.min && version <= self.max
+    }
+}
+
+/// What this build advertises. Exactly the range [`decode_message`] enforces,
+/// so the claim cannot drift from the behaviour.
+pub const OUR_VERSION_RANGE: VersionRange = VersionRange {
+    min: EMBER_DHT_MIN_VERSION,
+    max: EMBER_DHT_VERSION,
+};
+
+/// TLV tag for [`VersionRange`] in the block trailing a `PING` or `PONG`.
+const VERSION_RANGE_TAG: u8 = 0x01;
+const VERSION_RANGE_VALUE_LEN: u8 = 2;
+
+/// Append the tag/len/value block advertising `range`.
+///
+/// Additive on the same terms as the `FIND_VALUE` constraint block and a keyword
+/// record's media: it goes where no existing decoder looks. `MSG_PING` discards
+/// its payload entirely, and `MSG_PONG` reads its address through
+/// [`decode_socket_addr`], which checks only a minimum length and reports what
+/// it consumed — so a v4 build reads both frames exactly as it does today and
+/// ignores these bytes. The version byte therefore must *not* move for this; if
+/// it did, the peers this is meant to reach would refuse the frame carrying it.
+///
+/// Tag/len rather than two bare bytes so a later capability can ride the same
+/// block. A decoder skips a tag it does not know, which is the property that
+/// makes the second addition as cheap as this one.
+fn encode_version_block(range: &VersionRange, buf: &mut Vec<u8>) {
+    buf.push(VERSION_RANGE_TAG);
+    buf.push(VERSION_RANGE_VALUE_LEN);
+    buf.push(range.min);
+    buf.push(range.max);
+}
+
+/// Read a [`VersionRange`] out of the trailing block, if it carries one.
+///
+/// `None` for absent, truncated or nonsensical — all three mean the same thing
+/// to a caller, which is "assume nothing about this peer beyond the frame it
+/// just sent". Deliberately not an error: the block is advisory, and refusing a
+/// frame over it would make an optional field load-bearing.
+fn decode_version_block(data: &[u8]) -> Option<VersionRange> {
+    let mut at = 0usize;
+    // Two bytes for the tag and length, or there is no further block to read.
+    while at + 2 <= data.len() {
+        let tag = data[at];
+        let len = data[at + 1] as usize;
+        let value = at + 2;
+        let end = value.checked_add(len)?;
+        if end > data.len() {
+            // A block claiming more than it carries. Nothing further can be
+            // trusted to start at a tag boundary, so stop rather than resync.
+            return None;
+        }
+        if tag == VERSION_RANGE_TAG {
+            if len != VERSION_RANGE_VALUE_LEN as usize {
+                return None;
+            }
+            let (min, max) = (data[value], data[value + 1]);
+            // Version 0 is not a version, and an inverted range is not a range.
+            // Either means a peer we should treat as un-advertised rather than
+            // one we believe about a span it cannot have meant.
+            if min == 0 || min > max {
+                return None;
+            }
+            return Some(VersionRange { min, max });
+        }
+        at = end;
+    }
+    None
+}
+
 /// Whether an unsupported version byte means the sender is ahead of this build.
 ///
 /// [`unsupported_dht_version`] only returns `Some` for a non-zero byte outside
@@ -926,7 +1025,9 @@ pub fn build_ping(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::Ping,
+        payload: DhtPayload::Ping {
+            versions: Some(OUR_VERSION_RANGE),
+        },
         signature: [0u8; 64], // filled by encode_message
     }
 }
@@ -941,6 +1042,7 @@ pub fn build_pong(sender_id: EmberNodeId, request_id: u32, observed: SocketAddr)
         sender_pub_key: None,
         payload: DhtPayload::Pong {
             observed: Some(observed),
+            versions: Some(OUR_VERSION_RANGE),
         },
         signature: [0u8; 64],
     }
@@ -1326,15 +1428,28 @@ pub fn build_found_value(
 
 fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     match payload {
-        DhtPayload::Ping => Vec::new(),
-        DhtPayload::Pong { observed } => match observed {
-            Some(addr) => {
-                let mut buf = Vec::with_capacity(19);
-                encode_socket_addr(addr, &mut buf);
-                buf
+        DhtPayload::Ping { versions } => {
+            let mut buf = Vec::new();
+            if let Some(range) = versions {
+                encode_version_block(range, &mut buf);
             }
-            None => Vec::new(),
-        },
+            buf
+        }
+        DhtPayload::Pong { observed, versions } => {
+            let mut buf = Vec::with_capacity(19);
+            if let Some(addr) = observed {
+                encode_socket_addr(addr, &mut buf);
+                // Only behind an address: the block trails the fields a reader
+                // parses at fixed offsets, and with no address there are none —
+                // an older build would read the tag byte as an address type and
+                // reject the whole frame. A PONG without an observed address is
+                // the pre-slice-19 shape, so it stays byte-for-byte itself.
+                if let Some(range) = versions {
+                    encode_version_block(range, &mut buf);
+                }
+            }
+            buf
+        }
         DhtPayload::FindNode { target } => target.0.to_vec(),
         DhtPayload::FoundNode { contacts }
         | DhtPayload::AnnouncePeer { contacts }
@@ -1591,14 +1706,20 @@ fn decode_socket_addr(data: &[u8]) -> anyhow::Result<(SocketAddr, usize)> {
 
 fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     match msg_type {
-        MSG_PING => Ok(DhtPayload::Ping),
+        MSG_PING => Ok(DhtPayload::Ping {
+            versions: decode_version_block(data),
+        }),
         MSG_PONG => {
             if data.is_empty() {
-                Ok(DhtPayload::Pong { observed: None })
+                Ok(DhtPayload::Pong {
+                    observed: None,
+                    versions: None,
+                })
             } else {
-                let (addr, _) = decode_socket_addr(data)?;
+                let (addr, consumed) = decode_socket_addr(data)?;
                 Ok(DhtPayload::Pong {
                     observed: Some(addr),
+                    versions: decode_version_block(&data[consumed..]),
                 })
             }
         }
@@ -2043,13 +2164,13 @@ mod tests {
         assert_eq!(decoded.msg_type, MSG_PING);
         assert_eq!(decoded.request_id, 42);
         assert_eq!(decoded.sender_id, id);
-        assert!(matches!(decoded.payload, DhtPayload::Ping));
+        assert!(matches!(decoded.payload, DhtPayload::Ping { .. }));
 
         let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
         let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
         let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
-            DhtPayload::Pong { observed } => {
+            DhtPayload::Pong { observed, .. } => {
                 assert_eq!(observed, Some("203.0.113.50:4672".parse().unwrap()));
             }
             _ => panic!("expected Pong"),
@@ -2238,8 +2359,175 @@ mod tests {
         match decoded.payload {
             DhtPayload::Pong {
                 observed: Some(addr),
+                ..
             } => assert_eq!(addr, observed),
             _ => panic!("expected Pong with observed"),
+        }
+    }
+
+    /// A `PING` and a `PONG` carry the range this build can decode, and it
+    /// survives the round trip both ways.
+    #[test]
+    fn ping_and_pong_advertise_the_range_this_build_speaks() {
+        let (sk, id) = test_keypair();
+
+        let ping = build_ping(id, 11);
+        let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
+        match decoded.payload {
+            DhtPayload::Ping { versions } => {
+                assert_eq!(versions, Some(OUR_VERSION_RANGE));
+            }
+            other => panic!("expected Ping, got {other:?}"),
+        }
+
+        let pong = build_pong(id, 11, "198.51.100.9:4672".parse().unwrap());
+        let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
+        match decoded.payload {
+            DhtPayload::Pong { observed, versions } => {
+                assert_eq!(
+                    observed,
+                    Some("198.51.100.9:4672".parse().unwrap()),
+                    "the block must not disturb the field in front of it"
+                );
+                assert_eq!(versions, Some(OUR_VERSION_RANGE));
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    /// The property the whole change rests on: this is additive, so a build that
+    /// has never heard of the block reads both frames exactly as it does today.
+    ///
+    /// Pinned at the payload codec, because that is where a v4 peer differs from
+    /// us — it runs this same `decode_payload` without the block-aware arms. A
+    /// `PING` payload is discarded whatever it holds, and a `PONG` address is
+    /// read at a fixed offset through a decoder that checks only a minimum
+    /// length. If either of those ever stops being true, the block has to move
+    /// and the version has to bump, which is the thing it exists to avoid.
+    #[test]
+    fn the_version_block_is_invisible_to_a_decoder_that_ignores_it() {
+        let observed: SocketAddr = "203.0.113.4:4662".parse().unwrap();
+
+        // What a peer predating the block sends: an empty PING payload, and a
+        // PONG carrying only its address.
+        let bare_pong = {
+            let mut buf = Vec::new();
+            encode_socket_addr(&observed, &mut buf);
+            buf
+        };
+        let with_block = {
+            let mut buf = bare_pong.clone();
+            encode_version_block(&OUR_VERSION_RANGE, &mut buf);
+            buf
+        };
+        assert_eq!(
+            &with_block[..bare_pong.len()],
+            &bare_pong[..],
+            "the block appends, it does not rewrite what a v4 peer parses"
+        );
+
+        // The address a version-blind reader takes from either payload is the
+        // same one, and it does not care that more bytes follow.
+        let (bare_addr, consumed) = decode_socket_addr(&bare_pong).unwrap();
+        let (block_addr, block_consumed) = decode_socket_addr(&with_block).unwrap();
+        assert_eq!(bare_addr, observed);
+        assert_eq!(block_addr, observed);
+        assert_eq!(consumed, block_consumed);
+
+        // And the older shapes still decode here, as the peers sending them
+        // will keep doing until they update.
+        assert!(matches!(
+            decode_payload(MSG_PING, &[]).unwrap(),
+            DhtPayload::Ping { versions: None }
+        ));
+        assert!(matches!(
+            decode_payload(MSG_PONG, &bare_pong).unwrap(),
+            DhtPayload::Pong {
+                observed: Some(_),
+                versions: None
+            }
+        ));
+    }
+
+    /// A `PONG` with no observed address stays byte-for-byte the pre-slice-19
+    /// shape. The block may only trail a field a reader parses first: with no
+    /// address in front of it, an older build would read the tag byte as an
+    /// address type and reject the frame outright.
+    #[test]
+    fn a_pong_without_an_address_carries_no_block() {
+        let payload = encode_payload(&DhtPayload::Pong {
+            observed: None,
+            versions: Some(OUR_VERSION_RANGE),
+        });
+        assert!(
+            payload.is_empty(),
+            "an addressless PONG must stay empty, not lead with a tag byte"
+        );
+    }
+
+    /// Absent, truncated and nonsensical all have to read as "this peer told us
+    /// nothing", never as a range we then act on. A refusal would be worse: it
+    /// would make an advisory field able to drop a frame.
+    #[test]
+    fn a_malformed_version_block_reads_as_no_claim() {
+        // Truncated: claims two value bytes, carries one.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 4]), None);
+        // Wrong length for the tag.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 3, 4, 4, 4]), None);
+        // Version 0 is not a version, and an inverted range is not a range.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 0, 4]), None);
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 5, 4]), None);
+        // Nothing at all.
+        assert_eq!(decode_version_block(&[]), None);
+
+        // An unknown tag is skipped rather than fatal, which is what lets a
+        // later capability share this block without a version bump.
+        let mut buf = vec![0x7F, 3, 1, 2, 3];
+        encode_version_block(&VersionRange { min: 4, max: 6 }, &mut buf);
+        assert_eq!(
+            decode_version_block(&buf),
+            Some(VersionRange { min: 4, max: 6 })
+        );
+    }
+
+    /// The range is a claim about the sender, so it has to be as forgeable as
+    /// the rest of the frame and no more: it rides inside the signed bytes.
+    #[test]
+    fn the_advertised_range_is_covered_by_the_frame_signature() {
+        let (sk, id) = test_keypair();
+        let ping = build_ping(id, 3);
+        let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
+
+        // The block is the whole payload of a PING, which sits last before the
+        // signature; flipping its final byte is flipping the advertised max.
+        let payload_len_off = HEADER_MIN_SIZE + 32;
+        let payload_off = payload_len_off + 2;
+        let mut tampered = encoded.clone();
+        let last = payload_off + 3;
+        tampered[last] ^= 0xFF;
+        assert!(
+            decode_message(&tampered, true, &TEST_NOISE_PUB).is_err(),
+            "a relay must not be able to rewrite what a peer claims it speaks"
+        );
+    }
+
+    /// `OUR_VERSION_RANGE` is what we tell peers; the decoder is what we
+    /// actually enforce. Nothing but this test keeps the promise honest.
+    #[test]
+    fn we_advertise_exactly_the_range_we_enforce() {
+        assert_eq!(OUR_VERSION_RANGE.min, EMBER_DHT_MIN_VERSION);
+        assert_eq!(OUR_VERSION_RANGE.max, EMBER_DHT_VERSION);
+        assert!(OUR_VERSION_RANGE.accepts(EMBER_DHT_VERSION));
+        assert!(OUR_VERSION_RANGE.accepts(EMBER_DHT_MIN_VERSION));
+        assert!(!OUR_VERSION_RANGE.accepts(EMBER_DHT_VERSION + 1));
+        assert!(!OUR_VERSION_RANGE.accepts(EMBER_DHT_MIN_VERSION - 1));
+        for bogus in [0u8, EMBER_DHT_MIN_VERSION - 1, EMBER_DHT_VERSION + 1] {
+            assert!(
+                unsupported_dht_version(&[bogus]).is_some() || bogus == 0,
+                "the decoder must refuse every version we do not advertise"
+            );
         }
     }
 

@@ -1056,6 +1056,13 @@ pub struct EmberDiagnostics {
     /// STORE records for keys this node is not close enough to hold.
     #[serde(default)]
     pub ember_dht_store_reject_proximity: u32,
+    /// Peers that have told us which wire versions they can decode.
+    ///
+    /// Read against `ember_dht_verified_contacts`: while this trails it, a frame
+    /// shaped for a version older builds cannot parse would still partition the
+    /// overlay, because the peers that would refuse it are the ones missing here.
+    #[serde(default)]
+    pub ember_dht_version_advertisers: u32,
     /// Verified inbound keyword records whose key no word in their own signed
     /// name hashes to. Not a refusal — the key is not recomputable from the wire, so
     /// this is the closest a storer can come to asking whether a publisher

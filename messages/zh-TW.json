@@ -144,6 +144,7 @@
   "ember_stat_store_reject_per_key_cap": "STORE 拒絕：鍵上限",
   "ember_stat_store_reject_proximity": "STORE 拒絕：距離",
   "ember_stat_keyword_key_off_name": "關鍵詞鍵與檔名不符",
+  "ember_stat_version_advertisers": "已宣告協定版本的節點",
   "ember_stat_search_avg_nodes": "搜尋平均回應節點",
   "ember_stat_search_avg_ms": "搜尋平均耗時",
   "ember_stat_search_avg_records": "搜尋平均紀錄數",

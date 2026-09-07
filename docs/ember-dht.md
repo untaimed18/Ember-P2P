@@ -5,7 +5,7 @@ The protocol specification is
 version 2 as implemented in Ember 1.5.6. **The wire is now version 4 and the PDF
 is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
 [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
-two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)
+two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)
 for what moved it to v4. This file is the standing work log: what is left, what
 was compared against KAD, and what is explicitly not planned.
 
@@ -106,7 +106,7 @@ does not need the eMule wire at all:
   offer/accept handshake, which is why the file is identified by its hash-tree
   root rather than by anything transport-specific.
 
-### 2. Wire versioning rejects cleanly but cannot negotiate
+### 2. Wire versioning rejects cleanly and now advertises, but still cannot route around old peers
 
 `EMBER_DHT_VERSION` is now **4**, with `EMBER_DHT_MIN_VERSION` 4 alongside it:
 the decoder accepts a *range*, and a frame outside it is refused at the version
@@ -134,13 +134,42 @@ cannot decode anything we send, and it is running a build from before those
 counters existed. It sees the network shrink with nothing to explain it. That is
 a release-note problem, not a code one.
 
-The negotiation gap itself is still open, and it is the part worth keeping on
-this list. Nothing on the wire advertises the range a peer speaks, so there is
-no graceful downgrade: a shape change partitions the network on the day it
-ships, and the only reason that has been survivable is that the overlay is
-small and updates are quick. A future *additive* change can lower
-`EMBER_DHT_MIN_VERSION` rather than raising both, which is the cheap half; the
-expensive half is that neither of the last two changes could take that path.
+**The negotiation half is now started, and it had to start before it could be
+useful.** A `PING` and a `PONG` carry the range this build can decode —
+`VersionRange`, tag/len/value trailing the payload, `OUR_VERSION_RANGE` pinned to
+the two constants `decode_message` actually enforces — and the receiver keeps it
+per peer (`peer_versions`, pruned to the routing table each maintenance tick).
+`ember_dht_version_advertisers` on `/ember` is the number to read against
+verified contacts.
+
+Additive on exactly the terms items 1 and 2 of
+[the search plan](ember-dht-search-plan.md#1-find_value-carries-no-constraints--done-and-without-a-version-bump)
+turned out to be, and the version deliberately did **not** move: `MSG_PING`
+discards its payload entirely and `MSG_PONG` reads its address through
+`decode_socket_addr`, which checks only a minimum length and reports what it
+consumed, so a v4 build reads both frames exactly as it does today. Bumping for
+this would have been self-defeating — the peers it exists to reach are the ones
+that would refuse the frame carrying it.
+`the_version_block_is_invisible_to_a_decoder_that_ignores_it` pins that property
+at the payload codec, since that is precisely where a v4 peer differs from us.
+
+Two shapes are load-bearing. The block only ever trails a field a reader parses
+first, so an addressless `PONG` — the pre-slice-19 shape — carries none: with no
+address in front of it an older build would read the tag byte as an address type
+and reject the whole frame. And absent, truncated and nonsensical all read as
+"this peer told us nothing" rather than as a range or as an error, because an
+advisory field must not be able to drop a frame.
+
+What this does not do yet is *use* the answer. `peer_accepts_version` has no
+production caller and cannot have one: `EMBER_DHT_MIN_VERSION` equals
+`EMBER_DHT_VERSION`, so every peer we can exchange a frame with speaks exactly
+one version and there is no decision to make. Its first caller is whatever
+encodes the next wire change, and the ordering is the point — the ranges have to
+be arriving from the field *before* a bump can route around the peers that lack
+them, or the first peer to advertise one is also the first to need it. So the
+standing gap is now narrower and different: not "nothing advertises a range" but
+"a shape change still partitions every peer running a build older than this
+one", which the advertiser count is what measures.
 
 ### 2a. Bootstrapping from a friend
 
@@ -439,9 +468,9 @@ together, since one bump pays for both and item 2 was only worth having once ite
 - Item 2, unblocked by the above: keyword capacity raised to KAD's 150 of 1000.
 
 **Every item in this list is now done.** What remains for the overlay is the
-standing work in the sections above (native transfers, version negotiation, cold
-join without eMule, validation past the happy path) and the "Future improvements"
-below — not this comparison.
+standing work in the sections above (native transfers, routing a wire change
+around old peers now that they advertise, cold join without eMule, validation
+past the happy path) and the "Future improvements" below — not this comparison.
 
 ### 1. The serving ceiling — done (wire v3)
 

@@ -51409,6 +51409,15 @@ async fn run_ember_maintenance(
         debug!("Ember DHT: promoted {admitted} cached contact(s) into free bucket slots");
     }
 
+    // Advertised version ranges follow the table rather than accumulating
+    // beside it. Runs after the demote/promote passes so it prunes against the
+    // membership this tick settled on, and a peer that comes back through the
+    // replacement cache re-advertises on its next ping anyway.
+    let forgotten = state.ember_dht.prune_peer_versions();
+    if forgotten > 0 {
+        debug!("Ember DHT: forgot {forgotten} advertised version range(s) for departed peers");
+    }
+
     // 0b2) Top the table up from the remembered set. Runs after the purge and
     //      the eviction sweep it follows, so the slots the last batch just
     //      vacated are refilled in time for this tick's liveness pings.
@@ -52136,6 +52145,8 @@ async fn handle_ember_dht_message(
         state.ember_dht.store_reject_proximity() as u32;
     state.ember_diagnostics.ember_dht_keyword_key_off_name =
         state.ember_dht.keyword_key_off_name() as u32;
+    state.ember_diagnostics.ember_dht_version_advertisers =
+        state.ember_dht.peers_advertising_versions() as u32;
 
     if let Some(version) = inbound.version_mismatch {
         state.ember_diagnostics.ember_dht_version_mismatch = state

@@ -144,6 +144,7 @@
   "ember_stat_store_reject_per_key_cap": "STORE refusé : plafond de clé",
   "ember_stat_store_reject_proximity": "STORE refusé : proximité",
   "ember_stat_keyword_key_off_name": "Clé de mot-clé absente du nom",
+  "ember_stat_version_advertisers": "Pairs annonçant leurs versions",
   "ember_stat_search_avg_nodes": "Recherche moy. nœuds répondants",
   "ember_stat_search_avg_ms": "Recherche moy. durée",
   "ember_stat_search_avg_records": "Recherche moy. enregistrements",

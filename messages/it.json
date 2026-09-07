@@ -144,6 +144,7 @@
   "ember_stat_store_reject_per_key_cap": "STORE rifiutato: limite chiave",
   "ember_stat_store_reject_proximity": "STORE rifiutato: prossimità",
   "ember_stat_keyword_key_off_name": "Chiave keyword non nel nome",
+  "ember_stat_version_advertisers": "Peer che annunciano le versioni",
   "ember_stat_search_avg_nodes": "Ricerca media nodi che rispondono",
   "ember_stat_search_avg_ms": "Ricerca media durata",
   "ember_stat_search_avg_records": "Ricerca media record",

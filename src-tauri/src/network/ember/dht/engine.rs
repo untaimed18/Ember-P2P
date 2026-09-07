@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use tracing::trace;
 
-use super::messages::{self, DhtPayload};
+use super::messages::{self, DhtPayload, VersionRange};
 use super::publish::{
     source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD,
     RECORD_TYPE_SOURCE,
@@ -144,6 +144,15 @@ const MAX_BUDDY_ENDORSE_ASKED: usize = 64;
 /// that gossip keeps being promoted once the table is healthy, small enough
 /// that the contacts we actually route through stay refreshed.
 const LEAD_PING_RESERVE_DIVISOR: usize = 4;
+
+/// Peers whose advertised wire-version range we hold at once.
+///
+/// The map is pruned to the routing table's membership every maintenance tick,
+/// so this is a ceiling between ticks rather than the working size. Set well
+/// clear of a full table plus its replacement caches: the entries this bounds
+/// are the ones a peer rotating node ids could otherwise mint, and the cost of
+/// being wrong on the low side is forgetting a range that one ping relearns.
+const MAX_TRACKED_PEER_VERSIONS: usize = 1024;
 
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
@@ -403,6 +412,15 @@ pub struct EmberDht {
     /// Verified inbound keyword records whose key no word in their own signed
     /// name hashes to. Counted, never enforced — see `accept_record`.
     keyword_key_off_name: u64,
+    /// The wire-version range each peer has told us it can decode, learned from
+    /// the block on a signed `PING` or `PONG`.
+    ///
+    /// Held here rather than on [`EmberContact`] because it is neither wire nor
+    /// persisted state: a contact is encoded into `FOUND_NODE` and written to
+    /// `nodes_ember.dat`, and a peer's range is worth exactly as much as the
+    /// session it was proved on. Relearned in one maintenance ping if we forget
+    /// it, which is also why nothing here needs to survive a restart.
+    peer_versions: HashMap<EmberNodeId, VersionRange>,
     /// Noise static we currently advertise. A `PROXY_STORE` trailer must
     /// name this key, otherwise a firewalled publisher can steer every
     /// searcher's `CALLBACK_REQ` at someone else.
@@ -507,6 +525,7 @@ impl EmberDht {
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
             keyword_key_off_name: 0,
+            peer_versions: HashMap::new(),
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
@@ -859,6 +878,90 @@ impl EmberDht {
     /// [`RoutingTable::enforce_scale_quotas`].
     pub fn enforce_scale_quotas(&mut self) -> usize {
         self.routing.enforce_scale_quotas()
+    }
+
+    /// Record the wire-version range a peer advertised on a signed frame.
+    ///
+    /// Only ever called from a frame that has already verified, so the range is
+    /// the peer's own claim about itself rather than something a relay wrote —
+    /// which matters, because the whole point is deciding what to send them.
+    ///
+    /// A peer that advertises nothing is left absent rather than stored as a
+    /// guess. Absent and "advertised exactly our range" have to stay
+    /// distinguishable: the first is a build predating the block, and it is the
+    /// count of those that says whether a future version is safe to send.
+    fn note_peer_versions(&mut self, id: EmberNodeId, versions: Option<VersionRange>) {
+        let Some(range) = versions else {
+            return;
+        };
+        // A full map refuses a newcomer rather than evicting an incumbent, the
+        // same way the store's caps do. Safe here in a way it is not there: the
+        // entry is advisory, the prune below restores the map to the table's
+        // membership every maintenance tick, and one ping relearns it. The cap
+        // exists because this is fed by inbound frames, so without it a peer
+        // rotating node ids could grow the map for the cost of a handshake.
+        if self.peer_versions.len() >= MAX_TRACKED_PEER_VERSIONS
+            && !self.peer_versions.contains_key(&id)
+        {
+            return;
+        }
+        self.peer_versions.insert(id, range);
+    }
+
+    /// Forget advertised ranges for peers no longer in the routing table.
+    /// Returns how many were dropped.
+    ///
+    /// Runs on the maintenance tick beside the other table passes. The map is
+    /// fed from frames and the table is what bounds everything else, so tying
+    /// one to the other is what keeps this from being a second, unbounded
+    /// notion of "peers we know about".
+    pub fn prune_peer_versions(&mut self) -> usize {
+        if self.peer_versions.is_empty() {
+            return 0;
+        }
+        let before = self.peer_versions.len();
+        let known: HashSet<EmberNodeId> = self
+            .routing
+            .all_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .collect();
+        self.peer_versions.retain(|id, _| known.contains(id));
+        before - self.peer_versions.len()
+    }
+
+    /// Whether `peer` said it can decode `version`.
+    ///
+    /// `None` means it has not told us — which is not the same as no, and must
+    /// not be treated as yes. The caller decides: a frame in the range every
+    /// build speaks needs no permission, and a frame outside it has to fall
+    /// back rather than assume.
+    ///
+    /// No production caller yet, deliberately, and this is the whole point of
+    /// the feature rather than an oversight: nothing can ask the question until
+    /// there are two answers to it, and today `EMBER_DHT_MIN_VERSION` equals
+    /// [`super::EMBER_DHT_VERSION`], so every peer we can exchange a frame with
+    /// speaks exactly one version. Its first caller is whatever encodes the next
+    /// wire change — which is why the primitive ships now, ahead of it: the
+    /// ranges have to already be arriving from the field before a bump can use
+    /// them, or the first peer to advertise one is also the first to need it.
+    /// Covered by `a_ping_exchange_teaches_both_sides_what_the_other_can_decode`.
+    #[allow(dead_code)]
+    pub fn peer_accepts_version(&self, peer: &EmberNodeId, version: u8) -> Option<bool> {
+        self.peer_versions
+            .get(peer)
+            .map(|range| range.accepts(version))
+    }
+
+    /// Peers currently holding an advertised range.
+    ///
+    /// Read against the verified contact count: while this trails it, a frame
+    /// shaped for a version older builds cannot parse would still partition the
+    /// overlay, because the peers that would refuse it are exactly the ones not
+    /// counted here. When it catches up, a bump can be delivered per peer
+    /// instead of on a flag day.
+    pub fn peers_advertising_versions(&self) -> usize {
+        self.peer_versions.len()
     }
 
     /// Insert a contact directly (manual harness seeding). Returns
@@ -2214,14 +2317,16 @@ impl EmberDht {
         }
 
         match msg.payload {
-            DhtPayload::Ping => {
+            DhtPayload::Ping { versions } => {
                 out.ping_received = true;
+                self.note_peer_versions(msg.sender_id, versions);
                 let pong = messages::build_pong(self.local_id, msg.request_id, from);
                 out.responses
                     .push(messages::encode_message(&pong, &self.signing_key, true, &self.local_noise_pub));
             }
-            DhtPayload::Pong { observed } => {
+            DhtPayload::Pong { observed, versions } => {
                 out.pong_received = true;
+                self.note_peer_versions(msg.sender_id, versions);
                 out.pong_request_id = Some(msg.request_id);
                 out.pong_observed = observed;
                 // The PONG proves liveness; refresh the contact's
@@ -5737,6 +5842,78 @@ mod tests {
         assert!(!on_b.stored_record, "key/content mismatch must be rejected");
         assert!(on_b.responses.is_empty(), "no STORE_ACK on rejection");
         assert_eq!(b.store_stats(), (0, 0));
+    }
+
+    /// A ping exchange teaches each side what the other can decode, which is
+    /// the piece that lets a future wire change be sent per peer instead of on
+    /// a flag day.
+    #[test]
+    fn a_ping_exchange_teaches_both_sides_what_the_other_can_decode() {
+        let mut a = dht(60);
+        let mut b = dht(61);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(60, 4672);
+        let b_addr = addr(61, 4672);
+
+        let (_rid, ping) = a.build_ping();
+        let on_b = b.handle_message(&ping, a_addr, a_noise, 1000);
+        assert!(on_b.ping_received);
+        assert_eq!(
+            b.peer_accepts_version(&a.local_id(), super::super::EMBER_DHT_VERSION),
+            Some(true),
+            "B learned A's range from the PING"
+        );
+
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        assert!(on_a.pong_received);
+        assert_eq!(
+            a.peer_accepts_version(&b.local_id(), super::super::EMBER_DHT_VERSION),
+            Some(true),
+            "and A learned B's from the PONG"
+        );
+
+        // The number that decides whether a bump is safe is how many peers have
+        // answered this question at all.
+        assert_eq!(a.peers_advertising_versions(), 1);
+        assert_eq!(b.peers_advertising_versions(), 1);
+    }
+
+    /// A version we have not been told about is unknown, not permitted. The
+    /// caller has to be able to tell "said no" from "never said", because
+    /// treating silence as yes is exactly the flag day this replaces.
+    #[test]
+    fn a_peer_that_never_advertised_is_unknown_rather_than_willing() {
+        let a = dht(62);
+        let stranger = dht(63);
+        assert_eq!(
+            a.peer_accepts_version(&stranger.local_id(), super::super::EMBER_DHT_VERSION),
+            None
+        );
+        assert_eq!(a.peers_advertising_versions(), 0);
+    }
+
+    /// The map is fed by inbound frames, so it follows the routing table rather
+    /// than growing beside it: a peer that leaves the table is forgotten, and
+    /// one ping relearns it if it comes back.
+    #[test]
+    fn advertised_ranges_are_forgotten_once_the_peer_leaves_the_table() {
+        let mut a = dht(64);
+        let mut b = dht(65);
+        let b_addr = addr(65, 4672);
+
+        let (_rid, ping) = b.build_ping();
+        a.handle_message(&ping, b_addr, b.local_noise_pub, 1000);
+        assert_eq!(a.peers_advertising_versions(), 1);
+        assert_eq!(
+            a.prune_peer_versions(),
+            0,
+            "a peer still in the table keeps its range"
+        );
+
+        a.routing.remove_contact(&b.local_id());
+        assert_eq!(a.prune_peer_versions(), 1);
+        assert_eq!(a.peers_advertising_versions(), 0);
     }
 
     /// The measurement the keyword half of that rule stops at. A storer cannot

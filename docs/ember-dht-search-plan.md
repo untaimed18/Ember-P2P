@@ -365,7 +365,7 @@ Open questions worth deciding before code:
 ## A note on future wire additions
 
 The version byte is range-checked on receive
-(`decode_message`, and [ember-dht.md item 2](ember-dht.md#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)),
+(`decode_message`, and [ember-dht.md item 2](ember-dht.md#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
 so raising `EMBER_DHT_VERSION` partitions the overlay on the day it ships
 regardless of where `EMBER_DHT_MIN_VERSION` sits — the *other* side is what
 refuses, and it is running the old range. Lowering the minimum only helps a build
@@ -376,5 +376,13 @@ byte. It has to go where an existing decoder does not look: after the fields a
 payload's parser reads at fixed offsets, or after a record's length-prefixed name.
 Both `FIND_VALUE` and keyword records have that room, which is why items 1 and 2
 landed without touching the version at all. (Item 3 is searcher-local policy and
-touches no wire format, so it never faced the question.) A change that needs to alter an
-existing field still has no path but a bump, and that is still the standing gap.
+touches no wire format, so it never faced the question.)
+
+A change that needs to alter an existing field still has no path but a bump. What
+has changed is that the bump no longer has to be blind: `PING` and `PONG` now
+carry the range each side can decode, by the same trailing-block trick and with
+the version deliberately left alone, so a v5 encoder can ask per peer instead of
+assuming. That only helps against peers running a build with the advertisement in
+it — `ember_dht_version_advertisers` against verified contacts is how to tell
+when that is most of them — so the flag day is now a measurable risk rather than
+a certainty, which is not the same as gone.

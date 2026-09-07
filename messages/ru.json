@@ -144,6 +144,7 @@
   "ember_stat_store_reject_per_key_cap": "STORE отклонён: лимит ключа",
   "ember_stat_store_reject_proximity": "STORE отклонён: близость",
   "ember_stat_keyword_key_off_name": "Ключ слова не из имени",
+  "ember_stat_version_advertisers": "Узлы, сообщившие версии",
   "ember_stat_search_avg_nodes": "Поиск, ср. ответивших узлов",
   "ember_stat_search_avg_ms": "Поиск, ср. время",
   "ember_stat_search_avg_records": "Поиск, ср. записей",

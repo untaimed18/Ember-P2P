@@ -144,6 +144,7 @@
   "ember_stat_store_reject_per_key_cap": "STORE abgelehnt: Schlüssel-Limit",
   "ember_stat_store_reject_proximity": "STORE abgelehnt: Nähe",
   "ember_stat_keyword_key_off_name": "Schlüsselwort-Key nicht im Namen",
+  "ember_stat_version_advertisers": "Peers mit Versionsangabe",
   "ember_stat_search_avg_nodes": "Suche Ø antwortende Knoten",
   "ember_stat_search_avg_ms": "Suche Ø Dauer",
   "ember_stat_search_avg_records": "Suche Ø Einträge",
