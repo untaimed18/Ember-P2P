@@ -299,24 +299,39 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
-### 5. `store_attributed` binds the key but not the author or the date
+### 5. `store_attributed` binds the key but not the author or the date — done
 
-`DhtStore::restore` takes all three of key, `publisher_key` and `created_at`
-out of the record's own signed body. `store_attributed` takes only the key,
-and trusts the caller for the other two — `verify_record_signature` verifies
-under the key it is *handed*, not the one at `data[73..105]`, so a body naming
-a different author still verifies there while failing for every reader.
+`DhtStore::restore` took all three of key, `publisher_key` and `created_at` out
+of the record's own signed body. `store_attributed` took only the key and
+trusted the caller for the other two — `verify_record_signature` verified under
+the key it was *handed*, not the one at `data[73..105]`, so a body naming a
+different author still verified there while failing for every reader.
 
-Not reachable from the wire, and not a live bug: `accept_record` passes what
-`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derives
-them, and the proxy replica reads them off its own `SignedRecord`. It is on
-this list because the invariant is one the callers happen to keep rather than
-one the store enforces, and the next caller has no way to know that.
+Never reachable from the wire, and never a live bug: `accept_record` passed what
+`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derived
+them, and the proxy replica read them off its own `SignedRecord`. It was on this
+list because the invariant was one the callers happened to keep rather than one
+the store enforced, and the next caller had no way to know that.
 
-Closing it means the store deriving both from the body, which every synthetic
-fixture in `store.rs`'s tests would then have to carry — roughly 120 call
-sites that currently zero those fields and pass real values beside them. That
-churn, not the change itself, is what has kept it open.
+**Done, by deriving rather than by checking.** Both parameters are gone:
+`store_attributed` binds all three from the one
+`signed_identity_from_record_data` call it was already making and discarding two
+thirds of. Production behaviour is identical, because every caller was passing
+exactly those bytes' own fields; what changed is that it is now impossible to
+pass anything else. `restore` no longer reads `publisher_key` out of the
+persisted file either — the file is not evidence, the signed body is.
+
+The churn this section warned about was the cost of the *other* approach.
+Requiring the caller's values to match the body would have left every synthetic
+fixture in `store.rs` failing, because those bodies zero the author and date
+fields and pass real values beside them. Deriving needs the same fixtures fixed,
+but fixing them is what makes them realistic: `stamped` writes the author and
+date into the body at the offsets the wire uses, so a hand-built test record now
+has the shape a real one does, and `signed_body` / `redated` build and sign one
+in a line. Two tests got sharper for it —
+`rejects_a_body_signed_by_someone_other_than_the_author_it_names` is the case
+that used to be storable, and the TTL tests now date a record where the store
+actually reads a date from, rather than in a struct field beside it.
 
 ---
 

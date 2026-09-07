@@ -1059,14 +1059,10 @@ impl EmberDht {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
             return StoreOutcome::Rejected;
         }
-        if self.store.store_attributed(
-            key,
-            record,
-            record_signature,
-            parsed.publisher_key,
-            parsed.timestamp,
-            attributed_ip,
-        ) {
+        if self
+            .store
+            .store_attributed(key, record, record_signature, attributed_ip)
+        {
             // At capacity, make room rather than stopping: silently declining to
             // record a signature turns off replay collapse for exactly the
             // publishers arriving during a flood, which is when it earns its
@@ -1206,8 +1202,6 @@ impl EmberDht {
             record.keyword_hash,
             record.data.clone(),
             record.signature,
-            record.publisher_key,
-            record.timestamp,
             attributed_ip,
         )
     }
@@ -1824,13 +1818,8 @@ impl EmberDht {
             return false;
         }
         self.sync_store_scale();
-        self.store.store(
-            record.keyword_hash,
-            record.data.clone(),
-            record.signature,
-            record.publisher_key,
-            record.timestamp,
-        )
+        self.store
+            .store(record.keyword_hash, record.data.clone(), record.signature)
     }
 
     /// Blobs we already hold for `key`, in `FOUND_VALUE` wire form.
@@ -3555,13 +3544,7 @@ mod tests {
             let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(1); 32]);
             let rec = SignedRecord::keyword("linux", [i; 16], [0u8; 32], 1, name, &sk);
             assert_eq!(rec.keyword_hash, key);
-            assert!(b.store.store(
-                key,
-                rec.data.clone(),
-                rec.signature,
-                rec.publisher_key,
-                rec.timestamp,
-            ));
+            assert!(b.store.store(key, rec.data.clone(), rec.signature));
         }
 
         let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
