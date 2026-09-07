@@ -472,13 +472,21 @@ pub async fn download_collection_files(
     let mut oversize_count = 0usize;
     let mut failed_count = 0usize;
     for file in files {
+        // Deliberately no `file.size == 0` rejection: a zero-byte ed2k file is
+        // a legitimate entry and `start_download` takes it, so dropping it here
+        // made a collection containing one download incompletely while telling
+        // the user nothing. `multi_source::run_inner` owns the policy for the
+        // size either way — it completes a zero-byte transfer locally when the
+        // hash is the empty-file MD4 and fails it with a named reason when it is
+        // not, which is also the honest outcome for a binary collection entry
+        // whose `FT_FILESIZE` tag was missing (the parser leaves those at 0 and
+        // cannot tell them apart from a real empty file).
         if file.hash.is_empty()
             || file.name.trim().is_empty()
             || file.name.len() > MAX_COLLECTION_ENTRY_NAME_LEN
-            || file.size == 0
         {
             skipped_count += 1;
-            tracing::debug!("Skipping collection entry: invalid name, hash, or size");
+            tracing::debug!("Skipping collection entry: invalid name or hash");
             continue;
         }
         if file.hash.len() != 32 || hex::decode(&file.hash).is_err() {

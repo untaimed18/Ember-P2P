@@ -6,6 +6,19 @@
   --bg-hover: #eceef5;
   --bg-input: #ffffff;
 
+  /* Context menus get their own surface rather than reusing `--bg-surface`.
+     Sits just under the sidebar's white so a menu reads as the same family of
+     chrome without glaring — which means it lands close to the white table
+     rows it opens over, so the separation is carried by a firmer border than
+     the app's quiet dividers plus a tighter, deeper shadow than `--shadow-lg`
+     rather than by the fill. */
+  --ctx-surface: #f7f8fc;
+  --ctx-border: #c8cddb;
+  --ctx-divider: #e3e7f0;
+  --ctx-shadow:
+    0 12px 28px rgba(18, 22, 40, 0.18),
+    0 2px 6px rgba(18, 22, 40, 0.1);
+
   --text-primary: #1a1c24;
   --text-secondary: #4a5068;
   --text-muted: #8890a8;
@@ -139,6 +152,15 @@
   --bg-tertiary: #242a32;   /* nested surfaces, alt inputs */
   --bg-hover: #2a313b;      /* hover / selected rows */
   --bg-input: #14181e;      /* inputs — slightly inset below panels */
+
+  /* Menus sit above every other surface, so they take the brightest step of
+     the bg ladder — above the panels they open over. */
+  --ctx-surface: #232932;
+  --ctx-border: #3a4250;
+  --ctx-divider: #30373f;
+  --ctx-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.55),
+    0 2px 8px rgba(0, 0, 0, 0.4);
 
   --text-primary: #e4e8ed;
   --text-secondary: #a8aeb8;
@@ -482,11 +504,12 @@ input[type="checkbox"], input[type="radio"] {
   accent-color: var(--accent);
   cursor: pointer;
 }
+/* No focus ring: a click focuses the control, and Chromium treats that
+   as :focus-visible, so the ring would linger until the next click. */
 input[type="checkbox"]:focus, input[type="radio"]:focus,
 input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   box-shadow: none;
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: none;
 }
 
 input::placeholder {
@@ -930,6 +953,274 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   background-size: 800px 100%;
   animation: shimmer 1.4s ease-in-out infinite;
   border-radius: var(--radius-sm);
+}
+
+/*
+ * Right-click context menus.
+ *
+ * One vocabulary for every menu in the app (servers, search, library,
+ * transfers, column pickers) so they share a single look:
+ *
+ *   .ctx-menu          fixed panel positioned at the pointer
+ *     .ctx-header      what the menu acts on (file / server / peer name)
+ *     .ctx-label       uppercase group heading
+ *     .ctx-item        action row; add .ctx-danger, .ctx-check, .ctx-sub
+ *     .ctx-hint        right-aligned muted detail inside an item
+ *     .ctx-sep         hairline group divider
+ *     .ctx-submenu-wrap / .ctx-submenu   nested panel
+ *   .ctx-backdrop      transparent click-catcher behind a menu
+ *
+ * Every item reserves the same 26px leading gutter, so labels stay on one
+ * vertical line whether or not a check mark is present — the checked and
+ * unchecked states of a toggle no longer shift the text sideways.
+ */
+.ctx-menu,
+.ctx-submenu {
+  padding: 5px;
+  background: var(--ctx-surface);
+  border: 1px solid var(--ctx-border);
+  border-radius: var(--radius-md);
+  box-shadow:
+    inset 0 1px 0 var(--surface-highlight),
+    var(--ctx-shadow);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+/* `left`/`top` are owned by the `ctxMenuPosition` action, which measures the
+   rendered panel; the zeroes here are only a fallback so a menu can never be
+   laid out at its static flow position. */
+.ctx-menu {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9999;
+  min-width: 200px;
+  transform-origin: top left;
+  animation: ctx-menu-in 0.12s ease-out;
+}
+
+/* Long menus (column pickers, friend lists) scroll instead of running off
+   the screen. Only for menus without submenus — `overflow` would clip them. */
+.ctx-scroll {
+  max-height: min(70vh, 460px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@keyframes ctx-menu-in {
+  from { opacity: 0; transform: scale(0.97) translateY(-2px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.ctx-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 300px;
+  padding: 4px 9px 7px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--ctx-divider);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.ctx-header > bdi,
+.ctx-header > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ctx-label {
+  padding: 5px 9px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* A label directly after a divider owns the spacing above it. */
+.ctx-sep + .ctx-label {
+  padding-top: 2px;
+}
+
+.ctx-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 10px 6px 26px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* Hover is mixed into the menu's own surface, not `--bg-hover`, so the
+   highlight keeps the same relative lift whatever the panel color is. */
+.ctx-item:hover:not(:disabled):not(.ctx-disabled),
+.ctx-item:focus-visible {
+  background: color-mix(in srgb, var(--accent) 14%, var(--ctx-surface));
+  color: var(--text-primary);
+}
+
+.ctx-item:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.ctx-item:disabled,
+.ctx-item.ctx-disabled {
+  background: none;
+  color: var(--text-disabled);
+  cursor: default;
+  opacity: 1;
+}
+
+.ctx-item.ctx-danger {
+  color: var(--danger);
+}
+
+.ctx-item.ctx-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 16%, var(--ctx-surface));
+  color: var(--danger);
+}
+
+/* Check mark for toggles and for the selected option in a radio-style
+   submenu. Driven by `aria-checked` where the role allows it, class
+   otherwise, so the glyph can never disagree with what screen readers say. */
+.ctx-item.ctx-check::before,
+.ctx-item[aria-checked="true"]::before {
+  content: "\2713";
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.ctx-item.ctx-check,
+.ctx-item[aria-checked="true"] {
+  font-weight: 600;
+}
+
+.ctx-hint {
+  margin-left: auto;
+  padding-left: 14px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--ctx-divider);
+}
+
+.ctx-item.ctx-sub {
+  padding-right: 22px;
+}
+
+.ctx-item.ctx-sub::after {
+  content: "";
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border: 4px solid transparent;
+  border-left-color: currentColor;
+  border-right-width: 0;
+  transform: translateY(-50%);
+  opacity: 0.45;
+}
+
+.ctx-item.ctx-sub:hover::after,
+.ctx-item.ctx-sub.ctx-sub-open::after {
+  opacity: 0.9;
+}
+
+.ctx-submenu-wrap {
+  position: relative;
+}
+
+.ctx-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  z-index: 1;
+  min-width: 170px;
+  margin-left: 2px;
+  transform-origin: top left;
+  animation: ctx-menu-in 0.1s ease-out;
+}
+
+.ctx-submenu.ctx-submenu-left {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: 2px;
+  transform-origin: top right;
+}
+
+.ctx-submenu.ctx-submenu-up {
+  top: auto;
+  bottom: -5px;
+  transform-origin: bottom left;
+}
+
+.ctx-submenu.ctx-submenu-left.ctx-submenu-up {
+  transform-origin: bottom right;
+}
+
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  cursor: default;
+}
+
+/*
+ * The backdrop is a real <button> so it can be dismissed from the keyboard,
+ * which subjects it to the generic `button:hover` / `button:active` rules —
+ * and it covers the entire viewport. Those selectors (0,1,1) outweigh a bare
+ * `.ctx-backdrop` (0,1,0), so without an element-qualified override here the
+ * whole screen washes accent blue as soon as the pointer moves over it.
+ */
+button.ctx-backdrop:hover,
+button.ctx-backdrop:active {
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+/* Frosted panel in dark mode, matching the dialog treatment above. Only the
+   top-level panel is translucent: a nested `backdrop-filter` samples its
+   ancestor's backdrop root, so a frosted submenu hanging outside the parent
+   would blur against nothing along its overhang. */
+[data-theme="dark"] .ctx-menu {
+  background: color-mix(in srgb, var(--ctx-surface) 94%, transparent);
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
 }
 
 /* Confirm dialog overlay */

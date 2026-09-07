@@ -74,6 +74,18 @@ export interface KadSearchEntry {
   started_at: number;
 }
 
+/** One configured eMule-style web service.
+ *
+ *  `url` is a template, not a URL: it may contain eMule's placeholders
+ *  (`#hashid`, `#filename`, `#cleanfilename`, `#name`, `#cleanname`,
+ *  `#filesize`), which the backend fills and validates at open time. Note that
+ *  `#hashid` makes the template parse as a URL with a fragment, which is why
+ *  the renderer never builds the final URL itself. */
+export interface WebService {
+  name: string;
+  url: string;
+}
+
 export interface Transfer {
   id: string;
   file_name: string;
@@ -512,6 +524,13 @@ export interface EmberDiagnostics {
    */
   ember_dht_published_files: number;
   /**
+   * Complete, publicly listable shared files Ember will advertise. The
+   * denominator for "published of total"; the gap vs
+   * `ember_dht_published_files` is files still waiting for a confirmed
+   * source record.
+   */
+  ember_dht_publishable_files?: number;
+  /**
    * Every source listed in an EPX payload we accepted, before filtering. The
    * denominator for EPX yield — compare against `epx_sources_received` on
    * `NetworkStats`, which counts only those that reached a live download.
@@ -549,6 +568,22 @@ export interface EmberDiagnostics {
   ember_dht_store_reject_source_ip?: number;
   /** STORE records for keys this node is not close enough to hold. */
   ember_dht_store_reject_proximity?: number;
+  /** Verified inbound keyword records whose key no word in their own signed name hashes to. */
+  ember_dht_keyword_key_off_name?: number;
+  /** Peers that have told us which wire versions they can decode. */
+  ember_dht_version_advertisers?: number;
+  /** Frames refused by the aggregate per-address STORE ceiling. */
+  ember_dht_store_addr_ceiling?: number;
+  /** Highest load a storer has reported for the rendezvous key (0-100); 90+ means sharding is due. */
+  ember_dht_rendezvous_key_load?: number;
+  /** Searches where both keyword DHT legs ran — the denominator for the three below. */
+  ember_dht_recall_searches?: number;
+  /** Files both keyword DHTs found. */
+  ember_dht_recall_both?: number;
+  /** Files only KAD found; ahead of ember_only means Ember's recall is lagging. */
+  ember_dht_recall_kad_only?: number;
+  /** Files only Ember found. */
+  ember_dht_recall_ember_only?: number;
   /** Completed FIND_VALUE searches this session (hits, misses, and timeouts). */
   ember_dht_search_outcomes?: number;
   /** Sum of shortlist nodes that answered across those searches. */
@@ -765,6 +800,10 @@ export interface AppSettings {
    *  default. Unrelated to `friend_browse_disabled`, which gates the
    *  separate Ember-only friend browse feature. */
   allow_shared_files_browse: boolean;
+  /** eMule-style web services: sites openable for one file from its context
+   *  menu, with the file's facts substituted into a URL template. Empty by
+   *  default — opening one tells a third party which file you are after. */
+  web_services: WebService[];
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;
@@ -823,7 +862,15 @@ export interface AppSettings {
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
-  /** Rendezvous server URL for Ember friend discovery */
+  /**
+   * Rendezvous server URL for Ember friend discovery.
+   *
+   * Backend-owned: `update_settings` restores the stored value over whatever
+   * the renderer sends, because registration POSTs our public key, public IP
+   * and listening port to this host. No Settings control binds it — it lives in
+   * `config.json` — so writes from here are silently ignored rather than
+   * rejected.
+   */
   rendezvous_url: string;
   /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
    *  Always on: the DHT bootstraps from other clients rather than a

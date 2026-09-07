@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use tracing::trace;
 
-use super::messages::{self, DhtPayload};
+use super::messages::{self, DhtPayload, VersionRange};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD,
     RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
@@ -144,6 +144,15 @@ const MAX_BUDDY_ENDORSE_ASKED: usize = 64;
 /// that gossip keeps being promoted once the table is healthy, small enough
 /// that the contacts we actually route through stay refreshed.
 const LEAD_PING_RESERVE_DIVISOR: usize = 4;
+
+/// Peers whose advertised wire-version range we hold at once.
+///
+/// The map is pruned to the routing table's membership every maintenance tick,
+/// so this is a ceiling between ticks rather than the working size. Set well
+/// clear of a full table plus its replacement caches: the entries this bounds
+/// are the ones a peer rotating node ids could otherwise mint, and the cost of
+/// being wrong on the low side is forgetting a range that one ping relearns.
+const MAX_TRACKED_PEER_VERSIONS: usize = 1024;
 
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
@@ -400,6 +409,18 @@ pub struct EmberDht {
     /// STORE records for keys this node is not close enough to hold, once
     /// the routing table is large enough to be selective.
     store_reject_proximity: u64,
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to. Counted, never enforced — see `accept_record`.
+    keyword_key_off_name: u64,
+    /// The wire-version range each peer has told us it can decode, learned from
+    /// the block on a signed `PING` or `PONG`.
+    ///
+    /// Held here rather than on [`EmberContact`] because it is neither wire nor
+    /// persisted state: a contact is encoded into `FOUND_NODE` and written to
+    /// `nodes_ember.dat`, and a peer's range is worth exactly as much as the
+    /// session it was proved on. Relearned in one maintenance ping if we forget
+    /// it, which is also why nothing here needs to survive a restart.
+    peer_versions: HashMap<EmberNodeId, VersionRange>,
     /// Noise static we currently advertise. A `PROXY_STORE` trailer must
     /// name this key, otherwise a firewalled publisher can steer every
     /// searcher's `CALLBACK_REQ` at someone else.
@@ -503,6 +524,8 @@ impl EmberDht {
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
+            keyword_key_off_name: 0,
+            peer_versions: HashMap::new(),
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
@@ -857,6 +880,90 @@ impl EmberDht {
         self.routing.enforce_scale_quotas()
     }
 
+    /// Record the wire-version range a peer advertised on a signed frame.
+    ///
+    /// Only ever called from a frame that has already verified, so the range is
+    /// the peer's own claim about itself rather than something a relay wrote —
+    /// which matters, because the whole point is deciding what to send them.
+    ///
+    /// A peer that advertises nothing is left absent rather than stored as a
+    /// guess. Absent and "advertised exactly our range" have to stay
+    /// distinguishable: the first is a build predating the block, and it is the
+    /// count of those that says whether a future version is safe to send.
+    fn note_peer_versions(&mut self, id: EmberNodeId, versions: Option<VersionRange>) {
+        let Some(range) = versions else {
+            return;
+        };
+        // A full map refuses a newcomer rather than evicting an incumbent, the
+        // same way the store's caps do. Safe here in a way it is not there: the
+        // entry is advisory, the prune below restores the map to the table's
+        // membership every maintenance tick, and one ping relearns it. The cap
+        // exists because this is fed by inbound frames, so without it a peer
+        // rotating node ids could grow the map for the cost of a handshake.
+        if self.peer_versions.len() >= MAX_TRACKED_PEER_VERSIONS
+            && !self.peer_versions.contains_key(&id)
+        {
+            return;
+        }
+        self.peer_versions.insert(id, range);
+    }
+
+    /// Forget advertised ranges for peers no longer in the routing table.
+    /// Returns how many were dropped.
+    ///
+    /// Runs on the maintenance tick beside the other table passes. The map is
+    /// fed from frames and the table is what bounds everything else, so tying
+    /// one to the other is what keeps this from being a second, unbounded
+    /// notion of "peers we know about".
+    pub fn prune_peer_versions(&mut self) -> usize {
+        if self.peer_versions.is_empty() {
+            return 0;
+        }
+        let before = self.peer_versions.len();
+        let known: HashSet<EmberNodeId> = self
+            .routing
+            .all_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .collect();
+        self.peer_versions.retain(|id, _| known.contains(id));
+        before - self.peer_versions.len()
+    }
+
+    /// Whether `peer` said it can decode `version`.
+    ///
+    /// `None` means it has not told us — which is not the same as no, and must
+    /// not be treated as yes. The caller decides: a frame in the range every
+    /// build speaks needs no permission, and a frame outside it has to fall
+    /// back rather than assume.
+    ///
+    /// No production caller yet, deliberately, and this is the whole point of
+    /// the feature rather than an oversight: nothing can ask the question until
+    /// there are two answers to it, and today `EMBER_DHT_MIN_VERSION` equals
+    /// [`super::EMBER_DHT_VERSION`], so every peer we can exchange a frame with
+    /// speaks exactly one version. Its first caller is whatever encodes the next
+    /// wire change — which is why the primitive ships now, ahead of it: the
+    /// ranges have to already be arriving from the field before a bump can use
+    /// them, or the first peer to advertise one is also the first to need it.
+    /// Covered by `a_ping_exchange_teaches_both_sides_what_the_other_can_decode`.
+    #[allow(dead_code)]
+    pub fn peer_accepts_version(&self, peer: &EmberNodeId, version: u8) -> Option<bool> {
+        self.peer_versions
+            .get(peer)
+            .map(|range| range.accepts(version))
+    }
+
+    /// Peers currently holding an advertised range.
+    ///
+    /// Read against the verified contact count: while this trails it, a frame
+    /// shaped for a version older builds cannot parse would still partition the
+    /// overlay, because the peers that would refuse it are exactly the ones not
+    /// counted here. When it catches up, a bump can be delivered per peer
+    /// instead of on a flag day.
+    pub fn peers_advertising_versions(&self) -> usize {
+        self.peer_versions.len()
+    }
+
     /// Insert a contact directly (manual harness seeding). Returns
     /// `true` if it landed in a bucket, `false` if rejected (self,
     /// subnet-diversity limit) or only cached behind a full bucket.
@@ -1025,18 +1132,40 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        // The keyword half of that argument, measured rather than enforced.
+        //
+        // The word is not on the wire, but the *name* is — signed beside the key
+        // — and the publish loop derives its keywords from that name, so a storer
+        // can recompute the set and ask whether the key is one of their hashes.
+        // A keyword publisher that answers no chose its key freely, which is the
+        // same free choice of eviction victim the source rule above refuses.
+        //
+        // Refusing on this answer was implemented and backed out, and counting is
+        // deliberately where it stops. Enforcing would make a record's validity
+        // depend on our tokenizer, so the next publisher to improve it (stemming,
+        // more than space-split tokens) would have its records refused by every
+        // storer still running the old one — turning a drop-in change into a wire
+        // break of the class that forced v3 and v4. What is missing to justify
+        // paying that price is evidence that anyone is aiming at all, and that is
+        // exactly what this counts. It doubles as a tripwire for the publish and
+        // store sides' tokenizers drifting apart, which would show up here as a
+        // count climbing with no attacker involved.
+        //
+        // Cheap next to what admitting a record has already cost by this line:
+        // a few BLAKE3 hashes of short words against two Ed25519 verifications.
+        if parsed.record_type == RECORD_TYPE_KEYWORD
+            && !super::search::name_hashes_to_key(&parsed.file_name, &key)
+        {
+            self.keyword_key_off_name = self.keyword_key_off_name.saturating_add(1);
+        }
         if !self.store_proximity_ok(&key) {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
             return StoreOutcome::Rejected;
         }
-        if self.store.store_attributed(
-            key,
-            record,
-            record_signature,
-            parsed.publisher_key,
-            parsed.timestamp,
-            attributed_ip,
-        ) {
+        if self
+            .store
+            .store_attributed(key, record, record_signature, attributed_ip)
+        {
             // At capacity, make room rather than stopping: silently declining to
             // record a signature turns off replay collapse for exactly the
             // publishers arriving during a flood, which is when it earns its
@@ -1176,8 +1305,6 @@ impl EmberDht {
             record.keyword_hash,
             record.data.clone(),
             record.signature,
-            record.publisher_key,
-            record.timestamp,
             attributed_ip,
         )
     }
@@ -1691,20 +1818,36 @@ impl EmberDht {
     /// (`FOUND_VALUE`, or `FOUND_NODE` if the peer has no record) arrives
     /// via [`Self::handle_message`].
     ///
-    /// Keys past [`messages::MAX_FIND_VALUE_KEYS`] are dropped. A peer rejects
-    /// an over-long request at decode and answers nothing at all, so sending
-    /// one would cost the whole query timeout and return no contacts either;
-    /// callers pass keys most-selective-first, and the keywords dropped here
-    /// are still applied by the caller's own filename filter. Truncating is
-    /// therefore strictly better than letting a long query go unanswered.
+    /// Keys past [`messages::MAX_FIND_VALUE_KEYS`] move into the constraint
+    /// block rather than being dropped. That run's count byte cannot grow — a
+    /// peer refuses a higher count at decode and answers nothing at all, costing
+    /// the whole query timeout — but the block trails the fields an older decoder
+    /// reads, so it ignores the surplus instead of refusing the frame. A long
+    /// query therefore narrows on peers that understand it and is merely
+    /// unnarrowed on the ones that do not, where the caller's own filename filter
+    /// still applies. Anything past [`messages::MAX_FIND_VALUE_KEYS_TOTAL`] is
+    /// dropped; callers pass keys most-selective-first.
     pub fn build_find_value(
         &mut self,
         mut keys: Vec<[u8; 16]>,
         start_position: u16,
+        mut constraints: messages::ValueConstraints,
     ) -> (u32, Vec<u8>) {
-        keys.truncate(messages::MAX_FIND_VALUE_KEYS);
+        if keys.len() > messages::MAX_FIND_VALUE_KEYS {
+            let surplus = keys.split_off(messages::MAX_FIND_VALUE_KEYS);
+            constraints.extra_keys.extend(surplus);
+        }
+        constraints
+            .extra_keys
+            .truncate(messages::MAX_FIND_VALUE_EXTRA_KEYS);
         let request_id = self.next_request_id();
-        let msg = messages::build_find_value(self.local_id, request_id, keys, start_position);
+        let msg = messages::build_find_value(
+            self.local_id,
+            request_id,
+            keys,
+            start_position,
+            constraints,
+        );
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
@@ -1778,13 +1921,8 @@ impl EmberDht {
             return false;
         }
         self.sync_store_scale();
-        self.store.store(
-            record.keyword_hash,
-            record.data.clone(),
-            record.signature,
-            record.publisher_key,
-            record.timestamp,
-        )
+        self.store
+            .store(record.keyword_hash, record.data.clone(), record.signature)
     }
 
     /// Blobs we already hold for `key`, in `FOUND_VALUE` wire form.
@@ -1843,6 +1981,28 @@ impl EmberDht {
         )
     }
 
+    /// The same, announcing the media metadata the publisher holds for the file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_keyword_record_with_media(
+        &self,
+        keyword: &str,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        file_size: u64,
+        file_name: &str,
+        media: Option<&crate::types::MediaMetadata>,
+    ) -> SignedRecord {
+        SignedRecord::keyword_with_media(
+            keyword,
+            file_hash,
+            ember_file_hash,
+            file_size,
+            file_name,
+            media,
+            &self.signing_key,
+        )
+    }
+
     /// Sign a source record advertising `contact` as a source for
     /// `file_hash`, ready to publish on the file's source key. The contact
     /// is part of the signed payload, so a downloader can dial it after
@@ -1896,6 +2056,25 @@ impl EmberDht {
 
     pub fn store_reject_proximity(&self) -> u64 {
         self.store_reject_proximity
+    }
+
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to.
+    ///
+    /// Counted where the record is known to be genuine and new — past
+    /// `from_wire` and past the replay collapse — so a retransmit storm cannot
+    /// inflate it, and unsigned junk cannot appear here at all. Counted before
+    /// the proximity gate and the store's caps, because the question is what
+    /// publishers are doing rather than what we happened to keep.
+    ///
+    /// Read it as two different findings depending on the shape. A count that
+    /// climbs against a handful of publishers is someone choosing keys rather
+    /// than deriving them — the aiming the store's eviction rankers are
+    /// vulnerable to, and the evidence that would justify enforcing the rule
+    /// this only measures. A count that climbs broadly, across publishers, is
+    /// far more likely to be our own two tokenizers having drifted apart.
+    pub fn keyword_key_off_name(&self) -> u64 {
+        self.keyword_key_off_name
     }
 
     /// Local store stats `(distinct_keys, total_records)` restricted to
@@ -2138,14 +2317,16 @@ impl EmberDht {
         }
 
         match msg.payload {
-            DhtPayload::Ping => {
+            DhtPayload::Ping { versions } => {
                 out.ping_received = true;
+                self.note_peer_versions(msg.sender_id, versions);
                 let pong = messages::build_pong(self.local_id, msg.request_id, from);
                 out.responses
                     .push(messages::encode_message(&pong, &self.signing_key, true, &self.local_noise_pub));
             }
-            DhtPayload::Pong { observed } => {
+            DhtPayload::Pong { observed, versions } => {
                 out.pong_received = true;
+                self.note_peer_versions(msg.sender_id, versions);
                 out.pong_request_id = Some(msg.request_id);
                 out.pong_observed = observed;
                 // The PONG proves liveness; refresh the contact's
@@ -2306,17 +2487,24 @@ impl EmberDht {
                 }
             }
             DhtPayload::FindValue {
-                keys,
+                mut keys,
                 start_position,
+                constraints,
             } => {
                 out.find_value_received = true;
+                // Keys the searcher could not fit in the count-prefixed run.
+                // Merged here so the intersection below cannot tell where a key
+                // travelled, and held to the total so a peer cannot buy an
+                // unbounded scan by naming keys in both places.
+                keys.extend_from_slice(&constraints.extra_keys);
+                keys.truncate(messages::MAX_FIND_VALUE_KEYS_TOTAL);
                 // Multi-keyword wire intersection (when `keys.len() > 1`):
                 // serve primary-key (`keys[0]`) records; when this node also
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
                 if let Some(reply) =
-                    intersect_find_value_records(&self.store, &keys, start_position)
+                    intersect_find_value_records(&self.store, &keys, start_position, &constraints)
                 {
                     out.find_value_hit = true;
                     out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
@@ -2543,15 +2731,7 @@ fn callback_tokens_match(expected: &[u8; 16], got: &[u8; 16]) -> bool {
     diff == 0
 }
 
-/// Extract `file_hash` from a packed Ember DHT record (`type || keyword_hash || file_hash || …`).
-fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
-    if data.len() < 33 {
-        return None;
-    }
-    let mut h = [0u8; 16];
-    h.copy_from_slice(&data[17..33]);
-    Some(h)
-}
+use super::publish::file_hash_from_record_data;
 
 /// Multi-keyword FIND_VALUE answer: primary-key blobs, optionally narrowed
 /// to `file_hash`es that also appear under a secondary key this node holds.
@@ -2572,8 +2752,25 @@ fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
     start_position: u16,
+    constraints: &messages::ValueConstraints,
 ) -> Option<FoundValueReply> {
-    let (primary, filtered) = intersect_live_records(store, keys)?;
+    let (primary, mut filtered) = intersect_live_records(store, keys)?;
+
+    // Before the packing below, which is the whole point: a constraint applied
+    // after truncation cannot recover the matching records that fell outside the
+    // page. `total_available` is then the count of records that *match*, so a
+    // searcher pages through the filtered list rather than through positions
+    // most of which it would discard.
+    if !constraints.is_empty() {
+        filtered
+            .retain(|record| super::publish::record_matches_constraints(&record.data, constraints));
+        if filtered.is_empty() {
+            // Nothing here for this searcher. Answering `FOUND_NODE` instead is
+            // what we already do for a key we do not hold, and it keeps the walk
+            // moving toward peers that may hold a match.
+            return None;
+        }
+    }
 
     // Pack records until the reply would stop fitting a datagram. A key can
     // legitimately hold far more records than one response can carry, and an
@@ -2767,7 +2964,7 @@ fn intersect_live_records<'a>(
 #[cfg(test)]
 impl EmberDht {
     fn build_find_value_page_one(&mut self, keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
-        self.build_find_value(keys, 0)
+        self.build_find_value(keys, 0, messages::ValueConstraints::default())
     }
 }
 
@@ -3452,13 +3649,7 @@ mod tests {
             let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(1); 32]);
             let rec = SignedRecord::keyword("linux", [i; 16], [0u8; 32], 1, name, &sk);
             assert_eq!(rec.keyword_hash, key);
-            assert!(b.store.store(
-                key,
-                rec.data.clone(),
-                rec.signature,
-                rec.publisher_key,
-                rec.timestamp,
-            ));
+            assert!(b.store.store(key, rec.data.clone(), rec.signature));
         }
 
         let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
@@ -3613,6 +3804,193 @@ mod tests {
         assert_eq!(b.store_stats(), (1, 1), "the live store is unchanged");
     }
 
+    /// A query with more keywords than the count-prefixed run can name must still
+    /// intersect on all of them. The surplus rides in the constraint block, and
+    /// the responder merges the two runs before intersecting — so where a key
+    /// travelled cannot change the answer.
+    #[test]
+    fn keys_past_the_count_prefixed_run_still_intersect() {
+        let mut a = dht(70);
+        let mut b = dht(71);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(70, 4672);
+        let b_addr = addr(71, 4672);
+
+        // Ten words, so two have to travel in the block. Only one of the two
+        // files carries every word, and the odd one out is under the *last*
+        // word — the one that would be dropped if the surplus were truncated
+        // rather than carried.
+        let words: Vec<String> = (0..10).map(|i| format!("keyword{i}")).collect();
+        let wanted = [0x11u8; 16];
+        let other = [0x22u8; 16];
+        let mut stored = 0i64;
+        for (w, word) in words.iter().enumerate() {
+            let mut files = vec![wanted];
+            if w < words.len() - 1 {
+                files.push(other);
+            }
+            for file_hash in files {
+                let record =
+                    a.build_keyword_record(word, file_hash, [0u8; 32], 4096, "release.mkv");
+                let (_rid, bytes) = a.build_store(
+                    record.keyword_hash,
+                    record.data.clone(),
+                    record.signature,
+                );
+                assert!(b
+                    .handle_message(&bytes, a_addr, a_noise, 1000 + stored)
+                    .stored_record);
+                stored += 1;
+            }
+        }
+
+        let keys: Vec<[u8; 16]> = words
+            .iter()
+            .map(|w| super::super::search::keyword_hash(w))
+            .collect();
+        assert!(keys.len() > messages::MAX_FIND_VALUE_KEYS);
+
+        let (_rid, find) = a.build_find_value(keys, 0, messages::ValueConstraints::default());
+        let reply = b.handle_message(&find, a_addr, a_noise, 2000);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2001)
+            .found_value
+            .expect("FOUND_VALUE");
+        let hashes: Vec<[u8; 16]> = page
+            .records
+            .iter()
+            .filter_map(|blob| {
+                super::super::publish::SignedRecord::from_value_blob(blob).map(|r| r.file_hash)
+            })
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![wanted],
+            "the keyword carried in the block has to narrow the answer like any other"
+        );
+    }
+
+    /// The point of sending constraints at all: the responder has to drop what
+    /// the searcher cannot use *before* it packs a page, so a page carries
+    /// matches instead of whatever happened to sit at the front of the key.
+    ///
+    /// A datagram fits roughly five keyword records, so a key holding fifty
+    /// non-matching files ahead of the matches served the searcher pages of
+    /// nothing — and a search has a bounded budget, so those pages were spent.
+    #[test]
+    fn a_responder_applies_a_searchers_constraints_before_it_packs() {
+        let mut a = dht(60);
+        let mut b = dht(61);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(60, 4672);
+        let b_addr = addr(61, 4672);
+
+        // Fifty small files under one word, then the two the searcher wants.
+        // Order matters: the wanted files are last, so an unfiltered first page
+        // cannot reach them.
+        let mut key = [0u8; 16];
+        for i in 0..50u8 {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i;
+            let record =
+                a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 1024, "ubuntu-notes.txt");
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(b
+                .handle_message(&bytes, a_addr, a_noise, 1000 + i as i64)
+                .stored_record);
+        }
+        for (i, name) in ["ubuntu-release.mkv", "ubuntu-talk.mkv"].iter().enumerate() {
+            let mut file_hash = [0xF0u8; 16];
+            file_hash[0] = i as u8;
+            let record =
+                a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 700_000_000, name);
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(b
+                .handle_message(&bytes, a_addr, a_noise, 1100 + i as i64)
+                .stored_record);
+        }
+
+        // Unconstrained, the first page is all text files — the wanted ones are
+        // fifty positions away.
+        let (_rid, plain) = a.build_find_value(vec![key], 0, messages::ValueConstraints::default());
+        let reply = b.handle_message(&plain, a_addr, a_noise, 2000);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2001)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(page.total_available, 52);
+        assert!(
+            page.records.iter().all(|blob| {
+                super::super::publish::SignedRecord::from_value_blob(blob)
+                    .is_some_and(|r| r.file_name.ends_with(".txt"))
+            }),
+            "the front of the key is what an unconstrained page serves"
+        );
+
+        // Constrained on size and type, the same first page carries the matches
+        // and the total counts only them — so the searcher pages through matches
+        // rather than through positions it would throw away.
+        let constraints = messages::ValueConstraints {
+            min_size: Some(100_000_000),
+            file_type: Some("Video".to_string()),
+            ..Default::default()
+        };
+        let (_rid, narrow) = a.build_find_value(vec![key], 0, constraints);
+        let reply = b.handle_message(&narrow, a_addr, a_noise, 2002);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2003)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(
+            page.total_available, 2,
+            "the total has to count matches, or paging walks the discards"
+        );
+        assert_eq!(page.records.len(), 2);
+        for blob in &page.records {
+            let record =
+                super::super::publish::SignedRecord::from_value_blob(blob).expect("signed");
+            assert!(record.file_name.ends_with(".mkv"));
+            assert_eq!(record.file_size, 700_000_000);
+        }
+
+        // An extension constraint narrows the same way, which is how Ember
+        // answers "search by extension" without the extension being a key.
+        let by_extension = messages::ValueConstraints {
+            file_extension: Some("mkv".to_string()),
+            ..Default::default()
+        };
+        let (_rid, ask) = a.build_find_value(vec![key], 0, by_extension);
+        let reply = b.handle_message(&ask, a_addr, a_noise, 2010);
+        assert!(reply.find_value_hit);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2011)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(page.total_available, 2);
+        assert!(page.records.iter().all(|blob| {
+            super::super::publish::SignedRecord::from_value_blob(blob)
+                .is_some_and(|r| r.file_name.ends_with(".mkv"))
+        }));
+
+        // A constraint nothing under the key satisfies is answered the way a key
+        // we do not hold is: with contacts, so the walk keeps moving.
+        let impossible = messages::ValueConstraints {
+            min_size: Some(u64::MAX),
+            ..Default::default()
+        };
+        let (_rid, hopeless) = a.build_find_value(vec![key], 0, impossible);
+        let reply = b.handle_message(&hopeless, a_addr, a_noise, 2004);
+        assert!(
+            !reply.find_value_hit,
+            "no match must not be answered as a hit"
+        );
+    }
+
     /// A record too large for the budget *left* on a page must be reached by a
     /// later one. The packer keeps scanning past it for something that still
     /// fits, so the records a page serves are not always a contiguous run — and
@@ -3654,7 +4032,8 @@ mod tests {
         let mut seen: HashSet<[u8; 16]> = HashSet::new();
         let mut position = 0u16;
         for round in 0..12 {
-            let (_rid, find) = a.build_find_value(vec![key], position);
+            let (_rid, find) =
+                a.build_find_value(vec![key], position, messages::ValueConstraints::default());
             let reply = b.handle_message(&find, a_addr, a_noise, 2000 + round);
             assert!(reply.find_value_hit, "page at {position} must be served");
             let page = a
@@ -4044,7 +4423,11 @@ mod tests {
             }
             rounds += 1;
             assert!(rounds < 40, "paging must terminate");
-            let (_rid, next_find) = a.build_find_value(vec![key], page.next_position);
+            let (_rid, next_find) = a.build_find_value(
+                vec![key],
+                page.next_position,
+                messages::ValueConstraints::default(),
+            );
             let reply = b.handle_message(&next_find, a_addr, a_noise, 2000 + rounds);
             assert!(reply.find_value_hit, "a page inside the key must be served");
             page = a
@@ -5459,6 +5842,141 @@ mod tests {
         assert!(!on_b.stored_record, "key/content mismatch must be rejected");
         assert!(on_b.responses.is_empty(), "no STORE_ACK on rejection");
         assert_eq!(b.store_stats(), (0, 0));
+    }
+
+    /// A ping exchange teaches each side what the other can decode, which is
+    /// the piece that lets a future wire change be sent per peer instead of on
+    /// a flag day.
+    #[test]
+    fn a_ping_exchange_teaches_both_sides_what_the_other_can_decode() {
+        let mut a = dht(60);
+        let mut b = dht(61);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(60, 4672);
+        let b_addr = addr(61, 4672);
+
+        let (_rid, ping) = a.build_ping();
+        let on_b = b.handle_message(&ping, a_addr, a_noise, 1000);
+        assert!(on_b.ping_received);
+        assert_eq!(
+            b.peer_accepts_version(&a.local_id(), super::super::EMBER_DHT_VERSION),
+            Some(true),
+            "B learned A's range from the PING"
+        );
+
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        assert!(on_a.pong_received);
+        assert_eq!(
+            a.peer_accepts_version(&b.local_id(), super::super::EMBER_DHT_VERSION),
+            Some(true),
+            "and A learned B's from the PONG"
+        );
+
+        // The number that decides whether a bump is safe is how many peers have
+        // answered this question at all.
+        assert_eq!(a.peers_advertising_versions(), 1);
+        assert_eq!(b.peers_advertising_versions(), 1);
+    }
+
+    /// A version we have not been told about is unknown, not permitted. The
+    /// caller has to be able to tell "said no" from "never said", because
+    /// treating silence as yes is exactly the flag day this replaces.
+    #[test]
+    fn a_peer_that_never_advertised_is_unknown_rather_than_willing() {
+        let a = dht(62);
+        let stranger = dht(63);
+        assert_eq!(
+            a.peer_accepts_version(&stranger.local_id(), super::super::EMBER_DHT_VERSION),
+            None
+        );
+        assert_eq!(a.peers_advertising_versions(), 0);
+    }
+
+    /// The map is fed by inbound frames, so it follows the routing table rather
+    /// than growing beside it: a peer that leaves the table is forgotten, and
+    /// one ping relearns it if it comes back.
+    #[test]
+    fn advertised_ranges_are_forgotten_once_the_peer_leaves_the_table() {
+        let mut a = dht(64);
+        let mut b = dht(65);
+        let b_addr = addr(65, 4672);
+
+        let (_rid, ping) = b.build_ping();
+        a.handle_message(&ping, b_addr, b.local_noise_pub, 1000);
+        assert_eq!(a.peers_advertising_versions(), 1);
+        assert_eq!(
+            a.prune_peer_versions(),
+            0,
+            "a peer still in the table keeps its range"
+        );
+
+        a.routing.remove_contact(&b.local_id());
+        assert_eq!(a.prune_peer_versions(), 1);
+        assert_eq!(a.peers_advertising_versions(), 0);
+    }
+
+    /// The measurement the keyword half of that rule stops at. A storer cannot
+    /// refuse a key it cannot recompute, but it can recompute the *name* and say
+    /// whether the key is one of the words in it — and a publisher that derived
+    /// its key honestly always answers yes.
+    #[test]
+    fn a_keyword_key_derived_from_its_own_name_is_not_counted_as_aimed() {
+        let mut a = dht(42);
+        let mut b = dht(43);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(42, 4672);
+
+        // "debian" is exactly what this tokenizer takes from the name: the "12"
+        // is under the length floor and "iso" is a trailing three-character
+        // extension, so the word the publisher filed under is the only one left.
+        let record = a.build_keyword_record("debian", [1u8; 16], [0u8; 32], 10, "debian-12.iso");
+        let (_rid, store_bytes) = a.build_store(record.keyword_hash, record.data, record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+
+        assert!(on_b.stored_record, "an honestly keyed record is still stored");
+        assert_eq!(
+            b.keyword_key_off_name(),
+            0,
+            "a key the record's own name hashes to is not aiming"
+        );
+    }
+
+    /// The other side of it: nothing in the name hashes to the key, so the
+    /// publisher chose the key rather than deriving it — which for the eviction
+    /// rankers is a choice of which of our records to displace. Counted and
+    /// stored, never refused, because refusing would tie a record's validity to
+    /// our tokenizer.
+    #[test]
+    fn a_keyword_key_no_word_of_its_name_hashes_to_is_counted_but_still_stored() {
+        let mut a = dht(44);
+        let mut b = dht(45);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(44, 4672);
+
+        let record = a.build_keyword_record("debian", [2u8; 16], [0u8; 32], 10, "ubuntu-24.iso");
+        let (_rid, store_bytes) = a.build_store(record.keyword_hash, record.data, record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+
+        assert!(
+            on_b.stored_record,
+            "the count is a measurement, so the record must still be accepted"
+        );
+        assert_eq!(b.keyword_key_off_name(), 1);
+
+        // A retransmit of the same signed bytes is the same attempt. The replay
+        // collapse sits above the count for exactly this reason: without it a
+        // storm would read as a publisher aiming thousands of times.
+        let on_b_again = b.handle_message(&store_bytes, a_addr, a_noise, 1001);
+        assert!(
+            on_b_again.store_replay_rejected,
+            "the identical signature is a replay"
+        );
+        assert_eq!(
+            b.keyword_key_off_name(),
+            1,
+            "a replay is not a second attempt"
+        );
     }
 
     #[test]

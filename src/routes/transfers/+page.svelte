@@ -3,7 +3,7 @@
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
@@ -12,10 +12,11 @@
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
+  import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
-  import { getPeerReputation, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
+  import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
     formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
@@ -25,6 +26,10 @@
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
+  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
+  import { serviceAvailableFor } from '$lib/webServices';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -704,6 +709,16 @@
   let selectedDownloadIds = $state<string[]>([]);
   let selectedDlIdSet = $derived(new Set(selectedDownloadIds));
   let lastClickedDlId = $state<string | null>(null);
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we — the search
+   * only ever asks that one connection (see `RELATED_SEARCH_METHOD`).
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
 
   // --- Uploads ---
   function isUploadFinished(t: Transfer): boolean {
@@ -797,17 +812,6 @@
   let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
   const KNOWN_POLL_INTERVAL_MS = 8000;
-  // Upper bound on Trust badges force-refreshed per poll. Each one is a
-  // backend command, not a local read, so this cannot scale with the
-  // 1,000-row display limit.
-  const KNOWN_REPUTATION_REFRESH_MAX = 100;
-  // Where the next poll's window starts. The budget above has to rotate
-  // rather than sit on the first hundred rows: this sweep is the only thing
-  // that ever populates `reputationMap` for the table, so a fixed window left
-  // every row past it showing "—" with a "Fetching…" tooltip forever, however
-  // long the tab stayed open. Rotating covers a full 1,000-row ledger in
-  // about eighty seconds while keeping each poll's cost flat.
-  let knownReputationCursor = 0;
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
@@ -868,27 +872,18 @@
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
       // Force-refresh Trust badges so manual bans / score changes appear
-      // without leaving the tab — but only for a bounded slice.
+      // without leaving the tab.
       //
-      // `getPeerReputation` is not a local read: each call is pushed onto the
-      // bounded network command channel and fails with `network_busy` when it
-      // is full. Forcing all 1,000 displayed rows every 8 seconds put ~1,000
-      // commands per cycle through the same channel that serves transfers,
-      // search and server operations, so unrelated actions intermittently
-      // failed with "Network busy". Chunking bounds concurrency, not volume.
+      // Every displayed row, every poll: `getPeerReputationBatch` is one
+      // command for the whole page, so the cost no longer scales with the row
+      // count and there is nothing left to ration. The rotating window this
+      // replaces existed only to bound a per-row fan-out, and its side effect
+      // was that rows outside the current slice sat on "—" with a "Fetching…"
+      // tooltip for up to eighty seconds.
       if (refreshBadges) {
         const hashes = displayedKnownClients.map((k) => k.user_hash);
         if (hashes.length > 0) {
-          const start = knownReputationCursor % hashes.length;
-          const window =
-            hashes.length <= KNOWN_REPUTATION_REFRESH_MAX
-              ? hashes
-              : [...hashes.slice(start), ...hashes.slice(0, start)].slice(
-                  0,
-                  KNOWN_REPUTATION_REFRESH_MAX,
-                );
-          knownReputationCursor = (start + window.length) % hashes.length;
-          void refreshReputations(window, true);
+          void refreshReputations(hashes, true);
         }
       }
     } catch (e) {
@@ -917,8 +912,6 @@
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
 
-  const REPUTATION_FETCH_CONCURRENCY = 16;
-
   async function refreshReputations(hashes: string[], force = false) {
     // Skip hashes currently in flight. Non-null cache entries are
     // re-fetched when `force` is set (Known Clients poll) so score /
@@ -929,31 +922,28 @@
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
-    // Chunked rather than one flat `Promise.all`: each call takes a slot in the
-    // backend's bounded network command channel, so an unbounded fan-out over a
-    // large credit ledger starves unrelated commands into "Network busy".
-    const results: (readonly [string, PeerReputationInfo | null])[] = [];
-    for (let i = 0; i < targets.length; i += REPUTATION_FETCH_CONCURRENCY) {
-      const chunk = targets.slice(i, i + REPUTATION_FETCH_CONCURRENCY);
-      results.push(
-        ...(await Promise.all(
-          chunk.map(async (h) => {
-            try {
-              return [h, await getPeerReputation(h)] as const;
-            } catch {
-              return [h, null] as const;
-            }
-          }),
-        )),
-      );
+    // One command for the whole set. Every answer comes from the same
+    // in-memory tracker, so the per-hash fan-out this replaces bought nothing
+    // and cost a slot in the backend's bounded command channel per row — which
+    // is what surfaced as unrelated actions failing with "Network busy" while
+    // this tab was open.
+    let fetched: Record<string, PeerReputationInfo | null> = {};
+    try {
+      fetched = await getPeerReputationBatch(targets);
+    } catch (e) {
+      // Leave the cache as it was; the poll retries. Clearing entries here
+      // would flash every badge back to "unknown" on one transient failure.
+      console.warn('Failed to refresh peer reputations:', e);
     }
     // Always clear in-flight markers — an early unmount return used to
     // leak hashes permanently blocked from future fetches.
-    for (const [h] of results) reputationInFlight.delete(h);
+    for (const h of targets) reputationInFlight.delete(h);
     if (!mounted) return;
+    // A hash the backend could not parse is absent from the response rather
+    // than null, so only assign what came back.
     const next = { ...reputationMap };
-    for (const [h, rep] of results) {
-      next[h] = rep;
+    for (const h of targets) {
+      if (h in fetched) next[h] = fetched[h];
     }
     reputationMap = next;
   }
@@ -1329,6 +1319,11 @@
     if (speedHistory.size > liveIds.size) {
       for (const id of Array.from(speedHistory.keys())) {
         if (!liveIds.has(id)) speedHistory.delete(id);
+      }
+    }
+    if (uploadTooltipCache.size > liveIds.size) {
+      for (const id of Array.from(uploadTooltipCache.keys())) {
+        if (!liveIds.has(id)) uploadTooltipCache.delete(id);
       }
     }
   });
@@ -1732,22 +1727,24 @@
   }
 
   function sourcesLabel(t: Transfer): string {
-    const active = t.active_sources || 0;
+    // eMule DownloadListCtrl: xx/yy+aa (zz) [max]
+    // xx = on-queue + downloading, yy = srclist size, zz = transferring.
+    const transferring = t.active_sources || 0;
     const queued = t.queued_sources || 0;
-    const current = active + queued;
-    if (!t.sources) {
-      // L11: if the backend reports 0 known sources but there's live
-      // activity (active/queued > 0), show what's live rather than an
-      // em-dash that disagrees with the tooltip.
-      return current > 0 ? `${current}` : '\u2014';
+    const current = transferring + queued;
+    const total = t.sources || 0;
+    if (!total && current === 0) {
+      return '\u2014';
     }
+    const yy = total || current;
     let label: string;
-    if (current > 0 && current !== t.sources) {
-      label = `${current}/${t.sources}`;
+    if (current !== yy) {
+      label = `${current}/${yy}`;
     } else {
-      label = `${t.sources}`;
+      label = `${yy}`;
     }
     if (t.a4af_sources > 0) label += `+${t.a4af_sources}`;
+    if (transferring > 0) label += ` (${transferring})`;
     if (t.max_sources > 0) label += ` [${t.max_sources}]`;
     return label;
   }
@@ -1794,13 +1791,44 @@
     return n;
   }
 
+  /** Memo for [`uploadPartsTooltip`], keyed by transfer id and invalidated by
+   *  the bitmaps it was built from.
+   *
+   *  The tooltip is a plain template expression, and `flushProgress` replaces
+   *  the row object on every coalesced progress batch, so it recomputed at
+   *  flush rate — two `slice` + `parseInt` per part, per visible upload row,
+   *  for a string that almost never changes (a 4 GB file is ~441 parts). The
+   *  bar beside it already memoizes the identical decode through `$derived` on
+   *  the bitmap strings; this gives the tooltip the same treatment. Pruned by
+   *  the `speedHistory` sweep below, which walks the same live-id set. */
+  const uploadTooltipCache: Map<
+    string,
+    { served?: string; peer?: string; total: number; text: string }
+  > = new Map();
+
   /** Tooltip for the upload parts bar: parts we've sent this session, plus the
    *  count the downloader already had (eMule `m_abyUpPartStatus`) when present. */
   function uploadPartsTooltip(t: Transfer): string {
     const total = t.up_part_count ?? 0;
+    const cached = uploadTooltipCache.get(t.id);
+    if (
+      cached
+      && cached.total === total
+      && cached.served === t.up_part_status
+      && cached.peer === t.up_peer_part_status
+    ) {
+      return cached.text;
+    }
     const base = m.transfers_parts({ have: countServedParts(t.up_part_status), total });
     const peerOnly = countPeerOnlyParts(t.up_peer_part_status, t.up_part_status, total);
-    return peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    const text = peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    uploadTooltipCache.set(t.id, {
+      served: t.up_part_status,
+      peer: t.up_peer_part_status,
+      total,
+      text,
+    });
+    return text;
   }
 
   function ulStatusLabel(t: Transfer): string {
@@ -1874,7 +1902,11 @@
   });
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
+  let ctxWebSub = $state(false);
   const CATEGORY_OPTIONS = ['None', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  // Empty until settings load, which is the honest default: the submenu then
+  // shows its "configure these in Settings" hint rather than a stale list.
+  let webServices = $derived($appSettings?.web_services ?? []);
 
   function onCtx(e: MouseEvent, t: Transfer, section: 'active' | 'completed' | 'upload') {
     e.preventDefault();
@@ -1883,20 +1915,17 @@
     closePaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 300 - margin));
-    ctxMenu = { x, y, transfer: t, section };
+    ctxWebSub = false;
+    // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
+    // keeps it on screen.
+    ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
   }
   function onKnownCtx(e: MouseEvent, client: KnownClient) {
     e.preventDefault();
     closeCtx();
     closeColumnMenu();
     closePaneCtx();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 180 - margin));
-    knownCtxMenu = { x, y, client };
+    knownCtxMenu = { x: e.clientX, y: e.clientY, client };
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
   /// It acts on the whole visible list, and it is the only place two of these
@@ -1914,13 +1943,10 @@
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 240 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 340 - margin));
-    paneCtxMenu = { x, y };
+    paneCtxMenu = { x: e.clientX, y: e.clientY };
   }
 
-  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; }
+  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
@@ -1991,7 +2017,11 @@
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
         case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
-        case 'remove': await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        // `markDownloadRemoved` before the store edit, as `removeTransfersBatch`
+        // does: a `getTransfers()` snapshot already in flight when the backend
+        // drops the row still carries it, and without the tombstone the next
+        // merge pushed the row straight back for a poll cycle.
+        case 'remove': markDownloadRemoved(t.id); await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
@@ -2001,6 +2031,18 @@
           } catch (e: unknown) {
             transferError = toErrorMsg(e);
           }
+          break;
+        }
+        // The backend reads the template from settings by index and does the
+        // substituting, so a peer-supplied file name never reaches a URL this
+        // renderer assembled. It also collects the native confirmation, which
+        // is where the user is told which third party is about to learn what
+        // they are looking for — so there is deliberately no prompt here.
+        case 'web_service': {
+          if (!extra) break;
+          const index = Number(extra);
+          if (!Number.isInteger(index)) break;
+          await openWebService(index, t.file_hash, t.file_name, t.total_size);
           break;
         }
         case 'preview': await previewFile(t.id); break;
@@ -2022,6 +2064,23 @@
         }
         case 'paste_link': {
           await pasteLinksFromClipboard();
+          break;
+        }
+        case 'find_related':
+        case 'find_related_selected': {
+          // eMule's menu item acts on the whole selection — `DownloadListCtrl`
+          // hands `SearchRelatedFiles` its `selectedList` — and one co-share
+          // request can name several hashes. The clicked row leads, because the
+          // plan derives its keyword probes from the first seed's filename.
+          const alsoSelected =
+            action === 'find_related_selected'
+              ? selectedBatchTransfers.filter((s) => s.id !== t.id)
+              : [];
+          // Navigates to Search on success, so nothing after this runs here.
+          await startRelatedSearch([
+            { hash: t.file_hash, name: t.file_name },
+            ...alsoSelected.map((s) => ({ hash: s.file_hash, name: s.file_name })),
+          ]);
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
@@ -2238,22 +2297,21 @@
     }
   }
 
+  /** Ask every connected network for this file's sources.
+   *
+   *  The reply says which networks the ask reached, not what they found: each
+   *  one answers on its own schedule, and its answer arrives as a
+   *  `transfer:source-search` event that replaces the status below ("KAD found
+   *  3 sources", "Server returned no sources") and as sources on the row. So a
+   *  network that is down is reported here, once, and never waited on. */
   async function runFindSourcesWithStatus(t: Transfer): Promise<void> {
-    searchStatus.set(t.id, m.transfers_src_kad_search());
+    searchStatus.set(t.id, m.transfers_src_asking());
     searchStatus = new Map(searchStatus);
-    const found = await findSources(t.file_hash, t.total_size);
-    if (found.length > 0) {
-      searchFoundIds.add(t.id);
-      searchStatus.set(
-        t.id,
-        found.length === 1
-          ? m.transfers_src_kad_found_one()
-          : m.transfers_src_kad_found_other({ count: found.length }),
-      );
-    } else if (!searchFoundIds.has(t.id)) {
-      searchStatus.set(t.id, m.transfers_src_kad_empty());
+    const ask = await findSources(t.id, t.file_hash, t.total_size);
+    if (!ask.kad && !ask.ember && !ask.server && !ask.server_udp) {
+      searchStatus.set(t.id, m.transfers_src_asking_none());
+      searchStatus = new Map(searchStatus);
     }
-    searchStatus = new Map(searchStatus);
   }
 
   /** One footer action at a time. Pause and Stop in particular are slow enough
@@ -2803,12 +2861,7 @@
     event.stopPropagation();
     closeCtx();
     closePaneCtx();
-    const margin = 8;
-    columnMenu = {
-      table,
-      x: Math.max(margin, Math.min(event.clientX, window.innerWidth - 240 - margin)),
-      y: Math.max(margin, Math.min(event.clientY, window.innerHeight - 360 - margin)),
-    };
+    columnMenu = { table, x: event.clientX, y: event.clientY };
   }
 
   function canDragColumn(table: TableKey, columnKey: string): boolean {
@@ -3120,12 +3173,13 @@
   }
 
   function sourcesTooltip(t: Transfer): string {
-    const active = t.active_sources || 0;
+    const transferring = t.active_sources || 0;
     const queued = t.queued_sources || 0;
-    const current = active + queued;
+    const current = transferring + queued;
     if (!t.sources && current === 0) return m.transfers_sources_tooltip_none();
     const parts: string[] = [];
-    parts.push(m.transfers_sources_tooltip_active({ count: active }));
+    parts.push(m.transfers_sources_tooltip_useful({ count: current }));
+    parts.push(m.transfers_sources_tooltip_active({ count: transferring }));
     parts.push(m.transfers_sources_tooltip_queued({ count: queued }));
     parts.push(m.transfers_sources_tooltip_total({ count: t.sources || current }));
     if (t.ember_sources > 0) parts.push(m.transfers_sources_tooltip_ember({ count: t.ember_sources }));
@@ -4562,17 +4616,56 @@
 {#if columnMenu}
   {@const menu = columnMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu column-menu" style="left: {menu.x}px; top: {menu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <div class="column-menu-title">{getColumnMenuTitle(menu.table)}</div>
+  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: menu.x, y: menu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-label" role="presentation">{getColumnMenuTitle(menu.table)}</div>
     {#each getColumnMenuColumns(menu.table) as column (column.key)}
-      <button class="ctx-item" onclick={() => toggleColumnVisibility(menu.table, column.key)}>
-        {isColumnHidden(menu.table, column.key) ? '☐' : '☑'} {column.label}
-      </button>
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!isColumnHidden(menu.table, column.key)}
+        onclick={() => toggleColumnVisibility(menu.table, column.key)}
+      >{column.label}</button>
     {/each}
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => resetColumnLayout(menu.table)}>{m.transfers_reset_columns()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" onclick={() => resetColumnLayout(menu.table)}>{m.transfers_reset_columns()}</button>
   </div>
 {/if}
+
+<!-- eMule's right-click → Web services, shared by the active and completed
+     download menus. Rendered even with nothing configured, because a submenu
+     that only appears once you have already found the setting cannot tell you
+     the feature exists. Uploads are left out: the question it answers is about
+     a file you are trying to get, and a file you are sharing is the Library's. -->
+{#snippet webServicesSubmenu()}
+  <div class="ctx-submenu-wrap" role="presentation">
+    <button
+      class="ctx-item ctx-sub"
+      class:ctx-sub-open={ctxWebSub}
+      role="menuitem"
+      aria-haspopup="menu"
+      aria-expanded={ctxWebSub}
+      onclick={() => (ctxWebSub = !ctxWebSub)}
+    >{m.webservices_ctx_menu()}</button>
+    {#if ctxWebSub}
+      {@const hash = ctxTransfer?.file_hash ?? ''}
+      <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+        {#each webServices as service, index (service.url)}
+          {@const usable = serviceAvailableFor(service.url, hash)}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            disabled={!usable}
+            title={usable ? service.url : m.webservices_ctx_no_hash()}
+            onclick={() => ctxAction('web_service', String(index))}
+          ><bdi dir="auto">{service.name}</bdi></button>
+        {/each}
+        {#if webServices.length === 0}
+          <span class="ctx-label" role="presentation">{m.webservices_ctx_none()}</span>
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/snippet}
 
 <!-- Context Menu -->
 {#if paneCtxMenu}
@@ -4580,87 +4673,133 @@
        list, matching `globalDownloadTargets` — an "all" that reaches rows the
        user cannot see is how people lose downloads they meant to keep. -->
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu" style="left: {paneCtxMenu.x}px; top: {paneCtxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handlePauseAll(); }}>{m.transfers_pause_all()}</button>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleResumeAll(); }}>{m.transfers_resume_all()}</button>
-    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleStopAll(); }}>{m.transfers_stop_all()}</button>
-    <button class="ctx-item danger" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
-    <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: paneCtxMenu.x, y: paneCtxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handlePauseAll(); }}>{m.transfers_pause_all()}</button>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleResumeAll(); }}>{m.transfers_resume_all()}</button>
+    <button class="ctx-item" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleStopAll(); }}>{m.transfers_stop_all()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
       {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
     </button>
-    <button class="ctx-item" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
+    <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
   </div>
 {/if}
 
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-header" role="presentation">
+      <bdi dir="auto">{ctxTransfer.file_name}</bdi>
+    </div>
     {#if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
       {/if}
       {#if canStop(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
       {/if}
       {#if canResume(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
-      <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('toggle_preview_prio')}>
-        {ctxTransfer.preview_priority ? '✓ ' : ''}{m.transfers_ctx_preview_priority()}
-      </button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!!ctxTransfer.preview_priority}
+        onclick={() => ctxAction('toggle_preview_prio')}
+      >{m.transfers_ctx_preview_priority()}</button>
       {#if isArchive(ctxTransfer)}
-        <button class="ctx-item" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
+        <button class="ctx-item" role="menuitem" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
           {recoveringIds.has(ctxTransfer.id) ? m.transfers_ctx_recovering() : m.transfers_ctx_recover_archive()}
         </button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
-      <div class="ctx-sep"></div>
-      <div class="ctx-submenu-wrap">
-        <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>
-          {m.transfers_ctx_priority()} ▶
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
+           a `role="menu"` may only own menuitems, so a plain div between the two
+           drops this entry out of the menu's structure entirely. -->
+      <div class="ctx-submenu-wrap" role="presentation">
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxPrioritySub}
+          role="menuitem"
+          aria-haspopup="menu"
+          aria-expanded={ctxPrioritySub}
+          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+        >
+          {m.transfers_ctx_priority()}
+          <span class="ctx-hint">{priorityLabel(ctxTransfer.priority)}</span>
         </button>
         {#if ctxPrioritySub}
-          <div class="ctx-submenu">
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each ['verylow', 'low', 'normal', 'high', 'auto', 'release'] as prio}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={ctxTransfer.priority === prio}
+                onclick={() => ctxAction('priority', prio)}
+              >{priorityLabel(prio)}</button>
+            {/each}
           </div>
         {/if}
       </div>
-      <div class="ctx-submenu-wrap">
-        <button class="ctx-item has-sub" onclick={() => ctxCategorySub = !ctxCategorySub}>
-          {m.transfers_ctx_category()} ▶
+      <div class="ctx-submenu-wrap" role="presentation">
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxCategorySub}
+          role="menuitem"
+          aria-haspopup="menu"
+          aria-expanded={ctxCategorySub}
+          onclick={() => ctxCategorySub = !ctxCategorySub}
+        >
+          {m.transfers_ctx_category()}
+          <span class="ctx-hint">{categoryLabel(ctxTransfer.category || 'None')}</span>
         </button>
         {#if ctxCategorySub}
-          <div class="ctx-submenu">
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             {#each CATEGORY_OPTIONS as cat}
               <button
                 class="ctx-item"
-                class:ctx-active={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
+                role="menuitemradio"
+                aria-checked={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
                 onclick={() => ctxAction('set_category', cat)}
               >{categoryLabel(cat)}</button>
             {/each}
           </div>
         {/if}
       </div>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
+      <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
+      {@render webServicesSubmenu()}
+      {#if selectedDownloadCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          onclick={() => ctxAction('find_related_selected')}
+        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
+      {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section === 'completed'}
       <!--
         D26: also offer Open File for failed downloads that have produced a
@@ -4668,25 +4807,49 @@
         `open_file` command returns an error that surfaces via transferError.
       -->
       {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
-        <button class="ctx-item" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <div class="ctx-sep"></div>
-      <button class="ctx-item danger" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
+      {@render webServicesSubmenu()}
+      {#if selectedDownloadCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          onclick={() => ctxAction('find_related_selected')}
+        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
+      {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
       <!-- Upload context menu -->
       {#if uploadFriendHash && ctxTransfer.client_software?.startsWith('Ember') && !friendHashSet.has(uploadFriendHash.toLowerCase())}
-        <button class="ctx-item" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
-        <div class="ctx-sep"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
+        <div class="ctx-sep" role="separator"></div>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related')}
+      >{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
-        <div class="ctx-sep"></div>
-        <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
       {/if}
     {/if}
   </div>
@@ -4695,25 +4858,34 @@
 {#if knownCtxMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
-    class="context-menu"
-    style="left: {knownCtxMenu.x}px; top: {knownCtxMenu.y}px;"
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    use:ctxMenuPosition={{ x: knownCtxMenu.x, y: knownCtxMenu.y }}
     onclick={(e) => e.stopPropagation()}
   >
-    <button class="ctx-item" onclick={() => knownCtxAction('copy_user_hash')}>
+    <div class="ctx-header" role="presentation">
+      <bdi dir="auto">
+        {knownCtxMenu.client.nickname
+          || knownCtxMenu.client.last_known_ip
+          || knownCtxMenu.client.user_hash.slice(0, 12)}
+      </bdi>
+    </div>
+    <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('copy_user_hash')}>
       {m.transfers_ctx_copy_user_hash()}
     </button>
     {#if knownCtxMenu.client.ember_hash}
-      <button class="ctx-item" onclick={() => knownCtxAction('copy_ember_hash')}>
+      <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('copy_ember_hash')}>
         {m.transfers_ctx_copy_ember_hash()}
       </button>
       {#if !friendHashSet.has(knownCtxMenu.client.ember_hash.toLowerCase())}
-        <button class="ctx-item" onclick={() => knownCtxAction('add_friend')}>
+        <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('add_friend')}>
           {m.transfers_ctx_add_friend()}
         </button>
       {/if}
     {/if}
-    <div class="ctx-sep"></div>
-    <button class="ctx-item danger" onclick={() => knownCtxAction('ban_user')}>
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
       {m.transfers_ctx_ban_user()}
     </button>
   </div>
@@ -4780,7 +4952,7 @@
     ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); for (const id of ids) markDownloadRemoved(id); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->
@@ -5732,66 +5904,7 @@
     flex-shrink: 0;
   }
 
-  /* --- Context Menu --- */
-  .context-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 4px;
-    min-width: 180px;
-  }
-  .column-menu {
-    min-width: 220px;
-  }
-  .column-menu-title {
-    padding: 4px 14px 6px;
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .ctx-item {
-    display: flex;
-    width: 100%;
-    text-align: left;
-    padding: 4px 12px;
-    font-size: 11px;
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-  }
-  .ctx-item:hover:not(:disabled) { background: var(--bg-hover); }
-  .ctx-item:disabled { opacity: 0.5; cursor: default; }
-  .ctx-item.danger { color: var(--danger); }
-  .ctx-item.has-sub { display: flex; justify-content: space-between; }
-  .ctx-active { font-weight: 700; }
-  .ctx-sep {
-    height: 1px;
-    background: var(--border);
-    margin: 3px 0;
-  }
-  .ctx-submenu-wrap { position: relative; }
-  .ctx-submenu {
-    position: absolute;
-    left: 100%;
-    top: -4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 4px;
-    min-width: 100px;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   /* --- Expanded source rows (compact, eMule-like) --- */
   .dl-row.expanded {

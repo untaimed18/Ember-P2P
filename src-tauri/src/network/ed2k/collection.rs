@@ -214,10 +214,8 @@ impl Collection {
                 ));
             }
             let line = line.trim();
-            if line.starts_with("ed2k://|file|") {
-                if let Some(cf) = parse_ed2k_link(line) {
-                    files.push(cf);
-                }
+            if let Some(cf) = parse_ed2k_link(line) {
+                files.push(cf);
             }
         }
 

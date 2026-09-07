@@ -2,7 +2,9 @@
   "description": [
     "Shared source of truth for the search-result merge rules that the frontend",
     "and the backend both implement: `resultKey`/`result_key`,",
-    "`combineOrigin`/`combine_origin` and the MAX_PLAUSIBLE_SOURCES ceiling.",
+    "`combineOrigin`/`combine_origin`, `pickEmberDigest`/`pick_ember_digest`, the",
+    "MAX_PLAUSIBLE_SOURCES ceiling, the MAX_SOURCE_ADDRS cap, and the fields both",
+    "sides resolve by keeping the first non-empty value.",
     "src/lib/stores/search.ts merges streamed batches per tab, src-tauri/src/search/merge.rs",
     "merges the lists it emits, and the two were kept aligned only by a comment.",
     "Checked by scripts/merge-contract.test.mjs and by the fixture tests in merge.rs.",
@@ -15,7 +17,7 @@
     "ordering there (JS sorts by UTF-16 code unit, Rust by byte)."
   ],
   "max_plausible_sources": 65535,
-  "max_source_addrs": 500,
+  "max_source_addrs": 64,
   "result_key_cases": [
     {
       "name": "the ed2k hash wins over every fallback",
@@ -79,6 +81,73 @@
     { "a": "Ember · KAD", "b": "KAD", "combined": "Ember · KAD" },
     { "a": "KAD", "b": "KAD · Server", "combined": "KAD · Server" },
     { "a": "Server · UDP", "b": "Local · Notes", "combined": "Local · Notes · Server · UDP" }
+  ],
+  "first_non_empty_fields": {
+    "note": [
+      "Fields both merges resolve by keeping the first non-empty value. They are",
+      "inline expressions rather than named functions, so they cannot be lifted and",
+      "run the way resultKey and pickEmberDigest are; the test asserts the shape of",
+      "each side instead, which is the same technique the MAX_PLAUSIBLE_SOURCES",
+      "clamp check uses. Listed because file_type, rating and comment silently",
+      "resolved in OPPOSITE directions for a long time -- Rust kept the existing",
+      "value, the store took the incoming one -- so the same two rows merged",
+      "differently depending on which layer merged them.",
+      "aich_hash is here because it is a recovery hash a download consumes, it sits",
+      "one line from ember_file_hash (which has its own rule and its own cases), and",
+      "nothing but a comment on each side held the two together."
+    ],
+    "fields": ["file_type", "rating", "comment", "aich_hash"]
+  },
+  "ember_digest_cases": [
+    {
+      "name": "an empty row takes the digest the network offered",
+      "existing_digest": "",
+      "existing_origin": "Ember",
+      "incoming_digest": "ab12",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a row with a digest keeps it when the other side has none",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember",
+      "incoming_digest": "",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a later Ember batch replaces an earlier slice-local plurality",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember",
+      "incoming_digest": "cd34",
+      "chosen": "cd34"
+    },
+    {
+      "name": "the library's own digest outranks a network claim",
+      "existing_digest": "ab12",
+      "existing_origin": "Local",
+      "incoming_digest": "cd34",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a row the library already contributed to is still protected",
+      "existing_digest": "ab12",
+      "existing_origin": "Ember · Local",
+      "incoming_digest": "cd34",
+      "chosen": "ab12"
+    },
+    {
+      "name": "a KAD row that somehow carries one is treated like any other claim",
+      "existing_digest": "ab12",
+      "existing_origin": "KAD",
+      "incoming_digest": "cd34",
+      "chosen": "cd34"
+    },
+    {
+      "name": "nothing on either side stays empty",
+      "existing_digest": "",
+      "existing_origin": "KAD",
+      "incoming_digest": "",
+      "chosen": ""
+    }
   ],
   "clamp_source_count_cases": [
     { "count": 0, "clamped": 0 },

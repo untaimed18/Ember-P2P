@@ -86,10 +86,237 @@ pub const MAX_STORE_BATCH_RECORDS: usize = 64;
 // the bitmap would turn an attacker-controlled count into a shift overflow.
 const _: () = assert!(MAX_STORE_BATCH_RECORDS <= u64::BITS as usize);
 
-/// Maximum keys in a FIND_VALUE request.
+/// Maximum keys a FIND_VALUE names in its count-prefixed key run.
+///
+/// Frozen at eight, and it has to stay frozen: a peer refuses a higher count at
+/// decode and answers nothing at all, so raising it would cost the whole query
+/// timeout against every build that predates the change. Keys past this ride in
+/// the extension block instead — see [`MAX_FIND_VALUE_EXTRA_KEYS`] — which an
+/// older peer ignores, so a long query narrows on new peers and is merely
+/// unnarrowed on old ones.
 pub const MAX_FIND_VALUE_KEYS: usize = 8;
+
+/// Keyword hashes the extension block may carry past the eight above.
+///
+/// Bounded by the one-byte TLV length (15 × 16 = 240 bytes) and, well before
+/// that, by there being no query worth twenty-three distinct keywords.
+pub const MAX_FIND_VALUE_EXTRA_KEYS: usize = 15;
+
+/// Every key one FIND_VALUE can name, across both runs. The responder holds the
+/// merged set to this so a peer cannot buy an unbounded intersection scan.
+pub const MAX_FIND_VALUE_KEYS_TOTAL: usize = MAX_FIND_VALUE_KEYS + MAX_FIND_VALUE_EXTRA_KEYS;
+
 /// Maximum records in a FOUND_VALUE response.
 pub const MAX_FOUND_VALUE_RECORDS: usize = 300;
+
+/// Sentinel introducing the optional trailing block on a `FIND_VALUE` payload.
+///
+/// The block is *additive*: the `FIND_VALUE` decoder has always required only a
+/// minimum length and read its fields at fixed offsets, so a build that predates
+/// this ignores whatever follows `start_position`. That is what lets the overlay
+/// gain query constraints without moving [`EMBER_DHT_VERSION`] — and the version
+/// byte is range-checked on receive, so moving it would have *partitioned* the
+/// network rather than degrading gracefully.
+///
+/// The magic is not needed for that compatibility; it is here so the block is
+/// self-describing and so a future sender appending something else cannot have
+/// its bytes read as constraints.
+const VALUE_EXT_MAGIC: u16 = 0xE5C1;
+
+const VALUE_EXT_TAG_MIN_SIZE: u8 = 0x01;
+const VALUE_EXT_TAG_MAX_SIZE: u8 = 0x02;
+const VALUE_EXT_TAG_FILE_TYPE: u8 = 0x03;
+const VALUE_EXT_TAG_EXTRA_KEYS: u8 = 0x04;
+const VALUE_EXT_TAG_FILE_EXTENSION: u8 = 0x05;
+
+/// Longest eMule file-type string (`EmuleCollection` is 15).
+const MAX_VALUE_FILE_TYPE_BYTES: usize = 16;
+
+/// Longest file extension a constraint may name. Generous next to real ones
+/// (`webm`, `flac`); the point is a bound, not a taxonomy.
+const MAX_VALUE_FILE_EXTENSION_BYTES: usize = 16;
+
+/// What a searcher will accept, evaluated by the responder against each record
+/// before it packs a page.
+///
+/// This is the half of KAD's arrangement Ember was missing. KAD encodes the
+/// query's constraints into `SearchKeyReq` and the responder applies them before
+/// truncating to its page; Ember sent keyword hashes and a paging offset, so a
+/// narrow search spent its whole result budget on records it then discarded at
+/// emit while the matching files sat behind peers the walk never reached. A
+/// client-side filter cannot recover what the remote already truncated away.
+///
+/// Availability is deliberately absent. KAD can filter on it because its keyword
+/// entries carry a publisher-claimed `TAG_SOURCES`; an Ember record carries no
+/// source count, and the number the search page shows is the count of *distinct
+/// publishers across the network*, which no single responder can see. A
+/// constraint no responder could evaluate honestly is worse than none.
+///
+/// Every field is advisory: a responder may ignore the block (an older build
+/// does), so the searcher keeps its own filter at emit time as defence in depth.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValueConstraints {
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    /// eMule file-type string (`Audio`, `Video`, …), inferred by both sides from
+    /// the record's file name via `search::index::infer_file_type`.
+    pub file_type: Option<String>,
+    /// A single file extension, without the dot and lowercased.
+    ///
+    /// This is how Ember answers "search by extension" without making the
+    /// extension a *keyword*. `MD4("mp3")` would be the hottest key on the
+    /// network — every mp3 anyone shares competing for one key's thousand
+    /// records, on the twenty nodes nearest it, where a full key refuses new
+    /// records rather than evicting incumbents. As a constraint it costs no key,
+    /// no publish traffic and no hotspot: the searcher still walks a real word and
+    /// the responder drops everything that is not an `.mp3` before it packs.
+    pub file_extension: Option<String>,
+    /// Keyword hashes past the eight the count-prefixed run can name.
+    pub extra_keys: Vec<[u8; 16]>,
+}
+
+impl ValueConstraints {
+    /// True when there is nothing to send, in which case the payload stays
+    /// byte-for-byte what it was before the block existed.
+    pub fn is_empty(&self) -> bool {
+        self.min_size.is_none()
+            && self.max_size.is_none()
+            && self.file_type.is_none()
+            && self.file_extension.is_none()
+            && self.extra_keys.is_empty()
+    }
+}
+
+fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
+    if constraints.is_empty() {
+        return;
+    }
+    let mut tlv: Vec<u8> = Vec::new();
+    let mut push = |tag: u8, value: &[u8]| {
+        // A TLV length is one byte, so anything longer cannot be expressed.
+        // Every writer below is already inside that bound; this keeps the
+        // guarantee local rather than assuming it.
+        if let Ok(len) = u8::try_from(value.len()) {
+            tlv.push(tag);
+            tlv.push(len);
+            tlv.extend_from_slice(value);
+        }
+    };
+    if let Some(min) = constraints.min_size {
+        push(VALUE_EXT_TAG_MIN_SIZE, &min.to_le_bytes());
+    }
+    if let Some(max) = constraints.max_size {
+        push(VALUE_EXT_TAG_MAX_SIZE, &max.to_le_bytes());
+    }
+    if let Some(file_type) = &constraints.file_type {
+        let bytes = file_type.as_bytes();
+        push(
+            VALUE_EXT_TAG_FILE_TYPE,
+            &bytes[..bytes.len().min(MAX_VALUE_FILE_TYPE_BYTES)],
+        );
+    }
+    if let Some(extension) = &constraints.file_extension {
+        let bytes = extension.as_bytes();
+        push(
+            VALUE_EXT_TAG_FILE_EXTENSION,
+            &bytes[..bytes.len().min(MAX_VALUE_FILE_EXTENSION_BYTES)],
+        );
+    }
+    if !constraints.extra_keys.is_empty() {
+        let mut keys: Vec<u8> = Vec::with_capacity(constraints.extra_keys.len() * 16);
+        for key in constraints
+            .extra_keys
+            .iter()
+            .take(MAX_FIND_VALUE_EXTRA_KEYS)
+        {
+            keys.extend_from_slice(key);
+        }
+        push(VALUE_EXT_TAG_EXTRA_KEYS, &keys);
+    }
+    let Ok(len) = u16::try_from(tlv.len()) else {
+        return;
+    };
+    buf.write_u16::<LittleEndian>(VALUE_EXT_MAGIC).unwrap();
+    buf.write_u16::<LittleEndian>(len).unwrap();
+    buf.extend_from_slice(&tlv);
+}
+
+/// Read the optional block trailing a `FIND_VALUE` payload.
+///
+/// Lenient by design: anything unrecognised, truncated or mis-tagged yields no
+/// constraints, which makes us answer unfiltered — exactly what a peer that has
+/// never heard of the block does, and always a correct answer. Failing the frame
+/// instead would turn a future sender's additions into a refusal.
+fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
+    let mut out = ValueConstraints::default();
+    if rest.len() < 4 || u16::from_le_bytes([rest[0], rest[1]]) != VALUE_EXT_MAGIC {
+        return out;
+    }
+    let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+    let Some(tlv) = rest.get(4..4 + len) else {
+        return out;
+    };
+    let mut i = 0usize;
+    while i + 2 <= tlv.len() {
+        let tag = tlv[i];
+        let value_len = tlv[i + 1] as usize;
+        let Some(value) = tlv.get(i + 2..i + 2 + value_len) else {
+            break;
+        };
+        match tag {
+            VALUE_EXT_TAG_MIN_SIZE => {
+                if let Ok(bytes) = <[u8; 8]>::try_from(value) {
+                    out.min_size = Some(u64::from_le_bytes(bytes));
+                }
+            }
+            VALUE_EXT_TAG_MAX_SIZE => {
+                if let Ok(bytes) = <[u8; 8]>::try_from(value) {
+                    out.max_size = Some(u64::from_le_bytes(bytes));
+                }
+            }
+            VALUE_EXT_TAG_FILE_TYPE => {
+                // Publisher-supplied text that decides a comparison, so it is
+                // held to the same length cap the encoder applies and has to be
+                // real UTF-8 rather than lossy — a mangled label would silently
+                // match nothing instead of being ignored.
+                if value.len() <= MAX_VALUE_FILE_TYPE_BYTES {
+                    if let Ok(text) = std::str::from_utf8(value) {
+                        if !text.is_empty() {
+                            out.file_type = Some(text.to_string());
+                        }
+                    }
+                }
+            }
+            VALUE_EXT_TAG_FILE_EXTENSION => {
+                // Normalised here rather than trusted: the responder compares it
+                // against an extension it lowercases off a file name, and a
+                // constraint arriving as `MP3` or `.mp3` would silently match
+                // nothing instead of being obviously wrong.
+                if value.len() <= MAX_VALUE_FILE_EXTENSION_BYTES {
+                    if let Ok(text) = std::str::from_utf8(value) {
+                        let text = text.trim_start_matches('.').to_ascii_lowercase();
+                        if !text.is_empty() {
+                            out.file_extension = Some(text);
+                        }
+                    }
+                }
+            }
+            VALUE_EXT_TAG_EXTRA_KEYS => {
+                for chunk in value.chunks_exact(16).take(MAX_FIND_VALUE_EXTRA_KEYS) {
+                    if let Ok(key) = <[u8; 16]>::try_from(chunk) {
+                        out.extra_keys.push(key);
+                    }
+                }
+            }
+            // An unknown tag is skipped by its own length, which is the point of
+            // the encoding: a newer peer may name things this build has no
+            // opinion about.
+            _ => {}
+        }
+        i += 2 + value_len;
+    }
+    out
+}
 
 /// Bytes a signed frame adds around its payload: the 22-byte header, the
 /// 32-byte sender public key, the 2-byte payload length, and the 64-byte
@@ -287,11 +514,17 @@ pub struct BatchedRecord {
 /// Payload variants for each message type.
 #[derive(Debug, Clone)]
 pub enum DhtPayload {
-    Ping,
+    Ping {
+        /// The wire versions the sender says it can decode, when it said so.
+        /// `None` is a build predating the block — every peer today — and
+        /// means "assume `EMBER_DHT_VERSION` and nothing else".
+        versions: Option<VersionRange>,
+    },
     /// Optional observed address of the ping sender (slice 19). Empty
     /// payload decodes as `None` for backward compatibility.
     Pong {
         observed: Option<SocketAddr>,
+        versions: Option<VersionRange>,
     },
     FindNode {
         target: EmberNodeId,
@@ -356,6 +589,10 @@ pub enum DhtPayload {
         /// entry across pages. That is the same guarantee a Kademlia walk gives
         /// for contacts, and the searcher dedups by blob hash regardless.
         start_position: u16,
+        /// What the searcher is willing to receive, so the responder can drop
+        /// the rest *before* it packs a page. Empty when the search carried no
+        /// filters, in which case nothing is written to the wire at all.
+        constraints: ValueConstraints,
     },
     FoundValue {
         key: [u8; 16],
@@ -551,6 +788,99 @@ pub fn unsupported_dht_version(data: &[u8]) -> Option<u8> {
     }
 }
 
+/// The span of wire versions a peer says it can decode.
+///
+/// The gap this closes: the version byte says what a frame *is*, never what its
+/// sender could have accepted. So a change to the shape of an existing frame
+/// partitions the overlay on the day it ships — the other side is the one who
+/// refuses, and it is running the old range — and lowering
+/// [`EMBER_DHT_MIN_VERSION`] only ever helps a build that already speaks the
+/// higher number. Both v3 and v4 had to be flag days for exactly this reason.
+///
+/// Knowing the range lets the *sender* decide, one peer at a time, which is the
+/// half that was missing: a future v5 frame can be sent only to peers that said
+/// they can read it, with v4 for everyone else, and no flag day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl VersionRange {
+    /// Whether `version` is inside the range the peer advertised.
+    pub fn accepts(&self, version: u8) -> bool {
+        version >= self.min && version <= self.max
+    }
+}
+
+/// What this build advertises. Exactly the range [`decode_message`] enforces,
+/// so the claim cannot drift from the behaviour.
+pub const OUR_VERSION_RANGE: VersionRange = VersionRange {
+    min: EMBER_DHT_MIN_VERSION,
+    max: EMBER_DHT_VERSION,
+};
+
+/// TLV tag for [`VersionRange`] in the block trailing a `PING` or `PONG`.
+const VERSION_RANGE_TAG: u8 = 0x01;
+const VERSION_RANGE_VALUE_LEN: u8 = 2;
+
+/// Append the tag/len/value block advertising `range`.
+///
+/// Additive on the same terms as the `FIND_VALUE` constraint block and a keyword
+/// record's media: it goes where no existing decoder looks. `MSG_PING` discards
+/// its payload entirely, and `MSG_PONG` reads its address through
+/// [`decode_socket_addr`], which checks only a minimum length and reports what
+/// it consumed — so a v4 build reads both frames exactly as it does today and
+/// ignores these bytes. The version byte therefore must *not* move for this; if
+/// it did, the peers this is meant to reach would refuse the frame carrying it.
+///
+/// Tag/len rather than two bare bytes so a later capability can ride the same
+/// block. A decoder skips a tag it does not know, which is the property that
+/// makes the second addition as cheap as this one.
+fn encode_version_block(range: &VersionRange, buf: &mut Vec<u8>) {
+    buf.push(VERSION_RANGE_TAG);
+    buf.push(VERSION_RANGE_VALUE_LEN);
+    buf.push(range.min);
+    buf.push(range.max);
+}
+
+/// Read a [`VersionRange`] out of the trailing block, if it carries one.
+///
+/// `None` for absent, truncated or nonsensical — all three mean the same thing
+/// to a caller, which is "assume nothing about this peer beyond the frame it
+/// just sent". Deliberately not an error: the block is advisory, and refusing a
+/// frame over it would make an optional field load-bearing.
+fn decode_version_block(data: &[u8]) -> Option<VersionRange> {
+    let mut at = 0usize;
+    // Two bytes for the tag and length, or there is no further block to read.
+    while at + 2 <= data.len() {
+        let tag = data[at];
+        let len = data[at + 1] as usize;
+        let value = at + 2;
+        let end = value.checked_add(len)?;
+        if end > data.len() {
+            // A block claiming more than it carries. Nothing further can be
+            // trusted to start at a tag boundary, so stop rather than resync.
+            return None;
+        }
+        if tag == VERSION_RANGE_TAG {
+            if len != VERSION_RANGE_VALUE_LEN as usize {
+                return None;
+            }
+            let (min, max) = (data[value], data[value + 1]);
+            // Version 0 is not a version, and an inverted range is not a range.
+            // Either means a peer we should treat as un-advertised rather than
+            // one we believe about a span it cannot have meant.
+            if min == 0 || min > max {
+                return None;
+            }
+            return Some(VersionRange { min, max });
+        }
+        at = end;
+    }
+    None
+}
+
 /// Whether an unsupported version byte means the sender is ahead of this build.
 ///
 /// [`unsupported_dht_version`] only returns `Some` for a non-zero byte outside
@@ -695,7 +1025,9 @@ pub fn build_ping(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::Ping,
+        payload: DhtPayload::Ping {
+            versions: Some(OUR_VERSION_RANGE),
+        },
         signature: [0u8; 64], // filled by encode_message
     }
 }
@@ -710,6 +1042,7 @@ pub fn build_pong(sender_id: EmberNodeId, request_id: u32, observed: SocketAddr)
         sender_pub_key: None,
         payload: DhtPayload::Pong {
             observed: Some(observed),
+            versions: Some(OUR_VERSION_RANGE),
         },
         signature: [0u8; 64],
     }
@@ -1048,6 +1381,7 @@ pub fn build_find_value(
     request_id: u32,
     keys: Vec<[u8; 16]>,
     start_position: u16,
+    constraints: ValueConstraints,
 ) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
@@ -1058,6 +1392,7 @@ pub fn build_find_value(
         payload: DhtPayload::FindValue {
             keys,
             start_position,
+            constraints,
         },
         signature: [0u8; 64],
     }
@@ -1093,15 +1428,28 @@ pub fn build_found_value(
 
 fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     match payload {
-        DhtPayload::Ping => Vec::new(),
-        DhtPayload::Pong { observed } => match observed {
-            Some(addr) => {
-                let mut buf = Vec::with_capacity(19);
-                encode_socket_addr(addr, &mut buf);
-                buf
+        DhtPayload::Ping { versions } => {
+            let mut buf = Vec::new();
+            if let Some(range) = versions {
+                encode_version_block(range, &mut buf);
             }
-            None => Vec::new(),
-        },
+            buf
+        }
+        DhtPayload::Pong { observed, versions } => {
+            let mut buf = Vec::with_capacity(19);
+            if let Some(addr) = observed {
+                encode_socket_addr(addr, &mut buf);
+                // Only behind an address: the block trails the fields a reader
+                // parses at fixed offsets, and with no address there are none —
+                // an older build would read the tag byte as an address type and
+                // reject the whole frame. A PONG without an observed address is
+                // the pre-slice-19 shape, so it stays byte-for-byte itself.
+                if let Some(range) = versions {
+                    encode_version_block(range, &mut buf);
+                }
+            }
+            buf
+        }
         DhtPayload::FindNode { target } => target.0.to_vec(),
         DhtPayload::FoundNode { contacts }
         | DhtPayload::AnnouncePeer { contacts }
@@ -1157,6 +1505,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
         DhtPayload::FindValue {
             keys,
             start_position,
+            constraints,
         } => {
             let mut buf = Vec::with_capacity(1 + keys.len() * 16 + 2);
             // Same reasoning as `StoreBatch` above: a bare `as u8` truncates the
@@ -1177,6 +1526,11 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             // Trails the keys so the fixed-size prefix a decoder needs to size
             // the key run stays first.
             buf.write_u16::<LittleEndian>(*start_position).unwrap();
+            // And the optional block trails that, where a decoder which stops
+            // after `start_position` never looks. Writes nothing when the search
+            // carried no filters, so an unconstrained query is byte-identical to
+            // what this built before the block existed.
+            encode_value_constraints(&mut buf, constraints);
             buf
         }
         DhtPayload::FoundValue {
@@ -1352,14 +1706,20 @@ fn decode_socket_addr(data: &[u8]) -> anyhow::Result<(SocketAddr, usize)> {
 
 fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     match msg_type {
-        MSG_PING => Ok(DhtPayload::Ping),
+        MSG_PING => Ok(DhtPayload::Ping {
+            versions: decode_version_block(data),
+        }),
         MSG_PONG => {
             if data.is_empty() {
-                Ok(DhtPayload::Pong { observed: None })
+                Ok(DhtPayload::Pong {
+                    observed: None,
+                    versions: None,
+                })
             } else {
-                let (addr, _) = decode_socket_addr(data)?;
+                let (addr, consumed) = decode_socket_addr(data)?;
                 Ok(DhtPayload::Pong {
                     observed: Some(addr),
+                    versions: decode_version_block(&data[consumed..]),
                 })
             }
         }
@@ -1509,9 +1869,15 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             }
             let pos_at = 1 + count * 16;
             let start_position = u16::from_le_bytes([data[pos_at], data[pos_at + 1]]);
+            // Whatever follows, if anything. `data` has only ever been required
+            // to be *at least* long enough for the fields above, so a payload
+            // carrying more than this build understands has always been valid —
+            // which is what makes the block additive.
+            let constraints = decode_value_constraints(&data[pos_at + 2..]);
             Ok(DhtPayload::FindValue {
                 keys,
                 start_position,
+                constraints,
             })
         }
         MSG_FOUND_VALUE => {
@@ -1798,13 +2164,13 @@ mod tests {
         assert_eq!(decoded.msg_type, MSG_PING);
         assert_eq!(decoded.request_id, 42);
         assert_eq!(decoded.sender_id, id);
-        assert!(matches!(decoded.payload, DhtPayload::Ping));
+        assert!(matches!(decoded.payload, DhtPayload::Ping { .. }));
 
         let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
         let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
         let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
-            DhtPayload::Pong { observed } => {
+            DhtPayload::Pong { observed, .. } => {
                 assert_eq!(observed, Some("203.0.113.50:4672".parse().unwrap()));
             }
             _ => panic!("expected Pong"),
@@ -1993,8 +2359,175 @@ mod tests {
         match decoded.payload {
             DhtPayload::Pong {
                 observed: Some(addr),
+                ..
             } => assert_eq!(addr, observed),
             _ => panic!("expected Pong with observed"),
+        }
+    }
+
+    /// A `PING` and a `PONG` carry the range this build can decode, and it
+    /// survives the round trip both ways.
+    #[test]
+    fn ping_and_pong_advertise_the_range_this_build_speaks() {
+        let (sk, id) = test_keypair();
+
+        let ping = build_ping(id, 11);
+        let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
+        match decoded.payload {
+            DhtPayload::Ping { versions } => {
+                assert_eq!(versions, Some(OUR_VERSION_RANGE));
+            }
+            other => panic!("expected Ping, got {other:?}"),
+        }
+
+        let pong = build_pong(id, 11, "198.51.100.9:4672".parse().unwrap());
+        let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
+        match decoded.payload {
+            DhtPayload::Pong { observed, versions } => {
+                assert_eq!(
+                    observed,
+                    Some("198.51.100.9:4672".parse().unwrap()),
+                    "the block must not disturb the field in front of it"
+                );
+                assert_eq!(versions, Some(OUR_VERSION_RANGE));
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    /// The property the whole change rests on: this is additive, so a build that
+    /// has never heard of the block reads both frames exactly as it does today.
+    ///
+    /// Pinned at the payload codec, because that is where a v4 peer differs from
+    /// us — it runs this same `decode_payload` without the block-aware arms. A
+    /// `PING` payload is discarded whatever it holds, and a `PONG` address is
+    /// read at a fixed offset through a decoder that checks only a minimum
+    /// length. If either of those ever stops being true, the block has to move
+    /// and the version has to bump, which is the thing it exists to avoid.
+    #[test]
+    fn the_version_block_is_invisible_to_a_decoder_that_ignores_it() {
+        let observed: SocketAddr = "203.0.113.4:4662".parse().unwrap();
+
+        // What a peer predating the block sends: an empty PING payload, and a
+        // PONG carrying only its address.
+        let bare_pong = {
+            let mut buf = Vec::new();
+            encode_socket_addr(&observed, &mut buf);
+            buf
+        };
+        let with_block = {
+            let mut buf = bare_pong.clone();
+            encode_version_block(&OUR_VERSION_RANGE, &mut buf);
+            buf
+        };
+        assert_eq!(
+            &with_block[..bare_pong.len()],
+            &bare_pong[..],
+            "the block appends, it does not rewrite what a v4 peer parses"
+        );
+
+        // The address a version-blind reader takes from either payload is the
+        // same one, and it does not care that more bytes follow.
+        let (bare_addr, consumed) = decode_socket_addr(&bare_pong).unwrap();
+        let (block_addr, block_consumed) = decode_socket_addr(&with_block).unwrap();
+        assert_eq!(bare_addr, observed);
+        assert_eq!(block_addr, observed);
+        assert_eq!(consumed, block_consumed);
+
+        // And the older shapes still decode here, as the peers sending them
+        // will keep doing until they update.
+        assert!(matches!(
+            decode_payload(MSG_PING, &[]).unwrap(),
+            DhtPayload::Ping { versions: None }
+        ));
+        assert!(matches!(
+            decode_payload(MSG_PONG, &bare_pong).unwrap(),
+            DhtPayload::Pong {
+                observed: Some(_),
+                versions: None
+            }
+        ));
+    }
+
+    /// A `PONG` with no observed address stays byte-for-byte the pre-slice-19
+    /// shape. The block may only trail a field a reader parses first: with no
+    /// address in front of it, an older build would read the tag byte as an
+    /// address type and reject the frame outright.
+    #[test]
+    fn a_pong_without_an_address_carries_no_block() {
+        let payload = encode_payload(&DhtPayload::Pong {
+            observed: None,
+            versions: Some(OUR_VERSION_RANGE),
+        });
+        assert!(
+            payload.is_empty(),
+            "an addressless PONG must stay empty, not lead with a tag byte"
+        );
+    }
+
+    /// Absent, truncated and nonsensical all have to read as "this peer told us
+    /// nothing", never as a range we then act on. A refusal would be worse: it
+    /// would make an advisory field able to drop a frame.
+    #[test]
+    fn a_malformed_version_block_reads_as_no_claim() {
+        // Truncated: claims two value bytes, carries one.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 4]), None);
+        // Wrong length for the tag.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 3, 4, 4, 4]), None);
+        // Version 0 is not a version, and an inverted range is not a range.
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 0, 4]), None);
+        assert_eq!(decode_version_block(&[VERSION_RANGE_TAG, 2, 5, 4]), None);
+        // Nothing at all.
+        assert_eq!(decode_version_block(&[]), None);
+
+        // An unknown tag is skipped rather than fatal, which is what lets a
+        // later capability share this block without a version bump.
+        let mut buf = vec![0x7F, 3, 1, 2, 3];
+        encode_version_block(&VersionRange { min: 4, max: 6 }, &mut buf);
+        assert_eq!(
+            decode_version_block(&buf),
+            Some(VersionRange { min: 4, max: 6 })
+        );
+    }
+
+    /// The range is a claim about the sender, so it has to be as forgeable as
+    /// the rest of the frame and no more: it rides inside the signed bytes.
+    #[test]
+    fn the_advertised_range_is_covered_by_the_frame_signature() {
+        let (sk, id) = test_keypair();
+        let ping = build_ping(id, 3);
+        let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
+
+        // The block is the whole payload of a PING, which sits last before the
+        // signature; flipping its final byte is flipping the advertised max.
+        let payload_len_off = HEADER_MIN_SIZE + 32;
+        let payload_off = payload_len_off + 2;
+        let mut tampered = encoded.clone();
+        let last = payload_off + 3;
+        tampered[last] ^= 0xFF;
+        assert!(
+            decode_message(&tampered, true, &TEST_NOISE_PUB).is_err(),
+            "a relay must not be able to rewrite what a peer claims it speaks"
+        );
+    }
+
+    /// `OUR_VERSION_RANGE` is what we tell peers; the decoder is what we
+    /// actually enforce. Nothing but this test keeps the promise honest.
+    #[test]
+    fn we_advertise_exactly_the_range_we_enforce() {
+        assert_eq!(OUR_VERSION_RANGE.min, EMBER_DHT_MIN_VERSION);
+        assert_eq!(OUR_VERSION_RANGE.max, EMBER_DHT_VERSION);
+        assert!(OUR_VERSION_RANGE.accepts(EMBER_DHT_VERSION));
+        assert!(OUR_VERSION_RANGE.accepts(EMBER_DHT_MIN_VERSION));
+        assert!(!OUR_VERSION_RANGE.accepts(EMBER_DHT_VERSION + 1));
+        assert!(!OUR_VERSION_RANGE.accepts(EMBER_DHT_MIN_VERSION - 1));
+        for bogus in [0u8, EMBER_DHT_MIN_VERSION - 1, EMBER_DHT_VERSION + 1] {
+            assert!(
+                unsupported_dht_version(&[bogus]).is_some() || bogus == 0,
+                "the decoder must refuse every version we do not advertise"
+            );
         }
     }
 
@@ -2412,15 +2945,26 @@ mod tests {
     fn find_value_paging_positions_round_trip() {
         let (sk, id) = test_keypair();
 
-        let ask = build_find_value(id, 1, vec![[0xA1; 16], [0xA2; 16]], 4321);
+        let ask = build_find_value(
+            id,
+            1,
+            vec![[0xA1; 16], [0xA2; 16]],
+            4321,
+            ValueConstraints::default(),
+        );
         let decoded = decode_message(&encode_message(&ask, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::FindValue {
                 keys,
                 start_position,
+                constraints,
             } => {
                 assert_eq!(keys, vec![[0xA1; 16], [0xA2; 16]]);
                 assert_eq!(start_position, 4321);
+                assert!(
+                    constraints.is_empty(),
+                    "an unconstrained query must not grow a block"
+                );
             }
             other => panic!("expected FindValue, got {other:?}"),
         }
@@ -2443,6 +2987,146 @@ mod tests {
         }
     }
 
+    /// The constraint block has to survive the wire, and — the property the
+    /// whole design rests on — a payload carrying it has to still decode on a
+    /// build that has never heard of it. That build is reproduced here by
+    /// decoding the same bytes with the block truncated away and with the block
+    /// present but unread: both must yield the same keys and position.
+    #[test]
+    fn find_value_constraints_round_trip_and_stay_ignorable() {
+        let (sk, id) = test_keypair();
+
+        let constraints = ValueConstraints {
+            min_size: Some(1024),
+            max_size: Some(4 * 1024 * 1024 * 1024),
+            file_type: Some("Video".to_string()),
+            file_extension: Some("mkv".to_string()),
+            extra_keys: vec![[0xC1; 16], [0xC2; 16]],
+        };
+        let ask = build_find_value(id, 9, vec![[0xA1; 16]], 12, constraints.clone());
+        let decoded = decode_message(
+            &encode_message(&ask, &sk, true, &TEST_NOISE_PUB),
+            true,
+            &TEST_NOISE_PUB,
+        )
+        .unwrap();
+        match decoded.payload {
+            DhtPayload::FindValue {
+                keys,
+                start_position,
+                constraints: got,
+            } => {
+                assert_eq!(keys, vec![[0xA1; 16]]);
+                assert_eq!(start_position, 12);
+                assert_eq!(got, constraints);
+            }
+            other => panic!("expected FindValue, got {other:?}"),
+        }
+
+        // What an older decoder sees: the fields it reads are at the offsets it
+        // expects, and the bytes past them are surplus it never looks at. Cutting
+        // the block off has to leave a payload that still decodes, which is the
+        // same thing as saying the block is purely additive.
+        let full = encode_payload(&ask.payload);
+        let base = encode_payload(
+            &build_find_value(id, 9, vec![[0xA1; 16]], 12, ValueConstraints::default()).payload,
+        );
+        assert!(
+            full.starts_with(&base),
+            "the block must trail the fields an older decoder reads, not move them"
+        );
+        match decode_payload(MSG_FIND_VALUE, &base).unwrap() {
+            DhtPayload::FindValue {
+                keys,
+                start_position,
+                constraints: got,
+            } => {
+                assert_eq!(keys, vec![[0xA1; 16]]);
+                assert_eq!(start_position, 12);
+                assert!(got.is_empty());
+            }
+            other => panic!("expected FindValue, got {other:?}"),
+        }
+    }
+
+    /// The block is advisory, so nothing in it may turn a usable query into a
+    /// refused frame. Garbage where the block would be has to read as "no
+    /// constraints" — the answer an older peer gives — rather than as an error.
+    #[test]
+    fn a_malformed_constraint_block_is_ignored_not_refused() {
+        let (_, id) = test_keypair();
+        let base = encode_payload(
+            &build_find_value(id, 1, vec![[0xA1; 16]], 3, ValueConstraints::default()).payload,
+        );
+
+        for trailer in [
+            vec![0x00],
+            vec![0xFF, 0xFF],
+            // Right magic, length past the end of the buffer.
+            vec![0xC1, 0xE5, 0xFF, 0xFF],
+            // Right magic and length, then a TLV whose length overruns it.
+            vec![0xC1, 0xE5, 0x03, 0x00, VALUE_EXT_TAG_MIN_SIZE, 0x40, 0x01],
+            // An unknown tag, which must be skipped by its own length rather
+            // than abandoning the ones after it.
+            vec![0xC1, 0xE5, 0x02, 0x00, 0x7F, 0x00],
+            // An extension longer than the cap, and an empty one: both dropped
+            // rather than matched against, since either would silently exclude
+            // every record.
+            vec![0xC1, 0xE5, 0x14, 0x00, VALUE_EXT_TAG_FILE_EXTENSION, 0x11]
+                .into_iter()
+                .chain(std::iter::repeat_n(b'a', 17))
+                .collect(),
+            vec![0xC1, 0xE5, 0x02, 0x00, VALUE_EXT_TAG_FILE_EXTENSION, 0x00],
+        ] {
+            let mut payload = base.clone();
+            payload.extend_from_slice(&trailer);
+            match decode_payload(MSG_FIND_VALUE, &payload) {
+                Ok(DhtPayload::FindValue {
+                    keys,
+                    start_position,
+                    constraints,
+                }) => {
+                    assert_eq!(keys, vec![[0xA1; 16]]);
+                    assert_eq!(start_position, 3);
+                    assert!(
+                        constraints.is_empty(),
+                        "{trailer:?} must not be read as a constraint"
+                    );
+                }
+                other => panic!("{trailer:?} must still decode, got {other:?}"),
+            }
+        }
+    }
+
+    /// The extension constraint is compared against a name the responder
+    /// lowercases, so it is normalised on arrival: a peer naming `.MP3` or `MP3`
+    /// must not silently match nothing.
+    #[test]
+    fn an_extension_constraint_is_normalised_on_arrival() {
+        let (_, id) = test_keypair();
+        for written in ["MP3", ".mp3", ".MP3", "mp3"] {
+            let ask = build_find_value(
+                id,
+                1,
+                vec![[0xA1; 16]],
+                0,
+                ValueConstraints {
+                    file_extension: Some(written.to_string()),
+                    ..Default::default()
+                },
+            );
+            let payload = encode_payload(&ask.payload);
+            match decode_payload(MSG_FIND_VALUE, &payload).unwrap() {
+                DhtPayload::FindValue { constraints, .. } => assert_eq!(
+                    constraints.file_extension.as_deref(),
+                    Some("mp3"),
+                    "{written} must arrive as the extension a file name yields"
+                ),
+                other => panic!("expected FindValue, got {other:?}"),
+            }
+        }
+    }
+
     /// A `FIND_VALUE` whose `start_position` is missing must be refused, not
     /// read as position zero. Silently defaulting would make a truncated frame
     /// look like a first-page request and re-serve records the searcher already
@@ -2450,7 +3134,7 @@ mod tests {
     #[test]
     fn a_find_value_without_its_start_position_is_refused() {
         let (_, id) = test_keypair();
-        let ask = build_find_value(id, 1, vec![[0xA1; 16]], 7);
+        let ask = build_find_value(id, 1, vec![[0xA1; 16]], 7, ValueConstraints::default());
         let full = encode_payload(&ask.payload);
         assert!(decode_payload(MSG_FIND_VALUE, &full).is_ok());
         assert!(
@@ -2471,7 +3155,9 @@ mod tests {
     #[test]
     fn a_find_value_with_no_keys_is_refused() {
         let (_, id) = test_keypair();
-        let one_key = encode_payload(&build_find_value(id, 1, vec![[0xA1; 16]], 0).payload);
+        let one_key = encode_payload(
+            &build_find_value(id, 1, vec![[0xA1; 16]], 0, ValueConstraints::default()).payload,
+        );
         assert!(decode_payload(MSG_FIND_VALUE, &one_key).is_ok());
 
         // The same frame with its key run removed: count 0, then the position.

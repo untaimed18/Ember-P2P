@@ -7,9 +7,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>EmberDHT Protocol Specification — Wire Version 2</title>
+<title>EmberDHT Protocol Specification — Wire Version 4</title>
 <meta name="author" content="Ember">
-<meta name="description" content="Protocol specification for EmberDHT, Ember's native encrypted Kademlia overlay. Wire version 2, as implemented in Ember 1.5.6.">
+<meta name="description" content="Protocol specification for EmberDHT, Ember's native encrypted Kademlia overlay. Wire version 4, as implemented in Ember 1.6.3.">
 <meta name="keywords" content="EmberDHT, Kademlia, Noise, DHT, eMule, P2P">
 <style>
 @font-face { font-family: Inter; src: url("fonts/Inter-Regular.ttf"); font-weight: 400; }
@@ -66,7 +66,7 @@ body {
     text-transform: uppercase;
   }
   @top-right {
-    content: "Wire version 2  ·  Ember 1.5.6";
+    content: "Wire version 4  ·  Ember 1.6.3";
     font-family: Inter, sans-serif;
     font-size: 8pt;
     color: #a8a29e;
@@ -357,6 +357,20 @@ table.data.plain td:first-child { font-family: Inter, sans-serif; font-size: 9pt
 .callout.secure .label { color: var(--teal); }
 .callout.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); }
 .callout.warn .label { color: var(--warn); }
+/* Inline marker for a wire addition that cost no version bump. */
+.badge {
+  display: inline-block;
+  font-size: 6.8pt;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--teal);
+  background: var(--teal-soft);
+  border-radius: 2px;
+  padding: 0.3mm 1.2mm;
+  vertical-align: 0.4mm;
+  white-space: nowrap;
+}
 
 /* ── Wire diagrams ── */
 .wire {
@@ -573,10 +587,10 @@ footer.doc-end {
     <h1 class="brand">EmberDHT</h1>
     <p class="subtitle">Protocol Specification</p>
     <div class="cover-meta">
-      <div><strong>Wire version</strong>2  (min 2)</div>
-      <div><strong>Software</strong>Ember 1.5.6</div>
+      <div><strong>Wire version</strong>4  (min 4)</div>
+      <div><strong>Software</strong>Ember 1.6.3</div>
       <div><strong>Transport</strong>Noise_IK / Noise_XX</div>
-      <div><strong>Date</strong>August 2026</div>
+      <div><strong>Date</strong>September 2026</div>
     </div>
     <div class="cover-abstract">
       EmberDHT is Ember’s native Kademlia overlay: a signed, encrypted, server-less
@@ -584,7 +598,7 @@ footer.doc-end {
       the eMule KAD network and eD2K servers. This document specifies the identity
       model, Noise transport, wire frames, routing table, record formats, lookup
       and publish algorithms, bootstrap paths, and abuse limits as implemented in
-      Ember 1.5.6. It is written from the code, not from comments.
+      Ember 1.6.3. It is written from the code, not from comments.
     </div>
     <div class="cover-foot">
       <div>Canonical implementation: <span class="mono">src-tauri/src/network/ember/</span></div>
@@ -621,9 +635,15 @@ footer.doc-end {
     <tr><td class="num">B</td><td class="title"><a href="#sec-b">Code map</a></td><td class="page"><a href="#sec-b"></a></td></tr>
   </table>
   <p style="margin-top:8mm;font-size:9pt;color:#57534e;">
-    This specification describes the protocol as implemented in Ember 1.5.6
-    (<code>EMBER_DHT_VERSION = 2</code>). Wire version is unchanged since 1.5.3;
-    1.5.4–1.5.6 are local and operational changes on the same overlay. Remaining
+    This specification describes the protocol as implemented in Ember 1.6.3
+    (<code>EMBER_DHT_VERSION = 4</code>, <code>EMBER_DHT_MIN_VERSION = 4</code>).
+    Two breaking changes have landed since wire version 2: v3 reshaped contact
+    lists and <code>FOUND_VALUE</code>, and v4 bound a frame signature to the
+    session it arrives on. Both are marked in place. Everything added since
+    without a bump — query constraints, record media, the callback and
+    endorsement pair, channel records, and the advertised version range — is
+    marked <span class="badge">additive</span>, meaning a peer that does not
+    speak it parses the frame correctly and ignores the addition. Remaining
     work, including the dormant native transfer path, is called out where it
     affects interoperability. Design notes that are not yet wire-stable live in
     <code>docs/ember-dht.md</code>.
@@ -771,11 +791,14 @@ footer.doc-end {
 <div class="eq">node_id[16] = BLAKE3(ed25519_public_key[32])[0..16]</div>
 <p>
   The 128-bit ID is compatible with Ember’s existing <code>ember_hash</code>
-  field and is cryptographically bound to the signing key. A peer-supplied
-  <code>node_id</code> in a contact list is never trusted: the receiver
-  re-derives it from the Ed25519 bytes and refuses the contact if the key is
-  not a valid curve point or the ID does not match. This is the primary
-  defence against routing-table poisoning.
+  field and is cryptographically bound to the signing key. Since wire version 3
+  a contact list carries no <code>node_id</code> at all: the receiver derives it
+  from the Ed25519 bytes beside it and refuses the contact if the key is not a
+  valid curve point. Before v3 the ID was transmitted and then re-derived and
+  compared, so the only thing those 16 bytes could do was disagree with the key
+  they travelled with. Deriving rather than checking is the primary defence
+  against routing-table poisoning: a peer cannot name a contact under an ID it
+  does not control, because it does not get to name the ID.
 </p>
 <div class="callout secure">
   <span class="label">Proof of possession</span>
@@ -796,6 +819,28 @@ footer.doc-end {
   frame never becomes a message object. This build always includes the public
   key on the wire.
 </p>
+<div class="callout secure">
+  <span class="label">Wire version 4 — session binding</span>
+  The signature also covers the sender’s own Noise static key, which is
+  <em>not</em> transmitted: the receiver already learned it from the handshake,
+  so the frame is the same size on the wire and only the signature changes.
+  <p style="margin-top:2mm;">
+    Without that binding a signed frame was a bearer token. It proved only that
+    its <code>sender_id</code> had once signed those bytes, not that whoever
+    delivered them was that sender — so anyone who had ever received a frame
+    from Alice could replay it verbatim inside their own Noise session, and the
+    receiver, which records a verified contact from the session’s address and
+    static key on every frame that decodes, would file Alice at the replayer’s
+    address with the replayer’s key. The <code>noise_pub</code> pin then held
+    that entry against the real Alice, and replaying kept it fresh so it never
+    aged out.
+  </p>
+  <p style="margin-top:2mm;">
+    A v3 signature cannot verify here and ours cannot verify there, so the
+    version byte had to move with it. This is the change that makes a refusal at
+    the version check preferable to a stream of “signature verification failed”.
+  </p>
+</div>
 
 <h3>3.4 Record signature</h3>
 <p>
@@ -947,7 +992,7 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>Field</th><th>Size</th><th>Notes</th></tr></thead>
   <tbody>
-    <tr><td>node_id</td><td>16</td><td>Re-derived from ed25519_pub on ingest</td></tr>
+    <tr><td>node_id</td><td>16</td><td>Derived from ed25519_pub; not carried on the wire since v3</td></tr>
     <tr><td>addr</td><td>IPv4 or IPv6 + port</td><td>Port 0 is not admitted</td></tr>
     <tr><td>noise_pub</td><td>32</td><td>X25519 static key for IK</td></tr>
     <tr><td>ed25519_pub</td><td>32</td><td>Signing / identity key</td></tr>
@@ -1005,29 +1050,55 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>Constant</th><th>Value</th><th>Meaning</th></tr></thead>
   <tbody>
-    <tr><td>EMBER_DHT_VERSION</td><td>2</td><td>Wire version this build speaks</td></tr>
-    <tr><td>EMBER_DHT_MIN_VERSION</td><td>2</td><td>Oldest version this build can parse</td></tr>
+    <tr><td>EMBER_DHT_VERSION</td><td>4</td><td>Wire version this build speaks</td></tr>
+    <tr><td>EMBER_DHT_MIN_VERSION</td><td>4</td><td>Oldest version this build can parse</td></tr>
   </tbody>
 </table>
 <p>
   Version 0 is invalid. A frame outside <code>[MIN, VERSION]</code> is refused
   at the version byte rather than becoming a malformed-payload counter that
-  reads like packet loss. Version was bumped to 2 because batched store, its
-  ack, contact-list trimming, and payload limits all changed shape while the
-  byte still read 1 — two peers announced the same version and then misparsed
-  each other.
+  reads like packet loss.
 </p>
+<table class="data">
+  <thead><tr><th>Version</th><th>Shipped</th><th>What changed shape</th></tr></thead>
+  <tbody>
+    <tr><td>2</td><td>1.5.3</td><td>Batched store, its ack, contact-list trimming and payload limits all changed while the byte still read 1 — two peers announced the same version and then misparsed each other.</td></tr>
+    <tr><td>3</td><td>1.5.7</td><td><code>node_id</code> dropped from wire contacts (87 → 71 bytes); <code>FIND_VALUE</code> gained <code>start_position</code> and <code>FOUND_VALUE</code> gained <code>next_position</code> and <code>total_available</code>. A v2 peer reads both at fixed offsets, so neither could be additive.</td></tr>
+    <tr><td>4</td><td>1.6.0</td><td>The sender’s Noise static key joined the <em>signed</em> bytes without being transmitted (§3.3). No layout change; a v3 signature simply cannot verify here.</td></tr>
+  </tbody>
+</table>
 <p>
-  A future change that only <em>adds</em> to the format can lower
-  <code>MIN_VERSION</code> instead of raising both. Incompatible peers currently
-  fail cleanly but silently: neither is told why, and they never fold each
-  other into a routing table. There is no upgrade prompt.
+  A change that only <em>adds</em> to the format can lower
+  <code>MIN_VERSION</code> instead of raising both. Neither of the last two
+  could: v3 moved fields a v2 peer reads at fixed offsets, and v4 changed what
+  the signature covers.
 </p>
+<div class="callout">
+  <span class="label">Why a bump partitions, and what now mitigates it</span>
+  The version byte is range-checked on <em>receive</em>, so raising
+  <code>EMBER_DHT_VERSION</code> partitions the overlay regardless of where
+  <code>MIN_VERSION</code> sits — the peer that refuses the frame is the one
+  running the old range, and it cannot be reasoned with after the fact.
+  <p style="margin-top:2mm;">
+    Since 1.6.3, <code>PING</code> and <code>PONG</code> carry the range their
+    sender can decode (§6.5), so a future encoder can ask per peer rather than
+    assume, and send the older shape to anyone who has not answered. That does
+    not help against peers predating the advertisement itself, which is why the
+    diagnostic counting how many contacts have advertised one is the number to
+    watch before any further bump.
+  </p>
+  <p style="margin-top:2mm;">
+    A refused frame is counted and split by direction, so a node can tell peers
+    that are behind from peers that are ahead, and the Ember page raises a
+    banner while older peers are being turned away. The peer that needs to
+    update is by definition the one that cannot decode anything we send.
+  </p>
+</div>
 
 <h3>6.2 Frame layout</h3>
 <div class="wire">
   <div class="cap">Signed DHT frame (after Noise decryption)</div>
-  <span class="c-orange">version</span>     u8     this build: 2<br>
+  <span class="c-orange">version</span>     u8     this build: 4<br>
   <span class="c-orange">msg_type</span>    u8     see table below<br>
   <span class="c-teal">request_id</span>  u32 LE  correlation; 0 is reserved<br>
   <span class="c-teal">sender_id</span>   16 B    BLAKE3(sender Ed25519)[..16]<br>
@@ -1035,6 +1106,7 @@ footer.doc-end {
   <span class="c-muted">payload_len</span> u16 LE  ≤ MAX_DELIVERABLE_PAYLOAD<br>
   <span class="c-white">payload</span>     N B    message-specific<br>
   <span class="c-red">signature</span>   64 B    Ed25519 over every preceding byte
+                        plus the sender's own Noise static key (v4, not sent)
 </div>
 <p>
   The encoder always includes the sender’s 32-byte Ed25519 public key
@@ -1055,14 +1127,14 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>ID</th><th>Name</th><th>Direction</th><th>Payload</th></tr></thead>
   <tbody>
-    <tr><td>0x01</td><td>PING</td><td>→</td><td>empty</td></tr>
-    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr</td></tr>
+    <tr><td>0x01</td><td>PING</td><td>→</td><td>optional advertised version range</td></tr>
+    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr, then optional advertised version range</td></tr>
     <tr><td>0x03</td><td>FIND_NODE</td><td>→</td><td>target node ID (16)</td></tr>
     <tr><td>0x04</td><td>FOUND_NODE</td><td>←</td><td>contact list</td></tr>
     <tr><td>0x05</td><td>STORE_RECORD</td><td>→</td><td>key + record + record signature</td></tr>
     <tr><td>0x06</td><td>STORE_ACK</td><td>←</td><td>key (16)</td></tr>
-    <tr><td>0x07</td><td>FIND_VALUE</td><td>→</td><td>1…8 keys</td></tr>
-    <tr><td>0x08</td><td>FOUND_VALUE</td><td>←</td><td>key + records (or FOUND_NODE on miss)</td></tr>
+    <tr><td>0x07</td><td>FIND_VALUE</td><td>→</td><td>1…8 keys + start_position, then an optional constraint block</td></tr>
+    <tr><td>0x08</td><td>FOUND_VALUE</td><td>←</td><td>key + next_position + total_available + records (or FOUND_NODE on miss)</td></tr>
     <tr><td>0x09</td><td>ANNOUNCE_PEER</td><td>→</td><td>contact list (gossip dump)</td></tr>
     <tr><td>0x0A</td><td>PEER_LIST</td><td>←</td><td>contact list</td></tr>
     <tr><td>0x0B</td><td>PROXY_STORE</td><td>→</td><td>same body as STORE_RECORD</td></tr>
@@ -1071,10 +1143,26 @@ footer.doc-end {
     <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
     <tr><td>0x0F</td><td>CALLBACK_REQ</td><td>→</td><td>publisher id (16) + file hash (16) + searcher TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Searcher → HighID buddy. The searcher's IP is the UDP source, not in the payload.</td></tr>
     <tr><td>0x10</td><td>CALLBACK</td><td>→</td><td>file hash (16) + searcher IPv4 (4) + TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Buddy → firewalled publisher: connect-and-serve this searcher.</td></tr>
-    <tr><td>0x11</td><td>CHANNEL_MSG</td><td>→</td><td>AEAD channel gossip body. Develop overlay rooms; additive vs v2.</td></tr>
-    <tr><td>0x12</td><td>CHANNEL_RELAY</td><td>→</td><td>opaque CHANNEL_MSG envelope for a HighID hop to forward to a LowID target.</td></tr>
+    <tr><td>0x11</td><td>CHANNEL_MSG</td><td>→</td><td>AEAD channel gossip body for overlay rooms. <span class="badge">additive</span></td></tr>
+    <tr><td>0x12</td><td>CHANNEL_RELAY</td><td>→</td><td>opaque CHANNEL_MSG envelope for a HighID hop to forward to a LowID target. <span class="badge">additive</span></td></tr>
+    <tr><td>0x13</td><td>BUDDY_ENDORSE_REQ</td><td>→</td><td>empty — the requester is the authenticated frame <code>sender_id</code>, and that is what the endorsement binds to. <span class="badge">additive</span></td></tr>
+    <tr><td>0x14</td><td>BUDDY_ENDORSE</td><td>←</td><td>buddy IPv4 (4) + UDP port (2) + noise_pub (32) + expiry (8) + signature (64). <span class="badge">additive</span></td></tr>
   </tbody>
 </table>
+<p>
+  Every type from <code>0x0F</code> up is additive: a peer that does not speak
+  one decodes it as <code>Unknown</code> and ignores it, because the header
+  layout is unchanged. None of them cost a version bump.
+</p>
+<div class="callout">
+  <span class="label">Numbering is global, not per branch</span>
+  The endorsement pair sits <em>after</em> the channel types rather than filling
+  the gap before them. <code>BUDDY_ENDORSE_REQ</code> carries no payload and its
+  decoder ignores the body, so sharing a number with <code>CHANNEL_MSG</code>
+  would have had a channel frame decode cleanly on that arm and draw a signed
+  endorsement in reply. Two features developed in parallel must not both claim
+  the next free byte.
+</div>
 
 <h3>6.4 Contact list encoding</h3>
 <p>
@@ -1083,21 +1171,26 @@ footer.doc-end {
   encoder trims the tail to stay inside the unfragmented payload budget.
 </p>
 <div class="wire">
-  <div class="cap">Contact list</div>
+  <div class="cap">Contact list — wire version 3 onward</div>
   count     u8     ≤ 20, then for each contact:<br>
-  node_id   16 B<br>
   addr      1 + 4 or 16 + 2 BE &nbsp; <span class="c-muted">0x04 = IPv4, 0x06 = IPv6</span><br>
   noise_pub 32 B<br>
   ed25519   32 B
 </div>
 <p>
-  An IPv4 contact is 16 + 7 + 32 + 32 = <strong>87 bytes</strong>. At 1253 bytes
-  of payload, only <strong>14 IPv4 contacts</strong> fit, so a
-  <code>FOUND_NODE</code> never carries a full k-bucket of 20.
+  An IPv4 contact is 7 + 32 + 32 = <strong>71 bytes</strong>. At 1253 bytes of
+  payload, <strong>17 IPv4 contacts</strong> fit, so a <code>FOUND_NODE</code>
+  still never carries a full k-bucket of 20 —
   <code>MAX_CONTACTS_PER_RESPONSE</code> is 20 but is not reachable on IPv4.
-  Dropping the redundant <code>node_id</code> (the receiver re-derives it) would
-  take a contact from 87 to 71 bytes and yield 17 contacts per reply — a
-  planned wire change, bundled with the next version bump.
+</p>
+<p>
+  Version 2 also transmitted a 16-byte <code>node_id</code> per contact, at 87
+  bytes each and 14 per reply. Every decoder re-derived the ID from the Ed25519
+  key beside it and compared, so the only thing those bytes could do was
+  disagree with that key; dropping them bought most of a hop on a sparse table.
+  This is the <em>wire</em> format only — <code>nodes_ember.dat</code> still
+  stores an advisory ID per contact (§14.1), because changing the file format
+  would cost every user their bootstrap set for no bandwidth saving.
 </p>
 <p>
   The asker is excluded from a <code>FOUND_NODE</code> reply: they were just
@@ -1107,11 +1200,48 @@ footer.doc-end {
 
 <h3>6.5 PING / PONG</h3>
 <p>
-  <code>PING</code> is empty. <code>PONG</code> may carry the sender’s observed
-  address (the address we received the ping from), encoded the same way as a
-  contact address: <code>0x04</code>/<code>0x06</code> + IP + port (big-endian).
-  An empty PONG payload decodes as “no observation” for backward compatibility.
-  Observed-IP voting is specified in §11.
+  <code>PONG</code> may carry the sender’s observed address (the address we
+  received the ping from), encoded the same way as a contact address:
+  <code>0x04</code>/<code>0x06</code> + IP + port (big-endian). An empty PONG
+  payload decodes as “no observation” for backward compatibility. Observed-IP
+  voting is specified in §11.
+</p>
+<p>
+  Both frames may then carry a tag/len/value block advertising the wire versions
+  their sender can decode. <span class="badge">additive</span>
+</p>
+<div class="wire">
+  <div class="cap">Advertised version range (trailing block)</div>
+  tag       u8     0x01 = version range<br>
+  len       u8     2<br>
+  min       u8     oldest version the sender can parse<br>
+  max       u8     newest version the sender can parse
+</div>
+<p>
+  This is what lets a future encoder pick a frame shape per peer instead of
+  assuming (§6.1). It is additive because no existing decoder looks here:
+  <code>PING</code> discards its payload entirely, and <code>PONG</code> reads
+  its address through a decoder that checks only a minimum length and reports
+  what it consumed. The version byte therefore must <em>not</em> move for this —
+  the peers it exists to reach are exactly the ones that would refuse the frame
+  carrying it.
+</p>
+<p>
+  Three properties are load-bearing. The block only ever trails a field a reader
+  parses first, so a <code>PONG</code> with no observed address carries none: with
+  nothing in front of it, an older build would read the tag byte as an address
+  type and reject the whole frame. Absent, truncated and nonsensical
+  (<code>min = 0</code>, or <code>min &gt; max</code>) all read as “this peer
+  said nothing” rather than as a range or an error, because an advisory field
+  must not be able to drop a frame. And an unknown tag is skipped rather than
+  fatal, which is what lets a later capability share the same block.
+</p>
+<p>
+  The claim rides inside the signed bytes, so it is exactly as forgeable as the
+  rest of the frame and no more: a relay cannot rewrite what a peer says it
+  speaks. A receiver holds the range per peer and forgets it when the peer
+  leaves the routing table — it is worth what the session that proved it is
+  worth, and one ping relearns it.
 </p>
 
 <h3>6.6 FIND_NODE / FOUND_NODE</h3>
@@ -1177,27 +1307,73 @@ footer.doc-end {
 
 <h3>6.9 FIND_VALUE / FOUND_VALUE</h3>
 <div class="wire">
-  <div class="cap">FIND_VALUE payload</div>
-  count     u8      1…8<br>
-  keys      16 B × count
+  <div class="cap">FIND_VALUE payload — wire version 3 onward</div>
+  count          u8      1…8<br>
+  keys           16 B × count<br>
+  start_position u16 LE  first record of the key to serve<br>
+  <span class="c-muted">then, optionally, a constraint block (see below)</span>
 </div>
 <div class="wire">
-  <div class="cap">FOUND_VALUE payload</div>
-  key            16 B    the key this reply is for<br>
-  record_count   u16 LE  ≤ 300<br>
-  for each: len  u16 LE + blob (record body ‖ 64-byte publisher signature)
+  <div class="cap">FOUND_VALUE payload — wire version 3 onward</div>
+  key             16 B    the key this reply is for<br>
+  next_position   u16 LE  where a follow-up should resume, or 0 when exhausted<br>
+  total_available u16 LE  matching records the responder holds under the key<br>
+  record_count    u16 LE  ≤ 300<br>
+  for each: len   u16 LE + blob (record body ‖ 64-byte publisher signature)
 </div>
 <p>
   The searcher walks the primary (longest) keyword key. Additional keys ride
   along so a peer that holds records can intersect on <code>file_hash</code>
   locally. On a miss the responder sends <code>FOUND_NODE</code> with closer
-  contacts, as in classic Kademlia.
+  contacts, as in classic Kademlia. A declared count the buffer cannot satisfy
+  is a framing error — the whole frame is refused, so a peer cannot smuggle a
+  truncated payload.
 </p>
 <p>
-  Record blobs in the reply are packed from a rotating window per key
-  (§8.4), into the 1235-byte record budget. A declared count the buffer
-  cannot satisfy is a framing error — the whole frame is refused, so a peer
-  cannot smuggle a truncated payload.
+  <strong>Paging is the searcher’s, not the responder’s.</strong> Version 2 had
+  the responder advance a rotation cursor per key, which could not tell “this
+  searcher wants the next page” from “a different searcher wants the first”, so
+  two searchers on one hot key advanced each other’s window and neither saw a
+  contiguous run. Serving is now deterministic: the same request gets the same
+  answer every time.
+</p>
+<p>
+  <code>next_position</code> is reported rather than inferred. The packer skips a
+  record too large for the budget <em>left</em> on a page and keeps scanning for
+  one that fits, so a page is not always a contiguous run and
+  <code>start + len</code> would step over what was skipped — the oversized
+  record would then never be first, never face an empty budget, and never be
+  served, while the responder went on reporting it as held. A page therefore
+  resumes at the earliest record it passed over, which re-sends the ones after
+  it; content-based dedup at the searcher absorbs that. Positions are advisory,
+  since the responder’s list shifts as records expire, so paging may repeat or
+  skip an entry.
+</p>
+<p>
+  <strong>Query constraints.</strong> <span class="badge">additive</span>
+  A <code>FIND_VALUE</code> may append a tag/len/value block carrying minimum
+  size, maximum size, file type, file extension, and any keyword hashes past the
+  eight the count-prefixed run can name (up to
+  <code>MAX_FIND_VALUE_KEYS_TOTAL</code> = 23 across both runs). The responder
+  applies it <em>before</em> packing, so <code>total_available</code> counts
+  matches and a searcher pages through matches rather than through positions it
+  would discard. A key where nothing matches is answered with contacts, exactly
+  as a key we do not hold is.
+</p>
+<p>
+  Additive because <code>MSG_FIND_VALUE</code> has always required only a
+  <em>minimum</em> length and read its fields at fixed offsets, so bytes past
+  <code>start_position</code> have always been valid and ignored. An
+  unconstrained query encodes byte-for-byte as it did before. The block is
+  advisory: a searcher re-applies the same filters at emit, because a peer
+  predating it will answer without having applied them.
+</p>
+<p>
+  Availability is deliberately <em>not</em> a constraint. KAD can filter on it
+  because its keyword entries carry a publisher-claimed source count; an Ember
+  record carries none, and the number a search page shows counts distinct
+  publishers across the network, which no single responder can see. A constraint
+  no responder could evaluate honestly is worse than none.
 </p>
 
 <!-- ══════════════════════════════════════════════ 7 ══════════════════════════════════════════════ -->
@@ -1219,8 +1395,31 @@ footer.doc-end {
   <tbody>
     <tr><td>RECORD_TYPE_KEYWORD</td><td>0x01</td><td>BLAKE3(lowercase keyword)[..16]</td><td>24 h</td></tr>
     <tr><td>RECORD_TYPE_SOURCE</td><td>0x02</td><td>BLAKE3(eD2K file_hash)[..16]</td><td>6 h</td></tr>
+    <tr><td>RECORD_TYPE_CHANNEL</td><td>0x03</td><td>Sharded room index / presence / moderation / handoff key</td><td>Varies by kind</td></tr>
   </tbody>
 </table>
+<p>
+  <strong>Keyword media.</strong> <span class="badge">additive</span>
+  A keyword record may carry an optional block after its name:
+  <code>version[1]</code> then <code>tag/len/value</code> triples for duration,
+  bitrate, codec, artist, album and title. It is parsed through to the search
+  row, so an Ember-only hit can fill the Length, Bitrate, Codec, Artist, Album
+  and Title columns that only a server result used to populate.
+</p>
+<p>
+  Additive because <code>parse_unverified</code> reads the name from its length
+  prefix and does not length-check a keyword record: an older build parses a
+  longer body correctly and ignores the tail, and a storer relays the bytes it
+  was handed. The name budget charges the block, and the publisher signature
+  covers it, so a relay cannot rewrite it. Publisher-supplied strings are capped
+  and required to be real UTF-8 — they decide sort keys and column widths, and
+  must not become a second name field that disagrees with the file name.
+</p>
+<p>
+  The reader shipped one release before the writer, on purpose: by the time
+  anything published a block, the builds that would receive it already
+  understood it. That is the right order for any additive wire change.
+</p>
 
 <h3>7.1 Keyword hash and tokenization</h3>
 <div class="eq">keyword_hash(s) = BLAKE3(s.to_lowercase().as_bytes())[0..16]</div>
@@ -1263,10 +1462,20 @@ footer.doc-end {
   A downloader uses <code>ip + tcp_port</code> over the existing eD2K path
   when the source is not firewalled. Firewalled records append a 70-byte
   callback trailer (user hash + buddy address + buddy Noise key + token) after the
-  41-byte contact. HighID records stay 41 bytes. v2 parsers that ignore extra
-  bytes still accept the contact
-  block; this build reads the trailer when it is present. That is an additive
-  record-body change, not a DHT-frame version bump.
+  41-byte contact. HighID records stay 41 bytes. A parser that ignores extra
+  bytes still accepts the contact block; this build reads the trailer when it is
+  present. That is an additive record-body change, not a DHT-frame version bump.
+  <span class="badge">additive</span>
+</p>
+<p>
+  Naming a buddy <em>requires</em> that buddy’s signed endorsement
+  (<code>BUDDY_ENDORSE</code>, 0x14). It was once also possible to name a buddy
+  by quoting its Noise static key, which is on every signed frame that buddy
+  sends — and that was never consent: anyone who had ever heard from a node
+  could name it and spend a replica, a twenty-node fan-out and a callback slot
+  on its behalf. That compatibility path is gone from both sides. A firewalled
+  publisher with no endorsement yet publishes nothing for that file and retries
+  on the next tick, rather than placing a record no searcher would dial.
 </p>
 
 <h3>7.3 Ember file hash</h3>
@@ -1309,8 +1518,8 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>Cap</th><th>Value</th><th>Behaviour when hit</th></tr></thead>
   <tbody>
-    <tr><td>MAX_RECORDS_PER_KEY</td><td>300</td><td>Refuse the newcomer (do not evict incumbents)</td></tr>
-    <tr><td>MAX_RECORDS_PER_PUBLISHER_PER_KEY</td><td>45</td><td>Refuse; ~15% of the key, matching KAD’s ratio (150 of 1000)</td></tr>
+    <tr><td>MAX_RECORDS_PER_KEY</td><td>1000</td><td>Refuse the newcomer (do not evict incumbents)</td></tr>
+    <tr><td>MAX_RECORDS_PER_PUBLISHER_PER_KEY</td><td>150</td><td>Refuse; ~15% of the key, and now KAD’s absolute numbers rather than only its ratio</td></tr>
     <tr><td>MAX_KEYS</td><td>50,000</td><td>Evict the furthest key by XOR-distance when the incoming key is closer; refuse a newcomer that is no closer than the furthest held key</td></tr>
     <tr><td>MAX_STORE_BYTES</td><td>48 MiB</td><td>Evict least valuable (furthest from our ID, then nearest expiry)</td></tr>
     <tr><td>Sources per IP (adaptive)</td><td>8 / 5 / 3</td><td>See NetworkScale; firewalled sources attributed to the forwarder</td></tr>
@@ -1328,10 +1537,16 @@ footer.doc-end {
   keypair.
 </div>
 <p>
-  The 45-record publisher cap is network-wide in effect: every storer applies
-  the same cap to the same publisher key. A user sharing 200 files that share
-  a common word gets 45 of them findable under that word, anywhere — and the
-  same allowance applies to their own local store.
+  The publisher cap is network-wide in effect: every storer applies the same cap
+  to the same publisher key, and the same allowance applies to their own local
+  store. It was 45 of 300 through wire version 2 — so a user sharing 200 files
+  with a word in common got 45 of them findable under that word <em>anywhere</em>,
+  30% of what KAD serves. Raising both to KAD’s own 150 of 1000 waited on
+  searcher-driven paging (§6.9): while a peer could only ever serve its first
+  window, the extra stored records had no way to reach a searcher and the one
+  certain effect would have been more replication traffic.
+  <code>MAX_STORE_BYTES</code> is unchanged, so per-key capacity tripled without
+  raising what the process may hold resident.
 </p>
 <p>
   <code>MAX_KEYS</code> is not a hard admission freeze. When the map is full,
@@ -1421,27 +1636,50 @@ footer.doc-end {
   search from being streamed after its <code>search-complete</code>.
 </p>
 
-<h3>8.4 Serving window</h3>
+<h3>8.4 Serving window and paging</h3>
 <p>
-  A peer answers a keyword query with whatever fits the 1235-byte record
-  budget — typically about five records. Packing used to fill from the front
-  of insertion order, so the oldest five were the only ones that node would
-  ever serve.
+  A peer answers a keyword query with whatever fits the 1235-byte record budget:
+  about five records for a bare keyword record, four for one carrying media, two
+  in the worst case. Through wire version 2 packing filled from the front of
+  insertion order, so the oldest five were the only ones a node would ever
+  serve; a rotation cursor was then added, but the responder owned it and could
+  not tell one searcher from another (§6.9).
 </p>
 <p>
-  Successive <code>FIND_VALUE</code>s now rotate the served window per key.
-  The cursor advances by how many records the reply actually carried, and
-  only when the reply withholds some — if everything fits, rotation is a
-  no-op. Blob-hash de-duplication on the searcher is content-based, so
-  rotating windows can only gather more. Local seeding does not inherit this
-  packing.
+  Since v3 the searcher owns the offset, so a walk pages a well-stocked node
+  until the key is exhausted. Paging is the one mechanism here where a
+  <em>responder</em> influences how many queries we send, so the searcher bounds
+  it independently of what <code>total_available</code> claims: each follow-up
+  must name an offset strictly past the one it answered, and both the per-node
+  result allowance and the page ceiling are two-tier.
 </p>
 <p>
-  Truncation is counted: <code>ember_dht_found_value_truncated</code> and
-  <code>ember_dht_found_value_withheld</code>. Truncation near zero means the
-  ceiling is theoretical on the current network. A high withheld-per-truncated
-  ratio is the case that justifies adding <code>start_position</code> to the
-  wire (a version bump).
+  While the shortlist still holds an unqueried hop — or any query is outstanding
+  — one peer may offer <code>MAX_RESULTS_PER_NODE</code> (75, a quarter of the
+  300-file budget) over up to <code>MAX_PAGES_PER_NODE</code> (25) follow-ups.
+  Once neither is true there is no hop left for extra records to crowd out, so a
+  lone storer may spend what remains of the whole budget, over up to
+  <code>MAX_PAGES_PER_NODE_EXHAUSTED</code> (100) pages. That second page tier
+  has to be <em>earned</em>: past the base ceiling a node keeps paging only
+  while it sustains <code>MIN_RECORDS_PER_PAGE_TO_CONTINUE</code> (2) records
+  per page on average, so a peer answering one record at a time while claiming a
+  huge total stops at the base ceiling.
+</p>
+<p>
+  Blob de-duplication on the searcher is content-based, so a re-sent record
+  costs bandwidth but not a slot of the per-node allowance, which is charged per
+  distinct blob. Local seeding does no packing at all.
+</p>
+<p>
+  Truncation is still counted:
+  <code>ember_dht_found_value_truncated</code> and
+  <code>ember_dht_found_value_withheld</code>, which is how to read how far the
+  datagram ceiling binds on real keys. Read <em>withheld</em> as records past
+  this page’s window that it has not served. It once counted from the rewound
+  resume point, which included records the same page had just put on the wire;
+  a page that rewinds but still reaches the end of its key now reports zero
+  withheld and does not increment <code>truncated</code>, because it truncated
+  nothing.
 </p>
 
 <!-- ══════════════════════════════════════════════ 9 ══════════════════════════════════════════════ -->
@@ -1801,7 +2039,10 @@ footer.doc-end {
       <li>Noise transport</li>
       <li>Adaptive abuse limits</li>
       <li>Rich diagnostics (truncation, reject causes, search quality, high-water)</li>
-      <li>Buddy trailer + <code>CALLBACK_REQ</code> for firewalled consume</li>
+      <li>Buddy endorsement + <code>CALLBACK_REQ</code> for firewalled consume</li>
+      <li>Searcher-owned <code>FIND_VALUE</code> paging</li>
+      <li>Media on keyword records</li>
+      <li>Peers advertise the wire versions they speak</li>
     </ul>
   </div>
   <div class="col kad">
@@ -1815,9 +2056,9 @@ footer.doc-end {
       <li>No signed overlay identity</li>
       <li>Cleartext UDP (obfuscation optional)</li>
       <li>Fixed caps (1 contact/IP, 10/subnet, 3 sources/IP)</li>
-      <li>150 of 1000 records per sender per key</li>
+      <li>150 of 1000 records per sender per key — now matched</li>
       <li>Buddy hash + callback for firewalled consume</li>
-      <li>FIND_VALUE pagination (start position)</li>
+      <li>Keyword search carries query constraints — now matched</li>
     </ul>
   </div>
 </div>
@@ -1837,35 +2078,51 @@ footer.doc-end {
 <ul>
   <li><strong>Content still moves over eD2K.</strong> Native 256&nbsp;KiB chunks and a BLAKE3 hash tree exist but nothing imports them. Downloads still verify the streaming BLAKE3 pin when one is present: mismatch is a permanent failure with a red Ember badge.</li>
   <li><strong>Bootstrap depends on eMule</strong> except for a previously persisted contact file.</li>
-  <li><strong>Version mismatches are silent</strong> — clean refusal, no upgrade prompt.</li>
-  <li><strong>Multi-keyword search is approximate</strong> — sparse intersection plus filename match, not a worldwide AND.</li>
-  <li><strong>Serving ceiling ~5 records per reply</strong> — mitigated by window rotation; pagination waits on a version bump.</li>
-  <li><strong>45 records per publisher per keyword, network-wide.</strong></li>
-  <li><strong>No reputation scoring on gossip</strong> — Sybil pressure is rate-limited, not scored.</li>
+  <li><strong>A version bump still partitions</strong> peers running a build older than the advertised range (§6.1). The refusal is clean and counted, and the Ember page raises a banner, but the peer that needs to update cannot decode anything we send.</li>
+  <li><strong>Multi-keyword search is approximate</strong> — sparse intersection plus filename match, not a worldwide AND. A query may name up to 23 keywords, but only the first eight travel in the run every build reads; the rest ride the constraint block, so a peer predating it intersects on eight and leaves the remainder to the filename match.</li>
+  <li><strong>A few records per reply</strong> — five for a bare keyword record, four with media, two in the worst case — but a searcher can now page a node until its key is exhausted (§8.4).</li>
+  <li><strong>150 records per publisher per keyword, network-wide.</strong></li>
+  <li><strong>Media columns fill only after a republish.</strong> A record published by a build predating the media block simply has none, so those columns stay empty until that publisher re-announces.</li>
   <li><strong>Not yet exercised end to end:</strong> LowID PROXY_STORE / callback, cold join from an empty contact file with no KAD, republish across a full record TTL on a large library.</li>
 </ul>
 
-<h3>16.2 Planned wire changes (one version bump)</h3>
-<p>These wait on <code>EMBER_DHT_VERSION</code> 3 so they can land together:</p>
+<h3>16.2 Shipped since wire version 2</h3>
+<p>
+  Both items this section previously listed as waiting on a bump have landed, as
+  wire version 3, together — one bump paid for both, and the capacity raise was
+  only worth having once paging could serve the extra records.
+</p>
 <ol>
-  <li><strong><code>start_position</code> on FIND_VALUE / FOUND_VALUE</strong> — real pagination. Justified if truncation counters show withheld records on the live network after rotation.</li>
-  <li><strong>Drop <code>node_id</code> from wire contacts</strong> — 87 → 71 bytes, 14 → 17 contacts per FOUND_NODE. The ID is BLAKE3 of the key and is re-derived anyway.</li>
+  <li><strong><code>start_position</code> on FIND_VALUE / FOUND_VALUE</strong> — searcher-owned paging, replacing the responder-side rotation cursor (§6.9, §8.4).</li>
+  <li><strong><code>node_id</code> dropped from wire contacts</strong> — 87 → 71 bytes, 14 → 17 contacts per FOUND_NODE (§6.4).</li>
+  <li><strong><code>MAX_RECORDS_PER_PUBLISHER_PER_KEY</code> raised to KAD’s 150 of 1000</strong>, unblocked by the above (§7.5).</li>
 </ol>
 <p>
-  Raising <code>MAX_RECORDS_PER_PUBLISHER_PER_KEY</code> toward KAD’s 150 is
-  blocked on pagination: if a peer only ever serves ~5 records per reply, extra
-  stored records have no way to reach a searcher, and the only certain effect
-  is more storer-replication traffic.
+  Everything else added since needed no bump, because each went where an
+  existing decoder does not look — after the fields a payload’s parser reads at
+  fixed offsets, or after a record’s length-prefixed name: query constraints and
+  keyword media, the callback and endorsement message pair, channel records, and
+  the advertised version range. A change that must alter an <em>existing</em>
+  field still has no path but a bump.
 </p>
 
 <h3>16.3 Future, non-blocking</h3>
 <ul>
-  <li>Shard the rendezvous key space once one KAD bucket’s 1000-entry cap is in sight. Rendezvous-key health (listed / lookups / empty) is already on the Ember page.</li>
-  <li>Richer keyword indexing (stemming) if recall lags KAD on real libraries.</li>
-  <li>Score gossip under Sybil pressure, beyond per-IP and per-subnet caps.</li>
+  <li>Shard the rendezvous key space. Its trigger is now observable: the storer load reported for the rendezvous key, since a lookup’s returned-peer count saturates at the source-search stop threshold (20) and can never see a 1000-entry key.</li>
+  <li>Richer keyword indexing (stemming) if recall lags KAD on real libraries. Now measured per search as files found by both DHTs, by KAD only, or by Ember only.</li>
+  <li>Route a future wire change around peers that have not advertised a range, rather than shipping it on a flag day (§6.1).</li>
   <li>Wire the native transfer path (<code>ember/transfer.rs</code>).</li>
   <li>Longer fuzz / property tests and overnight soak jobs.</li>
 </ul>
+<p>
+  Gossip is now scored rather than merely rate-limited: an introducer’s probes
+  are rationed by how many of the leads it gave us went on to answer, though it
+  is never consulted while the table is starved and never refuses a contact
+  outright. Sybil pressure on the <em>store</em> remains bounded by address
+  diversity rather than by identity, since every per-publisher share is keyed on
+  a free keypair; the per-address STORE ceiling is where a rotating-identity
+  flood becomes visible, and it is counted.
+</p>
 
 <h3>16.4 Dormant native transfer</h3>
 <p>
@@ -1880,17 +2137,17 @@ footer.doc-end {
 
 <!-- ══════════════════════════════════════════════ A ══════════════════════════════════════════════ -->
 <h2 id="sec-a">Appendix A. Constant tables</h2>
-<p class="sec-lead" style="margin-top:-2mm;">Values as compiled in Ember 1.5.6. Source files in parentheses.</p>
+<p class="sec-lead" style="margin-top:-2mm;">Values as compiled in Ember 1.6.3. Source files in parentheses.</p>
 
 <h3>A.1 Overlay</h3>
 <table class="data">
   <thead><tr><th>Constant</th><th>Value</th><th>File</th></tr></thead>
   <tbody>
-    <tr><td>EMBER_DHT_VERSION / MIN</td><td>2 / 2</td><td>dht/mod.rs</td></tr>
+    <tr><td>EMBER_DHT_VERSION / MIN</td><td>4 / 4</td><td>dht/mod.rs</td></tr>
     <tr><td>K_BUCKET_SIZE</td><td>20</td><td>dht/mod.rs</td></tr>
     <tr><td>ALPHA</td><td>5</td><td>dht/mod.rs</td></tr>
     <tr><td>ID_BITS</td><td>128</td><td>dht/mod.rs</td></tr>
-    <tr><td>MAX_CONTACTS_PER_RESPONSE</td><td>20 (14 IPv4 fit)</td><td>dht/mod.rs</td></tr>
+    <tr><td>MAX_CONTACTS_PER_RESPONSE</td><td>20 (17 IPv4 fit)</td><td>dht/mod.rs</td></tr>
     <tr><td>CONTACT_TIMEOUT_SECS</td><td>600</td><td>dht/mod.rs</td></tr>
     <tr><td>MAX_FAILED_QUERIES</td><td>3</td><td>dht/mod.rs</td></tr>
     <tr><td>EMBER_MAGIC</td><td>0xEB 0x3E</td><td>transport.rs</td></tr>
@@ -1911,6 +2168,9 @@ footer.doc-end {
     <tr><td>MAX_STORE_RECORD_BYTES</td><td>1169</td><td>dht/messages.rs — FOUND_VALUE singleton pack budget (1235 − 2 − 64)</td></tr>
     <tr><td>MAX_FOUND_VALUE_BLOB_BYTES</td><td>1233</td><td>dht/messages.rs — body + 64-byte signature</td></tr>
     <tr><td>MAX_FIND_VALUE_KEYS</td><td>8</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_FIND_VALUE_EXTRA_KEYS</td><td>15 (constraint block)</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_FIND_VALUE_KEYS_TOTAL</td><td>23</td><td>dht/messages.rs</td></tr>
+    <tr><td>CONTACT_WIRE_LEN_IPV4</td><td>71</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_STORE_BATCH_RECORDS</td><td>64</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_FOUND_VALUE_RECORDS</td><td>300</td><td>dht/messages.rs</td></tr>
   </tbody>
@@ -1991,17 +2251,26 @@ footer.doc-end {
 
 <footer class="doc-end">
   <p>
-    EmberDHT Protocol Specification · Wire version 2 · Ember 1.5.6 · August 2026.
+    EmberDHT Protocol Specification · Wire version 4 · Ember 1.6.3 · September 2026.
     Derived from the canonical implementation in the ember-p2p repository.
     Licensed under the GNU General Public License, version 3.
   </p>
   <p>
-    This document describes behaviour as implemented. It is not a promise that
-    the wire will remain unchanged: version 3 is reserved for pagination
-    and contact-list compaction. Firewalled consume landed in version 2 as
-    an additive source-record trailer and two new message types. Implementers targeting
-    interoperability should treat <code>EMBER_DHT_MIN_VERSION..=EMBER_DHT_VERSION</code>
-    as the only supported range.
+    This document describes behaviour as implemented, and is not a promise that
+    the wire will remain unchanged. Version 3 carried pagination and
+    contact-list compaction; version 4 bound a frame signature to the session it
+    arrives on. Everything since has been additive — query constraints, keyword
+    media, the callback and endorsement pair, channel records, and the
+    advertised version range — and additive means a peer that does not speak it
+    parses the frame correctly and ignores the addition.
+  </p>
+  <p>
+    Implementers targeting interoperability should treat
+    <code>EMBER_DHT_MIN_VERSION..=EMBER_DHT_VERSION</code> as the only supported
+    range, read that range from the block on a <code>PING</code> or
+    <code>PONG</code> where a peer offers one, and treat its absence as “this
+    peer speaks version 4 and nothing else” rather than as consent to anything
+    newer.
   </p>
 </footer>
 

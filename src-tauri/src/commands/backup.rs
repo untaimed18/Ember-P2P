@@ -580,6 +580,51 @@ fn decrypt_stream(src: &Path, dest: &Path, passphrase: &str) -> Result<(), Strin
 /// Scratch directory for the intermediate plaintext zip. Lives inside the data
 /// directory so it inherits the restricted ACL and shares a volume with the
 /// database snapshot.
+/// Remove `.backup-tmp-*` / `.restore-tmp-*` directories left in the data
+/// directory by an export or import that did not finish.
+///
+/// Export deliberately DPAPI-*unwraps* `identity.json`, `cryptkey.dat` and
+/// `chat-history.key` into its scratch directory, because a backup that only
+/// restores under the Windows account that made it is not a backup. Those
+/// plaintext keys are only removed by the tail of the export closure, which a
+/// kill, a crash or a power loss skips — and the directory name carries a pid
+/// and a UUID, so nothing ever looked for it again. Living in the data
+/// directory rather than `%TEMP%`, the OS never reclaimed it either, leaving
+/// the Ed25519, Noise and SecIdent private keys plus the chat-history key
+/// unwrapped on disk indefinitely. The ACL is still current-user-only; what
+/// this restores is the at-rest wrapping that protects a copied, cloned or
+/// cloud-synced profile.
+///
+/// Startup is the right place because no export or import can be in flight
+/// yet, so a directory found here is always abandoned.
+pub fn sweep_orphaned_scratch(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(".backup-tmp-") && !name.starts_with(".restore-tmp-") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::warn!(
+                "Removed an abandoned backup scratch directory ({name}); an export or import \
+                 did not finish"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not remove the abandoned backup scratch directory {name}"
+            ),
+        }
+    }
+}
+
 fn temp_dir_in(data_dir: &Path, tag: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| {
         coded_ctx(
@@ -1367,21 +1412,20 @@ fn stage_restore(
     Ok(summary)
 }
 
-/// Move `staged` onto `live`, falling back to a copy.
+/// Copy `staged` onto `live`, leaving the staged copy where it is.
 ///
-/// A rename within one directory should not fail, but a scanner or indexer
-/// holding the freshly written file for a moment can make it fail on Windows -
-/// and by this point the file being replaced has already been moved aside, so
-/// giving up cheaply is expensive.
-fn swap_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
-    match std::fs::rename(staged, live) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            std::fs::copy(staged, live).map_err(|_| rename_error)?;
-            let _ = std::fs::remove_file(staged);
-            Ok(())
-        }
-    }
+/// Deliberately a copy rather than a rename. [`apply_pending_restore`] rolls
+/// back the files that already landed when a later one fails, and keeps
+/// `restore-pending/` so the next launch can retry — but a rename consumes the
+/// staged copy, so the retry found those files gone, could not tell "rolled
+/// back" from "already applied", skipped them, and reported success. The
+/// profile was then left holding the machine's original of every rolled-back
+/// file beside the backup's copy of the rest, which is precisely the mixed
+/// state the rollback exists to prevent. Staging is removed only once the
+/// whole set has landed.
+fn copy_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
+    std::fs::copy(staged, live)?;
+    Ok(())
 }
 
 /// Swap a staged restore into place. Called during startup before the
@@ -1447,6 +1491,67 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         return Ok(None);
     }
 
+    // Every file the marker lists has to be present before anything moves.
+    //
+    // The apply is all-or-nothing across *retries*, not only within one run: a
+    // rollback leaves staging in place for the next launch, so a staged file
+    // that has gone missing means this directory is no longer the complete
+    // profile its marker claims. Pressing on past it is what silently produced
+    // a half-restored profile — and reported success, because a skipped file
+    // sets no failure. A profile staged by a build that consumed its staged
+    // copies lands here too, and is refused rather than half-applied.
+    let absent: Vec<&str> = pending
+        .files
+        .iter()
+        .filter(|name| backup_file(name).is_some())
+        .filter(|name| !staging.join(name.as_str()).is_file())
+        .map(|name| name.as_str())
+        .collect();
+    if !absent.is_empty() {
+        tracing::error!(
+            "Not applying the staged restore: {} file(s) its marker lists are missing from {} \
+             ({}). It stays staged - discard it from Settings > Backup and import again.",
+            absent.len(),
+            staging.display(),
+            absent.join(", ")
+        );
+        return Ok(None);
+    }
+
+    // Room for the copies before any of them is attempted.
+    //
+    // `copy_into_place` keeps each staged file until the whole set has landed,
+    // which is what makes a retry after a rollback start from a complete
+    // profile — but it also means the staged set, the live copies and the
+    // displaced originals all exist at once, where the previous rename
+    // consumed staging as it went. On a nearly-full disk that turns a restore
+    // that used to squeeze through into one that fails part-way. The rollback
+    // handles that correctly now, but an upfront refusal that keeps staging
+    // intact is a better answer than a mid-apply abort.
+    let staged_bytes: u64 = pending
+        .files
+        .iter()
+        .filter_map(|name| std::fs::metadata(staging.join(name)).ok())
+        .map(|meta| meta.len())
+        .sum();
+    if let Ok(free) = fs2::available_space(data_dir) {
+        // The originals are moved aside rather than copied, so one further
+        // copy of the staged set is what this actually needs; the margin
+        // covers the database's WAL and SHM sidecars.
+        let needed = staged_bytes.saturating_add(staged_bytes / 4);
+        if free < needed {
+            tracing::error!(
+                "Not applying the staged restore: it needs about {} MiB free in {} and only {} MiB \
+                 is available. It stays staged - free some space and relaunch, or discard it from \
+                 Settings > Backup.",
+                needed / (1024 * 1024),
+                data_dir.display(),
+                free / (1024 * 1024)
+            );
+            return Ok(None);
+        }
+    }
+
     let backup_dir = data_dir.join(format!("pre-restore-{}", chrono::Utc::now().timestamp()));
     std::fs::create_dir_all(&backup_dir)?;
     crate::security::restrict_file_permissions(&backup_dir);
@@ -1466,7 +1571,11 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         }
         let staged = staging.join(name);
         if !staged.is_file() {
-            continue;
+            // Checked before the loop, so this is a file that vanished under
+            // us mid-apply. A failure rather than a skip, for the reason the
+            // pre-flight gives.
+            failure = Some(format!("the staged {name} disappeared before it was applied"));
+            break;
         }
         let live = data_dir.join(name);
         let mut displaced = false;
@@ -1494,7 +1603,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
                 }
             }
         }
-        match swap_into_place(&staged, &live) {
+        match copy_into_place(&staged, &live) {
             Ok(()) => {
                 crate::security::restrict_file_permissions(&live);
                 applied += 1;
@@ -1538,7 +1647,10 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             if !saved.exists() {
                 continue;
             }
-            let _ = std::fs::remove_file(&live);
+            // No `remove_file` first: `fs::rename` already replaces the
+            // destination on every platform we ship, and deleting ahead of it
+            // opened a window where a rename that then failed left the profile
+            // with no copy of the file at all.
             if let Err(e) = std::fs::rename(&saved, &live) {
                 tracing::error!(
                     "Rollback failed for {name} ({e}); recover it from {}",
@@ -1816,6 +1928,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A staging directory that no longer holds every file its marker lists is
+    /// refused outright rather than applied in part.
+    ///
+    /// This is the state a rollback used to leave: the apply *renamed* each
+    /// staged copy into place, so the files it then rolled back were gone from
+    /// staging. The retry could not tell that from "already applied", skipped
+    /// them, set no failure, deleted staging and returned success — leaving the
+    /// machine's original of every rolled-back file beside the backup's copy of
+    /// the rest, which is exactly the mixed profile the rollback exists to
+    /// prevent.
+    #[test]
+    fn a_staging_dir_missing_a_listed_file_is_refused_not_half_applied() {
+        let dir = scratch("apply-incomplete");
+        let staging = staging_dir(&dir);
+        std::fs::create_dir_all(&staging).unwrap();
+        // `identity.json` is still staged; `config.json` is the one an earlier
+        // attempt consumed and then rolled back.
+        std::fs::write(staging.join("identity.json"), b"restored-identity").unwrap();
+        std::fs::write(dir.join("identity.json"), b"live-identity").unwrap();
+        std::fs::write(dir.join("config.json"), b"live-config").unwrap();
+        let pending = PendingRestore {
+            version: FORMAT_VERSION,
+            staged_at: chrono::Utc::now().timestamp(),
+            source_app_version: "1.3.3".to_string(),
+            schema_version: 1,
+            files: vec!["config.json".to_string(), "identity.json".to_string()],
+        };
+        std::fs::write(
+            staging.join(STAGING_MARKER),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        // Nothing swapped: both live files are still the machine's own.
+        assert_eq!(
+            std::fs::read(dir.join("identity.json")).unwrap(),
+            b"live-identity"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("config.json")).unwrap(),
+            b"live-config"
+        );
+        // Left staged, so the startup notice fires and Settings > Backup can
+        // still discard it.
+        assert!(pending_restore_still_staged(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staged copies outlive the individual swaps, so a retry after a rollback
+    /// starts from a complete staging directory. Staging goes only once the
+    /// whole set has landed.
+    #[test]
+    fn applying_a_multi_file_restore_swaps_every_file_and_keeps_both_originals() {
+        let dir = scratch("apply-multi");
+        let staging = staging_dir(&dir);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("config.json"), b"restored-config").unwrap();
+        std::fs::write(staging.join("identity.json"), b"restored-identity").unwrap();
+        std::fs::write(dir.join("config.json"), b"live-config").unwrap();
+        std::fs::write(dir.join("identity.json"), b"live-identity").unwrap();
+        let pending = PendingRestore {
+            version: FORMAT_VERSION,
+            staged_at: chrono::Utc::now().timestamp(),
+            source_app_version: "1.3.3".to_string(),
+            schema_version: 1,
+            files: vec!["config.json".to_string(), "identity.json".to_string()],
+        };
+        std::fs::write(
+            staging.join(STAGING_MARKER),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let preserved = apply_pending_restore(&dir).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("config.json")).unwrap(),
+            b"restored-config"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("identity.json")).unwrap(),
+            b"restored-identity"
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("config.json")).unwrap(),
+            b"live-config"
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("identity.json")).unwrap(),
+            b"live-identity"
+        );
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An abandoned export scratch directory holds DPAPI-*unwrapped* identity,
+    /// SecIdent and chat keys, so it must not survive a restart.
+    #[test]
+    fn startup_sweeps_abandoned_backup_scratch_directories() {
+        let dir = scratch("scratch-sweep");
+        let export = temp_dir_in(&dir, "backup-tmp").unwrap();
+        let import = temp_dir_in(&dir, "restore-tmp").unwrap();
+        std::fs::write(export.join("payload.zip"), b"plaintext-keys").unwrap();
+        // Not ours to remove.
+        std::fs::write(dir.join("config.json"), b"live").unwrap();
+        let keep = dir.join("pre-restore-123");
+        std::fs::create_dir_all(&keep).unwrap();
+
+        sweep_orphaned_scratch(&dir);
+
+        assert!(!export.exists(), "export scratch must be swept");
+        assert!(!import.exists(), "import scratch must be swept");
+        assert!(keep.is_dir(), "displaced originals must be kept");
+        assert!(dir.join("config.json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_staged_restore_left_for_a_month_is_discarded_rather_than_applied() {
         let dir = scratch("stale-restore");
@@ -1881,7 +2110,7 @@ mod tests {
         // Displace the live file the way the apply loop does, then fail the
         // swap by pointing it at a staged path that does not exist.
         std::fs::rename(&live, backup_dir.join("config.json")).unwrap();
-        assert!(swap_into_place(&dir.join("missing.staged"), &live).is_err());
+        assert!(copy_into_place(&dir.join("missing.staged"), &live).is_err());
         std::fs::rename(backup_dir.join("config.json"), &live).unwrap();
         assert_eq!(std::fs::read(&live).unwrap(), b"live");
         let _ = std::fs::remove_dir_all(&dir);

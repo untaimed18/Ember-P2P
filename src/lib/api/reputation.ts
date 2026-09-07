@@ -53,6 +53,26 @@ export async function getPeerReputation(userHashHex: string): Promise<PeerReputa
 }
 
 /**
+ * Reputation for many peers in a single call, keyed by lowercase hex hash.
+ *
+ * Prefer this over looping `getPeerReputation` anywhere a table needs a badge
+ * per row. Each single-peer call takes a slot in the backend's bounded command
+ * channel, so a per-row fan-out on a repeating timer starves unrelated commands
+ * into "Network busy" — while every answer comes from the same in-memory
+ * tracker and could have been fetched at once.
+ *
+ * Hashes the backend cannot parse are omitted from the result; a peer with no
+ * tracker record is present with a `null` value, so a missing key means "not
+ * answered" and a null one means "no record".
+ */
+export async function getPeerReputationBatch(
+  userHashes: string[],
+): Promise<Record<string, PeerReputationInfo | null>> {
+  if (userHashes.length === 0) return {};
+  return invoke('get_peer_reputation_batch', { userHashes });
+}
+
+/**
  * Fetch aggregate reputation counters for the statistics / security
  * page. Cheap — reads in-memory counters with no I/O.
  */

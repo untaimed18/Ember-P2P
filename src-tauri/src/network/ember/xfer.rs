@@ -66,7 +66,15 @@ pub struct SendState {
     /// Held open once the transfer starts, rather than reopened per block.
     /// At the full block rate that would be nearly two hundred `open` calls a
     /// second for one file.
-    handle: Option<std::fs::File>,
+    ///
+    /// Buffered for the same reason [`RecvState::file`] is: the receiver asks
+    /// for a window of consecutive blocks, so one read syscall answers all of
+    /// them instead of one per 1008-byte block on the network task.
+    handle: Option<std::io::BufReader<std::fs::File>>,
+    /// Where `handle`'s cursor is, when known. See [`RecvState::write_pos`] —
+    /// seeking a `BufReader` discards its buffer, so skipping the redundant
+    /// seek is what makes the buffering worth having.
+    read_pos: Option<u64>,
     reported_pct: u8,
 }
 
@@ -92,6 +100,7 @@ impl SendState {
             sent_blocks: 0,
             updated_at: Instant::now(),
             handle: None,
+            read_pos: None,
             reported_pct: 0,
         }
     }
@@ -99,15 +108,23 @@ impl SendState {
     /// Read one block, opening the file on first use and keeping the handle.
     pub fn read_block(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         if self.handle.is_none() {
-            self.handle = Some(std::fs::File::open(&self.path)?);
+            self.handle = Some(std::io::BufReader::with_capacity(
+                XFER_WINDOW_BLOCKS * XFER_BLOCK_SIZE,
+                std::fs::File::open(&self.path)?,
+            ));
+            self.read_pos = Some(0);
         }
+        let resuming_at = self.read_pos.take();
         let file = self
             .handle
             .as_mut()
             .expect("handle was just opened or already present");
         let mut buf = vec![0u8; len];
-        file.seek(SeekFrom::Start(offset))?;
+        if resuming_at != Some(offset) {
+            file.seek(SeekFrom::Start(offset))?;
+        }
         file.read_exact(&mut buf)?;
+        self.read_pos = Some(offset + len as u64);
         Ok(buf)
     }
 
@@ -211,7 +228,18 @@ pub struct RecvState {
     pub part_path: PathBuf,
     /// Where the finished file is moved to.
     pub final_path: PathBuf,
-    file: std::fs::File,
+    /// Buffered so a window's worth of blocks costs one write syscall instead
+    /// of one each. Blocks are 1008 bytes and arrive at up to
+    /// `XFER_BLOCKS_OUT_PER_SEC` across `XFER_MAX_ACTIVE` transfers, and this
+    /// runs on the network task — against a download folder on a share, a
+    /// cold disk, or one a virus scanner is watching, a syscall per block was
+    /// enough to starve UDP receive.
+    file: std::io::BufWriter<std::fs::File>,
+    /// Where `file`'s cursor is, when known. Blocks normally arrive in order,
+    /// so tracking this lets the common case skip the `seek` that would
+    /// otherwise flush the buffer on every block and undo the buffering.
+    /// `None` means "unknown, seek before writing".
+    write_pos: Option<u64>,
     /// One bit per block.
     have: Vec<u64>,
     have_blocks: u64,
@@ -246,7 +274,11 @@ impl RecvState {
             root,
             part_path,
             final_path,
-            file,
+            file: std::io::BufWriter::with_capacity(
+                XFER_WINDOW_BLOCKS * XFER_BLOCK_SIZE,
+                file,
+            ),
+            write_pos: None,
             have: vec![0u64; words],
             have_blocks: 0,
             total_blocks,
@@ -304,8 +336,15 @@ impl RecvState {
         if self.has(block) {
             return Ok(false);
         }
-        self.file.seek(SeekFrom::Start(offset))?;
+        // Cleared first so any failure below leaves the cursor unknown rather
+        // than claimed: a half-applied seek or write must force a real seek
+        // next time, never let the next block land at a guessed offset.
+        let resuming_at = self.write_pos.take();
+        if resuming_at != Some(offset) {
+            self.file.seek(SeekFrom::Start(offset))?;
+        }
         self.file.write_all(data)?;
+        self.write_pos = Some(offset + data.len() as u64);
         self.set(block);
         self.have_blocks = self.have_blocks.saturating_add(1);
         Ok(true)
@@ -316,8 +355,13 @@ impl RecvState {
     }
 
     pub fn finish(&mut self) -> std::io::Result<()> {
+        // `flush` empties the buffer into the file; `sync_all` on the inner
+        // handle then commits it. The verify pass that follows reopens the
+        // part file by path, so the flush has to happen before it, not just
+        // whenever the writer is dropped.
         self.file.flush()?;
-        self.file.sync_all()
+        self.write_pos = None;
+        self.file.get_ref().sync_all()
     }
 
     /// Percentage to report, if it has moved a whole step since last time.
@@ -436,6 +480,105 @@ mod tests {
             file,
         );
         (state, TempDir(dir))
+    }
+
+    /// Position-dependent bytes, so a block written or read at the wrong
+    /// offset cannot coincidentally match the expected content.
+    fn block_bytes(block: u64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (block as u8).wrapping_mul(31).wrapping_add(i as u8))
+            .collect()
+    }
+
+    fn temp_send(blocks: u64) -> (SendState, TempDir, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-xfer-send-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("src.bin");
+        let mut contents = Vec::new();
+        for block in 0..blocks {
+            contents.extend_from_slice(&block_bytes(block, XFER_BLOCK_SIZE));
+        }
+        std::fs::write(&path, &contents).unwrap();
+        let state = SendState::new(
+            [1u8; 16],
+            [2u8; 32],
+            [3u8; 32],
+            "src.bin".into(),
+            contents.len() as u64,
+            path,
+        );
+        (state, TempDir(dir), contents)
+    }
+
+    /// The sequential case, which is the one that skips the `seek` so the
+    /// buffering actually batches.
+    #[test]
+    fn sequential_buffered_writes_reproduce_the_file() {
+        let size = XFER_BLOCK_SIZE as u64 * 5;
+        let (mut recv, _dir) = temp_recv(size);
+        let mut expected = Vec::new();
+        for block in 0..5u64 {
+            let data = block_bytes(block, XFER_BLOCK_SIZE);
+            assert!(recv
+                .write_block(block * XFER_BLOCK_SIZE as u64, &data)
+                .unwrap());
+            expected.extend_from_slice(&data);
+        }
+        assert!(recv.is_complete());
+        recv.finish().unwrap();
+        assert_eq!(std::fs::read(&recv.part_path).unwrap(), expected);
+    }
+
+    /// Out-of-order arrival, including a short final block. Skipping a
+    /// redundant seek must never let a jump write at the previous cursor.
+    #[test]
+    fn out_of_order_buffered_writes_land_at_their_offsets() {
+        let size = XFER_BLOCK_SIZE as u64 * 2 + 100;
+        let (mut recv, _dir) = temp_recv(size);
+        let b0 = block_bytes(0, XFER_BLOCK_SIZE);
+        let b1 = block_bytes(1, XFER_BLOCK_SIZE);
+        let b2 = block_bytes(2, 100);
+
+        assert!(recv.write_block(XFER_BLOCK_SIZE as u64, &b1).unwrap());
+        assert!(recv.write_block(0, &b0).unwrap());
+        assert!(recv.write_block(XFER_BLOCK_SIZE as u64 * 2, &b2).unwrap());
+        // A block already held is refused, and must leave the cursor alone.
+        assert!(!recv.write_block(0, &b0).unwrap());
+        assert!(recv.is_complete());
+        recv.finish().unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&b0);
+        expected.extend_from_slice(&b1);
+        expected.extend_from_slice(&b2);
+        assert_eq!(std::fs::read(&recv.part_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn buffered_reads_return_the_right_block_in_any_order() {
+        let (mut send, _dir, contents) = temp_send(6);
+        let at = |block: u64| {
+            let start = (block * XFER_BLOCK_SIZE as u64) as usize;
+            contents[start..start + XFER_BLOCK_SIZE].to_vec()
+        };
+        // Sequential first: the reads that reuse the buffer without seeking.
+        for block in 0..3u64 {
+            let got = send
+                .read_block(block * XFER_BLOCK_SIZE as u64, XFER_BLOCK_SIZE)
+                .unwrap();
+            assert_eq!(got, at(block), "sequential block {block}");
+        }
+        // Then jump around, which has to invalidate the buffer and seek.
+        for block in [5u64, 0, 4, 1] {
+            let got = send
+                .read_block(block * XFER_BLOCK_SIZE as u64, XFER_BLOCK_SIZE)
+                .unwrap();
+            assert_eq!(got, at(block), "seeking block {block}");
+        }
     }
 
     #[test]

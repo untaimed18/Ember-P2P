@@ -1,6 +1,12 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import {
+    pendingRelatedSearch,
+    relationKindLabel,
+    startRelatedSearch,
+    RELATED_SEARCH_METHOD,
+  } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { getEmberDiagnostics } from '$lib/api/ember';
@@ -21,9 +27,17 @@
     searchTabs,
     setActiveSearchTab,
     spamFilterEpoch,
+    type RelatedSearchInfo,
     type SearchTab,
   } from '$lib/stores/search';
-  import { networkStats, serverStatus } from '$lib/stores/network';
+  import {
+    MAX_SEARCH_QUERY_LEN,
+    clampQueryBytes,
+    extensionOnlyQueryToken,
+    isServerDirectiveQuery,
+    queryHasNetworkKeyword,
+  } from '$lib/searchQuery';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
@@ -32,6 +46,9 @@
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { openWebService } from '$lib/api/settings';
+  import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -49,10 +66,6 @@
    * getSettings() from re-arming the cancel watchdog after completion grace
    * is already in `searchTimeouts`. */
   const searchInvokeSettled = new Set<number>();
-
-  /// Upper bound on a search query length sent over IPC. Matches
-  /// `MAX_SEARCH_QUERY_LEN` in commands/search.rs (1024 bytes for ASCII).
-  const MAX_SEARCH_QUERY_LEN = 1024;
 
   let searchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
@@ -323,6 +336,11 @@
 
   // Shown when the user tries to search with no usable network connected.
   let networkAlertOpen = $state(false);
+  // Which method the refused search would have run on, which is not always the
+  // one in the dropdown: a related search always runs on the server, so the
+  // dialog has to ask for a server rather than explain a method that search
+  // was never going to use.
+  let networkAlertMethod = $state<SearchMethod>('global');
 
   function searchNetworkHint(method: SearchMethod): string {
     if (method === 'kad') return m.search_network_need_kad_hint();
@@ -353,6 +371,15 @@
   // Live network readiness used by hints (must stay reactive).
   let kadUpLive = $derived($networkStats.status === 'connected');
   let serverUpLive = $derived($serverStatus === 'connected');
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we.
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived(serverUpLive && $relatedSearchSupported !== false);
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -436,23 +463,21 @@
   // received (the count arrives on each hit as `file.complete_sources`).
   let filterMinComplete = $state<number | null>(null);
   let hideSpam = $state<boolean>(true);
-  /** True when the hit is only from the shared library (not merged with KAD/Server/UDP/Notes). */
-  function isLocalOnlySearchResult(r: SearchResult): boolean {
-    const o = (r.result_origin || '').trim();
-    if (!o) return r.peer_id === 'local';
-    const parts = o.split(' · ').map((s) => s.trim()).filter(Boolean);
-    if (parts.length === 0) return r.peer_id === 'local';
-    return parts.every((p) => p === 'Local');
-  }
 
   /**
-   * Whether a (visible) result is effectively "already in the library" with
-   * nothing to fetch. Pure-local rows are filtered out by
-   * `isLocalOnlySearchResult`, but a row can carry a mixed origin like
-   * `KAD · Local` when a file we share is also found on the network — those
-   * rows DO have downloadable network sources. This mirrors the exact early
-   * exit in `download()` so the in-library badge / disabled download button
-   * only show when the action would genuinely be a no-op.
+   * Whether a result is effectively "already in the library" with nothing
+   * to fetch.
+   *
+   * Keyed on the addresses rather than on the origin alone, because a row can
+   * carry a mixed origin like `KAD · Local` when a file we share is also found
+   * on the network. Where such a row names peers, it is downloadable and this
+   * returns false; where it names none — which is the ordinary shape of an
+   * Ember hit, and common for KAD and server hits, since they report
+   * availability without embedding IPs — starting a download would fetch a file
+   * this library already holds.
+   *
+   * Mirrors the exact early exit in `download()`, so the in-library badge and
+   * the disabled button always agree with what the action would do.
    */
   function isInLibraryOnly(r: SearchResult): boolean {
     if (!r.result_origin?.includes('Local')) return false;
@@ -463,12 +488,48 @@
   function displayName(result: SearchResult): string {
     return result.clean_name || result.file.name;
   }
+
+  /**
+   * What the Sources number on a row actually counted.
+   *
+   * The column holds one field for every network, but the networks do not
+   * measure the same thing. eD2K servers and KAD report a swarm estimate they
+   * were told; Ember counts the distinct publishers that signed a record for the
+   * file, which is a handful even for something widely shared. Sorting puts them
+   * in one order regardless, so a row's own number needs to say which it is.
+   */
+  function sourceCountHint(r: SearchResult): string | undefined {
+    const origin = r.result_origin || '';
+    if (!origin.includes('Ember')) return undefined;
+    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint({ count: r.availability });
+    return r.availability === 1
+      ? m.search_sources_ember_hint_one()
+      : m.search_sources_ember_hint_other({ count: r.availability });
+  }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
       ?? 'balanced',
   );
   let showSpamHelp = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
+  let ctxWebSub = $state(false);
+  // Empty until settings load, so the submenu shows its "configure in
+  // Settings" hint rather than a stale list.
+  let webServices = $derived($appSettings?.web_services ?? []);
+
+  /// eMule's right-click → Web services, for one search result.
+  ///
+  /// The backend reads the template from settings by index, substitutes, and
+  /// collects the native confirmation — so there is deliberately no prompt
+  /// here and no URL assembled in this renderer.
+  async function openWebServiceFor(result: SearchResult, index: number) {
+    closeContextMenu();
+    try {
+      await openWebService(index, result.file.hash, result.file.name, result.file.size);
+    } catch (e: unknown) {
+      addToast('error', translateError(e));
+    }
+  }
   let notesRequestId = $state(0);
 
   // Text filter (eMule-style: space-separated AND tokens, "-" prefix = NOT)
@@ -537,6 +598,10 @@
     // background tab's live search.
     for (const id of [...searchInvokeSettled]) forgetSettledRequest(id);
     for (const id of miscTimers) clearTimeout(id);
+    // A related search still waiting on network readiness is abandoned when the
+    // user leaves, rather than kept to fire unprompted next time this page is
+    // opened.
+    pendingRelatedSearch.set(null);
   });
 
   function onFilterTextInput() {
@@ -600,6 +665,34 @@
     return t.split(/\s+/).filter((s) => s !== '' && s !== '-');
   });
 
+  /** Lowercased searchable text for one row, under the active filter column.
+   *
+   *  `getColumnText` formats a size, resolves a type label and splits an
+   *  origin string, then joins the lot and lowercases it — all pure functions
+   *  of the row. It was doing that per row on every filter pass, and the
+   *  filter re-derives on each streamed batch as well as each debounced
+   *  keystroke, so typing into a large tab redid the whole thing several times
+   *  a second.
+   *
+   *  Keyed on the row object, which `mergeIntoTab` replaces whenever the row's
+   *  data changes, so there is nothing to invalidate by hand. The whole map is
+   *  dropped when the column changes, since every entry describes one column's
+   *  text. A locale change cannot strand it: `setLocale` reloads the page. */
+  let haystackCache = new WeakMap<SearchResult, string>();
+  let haystackColumn: FilterColumn | null = null;
+
+  function filterHaystack(result: SearchResult, column: FilterColumn): string {
+    if (haystackColumn !== column) {
+      haystackCache = new WeakMap();
+      haystackColumn = column;
+    }
+    const cached = haystackCache.get(result);
+    if (cached !== undefined) return cached;
+    const text = getColumnText(result, column).toLowerCase();
+    haystackCache.set(result, text);
+    return text;
+  }
+
   function isFilteredByText(result: SearchResult): boolean {
     const tokens = filterTokens;
     if (tokens.length === 0) return false;
@@ -627,7 +720,7 @@
       return false;
     }
 
-    const target = getColumnText(result, filterColumn).toLowerCase();
+    const target = filterHaystack(result, filterColumn);
 
     for (const token of tokens) {
       const isNot = token.startsWith('-');
@@ -785,53 +878,81 @@
     return `nohash:${result.file.name}:${result.file.size}`;
   }
 
-  function inferSearchTypeFromExtension(extension: string | null | undefined): string {
-    // Keep in sync with `search::index::infer_file_type` (eMule ED2KFT_*).
-    const ext = (extension ?? '').toLowerCase();
-    if ([
+  // Built once, and as sets rather than arrays.
+  //
+  // These were array literals inside `inferSearchTypeFromExtension`, so every
+  // call allocated up to eight arrays and scanned them linearly. The backend
+  // leaves `file_type` empty for KAD/Ember hits — which is why that function
+  // exists — so sorting by the Type column ran it twice per comparison: at the
+  // 15,000-row tab cap, on the order of 400,000 calls and millions of array
+  // allocations per sort, repeated on every `visibleResults` sync while a
+  // search streamed. `sortField` is persisted, so once a user sorted by Type
+  // every later search stayed wedged.
+  // Keep in sync with `search::index::infer_file_type` (eMule ED2KFT_*).
+  const EXT_TYPE_SETS: ReadonlyArray<readonly [ReadonlySet<string>, string]> = [
+    [new Set([
       'aac', 'ac3', 'aif', 'aifc', 'aiff', 'amr', 'ape', 'au', 'aud', 'audio',
       'cda', 'dmf', 'dsm', 'dts', 'far', 'flac', 'it', 'm1a', 'm2a', 'm4a', 'mdl',
       'med', 'mid', 'midi', 'mka', 'mod', 'mp1', 'mp2', 'mp3', 'mpa', 'mpc',
       'mtm', 'ogg', 'opus', 'psm', 'ptm', 'ra', 'rmi', 's3m', 'snd', 'stm', 'umx',
       'wav', 'wma', 'xm',
-    ].includes(ext)) return 'Audio';
-    if ([
+    ]), 'Audio'],
+    [new Set([
       '3g2', '3gp', '3gp2', '3gpp', 'amv', 'asf', 'avi', 'bik', 'divx', 'dvr-ms',
       'flc', 'fli', 'flic', 'flv', 'hdmov', 'ifo', 'm1v', 'm2t', 'm2ts', 'm2v',
       'm4b', 'm4v', 'mkv', 'mov', 'movie', 'mp1v', 'mp2v', 'mp4', 'mpe', 'mpeg',
       'mpg', 'mpv', 'mpv1', 'mpv2', 'ogm', 'pva', 'qt', 'ram', 'ratdvd', 'rm',
       'rmm', 'rmvb', 'rv', 'smil', 'smk', 'swf', 'tp', 'ts', 'vid', 'video',
       'vob', 'vp6', 'webm', 'wm', 'wmv', 'xvid',
-    ].includes(ext)) return 'Video';
-    if ([
+    ]), 'Video'],
+    [new Set([
       'bmp', 'emf', 'gif', 'ico', 'jfif', 'jpe', 'jpeg', 'jpg', 'pct', 'pcx', 'pic',
       'pict', 'png', 'psd', 'psp', 'svg', 'tga', 'tif', 'tiff', 'webp', 'wmf',
       'wmp', 'xif',
-    ].includes(ext)) return 'Image';
-    if ([
+    ]), 'Image'],
+    [new Set([
       'bat', 'cmd', 'com', 'exe', 'hta', 'js', 'jse', 'msc', 'vbe', 'vbs', 'wsf',
       'wsh', 'apk', 'app', 'deb', 'rpm', 'scr',
-    ].includes(ext)) return 'Pro';
-    if ([
+    ]), 'Pro'],
+    [new Set([
       'chm', 'css', 'diz', 'doc', 'dot', 'hlp', 'htm', 'html', 'nfo', 'pdf', 'pps',
       'ppt', 'ps', 'rtf', 'text', 'txt', 'wri', 'xls', 'xml', 'docx', 'xlsx',
       'pptx', 'odt', 'ods', 'odp', 'epub', 'djvu', 'lit', 'mobi', 'azw',
-    ].includes(ext)) return 'Doc';
-    if ([
+    ]), 'Doc'],
+    [new Set([
       '7z', 'ace', 'alz', 'arc', 'arj', 'bz2', 'cab', 'cbr', 'cbz', 'gz', 'hqx',
       'lha', 'lzh', 'msi', 'pak', 'par', 'par2', 'rar', 'sit', 'sitx', 'tar',
       'tbz2', 'tgz', 'xpi', 'xz', 'z', 'zip',
-    ].includes(ext)) return 'Arc';
-    if ([
+    ]), 'Arc'],
+    [new Set([
       'bin', 'bwa', 'bwi', 'bws', 'bwt', 'ccd', 'cue', 'dmg', 'img', 'iso', 'mdf',
       'mds', 'nrg', 'sub', 'toast',
-    ].includes(ext)) return 'Iso';
-    if (ext === 'emulecollection') return 'EmuleCollection';
+    ]), 'Iso'],
+    [new Set(['emulecollection']), 'EmuleCollection'],
+  ];
+
+  function inferSearchTypeFromExtension(extension: string | null | undefined): string {
+    const ext = (extension ?? '').toLowerCase();
+    for (const [exts, label] of EXT_TYPE_SETS) {
+      if (exts.has(ext)) return label;
+    }
     return '';
   }
 
+  /** Resolved type per result row.
+   *
+   *  Memoised because the sort comparator, the filter haystack and the type
+   *  label all ask for it, and it is a pure function of fields that never
+   *  change without `mergeIntoTab` replacing the row object — which is exactly
+   *  what a `WeakMap` key tracks, with no pruning to get wrong. */
+  const resultTypeCache = new WeakMap<SearchResult, string>();
+
   function resultType(result: SearchResult): string {
-    return result.file_type || inferSearchTypeFromExtension(result.file.extension);
+    const cached = resultTypeCache.get(result);
+    if (cached !== undefined) return cached;
+    const resolved = result.file_type || inferSearchTypeFromExtension(result.file.extension);
+    resultTypeCache.set(result, resolved);
+    return resolved;
   }
 
   function resultTypeLabel(result: SearchResult): string {
@@ -873,15 +994,9 @@
       case 'Fetch': return m.search_phase_fetch();
       case 'KadNoContacts': return m.search_phase_kad_no_contacts();
       case 'KadBusy': return m.search_phase_kad_busy();
+      case 'EmberBusy': return m.search_phase_ember_busy();
       default: return null;
     }
-  }
-
-  function queryHasNetworkKeyword(q: string): boolean {
-    // Same 3-byte floor as eD2K keyword indexing (UTF-8), so a 1–2 character
-    // CJK token is still a valid KAD/Ember key.
-    const encoder = new TextEncoder();
-    return q.split(/[\s()[\]{}<>,._\-!?:;\\/"']+/).some((t) => t && encoder.encode(t).length >= 3);
   }
 
   function explainBatchFromTab(): { batchFileHashes: string[]; batchFileNames: string[] } {
@@ -981,11 +1096,27 @@
     // broken service — and only declare readiness unknown once the command has
     // been unreachable for several ticks in a row.
     let emberDiagFailures = 0;
+    // Guards this poll the way every other poll in the app is guarded.
+    //
+    // Without the visibility gate a minimized client kept asking every three
+    // seconds for a strip nobody could see. Without the in-flight guard, the
+    // 10 s timeout on `getEmberDiagnostics` let up to four requests overlap
+    // with no ordering, so an older response could land after a newer one —
+    // and `emberContacts` feeds `emberSearchUsable` → `searchSubmitBlocked`,
+    // so a stale `0` disabled the Search button until the next tick.
+    let emberDiagInFlight = false;
+    let emberDiagMissedWhileHidden = false;
     const refreshEmber = () => {
       if (!$appSettings?.ember_native_enabled) {
         emberContacts = 0;
         return;
       }
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        emberDiagMissedWhileHidden = true;
+        return;
+      }
+      if (emberDiagInFlight) return;
+      emberDiagInFlight = true;
       getEmberDiagnostics()
         .then((d) => {
           emberContacts = d.ember_dht_verified_contacts ?? 0;
@@ -996,8 +1127,22 @@
           emberDiagFailures += 1;
           if (emberDiagFailures >= EMBER_DIAG_FAILURE_THRESHOLD) emberDiagnosticsStale = true;
           console.error('Failed to poll Ember DHT readiness:', e);
+        })
+        .finally(() => {
+          emberDiagInFlight = false;
         });
     };
+    // Catch up on return rather than waiting out a full tick with a figure
+    // that went stale while the window was away.
+    const emberDiagOnVisible = () => {
+      if (document.visibilityState === 'visible' && emberDiagMissedWhileHidden) {
+        emberDiagMissedWhileHidden = false;
+        refreshEmber();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', emberDiagOnVisible);
+    }
     refreshEmber();
     emberPoll = setInterval(refreshEmber, 3000);
     joinPoll = setInterval(() => recomputeEmberJoinState(), 1000);
@@ -1023,6 +1168,9 @@
       unlistenHistory?.();
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', emberDiagOnVisible);
+      }
     };
   });
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
@@ -1076,13 +1224,20 @@
   });
 
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
+    // Positive numbers only, matching the wire and the backend's
+    // `has_usable_filters`: `build_search_expression_with_node` drops a zero
+    // numeric, so a `0` left in a size or sources box is not a constraint and
+    // cannot stand in for a query. Counting it as one started a search whose
+    // expression was empty, which the network answers by completing instantly
+    // with nothing.
+    const constrains = (v: number | undefined) => v !== undefined && Number.isFinite(v) && v > 0;
     return !!(
       fileType ||
       filters?.fileType ||
       filters?.fileExtension ||
-      filters?.minSize !== undefined ||
-      filters?.maxSize !== undefined ||
-      filters?.minAvailability !== undefined
+      constrains(filters?.minSize) ||
+      constrains(filters?.maxSize) ||
+      constrains(filters?.minAvailability)
     );
   }
 
@@ -1234,7 +1389,6 @@
     for (const r of visibleResults) {
       if (r.is_spam) spamCount++;
       if (spamHidden && r.is_spam) continue;
-      if (isLocalOnlySearchResult(r)) continue;
       if (hasType && resultType(r) !== filterType) continue;
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
@@ -1258,7 +1412,14 @@
           cmp = sortCollator.compare(resultType(a), resultType(b));
           break;
         case 'sources':
-          cmp = a.availability - b.availability;
+          // Equal numbers are not equal evidence. Ember's count is confirmed
+          // publishers that each hold the whole file; every other network's is a
+          // swarm figure a peer reported and nobody checked. Break the tie
+          // toward the one that was counted rather than claimed.
+          cmp =
+            a.availability - b.availability ||
+            (a.result_origin?.includes('Ember') ? 1 : 0) -
+              (b.result_origin?.includes('Ember') ? 1 : 0);
           break;
         case 'origin':
           cmp = sortCollator.compare(a.result_origin || '', b.result_origin || '');
@@ -1404,10 +1565,60 @@
     return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
   }
 
+  /** Split a byte count back into the number and unit the size boxes hold. */
+  function sizeToInput(
+    bytes: number | undefined,
+    fallbackUnit: number,
+  ): { value: number | null; unit: number } {
+    if (bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) {
+      return { value: null, unit: fallbackUnit };
+    }
+    // Largest unit that divides evenly, so 1 GB comes back as "1 GB" rather
+    // than "1073741824 B".
+    for (let i = SIZE_UNITS.length - 1; i >= 0; i--) {
+      const unit = SIZE_UNITS[i].value;
+      if (bytes % unit === 0) return { value: bytes / unit, unit };
+    }
+    return { value: bytes, unit: 1 };
+  }
+
+  /**
+   * Point the method dropdown, the wire file type and the size / extension /
+   * sources boxes back at the search the selected tab actually ran.
+   *
+   * These controls are shared by every tab, so leaving them alone meant the
+   * panel described the *last* search while the table showed a different one.
+   * That is not only confusing: the same boxes post-filter the rows on screen,
+   * so a narrowing left over from another tab silently hid hits this one had
+   * found, and pressing Search re-ran the dropdowns rather than the tab.
+   *
+   * The client-only view controls — text filter, min complete sources, column,
+   * hide spam — are left as the user set them. They are a lens over whatever is
+   * on screen rather than part of the search that was sent.
+   */
+  function restoreTabSearchParams(tab: SearchTab) {
+    searchMethod = tab.method;
+    searchFileType = tab.fileType ?? '';
+    // Same rule as `handleSearch`: Program clears the local type filter so the
+    // Arc/Iso hits a Pro-wire search brings back stay visible.
+    filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    filterExtension = tab.filters?.fileExtension ?? '';
+    const min = sizeToInput(tab.filters?.minSize, filterMinUnit);
+    filterMinSize = min.value;
+    filterMinUnit = min.unit;
+    const max = sizeToInput(tab.filters?.maxSize, filterMaxUnit);
+    filterMaxSize = max.value;
+    filterMaxUnit = max.unit;
+    filterMinSources = tab.filters?.minAvailability ?? null;
+  }
+
   function selectSearchTab(tabId: string) {
     setActiveSearchTab(tabId);
     const t = get(searchTabs).find((x) => x.id === tabId);
-    if (t) barQuery = t.query;
+    if (t) {
+      barQuery = t.query;
+      restoreTabSearchParams(t);
+    }
     selectedResultKey = null;
     notes = [];
     notesRequestId += 1;
@@ -1452,6 +1663,31 @@
     });
   }
 
+  /** Tab strip text. A related search is labelled by what it went looking for
+   *  rather than by the seed filename: release names are long enough that every
+   *  such tab truncated to the same unreadable prefix, while the derived title
+   *  has already had all of that metadata stripped off it. */
+  function searchTabLabel(tab: SearchTab): string {
+    if (!tab.related) return shortenTabLabel(tab.query);
+    // No derived title means the co-share request is the whole search, which is
+    // the normal case on a server that can answer it. eMule names such a tab
+    // after the seed files ("Related: <names>", its `strSpecialTitle`), and so
+    // do we — it is the only thing left to tell two of them apart.
+    const title = tab.related.queryLabel || tab.related.seedLabel;
+    if (!title) return m.search_related_tab_label();
+    return shortenTabLabel(m.search_related_tab_label_named({ title }));
+  }
+
+  /** Tooltip for a tab: the query for a normal search, and for a related search
+   *  the seed file plus which signals it used and the keywords they derived —
+   *  which is the only place that is discoverable. */
+  function searchTabTitle(tab: SearchTab): string {
+    if (!tab.related) return tab.query;
+    const signals = tab.related.kinds.map(relationKindLabel).join(', ');
+    const base = m.search_related_tab_title({ file: tab.related.seedLabel, signals });
+    return tab.query ? `${base}\n${m.search_related_tab_query({ query: tab.query })}` : base;
+  }
+
   function requestCloseSearchTab(tab: SearchTab) {
     // Only confirm when closing would lose work: an in-flight search or
     // accumulated results. A closed, empty tab is always one click to drop.
@@ -1488,42 +1724,110 @@
     const next = get(activeSearchTabId);
     if (next) {
       const nt = get(searchTabs).find((x) => x.id === next);
-      if (nt) barQuery = nt.query;
+      if (nt) {
+        barQuery = nt.query;
+        // Closing a tab selects a neighbour, which is a tab switch by another
+        // route — so the panel has to follow it here too, or it would go on
+        // describing (and filtering by) the search that was just closed.
+        restoreTabSearchParams(nt);
+      }
     }
   }
 
-  async function handleSearch(query: string) {
+  /**
+   * Run a search.
+   *
+   * `plan` is set only when this is a "find related files" search, in which case
+   * `query` is the keyword query the backend derived from the seed file rather
+   * than anything the user typed. Related searches deliberately reuse this whole
+   * function — the tab strip, the timeout watchdogs, the streaming merge and the
+   * completion fallback all have to behave identically — and differ only in what
+   * they send (seed hashes alongside the query), how the tab is labelled, and
+   * that they may legitimately have no keywords at all when the co-share request
+   * is carrying the search.
+   */
+  async function handleSearch(query: string, plan?: RelatedPlan) {
+    // A related search runs on the server whatever the dropdown says — see
+    // `RELATED_SEARCH_METHOD` for why — so it also skips the gate below, which
+    // reads that dropdown. Its readiness is the server session, and it is
+    // checked by `methodAllowed` further down like any server search.
+    const method: SearchMethod = plan ? RELATED_SEARCH_METHOD : searchMethod;
     // The Search button is disabled in exactly these states, but pressing
     // Enter in the query box reaches this function directly — so without the
     // same gate, clicking did nothing while Enter popped the "no network"
     // dialog. The readiness hint above the results already explains every one
     // of these states on screen, so refusing quietly is the consistent
     // behaviour rather than a silent dead end.
-    if (searchSubmitBlocked) {
+    if (!plan && searchSubmitBlocked) {
       return;
     }
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
-    const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
-    const method = searchMethod;
-    // eMule/backend: Program clears the local type filter so Arc/Iso hits
-    // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
-    filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    const q = clampQueryBytes(query.trim());
+    // A related search carries no filters, because eMule's carries none:
+    // `CSearchResultsWnd::SearchRelatedFiles` fills in an expression and a tab
+    // title and leaves every filter field of a fresh `SSearchParams` at zero.
+    // Ours share one filter panel across tabs, so a "Video" or a min-size left
+    // over from the last hand-typed search would narrow a related search twice
+    // over — as constraints on the wire, and again as the client-side filter
+    // over the results — and hide the very files the seed went looking for.
+    if (plan) {
+      clearRelatedSearchFilters();
+    } else {
+      // eMule/backend: Program clears the local type filter so Arc/Iso hits
+      // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
+      filterType = searchFileType === 'Pro' ? '' : searchFileType;
+    }
+    const wireFileType = plan ? undefined : searchFileType || undefined;
     const parsedMinSize = filterMinSize !== null ? filterMinSize * filterMinUnit : undefined;
     const parsedMaxSize = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : undefined;
     const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
     // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
     // excludes both, unlike the previous `!isNaN` which let Infinity through.
-    const searchFilterSnapshot: import('$lib/api/search').SearchFilters = {
-      fileExtension: filterExtension.trim() || undefined,
-      minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
-      maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
-      minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
-    };
-    if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
+      ? {}
+      : {
+          fileExtension: filterExtension.trim() || undefined,
+          minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
+          maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
+          minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
+        };
+    // A related search whose seed filename yielded no searchable word is still
+    // runnable when the server can answer the co-share request from the hashes
+    // alone, so it is exempt from the "type something" and "needs a keyword"
+    // gates that a hand-typed query has to pass.
+    const coShareOnly = !!plan && plan.co_share_hashes.length > 0 && !plan.query;
+    if (!q && !coShareOnly && !hasSearchFilters(searchFilterSnapshot, wireFileType)) {
+      // Pressing Search on an empty box used to do nothing at all — no tab, no
+      // message, indistinguishable from a broken button. The Search button is
+      // only disabled for a missing network, which the readiness hint explains
+      // on screen; this state has nothing else saying it.
+      addToast('warning', m.search_enter_query());
+      return;
+    }
+    // Checked before the keyword floor below, which a directive passes: its
+    // text tokenizes into `ed2k` plus the hash, both comfortably over 3 bytes.
+    if ((method === 'kad' || method === 'ember') && isServerDirectiveQuery(q)) {
+      addToast('warning', m.search_directive_server_only());
+      return;
+    }
     if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
       addToast('warning', m.search_needs_keyword());
       return;
+    }
+    // A bare `.mp3` names a token the publisher stripped before indexing, so on
+    // a keyword DHT it walks a key nobody wrote. The extension is still a usable
+    // *filter* — Ember sends it to the responders — so move it into the box it
+    // belongs in and ask for the word the walk needs, rather than running a
+    // search that can only return the user's own library.
+    {
+      const bare = method === 'kad' || method === 'ember' ? extensionOnlyQueryToken(q) : null;
+      if (bare) {
+        filterExtension = bare;
+        addToast('info', m.search_extension_moved_to_filter({ ext: bare }));
+        searchBar?.focusInput();
+        return;
+      }
     }
     // Gate by the selected search method — KAD-only needs KAD, server-only
     // needs the eD2K server, Ember-only needs Ember enabled, global needs
@@ -1550,6 +1854,7 @@
       if (emberIsTheOnlyCandidate && (emberJoining || emberNoPeers)) {
         return;
       }
+      networkAlertMethod = method;
       networkAlertOpen = true;
       return;
     }
@@ -1559,7 +1864,16 @@
       clearSearchTimeoutForRequest(t.requestId);
       flushPendingSearchResults(t.requestId);
     }
-    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    // `probes` is ordered most-specific-first, so the first one carrying a query
+    // is the best one-line answer to "what is this tab looking for".
+    const relatedInfo: RelatedSearchInfo | undefined = plan
+      ? {
+          seedLabel: plan.seed_label,
+          queryLabel: plan.probes.find((p) => p.query)?.query ?? '',
+          kinds: plan.probes.map((p) => p.kind),
+        }
+      : undefined;
+    const { requestId, stoppedOthers } = openSearchTab(q, method, wireFileType, searchFilterSnapshot, relatedInfo);
     if (stoppedOthers) {
       addToast('info', m.search_previous_stopped());
     }
@@ -1568,7 +1882,9 @@
     clearChecked();
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
-    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot);
+    const searchPromise = searchFiles(q, method, requestId, wireFileType, searchFilterSnapshot, plan
+      ? { relatedHashes: plan.co_share_hashes, excludeHashes: plan.exclude_hashes }
+      : undefined);
 
     // Arm the watchdog once and expose a re-arm helper. getSettings() runs in
     // parallel with the search so a slow settings fetch can never block (and
@@ -1649,6 +1965,67 @@
       }));
       forgetSettledRequest(requestId);
     }
+  }
+
+  /*
+   * A related search planned elsewhere (the Transfers or Library context menu,
+   * or this page's own) arrives through `pendingRelatedSearch`.
+   *
+   * It is held while the server session is still coming up rather than
+   * consumed on arrival: navigating here from another page can land mid
+   * handshake, and starting then would raise the "no server" dialog on a
+   * server that is seconds from being connected. This re-runs the moment that
+   * resolves. A server that is simply not connected is not waited for — the
+   * dialog from `handleSearch` is the answer there, the same one a manual
+   * server search gets, and a related search cannot run without one.
+   *
+   * Deliberately not `searchSubmitBlocked`: that reads the method dropdown,
+   * which a related search ignores, so an Ember-only user sitting on Ember
+   * would have had theirs parked here indefinitely.
+   */
+  $effect(() => {
+    const pending = $pendingRelatedSearch;
+    if (!pending || $serverStatus === 'connecting') return;
+    pendingRelatedSearch.set(null);
+    // The keyword fallback's derived query goes in the box so it is visible and
+    // editable, since results for a query the user never saw are otherwise
+    // unexplainable. A co-share request has no such form: `related::<hash>` is
+    // what goes on the wire, and typing that back in would be shredded by the
+    // keyword parser — so the box is left empty and the tab label and tooltip
+    // carry the explanation instead.
+    barQuery = pending.plan.query ?? '';
+    void handleSearch(barQuery, pending.plan);
+  });
+
+  /** One search result as a related-search seed. */
+  function relatedSeed(result: SearchResult) {
+    return {
+      hash: result.file.hash,
+      name: result.file.name,
+      artist: result.media?.artist ?? null,
+      album: result.media?.album ?? null,
+    };
+  }
+
+  /** Find files related to `result` — the search-results context menu action. */
+  async function findRelated(result: SearchResult) {
+    closeContextMenu();
+    await startRelatedSearch([relatedSeed(result)]);
+  }
+
+  /**
+   * Find files related to all the ticked rows at once.
+   *
+   * eMule's menu item works on the whole selection — `CSearchListCtrl` hands
+   * `SearchRelatedFiles` its `selectedList` — and one co-share request can name
+   * several hashes (eserver 17.14 and later), so the server is asked about them
+   * together rather than once per file.
+   */
+  async function findRelatedChecked() {
+    closeContextMenu();
+    await startRelatedSearch(
+      filteredResults.filter((r) => checkedKeys.has(resultKey(r))).map(relatedSeed),
+    );
   }
 
   // `tabId` defaults to the active tab (toolbar Stop button), but a search
@@ -1904,21 +2281,45 @@
   let downloadPending: Record<string, boolean> = $state({});
 
   /**
-   * Pick the first syntactically valid address from the candidate list.
-   * Returns `{ ip: '', port: 0 }` when nothing parses — the backend then
-   * performs full KAD/server source discovery on its own. Previously we
-   * passed `addresses[0]` blindly, which could pin the transfer's first
-   * source to a bad peer when the list was unordered.
+   * Pick the first *dialable* address from the candidate list.
+   *
+   * Returns `{ ip: '', port: 0 }` when nothing qualifies — the backend then
+   * performs full KAD/server source discovery on its own, which is a working
+   * download, just a slower start. Previously we passed `addresses[0]`
+   * blindly, which could pin the transfer's first source to a bad peer when
+   * the list was unordered.
+   *
+   * IPv4 only, and that matters: the eD2K download transport cannot use an
+   * IPv6 peer, so `start_download` rejects an IPv6 primary outright. Taking
+   * the first syntactically valid address therefore failed the *entire*
+   * enqueue whenever a swarm happened to list an IPv6 peer first — including
+   * when the very next address was a perfectly good IPv4 one. Skipping them
+   * here costs nothing: the extras list drops IPv6 at the IPC boundary too.
    */
   function pickInitialSource(addresses: string[]): { ip: string; port: number } {
     for (const addr of addresses) {
       if (!addr) continue;
       const { ip, port } = parseAddress(addr);
-      if (ip && port > 0 && ip !== '0.0.0.0') {
+      if (ip && port > 0 && ip !== '0.0.0.0' && isIpv4(ip)) {
         return { ip, port };
       }
     }
     return { ip: '', port: 0 };
+  }
+
+  /**
+   * Dotted-quad check, matching what the backend will accept as a primary.
+   *
+   * Leading zeros are rejected because Rust's `Ipv4Addr` parser rejects them
+   * (they are octal-ambiguous), and this predicate is only useful if it agrees
+   * with the parser that decides the enqueue. Addresses reaching us are
+   * rendered by that same type so they never carry one, but a predicate that
+   * claims to mirror the backend has to actually mirror it.
+   */
+  function isIpv4(ip: string): boolean {
+    const parts = ip.split('.');
+    if (parts.length !== 4) return false;
+    return parts.every((p) => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255);
   }
 
   function parseAddress(addr: string): { ip: string; port: number } {
@@ -1976,7 +2377,9 @@
     // Empty `source_addresses` is fine when we have a hash: KAD/server
     // results often report availability without embedding peer IPs. The
     // backend starts with `{ ip: '', port: 0 }` and runs full source
-    // discovery. Only local-only hits (handled above) should short-circuit.
+    // discovery. The one case handled above is the row this library can
+    // already satisfy: an addressless hit for a file we share is a download
+    // of a file we hold, whichever network also reported it.
 
     downloadPending[key] = true;
     try {
@@ -2024,16 +2427,39 @@
     filterMinSources = null;
     filterMinComplete = null;
     filterColumn = 'all';
-    hideSpam = false;
+    // `hideSpam` is deliberately not cleared, for the reason
+    // `clearRelatedSearchFilters` gives: it is a standing preference about
+    // junk rather than a narrowing of this search. It defaults to on and is
+    // persisted, so clearing it here turned one click of a button — which
+    // `hasActiveFilters` can show for an entirely unrelated filter — into
+    // spam hiding being off for every future session.
+    clearFilterText();
+  }
+
+  /**
+   * Drop every result filter for an incoming related search.
+   *
+   * eMule shows a related search in a results tab of its own, whose filter box
+   * starts empty; the filter panel here is shared by all tabs, so it is emptied
+   * instead. Everything `clearFilters` does except the spam toggle, which is a
+   * standing preference about junk rather than a narrowing of this search.
+   */
+  function clearRelatedSearchFilters() {
+    filterType = '';
+    filterMinSize = null;
+    filterMaxSize = null;
+    filterExtension = '';
+    filterMinSources = null;
+    filterMinComplete = null;
+    filterColumn = 'all';
     clearFilterText();
   }
 
   function showContextMenu(e: MouseEvent, result: SearchResult) {
     e.preventDefault();
-    const margin = 8;
-    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 200 - margin));
-    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 150 - margin));
-    contextMenu = { x, y, result };
+    // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
+    // keeps it on screen.
+    contextMenu = { x: e.clientX, y: e.clientY, result };
   }
 
   function closeContextMenu() {
@@ -2500,16 +2926,23 @@
     filterText !== ''
   );
 
-  // The visible result count and the raw search count can differ for
-  // two reasons that aren't covered by `hasActiveFilters`: the spam
-  // filter (`hideSpam`) and local-only entries that the pipeline always
-  // drops. When they differ, the "(filtered from N)" suffix should show
-  // even if no explicit filter chip is set, so the user understands why
-  // the table isn't showing the headline number.
+  // The visible result count and the raw search count can differ for a
+  // reason that isn't covered by `hasActiveFilters`: Hide spam. When they
+  // differ, the "(filtered from N)" suffix should show even if no explicit
+  // filter chip is set, so the user understands why the table isn't showing
+  // the headline number. Library-only hits stay in the table; Hide spam is
+  // the only visibility rule that drops rows on its own.
   // Both sides come from `visibleResults`, not the live store list: mixing a
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
   let resultsHidden = $derived(visibleResults.length - filteredResults.length);
+  // `.mp3` / `.mp4` on Ember or KAD walk a key publishers almost never
+  // write (trailing three-letter extensions are stripped from the index).
+  let extensionOnlyHintExt = $derived(
+    activeTab && (activeTab.method === 'ember' || activeTab.method === 'kad')
+      ? extensionOnlyQueryToken(activeTab.query)
+      : null,
+  );
 
   let advancedFilterCount = $derived(
     (filterColumn !== 'all' && filterText !== '' ? 1 : 0) +
@@ -2623,6 +3056,9 @@
         <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
         <p class="search-syntax-ed2k">{m.search_query_syntax_min_term()}</p>
       {/if}
+      {#if searchMethod === 'kad' || searchMethod === 'ember' || searchMethod === 'global'}
+        <p class="search-syntax-ed2k">{m.search_query_syntax_extensions()}</p>
+      {/if}
       {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
         <p class="search-syntax-ember">
           <span class="search-syntax-ember-tag">{m.search_origin_ember()}</span>
@@ -2646,7 +3082,7 @@
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
     {#each $searchTabs as tab (tab.id)}
-      <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={tab.query}>
+      <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={searchTabTitle(tab)}>
         <button
           type="button"
           class="search-tab-select"
@@ -2657,7 +3093,7 @@
           aria-selected={tab.id === $activeSearchTabId}
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
-          <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
+          <span class="search-tab-label">{searchTabLabel(tab)}</span>
           <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
@@ -2953,23 +3389,36 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>{m.search_no_results()}</p>
-      <p class="hint">{m.search_no_results_hint()}</p>
+      <!-- A related search that came back empty is not a query to reword:
+           there is no query, only the co-share request, and the server
+           answering "nothing" is a fact about its index rather than something
+           the user can retype. Saying so is the difference between the
+           feature looking broken and looking finished. -->
+      <p>{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
+      <p class="hint">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      {#if extensionOnlyHintExt}
+        <p class="hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
+      {/if}
     </div>
   {:else}
     <div class="results-info">
-      <span>
-        {#if activeTab?.isSearching}
-          <span class="searching-indicator">{m.search_searching_indicator()}</span>
+      <div class="results-info-copy">
+        <span>
+          {#if activeTab?.isSearching}
+            <span class="searching-indicator">{m.search_searching_indicator()}</span>
+          {/if}
+          {#if filteredResults.length > 0}
+            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
+          {:else if visibleResults.length > 0}
+            {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
+          {:else}
+            {m.search_zero_results()}
+          {/if}
+        </span>
+        {#if extensionOnlyHintExt}
+          <p class="results-extension-hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
         {/if}
-        {#if filteredResults.length > 0}
-          {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
-        {:else if visibleResults.length > 0}
-          {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
-        {:else}
-          {m.search_zero_results()}
-        {/if}
-      </span>
+      </div>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>
           <summary class="column-menu-summary" title={m.search_columns_aria()} aria-haspopup="true">
@@ -3167,7 +3616,7 @@
                 {'\u2014'}
               {/if}
             </td>
-            <td class="col-sources">
+            <td class="col-sources" title={sourceCountHint(result)}>
               <span class="source-count" class:high-sources={result.availability >= 10}>
                 {result.availability}
               </span>
@@ -3269,15 +3718,17 @@
     {#if contextMenu}
       <button
         type="button"
-        class="context-menu-backdrop"
+        class="ctx-backdrop"
         aria-label={m.search_close_context_menu()}
         onclick={closeContextMenu}
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
-      <div class="context-menu" role="menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
-        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
-        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
+      <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
+        <div class="ctx-header" role="presentation">
+          <bdi dir="auto">{contextMenu.result.file.name}</bdi>
+        </div>
         <button
+          class="ctx-item"
           role="menuitem"
           disabled={isInLibraryOnly(contextMenu.result) || !!getBlockingDownloadTransfer(contextMenu.result)}
           title={isInLibraryOnly(contextMenu.result)
@@ -3286,15 +3737,76 @@
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
-          <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
+          <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
         {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
         {#if checkedCount > 1}
-          <button role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
+          <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
         {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
-        {#if downloadHistoryMap[contextMenu.result.file.hash]}
+        <!--
+          Greyed out exactly where eMule greys it out — see
+          `relatedSearchReady`. A related search only ever asks the connected
+          eD2k server (see `RELATED_SEARCH_METHOD`), so off a server that can
+          answer the co-share question there is nobody to ask.
+        -->
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          onclick={() => { if (contextMenu) void findRelated(contextMenu.result); }}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        >{m.search_ctx_find_related()}</button>
+        {#if checkedCount > 1}
           <button
+            class="ctx-item"
+            role="menuitem"
+            disabled={!relatedSearchReady}
+            onclick={() => void findRelatedChecked()}
+            title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+          >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+        {/if}
+        <!-- eMule's right-click → Web services. Shown even when nothing is
+             configured, so the feature is discoverable from a result rather
+             than only from Settings. -->
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+        <div
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxWebSub}
+          role="menuitem"
+          tabindex="-1"
+          aria-haspopup="menu"
+          aria-expanded={ctxWebSub}
+          onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+        >
+          {m.webservices_ctx_menu()}
+          {#if ctxWebSub}
+            {@const hash = contextMenu.result.file.hash ?? ''}
+            <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+              {#each webServices as service, index (service.url)}
+                {@const usable = serviceAvailableFor(service.url, hash)}
+                <button
+                  class="ctx-item"
+                  role="menuitem"
+                  disabled={!usable}
+                  title={usable ? service.url : m.webservices_ctx_no_hash()}
+                  onclick={() => { if (contextMenu) void openWebServiceFor(contextMenu.result, index); }}
+                ><bdi dir="auto">{service.name}</bdi></button>
+              {/each}
+              {#if webServices.length === 0}
+                <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.webservices_ctx_none()}</button>
+              {/if}
+            </div>
+          {/if}
+        </div>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
+        {#if downloadHistoryMap[contextMenu.result.file.hash]}
+          <div class="ctx-sep" role="separator"></div>
+          <button
+            class="ctx-item ctx-danger"
             role="menuitem"
             onclick={() => { if (contextMenu) handleRemoveFromHistory(contextMenu.result); }}
             title={m.search_remove_from_history_title({ status: historyStatusLabel(downloadHistoryMap[contextMenu.result.file.hash]) })}
@@ -3508,7 +4020,7 @@
   bind:open={networkAlertOpen}
   alert
   title={m.search_no_network_title()}
-  message={searchNetworkAlertMessage(searchMethod)}
+  message={searchNetworkAlertMessage(networkAlertMethod)}
   confirmLabel={m.common_ok()}
 />
 
@@ -3981,8 +4493,19 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
+    gap: 12px;
+  }
+
+  .results-info-copy {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .results-extension-hint {
+    margin: 6px 0 0;
+    line-height: 1.4;
   }
 
   .clear-results-btn {
@@ -4923,54 +5446,7 @@
     background: color-mix(in srgb, var(--danger) 5%, transparent) !important;
   }
 
-  .context-menu-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 9998;
-    padding: 0;
-    margin: 0;
-    border: none;
-    background: transparent;
-    cursor: default;
-  }
-  .context-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 160px;
-    box-shadow: var(--shadow-md);
-    transform-origin: top left;
-    animation: context-menu-pop 0.12s ease;
-  }
-  @keyframes context-menu-pop {
-    from { opacity: 0; transform: scale(0.97); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  .context-menu button {
-    display: block;
-    width: 100%;
-    padding: 6px 12px;
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    font-size: 0.85rem;
-    text-align: left;
-    cursor: pointer;
-  }
-  .context-menu button:hover {
-    background: var(--bg-hover);
-  }
-  .context-menu button:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .context-menu button:disabled:hover {
-    background: none;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   @media (max-width: 1200px) {
     .search-area {

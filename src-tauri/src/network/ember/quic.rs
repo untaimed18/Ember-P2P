@@ -304,8 +304,13 @@ pub fn connection_node_id(connection: &quinn::Connection) -> Option<[u8; 16]> {
 /// actually holds the cert's private key. For the unpinned smoke-check
 /// path (`expected_node_id: None`), that still doesn't prove the key
 /// belongs to a *specific* node_id, and not every dial is pinned: the
-/// relay's `connect_relay_target` calls `endpoint.connect` with no pin,
-/// which is acceptable because the relay is untrusted by design and the
+/// relay's `connect_relay_target` calls `endpoint.connect` with no pin.
+/// It does recover the answering peer's node id from the completed
+/// handshake and refuses a target with no Ember identity, or one that
+/// turns out to be the requester itself — but that is an identity check
+/// after the fact, not a pin, because the v2 RELAY_REQUEST carries no
+/// expected identity for the target to compare against. Acceptable
+/// because the relay is untrusted by design and the
 /// only traffic that crosses it is an anonymous LowID eD2K transfer whose
 /// integrity rests on MD4/AICH part verification, not on this channel.
 /// Friend *file* transfers never cross this relay: `EmberXferMethod`

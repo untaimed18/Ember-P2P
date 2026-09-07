@@ -10,7 +10,7 @@ use rand::RngCore;
 use tauri::Emitter;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{await_reply, coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_SEND_TIMEOUT};
 use crate::network::ember::channel::{
     self, ChannelIdentity, ChannelInvite, CHANNEL_KIND_PRIVATE, CHANNEL_KIND_PUBLIC,
 };
@@ -607,14 +607,29 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || {
         let rows = db.list_channels()?;
+        // Both flags for every room in one statement. Asking per row made the
+        // command `1 + 2N` statements, and while it runs on the blocking pool
+        // rather than the reactor, each one still takes the single SQLite
+        // connection the network loop needs — and the page calls this on every
+        // channel event.
+        //
+        // Propagated rather than defaulted, as the per-row reads were: showing
+        // a banned member an unbanned composer hands them a box whose sends
+        // every peer will drop, so a failed read must not read as "not banned".
+        let flags = db.channel_member_flags(&our_pk)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            // Not `unwrap_or(false)`: reporting a banned member as unbanned
-            // hands them a composer whose sends every peer will drop. Owners
-            // are exempt for the reasons in `self_banned_from`.
-            let you_are_banned =
-                !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
-            let you_are_moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
+            // No roster row in a room means neither flag is set there. That is
+            // the absent entry, not a failure — the query above already spoke
+            // for the whole table.
+            let (banned, moderator) = flags
+                .get(&row.channel_id)
+                .copied()
+                .unwrap_or((false, false));
+            // Owners are exempt from their own room's bans, for the reasons in
+            // `self_banned_from`.
+            let you_are_banned = !row.is_owner && banned;
+            let you_are_moderator = moderator;
             let moderation_updated_at = row.moderation_updated_at;
             let moderation_checked_at = row.moderation_checked_at;
             out.push(
@@ -1644,8 +1659,16 @@ pub async fn edit_channel_message(
         &cleaned,
     );
 
-    // Local first: a revision the user can see is worth more than one that only
-    // left the host, and the flood below is best-effort by nature.
+    // The queue slot is claimed before the row is written, because the write
+    // cannot be undone: `apply_channel_message_edit` overwrites the pre-edit
+    // text rather than archiving it, so an enqueue that failed afterwards left
+    // the author holding a revision no other member has, with nothing to
+    // restore it from and no resend to reconcile it. Deciding the flood first
+    // turns a busy network task into a plain refusal, with the text the user
+    // typed still in the composer.
+    let permit = reserve_network_slot(&state).await?;
+    // Local first, now that the flood behind it can no longer be refused: a
+    // revision the user can see is worth more than one that only left the host.
     let db = state.db.clone();
     let id_for_edit = channel_id.clone();
     let msg_id_for_edit = target.msg_id.clone();
@@ -1725,16 +1748,12 @@ pub async fn edit_channel_message(
         channel::CHANNEL_MSG_TTL_DEFAULT,
         edited_at,
     );
-    // Best effort past this point: the edit is already on disk here, and a busy
-    // network task must not make the user think it was refused.
-    if let Err(e) = state
-        .network_tx
-        .try_send(NetworkCommand::FanoutChannelGossip {
-            body: gossip.encode(),
-        })
-    {
-        tracing::warn!("Channel edit saved locally but not flooded: {e}");
-    }
+    // Spends the slot claimed before the write. Nothing between the two can
+    // refuse it, so the revision on disk and the frame on the mesh are one
+    // outcome rather than two.
+    permit.send(NetworkCommand::FanoutChannelGossip {
+        body: gossip.encode(),
+    });
     let _ = app.emit(
         "ember:channel-message-edited",
         serde_json::json!({
@@ -1828,6 +1847,13 @@ pub async fn set_channel_message_reaction(
         reaction,
     );
 
+    // Same order as the edit path, for the same reason: the upsert below
+    // replaces this member's previous reaction along with its `reacted_at` and
+    // signature, and nothing reads that pair back, so a flood that failed after
+    // the write left a tally only this device holds and no way to restore the
+    // one it overwrote. Claiming the slot first makes a busy network task a
+    // refusal the caller can act on instead.
+    let permit = reserve_network_slot(&state).await?;
     let db = state.db.clone();
     let id_for_write = channel_id.clone();
     let msg_id_for_write = target.msg_id.clone();
@@ -1865,14 +1891,9 @@ pub async fn set_channel_message_reaction(
         channel::CHANNEL_MSG_TTL_DEFAULT,
         reacted_at,
     );
-    if let Err(e) = state
-        .network_tx
-        .try_send(NetworkCommand::FanoutChannelGossip {
-            body: gossip.encode(),
-        })
-    {
-        tracing::warn!("Channel reaction saved locally but not flooded: {e}");
-    }
+    permit.send(NetworkCommand::FanoutChannelGossip {
+        body: gossip.encode(),
+    });
     Ok(())
 }
 
@@ -2550,6 +2571,43 @@ async fn self_banned_from(
         .map_err(|e| coded_ctx(fail_code, "Could not check your membership", e))
 }
 
+/// Whether this room's owner looks reachable right now.
+///
+/// Presence is the only owner-liveness signal a member holds that moves on a
+/// useful timescale: `moderation_updated_at` only advances every
+/// `MODERATION_REPUBLISH_SECS`, which is six hours, so it answers "has an owner
+/// at all" rather than "is the owner here". [`channel::PRESENCE_FRESH_SECS`] is
+/// two republish intervals — the same window the roster's presence dot and
+/// `member_count` are drawn from, so a decision made here agrees with what the
+/// user is already looking at instead of inventing a second notion of online.
+///
+/// A proxy, not proof: a present owner can still miss a gossip frame if no path
+/// of Noise sessions carries it to them. That direction is the safe one — the
+/// ban is recorded, and `mark_channel_rotate_pending` is on disk, so the work
+/// is late rather than lost. The unsafe direction is the one this rules out.
+///
+/// False when no owner-signed moderation record has ever been applied here
+/// (`owner_pubkey` empty) or the owner has no roster row at all: both mean this
+/// device has no evidence the owner is present, and absence of evidence has to
+/// read as absent for the caller's refusal to be worth anything.
+async fn owner_is_present(state: &AppState, row: &StoredChannel) -> bool {
+    if row.owner_pubkey.is_empty() {
+        return false;
+    }
+    let db = state.db.clone();
+    let id = row.channel_id.clone();
+    let Ok(Ok(members)) = tokio::task::spawn_blocking(move || db.list_channel_members(&id)).await
+    else {
+        return false;
+    };
+    let cutoff = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(channel::PRESENCE_FRESH_SECS);
+    members.iter().any(|member| {
+        member.member_pubkey.eq_ignore_ascii_case(&row.owner_pubkey) && member.last_seen >= cutoff
+    })
+}
+
 async fn moderation_power(
     state: &AppState,
     channel_id: &str,
@@ -2572,6 +2630,32 @@ async fn moderation_power(
     .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
     let is_owner = row.is_owner;
     Ok((row, is_owner, moderator))
+}
+
+/// Claim one slot on the network task's command queue, to be spent later.
+///
+/// For the paths that have to write to disk *and* flood, and whose write cannot
+/// be undone. `try_send` after the write can fail with the row already
+/// committed, and both callers here have nothing to restore: an edit overwrites
+/// the pre-edit text rather than archiving it, and a reaction overwrites the
+/// previous `reacted_at` and signature with no read-back. A failed flood there
+/// left the author reading a transcript no other member holds, with no resend
+/// and no way back — so the decision has to be made before anything is written,
+/// and [`tokio::sync::mpsc::Permit::send`] is infallible.
+///
+/// Waited on rather than polled, to the same [`CMD_SEND_TIMEOUT`] ceiling
+/// [`crate::commands::errors::bounded_send`] uses: the queue fills when the
+/// event loop is momentarily busy, and refusing a keystroke's worth of work for
+/// that is a worse answer than a pause. Bounded because these are IPC calls — a
+/// wedged network task has to surface as an error, not a permanent spinner.
+async fn reserve_network_slot<'a>(
+    state: &'a AppState,
+) -> Result<tokio::sync::mpsc::Permit<'a, NetworkCommand>, String> {
+    match tokio::time::timeout(CMD_SEND_TIMEOUT, state.network_tx.reserve()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(e)) => Err(coded_ctx("network_busy", "Network busy", e)),
+        Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
 }
 
 fn enqueue_channel_gossip(
@@ -3303,6 +3387,32 @@ pub async fn ban_channel_member(
                 CHANNEL_BAN_LIST_MAX,
             ));
         }
+        // In a private room a ban is only an eviction once the content key
+        // rotates, and an epoch record is signed by the room identity whose
+        // seed the owner alone holds — `load_owned_channel` is the only way to
+        // reach it, and it refuses anyone else. So a moderator's ban becomes an
+        // eviction by exactly one route: the owner ingests the gossip, sets
+        // `rotate_pending`, and their next moderation pass mints the epoch and
+        // reseals it to everyone still in the room. With the owner away that
+        // route does not exist, and the ban went through as an eviction anyway:
+        // the roster drew the member as removed while they went on decrypting
+        // every message the room sent afterwards, holding a key that is still
+        // current. Refusing is the honest answer, because nothing this device
+        // can sign would make the eviction real, and the moderator can see for
+        // themselves — same presence window as the roster dot — that the owner
+        // is the person to wait for.
+        //
+        // Public rooms are exempt: their key is derived from a pubkey anyone
+        // who found the room already has, so a ban there never claimed to take
+        // reading rights away in the first place.
+        if row.visibility == CHANNEL_KIND_PRIVATE && !owner_is_present(&state, &row).await {
+            return Err(coded(
+                "channels_ban_owner_offline",
+                "Removing someone from a private room needs the room's owner online: \
+                 only they can change the room key, and without that the person \
+                 would keep reading everything sent afterwards.",
+            ));
+        }
         apply_local_mod_ban(&state, &row, pk, true).await?;
     }
     Ok(())
@@ -3927,13 +4037,38 @@ fn listings_from_blobs(
         out.push(GatheredChannelInfo {
             channel_id: id_hex.clone(),
             pubkey: hex::encode(rec.ember_file_hash),
-            name: rec.file_name,
+            name: discovered_room_name(&rec.file_name, &id_hex),
             private,
             joined: joined_ids.contains(&id_hex),
             member_count: None,
         });
     }
     out
+}
+
+/// Display name for a room nobody here has joined, from a name its publisher
+/// chose.
+///
+/// Discover is the one route into the room list that does not pass through
+/// `accept_invite`, so it has to do the same trimming that path does. The
+/// record's own cap is a kilobyte and says nothing about characters, which
+/// leaves an unfiltered name free to run past every column the page has and
+/// to carry zero-width and bidi controls — a listing that reads as a
+/// well-known room while pointing somewhere else. The identity underneath is
+/// verified (`channel_id == BLAKE3(pubkey)`), so only the label is at stake,
+/// but the label is what the user clicks.
+///
+/// A name that sanitizes away to nothing falls back to the short id, which is
+/// what a room that never had a name already shows.
+fn discovered_room_name(raw: &str, channel_id_hex: &str) -> String {
+    let cleaned = crate::security::sanitize_remote_text(raw, MAX_CHANNEL_NAME_CHARS);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    channel_id_hex
+        .get(..8)
+        .unwrap_or(channel_id_hex)
+        .to_string()
 }
 
 fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
@@ -4071,11 +4206,12 @@ pub async fn gather_channels(
             continue;
         }
         seen.insert(id.clone());
+        let name = discovered_room_name(&listing.name, &id);
         out.push(GatheredChannelInfo {
             joined: joined_ids.contains(&id),
             channel_id: id,
             pubkey: pubkey_hex,
-            name: listing.name,
+            name,
             private: false,
             member_count: None,
         });
@@ -4647,6 +4783,32 @@ mod tests {
         assert_eq!(sanitize_channel_username("Ada").unwrap(), "Ada");
         assert_eq!(sanitize_channel_username("Ada1").unwrap(), "Ada1");
         assert_eq!(username_claim_key("Ada"), "ada");
+    }
+
+    /// Discover names come from whoever published the record, which is the one
+    /// route into the room list that does not go through `accept_invite`.
+    #[test]
+    fn discovered_room_names_are_trimmed_like_invited_ones() {
+        let id = "ab".repeat(16);
+
+        assert_eq!(discovered_room_name("Lobby", &id), "Lobby");
+
+        // Capped at the same length the compose form and invites enforce.
+        let long = "x".repeat(200);
+        assert_eq!(
+            discovered_room_name(&long, &id).chars().count(),
+            MAX_CHANNEL_NAME_CHARS
+        );
+
+        // Zero-width and bidi controls are what make one room's label
+        // indistinguishable from another's.
+        let spoof = "Lo\u{200B}bby\u{202E}";
+        assert_eq!(discovered_room_name(spoof, &id), "Lobby");
+
+        // Nothing left to draw falls back to the short id, which is what a
+        // room that never had a name already shows.
+        assert_eq!(discovered_room_name("\u{200B}\u{FEFF}", &id), &id[..8]);
+        assert_eq!(discovered_room_name("", &id), &id[..8]);
     }
 }
 

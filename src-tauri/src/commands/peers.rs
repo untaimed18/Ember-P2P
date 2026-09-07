@@ -1456,22 +1456,28 @@ pub async fn kad_bootstrap_url(
             .await
             .map_err(|e| coded_ctx("peers_bootstrap_url_invalid", "Invalid bootstrap URL", e))?;
 
+    // Downloaded and parsed here, on the IPC task, rather than inside the
+    // network task's command arm. The fetch alone is bounded only by the pinned
+    // client's 60s-per-hop timeout, and it was followed by a 10 MiB stream, a
+    // temp-file write and a *synchronous* `load_nodes_dat` read — all inside
+    // `tokio::select!`, so pasting one bootstrap link parked UDP receive, all
+    // the periodic timers and every other IPC request for a minute or more.
+    // The network task now only does what needs its state: insert the contacts
+    // and send the bootstrap requests.
+    let contacts = fetch_bootstrap_contacts(&validated_url).await?;
+
     // K0: same oneshot pattern as kad_bootstrap_ip — this is what lets the
     // UI show "Loaded N contacts" on success and a useful error on failure
     // instead of always toasting "Fetching…" on enqueue.
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::KadBootstrapUrl {
-            url: validated_url,
-            tx,
-        })
+        .try_send(NetworkCommand::KadBootstrapContacts { contacts, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    // Not the short CMD_REPLY_TIMEOUT used elsewhere: the handler performs an
-    // actual HTTP download (bounded by the pinned client's own 60s request
-    // timeout), so we allow a generous 90s ceiling. We still cap it, though —
-    // bare `rx.await` would hang the IPC call forever if the network task ever
-    // dropped the oneshot without replying.
+    // Not the short CMD_REPLY_TIMEOUT used elsewhere: the arm sends up to
+    // twenty bootstrap datagrams behind whatever else the loop is doing. We
+    // still cap it — a bare `rx.await` would hang the IPC call forever if the
+    // network task ever dropped the oneshot without replying.
     match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(coded(
@@ -1483,6 +1489,104 @@ pub async fn kad_bootstrap_url(
             "Bootstrap timed out waiting for the network task",
         )),
     }
+}
+
+/// Download a `nodes.dat` from `url` and parse it into contacts the network
+/// task can insert directly.
+///
+/// Runs on the calling IPC task so none of it lands in the network `select!`.
+/// The body is capped before it is buffered, and the parse itself is
+/// synchronous file IO, so it goes to the blocking pool rather than stalling
+/// this runtime worker.
+///
+/// Every contact comes back unproven. A URL-supplied file is an unproven seed
+/// list whatever its bytes claim, and honouring a `verified` bit would let one
+/// pasted link put contacts straight into lookup and publish target selection.
+async fn fetch_bootstrap_contacts(
+    url: &str,
+) -> Result<Vec<crate::network::kad::types::KadContact>, String> {
+    /// A real `nodes.dat` is tens of kilobytes; this only exists so a hostile
+    /// or misconfigured host cannot stream until memory runs out.
+    const MAX_NODES_BYTES: usize = 10 * 1024 * 1024;
+
+    // `fetch_pinned_get` re-validates the URL and every redirect hop against
+    // the private-IP rules, so a malicious redirect can't pivot this fetch onto
+    // an internal host.
+    let resp = crate::security::fetch_pinned_get(url)
+        .await
+        .map_err(|e| coded_ctx("peers_bootstrap_fetch_failed", "Bootstrap fetch failed", e))?;
+    if !resp.status().is_success() {
+        return Err(coded_ctx(
+            "peers_bootstrap_fetch_failed",
+            "Bootstrap fetch failed",
+            format!("HTTP {} from {url}", resp.status().as_u16()),
+        ));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    {
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let data = chunk.map_err(|e| {
+                coded_ctx("peers_bootstrap_fetch_failed", "Bootstrap fetch failed", e)
+            })?;
+            body.extend_from_slice(&data);
+            if body.len() > MAX_NODES_BYTES {
+                return Err(coded_ctx(
+                    "peers_bootstrap_fetch_failed",
+                    "Bootstrap fetch failed",
+                    format!("response exceeded {MAX_NODES_BYTES} bytes"),
+                ));
+            }
+        }
+    }
+
+    let downloaded = body.len();
+    let mut contacts = tokio::task::spawn_blocking(move || {
+        // `load_nodes_dat` only reads from a path, so the body has to be spilled
+        // to a file first. The name has to be unique per call, not per second:
+        // this runs on the IPC task now rather than on the serialized network
+        // loop, so two clicks in the same second are genuinely concurrent and a
+        // timestamped name had them writing, parsing and deleting each other's
+        // file. Process id plus a monotonic counter is unique within a process,
+        // and the pid distinguishes concurrent instances.
+        static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = std::env::temp_dir().join(format!(
+            "ember-nodes-{}-{unique}.dat",
+            std::process::id()
+        ));
+        std::fs::write(&tmp_path, &body)
+            .map_err(|e| format!("failed to write temp nodes.dat: {e}"))?;
+        let parsed = crate::network::kad::bootstrap::load_nodes_dat(&tmp_path);
+        let _ = std::fs::remove_file(&tmp_path);
+        parsed.map_err(|e| format!("parsed {downloaded} bytes but the file is not a valid nodes.dat: {e}"))
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "peers_bootstrap_parse_failed",
+            "Could not read the bootstrap file",
+            e,
+        )
+    })?
+    .map_err(|e| {
+        coded_ctx(
+            "peers_bootstrap_parse_failed",
+            "Could not read the bootstrap file",
+            e,
+        )
+    })?;
+
+    if contacts.is_empty() {
+        return Err(coded(
+            "peers_bootstrap_no_contacts",
+            "The bootstrap file contained no contacts",
+        ));
+    }
+    crate::network::kad::bootstrap::mark_contacts_unproven(&mut contacts);
+    Ok(contacts)
 }
 
 #[tauri::command]
@@ -1583,6 +1687,44 @@ pub async fn get_peer_reputation(
         .network_tx
         .try_send(NetworkCommand::GetPeerReputation {
             user_hash: hash,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await
+}
+
+/// Look up reputation for many peers in one round trip.
+///
+/// The Known Clients table needs a Trust badge per visible row and refreshes
+/// them on a timer, so the per-hash command it used to call put a hundred
+/// entries into the bounded network command channel every eight seconds and
+/// starved unrelated commands into `network_busy`. Every answer comes from the
+/// same in-memory tracker, so the fan-out bought nothing.
+///
+/// Malformed hashes are skipped rather than failing the whole request: the
+/// caller is rendering a table, and one bad row must not blank the other
+/// nine hundred and ninety-nine. Absent peers come back as `null`.
+#[tauri::command]
+pub async fn get_peer_reputation_batch(
+    state: tauri::State<'_, AppState>,
+    user_hashes: Vec<String>,
+) -> Result<std::collections::HashMap<String, Option<PeerReputationInfo>>, String> {
+    /// Matches the display limit of the table this serves, so one call can
+    /// cover a full page without the renderer being able to ask for more.
+    const MAX_REPUTATION_BATCH: usize = 1_000;
+    let parsed: Vec<[u8; 16]> = user_hashes
+        .iter()
+        .take(MAX_REPUTATION_BATCH)
+        .filter_map(|h| parse_user_hash(&h.to_lowercase()).ok())
+        .collect();
+    if parsed.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetPeerReputationBatch {
+            user_hashes: parsed,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;

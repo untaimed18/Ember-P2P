@@ -224,6 +224,14 @@ impl ServerUdpSocket {
         search_expr: &[u8],
         uses_64bit_search: bool,
     ) -> Option<(Vec<u8>, SocketAddr)> {
+        // An empty expression is a global search for nothing, sprayed at every
+        // server in the list. Callers gate on having a query, but this is where
+        // the packet is built, so the refusal belongs here as well: a search
+        // whose keywords all came from a "find related files" plan can end up
+        // with no keyword leg at all, and that must not reach the wire.
+        if search_expr.is_empty() {
+            return None;
+        }
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;
 
@@ -1509,6 +1517,25 @@ mod tests {
         server.udp_flags = SRV_UDPFLG_EXT_GETFILES | SRV_UDPFLG_LARGEFILES;
         let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, true).unwrap();
         assert_eq!(pkt[1], OP_GLOBSEARCHREQ3);
+    }
+
+    /// A related search can have no keyword leg at all — the co-share request
+    /// to the one connected server carries it. Asking every other server for
+    /// nothing is not a fallback, it is a broadcast of noise.
+    #[test]
+    fn build_global_search_packet_refuses_an_empty_expression() {
+        let mut server = ServerEntry::new("1.2.3.4".into(), 4661);
+        for flags in [
+            0,
+            SRV_UDPFLG_EXT_GETFILES,
+            SRV_UDPFLG_EXT_GETFILES | SRV_UDPFLG_LARGEFILES,
+        ] {
+            server.udp_flags = flags;
+            assert!(
+                ServerUdpSocket::build_global_search_packet(&server, &[], false).is_none(),
+                "empty expression queued for flags 0x{flags:04X}"
+            );
+        }
     }
 
     #[tokio::test]

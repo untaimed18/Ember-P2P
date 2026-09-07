@@ -505,6 +505,150 @@ pub fn percent_decode_str(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
+fn strip_ed2k_wrapper(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches('\u{feff}')
+        .trim_matches('"')
+        .trim_matches(['<', '>'])
+}
+
+fn strip_ed2k_scheme(s: &str) -> Option<&str> {
+    strip_prefix_ignore_ascii_case(s, "ed2k:")
+}
+
+/// Skip the `//` (or `%2F%2F`) authority slashes browsers insert or encode
+/// after `ed2k:`. Walks only ASCII so `i` stays on a UTF-8 boundary.
+fn skip_ed2k_authority_slashes(rest: &str) -> &str {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        if i + 2 < bytes.len()
+            && bytes[i] == b'%'
+            && bytes[i + 1] == b'2'
+            && matches!(bytes[i + 2], b'F' | b'f')
+        {
+            i += 3;
+            continue;
+        }
+        break;
+    }
+    &rest[i..]
+}
+
+/// Whether this URI's pipes were rewritten by a browser on the way here.
+///
+/// The tell is the opcode delimiter. Every `ed2k:` URI opens with one — `|file|`,
+/// `|server|` — and a browser that encoded the separators encoded that one too,
+/// because it treats the whole run as an authority and rewrites all of it. So an
+/// arriving `|` means the pipes were left alone, and any `%7C` further along is
+/// a *name* that contains a pipe rather than a separator.
+///
+/// This has to be decided for the URI as a whole rather than per escape, because
+/// after the fact the two are the same three characters. Deciding it from the
+/// one field that is always structural is what keeps
+/// `ed2k://|file|Track%7C01.mp3|123|<hash>|/` — a legitimate link to a file
+/// named `Track|01.mp3` — from splitting into fields at the name, which
+/// rejected the link when the fragment after it did not parse as a size, and
+/// silently read a different hash when it did.
+fn pipes_were_percent_encoded(rest: &str) -> bool {
+    !rest.starts_with('|')
+}
+
+/// Browsers percent-encode `|` (a forbidden WHATWG host code point) as `%7C`
+/// before handing an `ed2k:` URI to the OS handler. Restore field separators
+/// without decoding other escapes — those belong to the name field.
+fn decode_encoded_pipes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len()
+            && bytes[i] == b'%'
+            && bytes[i + 1] == b'7'
+            && matches!(bytes[i + 2], b'C' | b'c')
+        {
+            out.push(b'|');
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn lowercase_ed2k_opcode(rest: &str) -> String {
+    let Some(s) = rest.strip_prefix('|') else {
+        return rest.to_string();
+    };
+    let Some((opcode, tail)) = s.split_once('|') else {
+        return rest.to_string();
+    };
+    if opcode.eq_ignore_ascii_case("file")
+        || opcode.eq_ignore_ascii_case("server")
+        || opcode.eq_ignore_ascii_case("serverlist")
+    {
+        format!("|{}|{tail}", opcode.to_ascii_lowercase())
+    } else {
+        rest.to_string()
+    }
+}
+
+/// True when `arg` is an `ed2k:` URI, including browser-encoded forms such as
+/// `ed2k://%7Cfile%7C…` that no longer contain a literal `ed2k://|` prefix.
+pub fn looks_like_ed2k_uri(arg: &str) -> bool {
+    strip_ed2k_scheme(strip_ed2k_wrapper(arg)).is_some()
+}
+
+/// Undo browser/OS rewriting of `ed2k:` URIs so a clicked link parses the
+/// same way as a clipboard paste of the original href.
+///
+/// Firefox 122+ uses the WHATWG URL parser, which treats `|` as a forbidden
+/// host code point. A click on `ed2k://|file|name|size|hash|/` therefore
+/// typically arrives as `ed2k://%7Cfile%7Cname%7Csize%7Chash%7C/` or
+/// `ed2k:///%7Cfile%7C…`. An unencoded `#` in the filename is a URL fragment;
+/// if the launcher still includes it in argv it is part of the ed2k name and
+/// must not be stripped — which is also why the encoding can arrive mixed, the
+/// pipes before the `#` rewritten and the ones after it left alone.
+///
+/// Restoring separators is therefore gated on
+/// [`pipes_were_percent_encoded`]: a paste carries its pipes literally, so a
+/// `%7C` in one is the name's own and decoding it would split the link at the
+/// filename.
+pub fn normalize_ed2k_uri(raw: &str) -> String {
+    let s = strip_ed2k_wrapper(raw);
+    let Some(rest) = strip_ed2k_scheme(s) else {
+        return s.to_string();
+    };
+    let rest = skip_ed2k_authority_slashes(rest);
+    let rest = if pipes_were_percent_encoded(rest) {
+        decode_encoded_pipes(rest)
+    } else {
+        rest.to_string()
+    };
+    let rest = lowercase_ed2k_opcode(&rest);
+    format!("ed2k://{rest}")
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    // `bool::then_some` takes its value by argument, so the slice used to be
+    // evaluated whatever the length test said: anything shorter than the
+    // prefix panicked instead of returning `None`, and `ed2k://` on its own is
+    // shorter. Indexing has to happen after the check, and on bytes — a string
+    // slice at `prefix.len()` also panics when a multi-byte character straddles
+    // that offset.
+    let head = s.as_bytes().get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
+    }
+    // Every prefix byte matched an ASCII one, so this offset is a char boundary.
+    Some(&s[prefix.len()..])
+}
+
 pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
 
 /// Strictly parse an ed2k link, distinguishing an absent AICH segment from a
@@ -514,12 +658,8 @@ pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
 /// `sources,...`, `s=<url>`, etc.) are tolerated; AICH and the Ember digest
 /// are surfaced so imported links can carry recovery / integrity data.
 pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str> {
-    let trimmed = link.trim();
-    if !trimmed.starts_with("ed2k://|file|") {
-        return Err("Not an ed2k file link");
-    }
-    let inner = trimmed
-        .strip_prefix("ed2k://|file|")
+    let normalized = normalize_ed2k_uri(link);
+    let inner = strip_prefix_ignore_ascii_case(&normalized, "ed2k://|file|")
         .ok_or("Not an ed2k file link")?;
     let mut parts = inner.split('|');
     let raw_name = parts.next().ok_or("Missing ed2k file name")?;
@@ -689,6 +829,109 @@ mod link_tests {
 
         let repeated = format!("ed2k://|file|a.bin|9|{HASH}|eh={first}|eh={first}|/");
         assert_eq!(parse_ed2k_link_strict(&repeated).unwrap().4, Some(first));
+    }
+
+    #[test]
+    fn browser_encoded_pipes_parse_like_the_raw_href() {
+        let classic = format!("ed2k://|file|movie.avi|1234|{HASH}|/");
+        let encoded = format!("ed2k://%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let extra_slash = format!("ed2k:///%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let no_slashes = format!("ed2k:%7Cfile%7Cmovie.avi%7C1234%7C{HASH}%7C/");
+        let expected = parse_ed2k_link_strict(&classic).expect("classic");
+        for variant in [encoded, extra_slash, no_slashes] {
+            assert_eq!(parse_ed2k_link_strict(&variant).expect(&variant), expected);
+            assert_eq!(normalize_ed2k_uri(&variant), classic);
+        }
+        assert_eq!(normalize_ed2k_uri(&classic), classic);
+    }
+
+    #[test]
+    fn hash_in_filename_survives_browser_mangling() {
+        // Websites often leave `#` (issue numbers, etc.) unencoded in the href.
+        // Paste sees the raw string; a click arrives with `%7C` separators and
+        // the `#` still in the payload if the OS forwarded the fragment.
+        let aich = "A".repeat(32);
+        let classic = format!("ed2k://|file|Comic%20#43%20Issue.cbr|26434789|{HASH}|h={aich}|/");
+        let firefox =
+            format!("ed2k://%7Cfile%7CComic%20#43%20Issue.cbr%7C26434789%7C{HASH}%7Ch={aich}%7C/");
+        let mixed_fragment_pipes =
+            format!("ed2k://%7Cfile%7CComic%20#43%20Issue.cbr|26434789|{HASH}|h={aich}|/");
+        let wrapped = format!("<{firefox}>");
+        for variant in [&classic, &firefox, &mixed_fragment_pipes, &wrapped] {
+            let (name, size, hash, aich_hex, _) = parse_ed2k_link_strict(variant).expect(variant);
+            assert_eq!(name, "Comic #43 Issue.cbr");
+            assert_eq!(size, 26434789);
+            assert_eq!(hash, HASH);
+            assert_eq!(
+                aich_hex.as_deref(),
+                Some("0000000000000000000000000000000000000000")
+            );
+        }
+    }
+
+    /// A pasted link keeps its pipes, so `%7C` inside one is a pipe in the
+    /// *file name* — the only way to write one, since the character is the
+    /// field separator. Decoding it unconditionally split the link at the name:
+    /// here the tail parses as a size and a hash, so the link stopped being
+    /// rejected and quietly resolved to a different file than it names.
+    #[test]
+    fn an_encoded_pipe_in_a_pasted_name_is_not_a_separator() {
+        let other = "b".repeat(32);
+        let pasted = format!("ed2k://|file|Safe.mp4%7C734003200%7C{other}|734003200|{HASH}|/");
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&pasted).expect("pasted");
+        assert_eq!(
+            name,
+            format!("Safe.mp4|734003200|{other}"),
+            "the name field ends at the first literal pipe"
+        );
+        assert_eq!(size, 734003200);
+        assert_eq!(hash, HASH, "the hash is the link's own third field");
+
+        // The ordinary shape of this: a file whose name contains a pipe.
+        let named = format!("ed2k://|file|Track%7C01.mp3|4096|{HASH}|/");
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&named).expect("named");
+        assert_eq!(name, "Track|01.mp3");
+        assert_eq!(size, 4096);
+        assert_eq!(hash, HASH);
+    }
+
+    #[test]
+    fn looks_like_ed2k_uri_accepts_encoded_and_quoted_forms() {
+        assert!(looks_like_ed2k_uri("ed2k://|file|a|1|aaaa|"));
+        assert!(looks_like_ed2k_uri("ED2K://%7Cfile%7Ca"));
+        assert!(looks_like_ed2k_uri(
+            "\"ed2k:%7Cserver%7C1.2.3.4%7C4661%7C/\""
+        ));
+        assert!(!looks_like_ed2k_uri("https://example.test/ed2k://|file|"));
+        assert!(!looks_like_ed2k_uri(
+            r"C:\Users\Ember\shared.emulecollection"
+        ));
+    }
+
+    /// Input shorter than the prefix being tested, and input whose byte at the
+    /// prefix length sits inside a multi-byte character, both used to panic:
+    /// the length test and the slice were arguments to the same
+    /// `bool::then_some`, so the slice ran either way. Every one of these
+    /// reaches the parser from argv or the clipboard, so the panic was a crash
+    /// on a malformed link rather than a rejection.
+    #[test]
+    fn a_truncated_or_non_ascii_link_is_rejected_rather_than_panicking() {
+        for raw in [
+            "", "e", "ed2", "ed2k", "ed2k:", "ed2k:/", "ed2k://", "ed2k://|", "ed2k://|f",
+            // Byte 5 and byte 13 land mid-character.
+            "ed2ké", "ed2k://|fileé", "ed2k://|file|é", "é",
+        ] {
+            assert!(
+                parse_ed2k_link_strict(raw).is_err(),
+                "{raw:?} is not a complete file link"
+            );
+            // Neither of these may panic; the verdict itself is only
+            // interesting for the ones that carry the scheme.
+            let _ = looks_like_ed2k_uri(raw);
+            let _ = normalize_ed2k_uri(raw);
+        }
+        assert!(looks_like_ed2k_uri("ed2k:"));
+        assert!(!looks_like_ed2k_uri("ed2k"));
     }
 }
 

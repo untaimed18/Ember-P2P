@@ -190,6 +190,12 @@
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
   let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
+  let publishableCount = $derived(diag?.ember_dht_publishable_files ?? 0);
+  // Never show "200 of 50": a live advert can briefly outlast the share list
+  // (TTL) or the publish manager can still be empty while hydrated stamps
+  // already light badges.
+  let publishedTotal = $derived(Math.max(publishableCount, publishedCount));
+  let publishedInProgress = $derived(publishedTotal > 0 && publishedCount < publishedTotal);
   let joining = $derived(isActive && verifiedCount === 0 && !joinTimedOut);
   let isConnected = $derived(isActive && verifiedCount > 0);
 
@@ -281,23 +287,33 @@
   );
 
   let sharingPillLabel = $derived(
-    sharingPublished
-      ? m.ember_health_sharing_published_count({ count: publishedCount })
-      : m.ember_health_sharing_waiting(),
+    publishedTotal > 0
+      ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })
+      : sharingPublished
+        ? m.ember_health_sharing_published_count({ count: publishedCount })
+        : m.ember_health_sharing_waiting(),
   );
   // A green "Published" next to "Connecting…" is a contradiction: the count
   // is restored from the last successful STORE (still inside TTL) even
   // while this session has nobody who has answered. Warn until a live peer
   // exists so the badge is not read as "you are on the network".
   let sharingTone: PillTone = $derived(
-    !sharingPublished ? 'muted' : isConnected ? 'ok' : 'warn',
+    publishedTotal === 0 && !sharingPublished
+      ? 'muted'
+      : publishedInProgress || !isConnected
+        ? 'warn'
+        : 'ok',
   );
   let sharingHint = $derived(
-    !sharingPublished
+    publishedTotal === 0 && !sharingPublished
       ? m.ember_health_sharing_waiting_hint()
-      : isConnected
-        ? m.ember_health_sharing_published_hint()
-        : m.ember_health_sharing_published_rejoining_hint(),
+      : publishedInProgress && isConnected
+        ? m.ember_health_sharing_publishing_hint({
+            remaining: publishedTotal - publishedCount,
+          })
+        : isConnected
+          ? m.ember_health_sharing_published_hint()
+          : m.ember_health_sharing_published_rejoining_hint(),
   );
 
   // The estimate is a density measurement, so it is shown as approximate and
@@ -360,7 +376,7 @@
     { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
     { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
     { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },
-    { id: 'published-files', k: m.ember_stat_published_files(), v: String(diag?.ember_dht_published_files ?? 0) },
+    { id: 'published-files', k: m.ember_stat_published_files(), v: publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : String(publishedCount) },
     { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: String(diag?.ember_dht_stored_keys ?? 0) },
     { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: String(diag?.ember_dht_stored_for_others_records ?? 0) },
     { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
@@ -392,6 +408,7 @@
     { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
     { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
     { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
+    { id: 'rendezvous-key-load', k: m.ember_stat_rendezvous_key_load(), v: String(diag?.ember_dht_rendezvous_key_load ?? 0) },
     { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
     { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
@@ -407,6 +424,14 @@
     { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: String(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
     { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: String(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
     { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
+    { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: String(diag?.ember_dht_keyword_key_off_name ?? 0) },
+    { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: String(diag?.ember_dht_version_advertisers ?? 0) },
+    { id: 'recall-searches', k: m.ember_stat_recall_searches(), v: String(diag?.ember_dht_recall_searches ?? 0) },
+    { id: 'recall-both', k: m.ember_stat_recall_both(), v: String(diag?.ember_dht_recall_both ?? 0) },
+    { id: 'recall-kad-only', k: m.ember_stat_recall_kad_only(), v: String(diag?.ember_dht_recall_kad_only ?? 0) },
+    { id: 'recall-ember-only', k: m.ember_stat_recall_ember_only(), v: String(diag?.ember_dht_recall_ember_only ?? 0) },
+    { id: 'rate-limited', k: m.ember_stat_rate_limited(), v: String(diag?.ember_dht_rate_limited ?? 0) },
+    { id: 'store-addr-ceiling', k: m.ember_stat_store_addr_ceiling(), v: String(diag?.ember_dht_store_addr_ceiling ?? 0) },
     ];
   });
 
@@ -528,8 +553,14 @@
         </div>
         <div class="stat-label">{m.ember_overview_peers()}</div>
       </div>
-      <div class="stat">
-        <div class="stat-value">{publishedCount}</div>
+      <div class="stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
+        <div class="stat-value">
+          {#if publishedTotal > 0}
+            {m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })}
+          {:else}
+            {publishedCount}
+          {/if}
+        </div>
         <div class="stat-label">{m.ember_overview_published()}</div>
       </div>
     </section>

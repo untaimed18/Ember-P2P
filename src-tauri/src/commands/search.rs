@@ -2,7 +2,7 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::network::{NetworkCommand, SearchMethod};
@@ -14,6 +14,11 @@ use std::collections::HashMap;
 
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
+/// How long `find_sources` waits for the network task to send the asks. It
+/// does not wait for answers, so this only has to cover the task getting to
+/// the command and one TCP write to the server — long enough that a busy tick
+/// isn't reported as a failure, short enough that a wedged task is.
+const SOURCE_ASK_TIMEOUT_SECS: u64 = 15;
 const LINK_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Maximum query length accepted from the frontend. eMule keyword
@@ -30,6 +35,10 @@ const MAX_MARK_SPAM_SOURCES: usize = 64;
 const MAX_MARK_SPAM_FILENAME: usize = 1024;
 /// Maximum search-keyword count in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORDS: usize = 32;
+/// Maximum seed files accepted by `plan_related_search`. Only the first seed's
+/// filename shapes the keyword query; the rest only contribute hashes to the
+/// native eD2k co-share request, which is itself capped further down.
+const MAX_RELATED_SEEDS: usize = 16;
 /// Maximum keyword length in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
 
@@ -103,6 +112,66 @@ fn keywords_for_spam(search_query: Option<&str>, search_keywords: &[String]) -> 
     search_keywords.to_vec()
 }
 
+/// Which of [`search_files`]' hash lists is being validated.
+///
+/// This only picks an error code, and a `&str` parameter would do — except that
+/// `scripts/error-codes.test.mjs` finds codes by scanning for string literals
+/// inside `coded*` calls, so a code reaching `coded_ctx` through a variable is
+/// invisible to the check that it has been translated. Matching to a literal
+/// per variant keeps both codes discoverable.
+#[derive(Debug, Clone, Copy)]
+enum HashList {
+    Related,
+    Exclude,
+}
+
+impl HashList {
+    fn invalid_hash_error(self, hash: &str) -> String {
+        match self {
+            HashList::Related => {
+                coded_ctx("search_related_invalid_hash", "Invalid file hash", hash)
+            }
+            HashList::Exclude => {
+                coded_ctx("search_exclude_invalid_hash", "Invalid file hash", hash)
+            }
+        }
+    }
+}
+
+/// Validate and normalize an optional list of eD2k MD4 hashes from the
+/// renderer to lowercase hex, de-duplicated.
+///
+/// Rejects rather than silently drops a malformed hash: these lists decide
+/// which results are hidden and what goes into the native co-share request, so
+/// quietly ignoring a typo'd hash would make a related search look like it just
+/// found nothing.
+fn normalize_hash_list(
+    hashes: Option<Vec<String>>,
+    list: HashList,
+) -> Result<Vec<String>, String> {
+    let Some(hashes) = hashes else {
+        return Ok(Vec::new());
+    };
+    if hashes.len() > MAX_RELATED_SEEDS {
+        return Err(coded_ctx(
+            "search_related_too_many_seeds",
+            format!("At most {MAX_RELATED_SEEDS} file hashes"),
+            MAX_RELATED_SEEDS,
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        // Reuse the single 32-hex-char check so this can never diverge from
+        // what the rest of the search path considers a valid file hash.
+        parse_exact_file_hash(&hash).map_err(|_| list.invalid_hash_error(&hash))?;
+        let normalized = hash.to_lowercase();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(coded(
@@ -149,6 +218,26 @@ pub fn apply_search_enrichment_with_batch(
         &analyzed
     };
     for result in results.iter_mut() {
+        // Record which server the hit came from, not just score against it.
+        // Everything downstream of the emit re-derives from the row alone: the
+        // explain tooltip re-scores it, and marking it spam is what trains that
+        // server's reputation. Both read `origin_server_ip` (see
+        // `SpamFilter::explain_result` / `mark_spam`), so leaving it empty meant
+        // a tooltip that could not account for the score beside it, and a
+        // reputation that only ever decayed toward clean -- `record_server_clean_batch`
+        // has the batch's IP and redeems with it, while the user's own verdict
+        // arrived with nothing to attribute it to.
+        //
+        // Filled only when empty, and only from a batch that has an IP: a
+        // `rescore_search_results` pass re-enriches rows handed back by the UI
+        // with no server of its own, and must not strip what they already carry.
+        // First-seen-wins matches how both merge paths combine the field
+        // (`merge::merge_into`, `mergeResult` in `stores/search.ts`).
+        if result.origin_server_ip.is_none() {
+            if let Some(ip) = server_ip {
+                result.origin_server_ip = Some(ip.to_string());
+            }
+        }
         if spam_enabled {
             let cr = community
                 .get(&result.file.hash)
@@ -236,7 +325,95 @@ pub(crate) fn community_ratings_for(
         .collect()
 }
 
+/// A file the user asked for related files of, as it arrives over IPC.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RelatedSeedInput {
+    pub hash: Option<String>,
+    pub name: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+/// Work out what a "find related files" search should actually look for.
+///
+/// Pure planning: this runs no search and touches no network. The caller takes
+/// [`crate::search::related::RelatedPlan::query`] and
+/// `co_share_hashes` and feeds them straight back into [`search_files`], so a
+/// related search is an ordinary search and inherits streaming, dedup, spam
+/// scoring, filters and cancellation unchanged.
 #[tauri::command]
+pub async fn plan_related_search(
+    seeds: Vec<RelatedSeedInput>,
+) -> Result<crate::search::related::RelatedPlan, String> {
+    if seeds.is_empty() {
+        return Err(coded(
+            "search_related_no_seed",
+            "No file was given to find related files for",
+        ));
+    }
+    if seeds.len() > MAX_RELATED_SEEDS {
+        return Err(coded_ctx(
+            "search_related_too_many_seeds",
+            format!("Select at most {MAX_RELATED_SEEDS} files"),
+            MAX_RELATED_SEEDS,
+        ));
+    }
+    if seeds.iter().any(|s| {
+        s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME)
+            || s.artist.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
+            || s.album.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
+    }) {
+        return Err(coded(
+            "search_related_seed_too_long",
+            "Related-search seed metadata is too long",
+        ));
+    }
+
+    let seeds: Vec<crate::search::related::SeedFile> = seeds
+        .into_iter()
+        .map(|s| crate::search::related::SeedFile {
+            hash: s.hash.unwrap_or_default(),
+            name: s.name.unwrap_or_default(),
+            artist: s.artist,
+            album: s.album,
+        })
+        .collect();
+
+    let plan = crate::search::related::plan(
+        &seeds,
+        crate::network::ed2k::server::related_search_supported(),
+    );
+    if plan.is_empty() {
+        return Err(coded(
+            "search_related_nothing_to_search",
+            "Could not work out anything to search for from this file",
+        ));
+    }
+    Ok(plan)
+}
+
+/// Whether "Find related files" has a server that can answer it.
+///
+/// eMule offers the menu item only while `CanSearchRelatedFiles()` holds — a
+/// connected server advertising `SRV_TCPFLG_RELATEDSEARCH` — and greys it out
+/// otherwise, which is what the UI uses this for. The flag mirror is updated on
+/// login, on every `OP_IDCHANGE` and on disconnect, so this is an atomic read
+/// rather than a round-trip to the network task.
+#[tauri::command]
+pub fn related_search_supported() -> bool {
+    crate::network::ed2k::server::related_search_supported()
+}
+
+/// Run a search across the selected networks.
+///
+/// `related_hashes` / `exclude_hashes` are set only by a "find related files"
+/// search (see [`plan_related_search`]). `related_hashes` turns the connected
+/// eD2k server's leg of the search into eMule's native co-share request when
+/// that server advertises `SRV_TCPFLG_RELATEDSEARCH`, and is ignored otherwise
+/// — every other leg always runs `query`. `exclude_hashes` withholds the seed
+/// files from the results, since a file is not related to itself.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn search_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -248,6 +425,8 @@ pub async fn search_files(
     file_type: Option<String>,
     file_extension: Option<String>,
     min_availability: Option<u32>,
+    related_hashes: Option<Vec<String>>,
+    exclude_hashes: Option<Vec<String>>,
 ) -> Result<Vec<SearchResult>, String> {
     if query.len() > MAX_SEARCH_QUERY_LEN {
         return Err(coded_ctx(
@@ -285,6 +464,9 @@ pub async fn search_files(
             MAX_SEARCH_FILTER_LEN,
         ));
     }
+    let related_hashes = normalize_hash_list(related_hashes, HashList::Related)?;
+    let exclude_hashes = normalize_hash_list(exclude_hashes, HashList::Exclude)?;
+
     let (tx, rx) = oneshot::channel();
 
     let keywords = crate::search::query::parse(query.trim())
@@ -335,14 +517,15 @@ pub async fn search_files(
 
     let mut streamed_local = local_hits.clone();
     streamed_local.retain(|r| {
-        merge::result_matches_client_filters(
-            r,
-            file_type_filter.as_deref(),
-            client_min_size,
-            client_max_size,
-            client_file_extension.as_deref(),
-            client_min_availability,
-        )
+        !exclude_hashes.contains(&r.file.hash)
+            && merge::result_matches_client_filters(
+                r,
+                file_type_filter.as_deref(),
+                client_min_size,
+                client_max_size,
+                client_file_extension.as_deref(),
+                client_min_availability,
+            )
     });
     enrich_results_with_batch(&mut streamed_local, &state, &keywords, None, false).await;
     if !streamed_local.is_empty() {
@@ -363,6 +546,8 @@ pub async fn search_files(
             request_id,
             tx,
             search_filters: filters,
+            related_hashes,
+            exclude_hashes: exclude_hashes.clone(),
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
@@ -384,14 +569,15 @@ pub async fn search_files(
 
     results = merge::merge_search_vecs(results, local_hits);
     results.retain(|r| {
-        merge::result_matches_client_filters(
-            r,
-            file_type_filter.as_deref(),
-            client_min_size,
-            client_max_size,
-            client_file_extension.as_deref(),
-            client_min_availability,
-        )
+        !exclude_hashes.contains(&r.file.hash)
+            && merge::result_matches_client_filters(
+                r,
+                file_type_filter.as_deref(),
+                client_min_size,
+                client_max_size,
+                client_file_extension.as_deref(),
+                client_min_availability,
+            )
     });
     // No batch spam context: invoke often re-delivers hashes already shown via
     // streamed events; batch heuristics can flip clean → spam.
@@ -486,55 +672,45 @@ pub async fn find_notes(
     Ok(results)
 }
 
+/// Ask every connected network for the sources of one transfer's file.
+///
+/// Resolves once the asks are away, which is what the returned outcome
+/// describes — one flag per network, `false` for each one that had nowhere to
+/// send it. The sources themselves arrive on each network's own schedule and go
+/// straight into the transfer, so there is nothing to wait for here and no
+/// timeout worth imposing beyond the network task picking the command up.
 #[tauri::command]
 pub async fn find_sources(
     state: tauri::State<'_, AppState>,
+    transfer_id: String,
     file_hash: String,
     file_size: u64,
-) -> Result<Vec<(String, u16)>, String> {
-    let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
+) -> Result<crate::types::SourceAskOutcome, String> {
+    let hash = parse_exact_file_hash(&file_hash)?;
 
     let (tx, rx) = oneshot::channel();
-    let request_id: u64 = rand::random();
-
     state
         .network_tx
         .try_send(NetworkCommand::FindSources {
-            file_hash: kad_hash,
+            transfer_id,
+            file_hash: hash,
             file_size,
-            request_id,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let timeout_secs = {
-        let c = state.config.read().await;
-        c.settings
-            .search_timeout_secs
-            .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(Ok(results))) => Ok(results),
-        Ok(Ok(Err(msg))) => Err(coded_ctx(
-            "search_source_search_busy",
-            msg,
-            "kad search capacity",
-        )),
+    match tokio::time::timeout(std::time::Duration::from_secs(SOURCE_ASK_TIMEOUT_SECS), rx).await {
+        Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(e)) => Err(coded_ctx(
             "search_source_search_failed",
             "Source search failed",
             e,
         )),
-        Err(_) => {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::CancelSearch { request_id });
-            Err(coded_ctx(
-                "search_timed_out",
-                format!("Source search timed out after {timeout_secs}s"),
-                timeout_secs,
-            ))
-        }
+        Err(_) => Err(coded_ctx(
+            "search_timed_out",
+            format!("Source search timed out after {SOURCE_ASK_TIMEOUT_SECS}s"),
+            SOURCE_ASK_TIMEOUT_SECS,
+        )),
     }
 }
 
@@ -610,11 +786,15 @@ pub async fn cancel_search(
     state: tauri::State<'_, AppState>,
     request_id: u64,
 ) -> Result<(), String> {
-    state
-        .network_tx
-        .try_send(NetworkCommand::CancelSearch { request_id })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    Ok(())
+    // `bounded_send`, not `try_send`. A cancel that never reaches the network
+    // task leaves the KAD and Ember walks running to their own 60s expiry,
+    // holding routing-table in-use slots and search-manager slots the next
+    // query needs — and the frontend, which rotates the tab's request id on the
+    // strength of this call, would already have stopped associating results
+    // with it. The channel is most likely full precisely when the event loop is
+    // busy, which is exactly when a dropped cancel costs the most, so this
+    // waits briefly rather than failing instantly.
+    bounded_send(&state.network_tx, NetworkCommand::CancelSearch { request_id }).await
 }
 
 /// Compute the ed2k hash of raw bytes (for in-memory content).
@@ -1483,5 +1663,133 @@ mod ed2k_paste_tests {
         assert_eq!(batch.links.len(), 1);
         assert_eq!(batch.links[0].hash, single.hash);
         assert_eq!(batch.links[0].size, single.size);
+    }
+}
+
+/// Which server a hit is attributed to, which the row has to carry for
+/// `SpamFilter::mark_spam` / `explain_result` to reach it after the emit.
+#[cfg(test)]
+mod result_attribution_tests {
+    use super::*;
+    use crate::search::spam::SpamFilter;
+    use crate::types::{FileInfo, SearchResult};
+
+    fn row(hash: &str, origin: &str) -> SearchResult {
+        SearchResult {
+            file: FileInfo {
+                id: hash.into(),
+                name: "a.bin".into(),
+                path: String::new(),
+                size: 1,
+                hash: hash.into(),
+                aich_hash: String::new(),
+                ember_file_hash: String::new(),
+                extension: "bin".into(),
+                modified_at: 0,
+                priority: "normal".into(),
+                requests: 0,
+                accepted: 0,
+                bytes_transferred: 0,
+                alltime_requests: 0,
+                alltime_accepted: 0,
+                alltime_transferred: 0,
+                complete_sources: 0,
+                folder: String::new(),
+                shared: false,
+                friends_only: false,
+                shared_kad: false,
+                shared_ed2k: false,
+                shared_ember: false,
+            },
+            peer_id: String::new(),
+            peer_name: String::new(),
+            availability: 1,
+            file_type: String::new(),
+            source_addresses: Vec::new(),
+            rating: None,
+            comment: None,
+            media: None,
+            spam_rating: 0,
+            is_spam: false,
+            clean_name: String::new(),
+            result_origin: origin.into(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
+        }
+    }
+
+    fn enrich(results: &mut [SearchResult], server_ip: Option<&str>) {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-attrib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let spam = SpamFilter::load(&dir);
+        apply_search_enrichment_with_batch(
+            results,
+            &spam,
+            &[],
+            server_ip,
+            false,
+            SpamFilterProfile::Balanced,
+            &[],
+            &HashMap::new(),
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn a_server_batch_stamps_the_server_it_came_from() {
+        let mut results = vec![row(&"1".repeat(32), crate::search::merge::ORIGIN_SERVER_TCP)];
+        enrich(&mut results, Some("93.184.216.34"));
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("93.184.216.34"),
+            "marking this hit spam has to be able to train the server that served it"
+        );
+    }
+
+    #[test]
+    fn a_dht_batch_leaves_the_row_unattributed() {
+        // KAD, Ember and local batches enrich with no server IP, and inventing
+        // one would train the reputation of a server that never sent the hit.
+        let mut results = vec![
+            row(&"2".repeat(32), crate::search::merge::ORIGIN_KAD),
+            row(&"3".repeat(32), crate::search::merge::ORIGIN_EMBER),
+        ];
+        enrich(&mut results, None);
+        assert!(results.iter().all(|r| r.origin_server_ip.is_none()));
+    }
+
+    #[test]
+    fn a_rescore_pass_keeps_the_server_the_row_arrived_with() {
+        // `rescore_search_results` re-enriches rows the UI hands back, with no
+        // server of its own; stamping unconditionally would strip attribution
+        // from every row on a spam-settings change.
+        let mut results = vec![row(&"4".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP)];
+        results[0].origin_server_ip = Some("198.51.100.7".to_string());
+        enrich(&mut results, None);
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn the_first_server_to_answer_owns_the_row() {
+        // Same rule as the two merge paths: a later leg does not re-attribute a
+        // row already credited to the server that first sent it.
+        let mut results = vec![row(&"5".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP)];
+        results[0].origin_server_ip = Some("198.51.100.7".to_string());
+        enrich(&mut results, Some("203.0.113.9"));
+        assert_eq!(
+            results[0].origin_server_ip.as_deref(),
+            Some("198.51.100.7")
+        );
     }
 }

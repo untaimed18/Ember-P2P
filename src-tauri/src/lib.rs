@@ -31,6 +31,7 @@ pub mod security;
 mod sharing;
 mod storage;
 mod types;
+mod webservices;
 
 use futures::FutureExt;
 use tauri::Emitter;
@@ -821,6 +822,7 @@ pub fn run() {
                         );
                     }
                 }
+                commands::backup::sweep_orphaned_scratch(&data_dir);
             }
 
             // Allow WebView media playback for files under shared/download dirs.
@@ -1716,6 +1718,8 @@ pub fn run() {
             commands::backup::pending_restore_status,
             commands::backup::discard_pending_restore,
             commands::search::search_files,
+            commands::search::plan_related_search,
+            commands::search::related_search_supported,
             commands::search::cancel_search,
             commands::search::find_notes,
             commands::search::find_sources,
@@ -1829,6 +1833,7 @@ pub fn run() {
             commands::peers::get_kad_searches,
             commands::peers::kad_cancel_search,
             commands::peers::get_peer_reputation,
+            commands::peers::get_peer_reputation_batch,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
             commands::peers::ember_ping_peer,
@@ -1891,6 +1896,9 @@ pub fn run() {
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,
             commands::settings::open_external_url,
+            commands::settings::open_web_service,
+            commands::settings::pick_and_import_webservices_file,
+            commands::settings::get_example_web_service,
             commands::settings::get_log_folder_path,
             commands::settings::open_log_folder,
             commands::security::get_security_policy_state,

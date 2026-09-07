@@ -148,6 +148,8 @@ async fn handle_command_inner(
             request_id,
             tx,
             search_filters,
+            related_hashes,
+            exclude_hashes,
         } => {
             // Cancel the prior request while it is still `active_search_request`
             // so cancel can clear the UDP queue and emit `search-complete`.
@@ -158,6 +160,9 @@ async fn handle_command_inner(
                 cancel_search_request(state, app_handle, prior_id);
             }
             state.active_search_request = None;
+            // Any second server request still queued belongs to that prior
+            // search, which is now gone; this one queues its own below.
+            state.server_followup_search = None;
 
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
@@ -175,10 +180,13 @@ async fn handle_command_inner(
                 kad_pending: false,
                 udp_pending: false,
                 ember_pending: false,
+                kad_ran: false,
+                ember_ran: false,
                 udp_search_deadline: 0,
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
                 ed2k_noted_availability: HashMap::new(),
+                dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
@@ -190,8 +198,54 @@ async fn handle_command_inner(
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
                 streamed_hashes: std::collections::HashSet::new(),
+                exclude_hashes: exclude_hashes.iter().cloned().collect(),
                 batch_spam: crate::search::spam::BatchSpamContext::default(),
             };
+
+            // eMule's native "Search Related Files": the connected server is
+            // asked for files commonly shared *alongside* these hashes. Only
+            // that one server gets it, and only when it advertises support —
+            // the whole point is its global view of who shares what, which no
+            // other leg of the search has. It is asked in *addition* to the
+            // keyword query rather than instead of it; see the two-phase send
+            // below. The co-share term goes on that one TCP expression only,
+            // never on the shared `search_expr`, because a server without
+            // `SRV_TCPFLG_RELATEDSEARCH` would read `related::<hash>` as a
+            // filename substring and answer with nothing useful. The UI runs a
+            // related search as a `Server`-method search — eMule's feature is
+            // server-side — so in practice no other leg ever sees one; the
+            // per-leg gates below stay honest rather than trusting that.
+            let server_flags = state
+                .server_connection
+                .as_ref()
+                .and_then(|c| c.session.as_ref())
+                .map(|s| s.server_flags);
+            let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
+            {
+                None
+            } else {
+                crate::search::related::co_share_term(&related_hashes)
+            };
+            // Which of the two questions a related search is about to ask, and
+            // on whose authority. Without this the log could not tell a
+            // co-share request from the keyword fallback — both appear as one
+            // `OP_SEARCHREQUEST` of unremarkable length — so "no results" gave
+            // no way to tell a server with nothing to say from a request that
+            // never asked the right question.
+            if !related_hashes.is_empty() {
+                match co_share_term.as_deref() {
+                    Some(term) => info!(
+                        "Related search: asking the server {term} (flags 0x{:04X})",
+                        server_flags.unwrap_or(0)
+                    ),
+                    None => info!(
+                        "Related search: no co-share request — server flags 0x{:04X} lack \
+                         SRV_TCPFLG_RELATEDSEARCH (0x{:04X}); falling back to keywords '{query}'",
+                        server_flags.unwrap_or(0),
+                        crate::network::ed2k::server::SRV_TCPFLG_RELATEDSEARCH,
+                    ),
+                }
+            }
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
             // explicit AND/OR/NOT, `-` negation, "quoted phrases", and
@@ -214,7 +268,18 @@ async fn handle_command_inner(
                     || f.max_size.is_some_and(|v| v > 0)
                     || f.min_availability.is_some_and(|v| v > 0)
             }) || wire_file_type.as_ref().is_some_and(|t| !t.is_empty());
-            if keywords.is_empty() && !has_usable_filters {
+            // Whether the keyword legs have anything to send at all. A related
+            // search can legitimately have nothing: a file named `S01E02.mkv`
+            // is all marker and no title, so the co-share request carries the
+            // whole search. Every keyword leg is gated on this rather than on
+            // its own reading of `keywords` so none of them can put an empty
+            // expression on the wire.
+            let has_keyword_query = !keywords.is_empty() || has_usable_filters;
+            // A co-share request needs no keywords: the hashes *are* the query.
+            // Without this a related search on a file whose name yields no
+            // searchable token (all words under the eD2k 3-byte minimum) would
+            // bail out here even though the server could still answer it.
+            if !has_keyword_query && co_share_term.is_none() {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
@@ -244,23 +309,52 @@ async fn handle_command_inner(
                 &search_constraints,
             );
 
-            // --- TCP server search ---
-            let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
-            // Global's UDP leg does not need a server *session*, so it kept
-            // spraying `OP_GLOBSEARCH` at the whole server list after the user
-            // had gone offline. Ember still answers a Global query, which is
-            // the documented offline fallback; talking to eD2K servers is not.
-            let run_udp = matches!(method, SearchMethod::Global)
-                && !state
+            // Which networks this search is allowed to reach, and why, lives
+            // in `search_legs` — including the one rule a related search
+            // depends on: `Server` asks the connected server and nothing else.
+            // `ed2k::<hash>` and `related::<hash>` are instructions to an eD2k
+            // server, not words to match against filenames, so the keyword
+            // DHTs have nothing to look up: Kad would walk to
+            // MD4("ed2k::<hash>") and Ember would hash the same text — keys no
+            // publisher has ever written. Reporting no lookupable keyword keeps
+            // both legs out of it and leaves the directive to the legs that
+            // resolve it from a server's own index. A related search already
+            // arrives as `SearchMethod::Server`; this is what makes a directive
+            // the user typed or pasted behave the same way.
+            let server_directive_query = query_expr
+                .as_ref()
+                .is_some_and(|expr| expr.contains_server_directive());
+            let legs = search_legs(
+                method,
+                has_keyword_query,
+                !keywords.is_empty() && !server_directive_query,
+                state
                     .user_offline
-                    .load(std::sync::atomic::Ordering::Relaxed);
-            let run_kad =
-                !keywords.is_empty() && matches!(method, SearchMethod::Global | SearchMethod::Kad);
-            let run_ember = matches!(method, SearchMethod::Global | SearchMethod::Ember);
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
 
-            if run_server && state.server_connected {
+            // --- TCP server search ---
+            if legs.server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
-                    match conn.send_search_expr_bytes(&search_expr).await {
+                    // The co-share term must be wrapped as a `QueryExpr::Term`
+                    // by hand rather than parsed: `:` is an eD2k keyword
+                    // separator, so parsing `related::<hash>` would send the
+                    // server a keyword search for "related".
+                    let co_share_expr = co_share_term.as_deref().map(|term| {
+                        kad::messages::build_search_expression_with_node(
+                            Some(
+                                crate::search::query::QueryExpr::Term(term.to_string())
+                                    .to_wire_bytes(),
+                            ),
+                            &search_constraints,
+                        )
+                    });
+                    // Both questions are sent under the same `request_id`, so
+                    // both answers land in the same tab; the co-share request
+                    // goes out from the poll loop once the first has delivered.
+                    let (first_expr, followup_expr) =
+                        server_search_phases(&search_expr, co_share_expr, has_keyword_query);
+                    match conn.send_search_expr_bytes(&first_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
                             state.server_search_more_needed = false;
@@ -271,7 +365,29 @@ async fn handle_command_inner(
                                 request_id,
                             });
                             state.server_search_age = 0;
-                            info!("TCP server search started for '{query}'");
+                            // Queued only now that the first request is on the
+                            // wire: a write that failed leaves a connection in
+                            // no state to carry a second search, and nothing
+                            // else would ever retire the leg it opened.
+                            state.server_followup_search =
+                                followup_expr.map(|expr| (request_id, expr));
+                            if state.server_followup_search.is_some() {
+                                info!(
+                                    "TCP server search started for '{query}', co-share request for {} hash(es) queued behind it",
+                                    related_hashes.len()
+                                );
+                            } else if co_share_term.is_some() {
+                                // A co-share request carries the whole search,
+                                // so there is no `query` to name: logging one
+                                // printed `for ''` and made the only line a
+                                // related search produces unreadable.
+                                info!(
+                                    "TCP server co-share request started for {} hash(es)",
+                                    related_hashes.len()
+                                );
+                            } else {
+                                info!("TCP server search started for '{query}'");
+                            }
                         }
                         Err(e) => {
                             debug!("TCP server search failed to send: {e}");
@@ -282,7 +398,7 @@ async fn handle_command_inner(
             }
 
             // --- UDP global search ---
-            if run_udp {
+            if legs.udp {
                 let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
                 let connected_addr = state.server_addr;
                 let servers = state.server_list.servers().to_vec();
@@ -330,11 +446,11 @@ async fn handle_command_inner(
             // --- KAD search ---
             let mut kad_skip_phase: Option<&'static str> = None;
             let kad_started = 'kad: {
-                if !run_kad {
+                if !legs.kad {
                     break 'kad false;
                 }
                 // KAD needs the parsed boolean expression. Positive terms being
-                // present is already what gates `run_kad`, but guard here too —
+                // present is already what gates the Kad leg, but guard here too —
                 // before any side effects — so future logic drift degrades to a
                 // skipped KAD search instead of panicking the whole network task.
                 let Some(query_expr) = query_expr.clone() else {
@@ -394,6 +510,7 @@ async fn handle_command_inner(
                     search.search_terms_data = kad_search_expr;
                 }
                 active_request.kad_pending = true;
+                active_request.kad_ran = true;
                 let Some(search_tx) = tx.take() else {
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
@@ -438,7 +555,7 @@ async fn handle_command_inner(
             // completes immediately from whatever the local store holds
             // rather than being skipped, which keeps a momentarily empty
             // table from silently dropping the Ember leg of a search.
-            if run_ember && settings.ember_native_enabled {
+            if legs.ember && settings.ember_native_enabled {
                 let query = active_request.keywords.join(" ");
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {
@@ -451,11 +568,48 @@ async fn handle_command_inner(
                         &hashed,
                         !query_expr.as_ref().is_some_and(|e| e.contains_or()),
                     );
-                    if let Some(search_id) = state.ember_search.start_find_value(
+                    let ember_search_id = state.ember_search.start_find_value(
                         ember::dht::EmberNodeId(*primary_hash),
                         extras.clone(),
                         state.ember_dht.routing(),
-                    ) {
+                    );
+                    if ember_search_id.is_none() {
+                        // The pool holds a quarter of its slots back for user
+                        // searches (`MAX_BACKGROUND_SEARCHES`), so reaching this
+                        // means even the reserve is spent. Say so: this leg
+                        // silently vanishing is indistinguishable from "the
+                        // Ember network has nothing", which sent people looking
+                        // for a fault in their DHT setup that was not there.
+                        // Mirrors the `KadBusy` notice above.
+                        warn!(
+                            "Ember search pool exhausted ({} active); this query runs without its Ember leg",
+                            state.ember_search.active_count()
+                        );
+                        let _ = app_handle.emit(
+                            "search-progress",
+                            SearchProgressEvent {
+                                request_id,
+                                nodes_contacted: 0,
+                                results_so_far: 0,
+                                phase: "EmberBusy".to_string(),
+                            },
+                        );
+                    }
+                    if let Some(search_id) = ember_search_id {
+                        // Hand the size and type limits to the responders, so a
+                        // narrow search does not spend its result budget on
+                        // records it would discard at emit. Availability is not
+                        // sent: an Ember record carries no source count, and the
+                        // number the page shows counts publishers across the
+                        // network, which no single responder can see.
+                        if let Some(search) = state.ember_search.get_mut(search_id) {
+                            search.set_value_constraints(ember_keyword_constraints(
+                                active_request.file_type_filter.clone(),
+                                active_request.min_size,
+                                active_request.max_size,
+                                active_request.file_extension.clone(),
+                            ));
+                        }
                         seed_ember_local_records(state, search_id, primary_hash, &extras);
                         seed_ember_session_search_contacts(state, search_id);
                         state.ember_keyword_searches.insert(
@@ -470,9 +624,11 @@ async fn handle_command_inner(
                                 file_extension: active_request.file_extension.clone(),
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
+                                streamed_files: HashSet::new(),
                             },
                         );
                         active_request.ember_pending = true;
+                        active_request.ember_ran = true;
                         drive_ember_search(socket, state, search_id).await;
                     }
                 }
@@ -735,6 +891,35 @@ async fn handle_command_inner(
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
                 });
             }
+            // Assert the invariant the UI depends on: a paused row has no
+            // worker, so it must not still read Active. `pause_transfers_batch`
+            // pauses the control and writes Paused under the manager's write
+            // lock before this command is enqueued, so normally there is nothing
+            // to repair — but this handler is the last step of a pause, and an
+            // Active row with no worker behind it is a dead end for the user:
+            // the transfer view offers the controls for a running transfer and
+            // none of them apply. Cheaper to re-establish it here than to trust
+            // every start path forever.
+            {
+                let mut mgr = transfer_manager.write().await;
+                let stale_active = mgr
+                    .get_transfer(&transfer_id)
+                    .is_some_and(|t| matches!(t.status, TransferStatus::Active));
+                if stale_active {
+                    warn!(
+                        "Pause left {transfer_id} marked Active with no worker; restoring Paused"
+                    );
+                    mgr.update_status(&transfer_id, TransferStatus::Paused);
+                    drop(mgr);
+                    let _ = app_handle.emit(
+                        "transfer-status",
+                        serde_json::json!({
+                            "id": transfer_id,
+                            "status": "paused",
+                        }),
+                    );
+                }
+            }
             // Drop KAD-callback placeholder timestamps: the manager
             // clears `source_details` for this transfer on pause
             // (see `TransferManager::pause`), so any pending_since
@@ -804,22 +989,47 @@ async fn handle_command_inner(
             // we already hashed this file before.
             if let Ok(bytes) = hex::decode(file_hash.trim()) {
                 if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                    // Provenance, not arrival order, decides which digest a
+                    // transfer enforces. The caller's digest is the row the user
+                    // clicked, so it outranks any plurality a background walk
+                    // seeded; known.met and the library index are bytes hashed
+                    // here, so they outrank everything remote.
                     let mut digest = parse_ember_file_hash(&ember_file_hash);
+                    let mut provenance = EmberDigestProvenance::UserSelected;
                     if digest == [0u8; 32] {
                         if let Some(rec) = known_files.find_by_hash(&ed2k) {
                             digest = parse_ember_file_hash(&rec.ember_file_hash);
+                            provenance = EmberDigestProvenance::Local;
                         }
                     }
                     if digest == [0u8; 32] {
+                        // `try_read`: a library scan holds this lock across
+                        // `rebuild_indices`, and this arm runs inside the
+                        // network `select!`, so waiting for it stalled all
+                        // networking behind a full re-index. Missing the
+                        // fallback is survivable — the digest is only a
+                        // second-guess after known.met, ed2k and AICH still
+                        // verify the file, and the completed-file hash seeds
+                        // the map for next time — whereas blocking here is not.
                         let hash_hex = hex::encode(ed2k);
-                        let idx = local_index.read().await;
-                        if let Some(f) = idx.get_by_hash(&hash_hex) {
-                            digest = parse_ember_file_hash(&f.ember_file_hash);
+                        match local_index.try_read() {
+                            Ok(idx) => {
+                                if let Some(f) = idx.get_by_hash(&hash_hex) {
+                                    digest = parse_ember_file_hash(&f.ember_file_hash);
+                                    provenance = EmberDigestProvenance::Local;
+                                }
+                            }
+                            Err(_) => debug!(
+                                "Library index busy; starting {transfer_id} without its local Ember digest"
+                            ),
                         }
                     }
-                    if digest != [0u8; 32] {
-                        state.ember_content_hashes.entry(ed2k).or_insert(digest);
-                    }
+                    seed_ember_content_hash(
+                        &mut state.ember_content_hashes,
+                        ed2k,
+                        digest,
+                        provenance,
+                    );
                 }
             }
 
@@ -1246,7 +1456,7 @@ async fn handle_command_inner(
                         ember_file_hash: state
                             .ember_content_hashes
                             .get(&hash_bytes)
-                            .copied()
+                            .map(|pin| pin.digest)
                             .unwrap_or([0u8; 32]),
                         geoip: geoip.clone(),
                         tracker_registry: Some(state.tracker_registry.clone()),
@@ -1284,31 +1494,47 @@ async fn handle_command_inner(
                             "Aborting existing download task for {tid2} before starting new one"
                         );
                         old_handle.abort();
-                        // Parent Drop now aborts child AbortHandles. Wait for
-                        // the worker, then for in-progress claims so the new
-                        // PartFileWriter does not overlap the old one.
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
-                            .await;
-                        if let Some(tracker) = old_tracker {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                async {
-                                    loop {
-                                        let idle = {
-                                            let t = tracker.read().await;
-                                            t.in_progress_part_count() == 0
-                                                && t.write_reservation_count() == 0
-                                        };
-                                        if idle {
-                                            break;
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(20))
+                        // Joined off the network task, matching `CancelDownload`
+                        // and `PauseDownload`. `abort()` cannot pre-empt a worker
+                        // parked in `spawn_blocking` (final verify, MD4, fsync),
+                        // so waiting here held UDP receive, every timer and every
+                        // IPC snapshot for up to 7 s — on the very path a user
+                        // hits by resuming a download. Ordering of the `.part`
+                        // hand-off does not depend on this wait:
+                        // `PART_WRITER_GATES` in the write coordinator holds the
+                        // new `PartFileWriter` until the old writer thread has
+                        // closed its handle, whichever start path spawned it.
+                        let teardown_tid = tid2.clone();
+                        tokio::spawn(async move {
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
+                                    .await;
+                            if let Some(tracker) = old_tracker {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        loop {
+                                            let idle = {
+                                                let t = tracker.read().await;
+                                                t.in_progress_part_count() == 0
+                                                    && t.write_reservation_count() == 0
+                                            };
+                                            if idle {
+                                                break;
+                                            }
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(20),
+                                            )
                                             .await;
-                                    }
-                                },
-                            )
-                            .await;
-                        }
+                                        }
+                                    },
+                                )
+                                .await;
+                            }
+                            debug!(
+                                "Previous download worker for {teardown_tid} finished teardown"
+                            );
+                        });
                     }
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
@@ -1328,137 +1554,48 @@ async fn handle_command_inner(
 
                 // ─── Source-discovery fan-out for new downloads ──────────────
                 //
-                // Without these three dispatches a download added with a
-                // single seed peer (the common path: user clicks Download
-                // on a search result, frontend passes the first
-                // `source_addresses` entry) would only see that one peer
-                // until the next periodic sweep — the source_retry_timer
-                // for KAD (15s+ on `active_download_kad_interval(0)`)
-                // and the 4-minute TCP `OP_GETSOURCES` batch. A search
-                // result reporting "27 sources" then looked like it had
-                // exactly one in the transfer view, and a single failed
-                // connection left the file stuck. Match the
-                // `has_source = false` branch's behavior so the moment a
-                // download starts, every source-discovery channel is
-                // already in flight.
+                // Without this a download added with a single seed peer
+                // (the common path: user clicks Download on a search
+                // result, frontend passes the first `source_addresses`
+                // entry) would only see that one peer until the next
+                // periodic sweep — the source_retry_timer for KAD (15s+
+                // on `active_download_kad_interval(0)`) and the 4-minute
+                // TCP `OP_GETSOURCES` batch. A search result reporting
+                // "27 sources" then looked like it had exactly one in the
+                // transfer view, and a single failed connection left the
+                // file stuck. Match the `has_source = false` branch's
+                // behavior so the moment a download starts, every
+                // source-discovery channel is already in flight.
                 let now_ts = chrono::Utc::now().timestamp();
-                let kad_available = kad_ready_for_sources(state);
-                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                let ask = ask_networks_for_sources(
+                    socket,
+                    state,
+                    app_handle,
+                    stats_manager,
+                    settings,
+                    &transfer_id,
+                    hash_bytes,
+                    file_size,
+                )
+                .await;
 
-                let initial_kad_search_started = if kad_available {
-                    let mut closest = state
-                        .routing_table
-                        .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                        let sid = start_kad_search(
-                            state,
-                            app_handle,
-                            kad_hash,
-                            SearchType::FindSource { file_size },
-                            closest,
-                        );
-                        if sid != SearchId(0) {
-                            state
-                                .download_source_searches
-                                .insert(sid, (transfer_id.clone(), hash_bytes));
-                            info!(
-                                "Started KAD source search {} for new active download {}",
-                                sid.0, transfer_id
-                            );
-                            let _ = app_handle.emit(
-                                "transfer:source-search",
-                                serde_json::json!({
-                                    "transfer_id": &transfer_id,
-                                    "kind": "kad_search",
-                                }),
-                            );
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Seed `active_kad_search_state` so the periodic sweep
-                // schedules the next KAD search on its normal cadence
-                // (~30s after this one when count==1) instead of
-                // re-firing immediately. When the initial dispatch
-                // didn't run (no KAD contacts / KAD disconnected) we
-                // fall back to (now, 0) which lets the sweep retry as
-                // soon as KAD is available again.
-                state.active_kad_search_state.insert(
-                    transfer_id.clone(),
-                    (now_ts, if initial_kad_search_started { 1 } else { 0 }),
-                );
+                // Seed both sweeps so they schedule their next lookup on the
+                // normal cadence (~30s for KAD when count==1) instead of
+                // re-firing immediately. A leg with nowhere to send this ask
+                // records (now, 0), which lets its sweep retry as soon as that
+                // network is available again.
+                state
+                    .active_kad_search_state
+                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.kad)));
+                state
+                    .ember_source_search_state
+                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.ember)));
                 // Empty-seed pending was inserted with search_count=0; stamp the
                 // fan-out so the 5s retry timer does not start a duplicate FindSource.
-                if initial_kad_search_started {
+                if ask.kad {
                     if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                         pd.search_count = pd.search_count.max(1);
                         pd.last_search_at = now_ts;
-                    }
-                }
-
-                // Ember DHT source discovery for the new download (slice 9):
-                // independent of KAD, so it fires even on a KAD-less network.
-                // Mirrors the KAD seed above so the periodic source-retry sweep
-                // schedules the next lookup on the normal backoff instead of
-                // re-firing immediately.
-                let initial_ember_search_started =
-                    if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
-                        start_ember_source_search(socket, state, &transfer_id, hash_bytes).await
-                    } else {
-                        false
-                    };
-                state.ember_source_search_state.insert(
-                    transfer_id.clone(),
-                    (now_ts, if initial_ember_search_started { 1 } else { 0 }),
-                );
-
-                // Immediate TCP `OP_GETSOURCES` to the connected eD2K
-                // server after post-login settle (Lugdunum drops early asks).
-                if server_source_settle_elapsed(state) {
-                    if let Some(conn) = state.server_connection.as_mut() {
-                        if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
-                                );
-                                let _ = app_handle.emit(
-                                    "transfer:source-search",
-                                    serde_json::json!({
-                                        "transfer_id": &transfer_id,
-                                        "kind": "server_query",
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // UDP fan-out to every eligible known server, paced via
-                // `udp_source_queue` so we don't burst-send on add.
-                if network_ready_for_sources(state) {
-                    let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
-                    if !packets.is_empty() {
-                        let room =
-                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        debug!(
-                            "Queuing {}/{} UDP source requests for new active download {}",
-                            packets.len().min(room),
-                            packets.len(),
-                            transfer_id
-                        );
-                        state
-                            .udp_source_queue
-                            .extend(packets.into_iter().take(room));
                     }
                 }
             } else {
@@ -1471,16 +1608,8 @@ async fn handle_command_inner(
                         return;
                     }
                 };
-                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-
-                let mut closest = state
-                    .routing_table
-                    .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                if closest.is_empty() {
-                    debug!(
-                        "No routing table contacts for source search, download will retry later"
-                    );
-                }
+                let mut file_hash_arr = [0u8; 16];
+                file_hash_arr.copy_from_slice(&hash_bytes);
 
                 let now = chrono::Utc::now().timestamp();
 
@@ -1569,39 +1698,28 @@ async fn handle_command_inner(
                     });
                 }
 
-                let kad_search_started = if kad_ready_for_sources(state) && !closest.is_empty() {
-                    closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
-                    let sid = start_kad_search(
-                        state,
-                        app_handle,
-                        kad_hash,
-                        SearchType::FindSource { file_size },
-                        closest,
-                    );
-                    if sid != SearchId(0) {
-                        let mut fh = [0u8; 16];
-                        fh.copy_from_slice(&hash_bytes[..16]);
-                        state
-                            .download_source_searches
-                            .insert(sid, (transfer_id.clone(), fh));
-                        info!(
-                            "Started source search {} for download {}",
-                            sid.0, transfer_id
-                        );
-                        let _ = app_handle.emit(
-                            "transfer:source-search",
-                            serde_json::json!({
-                                "transfer_id": &transfer_id,
-                                "kind": "kad_search",
-                            }),
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                let ask = ask_networks_for_sources(
+                    socket,
+                    state,
+                    app_handle,
+                    stats_manager,
+                    settings,
+                    &transfer_id,
+                    file_hash_arr,
+                    file_size,
+                )
+                .await;
+                // Seed the Ember sweep so it re-asks on the normal backoff
+                // rather than immediately. A leg with nowhere to send this ask
+                // records (now, 0), which lets the sweep try again as soon as
+                // Ember is available. `active_kad_search_state` is deliberately
+                // left alone: this download has no sources yet, so its KAD
+                // retries are the pending-download timer's business below, and
+                // an entry here would look to the active sweep like a turn
+                // already taken once the download starts moving.
+                state
+                    .ember_source_search_state
+                    .insert(transfer_id.clone(), (now, u32::from(ask.ember)));
 
                 // Look up actual priority from the transfer manager if this
                 // is a promoted/re-started download, otherwise default to normal.
@@ -1621,70 +1739,11 @@ async fn handle_command_inner(
                         file_size,
                         expected_aich,
                         control,
-                        search_count: if kad_search_started { 1 } else { 0 },
-                        last_search_at: if kad_search_started { now } else { 0 },
+                        search_count: u32::from(ask.kad),
+                        last_search_at: if ask.kad { now } else { 0 },
                         priority: pending_priority,
                     },
                 );
-
-                // Kick an immediate Ember DHT source search too (slice 9),
-                // mirroring the KAD seed above so a download started purely by
-                // hash can discover sources on a KAD-less network. The periodic
-                // sweep re-asks on the normal backoff afterwards.
-                if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
-                    let mut fh = [0u8; 16];
-                    fh.copy_from_slice(&hash_bytes);
-                    let ember_started =
-                        start_ember_source_search(socket, state, &transfer_id, fh).await;
-                    state.ember_source_search_state.insert(
-                        transfer_id.clone(),
-                        (now, if ember_started { 1 } else { 0 }),
-                    );
-                }
-
-                // Request sources from the connected ed2k server (non-blocking)
-                // after post-login settle so Lugdunum does not drop the ask.
-                if server_source_settle_elapsed(state) {
-                    if let Some(conn) = &mut state.server_connection {
-                        let mut file_hash_arr = [0u8; 16];
-                        file_hash_arr.copy_from_slice(&hash_bytes);
-                        if let Ok(bytes) = conn.send_get_sources(&file_hash_arr, file_size).await {
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
-                                );
-                                let _ = app_handle.emit(
-                                    "transfer:source-search",
-                                    serde_json::json!({
-                                        "transfer_id": &transfer_id,
-                                        "kind": "server_query",
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Queue UDP source requests to ALL eligible servers (paced via udp_source_queue)
-                if network_ready_for_sources(state) {
-                    let mut file_hash_arr = [0u8; 16];
-                    file_hash_arr.copy_from_slice(&hash_bytes);
-                    let packets = build_all_getsources_packets(state, &file_hash_arr, file_size);
-                    if !packets.is_empty() {
-                        let room =
-                            MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        debug!(
-                            "Queuing {}/{} UDP source requests for new download",
-                            packets.len().min(room),
-                            packets.len()
-                        );
-                        state
-                            .udp_source_queue
-                            .extend(packets.into_iter().take(room));
-                    }
-                }
             }
 
             if let Ok(hb) = hex::decode(&file_hash) {
@@ -1930,18 +1989,17 @@ async fn handle_command_inner(
                 }
                 for ip in &ips_to_ban {
                     state.banned_ips.insert(*ip);
-                    // Persist the IP against this peer so the ban survives a
-                    // restart (boot rebuilds banned_ips from banned peers'
-                    // addresses) and so unban_peer — which walks the peer's
-                    // addresses — clears it again. Keeps ban/unban symmetric.
-                    if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
-                        warn!("Failed to persist banned IP {ip} for peer {peer_id_hex}: {e}");
-                    }
                 }
+                // Published before the persistence below rather than after it.
+                // The upload accept path, the download workers and the Ember
+                // relay all gate on these shared sets, and none of them are on
+                // this loop — so leaving the sync behind an awaited SQLite write
+                // left a window, as long as that write takes under a library
+                // scan, in which the peer the user just banned could still be
+                // admitted. Nothing in the write depends on the sets.
                 if let Ok(mut shared) = shared_banned_ips.write() {
                     *shared = state.banned_ips.clone();
                 }
-                // Also add user hash to upload-only banned set
                 if let Ok(mut set) = shared_banned_hashes.write() {
                     set.insert(kad_id.0);
                 }
@@ -1949,10 +2007,81 @@ async fn handle_command_inner(
                 // reputation-gated connect paths see the manual ban
                 // immediately (UnbanPeer already cleared this side).
                 state.reputation.apply_manual_ban(&kad_id.0);
+                // Persist each IP against this peer so the ban survives a
+                // restart (boot rebuilds banned_ips from banned peers'
+                // addresses) and so unban_peer — which walks the peer's
+                // addresses — clears it again. Keeps ban/unban symmetric.
+                //
+                // One blocking hop for the whole address set, rather than a
+                // synchronous `rusqlite` write per IP on this thread: a peer
+                // seen at many addresses turned a single ban into an N-deep
+                // stall, each element of it waiting on `Database`'s
+                // `Mutex<Connection>` while holding the runtime worker that
+                // runs this loop. Off-thread, the worker is free to drive other
+                // tasks for the duration instead.
+                //
+                // Awaited, not fire-and-forget, and that is load-bearing.
+                // `add_banned_peer_address` upserts with `banned = 1`, so
+                // detached it could land behind a later command's write and
+                // re-ban a peer on disk that every in-memory set reports as
+                // clear, until the next restart rebuilt the bans from it.
+                //
+                // Awaiting orders this against the *commands* that follow, which
+                // is what `UnbanPeer` needs — but not against the IPC task,
+                // which writes `banned = 0` itself before it enqueues that
+                // command. That half is closed at the other end: `UnbanPeer`
+                // re-asserts the row rather than trusting a write it did not
+                // sequence.
+                {
+                    let ban_db = db.clone();
+                    let ban_peer = peer_id_hex.clone();
+                    let ban_ips = ips_to_ban.clone();
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        for ip in ban_ips {
+                            if let Err(e) = ban_db.add_banned_peer_address(&ban_peer, ip) {
+                                warn!(
+                                    "Failed to persist banned IP {ip} for peer {ban_peer}: {e}"
+                                );
+                            }
+                        }
+                    })
+                    .await;
+                    if let Err(e) = persisted {
+                        warn!("Ban persistence task for {peer_id_hex} failed: {e}");
+                    }
+                }
             }
         }
 
         NetworkCommand::UnbanPeer { peer_id_hex } => {
+            // `commands::peers::unban_peer` already cleared the row before it
+            // enqueued this, so the write below is normally a no-op — but the
+            // two are not ordered by anything. `BanPeer` upserts `banned = 1`
+            // from a blocking task this loop awaits, and the IPC unban writes
+            // `banned = 0` concurrently with it, so an unban issued while a ban
+            // was still queued behind a busy database could be overwritten by
+            // the ban it was answering. On disk the peer then stayed banned
+            // while every in-memory set said otherwise, and the next launch
+            // rebuilt the bans from the row.
+            //
+            // Re-asserting here fixes that because the loop *does* order this
+            // against `BanPeer`: that handler cannot still be persisting when
+            // this one runs. Awaited for the same reason it is there — the
+            // point of the blocking hop is to free the worker, not to give up
+            // the ordering.
+            {
+                let unban_db = db.clone();
+                let unban_peer = peer_id_hex.clone();
+                let cleared =
+                    tokio::task::spawn_blocking(move || unban_db.unban_peer(&unban_peer)).await;
+                match cleared {
+                    Ok(Err(e)) => {
+                        warn!("Failed to clear the persisted ban for {peer_id_hex}: {e}")
+                    }
+                    Err(e) => warn!("Unban persistence task for {peer_id_hex} failed: {e}"),
+                    Ok(Ok(())) => {}
+                }
+            }
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
                 if let Some(contact) = state.routing_table.get_contact(&kad_id) {
                     state.banned_ips.remove(&contact.ip);
@@ -2096,6 +2225,7 @@ async fn handle_command_inner(
                 .unwrap_or(0);
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
             diag.ember_dht_published_files = state.ember_published_sources.len() as u32;
+            diag.ember_dht_publishable_files = state.publish_manager.complete_file_count() as u32;
             let (store_keys, store_records) = state.ember_dht.store_stats();
             diag.ember_dht_stored_keys = store_keys as u32;
             diag.ember_dht_stored_records = store_records as u32;
@@ -2784,7 +2914,12 @@ async fn handle_command_inner(
             let primary_hash = keys[0];
             let extras: Vec<[u8; 16]> = keys.iter().skip(1).copied().collect();
             let primary = ember::dht::EmberNodeId(primary_hash);
-            let search_id = match state.ember_search.start_find_value(
+            // Background pool, not the user reserve. Channel Discover and the
+            // other raw-key gathers behind this command retry on their own
+            // ticks, so a refusal costs them a few seconds; a keyword search
+            // has no second chance. Taking the reserve here is what made the
+            // user's Ember leg disappear while automatic work filled the pool.
+            let search_id = match state.ember_search.start_background_find_value(
                 primary,
                 extras.clone(),
                 state.ember_dht.routing(),
@@ -2815,15 +2950,12 @@ async fn handle_command_inner(
             // than let FIND_VALUE run to SEARCH_TIMEOUT_SECS (60s) after a
             // 6s Discover probe. Completing would only send to a dropped
             // oneshot; the slot is what matters.
-            state.ember_dht_pending_value_lookups.remove(&search_id);
-            state.ember_search.remove(search_id);
-            state
-                .ember_dht_search_requests
-                .retain(|_, r| r.search_id != search_id);
-            if let Some(channel_id) = state.ember_channel_presence_searches.remove(&search_id)
-            {
-                flush_channel_presence_if_idle(state, channel_id);
-            }
+            //
+            // Same teardown as the expiry backstop. Releasing the slot without
+            // releasing everything else keyed by this id let `alloc_id` hand the
+            // id straight to another walk, which then delivered its records into
+            // the abandoned caller's map.
+            release_ember_search_state(state, app_handle, search_id);
         }
 
         NetworkCommand::FanoutChannelGossip { body } => {
@@ -3046,17 +3178,35 @@ async fn handle_command_inner(
                 let temp_dir = download_folder.join("Temp");
                 let done_dir = download_folder.join("Downloads");
                 let part_path = temp_dir.join(format!("ember-xfer-{}.part", hex::encode(xfer_id)));
-                let prepared = std::fs::create_dir_all(&temp_dir)
-                    .and_then(|_| std::fs::create_dir_all(&done_dir))
-                    .and_then(|_| {
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .read(true)
-                            .truncate(true)
-                            .open(&part_path)
-                    });
-                let file = match prepared {
+                // Two directory creations and a truncating open, off the
+                // network task. The download folder can be a network share or
+                // a spinning disk behind a virus scanner, where these are
+                // hundreds of milliseconds — and this task also drives UDP
+                // receive, every timer and every IPC snapshot. Nothing else
+                // can touch `state` while we await here (the loop is one task
+                // and this handler holds `&mut`), so the capacity and ban
+                // checks above still hold on the far side.
+                let prepared = tokio::task::spawn_blocking({
+                    let done_dir = done_dir.clone();
+                    let part_path = part_path.clone();
+                    move || {
+                        std::fs::create_dir_all(&temp_dir)
+                            .and_then(|_| std::fs::create_dir_all(&done_dir))
+                            .and_then(|_| {
+                                std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .write(true)
+                                    .read(true)
+                                    .truncate(true)
+                                    .open(&part_path)
+                            })
+                    }
+                })
+                .await;
+                let file = match prepared
+                    .map_err(|e| e.to_string())
+                    .and_then(|opened| opened.map_err(|e| e.to_string()))
+                {
                     Ok(file) => file,
                     Err(e) => {
                         let _ = tx.send(Err(coded_ctx(
@@ -3266,10 +3416,29 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
-            let snap =
-                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip, db)
-                    .await;
-            let _ = tx.send(snap);
+            // Built off the network task. The snapshot joins a `spawn_blocking`
+            // SQLite read for friend metadata and then walks every persisted
+            // credit record — up to `MAX_CREDIT_RECORDS`, 50,000 — and the
+            // Known Clients tab polls it every 8 s for as long as it is open,
+            // so awaiting it inline was a periodic stall of UDP receive, all
+            // the timers and every other IPC request. Each handle is an `Arc`,
+            // so the clones are cheap and the task borrows nothing from `state`.
+            let credit_manager = credit_manager.clone();
+            let friend_hashes = friend_hashes.clone();
+            let upload_queue = upload_queue.clone();
+            let geoip = geoip.clone();
+            let db = db.clone();
+            tokio::spawn(async move {
+                let snap = known_clients_snapshot(
+                    &credit_manager,
+                    &friend_hashes,
+                    &upload_queue,
+                    &geoip,
+                    &db,
+                )
+                .await;
+                let _ = tx.send(snap);
+            });
         }
 
         NetworkCommand::GetAntiLeechSnapshot { tx } => {
@@ -3303,11 +3472,10 @@ async fn handle_command_inner(
             if let Some(removed) = state.search_manager.remove(&sid) {
                 // Beyond the in-use refs, a cancelled search can still have
                 // pending IPC oneshots (`pending_keyword_searches` /
-                // `pending_source_searches` / `pending_notes_searches`) and
-                // bookkeeping entries (`download_source_searches`,
-                // `store_keyword_searches`, `store_source_searches`,
-                // `pending_note_publishes`) keyed on this `sid`. Without
-                // this, callers of `find_notes`/`find_sources`/global
+                // `pending_notes_searches`) and bookkeeping entries
+                // (`download_source_searches`, `store_keyword_searches`,
+                // `store_source_searches`, `pending_note_publishes`) keyed on
+                // this `sid`. Without this, callers of `find_notes`/global
                 // search hang until their own IPC timeout instead of
                 // resolving immediately, and `active_search_request.kad_pending`
                 // can be left stuck set so `search-complete` never fires.
@@ -3370,36 +3538,69 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::FindSources {
+            transfer_id,
             file_hash,
             file_size,
-            request_id,
             tx,
         } => {
-            let closest = state
-                .routing_table
-                .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
-
-            if closest.is_empty() {
-                let _ = tx.send(Ok(Vec::new()));
-                return;
+            // The renderer names the transfer and the file separately, and this
+            // is the only caller that can make them disagree — the two internal
+            // ones derive the hash from the download they are starting. What
+            // arrives here decides both which peers get asked and which
+            // transfer's source list the answers are written into, so an
+            // unmatched pair would attach peers holding one file to a download
+            // of another. Refused rather than reconciled: a pair the UI never
+            // produces is a bug or a forgery, and neither half is the one to
+            // trust.
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(transfer) = mgr.get_transfer(&transfer_id) {
+                    if !transfer
+                        .file_hash
+                        .eq_ignore_ascii_case(&hex::encode(file_hash))
+                    {
+                        warn!(
+                            "Find sources for {transfer_id} named a different file than the transfer holds; refusing"
+                        );
+                        let _ = tx.send(crate::types::SourceAskOutcome::default());
+                        return;
+                    }
+                }
             }
-
-            let sid = start_kad_search(
+            let outcome = ask_networks_for_sources(
+                socket,
                 state,
                 app_handle,
+                stats_manager,
+                settings,
+                &transfer_id,
                 file_hash,
-                SearchType::FindSource { file_size },
-                closest,
-            );
-
-            if sid == SearchId(0) {
-                warn!("FindSources rejected: active search cap reached");
-                let _ = tx.send(Err(
-                    "Source search busy: too many active KAD searches".to_string()
-                ));
-                return;
+                file_size,
+            )
+            .await;
+            let now_ts = chrono::Utc::now().timestamp();
+            // Stamp both sweeps so the ask the user just made counts as this
+            // round's ask: without it the periodic sweep sees a file it has not
+            // asked about recently and immediately asks again, which on a
+            // repeatedly clicked button is how one file talks over every other
+            // download's turn.
+            state
+                .active_kad_search_state
+                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.kad)));
+            state
+                .ember_source_search_state
+                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.ember)));
+            if outcome.kad {
+                if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                    pd.search_count = pd.search_count.max(1);
+                    pd.last_search_at = now_ts;
+                }
             }
-            state.pending_source_searches.insert(sid, (request_id, tx));
+            info!(
+                "Find sources for {transfer_id}: asked KAD={} Ember={} server={} server UDP={}",
+                outcome.kad, outcome.ember, outcome.server, outcome.server_udp
+            );
+            let _ = tx.send(outcome);
         }
 
         NetworkCommand::BootstrapContacts { contacts, tx } => {
@@ -3917,9 +4118,6 @@ async fn handle_command_inner(
             {
                 let _ = tx.send(local_results);
             }
-            for (_, (_, tx)) in state.pending_source_searches.drain() {
-                let _ = tx.send(Ok(Vec::new()));
-            }
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Ok(Vec::new()));
             }
@@ -4279,134 +4477,39 @@ async fn handle_command_inner(
             let _ = tx.send(outcome);
         }
 
-        NetworkCommand::KadBootstrapUrl { url, tx } => {
-            info!("KAD bootstrap from URL: {url}");
-            const MAX_NODES_BYTES: usize = 10 * 1024 * 1024;
-            // `fetch_pinned_get` re-validates the URL and every redirect hop
-            // against the private-IP rules, so a malicious redirect can't
-            // pivot the bootstrap fetch onto an internal host.
-            let outcome: Result<String, String> = match crate::security::fetch_pinned_get(&url)
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        Err(format!("HTTP {} from {}", resp.status().as_u16(), url))
-                    } else {
-                        let download_result: Result<Vec<u8>, String> = {
-                            use futures::StreamExt;
-                            let mut body = Vec::new();
-                            let mut stream = resp.bytes_stream();
-                            let mut err: Option<String> = None;
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(data) => {
-                                        body.extend_from_slice(&data);
-                                        if body.len() > MAX_NODES_BYTES {
-                                            err = Some(format!(
-                                                "Response exceeded {} byte cap",
-                                                MAX_NODES_BYTES
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        err = Some(format!("Download failed: {e}"));
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Some(e) = err {
-                                Err(e)
-                            } else {
-                                Ok(body)
-                            }
-                        };
-                        match download_result {
-                            Ok(bytes) => {
-                                let tmp_dir = std::env::temp_dir();
-                                let tmp_path = tmp_dir.join(format!(
-                                    "ember-nodes-{}.dat",
-                                    chrono::Utc::now().timestamp()
-                                ));
-                                match tokio::fs::write(&tmp_path, &bytes).await {
-                                    Err(e) => Err(format!("Failed to write temp nodes.dat: {e}")),
-                                    Ok(_) => {
-                                        let parse_res = bootstrap::load_nodes_dat(&tmp_path);
-                                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                                        match parse_res {
-                                                    Err(e) => Err(format!(
-                                                        "Parsed {} bytes but file is not a valid nodes.dat: {e}",
-                                                        bytes.len()
-                                                    )),
-                                                    Ok(mut contacts) => {
-                                                        // K3: a URL-supplied file is an unproven
-                                                        // seed list whatever its verified bytes
-                                                        // claim. Honouring them would let one
-                                                        // pasted link put contacts straight into
-                                                        // lookup and publish target selection.
-                                                        bootstrap::mark_contacts_unproven(
-                                                            &mut contacts,
-                                                        );
-                                                        let count = contacts.len();
-                                                        if count == 0 {
-                                                            Err("Downloaded nodes.dat contained no contacts".into())
-                                                        } else {
-                                                            for c in &contacts {
-                                                                state.routing_table.insert(c.clone());
-                                                            }
-                                                            for contact in contacts.iter().take(20) {
-                                                                let addr = SocketAddr::new(
-                                                                    contact.ip.into(),
-                                                                    contact.udp_port,
-                                                                );
-                                                                let msg = KadMessage::BootstrapReq;
-                                                                if let Ok(packet) =
-                                                                    messages::encode_packet(&msg)
-                                                                {
-                                                                    state
-                                                                        .flood_protection
-                                                                        .track_request(addr, 0x01);
-                                                                    let _ = socket
-                                                                        .send_to(&packet, addr)
-                                                                        .await;
-                                                                }
-                                                            }
-                                            info!(
-                                                "Loaded {count} contacts from URL, bootstrapping"
-                                            );
-                                            if state.stats.status
-                                                == NetworkStatus::Disconnected
-                                            {
-                                                state.stats.status =
-                                                    NetworkStatus::Connecting;
-                                                // See `KadBootstrapIp`: keep
-                                                // the upload gate in sync
-                                                // with every path off
-                                                // Disconnected.
-                                                state.upload_disconnected.store(
-                                                    false,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                            }
-                                            Ok(format!(
-                                                "Loaded {count} contacts from nodes.dat"
-                                            ))
-                                                        }
-                                                    }
-                                                }
-                                    }
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                }
-                Err(e) => Err(format!("KAD bootstrap fetch failed: {e}")),
-            };
-            if let Err(ref e) = outcome {
-                warn!("KAD bootstrap from {url} failed: {e}");
+        NetworkCommand::KadBootstrapContacts { contacts, tx } => {
+            // The download and the `nodes.dat` parse already happened on the
+            // IPC task (`kad_bootstrap_url`); only these two steps need the
+            // network task, and both are cheap. Contacts arrive unproven —
+            // K3: a URL-supplied file is an unproven seed list whatever its
+            // verified bytes claim, because honouring them would let one
+            // pasted link put contacts straight into lookup and publish
+            // target selection.
+            let count = contacts.len();
+            info!("KAD bootstrap from {count} downloaded contact(s)");
+            for c in &contacts {
+                state.routing_table.insert(c.clone());
             }
-            let _ = tx.send(outcome);
+            for contact in contacts.iter().take(20) {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::BootstrapReq;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    // K17: track outgoing bootstrap requests so the periodic
+                    // sweeps do not double-send to the same contact.
+                    state.flood_protection.track_request(addr, 0x01);
+                    let _ = socket.send_to(&packet, addr).await;
+                }
+            }
+            if state.stats.status == NetworkStatus::Disconnected {
+                state.stats.status = NetworkStatus::Connecting;
+                // See `KadBootstrapIp`: keep the upload gate in sync with
+                // every path off Disconnected.
+                state
+                    .upload_disconnected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            info!("Loaded {count} contacts from URL, bootstrapping");
+            let _ = tx.send(Ok(format!("Loaded {count} contacts from nodes.dat")));
         }
 
         NetworkCommand::KadBootstrapClients { tx } => {
@@ -5148,6 +5251,13 @@ async fn handle_command_inner(
                                     .as_ref()
                                     .map(|r| r.last_ember_keyword_publish)
                                     .unwrap_or(0),
+                                // A rehash does not change the bytes' media, so
+                                // carry the probe result rather than making the
+                                // publisher read the file again.
+                                media: existing.as_ref().and_then(|r| r.media.clone()),
+                                media_scanned: existing
+                                    .as_ref()
+                                    .is_some_and(|r| r.media_scanned),
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
                             // drop publish timers so the next tick advertises
@@ -5403,8 +5513,29 @@ async fn handle_command_inner(
                 rating,
                 comment.clone(),
             );
-            if let Err(e) = db.save_file_comment(&file_hash, rating, &comment) {
-                warn!("Failed to save comment: {e}");
+            // `save_file_comment` is a synchronous `rusqlite` write behind
+            // `Database`'s `Mutex<Connection>`, so calling it on this thread
+            // held the runtime worker running this loop for however long
+            // another writer (library scan, statistics flush) was already
+            // inside that mutex. Moving it to the blocking pool frees the
+            // worker to drive other tasks while it waits.
+            //
+            // Awaited rather than detached, because the row is an upsert keyed
+            // by file hash: two detached writes for the same file complete in
+            // whatever order the pool schedules them, so editing a comment
+            // twice in quick succession could persist the *older* text and only
+            // reveal it after a restart, once the in-memory manager that had
+            // the right answer was gone.
+            let comment_db = db.clone();
+            let comment_hash = file_hash.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                if let Err(e) = comment_db.save_file_comment(&comment_hash, rating, &comment) {
+                    warn!("Failed to save comment for {comment_hash}: {e}");
+                }
+            })
+            .await;
+            if let Err(e) = saved {
+                warn!("Comment persistence task for {file_hash} failed: {e}");
             }
         }
 
@@ -6610,6 +6741,51 @@ async fn handle_command_inner(
                 None => None,
             };
             let _ = tx.send(info);
+        }
+
+        NetworkCommand::GetPeerReputationBatch { user_hashes, tx } => {
+            // Decay once for the whole batch, for the same reason the
+            // single-peer arm does it: the UI should see the score the tracker
+            // would act on.
+            state.reputation.maybe_decay();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Read the manual-ban set once rather than per hash: it is behind a
+            // `std::sync::RwLock` shared with the upload server.
+            let manual_bans = shared_banned_hashes.read().ok();
+            let mut out: HashMap<String, Option<PeerReputationInfo>> =
+                HashMap::with_capacity(user_hashes.len());
+            for user_hash in user_hashes {
+                let manual_banned = manual_bans
+                    .as_ref()
+                    .map(|s| s.contains(&user_hash))
+                    .unwrap_or(false);
+                let info = match state.reputation.get_peer(&user_hash) {
+                    Some(p) => Some(PeerReputationInfo {
+                        score: p.score,
+                        successful_transfers: p.successful_transfers,
+                        failed_transfers: p.failed_transfers,
+                        is_banned: p.is_banned(now) || manual_banned,
+                        first_seen: p.first_seen,
+                        last_interaction: p.last_interaction,
+                    }),
+                    // Manual ban with no tracker history still needs a row so
+                    // the Known Clients Trust column shows "banned".
+                    None if manual_banned => Some(PeerReputationInfo {
+                        score: 0,
+                        successful_transfers: 0,
+                        failed_transfers: 0,
+                        is_banned: true,
+                        first_seen: now,
+                        last_interaction: now,
+                    }),
+                    None => None,
+                };
+                out.insert(hex::encode(user_hash), info);
+            }
+            let _ = tx.send(out);
         }
 
         NetworkCommand::GetReputationStats { tx } => {

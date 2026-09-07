@@ -2,10 +2,26 @@ import { get, writable, type Unsubscriber } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { SearchMethod, SearchFilters } from '$lib/api/search';
+import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
+import { shedWeakestRows } from '$lib/searchOverflow';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
+
+/** Marks a tab as the result of "find related files" rather than a typed
+ *  query, so it can be labelled by the file it came from instead of by the
+ *  derived keywords — which are an implementation detail the user never typed
+ *  and would not recognise. */
+export type RelatedSearchInfo = {
+  /** Filename(s) the search was started from. */
+  seedLabel: string;
+  /** The most specific probe's query, which is what the tab is labelled with.
+   *  Empty when the seed yielded no keywords at all and the co-share request is
+   *  carrying the search on its own. */
+  queryLabel: string;
+  /** Signals in use, for explaining the tab. */
+  kinds: RelationKind[];
+};
 
 export type SearchTab = {
   id: string;
@@ -14,6 +30,8 @@ export type SearchTab = {
   method: SearchMethod;
   fileType?: string;
   filters?: SearchFilters;
+  /** Present only for a related search; see [`RelatedSearchInfo`]. */
+  related?: RelatedSearchInfo;
   results: SearchResult[];
   /** Persistent `resultKey` -> index-into-`results` map. Kept on the tab so a
    *  streaming flush only touches the incoming batch instead of rebuilding an
@@ -59,18 +77,20 @@ function newTabId(): string {
 }
 
 /*
- * `resultKey`, `combineOrigin` and `MAX_PLAUSIBLE_SOURCES` below re-implement
- * rules the backend already has in `src-tauri/src/search/merge.rs` (this store
- * merges the streamed batches a second time, per tab).
+ * `resultKey`, `combineOrigin`, `pickEmberDigest`, `MAX_PLAUSIBLE_SOURCES`,
+ * `MAX_SOURCE_ADDRS` and the first-non-empty fields inside `mergeResult` below all
+ * re-implement rules the backend already has in `src-tauri/src/search/merge.rs`
+ * (this store merges the streamed batches a second time, per tab).
  * `scripts/fixtures/merge-contract.json` is the shared source of truth for the
  * parts that must agree, and both sides are tested against it —
  * `scripts/merge-contract.test.mjs` here, `merge_contract_fixture` there — so a
  * divergence fails a test instead of shipping.
  *
  * That Node test cannot import this module (Svelte-app TypeScript, no bundler on
- * that path), so it lifts these two function bodies out of the source text and
- * runs them: keep them pure and closed over nothing, and keep their signatures
- * on one line. The divergences from Rust *are* deliberate where commented
+ * that path), so it lifts the three pure function bodies out of the source text
+ * and runs them: keep them pure and closed over nothing, and keep their signatures
+ * on one line. What it cannot lift — the inline field rules in `mergeResult` — it
+ * asserts the *shape* of instead, so those expressions have to stay recognisable. The divergences from Rust *are* deliberate where commented
  * (availability, filename, address cap) and are deliberately not in the fixture.
  */
 function resultKey(result: SearchResult): string {
@@ -89,6 +109,31 @@ function combineOrigin(a: string, b: string): string {
   return [...new Set(parts)].sort().join(' · ');
 }
 
+/**
+ * Which Ember content digest a merged row keeps.
+ *
+ * Deliberately not "first non-empty wins", which is what this used to be. An
+ * Ember keyword batch carries the plurality digest of the publishers in that
+ * batch, and the closing batch is rebuilt from every record the walk gathered —
+ * so the corrected value always arrives after the slice-local one it is meant to
+ * replace, and keeping the first pinned a row to a digest a minority of
+ * publishers claimed. That is what `startDownload` hands over as the digest to
+ * enforce at completion, and enforcing a wrong one fails verification on every
+ * retry.
+ *
+ * A `Local` digest still wins: it was computed from the bytes on this disk
+ * (known.met), so no network claim replaces it.
+ *
+ * Mirrors `pick_ember_digest` in `src-tauri/src/search/merge.rs`; pinned for both
+ * sides by `scripts/fixtures/merge-contract.json`. Keep it closed over nothing —
+ * `scripts/merge-contract.test.mjs` lifts this body out and runs it.
+ */
+function pickEmberDigest(existingDigest: string, existingOrigin: string, incomingDigest: string): string {
+  if (!incomingDigest) return existingDigest;
+  if (!existingDigest) return incomingDigest;
+  return existingOrigin.includes('Local') ? existingDigest : incomingDigest;
+}
+
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
@@ -98,8 +143,11 @@ const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number;
  * count as a u16 on the wire, so anything above it is a claim no honest peer can
  * make. */
 const MAX_PLAUSIBLE_SOURCES = 65535;
-/** Pin with `scripts/fixtures/merge-contract.json` / `MAX_SOURCE_ADDRS` in merge.rs. */
-const MAX_SOURCE_ADDRS = 500;
+/** Pin with `scripts/fixtures/merge-contract.json` / `MAX_SOURCE_ADDRS` in merge.rs.
+ * Sized to what `start_download` will actually accept (its `MAX_EXTRA_SOURCES_IPC`
+ * is 64, and the network task seeds at most 49); addresses beyond that were kept
+ * and shipped over IPC only to be dropped on arrival. */
+const MAX_SOURCE_ADDRS = 64;
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])])).slice(0, MAX_SOURCE_ADDRS);
@@ -164,8 +212,14 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
       size: existing.file.size || incoming.file.size,
       hash: incoming.file.hash || existing.file.hash,
       extension: incoming.file.extension || existing.file.extension,
+      // An AICH root is not voted on the way the Ember digest is — it arrives
+      // whole from an `h=` link or known.met — so first non-empty wins here.
       aich_hash: existing.file.aich_hash || incoming.file.aich_hash,
-      ember_file_hash: existing.file.ember_file_hash || incoming.file.ember_file_hash,
+      ember_file_hash: pickEmberDigest(
+        existing.file.ember_file_hash || '',
+        existing.result_origin || '',
+        incoming.file.ember_file_hash || '',
+      ),
       complete_sources: Math.min(
         Math.max(existing.file.complete_sources || 0, incoming.file.complete_sources || 0),
         MAX_PLAUSIBLE_SOURCES,
@@ -174,10 +228,16 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     peer_id: existing.peer_id || incoming.peer_id,
     peer_name: existing.peer_name || incoming.peer_name,
     availability,
-    file_type: incoming.file_type || existing.file_type,
+    // First non-empty wins on all three, which is what `merge_into` does. They
+    // used to take the *incoming* value here while Rust kept the existing one, so
+    // the same two rows merged to a different type, rating and comment depending
+    // on which layer did the merging. Keeping the first is also the rule the
+    // filename already follows, and for the same reason: a later answer for a
+    // public hash is not evidence, and letting it overwrite is a free rewrite.
+    file_type: existing.file_type || incoming.file_type,
     source_addresses: mergedAddresses,
-    rating: incoming.rating ?? existing.rating,
-    comment: incoming.comment ?? existing.comment,
+    rating: existing.rating ?? incoming.rating,
+    comment: existing.comment ?? incoming.comment,
     media: hasMedia ? media : existing.media || incoming.media,
     spam_rating,
     is_spam,
@@ -251,12 +311,7 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
     }
   }
   if (results.length > MAX_TAB_RESULTS) {
-    // Shed the least useful rows first. `availability` is the merged source
-    // count `mergeResult` maintains, so the rows dropped are the ones no peer
-    // claims to have — the ones a user can least act on. `sort` is stable, so
-    // ties keep the earlier-seen hit.
-    results.sort((a, b) => (b.availability || 0) - (a.availability || 0));
-    results.length = TAB_RESULTS_LOW_WATER;
+    shedWeakestRows(results, TAB_RESULTS_LOW_WATER);
     index.clear();
     for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
@@ -346,8 +401,37 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
  *  up to `MAX_TAB_RESULTS` rows. */
 const MAX_SEARCH_TABS = 20;
 
+/**
+ * Cancel a search, retrying briefly when the network task is busy.
+ *
+ * A tab's request id is rotated the moment it stops being the active search,
+ * so a cancel that never lands is invisible from here: nothing waits on it and
+ * no late result will be attributed to the old id. What does not go away is the
+ * walk — KAD and Ember keep querying until their own 60s expiry, holding
+ * routing-table and search-manager slots the *next* search needs. `cancelSearch`
+ * fails when the command channel is saturated, which is exactly when those
+ * slots are scarcest, so one attempt is not enough.
+ */
+async function cancelSearchWithRetry(requestId: number): Promise<void> {
+  const delaysMs = [0, 250, 1000];
+  let lastError: unknown = null;
+  for (const delay of delaysMs) {
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      await cancelSearch(requestId);
+      return;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  console.warn(
+    `Failed to cancel search ${requestId}; its DHT walks will expire on their own`,
+    lastError,
+  );
+}
+
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
-export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number; stoppedOthers: boolean } {
+export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters, related?: RelatedSearchInfo): { tabId: string; requestId: number; stoppedOthers: boolean } {
   const requestId = newSearchNonce();
   const id = newTabId();
   const tab: SearchTab = {
@@ -357,6 +441,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     method,
     fileType,
     filters,
+    related,
     results: [],
     resultIndex: new Map(),
     isSearching: true,
@@ -381,7 +466,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     }
     for (const rid of searchingIds) {
       pendingByRequest.delete(rid);
-      void cancelSearch(rid).catch(() => { /* best effort */ });
+      void cancelSearchWithRetry(rid);
     }
     return next;
   });
@@ -399,11 +484,7 @@ export async function closeSearchTab(tabId: string): Promise<void> {
   if (idx === -1) return;
   const tab = tabs[idx];
   if (tab.isSearching) {
-    try {
-      await cancelSearch(tab.requestId);
-    } catch {
-      /* best effort */
-    }
+    await cancelSearchWithRetry(tab.requestId);
   }
   const currentTabs = get(searchTabs);
   const currentIdx = currentTabs.findIndex((t) => t.id === tabId);
@@ -486,6 +567,17 @@ function scheduleFlush() {
   flushScheduled = true;
   if (typeof requestAnimationFrame === 'function' && typeof document !== 'undefined' && document.visibilityState === 'visible') {
     flushRaf = requestAnimationFrame(flushSearchResults);
+    // Armed alongside the frame, not instead of it.
+    //
+    // The choice above is made when the batch arrives, and browsers do not run
+    // frame callbacks for a hidden document — so a window minimized after a
+    // frame was requested but before it fired left `flushScheduled` true with
+    // nothing to clear it. Every later batch then appended to
+    // `pendingByRequest` and returned here immediately, and because the
+    // `MAX_TAB_RESULTS` ceiling lives inside `mergeIntoTab`, the buffer that
+    // stopped draining was the one thing nothing else bounds. Whichever of the
+    // two fires first flushes; `flushSearchResults` cancels the other.
+    flushTimeout = setTimeout(flushSearchResults, 250);
   } else {
     // Hidden tab or non-DOM host (SSR / tests): fall back to a macrotask so we
     // still coalesce but don't hang the burst waiting for a visibilitychange
@@ -513,9 +605,15 @@ async function rescoreOpenTabs() {
       searchTabs.update((current) => {
         const i = current.findIndex((t) => t.id === tabId);
         if (i === -1) return current;
-        const byHash = new Map(scored.map((r) => [r.file.hash, r]));
+        // Keyed by `resultKey`, not `file.hash`. Hashless rows are a supported
+        // case — `resultKey` has dedicated `nohash-id:` / `nohash-path:` /
+        // `nohash:` branches for pending library entries and path-only local
+        // hits — and every one of them keys to `''`, so a hash-keyed map kept
+        // only the last and every other hashless row in the tab then adopted
+        // that one row's spam verdict.
+        const byKey = new Map(scored.map((r) => [resultKey(r), r]));
         const results = current[i].results.map((r) => {
-          const n = byHash.get(r.file.hash);
+          const n = byKey.get(resultKey(r));
           if (!n) return r;
           const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
           return {

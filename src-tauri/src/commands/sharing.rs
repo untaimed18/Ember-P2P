@@ -2497,7 +2497,7 @@ fn media_file_type_label(ft: lofty::file::FileType) -> String {
 /// lofty (header-only read; no full decode). Returns `None` for non-media files
 /// or on any parse error so the caller can treat "no media" uniformly. Audio
 /// formats are covered; video files generally return `None`.
-fn extract_media_metadata(path: &str) -> Option<crate::types::MediaMetadata> {
+pub(crate) fn extract_media_metadata(path: &str) -> Option<crate::types::MediaMetadata> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
     use lofty::tag::Accessor;

@@ -92,6 +92,23 @@ fn default_true() -> bool {
     true
 }
 
+/// Web services a fresh profile starts with.
+///
+/// The availability lookup ships configured rather than empty. The feature
+/// exists to answer "why will this download not finish?", and a lookup you have
+/// to go and set up before you can ask is a lookup you will not use on the day
+/// you need it. It costs nothing until it is clicked: nothing is contacted, and
+/// nothing about it runs in the background.
+///
+/// This is also what an existing profile picks up, since a `config.json`
+/// written before the field existed has no key for `serde` to read.
+fn default_web_services() -> Vec<crate::webservices::WebService> {
+    vec![crate::webservices::WebService {
+        name: crate::webservices::EXAMPLE_SERVICE_NAME.to_string(),
+        url: crate::webservices::EXAMPLE_SERVICE_URL.to_string(),
+    }]
+}
+
 fn default_filename_cleanups() -> String {
     crate::search::cleanup::DEFAULT_CLEANUP_STRINGS.to_string()
 }
@@ -392,7 +409,7 @@ pub enum SourceStatus {
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
 /// optional because a remote node only fills the ones it knows. Grouped into a
 /// single optional struct so a hit with no media info serializes to nothing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaMetadata {
     /// Playback length in whole seconds (eMule `FT_MEDIA_LENGTH`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +447,28 @@ impl MediaMetadata {
             Some(self)
         }
     }
+}
+
+/// Which networks a source ask actually reached.
+///
+/// A `false` leg was skipped, and always for the same kind of reason: nowhere
+/// to send it. No KAD session or no contacts close to the hash, Ember disabled
+/// or no overlay peers, no eD2K server session (or one still inside its
+/// post-login settle), no eligible servers for the UDP fan-out. Skipping never
+/// stops the remaining legs from being asked.
+///
+/// What each leg *finds* is not in here. Answers arrive on each network's own
+/// schedule, are written into the transfer by the same paths the periodic
+/// source sweeps use, and are reported to the UI by `transfer:source-search`
+/// events as they land.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SourceAskOutcome {
+    pub kad: bool,
+    pub ember: bool,
+    /// The connected eD2K server, asked over TCP.
+    pub server: bool,
+    /// The other eligible servers, asked over UDP.
+    pub server_udp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,7 +877,17 @@ pub struct EmberDiagnostics {
     /// have all been confirmed stored by a peer.
     #[serde(default)]
     pub ember_dht_keywords_published: u32,
-    /// Slice 14: inbound Ember DHT frames dropped by per-IP rate limits.
+    /// Slice 14: inbound Ember DHT frames dropped by the rate limiter, for any
+    /// of its five reasons — a full address table, the per-address frame
+    /// window, the per-node STORE budget, the aggregate per-address STORE
+    /// ceiling, or the lookup window.
+    ///
+    /// Declared long before anything filled it in, which is what left
+    /// `DhtProtection::dropped_rate_limited` marked dead with a comment saying
+    /// it was "kept for the diagnostics surface to report drops". Now populated,
+    /// and only worth reading beside `ember_dht_store_addr_ceiling`: this total
+    /// climbing while that stays flat is ordinary pacing, and the two climbing
+    /// together is one address flooding the store under rotating identities.
     #[serde(default)]
     pub ember_dht_rate_limited: u32,
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
@@ -962,6 +1011,18 @@ pub struct EmberDiagnostics {
     /// dropping self. A gauge, not a counter.
     #[serde(default)]
     pub ember_dht_rendezvous_last_peers: u32,
+    /// Highest load any storer has reported for the Ember rendezvous key this
+    /// session, on the eMule 0–100 scale.
+    ///
+    /// The tripwire for sharding the rendezvous key space. That work is due
+    /// "once one bucket's 1000-entry cap is in sight", and no lookup can see
+    /// it: `ember_dht_rendezvous_last_peers` counts what one source search
+    /// returned, and such a search stops querying at 20 results. A storer's
+    /// load byte is its own report of how full it is for the key — the same
+    /// signal the keyword publish path already backs off on at 90 — so this is
+    /// what actually answers the question. Read 90 or above as due.
+    #[serde(default)]
+    pub ember_dht_rendezvous_key_load: u32,
     /// Slice 19: observed-IP votes recorded from PONG payloads.
     #[serde(default)]
     pub ember_dht_observed_votes: u32,
@@ -975,6 +1036,12 @@ pub struct EmberDiagnostics {
     /// set behind the Library's Ember badge, so the two cannot disagree.
     #[serde(default)]
     pub ember_dht_published_files: u32,
+    /// Complete, publicly listable shared files Ember will advertise. The
+    /// denominator for the Ember page's "published of total" readout; the
+    /// gap vs [`Self::ember_dht_published_files`] is files still waiting
+    /// for a confirmed source record.
+    #[serde(default)]
+    pub ember_dht_publishable_files: u32,
     /// Every source listed in an EPX payload we accepted, before any
     /// filtering. The denominator for EPX yield: compare against
     /// `NetworkStats::epx_sources_received`, which counts only the sources
@@ -1028,6 +1095,44 @@ pub struct EmberDiagnostics {
     /// STORE records for keys this node is not close enough to hold.
     #[serde(default)]
     pub ember_dht_store_reject_proximity: u32,
+    /// Searches where both keyword DHT legs ran, so the three counts below have
+    /// a denominator.
+    #[serde(default)]
+    pub ember_dht_recall_searches: u32,
+    /// Files both keyword DHTs found, across those searches.
+    #[serde(default)]
+    pub ember_dht_recall_both: u32,
+    /// Files only KAD found. This pulling ahead of `ember_only` is Ember's
+    /// recall lagging, which is the trigger for richer keyword indexing.
+    #[serde(default)]
+    pub ember_dht_recall_kad_only: u32,
+    /// Files only Ember found — worth knowing before anyone tunes the Ember
+    /// tokenizer toward KAD's.
+    #[serde(default)]
+    pub ember_dht_recall_ember_only: u32,
+    /// Frames refused by the aggregate per-address STORE ceiling.
+    ///
+    /// The store's per-publisher shares are keyed on the publisher's key, so a
+    /// flood spending a fresh keypair per record is never over its share and
+    /// that rule never fires. This ceiling is keyed on the address instead, so
+    /// it is where such a flood becomes visible. Zero means the proof-of-work
+    /// question is still hypothetical.
+    #[serde(default)]
+    pub ember_dht_store_addr_ceiling: u32,
+    /// Peers that have told us which wire versions they can decode.
+    ///
+    /// Read against `ember_dht_verified_contacts`: while this trails it, a frame
+    /// shaped for a version older builds cannot parse would still partition the
+    /// overlay, because the peers that would refuse it are the ones missing here.
+    #[serde(default)]
+    pub ember_dht_version_advertisers: u32,
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to. Not a refusal — the key is not recomputable from the wire, so
+    /// this is the closest a storer can come to asking whether a publisher
+    /// derived its key or chose it. A name too short to yield any word counts
+    /// here too, since no word could find it.
+    #[serde(default)]
+    pub ember_dht_keyword_key_off_name: u32,
     /// Completed FIND_VALUE searches this session (hits, misses, and timeouts).
     /// Denominator for the search-quality averages below.
     #[serde(default)]
@@ -1181,6 +1286,17 @@ pub struct AppSettings {
     /// matching real eMule's "deny" behavior.
     #[serde(default)]
     pub allow_shared_files_browse: bool,
+    /// eMule-style web services: external sites that can be opened for a
+    /// specific file from its context menu, with the file's hash, name or size
+    /// substituted into a URL template.
+    ///
+    /// Ships with the availability lookup already configured — see
+    /// [`default_web_services`]. Opening one does tell that site which file you
+    /// are looking for, which is why it only ever happens on an explicit click
+    /// and why the list is editable; but it is a lookup a user reaches for when
+    /// a download is stuck, and it has to be there at that moment.
+    #[serde(default = "default_web_services")]
+    pub web_services: Vec<crate::webservices::WebService>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -1773,6 +1889,7 @@ impl Default for AppSettings {
             ip_filter_enabled: true,
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
+            web_services: default_web_services(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,
@@ -1891,6 +2008,60 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh profile can answer "why will this download not finish?" without
+    /// being set up first, which is the whole point of shipping the lookup
+    /// configured. Pinned end to end — valid by the validator's rules, and
+    /// producing a real URL for a real hash — because a default that exists but
+    /// does not work would look identical from the settings page.
+    #[test]
+    fn a_fresh_profile_has_a_working_availability_lookup() {
+        let services = AppSettings::default().web_services;
+        assert_eq!(services.len(), 1, "exactly one, so no menu clutter");
+
+        let service = crate::webservices::validate_service_template(
+            &services[0].name,
+            &services[0].url,
+        )
+        .expect("the shipped default must survive our own validation");
+
+        let filled = crate::webservices::substitute_placeholders(
+            &service.url,
+            &crate::webservices::FileFacts {
+                hash: "ffdd6a41a2b30f27a1c3858a433b9822",
+                name: "some movie.avi",
+                size: 700,
+            },
+        );
+        assert!(
+            filled.ends_with("FFDD6A41A2B30F27A1C3858A433B9822"),
+            "the hash has to reach the URL, upper-cased: {filled}"
+        );
+        assert!(!filled.contains('#'), "no placeholder left behind: {filled}");
+    }
+
+    /// A profile written before the field existed has no key for `serde` to
+    /// read, so it inherits the default rather than an empty list. That is the
+    /// only reason an upgrading user gets the feature at all.
+    #[test]
+    fn a_config_predating_web_services_inherits_the_default() {
+        let mut value =
+            serde_json::to_value(AppSettings::default()).expect("serialize default settings");
+        // Simulate a config written before the field existed: the key is simply
+        // absent, which is what makes `serde` fall back to the default rather
+        // than to an empty list.
+        value
+            .as_object_mut()
+            .expect("AppSettings serializes to a JSON object")
+            .remove("web_services");
+        let parsed: AppSettings =
+            serde_json::from_value(value).expect("an older config still loads");
+        assert_eq!(
+            parsed.web_services.len(),
+            1,
+            "an upgrading profile picks up the lookup"
+        );
+    }
 
     /// Configs from a newer build may include unknown keys. Those must be
     /// ignored on downgrade rather than failing deserialize (which would

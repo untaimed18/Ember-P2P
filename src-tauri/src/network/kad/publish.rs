@@ -675,6 +675,17 @@ impl PublishManager {
         self.records.len()
     }
 
+    /// Complete shared files registered for source/keyword advertise.
+    /// Partials (`keyword_publishable: false`) are excluded: Ember does not
+    /// publish those, so this is the denominator for the Ember page's
+    /// "published of total" readout.
+    pub fn complete_file_count(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.file.keyword_publishable)
+            .count()
+    }
+
     pub fn reset_source_publish(&mut self, file_hash: &KadId) {
         if let Some(record) = self.records.get_mut(file_hash) {
             record.last_source_publish = 0;
@@ -1406,6 +1417,12 @@ mod tests {
         assert!(
             p.files_for_keyword(&keyword_to_kad_id("movie")).is_empty(),
             "a non-keyword-publishable file must not appear in keyword search"
+        );
+        assert_eq!(p.file_count(), 1);
+        assert_eq!(
+            p.complete_file_count(),
+            0,
+            "a partial must not count as a complete share Ember will publish"
         );
     }
 

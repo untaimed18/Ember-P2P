@@ -1,13 +1,16 @@
 # Ember DHT — remaining work and future improvements
 
 The protocol specification is
-[ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
-version 2 as implemented in Ember 1.5.6. **The wire is now version 4 and the PDF
-is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
-[item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
-two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)
-for what moved it to v4. This file is the standing work log: what is left, what
-was compared against KAD, and what is explicitly not planned.
+[ember-dht-specification.pdf](ember-dht-specification.pdf), now written against
+wire version 4 as implemented in Ember 1.6.3, and rebuilt from
+[its HTML source](ember-dht-specification.html) with
+[`scripts/build-ember-dht-spec.sh`](../scripts/build-ember-dht-spec.sh). It
+carries the v3 frame changes (see [item 1](#1-the-serving-ceiling--done-wire-v3)
+and [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3)),
+what moved it to v4 ([item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
+and every additive change since — each marked as additive, since that is the
+distinction an implementer needs. This file is the standing work log: what is
+left, what was compared against KAD, and what is explicitly not planned.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
@@ -106,7 +109,7 @@ does not need the eMule wire at all:
   offer/accept handshake, which is why the file is identified by its hash-tree
   root rather than by anything transport-specific.
 
-### 2. Wire versioning rejects cleanly but cannot negotiate
+### 2. Wire versioning rejects cleanly and now advertises, but still cannot route around old peers
 
 `EMBER_DHT_VERSION` is now **4**, with `EMBER_DHT_MIN_VERSION` 4 alongside it:
 the decoder accepts a *range*, and a frame outside it is refused at the version
@@ -134,13 +137,42 @@ cannot decode anything we send, and it is running a build from before those
 counters existed. It sees the network shrink with nothing to explain it. That is
 a release-note problem, not a code one.
 
-The negotiation gap itself is still open, and it is the part worth keeping on
-this list. Nothing on the wire advertises the range a peer speaks, so there is
-no graceful downgrade: a shape change partitions the network on the day it
-ships, and the only reason that has been survivable is that the overlay is
-small and updates are quick. A future *additive* change can lower
-`EMBER_DHT_MIN_VERSION` rather than raising both, which is the cheap half; the
-expensive half is that neither of the last two changes could take that path.
+**The negotiation half is now started, and it had to start before it could be
+useful.** A `PING` and a `PONG` carry the range this build can decode —
+`VersionRange`, tag/len/value trailing the payload, `OUR_VERSION_RANGE` pinned to
+the two constants `decode_message` actually enforces — and the receiver keeps it
+per peer (`peer_versions`, pruned to the routing table each maintenance tick).
+`ember_dht_version_advertisers` on `/ember` is the number to read against
+verified contacts.
+
+Additive on exactly the terms items 1 and 2 of
+[the search plan](ember-dht-search-plan.md#1-find_value-carries-no-constraints--done-and-without-a-version-bump)
+turned out to be, and the version deliberately did **not** move: `MSG_PING`
+discards its payload entirely and `MSG_PONG` reads its address through
+`decode_socket_addr`, which checks only a minimum length and reports what it
+consumed, so a v4 build reads both frames exactly as it does today. Bumping for
+this would have been self-defeating — the peers it exists to reach are the ones
+that would refuse the frame carrying it.
+`the_version_block_is_invisible_to_a_decoder_that_ignores_it` pins that property
+at the payload codec, since that is precisely where a v4 peer differs from us.
+
+Two shapes are load-bearing. The block only ever trails a field a reader parses
+first, so an addressless `PONG` — the pre-slice-19 shape — carries none: with no
+address in front of it an older build would read the tag byte as an address type
+and reject the whole frame. And absent, truncated and nonsensical all read as
+"this peer told us nothing" rather than as a range or as an error, because an
+advisory field must not be able to drop a frame.
+
+What this does not do yet is *use* the answer. `peer_accepts_version` has no
+production caller and cannot have one: `EMBER_DHT_MIN_VERSION` equals
+`EMBER_DHT_VERSION`, so every peer we can exchange a frame with speaks exactly
+one version and there is no decision to make. Its first caller is whatever
+encodes the next wire change, and the ordering is the point — the ranges have to
+be arriving from the field *before* a bump can route around the peers that lack
+them, or the first peer to advertise one is also the first to need it. So the
+standing gap is now narrower and different: not "nothing advertises a range" but
+"a shape change still partitions every peer running a build older than this
+one", which the advertiser count is what measures.
 
 ### 2a. Bootstrapping from a friend
 
@@ -244,10 +276,87 @@ friend holding fourteen, over a working friend session, with `Known peers` at 0
 The gossip machinery itself was fine, and said so: 190 gossip contacts seen, 0
 refused, 0 new, which is three peers describing each other in a loop.
 
+### 2b. Meeting a friend we cannot dial — designed, not started
+
 Still open on this path: nothing uses the friend session to carry a *live*
-introduction the other way, so two friends who can each reach a third party but
-not each other still do not meet over the overlay. That needs relay, not
-another ask.
+introduction, so a friend we cannot dial never becomes an overlay contact however
+long the session lasts. This section used to say "that needs relay, not another
+ask". Having costed the relay, that conclusion was wrong, and the cheaper
+mechanism is also the better one.
+
+**What is actually blocked.** `note_connected_ember_peer` returns at
+`udp_port == 0` — "the peer is now a known Ember host and will never be a DHT
+contact: the overlay rides the shared UDP socket, so with no port there is nothing
+to bridge to". That is the normal case for a friend reached by relay or NAT
+traversal, and it is a dead end rather than a slow path: no retry policy helps
+something that is never attempted. A friend that *did* advertise a port but sits
+behind a NAT that drops unsolicited datagrams is the same dead end one step later,
+because the bridge ping is unsolicited by definition.
+
+**Why not relay.** Three reasons, in increasing order of how much they cost:
+
+- The DHT does not need direct pairs. A record is found on whichever nodes are
+  closest to its key, so A does not need B as a contact to find B's files — it
+  needs *any* twenty working nodes. Making two specific peers contacts of each
+  other is close to worthless on its own.
+- A relayed contact is a fiction the routing table cannot hold. `is_verified()`
+  means we heard a signed frame *directly*; refreshing `last_seen` from relayed
+  traffic tells the liveness model an address works when it does not, and the
+  address is then gossiped onward in `FOUND_NODE` to peers for whom it certainly
+  does not.
+- It would duplicate the channel relay for the only population that genuinely
+  cannot punch — both ends symmetric — and that population already has the friend
+  session itself for chat, browse and file offers, plus the channel relay for
+  rooms. The marginal gain is a routing-table entry nobody can use.
+
+**The mechanism instead: a friend-coordinated simultaneous open.** The friend
+session is an authenticated, live, bidirectional channel to exactly the peer we
+want to meet. That is all a UDP simultaneous open needs, and it needs no third
+party, no rendezvous server and no new trust relationship.
+
+One new `EMBER_EXT` sub-type (`0x07`; `0x06` is the highest in use), sent over the
+friend session: *"I am sending you a DHT `PING` from my Ember UDP socket now — send
+me one too."* Both sides send immediately, each outbound datagram opens the return
+path through its own NAT, and whichever `PING` lands first is answered with a
+signed `PONG` that folds the sender into the routing table through the ordinary
+path. Nothing new touches the table.
+
+Four details carry the design:
+
+- **Observed IP, claimed port.** Take the friend's IP from the TCP connection we
+  are already talking to them on, and the UDP port from the payload — the port
+  cannot be observed and must be asserted, exactly as `BUDDY_ENDORSE` has a buddy
+  assert its own endpoint. Never take the IP from the payload; that is the rule
+  `CALLBACK` states as "a claimed address would let anyone aim the publisher at a
+  third party", and it applies here for the same reason.
+- **The frame grants nothing.** It is a request to *try*, not an introduction to
+  be believed. Only a real `PONG` creates a contact, so a friend that lies about
+  its port costs us one datagram and gets nothing — no table entry, no session, no
+  gossip.
+- **Fire it when it can help, not on a timer.** The condition is precise: we hold
+  no verified contact for this friend. That is cheaper than the starvation gate the
+  contact ask uses (`verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS`) and correct
+  at any table size. Add a per-friend interval on the same stamp-before-send
+  pattern as `EMBER_FRIEND_CONTACT_ASK_INTERVAL`, and the same
+  least-recently-asked rotation, so a handful of friends cannot monopolise it.
+- **It composes with the ask already there.** A friend hands over the contacts it
+  holds *and* can now become one. For a small overlay that is the difference
+  between a friend being a phone book and being a peer.
+
+**Where it stops.** Both-ends-symmetric fails a simultaneous open, and that is
+where this design ends rather than falling back. `NatType::can_punch_with` already
+states that case as unpunchable, and the live gate is narrower still — it checks
+only that *our own* type is not `Symmetric`, because the peer's type is not known
+until a punch is already in flight. Worth knowing when reading that predicate: STUN
+here only ever assigns `Open`, `Symmetric`, `PortRestricted` or `Unknown`, so
+`FullCone` and `RestrictedCone` are dead branches and the common real answer is
+`PortRestricted`, which punches.
+
+Diagnostics, mirroring `ember_dht_friend_contact_asks` against
+`ember_dht_friend_contacts_learned`: meets attempted against contacts gained. Those
+two are also the evidence that would justify revisiting the relay — a population
+whose attempts never convert is the both-symmetric case, measured rather than
+assumed.
 
 ### 3. Cold join when eMule is not available
 
@@ -299,24 +408,39 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
-### 5. `store_attributed` binds the key but not the author or the date
+### 5. `store_attributed` binds the key but not the author or the date — done
 
-`DhtStore::restore` takes all three of key, `publisher_key` and `created_at`
-out of the record's own signed body. `store_attributed` takes only the key,
-and trusts the caller for the other two — `verify_record_signature` verifies
-under the key it is *handed*, not the one at `data[73..105]`, so a body naming
-a different author still verifies there while failing for every reader.
+`DhtStore::restore` took all three of key, `publisher_key` and `created_at` out
+of the record's own signed body. `store_attributed` took only the key and
+trusted the caller for the other two — `verify_record_signature` verified under
+the key it was *handed*, not the one at `data[73..105]`, so a body naming a
+different author still verified there while failing for every reader.
 
-Not reachable from the wire, and not a live bug: `accept_record` passes what
-`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derives
-them, and the proxy replica reads them off its own `SignedRecord`. It is on
-this list because the invariant is one the callers happen to keep rather than
-one the store enforces, and the next caller has no way to know that.
+Never reachable from the wire, and never a live bug: `accept_record` passed what
+`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derived
+them, and the proxy replica read them off its own `SignedRecord`. It was on this
+list because the invariant was one the callers happened to keep rather than one
+the store enforced, and the next caller had no way to know that.
 
-Closing it means the store deriving both from the body, which every synthetic
-fixture in `store.rs`'s tests would then have to carry — roughly 120 call
-sites that currently zero those fields and pass real values beside them. That
-churn, not the change itself, is what has kept it open.
+**Done, by deriving rather than by checking.** Both parameters are gone:
+`store_attributed` binds all three from the one
+`signed_identity_from_record_data` call it was already making and discarding two
+thirds of. Production behaviour is identical, because every caller was passing
+exactly those bytes' own fields; what changed is that it is now impossible to
+pass anything else. `restore` no longer reads `publisher_key` out of the
+persisted file either — the file is not evidence, the signed body is.
+
+The churn this section warned about was the cost of the *other* approach.
+Requiring the caller's values to match the body would have left every synthetic
+fixture in `store.rs` failing, because those bodies zero the author and date
+fields and pass real values beside them. Deriving needs the same fixtures fixed,
+but fixing them is what makes them realistic: `stamped` writes the author and
+date into the body at the offsets the wire uses, so a hand-built test record now
+has the shape a real one does, and `signed_body` / `redated` build and sign one
+in a line. Two tests got sharper for it —
+`rejects_a_body_signed_by_someone_other_than_the_author_it_names` is the case
+that used to be storable, and the TTL tests now date a record where the store
+actually reads a date from, rather than in a struct field beside it.
 
 ---
 
@@ -325,10 +449,21 @@ churn, not the change itself, is what has kept it open.
 - Multi-keyword search uses sparse DHT intersection (missing secondary
   keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
-- A peer serves roughly five records per keyword *datagram*, but a searcher can
-  now page a node until its key is exhausted, bounded by 8 follow-ups per node
-  and the existing per-node result allowance. See
+- A peer serves only a few records per keyword *datagram* — five for a bare
+  record, four for one carrying media, two in the worst case — but a searcher can
+  now page a node until its key is exhausted, bounded by the per-node result
+  allowance and the page ceiling that allowance sizes. Both are two-tier: a peer
+  is held to a quarter of the budget while the walk still has somewhere to go, and
+  may spend the rest of it once the shortlist is exhausted. See
   [Planned next, item 1](#1-the-serving-ceiling--done-wire-v3).
+- A keyword search may name up to `MAX_FIND_VALUE_KEYS_TOTAL` (23) keywords, but
+  only the first eight travel in the count-prefixed run that every build reads.
+  The rest ride the constraint block, so a peer predating it intersects on eight
+  and leaves the remainder to the filename match at emit.
+- A keyword record may carry media (length, bitrate, codec, artist, album,
+  title). A peer predating that block ignores it and reads the record correctly;
+  a record published by a build predating it simply has none, so the columns stay
+  empty until that publisher's next republish.
 - One publisher may hold 150 records under any one keyword, network-wide (KAD's
   own allowance), so a user sharing more files than that with a word in common
   still will not have all of them findable under it.
@@ -413,16 +548,26 @@ together, since one bump pays for both and item 2 was only worth having once ite
 - Item 2, unblocked by the above: keyword capacity raised to KAD's 150 of 1000.
 
 **Every item in this list is now done.** What remains for the overlay is the
-standing work in the sections above (native transfers, version negotiation, cold
+standing work in the sections above (native transfers, routing a wire change
+around old peers now that they advertise, meeting a friend we cannot dial, cold
 join without eMule, validation past the happy path) and the "Future improvements"
 below — not this comparison.
 
 ### 1. The serving ceiling — done (wire v3)
 
-A peer answers a keyword query with **about five records**. `MAX_FOUND_VALUE_RECORD_BYTES`
+A peer answers a keyword query with **only a few records**. `MAX_FOUND_VALUE_RECORD_BYTES`
 is 1231, a keyword blob for a 40-character filename costs 221, and packing used
 to fill from the front of insertion order, so the oldest five were the only ones
 that node would ever serve.
+
+Five was the figure while a record was header, name and signature. Keyword records
+now carry an optional media block (see
+[the search plan](ember-dht-search-plan.md#2-keyword-records-carry-no-metadata--done)),
+which costs around 75 bytes for an ordinary music file and up to 229 with every
+text field at its cap — so a media-bearing record packs four to a page, or two in
+the worst case. `RECORDS_PER_UNFRAGMENTED_PAGE` is 3 to reflect that, since its
+only job is to size the page ceiling so the ceiling never binds before the
+per-node allowance does.
 
 **Shipped, cheap path (1.5.3–1.5.5):** successive `FIND_VALUE`s rotated the
 served window per key, using a cursor the *responder* advanced.
@@ -450,9 +595,21 @@ content dedup in `search.rs`) and guarantees nothing is stranded.
 
 Paging is the one mechanism here where a *responder* influences how many queries
 we send, so the searcher bounds it independently of what `total_available`
-claims: `MAX_PAGES_PER_NODE` (8) follow-ups per node, each required to name an
-offset strictly past the one it answered, and the existing
-`MAX_RESULTS_PER_NODE` allowance still caps what one peer may contribute.
+claims: `MAX_PAGES_PER_NODE` (25) follow-ups per node, each required to name an
+offset strictly past the one it answered.
+
+Both of those bounds are now two-tier, and the second tier is the newer half.
+While the shortlist still holds an unqueried hop — or any query is outstanding —
+one peer may offer `MAX_RESULTS_PER_NODE` (75, a quarter of the budget) and be
+asked for the 25 pages that allowance can be spent in. Once neither is true there
+is no hop left for extra records to crowd out, so a lone storer may spend what
+remains of the whole 300-file budget, over up to
+`MAX_PAGES_PER_NODE_EXHAUSTED` (100) pages. That second page tier has to be
+*earned*: past the base ceiling a node keeps paging only while it sustains
+`MIN_RECORDS_PER_PAGE_TO_CONTINUE` (2) records per page on average, so a peer
+answering one record at a time while claiming a huge total stops at the base
+ceiling. See
+[the search plan](ember-dht-search-plan.md#3-per-node-result-ceiling-is-an-eighth-of-kads--done).
 Positions are advisory — the responder's list shifts as records expire — so
 paging may repeat or skip an entry, which content-based dedup in `search.rs`
 already absorbs.
@@ -765,12 +922,49 @@ settled.
   data).
 - Shard the rendezvous key space. The derivation is already versioned for
   this; it matters once one KAD bucket's 1000-entry cap is in sight.
+
+  **Its trigger is now observable, and the obvious gauge could not see it.**
+  `ember_dht_rendezvous_last_peers` counts what one lookup *returned*, and a
+  KAD source search stops querying at `SOURCE_SEARCH_STOP_THRESHOLD` (20) — so
+  it saturates two orders of magnitude below `MAX_ENTRIES_PER_KEY` (1000) and
+  can never report approaching it. That gauge is a bootstrap canary ("did a cold
+  lookup find anyone"), not an occupancy one.
+
+  What can see it is the storer's own load byte, which already arrives on every
+  advert we place and is the same signal the keyword publish path backs off on
+  at 90. `ember_dht_rendezvous_key_load` is the highest any storer has reported
+  for the rendezvous key this session — highest rather than latest, because the
+  twenty nodes closest to the key fill at different rates and the first one to
+  run out is what decides whether the advert still lands. Read 90 or above as
+  due.
 - Table quality: tune announce versus bucket-refresh balance under load.
 
 ### Search and publish
 
+The gaps against KAD's *keyword search* specifically have their own plan file:
+[ember-dht-search-plan.md](ember-dht-search-plan.md). Wire-side constraint
+filtering, record metadata, and the per-node result ceiling live there. This list
+stays the home for indexing ideas that are not gaps against KAD.
+
 - Richer keyword indexing (stemming, more than space-split tokens) if
   recall lags KAD on real libraries.
+
+  **That condition is now measured**, which it was not: the search-quality
+  averages describe how a walk ran — nodes answered, milliseconds, records
+  returned — not whether Ember found the files KAD did. For searches where both
+  legs actually ran (`ember_dht_recall_searches`, the denominator), each file is
+  scored as found by both, by KAD only, or by Ember only. `both` climbing with
+  the two `_only` counts near zero is the tokenizers agreeing and the case for
+  doing nothing; `kad_only` pulling ahead is the lag this item is conditional
+  on, and by how much.
+
+  `ember_only` is the half worth having before anyone tunes the Ember tokenizer
+  toward KAD's — Ember already indexes four-letter extensions that KAD strips
+  (`flac`, `webm`, `epub`), so the two are not ordered by quality and "fixing"
+  one toward the other can lose recall. Presence rather than availability, so
+  Ember counting publishers where KAD counts a claimed swarm does not matter;
+  the sample is bounded by what `note_dht_availability` tracks, which caps the
+  cost of a diagnostic nobody is waiting on.
 - ~~Clearer search UI when Ember is joining (empty table) versus
   enabled-but-quiet.~~ Search, the Ember page, and the status bar wait for
   a verified contact; gossip-only no longer looks connected. After the
@@ -882,10 +1076,24 @@ settled.
     tokenizer. Today that improvement needs no version bump. Binding the key
     turns it into a wire break of the same class that forced v3 and v4.
 
-  If it is ever wanted, the cheap precursor is measurement rather than
-  enforcement: count inbound keyword records whose key no word in their own name
-  hashes to. That is zero-risk, answers whether anyone is actually aiming, and
-  doubles as a tripwire for tokenizer drift.
+  **The cheap precursor is now shipped, as measurement rather than enforcement**:
+  `ember_dht_keyword_key_off_name` counts verified inbound keyword records whose
+  key no word in their own signed name hashes to (`name_hashes_to_key`, applied
+  in `accept_record`). Zero-risk, because nothing is refused on the answer and so
+  no record's validity depends on the tokenizer.
+
+  Where it is counted is the load-bearing part. Past `from_wire` and past the
+  replay collapse, so unsigned junk cannot appear in it and a retransmit storm
+  cannot inflate it into a publisher that looks like it aimed thousands of times;
+  before the proximity gate and the store's caps, because the question is what
+  publishers are doing rather than what we happened to keep.
+
+  Read the shape rather than the number. Climbing against a few publishers is
+  someone choosing keys instead of deriving them, which is the evidence that
+  would justify enforcing the rule. Climbing broadly across publishers is far
+  more likely to be our own two tokenizers having drifted apart — the second
+  reason this counter is worth having, since the stemming item above is exactly
+  the change that would cause that.
 
   Volume is the other half, and that genuinely needs something scarcer than a
   keypair: a proof-of-work constraint on `BLAKE3(ed25519_pub)` is the only
@@ -895,6 +1103,18 @@ settled.
   keep the damage to bandwidth and memory rather than correctness. Nothing here
   is a correctness break today: a flood cannot forge a record, displace a validly
   signed one, or make a search return something unsigned.
+
+  **"If abuse appears" is now a number rather than a judgement.**
+  `MAX_STORE_IDENTITIES_PER_ADDR` (8) is the only cap keyed on something a
+  keypair cannot mint, so it is the only place a rotating-identity flood shows
+  up as a refusal rather than as ordinary traffic — and every refusal in
+  `protection.rs` used to land in one lumped `dropped_rate`, itself never
+  surfaced (`dropped_rate_limited` carried a stale `#[allow(dead_code)]` saying
+  it was "kept for the diagnostics surface to report drops"). Both are now on
+  `/ember`: `ember_dht_store_addr_ceiling` for that cap alone and
+  `ember_dht_rate_limited` for the total. The total climbing while the ceiling
+  stays flat is pacing; the two climbing together is the case proof-of-work
+  would be for.
 
 ### Product / UX
 

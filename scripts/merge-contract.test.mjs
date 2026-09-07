@@ -7,10 +7,13 @@ import test from "node:test";
 /**
  * The search-result merge contract is implemented twice: `src/lib/stores/search.ts`
  * merges streamed batches per tab, `src-tauri/src/search/merge.rs` merges the
- * lists it emits. Three rules have to agree between them — the dedup key, the
- * origin-label combination, and the plausibility ceiling on peer-reported
- * source counts — and until this test existed only a code comment
- * ("matching MAX_PLAUSIBLE_SOURCES in merge.rs") held them together.
+ * lists it emits. Several rules have to agree between them — the dedup key, the
+ * origin-label combination, the plausibility ceiling and address cap on
+ * peer-reported source counts, which Ember content digest a merged row keeps, and
+ * the fields resolved by keeping the first non-empty value — and until this test
+ * existed only a code comment ("matching MAX_PLAUSIBLE_SOURCES in merge.rs") held
+ * them together. `file_type`, `rating` and `comment` show why that was not
+ * enough: they resolved in opposite directions on the two sides for a long time.
  *
  * `fixtures/merge-contract.json` is the shared source of truth; the `#[cfg(test)]`
  * fixture tests in merge.rs read the same file. A divergence now fails on
@@ -65,6 +68,12 @@ const combineOrigin = ruleFromStore(
   "a",
   "b",
 );
+const pickEmberDigest = ruleFromStore(
+  "function pickEmberDigest(existingDigest: string, existingOrigin: string, incomingDigest: string): string {",
+  "existingDigest",
+  "existingOrigin",
+  "incomingDigest",
+);
 const mergeResultBody = bodyFromStore(
   "function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {",
 );
@@ -83,6 +92,22 @@ test("combineOrigin agrees with the shared origin table", () => {
       combineOrigin(testCase.a, testCase.b),
       testCase.combined,
       `combineOrigin(${JSON.stringify(testCase.a)}, ${JSON.stringify(testCase.b)})`,
+    );
+  }
+});
+
+test("pickEmberDigest chooses the digest the Rust side chooses", () => {
+  // The digest a download enforces at completion, so a divergence here is a
+  // verification failure rather than a display bug.
+  for (const testCase of fixture.ember_digest_cases) {
+    assert.equal(
+      pickEmberDigest(
+        testCase.existing_digest,
+        testCase.existing_origin,
+        testCase.incoming_digest,
+      ),
+      testCase.chosen,
+      testCase.name,
     );
   }
 });
@@ -119,6 +144,45 @@ test("mergeResult still holds both peer-reported counts to the ceiling", () => {
   );
 });
 
+test("both sides keep the FIRST non-empty value for the shared fields", () => {
+  // These are inline expressions in an object literal on one side and `if`
+  // guards on the other, so neither can be lifted and run. Asserting the shape
+  // is what is available, and it is enough to catch the failure that happened:
+  // `incoming.file_type || existing.file_type` reads almost identically to the
+  // correct form while meaning the opposite.
+  const rust = readFileSync(rustMergePath, "utf8");
+  for (const field of fixture.first_non_empty_fields.fields) {
+    const optional = field === "rating" || field === "comment";
+    const tsWanted = optional
+      ? `${field}: existing.${field} ?? incoming.${field},`
+      : new RegExp(
+          String.raw`\b${field}:\s*existing\.(?:file\.)?${field}\s*\|\|\s*incoming\.(?:file\.)?${field}\b`,
+        );
+    if (typeof tsWanted === "string") {
+      assert.ok(
+        mergeResultBody.includes(tsWanted),
+        `mergeResult must keep the existing ${field}: expected \`${tsWanted}\``,
+      );
+    } else {
+      assert.match(
+        mergeResultBody,
+        tsWanted,
+        `mergeResult must keep the existing ${field}, not the incoming one`,
+      );
+    }
+
+    // The Rust side writes it as a guard: only assign when what we hold is empty.
+    const rustGuard = new RegExp(
+      String.raw`if existing\.(?:file\.)?${field}\.is_(?:empty|none)\(\)`,
+    );
+    assert.match(
+      rust,
+      rustGuard,
+      `merge.rs must only fill ${field} when the existing value is absent`,
+    );
+  }
+});
+
 test("the Rust side derives its ceiling from the same wire limit", () => {
   // Cheap cross-check so a divergence is visible to `npm test` too: the Rust
   // fixture tests only run under `cargo test`.
@@ -136,16 +200,36 @@ test("the Rust side derives its ceiling from the same wire limit", () => {
 });
 
 test("the source-address cap matches the fixture on both sides", () => {
-  assert.equal(fixture.max_source_addrs, 500);
+  // Unlike MAX_PLAUSIBLE_SOURCES, this number is not fixed by the wire format
+  // — it is a tuning choice, so the fixture holds it and neither
+  // implementation is allowed its own copy.
   const rust = readFileSync(rustMergePath, "utf8");
-  assert.match(
-    rust,
-    /const MAX_SOURCE_ADDRS: usize = 500;/,
-    "src-tauri/src/search/merge.rs no longer pins MAX_SOURCE_ADDRS at 500",
+  const rustDeclared = rust.match(/const MAX_SOURCE_ADDRS: usize = (\d+);/);
+  assert.ok(
+    rustDeclared,
+    "src-tauri/src/search/merge.rs no longer declares MAX_SOURCE_ADDRS",
   );
+  assert.equal(Number(rustDeclared[1]), fixture.max_source_addrs);
   const declared = store.match(/const MAX_SOURCE_ADDRS = (\d+)/);
   assert.ok(declared, "MAX_SOURCE_ADDRS is no longer declared in src/lib/stores/search.ts");
   assert.equal(Number(declared[1]), fixture.max_source_addrs);
+});
+
+test("the source-address cap stays within what a download will accept", () => {
+  // The cap exists to bound a payload, so it must not sit above the point
+  // where the addresses stop being usable: `start_download` truncates the
+  // frontend's extras at MAX_EXTRA_SOURCES_IPC. Anything past that is merged,
+  // held for up to 15,000 rows per tab and serialised on every
+  // `search-results` batch, only to be discarded on arrival.
+  const ipcPath = join(root, "src-tauri", "src", "commands", "transfers.rs");
+  const ipcCap = readFileSync(ipcPath, "utf8").match(
+    /const MAX_EXTRA_SOURCES_IPC: usize = ([\d_]+);/,
+  );
+  assert.ok(ipcCap, "MAX_EXTRA_SOURCES_IPC is no longer declared in commands/transfers.rs");
+  assert.ok(
+    fixture.max_source_addrs <= Number(ipcCap[1].replaceAll("_", "")),
+    `max_source_addrs (${fixture.max_source_addrs}) exceeds MAX_EXTRA_SOURCES_IPC (${ipcCap[1]})`,
+  );
 });
 
 test("the fixture actually carries cases", () => {
@@ -153,6 +237,7 @@ test("the fixture actually carries cases", () => {
   // check above pass by iterating nothing.
   assert.ok(fixture.result_key_cases.length >= 5, "too few resultKey cases");
   assert.ok(fixture.combine_origin_cases.length >= 8, "too few combineOrigin cases");
+  assert.ok(fixture.ember_digest_cases.length >= 6, "too few ember digest cases");
   assert.ok(
     fixture.clamp_source_count_cases.length >= 4,
     "too few source-count clamp cases",

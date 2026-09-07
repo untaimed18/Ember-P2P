@@ -108,6 +108,16 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // renderer still must not clear it (it would re-run the migration).
     "ember_default_on_migrated",
     "ember_native_enabled",
+    // No Settings control binds this: the field exists in `AppSettings` for
+    // `config.json` only, so every renderer payload carrying it is an echo of
+    // what `get_settings` handed out. Owning it here is what stops a
+    // compromised webview from repointing friend registration — which POSTs
+    // our public key, public IP and listening port to `/register` (see
+    // `network::rendezvous`) — at a host of its choosing. Noise still prevents
+    // impersonation, so the loss would be identity plus address disclosure and
+    // a friend lookup that silently stops working, which is exactly the kind
+    // of change no renderer needs to make.
+    "rendezvous_url",
 ];
 
 fn merge_renderer_settings(
@@ -185,6 +195,106 @@ fn download_root_was_picked(path: &std::path::Path) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&key)
+}
+
+/// Decide whether an incoming `reapprove_download_root` flag may be honored.
+///
+/// Re-approval re-captures the identity of whatever object currently sits at
+/// the configured download path. That is the only way back for a root revoked
+/// because the user genuinely moved or reconnected the folder, and it is also
+/// exactly what an attacker wants after swapping a junction or a removable
+/// drive in underneath it. The flag itself arrives over IPC and the Settings
+/// page sets it on every save, so the flag cannot be the authorization —
+/// provenance is. Either this session's own picker produced that exact path,
+/// or the user answers a dialog the renderer can neither draw nor dismiss.
+///
+/// Fails closed: a dismissed dialog, a closed window, or a panicked dialog
+/// thread all leave the root revoked, which keeps downloads failing rather
+/// than granting the sandbox to an unverified object.
+async fn download_root_reapproval_authorized(
+    app: &tauri::AppHandle,
+    registry: std::sync::Arc<crate::security::filesystem::ApprovedRootRegistry>,
+    download_folder: &str,
+) -> bool {
+    if download_folder.is_empty() {
+        return false;
+    }
+    // Picking the folder in the OS dialog *is* the user's authorization, and
+    // it is the flow the Settings page steers people through, so the common
+    // recovery never sees a second prompt.
+    if download_root_was_picked(std::path::Path::new(download_folder)) {
+        return true;
+    }
+    let confirm_app = app.clone();
+    let folder = download_folder.to_string();
+    let prompt = format!(
+        "Ember no longer recognises the folder at:\n\n{}\n\nRe-approve it only if you moved this folder or reconnected the drive yourself. If something else was put at this path, re-approving gives Ember's downloads access to whatever is there now.",
+        elide_for_dialog(download_folder)
+    );
+    // `None` means there is nothing to authorize, which is the ordinary case:
+    // the Settings page sends the flag on every save and almost every save
+    // finds the root intact.
+    let answer = tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&folder);
+        // An absent root keeps its record (`build_next` retains it on
+        // `NotFound`) and a root whose identity still matches needs no grant,
+        // so neither is worth a prompt.
+        if std::fs::symlink_metadata(path).is_err() || registry.verify_root(path).is_ok() {
+            return None;
+        }
+        // `blocking_show` parks this thread until the main thread pumps the
+        // dialog, which is why every native dialog in this crate is reached
+        // through `spawn_blocking` instead of running on the command's task.
+        Some(
+            confirm_app
+                .dialog()
+                .message(prompt)
+                .title("Re-approve download folder?")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                    "Re-approve".to_string(),
+                    "Keep blocked".to_string(),
+                ))
+                .blocking_show(),
+        )
+    })
+    .await;
+    match answer {
+        Ok(Some(true)) => true,
+        // Withholding the grant rather than deferring to the persistence
+        // closure's own repeat of the same test: if the path changes between
+        // the two, "nothing was pending" would otherwise become a silent
+        // re-approval of whatever appeared in between.
+        Ok(None) => false,
+        Ok(Some(false)) => {
+            warn!(
+                "Ignoring reapprove_download_root: the download folder was not chosen with the native picker this session and the re-approval prompt was declined"
+            );
+            false
+        }
+        Err(error) => {
+            warn!("Ignoring reapprove_download_root: confirmation task failed: {error}");
+            false
+        }
+    }
+}
+
+/// Shorten a string for a native dialog body.
+///
+/// Dialog text is not scrollable on every platform, so a pathological value —
+/// a 2048-byte URL, a deeply nested path — can push the buttons off screen or
+/// bury the part the user is supposed to read. Keeps the head, where the
+/// scheme and host or the drive and first folders live.
+///
+/// Shared with the IP-filter override prompt in `commands::security`, so the
+/// two security confirmations cannot be made unreadable by different means.
+pub(crate) fn elide_for_dialog(value: &str) -> String {
+    const MAX_DIALOG_CHARS: usize = 180;
+    if value.chars().count() <= MAX_DIALOG_CHARS {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(MAX_DIALOG_CHARS).collect();
+    format!("{head}…")
 }
 
 /// Open a trusted native directory picker for the download folder.
@@ -988,6 +1098,20 @@ pub async fn update_settings(
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
+    // Web services are URL templates the user curates, so they are normalised
+    // here rather than trusted: each is checked for a http/https scheme, a host
+    // and no embedded credentials, duplicates by URL are dropped, and the list
+    // is truncated. Rejected rows are discarded rather than failing the save —
+    // the rest of the settings payload is unrelated, and the form reports what
+    // it kept. The strict check that guards the shell still runs later, on the
+    // substituted URL, because a template's `#hashid` is a URL fragment until
+    // it is replaced.
+    let (kept_services, rejected_services) =
+        crate::webservices::sanitize_services(std::mem::take(&mut settings.web_services));
+    for (name, reason) in &rejected_services {
+        warn!("Dropping web service {name:?} from settings: {reason}");
+    }
+    settings.web_services = kept_services;
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -1034,6 +1158,31 @@ pub async fn update_settings(
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
     }
 
+    // `rendezvous_url` is backend-owned, so `merge_renderer_settings` has
+    // already restored the authoritative value and this comparison cannot fire
+    // from IPC as things stand. It is the save-time gate that keeps the
+    // guarantee if the field is ever made writable again, because the checks
+    // in `validate_settings` only establish shape: an `https://` URL with a
+    // host and no userinfo can still name loopback, RFC1918 space, or
+    // `169.254.169.254`. `validate_fetch_url` resolves the host and rejects
+    // every private answer, which is the same bar `network::rendezvous`
+    // applies before it registers — so accepting anything weaker here would
+    // only defer the refusal to a background task that has no way to report
+    // it to the person who made the change.
+    if settings.rendezvous_url != old_settings.rendezvous_url
+        && !settings.rendezvous_url.is_empty()
+    {
+        crate::security::validate_fetch_url(&settings.rendezvous_url)
+            .await
+            .map_err(|error| {
+                coded_ctx(
+                    "security_url_validation_failed",
+                    "Rendezvous URL validation failed",
+                    error,
+                )
+            })?;
+    }
+
     if settings.channel_username != old_settings.channel_username {
         if settings.channel_username.is_empty() {
             if !old_settings.channel_username.is_empty() {
@@ -1058,6 +1207,41 @@ pub async fn update_settings(
             "settings_stale_revision",
             "Settings changed in another window or command; reload and apply your changes again",
         ));
+    }
+
+    // A web service is a destination this app hands to the browser, and unlike
+    // `rendezvous_url` it cannot be backend-owned: curating the list is the
+    // whole feature. So the renderer may propose one and the user approves it
+    // natively, once, here — which is what lets `open_web_service` skip a
+    // prompt of its own, and what stops a compromised webview from turning that
+    // command into a confirm-free opener for a URL it wrote itself.
+    //
+    // Only additions ask. Removals and renames reach nothing new, and a save
+    // that changes something else entirely must not raise a dialog about a list
+    // it did not touch.
+    //
+    // Below the revision check, for the reason the re-approval prompt is: a save
+    // that is going to be refused as stale must not collect consent first, since
+    // the caller retries and the user would answer the same question twice.
+    let added_web_services =
+        crate::webservices::newly_added(&old_settings.web_services, &settings.web_services);
+    if !added_web_services.is_empty()
+        && !confirm_web_service_additions(&app, &added_web_services).await
+    {
+        // Declining drops the new destinations and keeps the rest of the save,
+        // rather than failing it: the payload carries every other setting on
+        // the page, and this command answers with the settings it actually
+        // persisted, so the list the user sees corrects itself.
+        settings.web_services.retain(|candidate| {
+            old_settings
+                .web_services
+                .iter()
+                .any(|held| held.url == candidate.url)
+        });
+        info!(
+            "{} web service(s) were not added: the native confirmation was declined",
+            added_web_services.len()
+        );
     }
     let (removed_shared_folders, added_shared_folders) =
         shared_folder_changes(&old_settings.shared_folders, &settings.shared_folders);
@@ -1127,15 +1311,28 @@ pub async fn update_settings(
         // re-picking the same folder is not an addition, so it never reaches
         // `explicit_additions` and every download keeps failing.
         //
-        // Deliberately narrow. `reapprove_download_root` is set only by the
-        // Settings page's own save button, because `update_settings` is also
-        // reached from background paths with no user present — the UPnP
-        // auto-disable handler persists through it from a network event — and
-        // re-approval grants the sandbox to whatever object now sits at the
-        // path. It is also skipped unless something is actually there: a root
-        // that is merely offline (unplugged drive, disconnected share) must
-        // keep its record, which `build_next` retains on `NotFound`, rather
-        // than be re-captured and lost.
+        // Deliberately narrow. Re-approval grants the sandbox to whatever
+        // object now sits at the path, and `update_settings` is also reached
+        // from background paths with no user present — the UPnP auto-disable
+        // handler persists through it from a network event. The flag says the
+        // Settings save button was pressed, but it travels over IPC and the
+        // page sets it on every save, so it is treated as a request rather
+        // than as consent and `download_root_reapproval_authorized` decides.
+        // It is also skipped unless something is actually there: a root that
+        // is merely offline (unplugged drive, disconnected share) must keep
+        // its record, which `build_next` retains on `NotFound`, rather than be
+        // re-captured and lost.
+        //
+        // Resolved before the persistence task starts: the authorization may
+        // need a native dialog, and that must not run inside the closure that
+        // holds the approved-root transaction open.
+        let reapprove_download_root = reapprove_download_root
+            && download_root_reapproval_authorized(
+                &app,
+                registry.clone(),
+                &settings.download_folder,
+            )
+            .await;
         let download_folder = settings.download_folder.clone();
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
@@ -1818,15 +2015,221 @@ fn validate_external_url(raw: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
+/// How long to wait for a resolver before refusing the link.
+///
+/// A click should not hang. Matches the deadline `security::validate_fetch_url`
+/// uses for the same reason.
+const EXTERNAL_URL_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Refuse a link whose host is — or resolves to — something other than a
+/// public internet destination.
+///
+/// [`validate_external_url`] settles the shape; this settles the destination.
+/// `opener::open` hands the URL to the user's default browser, which will
+/// cheerfully fetch `http://127.0.0.1:8080/admin`, `http://192.168.1.1/` or
+/// `http://169.254.169.254/latest/meta-data/` — a service bound to loopback, a
+/// router's admin page, a cloud metadata endpoint — carrying whatever ambient
+/// cookies and LAN position the user has. A link in a room is written by
+/// whoever is in the room, so a literal address is the obvious attempt and a
+/// domain whose A record points into private space is the quieter one; the
+/// same policy the HTTP fetch path enforces has to apply here too.
+///
+/// Every resolved address is checked rather than the first, because a host
+/// answering with one public and one loopback record would otherwise pass or
+/// fail on whatever order the resolver happened to return.
+///
+/// This cannot pin DNS the way [`crate::security::build_pinned_client`] does
+/// for our own fetches: the browser is a separate process and resolves the
+/// name again itself, so a resolver under the attacker's control can answer
+/// differently a moment later. That residual is why the confirmation in
+/// [`open_external_url`] names the host — the resolution check removes the
+/// destinations a user cannot be expected to judge, and the dialog covers the
+/// judgement that is left.
+async fn reject_non_public_external_host(validated: &str) -> Result<(), String> {
+    let invalid = || {
+        coded(
+            "settings_open_link_invalid",
+            "That link cannot be opened safely",
+        )
+    };
+    // Re-parsed rather than threaded through: `validated` is already this
+    // parser's own output, so this agrees with what will actually be opened.
+    let parsed = url::Url::parse(validated).map_err(|_| invalid())?;
+    let Some(host) = parsed.host() else {
+        return Err(invalid());
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return Err(invalid());
+    };
+    match host {
+        // `Url::host` yields the address already parsed, so a bracketed IPv6
+        // literal or a shortened/zero-compressed form cannot arrive here as a
+        // string that the range checks would fail to recognise.
+        url::Host::Ipv4(v4) => {
+            if crate::security::is_special_use_v4(v4) {
+                return Err(invalid());
+            }
+        }
+        url::Host::Ipv6(v6) => {
+            if crate::security::is_private_ip(std::net::IpAddr::V6(v6)) {
+                return Err(invalid());
+            }
+        }
+        url::Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            // RFC 6761: `localhost` and every name under it are loopback by
+            // definition. Browsers short-circuit them without consulting a
+            // resolver, so the lookup below would never get the chance to
+            // object.
+            if lowered == "localhost" || lowered.ends_with(".localhost") {
+                return Err(invalid());
+            }
+            // `spawn_blocking(ToSocketAddrs)` cannot be cancelled: a resolver
+            // that accepts queries and never answers would strand one blocking
+            // worker per clicked link. Tokio's lookup future is cancellable,
+            // so the deadline actually releases the task.
+            let addrs = tokio::time::timeout(
+                EXTERNAL_URL_DNS_TIMEOUT,
+                tokio::net::lookup_host((lowered.as_str(), port)),
+            )
+            .await
+            .map_err(|_| invalid())?
+            .map_err(|_| invalid())?
+            .collect::<Vec<std::net::SocketAddr>>();
+            // A name that resolves to nothing is not a destination we can
+            // vouch for, and handing it over anyway just moves the lookup into
+            // the browser where this check cannot see the answer.
+            if addrs.is_empty() {
+                return Err(invalid());
+            }
+            if addrs
+                .iter()
+                .any(|addr| crate::security::is_private_ip(addr.ip()))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ask the user, natively, before handing a link to the browser.
+///
+/// The renderer already prompts, but a renderer under someone else's control
+/// simply does not run its own prompt before calling this command, so the
+/// answer that authorizes the open has to be collected somewhere the webview
+/// cannot reach. The host is shown on a line of its own because it is the part
+/// that decides where the click goes, and the part that link text is written
+/// to disagree with.
+///
+/// Returns false for a dismissed or closed dialog, so anything other than an
+/// explicit "open" leaves the browser untouched.
+async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
+    let host = url::Url::parse(validated)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(String::from))
+        .unwrap_or_default();
+    let prompt = format!(
+        "{}\n\nThis will open {} in your browser.\n\nOpen it only if you recognise where it goes — the text of a link and its destination do not have to match.",
+        elide_for_dialog(validated),
+        elide_for_dialog(&host)
+    );
+    let confirm_app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task; see `pick_download_folder`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title("Open this link?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Open link".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Ask, natively, before a site joins the web-services list.
+///
+/// The list decides where [`open_web_service`] may send the user, and that
+/// command deliberately does not prompt: a diagnostic clicked several times
+/// while triaging one download would teach people to dismiss the dialog that
+/// matters. Consent has to sit somewhere, though, because `web_services` is not
+/// backend-owned — a compromised webview can put a URL in an `update_settings`
+/// payload — so it sits here, on the one event that introduces a destination.
+///
+/// Asking on the addition rather than on the open is also the more useful
+/// question: "may this site learn which files you look up" is a property of the
+/// site, asked once, rather than of the file, asked forever.
+///
+/// Returns false for a dismissed or closed dialog, so anything other than an
+/// explicit "add" leaves the stored list alone.
+async fn confirm_web_service_additions(
+    app: &tauri::AppHandle,
+    added: &[crate::webservices::WebService],
+) -> bool {
+    let sites = added
+        .iter()
+        .map(|service| {
+            format!(
+                "{} — {}",
+                elide_for_dialog(&service.name),
+                elide_for_dialog(&crate::webservices::service_host(&service.url))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "{sites}\n\nOpening a web service for a file tells that site which file you are looking for. Ember asks once, here, and not again each time you use it.\n\nAdd it only if you recognise the site."
+    );
+    let title = if added.len() == 1 {
+        "Add this web service?"
+    } else {
+        "Add these web services?"
+    };
+    let confirm_app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task; see `pick_download_folder`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title(title)
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Add".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Open a link found in a message, in the default browser.
 ///
-/// The renderer asks the user to confirm the destination first — the text of a
-/// link and where it points are different strings, and in a room full of
-/// strangers they will sometimes disagree on purpose. This end does not rely
-/// on that: see [`validate_external_url`].
+/// Nothing about the request is trusted: the string is the least trusted one
+/// in the application, and the confirmation the renderer shows is the
+/// renderer's own and can simply be skipped. So the shape is checked
+/// ([`validate_external_url`]), the destination is checked
+/// ([`reject_non_public_external_host`]), and the consent is collected
+/// natively ([`confirm_external_url`]) before anything is handed to the shell.
 #[tauri::command]
-pub async fn open_external_url(url: String) -> Result<(), String> {
+pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let safe = validate_external_url(&url)?;
+    reject_non_public_external_host(&safe).await?;
+    if !confirm_external_url(&app, &safe).await {
+        // Declining is not a failure. Every native dialog in this crate
+        // reports a dismissal as "nothing happened" (`pick_download_folder`,
+        // `pick_and_import_ipfilter_file` both return `Ok(None)`), and an
+        // error toast after someone deliberately chose Cancel is noise.
+        info!("External link was not opened: the native confirmation was declined");
+        return Ok(());
+    }
     opener::open(&safe).map_err(|e| {
         coded_ctx(
             "settings_open_link_failed",
@@ -1834,6 +2237,199 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
             e,
         )
     })
+}
+
+/// Open a configured web service for one file.
+///
+/// This is eMule's right-click → *Web services*: a curated site is asked about
+/// a specific file, most usefully "how many complete sources has the network
+/// seen", which is the question a download that will not finish raises.
+///
+/// The renderer names *which* service by index and supplies the file's facts;
+/// the template itself is read from settings here, so the URL that gets opened
+/// is one the user stored rather than one the webview composed.
+///
+/// **Substitution has to happen before validation, and that ordering is the
+/// whole reason this command exists** rather than the renderer building a URL
+/// and calling [`open_external_url`]. A template's placeholder is written
+/// `#hashid`, and `#` starts a URL fragment — so `https://x.test/?hash=#hashid`
+/// parses as a URL with an empty query and a fragment of `hashid`. Nothing
+/// about the destination can be judged until the placeholders are gone.
+///
+/// Once they are, it is an ordinary external link and goes through two of the
+/// three gates a link pasted into a room does: the shape
+/// ([`validate_external_url`]) and the destination
+/// ([`reject_non_public_external_host`]). The third — native consent — was
+/// collected when the site joined the list ([`confirm_web_service_additions`]),
+/// rather than here, because this is a diagnostic clicked several times while
+/// triaging one download and a dialog on each use is a dialog people learn to
+/// dismiss.
+///
+/// That trade only holds while the list is genuinely the user's, so the two
+/// renderer-supplied halves are both bounded: the site comes from settings by
+/// index, and `file_hash` has to *be* a hash. Without that second check a
+/// compromised webview could still pick an approved site and use `#hashid` as a
+/// query parameter of its own, which is a channel out of a renderer whose CSP
+/// gives it none. `file_name` is peer-supplied text by design — it is the file's
+/// name — and reaches the URL percent-encoded, inside the length
+/// [`validate_external_url`] enforces.
+#[tauri::command]
+pub async fn open_web_service(
+    state: tauri::State<'_, AppState>,
+    service_index: usize,
+    file_hash: String,
+    file_name: String,
+    file_size: u64,
+) -> Result<(), String> {
+    let file_hash = file_hash.trim();
+    // Empty is ordinary: a file still being hashed, or a search hit that
+    // arrived without one. Anything else has to be an eD2K hash.
+    if !file_hash.is_empty()
+        && (file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(coded(
+            "settings_web_service_bad_hash",
+            "That file has no usable eD2K hash",
+        ));
+    }
+    let template = {
+        let config = state.config.read().await;
+        config
+            .settings
+            .web_services
+            .get(service_index)
+            .map(|service| service.url.clone())
+            .ok_or_else(|| {
+                coded(
+                    "settings_web_service_missing",
+                    "That web service is no longer configured",
+                )
+            })?
+    };
+    let filled = crate::webservices::substitute_placeholders(
+        &template,
+        &crate::webservices::FileFacts {
+            hash: file_hash,
+            name: file_name.trim(),
+            size: file_size,
+        },
+    );
+    let safe = validate_external_url(&filled)?;
+    reject_non_public_external_host(&safe).await?;
+    opener::open(&safe).map_err(|e| {
+        coded_ctx(
+            "settings_open_link_failed",
+            "Failed to open the link",
+            e,
+        )
+    })
+}
+
+/// Read an eMule `webservices.dat` the user picks, and return what it holds.
+///
+/// Deliberately returns the parsed entries instead of writing them: the
+/// Settings form merges them into its list and saves through
+/// [`update_settings`] like any other edit, so there is one persistence path
+/// rather than two that can disagree.
+///
+/// The file is chosen in a native dialog *here* rather than accepted as a path
+/// from the renderer, for the reason `pick_and_import_ipfilter_file` and
+/// `pick_and_load_collection` both give: picking a file in the OS dialog is the
+/// user's authorization, and a path arriving over IPC is not.
+///
+/// `Ok(None)` means the user dismissed the picker.
+#[tauri::command]
+pub async fn pick_and_import_webservices_file(
+    app: tauri::AppHandle,
+) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
+    let picker = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title("Choose an eMule webservices.dat")
+            .add_filter("eMule web services", &["dat", "txt"])
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path().map_err(|e| {
+                    coded_ctx(
+                        "settings_webservices_import_failed",
+                        "Could not read that file",
+                        e,
+                    )
+                })
+            })
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "settings_webservices_import_failed",
+            "Could not read that file",
+            e,
+        )
+    })?;
+    let Some(path) = selected.transpose()? else {
+        return Ok(None);
+    };
+
+    let services = tokio::task::spawn_blocking(move || -> Result<Vec<_>, String> {
+        let meta = std::fs::metadata(&path).map_err(|e| {
+            coded_ctx(
+                "settings_webservices_import_failed",
+                "Could not read that file",
+                e,
+            )
+        })?;
+        // A real webservices.dat is a few lines of text. The cap is here
+        // because the picker hands back whatever was selected, and reading an
+        // arbitrarily large file to find at most a handful of entries is work
+        // with no upside.
+        if meta.len() > crate::webservices::MAX_WEBSERVICES_FILE_BYTES {
+            return Err(coded(
+                "settings_webservices_too_large",
+                "That file is too large to be a webservices.dat",
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| {
+            coded_ctx(
+                "settings_webservices_import_failed",
+                "Could not read that file",
+                e,
+            )
+        })?;
+        // Lossy on purpose: eMule wrote these in the local code page for years,
+        // so a stray byte in a service *name* should cost that character rather
+        // than the whole import. A mangled URL is refused by validation anyway.
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(crate::webservices::parse_webservices_dat(&text))
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "settings_webservices_import_failed",
+            "Could not read that file",
+            e,
+        )
+    })??;
+
+    info!(
+        "Imported {} web service(s) from a picked webservices.dat",
+        services.len()
+    );
+    Ok(Some(services))
+}
+
+/// The example service offered in Settings, as `(name, url)`.
+///
+/// Read from the core rather than typed into the renderer so the string that
+/// gets stored is the one that was reviewed, and so the offer and the validation
+/// cannot drift apart.
+#[tauri::command]
+pub fn get_example_web_service() -> crate::webservices::WebService {
+    crate::webservices::WebService {
+        name: crate::webservices::EXAMPLE_SERVICE_NAME.to_string(),
+        url: crate::webservices::EXAMPLE_SERVICE_URL.to_string(),
+    }
 }
 
 /// Where `ember.log` and its rotated copies live.

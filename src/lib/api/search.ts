@@ -11,7 +11,17 @@ export interface SearchFilters {
   minAvailability?: number;
 }
 
-export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters): Promise<SearchResult[]> {
+/**
+ * Extra arguments a "find related files" search carries. `relatedHashes` turns
+ * the connected eD2K server's leg of the search into eMule's native co-share
+ * request; `excludeHashes` keeps the seed files out of their own results.
+ */
+export interface RelatedSearchArgs {
+  relatedHashes?: string[];
+  excludeHashes?: string[];
+}
+
+export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters, related?: RelatedSearchArgs): Promise<SearchResult[]> {
   return invoke('search_files', {
     query,
     method,
@@ -21,7 +31,54 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
     minSize: filters?.minSize ?? null,
     maxSize: filters?.maxSize ?? null,
     minAvailability: filters?.minAvailability ?? null,
+    relatedHashes: related?.relatedHashes?.length ? related.relatedHashes : null,
+    excludeHashes: related?.excludeHashes?.length ? related.excludeHashes : null,
   });
+}
+
+/** Why a related search believes results are related to the seed file. */
+export type RelationKind = 'co_share' | 'series' | 'album' | 'volume' | 'title';
+
+export interface RelatedProbe {
+  kind: RelationKind;
+  /** `null` for `co_share`, which the server answers from its own index
+   *  rather than from a keyword query. */
+  query: string | null;
+}
+
+export interface RelatedPlan {
+  /** Combined keyword query, or `null` when the filename yielded nothing
+   *  searchable and only the co-share request can produce results. */
+  query: string | null;
+  probes: RelatedProbe[];
+  co_share_hashes: string[];
+  exclude_hashes: string[];
+  seed_label: string;
+}
+
+export interface RelatedSeed {
+  hash?: string | null;
+  name?: string | null;
+  artist?: string | null;
+  album?: string | null;
+}
+
+/**
+ * Work out what "find related files" should search for, given the file(s) the
+ * user pointed at. Plans only — runs no search. Rejects when nothing usable can
+ * be derived, so callers should surface the error rather than open an empty tab.
+ */
+export async function planRelatedSearch(seeds: RelatedSeed[]): Promise<RelatedPlan> {
+  return invoke('plan_related_search', { seeds });
+}
+
+/**
+ * Whether the connected eD2k server advertises `SRV_TCPFLG_RELATEDSEARCH`, so a
+ * related search has somewhere to put its co-share question. False when no
+ * server is connected. Mirrors the condition eMule greys its menu item on.
+ */
+export async function relatedSearchSupported(): Promise<boolean> {
+  return invoke('related_search_supported');
 }
 
 export async function cancelSearch(requestId: number): Promise<void> {
@@ -106,8 +163,27 @@ export async function parseEd2kLinks(text: string): Promise<Ed2kLinkBatch> {
   return invoke('parse_ed2k_links', { text });
 }
 
-export async function findSources(fileHash: string, fileSize: number): Promise<[string, number][]> {
-  return invoke('find_sources', { fileHash, fileSize });
+/** Which networks a source ask reached. A `false` leg had nowhere to send it. */
+export type SourceAskOutcome = {
+  kad: boolean;
+  ember: boolean;
+  /** The connected eD2k server, asked over TCP. */
+  server: boolean;
+  /** The other eligible servers, asked over UDP. */
+  server_udp: boolean;
+};
+
+/**
+ * Ask every connected network for the sources of a transfer's file. Resolves
+ * once the asks are away; what they find goes into the transfer itself and is
+ * reported per network by `transfer:source-search` events.
+ */
+export async function findSources(
+  transferId: string,
+  fileHash: string,
+  fileSize: number,
+): Promise<SourceAskOutcome> {
+  return invoke('find_sources', { transferId, fileHash, fileSize });
 }
 
 export async function findNotes(fileHash: string, fileSize: number): Promise<SearchResult[]> {

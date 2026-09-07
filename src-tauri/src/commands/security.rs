@@ -657,6 +657,60 @@ pub async fn download_and_load_ipfilter(
     })
 }
 
+/// Ask the user, natively, before a list from a renderer-supplied URL
+/// replaces the installed IP filter.
+///
+/// The IP filter is the one file where "replaced wholesale" means "protection
+/// removed": a list that parses to nothing uninstalls it, and a list that
+/// parses to a handful of ranges can carve out exactly the peer whoever wrote
+/// it wants reachable. `fetch_pinned_get` keeps this command out of private
+/// address space, but it has nothing to say about an attacker-hosted list on
+/// an entirely ordinary public host, so the URL itself needs an authorization
+/// a compromised webview cannot produce.
+///
+/// The installed entry count is read first and shown, because "this replaces
+/// the 245000 blocked ranges you have now" is the fact that makes an
+/// unexpected prompt legible — a bare "allow this URL?" is a prompt people
+/// dismiss by clicking through.
+///
+/// Returns false for a dismissed or closed dialog, so the working filter
+/// survives anything short of an explicit yes.
+async fn confirm_ipfilter_override(app: &tauri::AppHandle, url: &str) -> bool {
+    let filter_path = crate::storage::paths::resolve_data_dir_with_app(app).join("ipfilter.dat");
+    let shown_url = crate::commands::settings::elide_for_dialog(url);
+    let confirm_app = app.clone();
+    // `blocking_show` parks this thread until the main thread pumps the
+    // dialog, which is why it runs here rather than on the command's task —
+    // the same reason `pick_and_import_ipfilter_file` wraps its picker.
+    tokio::task::spawn_blocking(move || {
+        // Best effort. An unreadable or absent ipfilter.dat means there is no
+        // working filter to lose, and saying so is more useful than hiding the
+        // line: it tells the user this prompt is not about a replacement.
+        let installed = std::fs::read(&filter_path)
+            .ok()
+            .map(|bytes| count_valid_entries(&bytes, "dat"))
+            .filter(|count| *count > 0);
+        let standing = match installed {
+            Some(count) => format!("This replaces the {count} blocked ranges you have now."),
+            None => "You have no working IP filter installed at the moment.".to_string(),
+        };
+        confirm_app
+            .dialog()
+            .message(format!(
+                "Ember will download an IP filter from:\n\n{shown_url}\n\n{standing}\n\nContinue only if you asked for this update. A list that is empty, or that quietly omits the ranges you rely on, removes the protection you have."
+            ))
+            .title("Replace your IP filter?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Download and replace".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Download and load an ipfilter from a user-supplied URL.
 ///
 /// Distinct from `download_and_load_ipfilter`, which fetches from a
@@ -667,7 +721,9 @@ pub async fn download_and_load_ipfilter(
 ///
 /// The URL is validated via `security::validate_fetch_url` (DNS
 /// resolved, public/private IP filtered, host pinned) before we
-/// dial, and the response is capped at 50 MiB.
+/// dial, and the response is capped at 50 MiB. That stops the command being
+/// used to reach the local network; it does not make the *list* trustworthy,
+/// which is what `confirm_ipfilter_override` is for.
 #[tauri::command]
 pub async fn update_ipfilter_from_url(
     app: tauri::AppHandle,
@@ -675,6 +731,21 @@ pub async fn update_ipfilter_from_url(
     url: String,
 ) -> Result<IpFilterApplyResult, String> {
     info!("Updating IP filter from a user-supplied URL");
+
+    // The shipped default is the same constant `download_and_load_ipfilter`
+    // pulls from its own button, so routing it through here must not be more
+    // onerous than pressing that. Everything else is an override, and the
+    // request alone is not consent: a compromised renderer can call this with
+    // any HTTPS URL it likes. The comparison is byte-exact on purpose — a
+    // percent-escaped, case-shifted or trailing-slash spelling of the default
+    // prompts rather than being waved through as "close enough".
+    if url != DEFAULT_IPFILTER_ARCHIVE_URL && !confirm_ipfilter_override(&app, &url).await {
+        warn!("Declining IP filter update: the native confirmation was not accepted");
+        return Err(coded(
+            "security_ipfilter_update_declined",
+            "IP filter update cancelled",
+        ));
+    }
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
     let response = crate::security::fetch_pinned_get(&url)
@@ -761,6 +832,14 @@ pub async fn update_ipfilter_from_url(
             e,
         )
     })??;
+    // Counted before anything on disk or in memory is touched, so a response
+    // that is not an IP filter can never be what replaces one. A dead mirror
+    // serving an HTML error page still answers 200, and a truncated transfer
+    // still writes cleanly — `atomic_write` plus `ReloadIpFilter` would
+    // faithfully install either as an empty filter and report success, which
+    // is indistinguishable from an attacker asking for the filter to be
+    // switched off. Refusing here means the worst a bad payload achieves is
+    // an error message over an untouched filter.
     if entry_count == 0 {
         return Err(coded(
             "security_ipfilter_no_valid_entries",

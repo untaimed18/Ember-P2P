@@ -8,10 +8,13 @@
     getLogFolderPath,
     openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
+    importWebServicesFile,
+    getExampleWebService,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
+  import type { WebService } from '$lib/types';
   import {
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
@@ -160,6 +163,17 @@
       })
       .catch(() => {
         // Only the displayed path is lost; the button still works.
+      });
+  });
+
+  $effect(() => {
+    getExampleWebService()
+      .then((service) => {
+        exampleWebService = service;
+      })
+      .catch(() => {
+        // Only the "add the example" shortcut is lost; the list and the manual
+        // add form are unaffected.
       });
   });
 
@@ -1259,6 +1273,128 @@
   // trip. The textarea below is bound to `antileechDraft` (newline-
   // joined patterns); we only push to the backend when the user clicks
   // Save, so the pattern list isn't recompiled on every keystroke.
+  // Mirrors `webservices::MAX_WEB_SERVICES`. The backend truncates regardless;
+  // this is only so the form can say why an add did nothing.
+  const MAX_WEB_SERVICES = 32;
+
+  // --- Web services (eMule's right-click → Web services) ---
+  //
+  // Edited straight into `settings.web_services`, so the page's own Save,
+  // Ctrl+S, dirty tracking and Discard all apply without a second persistence
+  // path. The backend re-validates and de-duplicates on save regardless; the
+  // checks here exist to give a reason next to the field the user typed in
+  // rather than a silent drop.
+  let newWebServiceName = $state('');
+  let newWebServiceUrl = $state('');
+  let webServiceMessage: { kind: 'ok' | 'err'; text: string } | null = $state(null);
+  // Loaded from the backend so the offer cannot drift from the validator, and
+  // so the button can hide itself once the entry is present rather than being
+  // clickable only to report a duplicate.
+  let exampleWebService: WebService | null = $state(null);
+  // Narrowed via local consts first, for the reason `antileechDraftDirty`
+  // records: TS does not reliably narrow a `$state`-backed getter read inside
+  // an expression the way it would a plain variable.
+  let canAddExample = $derived.by(() => {
+    const example = exampleWebService;
+    const current = settings;
+    if (!example || !current) return false;
+    return !current.web_services.some((s) => s.url === example.url);
+  });
+
+  function looksLikeWebServiceUrl(url: string): boolean {
+    // A template's `#hashid` is a URL fragment until it is substituted, so the
+    // strict check belongs at open time in the backend. This only rules out
+    // what could never work.
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return false;
+    if (/[\s\u0000-\u001f]/.test(trimmed)) return false;
+    try {
+      const parsed = new URL(trimmed);
+      return Boolean(parsed.host) && !parsed.username && !parsed.password;
+    } catch {
+      return false;
+    }
+  }
+
+  function addWebServiceEntry(name: string, url: string): 'added' | 'duplicate' | 'invalid' | 'full' {
+    const current = settings;
+    if (!current) return 'invalid';
+    const trimmedName = name.trim();
+    const trimmedUrl = url.trim();
+    if (!trimmedName || !looksLikeWebServiceUrl(trimmedUrl)) return 'invalid';
+    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
+    if (current.web_services.some((s) => s.url === trimmedUrl)) return 'duplicate';
+    current.web_services = [...current.web_services, { name: trimmedName, url: trimmedUrl }];
+    return 'added';
+  }
+
+  function addWebService() {
+    switch (addWebServiceEntry(newWebServiceName, newWebServiceUrl)) {
+      case 'added':
+        newWebServiceName = '';
+        newWebServiceUrl = '';
+        webServiceMessage = null;
+        break;
+      case 'duplicate':
+        webServiceMessage = { kind: 'err', text: m.webservices_import_duplicate() };
+        break;
+      case 'full':
+        webServiceMessage = { kind: 'err', text: m.webservices_full({ max: MAX_WEB_SERVICES }) };
+        break;
+      default:
+        webServiceMessage = { kind: 'err', text: m.webservices_invalid() };
+    }
+  }
+
+  function removeWebService(index: number) {
+    const current = settings;
+    if (!current) return;
+    current.web_services = current.web_services.filter((_, i) => i !== index);
+    webServiceMessage = null;
+  }
+
+  function addExampleWebService() {
+    try {
+      const example = exampleWebService;
+      if (!example) return;
+      const outcome = addWebServiceEntry(example.name, example.url);
+      webServiceMessage =
+        outcome === 'duplicate'
+          ? { kind: 'err', text: m.webservices_import_duplicate() }
+          : outcome === 'full'
+            ? { kind: 'err', text: m.webservices_full({ max: MAX_WEB_SERVICES }) }
+            : null;
+    } catch (e: unknown) {
+      webServiceMessage = { kind: 'err', text: translateError(e) };
+    }
+  }
+
+  async function handleImportWebServices() {
+    try {
+      const imported = await importWebServicesFile();
+      // Null is a dismissed picker, which is not a failure and not worth a
+      // message.
+      if (imported === null) return;
+      let added = 0;
+      for (const service of imported) {
+        if (addWebServiceEntry(service.name, service.url) === 'added') added += 1;
+      }
+      if (added === 0) {
+        webServiceMessage = {
+          kind: 'err',
+          text: imported.length === 0 ? m.webservices_import_none() : m.webservices_import_duplicate(),
+        };
+      } else {
+        webServiceMessage = {
+          kind: 'ok',
+          text: added === 1 ? m.webservices_imported_one() : m.webservices_imported_other({ count: added }),
+        };
+      }
+    } catch (e: unknown) {
+      webServiceMessage = { kind: 'err', text: translateError(e) };
+    }
+  }
+
   let antileechSnapshot: AntiLeechSnapshot | null = $state(null);
   let antileechDraft = $state('');
   let antileechSaving = $state(false);
@@ -2094,6 +2230,90 @@
             {/if}
             {#if historyClearMsg}
               <span class="hint">{historyClearMsg}</span>
+            {/if}
+          </div>
+
+          <div class="divider"></div>
+
+          <!-- eMule's web services, reached from a file's right-click menu.
+               Lives under Downloads because the question it answers is "why
+               will this not finish?". -->
+          <div class="field">
+            <span class="toggle-title">{m.webservices_title()}</span>
+            <!-- The two notes are one thought — what the feature is, and what
+                 using it discloses — so they sit closer to each other than to
+                 the list, rather than reading as two unrelated paragraphs. -->
+            <div class="webservice-intro">
+              <span class="hint">{m.webservices_desc()}</span>
+              <span class="hint">{m.webservices_privacy_note()}</span>
+            </div>
+
+            {#if settings.web_services.length === 0}
+              <span class="hint">{m.webservices_empty()}</span>
+            {:else}
+              <ul class="webservice-list">
+                {#each settings.web_services as service, index (service.url)}
+                  <li class="webservice-row">
+                    <div class="webservice-text">
+                      <span class="webservice-name"><bdi dir="auto">{service.name}</bdi></span>
+                      <span class="hint webservice-url" title={service.url}>{service.url}</span>
+                    </div>
+                    <button
+                      class="action-btn ghost webservice-remove"
+                      onclick={() => removeWebService(index)}
+                    >{m.webservices_remove()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+
+            <!-- Adding is a different activity from reviewing what is already
+                 configured, so it gets its own group rather than continuing the
+                 same flat stack. The rule is the separator; boxing it would make
+                 a second card inside a card. -->
+            <div class="webservice-form">
+              <div class="webservice-add">
+                <label class="webservice-field">
+                  <span class="hint">{m.webservices_name_label()}</span>
+                  <input
+                    type="text"
+                    bind:value={newWebServiceName}
+                    maxlength="64"
+                    spellcheck="false"
+                    placeholder={m.webservices_name_placeholder()}
+                  />
+                </label>
+                <label class="webservice-field webservice-field-url">
+                  <span class="hint">{m.webservices_url_label()}</span>
+                  <input
+                    type="text"
+                    bind:value={newWebServiceUrl}
+                    maxlength="512"
+                    spellcheck="false"
+                    placeholder={m.webservices_url_placeholder()}
+                  />
+                </label>
+                <button class="action-btn" onclick={addWebService}>{m.webservices_add()}</button>
+              </div>
+              <!-- Annotates the Address field above it, so it stays with the
+                   form instead of floating between the form and the buttons. -->
+              <span class="hint">{m.webservices_placeholders()}</span>
+
+              <div class="webservice-actions">
+                {#if canAddExample}
+                  <button class="action-btn ghost" onclick={addExampleWebService}>
+                    {m.webservices_add_example()}
+                  </button>
+                {/if}
+                <button class="action-btn ghost" onclick={handleImportWebServices}>
+                  {m.webservices_import()}
+                </button>
+              </div>
+            </div>
+            {#if webServiceMessage}
+              <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
+                {webServiceMessage.text}
+              </span>
             {/if}
           </div>
         </div>
@@ -4008,6 +4228,116 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+  }
+  /* Web services list + add form. */
+  .webservice-intro {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .webservice-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  /* `--bg-surface` rather than `--bg-secondary`, which is the card's own
+     colour: a row painted in it reads as a hairline outline on the card
+     instead of an object sitting on it. Matches `.ignored-list li`, the other
+     removable-entry list on this page. */
+  .webservice-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: border-color var(--transition-fast) ease;
+  }
+  .webservice-row:hover {
+    border-color: var(--accent-dim);
+  }
+  .webservice-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .webservice-name {
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* A URL is long and is the part worth inspecting, so it truncates rather
+     than wrapping the row to three lines; the full value is in the row's
+     `title`. Monospaced to match the Address field it was typed into, which
+     is also what makes a `#hashid` placeholder legible as a placeholder. */
+  .webservice-url {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Removing is the one destructive control here, and the shared hover turns
+     everything accent-coloured. */
+  .webservice-remove {
+    flex-shrink: 0;
+  }
+  .webservice-remove:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .webservice-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .webservice-add {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .webservice-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 140px;
+  }
+  .webservice-field-url {
+    flex: 1;
+    min-width: 220px;
+  }
+  .webservice-field input {
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    padding: 6px 8px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .webservice-field input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  /* Secondary ways in, so they sit further from the form than its own note. */
+  .webservice-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
   }
   .antileech-path {
     font-size: 11px;

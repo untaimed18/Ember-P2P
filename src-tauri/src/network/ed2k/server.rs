@@ -102,6 +102,35 @@ pub const SRV_TCPFLG_TCPOBFUSCATION: u32 = 0x0400;
 /// LowID threshold: client_id < this means LowID
 pub const LOWID_THRESHOLD: u32 = 0x0100_0000;
 
+/// Process-wide mirror of whether the connected server advertises
+/// [`SRV_TCPFLG_RELATEDSEARCH`].
+///
+/// The authoritative value lives in [`ServerSession::server_flags`], which only
+/// the network task can reach. The "find related files" planner runs in a Tauri
+/// command and has to know, before any search starts, whether eMule's native
+/// co-share request is available — that decides both what the UI tells the user
+/// and whether seed hashes are worth sending at all. Following
+/// `SHARE_BROWSING_ALLOWED` in `messages.rs`, one atomic is cheaper than
+/// threading a server snapshot into the command layer, and there is nothing
+/// per-caller about the answer.
+static RELATED_SEARCH_SUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mirror the connected server's co-share capability. Called with the server's
+/// TCP flags on login and on every `OP_IDCHANGE`, and with `0` on disconnect.
+pub fn set_server_flags_mirror(server_flags: u32) {
+    RELATED_SEARCH_SUPPORTED.store(
+        server_flags & SRV_TCPFLG_RELATEDSEARCH != 0,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Whether the connected server can answer eMule's `related::<HASH>` co-share
+/// request. False when no server is connected.
+pub fn related_search_supported() -> bool {
+    RELATED_SEARCH_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file to offer to the ed2k server via OP_OFFERFILES.
 pub struct OfferFile {
     pub hash: [u8; 16],

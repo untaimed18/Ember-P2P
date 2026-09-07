@@ -30,13 +30,14 @@
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
+  import { startRelatedSearch } from '$lib/relatedSearch';
   import { pickAndLoadCollection, createCollectionWithDialog, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import {
     incomingCollection,
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
@@ -51,6 +52,10 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
+  import { serviceAvailableFor } from '$lib/webServices';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
 
   // All three are replace-only — never mutated in place — so `$state.raw`
@@ -60,7 +65,21 @@
   // switch back to `$state` rather than mutating these.
   let folders: string[] = $state.raw([]);
   let folderPriorities: Record<string, string> = $state.raw({});
-  let files: FileInfo[] = $state.raw([]);
+  /** A library row plus the three keys the filter chain would otherwise derive
+   *  from it on every pass.
+   *
+   *  `matchName`, `matchType` and `matchPath` are pure functions of fields that
+   *  never change without a whole new `files` array arriving, but the filter
+   *  re-ran on every keystroke and every filter toggle — allocating a
+   *  lowercased name, a separator-rewritten lowercased path, and re-walking six
+   *  extension sets, once per row per pass. Deriving them where the array is
+   *  assigned makes those passes read instead of allocate. */
+  type LibraryRow = FileInfo & {
+    matchName: string;
+    matchType: TypeFilter | '';
+    matchPath: string;
+  };
+  let files: LibraryRow[] = $state.raw([]);
   let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
   let scanTruncated = $state(false);
@@ -537,6 +556,22 @@
       || normalizedFilePath.startsWith(`${normalizedFolderPath}/`);
   }
 
+  /** Attach the filter chain's derived keys to a freshly fetched row. */
+  function withMatchKeys(f: FileInfo): LibraryRow {
+    return {
+      ...f,
+      matchName: f.name.toLowerCase(),
+      matchType: fileTypeKey(f.extension),
+      matchPath: normalizePathForMatch(f.path),
+    };
+  }
+
+  /** `isPathInFolder` against a row whose path is already normalized. */
+  function rowInFolder(row: LibraryRow, normalizedFolder: string): boolean {
+    return row.matchPath === normalizedFolder
+      || row.matchPath.startsWith(`${normalizedFolder}/`);
+  }
+
   function pathsEqualForFolder(a: string, b: string): boolean {
     return normalizePathForMatch(a) === normalizePathForMatch(b);
   }
@@ -606,9 +641,23 @@
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let loadGen = 0;
 
+  /** Coalescing window for `shared-files-changed` while a scan is running.
+   *
+   *  A refresh re-fetches the *entire* library over IPC — `get_shared_files`
+   *  returns every indexed row, and discovery allows up to 100,000 per folder —
+   *  then recomputes every derived view over it. Hashing emits
+   *  `shared-files-changed` continuously, so the 300 ms window meant a large
+   *  library was serialised, transferred and re-derived three times a second
+   *  for the whole run. Nothing on screen changes usefully at that rate: the
+   *  scan banner has its own progress events, and the scan-completion poll
+   *  pulls a final snapshot regardless. */
+  const SCAN_REFRESH_DEBOUNCE_MS = 3000;
+  const IDLE_REFRESH_DEBOUNCE_MS = 300;
+
   function debouncedRefresh() {
     if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
+    const delay = scanning ? SCAN_REFRESH_DEBOUNCE_MS : IDLE_REFRESH_DEBOUNCE_MS;
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, delay);
   }
 
   async function refresh(force = false) {
@@ -647,7 +696,7 @@
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
-      files = newFiles;
+      files = newFiles.map(withMatchKeys);
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
@@ -996,10 +1045,13 @@
     const dupOnly = showDuplicatesOnly;
     const missOnly = showMissingOnly;
     if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly) return files;
+    // Normalized once per pass rather than once per row: `isPathInFolder`
+    // re-derived it from `folder` on every call.
+    const normalizedFolder = hasFolder ? normalizePathForMatch(folder!) : '';
     return files.filter((f) => {
-      if (hasFolder && !isPathInFolder(f.path, folder!)) return false;
-      if (hasQuery && !f.name.toLowerCase().includes(q)) return false;
-      if (hasType && fileTypeKey(f.extension) !== typeFilter) return false;
+      if (hasFolder && !rowInFolder(f, normalizedFolder)) return false;
+      if (hasQuery && !f.matchName.includes(q)) return false;
+      if (hasType && f.matchType !== typeFilter) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
       return true;
@@ -1432,7 +1484,7 @@
       sizes.set(folder, 0);
     }
     for (const f of files) {
-      const np = normalizePathForMatch(f.path);
+      const np = f.matchPath;
       for (const { folder, norm } of normalizedFolders) {
         if (np === norm || np.startsWith(`${norm}/`)) {
           counts.set(folder, (counts.get(folder) ?? 0) + 1);
@@ -1727,9 +1779,23 @@
 
   // --- Context menu ---
   let ctxMenu: { x: number; y: number; file: FileInfo } | null = $state(null);
+  /**
+   * eMule's `CanSearchRelatedFiles()`: a connected server that advertises
+   * `SRV_TCPFLG_RELATEDSEARCH`. It greys "Search Related Files" out otherwise,
+   * because the co-share request has nowhere to go, and so do we — the search
+   * only ever asks that one connection (see `RELATED_SEARCH_METHOD`).
+   *
+   * A capability we haven't been able to read yet counts as allowed — see
+   * `relatedSearchSupported`.
+   */
+  let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
+  let ctxWebSub = $state(false);
+  // Empty until settings load, so the submenu shows its "configure in Settings"
+  // hint rather than a stale list.
+  let webServices = $derived($appSettings?.web_services ?? []);
   /** Friends currently online, so "Send to Friend" only lists reachable ones. */
   let sendableFriends: { user_hash: string; nickname: string }[] = $state([]);
 
@@ -1751,44 +1817,21 @@
       sendableFriends = [];
     }
   }
-  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
-  let ctxSubmenuLeft = $state(false);
-  let ctxSubmenuUp = $state(false);
-
-  async function positionCtxMenu() {
-    if (!ctxMenu) return;
-    await tick();
-    if (!ctxMenu || !ctxMenuEl) return;
-    const margin = 8;
-    // Use offsetWidth/offsetHeight (untransformed layout size) rather than
-    // getBoundingClientRect(), whose width/height reflect the entrance scale
-    // animation mid-flight and would clamp the menu a few px off near edges.
-    const menuW = ctxMenuEl.offsetWidth;
-    const menuH = ctxMenuEl.offsetHeight;
-    const x = Math.min(ctxMenu.x, Math.max(margin, window.innerWidth - menuW - margin));
-    const y = Math.min(ctxMenu.y, Math.max(margin, window.innerHeight - menuH - margin));
-    ctxSubmenuLeft = x + menuW * 2 > window.innerWidth - margin;
-    ctxSubmenuUp = y + 240 > window.innerHeight - margin;
-    if (x !== ctxMenu.x || y !== ctxMenu.y) {
-      ctxMenu = { ...ctxMenu, x, y };
-    }
-  }
-
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxPrioritySub = false;
     ctxCopySub = false;
     // Highlight the target row without opening the properties drawer
     // (drawer stays tied to left-click / Properties menu item).
+    // `ctxMenuPosition` measures the panel and keeps it inside the viewport;
+    // the submenus pick their own side via `ctxSubmenuPlacement`.
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
-    void positionCtxMenu();
   }
   function closeCtx() {
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
-    ctxSubmenuLeft = false;
-    ctxSubmenuUp = false;
+    ctxWebSub = false;
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
@@ -2075,6 +2118,46 @@
           break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
+        // The backend reads the template from settings by index and does the
+        // substituting, and collects the native confirmation — so there is
+        // deliberately no prompt here and no URL built in this renderer.
+        case 'web_service': {
+          if (!extra) break;
+          const index = Number(extra);
+          if (!Number.isInteger(index)) break;
+          await openWebService(index, f.hash, f.name, f.size);
+          break;
+        }
+        case 'find_related':
+        case 'find_related_selected': {
+          // Tags earn a probe of their own, so it is worth one metadata read
+          // here: an album track's filename is often a bare track number, and
+          // the artist/album a search result carries in `result.media` is
+          // exactly what lets the planner ask for the rest of the album.
+          // `selectedMedia` is no use — it belongs to the selection, which a
+          // right-click need not have moved, and lands 200ms later anyway.
+          const media = await getFileMediaMetadata(f.path).catch(() => null);
+          // eMule's menu item acts on the whole selection, and one co-share
+          // request can name several hashes. The clicked row leads: the plan
+          // derives its keyword probes from the first seed's name and tags, so
+          // that is the only file whose metadata is worth reading — the rest
+          // ride along as hashes for the server's co-share question.
+          const alsoChecked =
+            action === 'find_related_selected'
+              ? getCheckedFiles().filter((c) => c.path !== f.path)
+              : [];
+          // Navigates to Search on success, so nothing after this runs here.
+          await startRelatedSearch([
+            {
+              hash: f.hash,
+              name: f.name,
+              artist: media?.artist ?? null,
+              album: media?.album ?? null,
+            },
+            ...alsoChecked.map((c) => ({ hash: c.hash, name: c.name })),
+          ]);
+          break;
+        }
         case 'delete': {
           const confirmed = await askConfirm(
             m.library_confirm_delete_single({ name: f.name }),
@@ -3644,46 +3727,62 @@
 <!-- Context menu -->
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
-  <div bind:this={ctxMenuEl} class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
+  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+    <div class="ctx-header" role="presentation">
+      <bdi dir="auto">{ctxMenu.file.name}</bdi>
+    </div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
-    <div class="ctx-sep"></div>
+    <div class="ctx-sep" role="separator"></div>
     {#if fileHashed}
       <div
-        class="ctx-item ctx-sub-parent"
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxPrioritySub}
         role="menuitem"
         tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxPrioritySub}
         onmouseenter={() => ctxPrioritySub = true}
         onmouseleave={() => ctxPrioritySub = false}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
       >
-        {m.library_col_priority()} &raquo;
+        {m.library_col_priority()}
+        <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
         {#if ctxPrioritySub}
-          <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
-            <div class="ctx-sep"></div>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each ['verylow', 'low', 'normal', 'high', 'release'] as prio}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={ctxMenu.file.priority === prio}
+                onclick={() => ctxAction('priority', prio)}
+              >{priorityLabel(prio)}</button>
+            {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button
+              class="ctx-item"
+              role="menuitemradio"
+              aria-checked={ctxMenu.file.priority === 'auto'}
+              onclick={() => ctxAction('priority', 'auto')}
+            >{m.library_priority_auto()}</button>
           </div>
         {/if}
       </div>
-      <div class="ctx-sep"></div>
       <div
-        class="ctx-item ctx-sub-parent"
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxCopySub}
         role="menuitem"
         tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxCopySub}
         onmouseenter={() => ctxCopySub = true}
         onmouseleave={() => ctxCopySub = false}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxCopySub = true; }}
       >
-        {m.servers_copy_ed2k_link()} &raquo;
+        {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
-          <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.library_copy_link_plain()}</button>
             {#if ctxMenu.file.aich_hash}
               <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'aich')}>{m.library_copy_link_aich()}</button>
@@ -3692,19 +3791,72 @@
           </div>
         {/if}
       </div>
-      <div class="ctx-sep"></div>
+      <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        onclick={() => ctxAction('find_related')}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+      >{m.search_ctx_find_related()}</button>
+      <!-- eMule's right-click → Web services. Shown even when nothing is
+           configured, so the feature is discoverable from the file it applies
+           to rather than only from Settings. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <div
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxWebSub}
+        role="menuitem"
+        tabindex="-1"
+        aria-haspopup="menu"
+        aria-expanded={ctxWebSub}
+        onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+      >
+        {m.webservices_ctx_menu()}
+        {#if ctxWebSub}
+          {@const hash = ctxMenu.file.hash ?? ''}
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each webServices as service, index (service.url)}
+              {@const usable = serviceAvailableFor(service.url, hash)}
+              <button
+                class="ctx-item"
+                role="menuitem"
+                disabled={!usable}
+                title={usable ? service.url : m.webservices_ctx_no_hash()}
+                onclick={() => ctxAction('web_service', String(index))}
+              ><bdi dir="auto">{service.name}</bdi></button>
+            {/each}
+            {#if webServices.length === 0}
+              <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.webservices_ctx_none()}</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+      {#if checkedCount > 1}
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!relatedSearchReady}
+          onclick={() => ctxAction('find_related_selected')}
+          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+      {/if}
+      <div class="ctx-sep" role="separator"></div>
       {#if ctxMenu.file.shared}
         <div
-          class="ctx-item ctx-sub-parent"
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxSendSub}
           role="menuitem"
           tabindex="0"
+          aria-haspopup="menu"
+          aria-expanded={ctxSendSub}
           onmouseenter={() => { ctxSendSub = true; void loadSendableFriends(); }}
           onmouseleave={() => ctxSendSub = false}
           onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') { ctxSendSub = true; void loadSendableFriends(); } }}
         >
-          {m.library_send_to_friend()} &raquo;
+          {m.library_send_to_friend()}
           {#if ctxSendSub}
-            <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+            <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
               {#if sendableFriends.length === 0}
                 <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_send_no_friends_online()}</button>
               {:else}
@@ -3727,8 +3879,8 @@
         >{m.library_republish_kad()}{$networkStats.status !== 'connected' ? m.library_republish_offline_suffix() : ''}</button>
         <button
           class="ctx-item"
-          role="menuitem"
-          class:ctx-checked={ctxMenu.file.friends_only}
+          role="menuitemcheckbox"
+          aria-checked={!!ctxMenu.file.friends_only}
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
@@ -3739,6 +3891,8 @@
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
+    <div class="ctx-sep" role="separator"></div>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
   </div>
 {/if}
 
@@ -4423,70 +4577,7 @@
     white-space: nowrap;
   }
 
-  /* --- Context menu --- */
-  .ctx-menu {
-    position: fixed;
-    z-index: 9999;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 180px;
-    box-shadow: var(--shadow-lg);
-    font-size: 12px;
-    transform-origin: top left;
-    animation: ctx-menu-pop 0.12s ease;
-  }
-  @keyframes ctx-menu-pop {
-    from { opacity: 0; transform: scale(0.97); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  .ctx-item {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 5px 16px;
-    cursor: pointer;
-    white-space: nowrap;
-    position: relative;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: inherit;
-    font: inherit;
-    font-size: 12px;
-    line-height: inherit;
-  }
-  .ctx-item:hover { background: var(--bg-hover); color: var(--text-primary); }
-  .ctx-item.ctx-danger { color: var(--danger); }
-  .ctx-item.ctx-danger:hover {
-    background: color-mix(in srgb, var(--danger) 14%, var(--bg-hover));
-    color: var(--danger);
-  }
-  .ctx-sep { height: 1px; margin: 4px 0; background: var(--border); }
-  .ctx-checked::before { content: '\2713  '; }
-  .ctx-sub-parent { padding-right: 24px; }
-  .ctx-disabled { color: var(--text-muted); cursor: default; }
-  .ctx-disabled:hover { background: none; color: var(--text-muted); }
-  .ctx-submenu {
-    position: absolute;
-    left: 100%;
-    top: 0;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 4px;
-    min-width: 140px;
-    box-shadow: var(--shadow-lg);
-  }
-  .ctx-submenu.ctx-submenu-left {
-    left: auto;
-    right: 100%;
-  }
-  .ctx-submenu.ctx-submenu-up {
-    top: auto;
-    bottom: 0;
-  }
+  /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   /* --- Filter bar --- */
   .filter-bar {

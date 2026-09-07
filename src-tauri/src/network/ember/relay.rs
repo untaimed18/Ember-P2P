@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MSG_RELAY_REQUEST: u8 = 0x01;
 const MSG_RELAY_ACCEPT: u8 = 0x02;
@@ -1542,6 +1542,187 @@ fn is_public_relay_target(ip: Ipv4Addr) -> bool {
     !crate::security::is_special_use_v4(ip)
 }
 
+/// Why a signed RELAY_REQUEST may not be served, or `None` when it may.
+/// Decides only who is asking; the destination is judged by
+/// [`relay_target_refusal`] and capacity by [`RelayManager::create_session`].
+///
+/// `connection_node_id` is the identity recovered from the certificate quinn
+/// proved possession of during the QUIC handshake, `signed_ember_hash` the
+/// identity bound into the request's signature, and `is_friend` whether that
+/// identity is in the user's friend list.
+///
+/// Two things have to hold. First, the connection must belong to the identity
+/// that signed: the signature alone proves possession of *an* Ember key at
+/// some point in the past, and the whole signed payload is replayable by
+/// anyone holding a copy of it once its nonce falls out of the per-identity
+/// replay cache (that cache evicts rather than refuses, by design — see
+/// [`RelayManager::consume_request_nonce`]). Both values are
+/// `BLAKE3(ed25519_pub)[..16]`, so comparing them is exact.
+///
+/// Second, the requester must be a friend. Carrying someone else's transfer
+/// spends this node's uplink, a session slot and a QUIC connection to a
+/// caller-chosen address; possession of the relay attestation hash is not a
+/// relationship that justifies that, because attestations are gossiped onward
+/// in EPX relay-offer blocks and so reach every peer that has seen one of ours
+/// and every peer *they* passed it to. Server-side relay is already
+/// friends-only, so this keeps the two transports on one policy. Strangers
+/// still use this endpoint for the relay-target handoff and hole-punched
+/// direct connections; neither goes through this gate.
+fn relay_requester_refusal(
+    connection_node_id: Option<[u8; 16]>,
+    signed_ember_hash: [u8; 16],
+    is_friend: bool,
+) -> Option<&'static str> {
+    if connection_node_id != Some(signed_ember_hash) {
+        return Some("signed identity is not the connection's authenticated node id");
+    }
+    if !is_friend {
+        return Some("requester is not a friend");
+    }
+    None
+}
+
+/// Why a RELAY_REQUEST's target may not be dialled, or `None` when it may.
+///
+/// Every constraint on the destination has to be decided here: once
+/// `connect_relay_target` hands back its streams the session is a raw byte
+/// pipe with no further checkpoint, and the destination is whatever the
+/// *initiator* named — never an address this node discovered for itself.
+/// The reason is returned as text so a refusal log identifies the rule that
+/// fired, which `REJECT_BAD_TARGET` alone cannot (a port-0 typo and a
+/// deliberate LAN probe are the same byte on the wire).
+///
+/// Deliberately *not* decided here: the operator's `ipfilter.dat` ranges and
+/// the enforced ban set. Both live on the network task's `NetworkState` and
+/// the QUIC accept task holds no shared handle to either, so an address the
+/// operator has explicitly blocked is currently kept out only by the friend
+/// gate applied to the *requester* on the RELAY_REQUEST path. Threading a
+/// `kad::ip_filter::SharedIpFilter` plus an `ed2k::upload::SharedBannedIps`
+/// into this function — both are already published for the upload listener,
+/// which applies exactly this pair to inbound eD2K TCP — is what closes the
+/// remaining half: without it a friend can still name a blocked host and the
+/// relay will dial it.
+fn relay_target_refusal(
+    target_ip: Ipv4Addr,
+    target_port: u16,
+    requester: SocketAddr,
+) -> Option<&'static str> {
+    if target_port == 0 {
+        return Some("port 0 is not a dialable endpoint");
+    }
+    if !is_public_relay_target(target_ip) {
+        return Some("not a globally-routable unicast address");
+    }
+    // A request naming the address it arrived from asks this node to dial the
+    // requester back and bridge it to itself. No honest transfer needs that,
+    // and serving it spends a session slot plus two directions of
+    // `RELAY_MAX_BYTES_PER_DIRECTION` looping a peer's own bytes. The remote
+    // is unwrapped through `to_ipv4_mapped` so a dual-stack accept reporting
+    // `::ffff:a.b.c.d` compares equal to the four octets on the wire.
+    let requester_v4 = match requester.ip() {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    };
+    if requester_v4 == Some(target_ip) && requester.port() == target_port {
+        return Some("target is the requester's own address");
+    }
+    None
+}
+
+/// The operator's own address policy, as the QUIC accept path sees it.
+///
+/// `ipfilter.dat` and the enforced ban set live on the network task's
+/// `NetworkState`, which this task has no access to — so both are published
+/// here as the same shared handles the eD2K TCP listener already reads, and for
+/// the same reason. Without them the Ember transport quietly ignored every
+/// range and every ban the user configured: a blocked host could open a QUIC
+/// session, and a friend could name one as a relay target and have this node
+/// dial it.
+#[derive(Clone)]
+pub struct RelayAddressPolicy {
+    pub ip_filter: crate::network::kad::ip_filter::SharedIpFilter,
+    pub banned_ips: crate::network::ed2k::upload::SharedBannedIps,
+    /// Mirrors `AppSettings::filter_incoming_connections`, read per connection
+    /// so the Security page's toggle takes effect without a restart.
+    pub filter_incoming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RelayAddressPolicy {
+    /// Why an inbound peer at `ip` may not be admitted, or `None` when it may.
+    ///
+    /// The filter honours `filter_incoming_connections` because that toggle is
+    /// precisely a statement about inbound traffic; the ban set does not,
+    /// because a ban is never conditional. Both fail closed on a poisoned
+    /// lock, matching the eD2K accept loop: a policy that cannot be read has
+    /// to be treated as "refuse", or a panic elsewhere silently disables it.
+    fn inbound_refusal(&self, ip: Ipv4Addr) -> Option<&'static str> {
+        if self
+            .filter_incoming
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.ip_filter_blocks(ip)
+        {
+            return Some("address is blocked by ipfilter.dat");
+        }
+        self.ban_refusal(ip)
+    }
+
+    /// Why an outbound dial to `ip` may not be made, or `None` when it may.
+    ///
+    /// Unconditional on the filter, unlike [`Self::inbound_refusal`]: an
+    /// outbound connection is always filtered (see
+    /// `AppSettings::filter_incoming_connections`, whose "off" position means
+    /// "outbound only"). This matters most for a relay target, which is an
+    /// address a *remote* peer chose and this node dials on its behalf.
+    fn outbound_refusal(&self, ip: Ipv4Addr) -> Option<&'static str> {
+        if self.ip_filter_blocks(ip) {
+            return Some("target is blocked by ipfilter.dat");
+        }
+        self.ban_refusal(ip)
+    }
+
+    /// Note that `IpFilterSnapshot::is_blocked` reports *everything* blocked
+    /// while the filter is enabled but its ranges have not been applied yet
+    /// (`enabled && !ranges_ready`). That is deliberate there, and it means
+    /// relaying is unavailable for the short window between enabling the filter
+    /// and `ipfilter.dat` being loaded or confirmed absent — the same
+    /// fail-closed window inbound eD2K TCP sits in, and a better answer than
+    /// serving a peer the list would have rejected.
+    fn ip_filter_blocks(&self, ip: Ipv4Addr) -> bool {
+        match self.ip_filter.read() {
+            Ok(snapshot) => snapshot.is_blocked(ip),
+            Err(_poisoned) => {
+                warn!("IP filter lock poisoned while checking {ip} for Ember QUIC; refusing");
+                true
+            }
+        }
+    }
+
+    fn ban_refusal(&self, ip: Ipv4Addr) -> Option<&'static str> {
+        match self.banned_ips.read() {
+            Ok(banned) => banned.contains(&ip).then_some("address is banned"),
+            Err(_poisoned) => {
+                warn!("Ban list lock poisoned while checking {ip} for Ember QUIC; refusing");
+                Some("ban list is unreadable")
+            }
+        }
+    }
+}
+
+/// The IPv4 view of a QUIC peer address, unwrapping the `::ffff:a.b.c.d` form a
+/// dual-stack socket reports so address policy sees the four octets on the wire.
+///
+/// `None` for a native IPv6 peer, which callers treat as "no policy to apply"
+/// rather than as a refusal. That is not a gap being waved through: both
+/// `ipfilter.dat` ranges and the enforced ban set are keyed by `Ipv4Addr`, so
+/// there is literally nothing configured for such a peer to match. Giving
+/// either structure an IPv6 half is what would make a refusal meaningful here.
+fn quic_peer_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
+    match addr {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    }
+}
+
 /// Maximum number of in-flight QUIC accept tasks. The semaphore is
 /// taken **before** spawning to bound pre-auth work — without this,
 /// a peer flooding QUIC connections could exhaust scheduler/memory
@@ -1704,6 +1885,7 @@ pub async fn run_quic_accept_loop(
         crate::network::ed2k::upload::InboundStreamRequest,
     >,
     friend_hashes: crate::app_state::SharedFriendHashes,
+    address_policy: RelayAddressPolicy,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
@@ -1737,6 +1919,17 @@ pub async fn run_quic_accept_loop(
         }
 
         let remote_ip = incoming.remote_address().ip();
+        // Before any per-IP accounting or handshake work: the operator's filter
+        // and ban list apply to this transport exactly as they do to inbound
+        // eD2K TCP. `refuse()` rather than `retry()` — a blocked peer is not
+        // being asked to prove its address, it is being turned away.
+        if let Some(peer_v4) = quic_peer_ipv4(remote_ip) {
+            if let Some(reason) = address_policy.inbound_refusal(peer_v4) {
+                debug!("QUIC accept: refusing inbound from {remote_ip}: {reason}");
+                incoming.refuse();
+                continue;
+            }
+        }
         {
             let mut counts = pending_ip_counts.lock();
             let count = counts.entry(remote_ip).or_insert(0);
@@ -1778,6 +1971,7 @@ pub async fn run_quic_accept_loop(
         let cb_tx = inbound_stream_tx.clone();
         let friends = friend_hashes.clone();
         let active_counts = active_session_counts.clone();
+        let policy = address_policy.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
             let pending_ip_guard = pending_ip_guard;
@@ -1919,10 +2113,34 @@ pub async fn run_quic_accept_loop(
                         }
                     };
 
-                // Refuse to relay to non-public destinations (SSRF/scan guard).
-                if verified.target_port == 0 || !is_public_relay_target(verified.target_ip) {
+                // Who is asking decides whether we relay at all: a valid
+                // signature over a public attestation hash is not authority to
+                // spend this node's uplink on a caller-chosen destination.
+                if let Some(reason) = relay_requester_refusal(
+                    peer_node_id,
+                    verified.requester_ember_hash,
+                    known_friend,
+                ) {
                     debug!(
-                        "QUIC accept: refusing relay to non-public target {}:{} from {remote}",
+                        "QUIC accept: refusing relay request from {remote} ({}): {reason}",
+                        hex::encode(verified.requester_ember_hash)
+                    );
+                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
+                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    return;
+                }
+
+                // Refuse destinations we must not dial (SSRF/scan guard), and
+                // then the ones the operator has told us not to reach: a relay
+                // target is an outbound dial to an address a *remote* peer
+                // chose, so `ipfilter.dat` applies unconditionally here — the
+                // `filter_incoming_connections` toggle is about inbound only.
+                if let Some(reason) =
+                    relay_target_refusal(verified.target_ip, verified.target_port, remote)
+                        .or_else(|| policy.outbound_refusal(verified.target_ip))
+                {
+                    debug!(
+                        "QUIC accept: refusing relay to target {}:{} from {remote}: {reason}",
                         verified.target_ip, verified.target_port
                     );
                     let reject = build_relay_reject(peer_session_id, REJECT_BAD_TARGET);
@@ -2012,7 +2230,13 @@ pub async fn run_quic_accept_loop(
 
                 let target_result = tokio::time::timeout(
                     RELAY_TARGET_CONNECT_TIMEOUT,
-                    connect_relay_target(&ep, target_addr, session_id, &file_hash),
+                    connect_relay_target(
+                        &ep,
+                        target_addr,
+                        session_id,
+                        &file_hash,
+                        verified.requester_ember_hash,
+                    ),
                 )
                 .await;
 
@@ -2196,17 +2420,50 @@ pub async fn run_quic_accept_loop(
 
 /// Connect to a target peer for relay bridging. Sends RELAY_CONNECT to
 /// inform the target that this is a relayed connection.
+///
+/// `requester_node_id` is the handshake-proven identity of the peer that asked
+/// for the bridge, used to establish that the far end is somebody else.
 async fn connect_relay_target(
     endpoint: &quinn::Endpoint,
     target_addr: SocketAddr,
     session_id: u32,
     file_hash: &[u8; 16],
+    requester_node_id: [u8; 16],
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     let conn = endpoint
         .connect(target_addr, "ember-relay")
         .map_err(|e| format!("target connect error: {e}"))?
         .await
         .map_err(|e| format!("target QUIC handshake failed with {target_addr}: {e}"))?;
+
+    // The completed handshake is the last point at which the far end can be
+    // identified: after this the session is an opaque byte pipe. The initiator
+    // supplied only an address, so recover who actually answered there from
+    // the certificate quinn has already proved possession of, rather than
+    // treating "something completed TLS on that port" as the target.
+    //
+    // The v2 RELAY_REQUEST carries no expected node id for the target, so this
+    // cannot yet be a pin — an initiator that names the wrong address reaches
+    // whichever Ember node lives there. Extending the request to carry the
+    // target's node id (the initiator learns it from the same source metadata
+    // it dials) would let this comparison become an equality check and remove
+    // the last caller-chosen degree of freedom from the dial.
+    let Some(target_node_id) = super::quic::connection_node_id(&conn) else {
+        conn.close(0u32.into(), b"relay target has no ember identity");
+        return Err(format!(
+            "target {target_addr} has no verifiable Ember identity"
+        ));
+    };
+    // A target that turns out to be the requester itself — same identity on a
+    // different address, so the address-level check on the accept path cannot
+    // see it — is asking this node to loop its bytes back to it, at the cost
+    // of a session slot and two directions of `RELAY_MAX_BYTES_PER_DIRECTION`.
+    if target_node_id == requester_node_id {
+        conn.close(0u32.into(), b"relay target is the requester");
+        return Err(format!(
+            "target {target_addr} is the requesting peer itself"
+        ));
+    }
 
     let (mut send, recv) = conn
         .open_bi()
@@ -2417,6 +2674,112 @@ mod tests {
         );
         let (_, sid, payload) = decode_relay_message(&msg).unwrap();
         assert!(parse_and_verify_relay_request_v2(sid, payload).is_err());
+    }
+
+    /// A verified signature is proof of identity, not of a relationship. The
+    /// attestation hash a requester signs over is gossiped in EPX relay-offer
+    /// blocks, so treating a valid v2 request as sufficient made the relay an
+    /// open Ember-QUIC proxy for anyone who had ever seen one.
+    #[test]
+    fn relay_requester_refusal_requires_a_bound_friend_identity() {
+        let friend = [0x11u8; 16];
+        let stranger = [0x22u8; 16];
+
+        assert_eq!(relay_requester_refusal(Some(friend), friend, true), None);
+
+        // Knowing the hash is not enough without the friendship.
+        assert!(relay_requester_refusal(Some(stranger), stranger, false).is_some());
+        // Nor is claiming a friend's identity from a connection that cannot
+        // produce its key — the replayed-request case.
+        assert!(relay_requester_refusal(Some(stranger), friend, true).is_some());
+        // A connection with no recoverable Ember identity can never match.
+        assert!(relay_requester_refusal(None, friend, true).is_some());
+    }
+
+    /// The destination is entirely initiator-chosen, so these rules are the
+    /// only thing standing between a relay request and a QUIC connection to
+    /// an address of the requester's choosing.
+    #[test]
+    fn relay_target_refusal_rejects_unroutable_and_self_bridge_targets() {
+        let requester: SocketAddr = "198.51.100.7:4662".parse().unwrap();
+        let public = Ipv4Addr::new(8, 8, 8, 8);
+
+        assert_eq!(relay_target_refusal(public, 4662, requester), None);
+        assert!(relay_target_refusal(public, 0, requester).is_some());
+        assert!(relay_target_refusal(Ipv4Addr::new(10, 0, 0, 5), 4662, requester).is_some());
+        assert!(relay_target_refusal(Ipv4Addr::LOCALHOST, 4662, requester).is_some());
+        assert!(relay_target_refusal(Ipv4Addr::new(169, 254, 1, 1), 4662, requester).is_some());
+
+        // Bridging a peer to its own endpoint carries nothing.
+        let looping: SocketAddr = "8.8.8.8:4662".parse().unwrap();
+        assert!(relay_target_refusal(public, 4662, looping).is_some());
+        // Same peer as a dual-stack accept reports it.
+        let mapped: SocketAddr = "[::ffff:8.8.8.8]:4662".parse().unwrap();
+        assert!(relay_target_refusal(public, 4662, mapped).is_some());
+        // A second client on that host is still a distinct endpoint, so the
+        // self-bridge rule must key off the full address, not just the IP.
+        assert_eq!(relay_target_refusal(public, 4670, looping), None);
+    }
+
+    /// The operator's `ipfilter.dat` and ban list are configured once and are
+    /// expected to hold for every transport. The Ember QUIC path consulted
+    /// neither, so a blocked host could open a session, and a relay target —
+    /// an address a remote peer names for this node to dial — was checked only
+    /// for being publicly routable.
+    #[test]
+    fn address_policy_applies_the_operators_filter_and_bans() {
+        use crate::network::kad::ip_filter::IpFilterSnapshot;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let blocked = Ipv4Addr::new(203, 0, 113, 9);
+        let allowed = Ipv4Addr::new(8, 8, 8, 8);
+        let banned = Ipv4Addr::new(198, 51, 100, 4);
+        let range = u32::from(blocked);
+
+        let policy = RelayAddressPolicy {
+            ip_filter: std::sync::Arc::new(std::sync::RwLock::new(IpFilterSnapshot {
+                ranges: vec![(range, range)],
+                range_hits: vec![AtomicU64::new(0)],
+                enabled: true,
+                block_private: true,
+                ranges_ready: true,
+                hit_counter: AtomicU64::new(0),
+                special_hit_counter: AtomicU64::new(0),
+            })),
+            banned_ips: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::from([banned]),
+            )),
+            filter_incoming: std::sync::Arc::new(AtomicBool::new(false)),
+        };
+
+        // Inbound filtering is what `filter_incoming_connections` governs, so
+        // with it off a filtered range may still connect to us…
+        assert_eq!(policy.inbound_refusal(blocked), None);
+        // …while an outbound dial is filtered unconditionally, which is the
+        // case that matters for a caller-chosen relay target.
+        assert!(policy.outbound_refusal(blocked).is_some());
+
+        policy
+            .filter_incoming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(policy.inbound_refusal(blocked).is_some());
+
+        // A ban is never conditional on that toggle, in either direction.
+        policy
+            .filter_incoming
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(policy.inbound_refusal(banned).is_some());
+        assert!(policy.outbound_refusal(banned).is_some());
+
+        assert_eq!(policy.inbound_refusal(allowed), None);
+        assert_eq!(policy.outbound_refusal(allowed), None);
+
+        // A dual-stack accept reports IPv4 peers as `::ffff:a.b.c.d`; policy
+        // has to see the four octets, or every check silently passes.
+        assert_eq!(
+            quic_peer_ipv4("::ffff:198.51.100.4".parse().unwrap()),
+            Some(banned)
+        );
     }
 
     #[test]

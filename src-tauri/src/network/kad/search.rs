@@ -1192,10 +1192,10 @@ pub struct SearchManager {
 impl SearchManager {
     fn reuses_existing_search(search_type: SearchType) -> bool {
         // FindSource is intentionally *not* reused across callers: each
-        // download (and each find_sources IPC) owns its own search id so
-        // `download_source_searches` / `pending_source_searches` cannot be
-        // overwritten when a second transfer looks up the same hash. FindNode
-        // / FindBuddy are still safe to coalesce (no per-caller result map).
+        // download owns its own search id so its `download_source_searches`
+        // entry cannot be overwritten when a second transfer looks up the same
+        // hash. FindNode / FindBuddy are still safe to coalesce (no per-caller
+        // result map).
         matches!(search_type, SearchType::FindNode | SearchType::FindBuddy)
     }
 
