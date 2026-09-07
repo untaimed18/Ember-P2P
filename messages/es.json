@@ -143,6 +143,7 @@
   "ember_stat_store_reject_publisher_cap": "STORE rechazado: tope de publicador",
   "ember_stat_store_reject_per_key_cap": "STORE rechazado: tope de clave",
   "ember_stat_store_reject_proximity": "STORE rechazado: proximidad",
+  "ember_stat_keyword_key_off_name": "Clave de palabra ajena al nombre",
   "ember_stat_search_avg_nodes": "Media de nodos que responden",
   "ember_stat_search_avg_ms": "Tiempo medio de búsqueda",
   "ember_stat_search_avg_records": "Media de registros por búsqueda",

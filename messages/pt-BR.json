@@ -143,6 +143,7 @@
   "ember_stat_store_reject_publisher_cap": "STORE recusado: teto de publicador",
   "ember_stat_store_reject_per_key_cap": "STORE recusado: teto da chave",
   "ember_stat_store_reject_proximity": "STORE recusado: proximidade",
+  "ember_stat_keyword_key_off_name": "Chave de palavra fora do nome",
   "ember_stat_search_avg_nodes": "Busca média de nós que respondem",
   "ember_stat_search_avg_ms": "Busca média de tempo",
   "ember_stat_search_avg_records": "Busca média de registros",

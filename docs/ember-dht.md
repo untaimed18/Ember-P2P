@@ -919,10 +919,24 @@ stays the home for indexing ideas that are not gaps against KAD.
     tokenizer. Today that improvement needs no version bump. Binding the key
     turns it into a wire break of the same class that forced v3 and v4.
 
-  If it is ever wanted, the cheap precursor is measurement rather than
-  enforcement: count inbound keyword records whose key no word in their own name
-  hashes to. That is zero-risk, answers whether anyone is actually aiming, and
-  doubles as a tripwire for tokenizer drift.
+  **The cheap precursor is now shipped, as measurement rather than enforcement**:
+  `ember_dht_keyword_key_off_name` counts verified inbound keyword records whose
+  key no word in their own signed name hashes to (`name_hashes_to_key`, applied
+  in `accept_record`). Zero-risk, because nothing is refused on the answer and so
+  no record's validity depends on the tokenizer.
+
+  Where it is counted is the load-bearing part. Past `from_wire` and past the
+  replay collapse, so unsigned junk cannot appear in it and a retransmit storm
+  cannot inflate it into a publisher that looks like it aimed thousands of times;
+  before the proximity gate and the store's caps, because the question is what
+  publishers are doing rather than what we happened to keep.
+
+  Read the shape rather than the number. Climbing against a few publishers is
+  someone choosing keys instead of deriving them, which is the evidence that
+  would justify enforcing the rule. Climbing broadly across publishers is far
+  more likely to be our own two tokenizers having drifted apart — the second
+  reason this counter is worth having, since the stemming item above is exactly
+  the change that would cause that.
 
   Volume is the other half, and that genuinely needs something scarcer than a
   keypair: a proof-of-work constraint on `BLAKE3(ed25519_pub)` is the only

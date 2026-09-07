@@ -23,7 +23,7 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD,
     RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
@@ -400,6 +400,9 @@ pub struct EmberDht {
     /// STORE records for keys this node is not close enough to hold, once
     /// the routing table is large enough to be selective.
     store_reject_proximity: u64,
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to. Counted, never enforced — see `accept_record`.
+    keyword_key_off_name: u64,
     /// Noise static we currently advertise. A `PROXY_STORE` trailer must
     /// name this key, otherwise a firewalled publisher can steer every
     /// searcher's `CALLBACK_REQ` at someone else.
@@ -503,6 +506,7 @@ impl EmberDht {
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
+            keyword_key_off_name: 0,
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
@@ -1024,6 +1028,32 @@ impl EmberDht {
         if parsed.record_type == RECORD_TYPE_SOURCE && key != source_key(&parsed.file_hash) {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
+        }
+        // The keyword half of that argument, measured rather than enforced.
+        //
+        // The word is not on the wire, but the *name* is — signed beside the key
+        // — and the publish loop derives its keywords from that name, so a storer
+        // can recompute the set and ask whether the key is one of their hashes.
+        // A keyword publisher that answers no chose its key freely, which is the
+        // same free choice of eviction victim the source rule above refuses.
+        //
+        // Refusing on this answer was implemented and backed out, and counting is
+        // deliberately where it stops. Enforcing would make a record's validity
+        // depend on our tokenizer, so the next publisher to improve it (stemming,
+        // more than space-split tokens) would have its records refused by every
+        // storer still running the old one — turning a drop-in change into a wire
+        // break of the class that forced v3 and v4. What is missing to justify
+        // paying that price is evidence that anyone is aiming at all, and that is
+        // exactly what this counts. It doubles as a tripwire for the publish and
+        // store sides' tokenizers drifting apart, which would show up here as a
+        // count climbing with no attacker involved.
+        //
+        // Cheap next to what admitting a record has already cost by this line:
+        // a few BLAKE3 hashes of short words against two Ed25519 verifications.
+        if parsed.record_type == RECORD_TYPE_KEYWORD
+            && !super::search::name_hashes_to_key(&parsed.file_name, &key)
+        {
+            self.keyword_key_off_name = self.keyword_key_off_name.saturating_add(1);
         }
         if !self.store_proximity_ok(&key) {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
@@ -1934,6 +1964,25 @@ impl EmberDht {
 
     pub fn store_reject_proximity(&self) -> u64 {
         self.store_reject_proximity
+    }
+
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to.
+    ///
+    /// Counted where the record is known to be genuine and new — past
+    /// `from_wire` and past the replay collapse — so a retransmit storm cannot
+    /// inflate it, and unsigned junk cannot appear here at all. Counted before
+    /// the proximity gate and the store's caps, because the question is what
+    /// publishers are doing rather than what we happened to keep.
+    ///
+    /// Read it as two different findings depending on the shape. A count that
+    /// climbs against a handful of publishers is someone choosing keys rather
+    /// than deriving them — the aiming the store's eviction rankers are
+    /// vulnerable to, and the evidence that would justify enforcing the rule
+    /// this only measures. A count that climbs broadly, across publishers, is
+    /// far more likely to be our own two tokenizers having drifted apart.
+    pub fn keyword_key_off_name(&self) -> u64 {
+        self.keyword_key_off_name
     }
 
     /// Local store stats `(distinct_keys, total_records)` restricted to
@@ -5705,6 +5754,69 @@ mod tests {
         assert!(!on_b.stored_record, "key/content mismatch must be rejected");
         assert!(on_b.responses.is_empty(), "no STORE_ACK on rejection");
         assert_eq!(b.store_stats(), (0, 0));
+    }
+
+    /// The measurement the keyword half of that rule stops at. A storer cannot
+    /// refuse a key it cannot recompute, but it can recompute the *name* and say
+    /// whether the key is one of the words in it — and a publisher that derived
+    /// its key honestly always answers yes.
+    #[test]
+    fn a_keyword_key_derived_from_its_own_name_is_not_counted_as_aimed() {
+        let mut a = dht(42);
+        let mut b = dht(43);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(42, 4672);
+
+        // "debian" is exactly what this tokenizer takes from the name: the "12"
+        // is under the length floor and "iso" is a trailing three-character
+        // extension, so the word the publisher filed under is the only one left.
+        let record = a.build_keyword_record("debian", [1u8; 16], [0u8; 32], 10, "debian-12.iso");
+        let (_rid, store_bytes) = a.build_store(record.keyword_hash, record.data, record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+
+        assert!(on_b.stored_record, "an honestly keyed record is still stored");
+        assert_eq!(
+            b.keyword_key_off_name(),
+            0,
+            "a key the record's own name hashes to is not aiming"
+        );
+    }
+
+    /// The other side of it: nothing in the name hashes to the key, so the
+    /// publisher chose the key rather than deriving it — which for the eviction
+    /// rankers is a choice of which of our records to displace. Counted and
+    /// stored, never refused, because refusing would tie a record's validity to
+    /// our tokenizer.
+    #[test]
+    fn a_keyword_key_no_word_of_its_name_hashes_to_is_counted_but_still_stored() {
+        let mut a = dht(44);
+        let mut b = dht(45);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(44, 4672);
+
+        let record = a.build_keyword_record("debian", [2u8; 16], [0u8; 32], 10, "ubuntu-24.iso");
+        let (_rid, store_bytes) = a.build_store(record.keyword_hash, record.data, record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+
+        assert!(
+            on_b.stored_record,
+            "the count is a measurement, so the record must still be accepted"
+        );
+        assert_eq!(b.keyword_key_off_name(), 1);
+
+        // A retransmit of the same signed bytes is the same attempt. The replay
+        // collapse sits above the count for exactly this reason: without it a
+        // storm would read as a publisher aiming thousands of times.
+        let on_b_again = b.handle_message(&store_bytes, a_addr, a_noise, 1001);
+        assert!(
+            on_b_again.store_replay_rejected,
+            "the identical signature is a replay"
+        );
+        assert_eq!(
+            b.keyword_key_off_name(),
+            1,
+            "a replay is not a second attempt"
+        );
     }
 
     #[test]

@@ -52134,6 +52134,8 @@ async fn handle_ember_dht_message(
         state.ember_dht.store_reject_source_ip() as u32;
     state.ember_diagnostics.ember_dht_store_reject_proximity =
         state.ember_dht.store_reject_proximity() as u32;
+    state.ember_diagnostics.ember_dht_keyword_key_off_name =
+        state.ember_dht.keyword_key_off_name() as u32;
 
     if let Some(version) = inbound.version_mismatch {
         state.ember_diagnostics.ember_dht_version_mismatch = state

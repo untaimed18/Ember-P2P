@@ -1056,6 +1056,13 @@ pub struct EmberDiagnostics {
     /// STORE records for keys this node is not close enough to hold.
     #[serde(default)]
     pub ember_dht_store_reject_proximity: u32,
+    /// Verified inbound keyword records whose key no word in their own signed
+    /// name hashes to. Not a refusal — the key is not recomputable from the wire, so
+    /// this is the closest a storer can come to asking whether a publisher
+    /// derived its key or chose it. A name too short to yield any word counts
+    /// here too, since no word could find it.
+    #[serde(default)]
+    pub ember_dht_keyword_key_off_name: u32,
     /// Completed FIND_VALUE searches this session (hits, misses, and timeouts).
     /// Denominator for the search-quality averages below.
     #[serde(default)]

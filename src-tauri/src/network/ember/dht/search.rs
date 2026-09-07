@@ -1692,6 +1692,26 @@ pub fn keyword_hash(keyword: &str) -> [u8; 16] {
     key
 }
 
+/// Whether any keyword the publish loop would derive from `file_name` hashes to
+/// `key` — that is, whether a keyword record filed under `key` could have been
+/// aimed there by the name it carries.
+///
+/// Both sides of the index are here on purpose: [`extract_keywords`] is the same
+/// tokenizer the publisher ran over the name, and [`keyword_hash`] is the same
+/// hash it filed the result under, so this asks the publisher's own question
+/// rather than an approximation of it. A name with no words at all — nothing at
+/// least three characters long once the extension is stripped — answers false
+/// for every key, because there is no word under which it could be found.
+///
+/// Deliberately a question and not a rule. See its one caller: making a record's
+/// validity depend on this tokenizer would refuse tomorrow's publisher from
+/// every storer still running today's.
+pub fn name_hashes_to_key(file_name: &str, key: &[u8; 16]) -> bool {
+    crate::network::kad::publish::extract_keywords(file_name)
+        .iter()
+        .any(|word| keyword_hash(word) == *key)
+}
+
 /// Compute keyword hashes for a multi-word query. Returns `(hash, text)` pairs
 /// sorted by keyword length descending (longest / most selective first). The
 /// first entry is the primary DHT walk key; the rest ride on FIND_VALUE for

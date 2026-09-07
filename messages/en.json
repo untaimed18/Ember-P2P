@@ -143,6 +143,7 @@
   "ember_stat_store_reject_publisher_cap": "Store refused: publisher cap",
   "ember_stat_store_reject_per_key_cap": "Store refused: key cap",
   "ember_stat_store_reject_proximity": "Store refused: proximity",
+  "ember_stat_keyword_key_off_name": "Keyword key not in name",
   "ember_stat_search_avg_nodes": "Search avg. nodes answered",
   "ember_stat_search_avg_ms": "Search avg. time",
   "ember_stat_search_avg_records": "Search avg. records",

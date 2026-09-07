@@ -423,6 +423,7 @@
     { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: String(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
     { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: String(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
     { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
+    { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: String(diag?.ember_dht_keyword_key_off_name ?? 0) },
     ];
   });
 
