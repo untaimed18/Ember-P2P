@@ -1,13 +1,16 @@
 # Ember DHT — remaining work and future improvements
 
 The protocol specification is
-[ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
-version 2 as implemented in Ember 1.5.6. **The wire is now version 4 and the PDF
-is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
-[item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
-two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)
-for what moved it to v4. This file is the standing work log: what is left, what
-was compared against KAD, and what is explicitly not planned.
+[ember-dht-specification.pdf](ember-dht-specification.pdf), now written against
+wire version 4 as implemented in Ember 1.6.3, and rebuilt from
+[its HTML source](ember-dht-specification.html) with
+[`scripts/build-ember-dht-spec.sh`](../scripts/build-ember-dht-spec.sh). It
+carries the v3 frame changes (see [item 1](#1-the-serving-ceiling--done-wire-v3)
+and [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3)),
+what moved it to v4 ([item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
+and every additive change since — each marked as additive, since that is the
+distinction an implementer needs. This file is the standing work log: what is
+left, what was compared against KAD, and what is explicitly not planned.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
