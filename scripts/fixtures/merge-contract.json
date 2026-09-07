@@ -2,7 +2,9 @@
   "description": [
     "Shared source of truth for the search-result merge rules that the frontend",
     "and the backend both implement: `resultKey`/`result_key`,",
-    "`combineOrigin`/`combine_origin` and the MAX_PLAUSIBLE_SOURCES ceiling.",
+    "`combineOrigin`/`combine_origin`, `pickEmberDigest`/`pick_ember_digest`, the",
+    "MAX_PLAUSIBLE_SOURCES ceiling, the MAX_SOURCE_ADDRS cap, and the fields both",
+    "sides resolve by keeping the first non-empty value.",
     "src/lib/stores/search.ts merges streamed batches per tab, src-tauri/src/search/merge.rs",
     "merges the lists it emits, and the two were kept aligned only by a comment.",
     "Checked by scripts/merge-contract.test.mjs and by the fixture tests in merge.rs.",
@@ -80,6 +82,22 @@
     { "a": "KAD", "b": "KAD · Server", "combined": "KAD · Server" },
     { "a": "Server · UDP", "b": "Local · Notes", "combined": "Local · Notes · Server · UDP" }
   ],
+  "first_non_empty_fields": {
+    "note": [
+      "Fields both merges resolve by keeping the first non-empty value. They are",
+      "inline expressions rather than named functions, so they cannot be lifted and",
+      "run the way resultKey and pickEmberDigest are; the test asserts the shape of",
+      "each side instead, which is the same technique the MAX_PLAUSIBLE_SOURCES",
+      "clamp check uses. Listed because file_type, rating and comment silently",
+      "resolved in OPPOSITE directions for a long time -- Rust kept the existing",
+      "value, the store took the incoming one -- so the same two rows merged",
+      "differently depending on which layer merged them.",
+      "aich_hash is here because it is a recovery hash a download consumes, it sits",
+      "one line from ember_file_hash (which has its own rule and its own cases), and",
+      "nothing but a comment on each side held the two together."
+    ],
+    "fields": ["file_type", "rating", "comment", "aich_hash"]
+  },
   "ember_digest_cases": [
     {
       "name": "an empty row takes the digest the network offered",

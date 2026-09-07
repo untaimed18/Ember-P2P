@@ -492,9 +492,10 @@
   function sourceCountHint(r: SearchResult): string | undefined {
     const origin = r.result_origin || '';
     if (!origin.includes('Ember')) return undefined;
-    return origin === 'Ember'
-      ? m.search_sources_ember_hint({ count: r.availability })
-      : m.search_sources_ember_mixed_hint({ count: r.availability });
+    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint({ count: r.availability });
+    return r.availability === 1
+      ? m.search_sources_ember_hint_one()
+      : m.search_sources_ember_hint_other({ count: r.availability });
   }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
@@ -3575,7 +3576,7 @@
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
       <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
-        <div class="ctx-header">
+        <div class="ctx-header" role="presentation">
           <bdi dir="auto">{contextMenu.result.file.name}</bdi>
         </div>
         <button

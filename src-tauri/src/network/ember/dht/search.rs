@@ -130,23 +130,55 @@ const MAX_PINNED_EXTRA_CONTACTS: usize = super::K_BUCKET_SIZE / 2;
 /// shortlist.
 const STALE_RESPONSES_TO_CONVERGE: u8 = ALPHA as u8;
 
-/// Records a `FOUND_VALUE` page carries, for a keyword record of ordinary
-/// filename length packed against [`super::messages::MAX_FOUND_VALUE_RECORD_BYTES`].
+/// Records a `FOUND_VALUE` page carries, packed against
+/// [`super::messages::MAX_FOUND_VALUE_RECORD_BYTES`] (1231).
 ///
-/// An estimate, and only ever used to size [`MAX_PAGES_PER_NODE`] — a node
-/// serving longer names fits fewer and runs out of pages first, which costs it
-/// the tail of its allowance rather than breaking anything.
+/// An estimate, and only ever used to size [`MAX_PAGES_PER_NODE`]. A node whose
+/// records run larger fits fewer per page and runs out of pages before it runs
+/// out of allowance, which costs it the tail of what it was welcome to send.
+///
+/// **Three, not five, because keyword records grew a media block.** Five was
+/// right when a record was header + name + signature: 115 + 40 + 64, plus the
+/// 2-byte length prefix, is 221 bytes, and 1231/221 is 5. A record carrying
+/// duration, bitrate, codec, artist, album and title costs around 295 — four per
+/// page — and one with every text field at its cap costs 450, which is two. At
+/// five, a node holding a music keyword would be allowed 75 blobs and reach 60 of
+/// them, which is the same "the round trips are the binding limit, not the
+/// allowance" failure [`MAX_PAGES_PER_NODE`] was raised to fix, reintroduced by
+/// the media block rather than by long names.
+///
+/// Three covers the ordinary media record with room to spare and still leaves the
+/// worst case short — but that case is bounded by the earned tier in
+/// [`IterativeSearch::per_node_page_allowance`], which grants a page per page's
+/// worth actually delivered, so a node genuinely sending large records earns the
+/// pages to finish.
 ///
 /// Keyword records, because they are what a user waits on. A source record
 /// carries a contact block and a callback trailer, so two or three fit a page
 /// and a storer reaches around half its allowance; sizing the ceiling for those
 /// instead would be dozens of round trips per node for a budget KAD caps at
 /// twenty answers in total (`SEARCHFINDSOURCE_TOTAL`).
-const RECORDS_PER_UNFRAGMENTED_PAGE: usize = 5;
+const RECORDS_PER_UNFRAGMENTED_PAGE: usize = 3;
+
+/// Average records per page a node must sustain to keep paging past the base
+/// ceiling.
+///
+/// A *rate*, not a price. Charging a fixed number of records per extra page —
+/// which is what this was first written as — cannot separate the two cases it
+/// needs to: set the price low enough that an honest node serving three records a
+/// page can still reach its allowance, and a peer serving one record a page earns
+/// nearly as fast. An average distinguishes them by construction, because the
+/// drip-feeder's average is below the floor from its first page and never
+/// recovers, while any node genuinely filling datagrams is far above it forever.
+///
+/// Two, because [`RECORDS_PER_UNFRAGMENTED_PAGE`] is three and the worst-case
+/// media record still fits two: the floor has to sit at or under what an honest
+/// node actually manages, or it disqualifies the nodes it exists to serve.
+const MIN_RECORDS_PER_PAGE_TO_CONTINUE: usize = 2;
 
 /// Extra `FIND_VALUE` pages one node may be asked for within a single search.
 ///
-/// A datagram carries roughly five keyword records, so on a popular key the
+/// A datagram carries only a few keyword records, so on a popular key the
 /// first answer is a small fraction of what the responder holds. Paging is how
 /// the rest becomes reachable, but it is also the one mechanism here that lets a
 /// *responder* decide how many queries we send — it reports the total — so it
@@ -534,21 +566,29 @@ impl IterativeSearch {
     /// [`MAX_PAGES_PER_NODE_EXHAUSTED`] would have quadrupled what a peer serving
     /// one record per page while claiming sixty thousand can buy.
     ///
-    /// So past the base ceiling a node earns one more page for every page's worth
-    /// of records it has actually delivered. A node genuinely serving full
-    /// datagrams earns a page per page and is never held by this at all — the
-    /// offer allowance stops it, which is the intent. A node drip-feeding one
-    /// record at a time earns a fifth of a page per page and runs out only a few
-    /// queries later than it used to.
+    /// So the base ceiling is granted and everything past it is conditional on the
+    /// node sustaining [`MIN_RECORDS_PER_PAGE_TO_CONTINUE`] records per page on
+    /// average. A node filling datagrams is far above that floor from its first
+    /// answer and never notices this; a node answering one record at a time is
+    /// below it from its first answer and stops at the base ceiling. The offer
+    /// allowance remains what actually ends an honest node's paging.
     fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
         if self.can_still_descend() {
             return MAX_PAGES_PER_NODE;
         }
+        let queued = self.pages_queued.get(node).copied().unwrap_or(0);
+        if queued < MAX_PAGES_PER_NODE {
+            return MAX_PAGES_PER_NODE;
+        }
+        // Pages this node has actually answered: the opening query, then one per
+        // follow-up queued.
+        let served = usize::from(queued).saturating_add(1);
         let delivered = self.offered_results.get(node).copied().unwrap_or(0);
-        let earned = u8::try_from(delivered / RECORDS_PER_UNFRAGMENTED_PAGE).unwrap_or(u8::MAX);
-        MAX_PAGES_PER_NODE
-            .saturating_add(earned)
-            .min(MAX_PAGES_PER_NODE_EXHAUSTED)
+        if delivered >= served.saturating_mul(MIN_RECORDS_PER_PAGE_TO_CONTINUE) {
+            MAX_PAGES_PER_NODE_EXHAUSTED
+        } else {
+            MAX_PAGES_PER_NODE
+        }
     }
 
     /// Pull the next request id, keeping the counter monotonic within a search.
@@ -2445,13 +2485,18 @@ mod tests {
                 }),
             );
         }
-        // A stingy pager earns almost nothing past the base ceiling: extra pages
-        // are granted per page's worth of records actually delivered, and this
-        // one delivers a fifth of that. It must stay far below what a node
-        // serving full datagrams is allowed, or the claim would be buying the
-        // queries again.
-        assert!(
-            pages <= MAX_PAGES_PER_NODE as u32 + 5,
+        // One record per page is below `MIN_RECORDS_PER_PAGE_TO_CONTINUE` from the
+        // first answer, so this peer never qualifies for a page past the base
+        // ceiling however large a total it claims: the opening query plus
+        // `MAX_PAGES_PER_NODE` follow-ups, and no more.
+        //
+        // Pinned exactly rather than loosely, because this is the bound that stops
+        // a responder's claim about its own store from buying round trips — and it
+        // has already moved once by accident, when one constant both sized the
+        // ceiling and priced an extra page.
+        assert_eq!(
+            pages,
+            MAX_PAGES_PER_NODE as u32 + 1,
             "one record per page against a claimed 60,000 bought {pages} queries"
         );
         assert!(

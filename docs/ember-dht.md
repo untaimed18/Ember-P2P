@@ -325,10 +325,21 @@ churn, not the change itself, is what has kept it open.
 - Multi-keyword search uses sparse DHT intersection (missing secondary
   keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
-- A peer serves roughly five records per keyword *datagram*, but a searcher can
-  now page a node until its key is exhausted, bounded by 8 follow-ups per node
-  and the existing per-node result allowance. See
+- A peer serves only a few records per keyword *datagram* — five for a bare
+  record, four for one carrying media, two in the worst case — but a searcher can
+  now page a node until its key is exhausted, bounded by the per-node result
+  allowance and the page ceiling that allowance sizes. Both are two-tier: a peer
+  is held to a quarter of the budget while the walk still has somewhere to go, and
+  may spend the rest of it once the shortlist is exhausted. See
   [Planned next, item 1](#1-the-serving-ceiling--done-wire-v3).
+- A keyword search may name up to `MAX_FIND_VALUE_KEYS_TOTAL` (23) keywords, but
+  only the first eight travel in the count-prefixed run that every build reads.
+  The rest ride the constraint block, so a peer predating it intersects on eight
+  and leaves the remainder to the filename match at emit.
+- A keyword record may carry media (length, bitrate, codec, artist, album,
+  title). A peer predating that block ignores it and reads the record correctly;
+  a record published by a build predating it simply has none, so the columns stay
+  empty until that publisher's next republish.
 - One publisher may hold 150 records under any one keyword, network-wide (KAD's
   own allowance), so a user sharing more files than that with a word in common
   still will not have all of them findable under it.
@@ -419,10 +430,19 @@ below — not this comparison.
 
 ### 1. The serving ceiling — done (wire v3)
 
-A peer answers a keyword query with **about five records**. `MAX_FOUND_VALUE_RECORD_BYTES`
+A peer answers a keyword query with **only a few records**. `MAX_FOUND_VALUE_RECORD_BYTES`
 is 1231, a keyword blob for a 40-character filename costs 221, and packing used
 to fill from the front of insertion order, so the oldest five were the only ones
 that node would ever serve.
+
+Five was the figure while a record was header, name and signature. Keyword records
+now carry an optional media block (see
+[the search plan](ember-dht-search-plan.md#2-keyword-records-carry-no-metadata--done)),
+which costs around 75 bytes for an ordinary music file and up to 229 with every
+text field at its cap — so a media-bearing record packs four to a page, or two in
+the worst case. `RECORDS_PER_UNFRAGMENTED_PAGE` is 3 to reflect that, since its
+only job is to size the page ceiling so the ceiling never binds before the
+per-node allowance does.
 
 **Shipped, cheap path (1.5.3–1.5.5):** successive `FIND_VALUE`s rotated the
 served window per key, using a cursor the *responder* advanced.
@@ -450,9 +470,21 @@ content dedup in `search.rs`) and guarantees nothing is stranded.
 
 Paging is the one mechanism here where a *responder* influences how many queries
 we send, so the searcher bounds it independently of what `total_available`
-claims: `MAX_PAGES_PER_NODE` (8) follow-ups per node, each required to name an
-offset strictly past the one it answered, and the existing
-`MAX_RESULTS_PER_NODE` allowance still caps what one peer may contribute.
+claims: `MAX_PAGES_PER_NODE` (25) follow-ups per node, each required to name an
+offset strictly past the one it answered.
+
+Both of those bounds are now two-tier, and the second tier is the newer half.
+While the shortlist still holds an unqueried hop — or any query is outstanding —
+one peer may offer `MAX_RESULTS_PER_NODE` (75, a quarter of the budget) and be
+asked for the 25 pages that allowance can be spent in. Once neither is true there
+is no hop left for extra records to crowd out, so a lone storer may spend what
+remains of the whole 300-file budget, over up to
+`MAX_PAGES_PER_NODE_EXHAUSTED` (100) pages. That second page tier has to be
+*earned*: past the base ceiling a node keeps paging only while it sustains
+`MIN_RECORDS_PER_PAGE_TO_CONTINUE` (2) records per page on average, so a peer
+answering one record at a time while claiming a huge total stops at the base
+ceiling. See
+[the search plan](ember-dht-search-plan.md#3-per-node-result-ceiling-is-an-eighth-of-kads--done).
 Positions are advisory — the responder's list shifts as records expire — so
 paging may repeat or skip an entry, which content-based dedup in `search.rs`
 already absorbs.

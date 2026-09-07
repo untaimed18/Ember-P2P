@@ -3663,7 +3663,7 @@
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
   <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
-    <div class="ctx-header">
+    <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
     </div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>

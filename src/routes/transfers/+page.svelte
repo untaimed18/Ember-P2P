@@ -4579,7 +4579,7 @@
   {@const menu = columnMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: menu.x, y: menu.y }} onclick={(e) => e.stopPropagation()}>
-    <div class="ctx-label">{getColumnMenuTitle(menu.table)}</div>
+    <div class="ctx-label" role="presentation">{getColumnMenuTitle(menu.table)}</div>
     {#each getColumnMenuColumns(menu.table) as column (column.key)}
       <button
         class="ctx-item"
@@ -4620,7 +4620,7 @@
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
-    <div class="ctx-header">
+    <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxTransfer.file_name}</bdi>
     </div>
     {#if ctxMenu.section === 'active'}
@@ -4648,10 +4648,14 @@
       {/if}
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
-      <div class="ctx-submenu-wrap">
+      <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
+           a `role="menu"` may only own menuitems, so a plain div between the two
+           drops this entry out of the menu's structure entirely. -->
+      <div class="ctx-submenu-wrap" role="presentation">
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxPrioritySub}
+          role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxPrioritySub}
           onclick={() => ctxPrioritySub = !ctxPrioritySub}
@@ -4672,10 +4676,11 @@
           </div>
         {/if}
       </div>
-      <div class="ctx-submenu-wrap">
+      <div class="ctx-submenu-wrap" role="presentation">
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxCategorySub}
+          role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxCategorySub}
           onclick={() => ctxCategorySub = !ctxCategorySub}
@@ -4783,7 +4788,7 @@
     use:ctxMenuPosition={{ x: knownCtxMenu.x, y: knownCtxMenu.y }}
     onclick={(e) => e.stopPropagation()}
   >
-    <div class="ctx-header">
+    <div class="ctx-header" role="presentation">
       <bdi dir="auto">
         {knownCtxMenu.client.nickname
           || knownCtxMenu.client.last_known_ip

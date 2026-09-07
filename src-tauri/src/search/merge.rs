@@ -585,8 +585,9 @@ mod tests {
         assert_eq!(merged[0].availability, MAX_PLAUSIBLE_SOURCES);
     }
 
-    /// `src/lib/stores/search.ts` mirrors `result_key`, `combine_origin` and
-    /// `MAX_PLAUSIBLE_SOURCES` — it merges the streamed batches a second time,
+    /// `src/lib/stores/search.ts` mirrors `result_key`, `combine_origin`,
+    /// `pick_ember_digest`, `MAX_PLAUSIBLE_SOURCES`, `MAX_SOURCE_ADDRS` and the
+    /// first-non-empty field rules — it merges the streamed batches a second time,
     /// per tab — and the two were held together only by a code comment.
     /// `scripts/fixtures/merge-contract.json` is the shared source of truth for
     /// the rules that must agree; `scripts/merge-contract.test.mjs` checks the

@@ -690,7 +690,7 @@
 {#if colMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: colMenu.x, y: colMenu.y }} onclick={(e) => e.stopPropagation()}>
-    <div class="ctx-label">{m.library_columns_title()}</div>
+    <div class="ctx-label" role="presentation">{m.library_columns_title()}</div>
     {#each orderedColumns.filter(c => c.key !== FIXED_KEY) as col (col.key)}
       <button
         class="ctx-item"

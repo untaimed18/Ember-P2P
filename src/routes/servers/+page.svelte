@@ -1021,7 +1021,7 @@
 
 {#if ctxMenu}
   <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
-    <div class="ctx-header">
+    <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.server.name || `${ctxMenu.server.ip}:${ctxMenu.server.port}`}</bdi>
     </div>
     {#if !isConnected(ctxMenu.server)}

@@ -77,18 +77,20 @@ function newTabId(): string {
 }
 
 /*
- * `resultKey`, `combineOrigin` and `MAX_PLAUSIBLE_SOURCES` below re-implement
- * rules the backend already has in `src-tauri/src/search/merge.rs` (this store
- * merges the streamed batches a second time, per tab).
+ * `resultKey`, `combineOrigin`, `pickEmberDigest`, `MAX_PLAUSIBLE_SOURCES`,
+ * `MAX_SOURCE_ADDRS` and the first-non-empty fields inside `mergeResult` below all
+ * re-implement rules the backend already has in `src-tauri/src/search/merge.rs`
+ * (this store merges the streamed batches a second time, per tab).
  * `scripts/fixtures/merge-contract.json` is the shared source of truth for the
  * parts that must agree, and both sides are tested against it —
  * `scripts/merge-contract.test.mjs` here, `merge_contract_fixture` there — so a
  * divergence fails a test instead of shipping.
  *
  * That Node test cannot import this module (Svelte-app TypeScript, no bundler on
- * that path), so it lifts these two function bodies out of the source text and
- * runs them: keep them pure and closed over nothing, and keep their signatures
- * on one line. The divergences from Rust *are* deliberate where commented
+ * that path), so it lifts the three pure function bodies out of the source text
+ * and runs them: keep them pure and closed over nothing, and keep their signatures
+ * on one line. What it cannot lift — the inline field rules in `mergeResult` — it
+ * asserts the *shape* of instead, so those expressions have to stay recognisable. The divergences from Rust *are* deliberate where commented
  * (availability, filename, address cap) and are deliberately not in the fixture.
  */
 function resultKey(result: SearchResult): string {
@@ -223,10 +225,16 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     peer_id: existing.peer_id || incoming.peer_id,
     peer_name: existing.peer_name || incoming.peer_name,
     availability,
-    file_type: incoming.file_type || existing.file_type,
+    // First non-empty wins on all three, which is what `merge_into` does. They
+    // used to take the *incoming* value here while Rust kept the existing one, so
+    // the same two rows merged to a different type, rating and comment depending
+    // on which layer did the merging. Keeping the first is also the rule the
+    // filename already follows, and for the same reason: a later answer for a
+    // public hash is not evidence, and letting it overwrite is a free rewrite.
+    file_type: existing.file_type || incoming.file_type,
     source_addresses: mergedAddresses,
-    rating: incoming.rating ?? existing.rating,
-    comment: incoming.comment ?? existing.comment,
+    rating: existing.rating ?? incoming.rating,
+    comment: existing.comment ?? incoming.comment,
     media: hasMedia ? media : existing.media || incoming.media,
     spam_rating,
     is_spam,

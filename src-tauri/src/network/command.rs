@@ -577,16 +577,12 @@ async fn handle_command_inner(
                         // number the page shows counts publishers across the
                         // network, which no single responder can see.
                         if let Some(search) = state.ember_search.get_mut(search_id) {
-                            search.set_value_constraints(ember::dht::messages::ValueConstraints {
-                                min_size: active_request.min_size,
-                                max_size: active_request.max_size,
-                                file_type: active_request.file_type_filter.clone(),
-                                // Ember's answer to "search by extension": a
-                                // constraint the responder applies, not a keyword
-                                // key. See `ValueConstraints::file_extension`.
-                                file_extension: active_request.file_extension.clone(),
-                                extra_keys: Vec::new(),
-                            });
+                            search.set_value_constraints(ember_keyword_constraints(
+                                active_request.file_type_filter.clone(),
+                                active_request.min_size,
+                                active_request.max_size,
+                                active_request.file_extension.clone(),
+                            ));
                         }
                         seed_ember_local_records(state, search_id, primary_hash, &extras);
                         seed_ember_session_search_contacts(state, search_id);

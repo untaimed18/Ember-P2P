@@ -7,10 +7,13 @@ import test from "node:test";
 /**
  * The search-result merge contract is implemented twice: `src/lib/stores/search.ts`
  * merges streamed batches per tab, `src-tauri/src/search/merge.rs` merges the
- * lists it emits. Three rules have to agree between them — the dedup key, the
- * origin-label combination, and the plausibility ceiling on peer-reported
- * source counts — and until this test existed only a code comment
- * ("matching MAX_PLAUSIBLE_SOURCES in merge.rs") held them together.
+ * lists it emits. Several rules have to agree between them — the dedup key, the
+ * origin-label combination, the plausibility ceiling and address cap on
+ * peer-reported source counts, which Ember content digest a merged row keeps, and
+ * the fields resolved by keeping the first non-empty value — and until this test
+ * existed only a code comment ("matching MAX_PLAUSIBLE_SOURCES in merge.rs") held
+ * them together. `file_type`, `rating` and `comment` show why that was not
+ * enough: they resolved in opposite directions on the two sides for a long time.
  *
  * `fixtures/merge-contract.json` is the shared source of truth; the `#[cfg(test)]`
  * fixture tests in merge.rs read the same file. A divergence now fails on
@@ -139,6 +142,45 @@ test("mergeResult still holds both peer-reported counts to the ceiling", () => {
     2,
     "expected mergeResult to clamp exactly `availability` and `file.complete_sources`",
   );
+});
+
+test("both sides keep the FIRST non-empty value for the shared fields", () => {
+  // These are inline expressions in an object literal on one side and `if`
+  // guards on the other, so neither can be lifted and run. Asserting the shape
+  // is what is available, and it is enough to catch the failure that happened:
+  // `incoming.file_type || existing.file_type` reads almost identically to the
+  // correct form while meaning the opposite.
+  const rust = readFileSync(rustMergePath, "utf8");
+  for (const field of fixture.first_non_empty_fields.fields) {
+    const optional = field === "rating" || field === "comment";
+    const tsWanted = optional
+      ? `${field}: existing.${field} ?? incoming.${field},`
+      : new RegExp(
+          String.raw`\b${field}:\s*existing\.(?:file\.)?${field}\s*\|\|\s*incoming\.(?:file\.)?${field}\b`,
+        );
+    if (typeof tsWanted === "string") {
+      assert.ok(
+        mergeResultBody.includes(tsWanted),
+        `mergeResult must keep the existing ${field}: expected \`${tsWanted}\``,
+      );
+    } else {
+      assert.match(
+        mergeResultBody,
+        tsWanted,
+        `mergeResult must keep the existing ${field}, not the incoming one`,
+      );
+    }
+
+    // The Rust side writes it as a guard: only assign when what we hold is empty.
+    const rustGuard = new RegExp(
+      String.raw`if existing\.(?:file\.)?${field}\.is_(?:empty|none)\(\)`,
+    );
+    assert.match(
+      rust,
+      rustGuard,
+      `merge.rs must only fill ${field} when the existing value is absent`,
+    );
+  }
 });
 
 test("the Rust side derives its ceiling from the same wire limit", () => {

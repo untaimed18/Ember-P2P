@@ -9467,6 +9467,162 @@ mod tests {
         assert_eq!(b.file.complete_sources, 1);
     }
 
+    /// The probe is a disk read awaited from the network task, so what it selects
+    /// is the whole cost. Two properties: an already-probed file is never read
+    /// again — the durable "found nothing" marker is pointless otherwise — and one
+    /// tick cannot read more than [`MEDIA_PROBES_PER_TICK`] files however many are
+    /// due.
+    #[test]
+    fn a_media_probe_reads_each_file_once_and_only_a_slice_per_tick() {
+        let due: Vec<([u8; 16], u64, String, [u8; 32], String)> = (0..20u8)
+            .map(|i| {
+                (
+                    [i; 16],
+                    1024,
+                    format!("f{i}.mp3"),
+                    [0u8; 32],
+                    format!("C:/Library/f{i}.mp3"),
+                )
+            })
+            .collect();
+
+        // Nothing probed yet: one tick takes its slice and no more.
+        let first = files_needing_media_probe(&due, |_| Some(false), MEDIA_PROBES_PER_TICK);
+        assert_eq!(first.len(), MEDIA_PROBES_PER_TICK);
+        assert_eq!(first[0].0, [0u8; 16]);
+        assert_eq!(first[0].1, "C:/Library/f0.mp3");
+
+        // Everything probed — including the files that turned out to have no
+        // media, which is most of a real library. Nothing may be read again.
+        assert!(
+            files_needing_media_probe(&due, |_| Some(true), MEDIA_PROBES_PER_TICK).is_empty(),
+            "a probed file must never be read a second time"
+        );
+
+        // A hash known.met has never heard of is not 'unprobed': there would be
+        // nowhere to record the answer, so reading the disk would repeat forever.
+        assert!(
+            files_needing_media_probe(&due, |_| None, MEDIA_PROBES_PER_TICK).is_empty(),
+            "a hash with no known.met record must not be probed"
+        );
+
+        // A row with no path has nothing to read.
+        let pathless: Vec<_> = due
+            .iter()
+            .cloned()
+            .map(|(h, s, n, e, _)| (h, s, n, e, String::new()))
+            .collect();
+        assert!(files_needing_media_probe(&pathless, |_| Some(false), 8).is_empty());
+    }
+
+    /// What the search sends its responders. Pinned because the wiring sits in
+    /// `command.rs`, which has no tests of its own, and because dropping a field
+    /// here breaks filtering silently — the searcher still filters at emit, so the
+    /// results stay correct and only the recall win disappears.
+    #[test]
+    fn an_ember_keyword_search_sends_size_type_and_extension_but_not_availability() {
+        let constraints = ember_keyword_constraints(
+            Some("Video".to_string()),
+            Some(1024),
+            Some(4096),
+            Some("mkv".to_string()),
+        );
+        assert_eq!(constraints.min_size, Some(1024));
+        assert_eq!(constraints.max_size, Some(4096));
+        assert_eq!(constraints.file_type.as_deref(), Some("Video"));
+        assert_eq!(
+            constraints.file_extension.as_deref(),
+            Some("mkv"),
+            "the extension is how Ember searches by extension without indexing one"
+        );
+        assert!(
+            constraints.extra_keys.is_empty(),
+            "surplus keyword hashes are added by build_find_value, not here"
+        );
+
+        // An unfiltered search must send nothing at all, so its payload stays
+        // byte-identical to what a build predating the block produces.
+        assert!(ember_keyword_constraints(None, None, None, None).is_empty());
+    }
+
+    /// A record's media has to reach the row, which is the entire user-visible
+    /// point of putting it on the wire. The record end is covered in
+    /// `publish.rs`; nothing asserted the two lines that carry it across, so
+    /// dropping them passed the whole suite while every Ember row went back to
+    /// showing empty Length, Bitrate and tag columns.
+    #[test]
+    fn ember_keyword_results_carry_the_publishers_media() {
+        let sk_a = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let sk_b = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let with_media = [0xAAu8; 16];
+        let without_media = [0xBBu8; 16];
+        let media = crate::types::MediaMetadata {
+            duration: Some(214),
+            bitrate: Some(320),
+            codec: Some("mp3".into()),
+            artist: Some("Anne Müller".into()),
+            album: Some("Heliopause".into()),
+            title: Some("Drifting Circles".into()),
+        };
+
+        let kw_with_media = |sk: &ed25519_dalek::SigningKey, file_hash: [u8; 16]| {
+            let rec = ember::dht::publish::SignedRecord::keyword_with_media(
+                "heliopause",
+                file_hash,
+                [0u8; 32],
+                9_000_000,
+                "anne-muller-heliopause.mp3",
+                Some(&media),
+                sk,
+            );
+            let mut blob = rec.data.clone();
+            blob.extend_from_slice(&rec.signature);
+            blob
+        };
+
+        let blobs = vec![
+            // The first publisher of this file has no media — a build predating
+            // the block, which is what most of the network is.
+            ember_kw_blob(
+                &sk_a,
+                "heliopause",
+                with_media,
+                9_000_000,
+                "anne-muller-heliopause.mp3",
+            ),
+            kw_with_media(&sk_b, with_media),
+            ember_kw_blob(
+                &sk_a,
+                "heliopause",
+                without_media,
+                1_000,
+                "heliopause-notes.txt",
+            ),
+        ];
+        let results =
+            build_ember_keyword_built(&blobs, &["heliopause".to_string()], None).results;
+
+        let row = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(with_media))
+            .expect("the file two publishers named");
+        assert_eq!(
+            row.media.as_ref(),
+            Some(&media),
+            "one publisher carrying media has to fill the row, even when the first did not"
+        );
+        assert_eq!(row.availability, 2);
+
+        let bare = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(without_media))
+            .expect("the file nobody published media for");
+        assert!(
+            bare.media.is_none(),
+            "a record with no media block must not invent one"
+        );
+    }
+
     #[test]
     fn ember_keyword_results_multi_word_and_filter() {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
@@ -21226,6 +21382,67 @@ const EMBER_KEYWORDS_PER_FILE_ESTIMATE: usize = 8;
 /// schedule), or a return from a long outage. In the steady state the backlog
 /// is one interval's worth of files and the floor covers it.
 const EMBER_SOURCE_BACKLOG_DRAIN_TICKS: usize = 10;
+
+/// Media probes one keyword publish tick may perform.
+///
+/// The probe is awaited from the network `select!`, so however long it takes is
+/// time eD2K, KAD and Ember are all suspended — the hazard the download path names
+/// explicitly where it refuses to await a file hash inline. The tick's own budget
+/// is not a tight enough bound: it reaches `EMBER_KEYWORD_PUBLISH_MAX_PER_TICK`,
+/// and that many header reads on a slow or networked disk is a visible stall in
+/// every transfer on the first ticks after a library is added.
+///
+/// Nothing is lost by going slower, because a file whose turn has not come
+/// publishes without media now and gains it on republish.
+const MEDIA_PROBES_PER_TICK: usize = 8;
+
+/// Which of this tick's due files still need reading for media.
+///
+/// `scanned` answers "has this hash been probed", or `None` for a hash known.met
+/// has never heard of — which is not the same as unprobed and must not be treated
+/// as a reason to read a disk, since there would be nowhere to record the answer.
+///
+/// Split out from [`maybe_publish_ember_keywords`] to be testable: the selection is
+/// where the cost lives, and dropping the already-probed check would silently
+/// re-read the whole library on every republish tick — exactly what the durable
+/// scanned marker exists to prevent.
+fn files_needing_media_probe(
+    due: &[([u8; 16], u64, String, [u8; 32], String)],
+    scanned: impl Fn(&[u8; 16]) -> Option<bool>,
+    limit: usize,
+) -> Vec<([u8; 16], String)> {
+    due.iter()
+        .filter(|(hash, _, _, _, path)| {
+            // An empty path is a row with nothing to read; it is skipped rather
+            // than marked scanned, because a later scan may fill the path in.
+            !path.is_empty() && scanned(hash) == Some(false)
+        })
+        .take(limit)
+        .map(|(hash, _, _, _, path)| (*hash, path.clone()))
+        .collect()
+}
+
+/// The constraints an Ember keyword search attaches to its `FIND_VALUE`s.
+///
+/// A function so the choice is testable and stated once. Availability is
+/// deliberately absent: KAD can filter on it because its keyword entries carry a
+/// publisher-claimed source count, while an Ember record carries none and the
+/// number the search page shows counts distinct publishers across the network,
+/// which no single responder can see.
+fn ember_keyword_constraints(
+    file_type_filter: Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<String>,
+) -> ember::dht::messages::ValueConstraints {
+    ember::dht::messages::ValueConstraints {
+        min_size,
+        max_size,
+        file_type: file_type_filter,
+        file_extension,
+        extra_keys: Vec::new(),
+    }
+}
 
 /// Files whose source records go out this tick, for a library of
 /// `publishable` files with `due` of them currently past their interval.
@@ -49774,15 +49991,11 @@ async fn maybe_publish_ember_keywords(
     // Nothing is lost by going slower. A file whose turn has not come publishes
     // without media now and gains it on republish, and at this rate a library of
     // several thousand is fully probed inside one republish interval anyway.
-    const MEDIA_PROBES_PER_TICK: usize = 8;
-    let unscanned: Vec<([u8; 16], String)> = due
-        .iter()
-        .filter(|(hash, _, _, _, path)| {
-            !path.is_empty() && known_files.media_for(hash).is_some_and(|(seen, _)| !seen)
-        })
-        .take(MEDIA_PROBES_PER_TICK)
-        .map(|(hash, _, _, _, path)| (*hash, path.clone()))
-        .collect();
+    let unscanned = files_needing_media_probe(
+        &due,
+        |hash| known_files.media_for(hash).map(|(seen, _)| seen),
+        MEDIA_PROBES_PER_TICK,
+    );
     if !unscanned.is_empty() {
         let probed = tokio::task::spawn_blocking(move || {
             unscanned

@@ -40,10 +40,12 @@ Worth recording, because each one looks like a gap until you check the other sid
 
 ## Closed in this pass (Sep 2026)
 
-Every item is done, and the extension question is decided. None of the wire
-additions needed a version bump — see item 1 for why bumping would have been
-actively wrong. What remains is one *new* feature rather than a gap:
-[browse by type](#next-browse-by-type-off-the-dht).
+Every item is done bar one loose end, and the extension question is decided. None
+of the wire additions needed a version bump — see item 1 for why bumping would
+have been actively wrong. What remains is one *new* feature rather than a gap
+([browse by type](#next-browse-by-type-off-the-dht)), plus the
+`CancelEmberSearch` tidy still listed under item 6 — a debug-only command, which
+is why it keeps being left.
 
 The two kinds of change this overlay is for, and which each item was:
 
@@ -83,7 +85,8 @@ walk never got to. `kad/messages.rs` says this outright in the comment above its
 own constraint encoding — a purely client-side filter cannot recover what the
 remote already truncated away.
 
-**Done.** `ValueConstraints` (min size, max size, file type) rides an optional
+**Done.** `ValueConstraints` — min size, max size, file type, file extension, and
+the keyword hashes that would not fit the count-prefixed run — rides an optional
 TLV block trailing the `FIND_VALUE` payload; the responder applies it in
 `intersect_find_value_records` *before* packing, so `total_available` counts
 matches and a searcher pages through matches rather than through positions it
@@ -346,6 +349,7 @@ that already speaks the higher number.
 So a change that wants to stay compatible cannot advertise itself in the version
 byte. It has to go where an existing decoder does not look: after the fields a
 payload's parser reads at fixed offsets, or after a record's length-prefixed name.
-Both `FIND_VALUE` and keyword records have that room, which is why items 1 and 3
-landed without touching the version at all. A change that needs to alter an
+Both `FIND_VALUE` and keyword records have that room, which is why items 1 and 2
+landed without touching the version at all. (Item 3 is searcher-local policy and
+touches no wire format, so it never faced the question.) A change that needs to alter an
 existing field still has no path but a bump, and that is still the standing gap.
