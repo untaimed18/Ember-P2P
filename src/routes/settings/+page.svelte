@@ -2240,8 +2240,13 @@
                will this not finish?". -->
           <div class="field">
             <span class="toggle-title">{m.webservices_title()}</span>
-            <span class="hint">{m.webservices_desc()}</span>
-            <span class="hint">{m.webservices_privacy_note()}</span>
+            <!-- The two notes are one thought — what the feature is, and what
+                 using it discloses — so they sit closer to each other than to
+                 the list, rather than reading as two unrelated paragraphs. -->
+            <div class="webservice-intro">
+              <span class="hint">{m.webservices_desc()}</span>
+              <span class="hint">{m.webservices_privacy_note()}</span>
+            </div>
 
             {#if settings.web_services.length === 0}
               <span class="hint">{m.webservices_empty()}</span>
@@ -2251,10 +2256,10 @@
                   <li class="webservice-row">
                     <div class="webservice-text">
                       <span class="webservice-name"><bdi dir="auto">{service.name}</bdi></span>
-                      <span class="hint webservice-url">{service.url}</span>
+                      <span class="hint webservice-url" title={service.url}>{service.url}</span>
                     </div>
                     <button
-                      class="action-btn ghost"
+                      class="action-btn ghost webservice-remove"
                       onclick={() => removeWebService(index)}
                     >{m.webservices_remove()}</button>
                   </li>
@@ -2262,40 +2267,48 @@
               </ul>
             {/if}
 
-            <div class="webservice-add">
-              <label class="webservice-field">
-                <span class="hint">{m.webservices_name_label()}</span>
-                <input
-                  type="text"
-                  bind:value={newWebServiceName}
-                  maxlength="64"
-                  spellcheck="false"
-                  placeholder={m.webservices_name_placeholder()}
-                />
-              </label>
-              <label class="webservice-field webservice-field-url">
-                <span class="hint">{m.webservices_url_label()}</span>
-                <input
-                  type="text"
-                  bind:value={newWebServiceUrl}
-                  maxlength="512"
-                  spellcheck="false"
-                  placeholder={m.webservices_url_placeholder()}
-                />
-              </label>
-              <button class="action-btn" onclick={addWebService}>{m.webservices_add()}</button>
-            </div>
-            <span class="hint">{m.webservices_placeholders()}</span>
+            <!-- Adding is a different activity from reviewing what is already
+                 configured, so it gets its own group rather than continuing the
+                 same flat stack. The rule is the separator; boxing it would make
+                 a second card inside a card. -->
+            <div class="webservice-form">
+              <div class="webservice-add">
+                <label class="webservice-field">
+                  <span class="hint">{m.webservices_name_label()}</span>
+                  <input
+                    type="text"
+                    bind:value={newWebServiceName}
+                    maxlength="64"
+                    spellcheck="false"
+                    placeholder={m.webservices_name_placeholder()}
+                  />
+                </label>
+                <label class="webservice-field webservice-field-url">
+                  <span class="hint">{m.webservices_url_label()}</span>
+                  <input
+                    type="text"
+                    bind:value={newWebServiceUrl}
+                    maxlength="512"
+                    spellcheck="false"
+                    placeholder={m.webservices_url_placeholder()}
+                  />
+                </label>
+                <button class="action-btn" onclick={addWebService}>{m.webservices_add()}</button>
+              </div>
+              <!-- Annotates the Address field above it, so it stays with the
+                   form instead of floating between the form and the buttons. -->
+              <span class="hint">{m.webservices_placeholders()}</span>
 
-            <div class="webservice-actions">
-              {#if canAddExample}
-                <button class="action-btn ghost" onclick={addExampleWebService}>
-                  {m.webservices_add_example()}
+              <div class="webservice-actions">
+                {#if canAddExample}
+                  <button class="action-btn ghost" onclick={addExampleWebService}>
+                    {m.webservices_add_example()}
+                  </button>
+                {/if}
+                <button class="action-btn ghost" onclick={handleImportWebServices}>
+                  {m.webservices_import()}
                 </button>
-              {/if}
-              <button class="action-btn ghost" onclick={handleImportWebServices}>
-                {m.webservices_import()}
-              </button>
+              </div>
             </div>
             {#if webServiceMessage}
               <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
@@ -4217,51 +4230,83 @@
     flex-wrap: wrap;
   }
   /* Web services list + add form. */
-  .webservice-list {
-    list-style: none;
-    margin: 4px 0 0;
-    padding: 0;
+  .webservice-intro {
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
+  .webservice-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  /* `--bg-surface` rather than `--bg-secondary`, which is the card's own
+     colour: a row painted in it reads as a hairline outline on the card
+     instead of an object sitting on it. Matches `.ignored-list li`, the other
+     removable-entry list on this page. */
   .webservice-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    background: var(--bg-secondary);
+    gap: 12px;
+    padding: 8px 10px;
+    background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+    transition: border-color var(--transition-fast) ease;
+  }
+  .webservice-row:hover {
+    border-color: var(--accent-dim);
   }
   .webservice-text {
     display: flex;
     flex-direction: column;
+    gap: 2px;
     min-width: 0;
     flex: 1;
   }
   .webservice-name {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   /* A URL is long and is the part worth inspecting, so it truncates rather
-     than wrapping the row to three lines. The full value is in the title
-     attribute on the context-menu item that uses it. */
+     than wrapping the row to three lines; the full value is in the row's
+     `title`. Monospaced to match the Address field it was typed into, which
+     is also what makes a `#hashid` placeholder legible as a placeholder. */
   .webservice-url {
+    font-family: var(--font-mono, monospace);
     font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Removing is the one destructive control here, and the shared hover turns
+     everything accent-coloured. */
+  .webservice-remove {
+    flex-shrink: 0;
+  }
+  .webservice-remove:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .webservice-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
   }
   .webservice-add {
     display: flex;
     align-items: flex-end;
     gap: 8px;
     flex-wrap: wrap;
-    margin-top: 6px;
   }
   .webservice-field {
     display: flex;
@@ -4286,6 +4331,7 @@
     outline: none;
     border-color: var(--accent);
   }
+  /* Secondary ways in, so they sit further from the form than its own note. */
   .webservice-actions {
     display: flex;
     align-items: center;
