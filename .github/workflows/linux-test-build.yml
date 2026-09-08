@@ -1,0 +1,170 @@
+name: Linux test build
+
+# Builds an unsigned, unpublished Linux AppImage on demand, to hand to a tester.
+#
+# Deliberately separate from release.yml. Shipping Linux for real still needs
+# updater-manifest work for linux-x86_64 and a decision on AppImage vs .deb as
+# the updater artifact, and this workflow settles none of that: it never touches
+# a signing key, never creates a release, and only runs when someone asks it to.
+#
+# Two jobs, because the distro an AppImage is built on decides what it can run
+# on. glibc is the one thing an AppImage does not bundle, and it is only
+# forwards compatible.
+#
+#   ubuntu-2204  The glibc baseline (2.35) Tauri recommends for shipping, and
+#                the same runner `check-linux` compiles on. Runs on anything
+#                that old or newer, so this is the artifact to give a tester.
+#   debian-13    Matches an LMDE 7 / Debian 13 tester exactly, bundling that
+#                distro's WebKitGTK rather than 22.04's. Worth having only to
+#                isolate whether a rendering fault is the bundled WebKit or
+#                Ember itself. Do not hand it to anyone on an older distro; it
+#                will not start there.
+#
+# `createUpdaterArtifacts` is forced off for both. tauri.conf.json enables it
+# for the signed Windows release, and with no signing key here the bundler would
+# fail at the updater step after paying for a full compile.
+#
+# `APPIMAGE_EXTRACT_AND_RUN` is set because the bundler runs linuxdeploy, which
+# is itself an AppImage and therefore wants FUSE. The container has none, and
+# setting it everywhere keeps the two jobs building the same way.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-2204:
+    name: AppImage on Ubuntu 22.04 (portable)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # `xdg-utils` and `desktop-file-utils` are not in `check-linux`'s list
+      # because that job only compiles. The AppImage bundler shells out to
+      # `xdg-mime` for the `.emulecollection` file association and fails at the
+      # very last step without it.
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            pkg-config \
+            file \
+            xdg-utils \
+            desktop-file-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          npm run tauri build -- --bundles appimage \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-appimage-ubuntu2204
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  debian-13:
+    name: AppImage on Debian 13 (LMDE 7 match)
+    runs-on: ubuntu-latest
+    container: debian:13
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      # Before `checkout`, which needs git to be present to clone rather than
+      # fall back to a source tarball. The image is minimal, so this also
+      # supplies the C toolchain, `cmake` for aws-lc-sys, and the `xz-utils`
+      # that setup-node needs to unpack its tarball.
+      - name: Install build and desktop dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            xz-utils \
+            build-essential \
+            cmake \
+            pkg-config \
+            file \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            xdg-utils \
+            desktop-file-utils
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          npm run tauri build -- --bundles appimage \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-appimage-debian13
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
