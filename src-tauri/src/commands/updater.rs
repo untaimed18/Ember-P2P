@@ -1249,10 +1249,29 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         })
         .build()
         .context("failed to build Tauri updater")?;
-    let update = updater
-        .check()
-        .await
-        .context("Tauri updater check failed")?;
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(error) => {
+            // A signed, otherwise valid manifest that carries no artifact for
+            // the running target. Releases are Windows-only, so on Linux this
+            // is the ordinary state rather than a failure: reporting it as one
+            // tells a Linux tester their update check is broken when there is
+            // simply nothing published for them. It stays a hard error on the
+            // platforms we do publish for, where a missing target means the
+            // release itself is malformed. `cfg!` rather than `#[cfg]` so both
+            // arms are type-checked wherever this is compiled.
+            if let tauri_plugin_updater::Error::TargetNotFound(target) = &error {
+                if cfg!(target_os = "linux") {
+                    tracing::debug!(
+                        "Signed updater manifest advertises {manifest_version} but has no \
+                         {target} artifact; treating as no update"
+                    );
+                    return Ok(None);
+                }
+            }
+            return Err(anyhow::Error::new(error).context("Tauri updater check failed"));
+        }
+    };
     let pending_parts = if let Some(update) = update {
         if update.raw_json != verified_json {
             bail!("Tauri updater metadata differed from the signed manifest");
