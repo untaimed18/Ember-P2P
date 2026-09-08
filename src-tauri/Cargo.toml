@@ -101,7 +101,10 @@ fs2 = "0.4"
 maxminddb = "0.29"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
-notify-debouncer-mini = { version = "0.7", default-features = false }
+# Direct `notify` rather than `notify-debouncer-mini`: the mini crate drops
+# EventKind, and Linux inotify OPEN/ATTRIB from our own directory walk would
+# otherwise look like a user change and rescan in a loop.
+notify = "8"
 # Used by the AntiLeech filter to compile the user-editable pattern list
 # into matchable regex automata. `default-features = false` strips the
 # Unicode tables we don't need (we match ASCII-only client-software

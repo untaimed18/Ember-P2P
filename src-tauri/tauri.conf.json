@@ -18,7 +18,8 @@
         "height": 900,
         "minWidth": 900,
         "minHeight": 600,
-        "center": true
+        "center": true,
+        "zoomHotkeysEnabled": true
       }
     ],
     "security": {
@@ -93,7 +94,11 @@
     },
     "linux": {
       "deb": {
-        "section": "net"
+        "section": "net",
+        "depends": [
+          "xdg-utils",
+          "desktop-file-utils"
+        ]
       }
     }
   }

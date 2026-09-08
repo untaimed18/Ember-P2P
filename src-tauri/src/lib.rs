@@ -958,7 +958,7 @@ pub fn run() {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing default window icon for tray"))?;
 
-            let _tray = TrayIconBuilder::with_id("main")
+            let tray_result = TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .tooltip("Ember")
                 .menu(&tray_menu)
@@ -1003,7 +1003,22 @@ pub fn run() {
                         }
                     }
                 })
-                .build(app)?;
+                .build(app);
+            if let Err(e) = tray_result {
+                // No session bus / AppIndicator host (WSL, some live sessions,
+                // GNOME without the extension). Failing `setup` here would
+                // never show a window.
+                #[cfg(target_os = "linux")]
+                {
+                    tracing::warn!(
+                        "System tray unavailable ({e}); close-to-tray will not have an icon"
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(e.into());
+                }
+            }
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();

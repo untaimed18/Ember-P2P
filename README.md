@@ -381,10 +381,11 @@ If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check
 
 ```bash
 sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-  libayatana-appindicator3-dev librsvg2-dev pkg-config file
+  libayatana-appindicator3-dev librsvg2-dev pkg-config file \
+  xdg-utils desktop-file-utils
 ```
 
-Official releases are still Windows-only. A Linux build from this tree produces a `.deb` and an AppImage locally; those formats are not yet published or auto-updated.
+Official releases are still Windows-only. A Linux build from this tree produces a `.deb` and an AppImage locally; those formats are not yet published or auto-updated. For a tester, prefer the `.deb`. The AppImage needs FUSE (`libfuse2` on Ubuntu 22.04); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
 
 #### Development
 

@@ -3,11 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify_debouncer_mini::{
-    new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode},
-    DebounceEventResult, Debouncer,
-};
+use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
@@ -20,9 +17,13 @@ use crate::app_state::AppState;
 /// file is added, removed, or modified underneath any shared folder.
 ///
 /// Behaviour summary:
-/// - A single `notify-debouncer-mini` debouncer watches every shared folder
-///   recursively. Events are collapsed into a 2-second debounce window.
-/// - Each debounced batch sends one ping on an internal channel; the handler
+/// - A single `notify` watcher watches every shared folder recursively.
+/// - Events that are side-effects of reading a folder (Linux inotify `OPEN`,
+///   close-after-read, atime `ATTRIB`) are ignored. Without that filter a
+///   scan's own `read_dir` retriggers the watcher, which rescans, which opens
+///   the directory again — a loop every debounce window, which is what a
+///   first Linux run produced on an empty Incoming folder.
+/// - Each accepted event sends one ping on an internal channel; the handler
 ///   task coalesces multiple pings into a single reload call.
 /// - The reload path reuses the existing `reload_shared_files` Tauri command
 ///   so hashing, KAD (re)publishing, and UI events behave identically to a
@@ -31,7 +32,7 @@ use crate::app_state::AppState;
 ///   folders removed via `remove_shared_folder` are unwatched the same way.
 pub struct SharedFoldersWatcher {
     watched: Mutex<HashSet<PathBuf>>,
-    debouncer: Mutex<Option<Debouncer<RecommendedWatcher>>>,
+    watcher: Mutex<Option<RecommendedWatcher>>,
     /// The last full set of folders we were asked to watch, including any that
     /// were offline at the time. `watched` holds only those actually
     /// registered, so this is what lets the retry loop tell "not requested"
@@ -43,6 +44,27 @@ pub struct SharedFoldersWatcher {
 /// or network drive that was disconnected at launch, or a directory that
 /// disappeared mid-session and took its OS watch with it.
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// True when this event means a shareable file may have appeared, vanished, or
+/// changed content. `notify` 8's Linux backend includes `OPEN` and `ATTRIB` in
+/// the default inotify mask; those fire when we walk a folder to index it, so
+/// they must not schedule a reload. `CLOSE_WRITE` is reported as
+/// `Access(Close(Write))` and *does* mean a copy finished.
+pub(crate) fn event_should_rescan(kind: EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Data(_)) => true,
+        EventKind::Modify(ModifyKind::Name(_)) => true,
+        EventKind::Modify(ModifyKind::Any) => true,
+        // Poll-watcher mtime (and `touch`) — not Linux inotify ATTRIB.
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)) => true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Modify(ModifyKind::Other) => false,
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        EventKind::Any | EventKind::Other => true,
+    }
+}
 
 impl SharedFoldersWatcher {
     /// Create and start the watcher. Returns `None` if the OS-level watcher
@@ -76,7 +98,9 @@ impl SharedFoldersWatcher {
             // keep arriving. Without this, a long-running bulk copy that emits
             // a steady trickle of events could starve the reload indefinitely.
             const MAX_COALESCE_WINDOW: Duration = Duration::from_secs(15);
-            const COALESCE_COOLDOWN: Duration = Duration::from_millis(400);
+            // Quiet window after the first ping. Replaces notify-debouncer-mini's
+            // 2s debounce now that we filter events ourselves.
+            const COALESCE_COOLDOWN: Duration = Duration::from_secs(2);
 
             while reload_rx.recv().await.is_some() {
                 let first_event = std::time::Instant::now();
@@ -151,34 +175,26 @@ impl SharedFoldersWatcher {
             }
         });
 
-        let tx_for_debouncer = reload_tx.clone();
-        let debouncer_result = new_debouncer(
-            Duration::from_secs(2),
-            move |res: DebounceEventResult| match res {
-                Ok(events) => {
-                    if events.is_empty() {
-                        return;
+        let tx_for_watcher = reload_tx.clone();
+        let watcher = match recommended_watcher(move |res: notify::Result<Event>| match res {
+            Ok(event) => {
+                if !event_should_rescan(event.kind) {
+                    return;
+                }
+                debug!("FS watcher: reload-worthy event ({:?})", event.kind);
+                match tx_for_watcher.try_send(()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!("FS watcher: reload queue full, ping coalesced");
                     }
-                    debug!("FS watcher: {} debounced event(s)", events.len());
-                    // try_send + discard on full: a pending ping already means
-                    // a reload is queued; no information is lost by dropping
-                    // the redundant notification.
-                    match tx_for_debouncer.try_send(()) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!("FS watcher: reload queue full, ping coalesced");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("FS watcher: reload driver task has exited");
-                        }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("FS watcher: reload driver task has exited");
                     }
                 }
-                Err(e) => warn!("FS watcher error: {e:?}"),
-            },
-        );
-
-        let debouncer = match debouncer_result {
-            Ok(d) => d,
+            }
+            Err(e) => warn!("FS watcher error: {e:?}"),
+        }) {
+            Ok(watcher) => watcher,
             Err(e) => {
                 warn!("FS watcher: failed to initialise ({e}); live folder tracking disabled");
                 return None;
@@ -187,7 +203,7 @@ impl SharedFoldersWatcher {
 
         let watcher = Arc::new(Self {
             watched: Mutex::new(HashSet::new()),
-            debouncer: Mutex::new(Some(debouncer)),
+            watcher: Mutex::new(Some(watcher)),
             desired: Mutex::new(Vec::new()),
         });
         watcher.sync_paths(&initial_paths);
@@ -255,10 +271,10 @@ impl SharedFoldersWatcher {
             // set from `watched` — so a directory that flickered accumulated a
             // fresh watch (and handle) on the backend every time it came back.
             let mut current = self.watched.lock();
-            let mut debouncer_guard = self.debouncer.lock();
-            if let Some(debouncer) = debouncer_guard.as_mut() {
+            let mut watcher_guard = self.watcher.lock();
+            if let Some(watcher) = watcher_guard.as_mut() {
                 for path in &vanished {
-                    if let Err(e) = debouncer.watcher().unwatch(path) {
+                    if let Err(e) = watcher.unwatch(path) {
                         debug!(
                             "FS watcher: could not unwatch the vanished {}: {e}",
                             path.display()
@@ -326,8 +342,8 @@ impl SharedFoldersWatcher {
             .collect();
 
         let mut current = self.watched.lock();
-        let mut debouncer_guard = self.debouncer.lock();
-        let Some(debouncer) = debouncer_guard.as_mut() else {
+        let mut watcher_guard = self.watcher.lock();
+        let Some(watcher) = watcher_guard.as_mut() else {
             return;
         };
 
@@ -335,13 +351,13 @@ impl SharedFoldersWatcher {
         let to_add: Vec<PathBuf> = desired_set.difference(&current).cloned().collect();
 
         for path in &to_remove {
-            if let Err(e) = debouncer.watcher().unwatch(path) {
+            if let Err(e) = watcher.unwatch(path) {
                 warn!("FS watcher: failed to unwatch {}: {e}", path.display());
             }
             current.remove(path);
         }
         for path in &to_add {
-            match debouncer.watcher().watch(path, RecursiveMode::Recursive) {
+            match watcher.watch(path, RecursiveMode::Recursive) {
                 Ok(()) => {
                     current.insert(path.clone());
                     debug!("FS watcher: watching {}", path.display());
@@ -358,5 +374,52 @@ impl SharedFoldersWatcher {
                 to_remove.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_should_rescan;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
+    };
+    use notify::EventKind;
+
+    #[test]
+    fn linux_scan_side_effects_do_not_rescan() {
+        assert!(!event_should_rescan(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!event_should_rescan(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!event_should_rescan(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!event_should_rescan(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+    }
+
+    #[test]
+    fn real_share_changes_do_rescan() {
+        assert!(event_should_rescan(EventKind::Create(CreateKind::File)));
+        assert!(event_should_rescan(EventKind::Create(CreateKind::Folder)));
+        assert!(event_should_rescan(EventKind::Remove(RemoveKind::File)));
+        assert!(event_should_rescan(EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(event_should_rescan(EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        assert!(event_should_rescan(EventKind::Modify(ModifyKind::Any)));
+        assert!(event_should_rescan(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(event_should_rescan(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        assert!(event_should_rescan(EventKind::Any));
     }
 }

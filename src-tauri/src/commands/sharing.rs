@@ -1287,6 +1287,7 @@ pub(crate) async fn persist_scan_cursors(
         let config = state.config.read().await;
         config.settings.clone()
     };
+    let cursors_before = settings.shared_folder_scan_cursors.clone();
     for (folder, cursor) in updates {
         match cursor {
             Some(value) => {
@@ -1309,6 +1310,13 @@ pub(crate) async fn persist_scan_cursors(
                     .remove(&crate::search::index::normalize_path_key(folder));
             }
         }
+    }
+    // Nothing moved: every update either repeated the stored cursor or was
+    // declined by `never_rewind`. Writing anyway rewrote settings.json on
+    // every scan, which on Linux turned each rescan into a visible
+    // "Config saved" churn cycle.
+    if settings.shared_folder_scan_cursors == cursors_before {
+        return Ok(());
     }
     // Scan cursors are internal recovery bookkeeping, not a user setting;
     // changing the visible revision here would make an open Settings form
