@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Build an unsigned Linux AppImage from a WSL (or native Linux) shell.
+# Build unsigned Linux packages (AppImage and .deb) from a WSL (or native
+# Linux) shell.
 #
 # This exists so the rebuild is one short command typed into WSL instead of a
 # multi-line paste. Pasting is the thing it replaces: continuation backslashes
 # collapse into half a command, and text copied on Windows arrives with CRLF
 # line endings, which bash reports as `$'\r': command not found`.
 #
-#   bash /mnt/c/P2PApp/scripts/build-linux-appimage.sh     # from the Windows tree
-#   bash scripts/build-linux-appimage.sh                   # from a Linux clone
+#   bash /mnt/c/P2PApp/scripts/build-linux-packages.sh     # from the Windows tree
+#   bash scripts/build-linux-packages.sh                   # from a Linux clone
 #
 # When the repository holding this script is on a Windows drive (/mnt/...), it
 # deliberately does not build there: drvfs is slow enough to dominate the build,
@@ -17,15 +18,20 @@
 # Windows side, which .gitignore already covers.
 #
 # Usage:
-#   bash scripts/build-linux-appimage.sh [branch]      # branch default: develop
+#   bash scripts/build-linux-packages.sh [branch]      # branch default: develop
 # Environment:
 #   EMBER_LINUX_TREE   Linux work tree to build in     (default: ~/ember)
-#   EMBER_BUNDLES      value passed to --bundles        (default: appimage)
+#   EMBER_BUNDLES      value passed to --bundles     (default: appimage,deb)
+#
+# Both formats by default because they fail differently and a tester should not
+# have to debug the packaging to reach the app. The AppImage needs FUSE 2, which
+# Debian 13 renamed and does not install; the .deb is an ordinary apt install
+# but has to satisfy Debian's own package versions.
 
 set -euo pipefail
 
 branch="${1:-develop}"
-bundles="${EMBER_BUNDLES:-appimage}"
+bundles="${EMBER_BUNDLES:-appimage,deb}"
 work_tree="${EMBER_LINUX_TREE:-$HOME/ember}"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -157,6 +163,9 @@ if (( on_windows_drive )); then
 fi
 
 echo
-echo "Reminder for a Debian 13 / LMDE 7 tester: FUSE 2 is not installed there by"
-echo "default and was renamed, so they need 'sudo apt install libfuse2t64', or"
-echo "they can run it with APPIMAGE_EXTRACT_AND_RUN=1 and install nothing."
+echo "For a Debian 13 / LMDE 7 tester:"
+echo "  .deb       sudo apt install ./Ember_<version>_amd64.deb"
+echo "             Pulls in xdg-utils and desktop-file-utils itself."
+echo "  AppImage   needs FUSE 2, which Debian 13 renamed and does not install:"
+echo "             sudo apt install libfuse2t64"
+echo "             or run it with APPIMAGE_EXTRACT_AND_RUN=1 and install nothing."

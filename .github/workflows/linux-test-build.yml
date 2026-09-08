@@ -1,6 +1,10 @@
 name: Linux test build
 
-# Builds an unsigned, unpublished Linux AppImage on demand, to hand to a tester.
+# Builds unsigned, unpublished Linux packages on demand, to hand to a tester:
+# an AppImage and a .deb, because they fail differently and a tester should not
+# have to debug the packaging to reach the app. The AppImage needs FUSE 2, which
+# Debian 13 renamed and does not install by default; the .deb is an ordinary apt
+# install but has to satisfy Debian's own package versions.
 #
 # Deliberately separate from release.yml. Shipping Linux for real still needs
 # updater-manifest work for linux-x86_64 and a decision on AppImage vs .deb as
@@ -86,18 +90,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build AppImage
+      - name: Build packages
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          npm run tauri build -- --bundles appimage \
+          npm run tauri build -- --bundles appimage,deb \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Upload AppImage
+      - name: Upload packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ember-appimage-ubuntu2204
-          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          name: ember-linux-ubuntu2204
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 14
 
@@ -154,17 +160,19 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build AppImage
+      - name: Build packages
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          npm run tauri build -- --bundles appimage \
+          npm run tauri build -- --bundles appimage,deb \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Upload AppImage
+      - name: Upload packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ember-appimage-debian13
-          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          name: ember-linux-debian13
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 14
