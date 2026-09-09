@@ -414,7 +414,6 @@
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
   let missingScanInFlight = $state(false);
-  let missingScanDone = $state(false);
   // `scanMissingFiles` stats every shared file on disk, so it must not run on
   // every data refresh — and `refresh()` itself fires every 3s while hashing.
   // Throttle background scans to once per interval; user-initiated paths pass
@@ -440,7 +439,6 @@
       missingPathSet = new Set(result.paths);
       missingScanTruncated = result.truncated;
       missingTotalCount = result.totalMissing;
-      missingScanDone = true;
       missingScanFailToasted = false;
       // Apply a deferred persisted "missing only" filter now that we know
       // whether any files are actually missing — only enable it if so.

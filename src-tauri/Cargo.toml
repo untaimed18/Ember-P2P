@@ -44,7 +44,6 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-walkdir = "2"
 md4 = "0.10"
 md-5 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
@@ -75,7 +74,6 @@ tauri-plugin-process = "2"
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
 tauri-plugin-updater = "2"
 rsa = "0.9"
-signature = "2"
 num-bigint-dig = "0.8"
 opener = "0.8"
 crc32fast = "1"
@@ -83,7 +81,6 @@ zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
-lz4_flex = "0.13"
 quinn = "0.11"
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }

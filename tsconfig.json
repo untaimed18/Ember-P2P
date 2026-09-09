@@ -9,6 +9,10 @@
     "skipLibCheck": true,
     "sourceMap": false,
     "strict": true,
+    // An unused import is not a `strict` error, which is how a dead
+    // `stopTransfersBatch` import sat in the transfers page through every CI
+    // run. This is the lint that catches that class on the way in.
+    "noUnusedLocals": true,
     "moduleResolution": "bundler"
   }
   // Path aliases are handled by https://svelte.dev/docs/kit/configuration#alias

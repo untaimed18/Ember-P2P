@@ -7,7 +7,7 @@
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
-    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
+    pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
@@ -752,7 +752,6 @@
     }
     return { all, active, completed, failed, queued };
   });
-  let allUploads = $derived(uploadPartition.all);
   let activeUploads = $derived(uploadPartition.active);
   // `completedUploads`, `failedUploads`, `queuedUploads` were derivations
   // for the old upload-pane "Completed"/"Failed"/"On Queue" placeholder

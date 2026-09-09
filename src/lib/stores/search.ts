@@ -65,10 +65,6 @@ export function newSearchNonce(): number {
   return searchNonce;
 }
 
-export function currentSearchNonce(): number {
-  return searchNonce;
-}
-
 function newTabId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();

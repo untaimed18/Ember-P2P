@@ -40,21 +40,6 @@ export function formatSpeed(bytesPerSec: number): string {
   return `${formatBytes(bytesPerSec)}/s`;
 }
 
-/** Format remaining time given total size, transferred bytes, and current speed. */
-export function formatEta(totalSize: number, transferred: number, speed: number): string {
-  if (!Number.isFinite(speed) || !Number.isFinite(totalSize) || !Number.isFinite(transferred)) return '\u2014';
-  if (speed <= 0 || transferred >= totalSize) return '\u2014';
-  const remaining = totalSize - transferred;
-  const secs = Math.round(remaining / speed);
-  if (secs < 60) return `${secs}s`;
-  const days = Math.floor(secs / 86400);
-  const hrs = Math.floor((secs % 86400) / 3600);
-  const mins = Math.floor((secs % 3600) / 60);
-  if (days > 0) return `${days}d ${hrs}h`;
-  if (hrs > 0) return `${hrs}h ${mins}m`;
-  return `${mins}m`;
-}
-
 /*
  * `Intl.DateTimeFormat` construction is surprisingly expensive — each call
  * to `toLocaleDateString(undefined, options)` allocates a fresh formatter
@@ -202,22 +187,10 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   return `${timeStr} (${remainStr})`;
 }
 
-/** Format a percentage with smart decimal handling. */
-export function formatPercent(value: number, decimals = 1): string {
-  if (!Number.isFinite(value) || value <= 0) return '0%';
-  if (value >= 100) return '100%';
-  return `${value.toFixed(decimals)}%`;
-}
-
 /** Truncate a hex hash with ellipsis. */
 export function truncateHash(hash: string, len = 16): string {
   if (hash.length <= len) return hash;
   return `${hash.slice(0, len)}\u2026`;
-}
-
-/** Pluralize a noun based on count. */
-export function pluralize(count: number, singular: string, plural?: string): string {
-  return count === 1 ? `${count} ${singular}` : `${count} ${plural || singular + 's'}`;
 }
 
 /**

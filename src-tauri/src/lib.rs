@@ -1851,12 +1851,10 @@ pub fn run() {
             commands::peers::get_peer_reputation_batch,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
-            commands::peers::ember_ping_peer,
             commands::peers::get_ember_dht_contacts,
             commands::peers::get_ember_dht_searches,
             commands::peers::get_ember_dht_store,
             $($harness,)*
-            commands::peers::ember_request_sources,
             commands::channels::list_channels,
             commands::channels::create_channel,
             commands::channels::join_channel,
@@ -1956,9 +1954,17 @@ pub fn run() {
                     ]
                 };
             }
+            // Harness-only commands, reachable by hand from devtools and never
+            // called by the UI. They dial arbitrary peers and ask them for
+            // sources, so a release build has no reason to carry them as
+            // callable IPC. `ember_ping_peer` and `ember_request_sources` were
+            // registered unconditionally while the rest of this list was
+            // already gated; that was an oversight rather than a decision.
             #[cfg(debug_assertions)]
             {
                 ember_invoke_handler![
+                    commands::peers::ember_ping_peer,
+                    commands::peers::ember_request_sources,
                     commands::peers::add_ember_dht_contact,
                     commands::peers::ember_dht_ping_peer,
                     commands::peers::ember_dht_find_node,
