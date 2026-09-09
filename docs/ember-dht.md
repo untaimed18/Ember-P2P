@@ -1,28 +1,28 @@
-# Ember DHT — remaining work and future improvements
+# Ember DHT — plan
 
 The protocol specification is
-[ember-dht-specification.pdf](ember-dht-specification.pdf), now written against
-wire version 4 as implemented in Ember 1.6.3, and rebuilt from
-[its HTML source](ember-dht-specification.html) with
-[`scripts/build-ember-dht-spec.sh`](../scripts/build-ember-dht-spec.sh). It
-carries the v3 frame changes (see [item 1](#1-the-serving-ceiling--done-wire-v3)
-and [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3)),
-what moved it to v4 ([item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
+[ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
+version 4 and rebuilt from [its HTML source](ember-dht-specification.html) with
+[`scripts/build-ember-dht-spec.sh`](../scripts/build-ember-dht-spec.sh). It carries
+the v3 frame changes, what moved it to v4 (see
+[item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
 and every additive change since — each marked as additive, since that is the
-distinction an implementer needs. This file is the standing work log: what is
-left, what was compared against KAD, and what is explicitly not planned.
+distinction an implementer needs.
+
+**This is the single plan for the overlay.** It replaces the separate
+`ember-dht-search-plan.md`, whose live content — the friend-browse filter design,
+the extension decision, and the standing "already better than KAD" list — is folded
+in below. Finished work is no longer narrated item by item; it is listed in
+[Closed](#closed), and the reasoning behind each closed item is in git history and
+in the specification.
 
 Status: **protocol slices complete** and the overlay is **always on**
-(`ember_native_enabled`; profiles that still had it off are turned on at
-load). Keyword/source publish, iterative search,
-join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
-BLAKE3 integrity digests, network-size-adaptive abuse limits, streamed
-search results, `FIND_VALUE` paging, and diagnostics are live on `develop`.
-
-Start at [Planned next](#planned-next--from-the-kad-comparison-aug-2026) — every
-item in it is now done, and each section records why the change was made and what
-to watch. The sections after it are older standing work the comparison did not
-change.
+(`ember_native_enabled`; profiles that still had it off are turned on at load).
+Keyword/source publish, iterative search, join via the KAD rendezvous key, buddy
+`PROXY_STORE`, peer announce, BLAKE3 integrity digests, network-size-adaptive
+abuse limits, streamed search results, `FIND_VALUE` paging, and diagnostics are
+live. Start at [Outstanding work](#outstanding-work); everything below it is
+reference, decisions already taken, or closed.
 
 Code: [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/).
 
@@ -52,8 +52,7 @@ gets in through, in rough order of who arrives first:
 4. **A friend's routing table, over the friend session.** While below one
    k-bucket of verified contacts, live friend sessions are asked for the
    contacts they hold (`EMBER_EXT_DHT_CONTACT_REQ`). This is the only path that
-   needs no dialable UDP address for the peer introducing us — see
-   [item 2a](#2a-bootstrapping-from-a-friend).
+   needs no dialable UDP address for the peer introducing us.
 5. **DHT gossip** (`FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`) and
    **`nodes_ember.dat`** (up to `EMBER_PERSIST_MAX_CONTACTS` = 200) once
    the node has been online before.
@@ -66,7 +65,7 @@ identity-to-IP map of every participant.
 
 ---
 
-## What's left
+## Outstanding work
 
 ### 1. Ember-native transfers are partly wired
 
@@ -145,9 +144,9 @@ per peer (`peer_versions`, pruned to the routing table each maintenance tick).
 `ember_dht_version_advertisers` on `/ember` is the number to read against
 verified contacts.
 
-Additive on exactly the terms items 1 and 2 of
-[the search plan](ember-dht-search-plan.md#1-find_value-carries-no-constraints--done-and-without-a-version-bump)
-turned out to be, and the version deliberately did **not** move: `MSG_PING`
+Additive on exactly the terms the closed `FIND_VALUE` constraint and record
+metadata changes turned out to be (see [Closed](#closed)), and the version
+deliberately did **not** move: `MSG_PING`
 discards its payload entirely and `MSG_PONG` reads its address through
 `decode_socket_addr`, which checks only a minimum length and reports what it
 consumed, so a v4 build reads both frames exactly as it does today. Bumping for
@@ -174,109 +173,7 @@ standing gap is now narrower and different: not "nothing advertises a range" but
 "a shape change still partitions every peer running a build older than this
 one", which the advertiser count is what measures.
 
-### 2a. Bootstrapping from a friend
-
-A friend is the strongest bootstrap signal the app has — explicitly trusted, a
-live authenticated session, and a routing table that is exactly what a cold node
-is missing. For a long time the route from that to a DHT contact ran entirely
-around the session rather than through it: the eD2K/friend hello had to carry a
-non-zero UDP port, `EmberPeerDiscovered` had to pass its address guards, and
-then a single bridge `PING` had to be answered. Both halves below are now
-closed — the retry rate while starved, and the case where there is no address to
-retry at all.
-
-**Improved:** the retry backoff no longer grows while the table is starved. It
-was designed for a healthy node deciding how much to keep spending on an address
-that will not answer — sensible there, wrong below
-`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`, where those addresses *are* the join. One
-dropped datagram put the next attempt five minutes out, which is longer than
-many sessions, so a friend who blinked got no second chance inside a visit.
-While starved the interval is pinned to `EMBER_BRIDGE_RETRY_FIRST`, which equals
-the maintenance tick, so the flattened rate is one datagram per candidate per
-minute; it is capped by `EMBER_KAD_BRIDGE_MAX_PINGS` and stops on its own once
-the table fills.
-
-**Also done: we now ask over the session instead of waiting for the address.**
-A friend whose hello carried no UDP port, or whose address the
-`EmberPeerDiscovered` guards reject — the normal case for a relayed or
-NAT-traversed session — was never a bridge candidate at all, and no retry
-policy helps something that is never attempted. `note_connected_ember_peer`
-returns at `udp_port == 0`, so that friend became a known peer and could never
-be a DHT contact.
-
-The overlay rides UDP, so a friend we cannot ping can never *be* a contact.
-It can still hand over the contacts it already has. `EMBER_EXT_DHT_CONTACT_REQ`
-(0x05) carries our own node ID; `EMBER_EXT_DHT_CONTACTS` (0x06) answers with a
-DHT wire contact list, reusing `encode_contact_list` so the identity binding
-travels with it — no node ID on the wire, every ID re-derived from the Ed25519
-key beside it, so a friend cannot name a contact under an ID it does not
-control. Older builds ignore both sub-types, as the envelope intends.
-
-Four things the shape of this is load-bearing on:
-
-- **Only verified contacts are shared.** `find_closest` prefers verified but
-  falls back to leads when it holds none — which is exactly the node whose
-  leads are least worth passing on, so `ember_friend_contact_answer` filters
-  after it. A starved node answers with an empty list, which still separates
-  "my friend has nothing" from "my friend predates the question".
-- **What arrives is a lead, not a contact.** The wire list carries no
-  `last_seen`, so every entry enters through `offer_contact` — the full IP
-  policy and diversity gate — and then through the ordinary gossip probe. A
-  friend is trusted to *introduce*, not to vouch.
-- **Strictly an answer to a question we asked**, inside
-  `EMBER_FRIEND_CONTACT_ANSWER_WINDOW`. An unsolicited list is dropped. A
-  friend is not scored by the gossip reputation below — it is asked rather than
-  believed — so without this it could claim the whole probe budget on demand,
-  which is the one thing that machinery rations a DHT peer for. Note this is a
-  policy choice, not a namespace one: an Ember hash *is* a DHT node ID
-  (`BLAKE3(ed25519_pub)[..16]`), so a friend could be scored; rationing one we
-  deliberately queried would just starve the path we opened.
-- **It stops on its own.** The ask only runs below
-  `EMBER_KAD_BRIDGE_UNTIL_CONTACTS` verified contacts, at four friends per
-  maintenance tick, once per friend per minute, plus an opportunistic ask when
-  a session comes up in either direction (`EmberFriendConnected` outbound,
-  `FriendSeen` inbound), because waiting out a 60 s tick is most of a short
-  visit. Those two are best-effort rather than the guarantee: either can fire
-  before the session is registered in `ember_sessions`, in which case it finds
-  nothing and the tick is what actually asks. Answering is
-  capped at one per friend per 30 s, stamped before the table walk rather than
-  after a successful send, so a friend whose writer queue is full cannot buy an
-  unthrottled walk per request.
-
-  Friends are taken least-recently-asked first, never-asked ahead of all of
-  them. That ordering is load-bearing rather than tidy: the ask interval equals
-  the maintenance tick, so every friend asked last cycle is due again this
-  cycle, and taking the first four in session-map order asks the same four for
-  the life of the process while a fifth is never asked at all — the identical
-  failure `ember_dht_announce_targets` was written to avoid. The ask stamp
-  therefore has to outlive its own interval, since it doubles as the rotation
-  key; `EMBER_FRIEND_CONTACT_STAMP_TTL` keeps it four minutes and the
-  acceptance window above is named separately so it cannot inherit that length
-  by accident. `the_friend_ask_rotates_instead_of_pinning_the_first_few` pins
-  it.
-
-One gate had to move for any of this to fire: the maintenance tick ran only
-when the table held contacts or the bridge held candidates, and a cold node
-whose only peer is a friend behind a relayed session has every one of those
-empty — so the ask would have been unreachable in precisely its own case. A
-live friend session now counts as work on its own.
-
-`a_friend_is_only_ever_told_about_contacts_that_answered_us` and
-`a_friend_answer_survives_the_round_trip_as_unverified_leads` pin the two
-halves; `the_contact_list_size_cap_cannot_refuse_an_honest_list` pins the
-receiver's length guard against what the encoder can emit, because a cap set
-too low would drop honest answers and look exactly like a friend on an older
-build. Diagnostics: `ember_dht_friend_contact_asks` against
-`ember_dht_friend_contacts_learned` — asks climbing with the second flat is
-friends on older builds or with nothing verified to give.
-
-Field evidence for why this mattered: a node with three contacts sat beside a
-friend holding fourteen, over a working friend session, with `Known peers` at 0
-— so the friend had never been registered as an Ember peer and was never asked.
-The gossip machinery itself was fine, and said so: 190 gossip contacts seen, 0
-refused, 0 new, which is three peers describing each other in a loop.
-
-### 2b. Meeting a friend we cannot dial — designed, not started
+### 3. Meeting a friend we cannot dial — designed, not started
 
 Still open on this path: nothing uses the friend session to carry a *live*
 introduction, so a friend we cannot dial never becomes an overlay contact however
@@ -358,15 +255,15 @@ two are also the evidence that would justify revisiting the relay — a populati
 whose attempts never convert is the both-symmetric case, measured rather than
 assumed.
 
-### 3. Cold join when eMule is not available
+### 4. Cold join when eMule is not available
 
 Every path in the list above except `nodes_ember.dat` used to presuppose either
 a live KAD connection or an eD2K transfer with an Ember-capable peer, so a
 first-run user with KAD off and no servers had no way in. Seed lists are
 deliberately not planned.
 
-**Narrowed, not closed.** The friend contact exchange in
-[item 2a](#2a-bootstrapping-from-a-friend) needs neither: a friend session is
+**Narrowed, not closed.** The friend contact exchange — now closed, see
+[Closed](#closed) — needs neither: a friend session is
 reached by stored address or through the rendezvous server, so a user who has
 added one friend can now join with KAD off and no servers. What is still
 uncovered is the user who has *nobody* — no friend, no KAD, no server — and for
@@ -374,7 +271,7 @@ them the answer remains that Ember rides eMule's bootstrap. That is now a
 documentation matter rather than a gap for most first runs, but the shape of the
 hole has not changed.
 
-### 4. Validation past the happy path
+### 5. Validation past the happy path
 
 Search → download over a live network is confirmed working. Still
 unexercised end to end:
@@ -408,39 +305,212 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
-### 5. `store_attributed` binds the key but not the author or the date — done
+### 6. Filter the friend browse on the wire — designed, not started
 
-`DhtStore::restore` took all three of key, `publisher_key` and `created_at` out
-of the record's own signed body. `store_attributed` took only the key and
-trusted the caller for the other two — `verify_record_signature` verified under
-the key it was *handed*, not the one at `data[73..105]`, so a body naming a
-different author still verified there while failing for every reader.
+What the constraint cannot do is answer "show me every `.mp3`" with no keyword at
+all. Kademlia has to walk *toward* something, and the only key such a query could
+name is the hotspot above — so if browsing by type is wanted, it must not be a DHT
+feature.
 
-Never reachable from the wire, and never a live bug: `accept_record` passed what
-`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derived
-them, and the proxy replica read them off its own `SignedRecord`. It was on this
-list because the invariant was one the callers happened to keep rather than one
-the store enforced, and the next caller had no way to know that.
+**The three open questions this section used to carry are answered by where the
+feature has to live**, so they are recorded as decided rather than left open.
 
-**Done, by deriving rather than by checking.** Both parameters are gone:
-`store_attributed` binds all three from the one
-`signed_identity_from_record_data` call it was already making and discarding two
-thirds of. Production behaviour is identical, because every caller was passing
-exactly those bytes' own fields; what changed is that it is now impossible to
-pass anything else. `restore` no longer reads `publisher_key` out of the
-persisted file either — the file is not evidence, the signed body is.
+`OP_EMBER_EXT` — the envelope the sketch proposed — is gated on
+`friend_privileges_allowed(secure_v2_authenticated, is_ember_friend)`, so an
+ember-ext sub-type is friends-only with proof of possession *by construction*. And
+a dedicated friend browse already exists beside it: `OP_EMBER_BROWSE_REQ` (0xF2) /
+`OP_EMBER_BROWSE_RES` (0xF3), over a secure-v2 friend session, gated on mutual
+friendship and `friend_browse_disabled`, answering with the `EBR1` format that
+carries AICH roots and Ember digests. So:
 
-The churn this section warned about was the cost of the *other* approach.
-Requiring the caller's values to match the body would have left every synthetic
-fixture in `store.rs` failing, because those bodies zero the author and date
-fields and pass real values beside them. Deriving needs the same fixtures fixed,
-but fixing them is what makes them realistic: `stamped` writes the author and
-date into the body at the offsets the wire uses, so a hand-built test record now
-has the shape a real one does, and `signed_body` / `redated` build and sign one
-in a line. Two tests got sharper for it —
-`rejects_a_body_signed_by_someone_other_than_the_author_it_names` is the case
-that used to be storable, and the TTL tests now date a record where the store
-actually reads a date from, rather than in a struct field beside it.
+1. **Who may ask** — friends, and only friends. Not a new policy and not a new
+   setting: a stranger cannot get the frame past the opcode gate. Mutual friends
+   already see `friends_only` shares (`is_friend_visible()` is `shared` alone,
+   against `is_public_listable()`'s `shared && !friends_only`), so the filter
+   exposes nothing a friend could not already ask for.
+2. **Where it surfaces** — in the Friend Browse dialog, which is where browse
+   already lives. Not a search method: presenting it beside "Ember Only" invites
+   the comparison it loses, because it can only show what one friend holds.
+3. **How results merge** — they do not. One friend's answer is one friend's list,
+   so no availability semantics, no publisher corroboration, no digest rules.
+
+**What the user actually gains**, which is the reason to build it: the friend
+browse answer is capped at `MAX_BROWSE_ANSWER_FILES` = 1000 files and
+`MAX_BROWSE_ANSWER_BYTES` = 400 KiB, and the parse and UI sides cap at 1000 too
+(`MAX_BROWSE_ENTRIES`, `MAX_BROWSE_FILES`). The filter that exists today is
+*client-side*, so browsing a friend with 40,000 shared files filters an arbitrary
+thousand of them. Filtering before the cap is what turns "some of your friend's
+files" into "your friend's FLACs".
+
+### The trap: the request marker is compared for equality
+
+`browse_request_supports_v1` is `payload == BROWSE_RESPONSE_V1_MAGIC` — an exact
+comparison of the whole payload, not a prefix test. So appending a filter block to
+the existing request does **not** read as additive: an unpatched answerer sees a
+payload that is not exactly `EBR1`, decides the requester is a legacy peer, and
+replies in the pre-v1 format *without* AICH roots or Ember digests. A new client
+browsing an old friend would get a worse answer than it gets today.
+
+That is the same class of mistake the trailing-block trick avoids everywhere else,
+and it does not apply here, because there is no field in front of the marker for a
+block to trail.
+
+### The prerequisite: the friend handshake cannot advertise anything
+
+There is no feature or protocol version in `PeerCapabilities` — only `is_ember`,
+`ember_hash` and `ember_pubkey`. The ext envelope degrades well for *unknown
+sub-types* (they are logged and ignored, which is the whole point of it), but
+nothing lets a sender know in advance whether a peer speaks one, so every new
+sub-type is fire-and-forget. That is the same gap the DHT wire had until `PING`
+and `PONG` began carrying a version range, and it wants the same shape of fix.
+
+`OP_EMBER_HELLO` can carry it additively. `parse_ember_hello` reads
+`version(1) ‖ flags(1) ‖ ember_hash(16) ‖ len-prefixed mod_version ‖
+len-prefixed nickname ‖ optional ed25519_pubkey(32)`, taking every field from a
+length prefix or a flag bit and **never checking that the payload ends** — so
+bytes past the pubkey are already valid and ignored by every build. Only bit 0 of
+`flags` is in use.
+
+So: **set `flags` bit 1 and append a feature-bits field.** An older peer ignores
+it; a newer peer learns what this one speaks before it sends anything. Do this
+first, and the browse filter becomes a plain negotiated feature instead of an
+optimistic guess with a fallback dance. It is also reusable by every friend-session
+feature after this one, which is most of the value.
+
+### Design
+
+1. **Feature bits on the Ember hello.** `flags & 0x02` ⇒ a `u32` LE of feature
+   bits follows the optional pubkey. Bit 0 = filtered browse. Surface it on
+   `PeerCapabilities` beside `is_ember`. Pin the additivity the way the DHT block
+   is pinned: a test asserting that a hello carrying feature bits parses
+   identically on the field-for-field path an older build takes.
+2. **A new request marker, sent only to a peer that advertised the bit.**
+   `EBR2` ‖ filter block. Keep `browse_request_supports_v1`'s exact comparison
+   untouched, and add an exact comparison for `EBR2`; do not loosen either to a
+   prefix test, or the next addition inherits this same trap.
+3. **Reuse `ValueConstraints` for the filter.** Its four content fields —
+   `min_size`, `max_size`, `file_type`, `file_extension` — are exactly the
+   browse filter, and its encoder already skips unknown tags, truncates
+   over-long strings and writes *nothing* when the filter is empty. `extra_keys`
+   is DHT-specific and stays unset. One encoder and one decoder then serve both
+   the keyword walk and the browse, which is the only way the two stay agreed on
+   what `Video` means — both must derive type from the extension with
+   `search::index::infer_file_type`, as the DHT path already does.
+4. **Apply the filter before the caps, and report the total.** Filtering after
+   the 1000-file cap would reproduce the bug being fixed. The answer carries
+   `total_matched` alongside the entries, so the dialog can say "showing 1000 of
+   3400 — narrow the filter" instead of silently truncating. That is `FOUND_VALUE`'s
+   `total_available` reasoning applied to a browse, and it is cheaper than paging.
+5. **Rate-limit the answer, stamped before the work.** A filter makes the request
+   cheap to send and the answer expensive to build — an index walk over every
+   shared file — which is the wrong asymmetry to leave open. Copy
+   `EMBER_FRIEND_CONTACT_SERVE_INTERVAL` exactly, including recording the stamp
+   *before* the walk rather than after a successful send, so a friend whose writer
+   queue is full cannot buy an unthrottled walk per request.
+
+**Not a confidentiality change, and worth saying so explicitly** so nobody
+"hardens" it later by accident: a mutual friend can already see every `shared`
+file, `friends_only` included. What the filter changes is how much of that they can
+retrieve per request, so the rate limit is about CPU and bandwidth, not about
+exposure.
+
+**Deliberately out of scope:** filtering the *vanilla* `OP_ASKSHAREDFILES` browse.
+That one answers any peer, is off by default (`allow_shared_files_browse`),
+excludes `friends_only`, and refuses explicitly with `OP_ASKSHAREDDENIEDANS`. A
+filter there would let a stranger enumerate a library far past the single capped
+packet the setting was reasoned about, which is a genuine exposure change and a
+separate decision.
+
+---
+
+## Already better than KAD — do not "fix" these
+
+Worth recording, because each one looks like a gap until you check the other side.
+
+- **Republish cadence.** Keyword records live 24 h (`KEYWORD_RECORD_TTL`) and are
+  re-announced every 12 h (`EMBER_KEYWORD_REPUBLISH`), against KAD's 24 h TTL and
+  ~20 h republish. Ember has twice the margin.
+- **Availability is counted, not claimed.** Ember's number is distinct Ed25519
+  publishers of a signed record. KAD's `TAG_SOURCES` / `TAG_COMPLETE_SOURCES` is
+  one peer's assertion about a swarm it cannot observe.
+- **Streaming and completion ordering.** Partial batches stream while the walk is
+  still running, the closing batch is rebuilt cumulatively so per-batch
+  aggregates cannot under-count, and `search-complete` cannot fire before the
+  final results. `dedup_streamed_batch` turns a re-emitted row into an
+  availability update rather than a duplicate.
+- **Empty `source_addresses` is deliberate.** A keyword hit identifies a file;
+  source discovery is the separate slice-9 lookup at download time. Download,
+  bulk download and link copying all work from the hash.
+
+---
+
+## Decisions on the record
+
+### Searching by extension — a constraint, never a keyword
+
+Settled: an extension is a **constraint**, never a keyword key.
+
+Indexing it was the tempting version and it is the harmful one. A key holds
+`MAX_RECORDS_PER_KEY` = 1000 records, `MAX_RECORDS_PER_PUBLISHER_PER_KEY` = 150 per
+publisher, and `MD4("mp3")` would immediately be the hottest key on the network:
+every mp3 anyone shares competing for a thousand slots on the twenty nodes closest
+to one key. A full key *refuses* new records rather than evicting incumbents
+(`a_full_keyword_never_evicts_an_incumbent`), so most of those publishes would be
+rejected after spending publish budget; the results a searcher got back would be an
+arbitrary three hundred files out of millions, which reads as broken rather than
+thin; and it would park a permanent load hotspot on whichever peers are unlucky
+enough to sit near the key — a concentration worth an attacker's attention. On top
+of that it is one extra record per file against an
+`EMBER_KEYWORDS_PER_FILE_ESTIMATE` of eight, so ~12% more keyword publish traffic
+for the worst-behaved key we would own.
+
+As a `ValueConstraints` field it costs no key, no publish traffic and no hotspot:
+the searcher still walks a real word, and the responder drops everything that is
+not an `.mp3` before it packs a page. Ember-only by construction, since only Ember
+reads the block.
+
+A bare `.mp3` typed on Ember or KAD now moves itself into the Extension box and
+asks for a word, rather than running a search whose only hits can be the user's own
+library.
+
+**A quirk to know:** four-letter extensions already are keywords, by accident. The
+publisher strips a trailing token only when it is *exactly* three characters and
+three bytes, so `flac`, `webm` and `epub` are indexed while `mp3`, `mkv` and `avi`
+are not. "flac" as a query has always worked; "mp3" never has. Nothing here changes
+that, and the constraint makes both behave the same as a filter.
+
+### Future wire additions cannot advertise in the version byte
+
+The version byte is range-checked on receive
+(`decode_message`, and [item 2](#2-wire-versioning-rejects-cleanly-and-now-advertises-but-still-cannot-route-around-old-peers)),
+so raising `EMBER_DHT_VERSION` partitions the overlay on the day it ships
+regardless of where `EMBER_DHT_MIN_VERSION` sits — the *other* side is what
+refuses, and it is running the old range. Lowering the minimum only helps a build
+that already speaks the higher number.
+
+So a change that wants to stay compatible cannot advertise itself in the version
+byte. It has to go where an existing decoder does not look: after the fields a
+payload's parser reads at fixed offsets, or after a record's length-prefixed name.
+Both `FIND_VALUE` and keyword records have that room, which is why the constraint
+block and record metadata both landed without touching the version at all. (The
+per-node result ceiling is searcher-local policy and touches no wire format, so it
+never faced the question.)
+
+A change that needs to alter an existing field still has no path but a bump. What
+has changed is that the bump no longer has to be blind: `PING` and `PONG` now
+carry the range each side can decode, by the same trailing-block trick and with
+the version deliberately left alone, so a v5 encoder can ask per peer instead of
+assuming. That only helps against peers running a build with the advertisement in
+it — `ember_dht_version_advertisers` against verified contacts is how to tell
+when that is most of them — so the flag day is now a measurable risk rather than
+a certainty, which is not the same as gone.
+
+### Explicitly not planned
+
+- Hardcoded `seeds.txt` or DNS SRV seed lists — join stays the KAD
+  rendezvous key, the bridges, gossip, and the persisted contact file.
+- A rendezvous-hosted bootstrap pool. It leaks an identity-to-IP roster of
+  every participant to whoever runs the server.
 
 ---
 
@@ -455,7 +525,7 @@ actually reads a date from, rather than in a struct field beside it.
   allowance and the page ceiling that allowance sizes. Both are two-tier: a peer
   is held to a quarter of the budget while the walk still has somewhere to go, and
   may spend the rest of it once the shortlist is exhausted. See
-  [Planned next, item 1](#1-the-serving-ceiling--done-wire-v3).
+  [Closed](#closed).
 - A keyword search may name up to `MAX_FIND_VALUE_KEYS_TOTAL` (23) keywords, but
   only the first eight travel in the count-prefixed run that every build reads.
   The rest ride the constraint block, so a peer predating it intersects on eight
@@ -503,409 +573,6 @@ actually reads a date from, rather than in a struct field beside it.
 
 ---
 
-## Planned next — from the KAD comparison (Aug 2026)
-
-Ember was compared against this repo's own KAD stack, constant for constant, to
-answer whether it matches or exceeds it operationally. On design it already
-does: twice the replicas (20 vs 10), three times the TTL margin on sources where
-KAD has none, a replacement cache KAD lacks entirely, storer-side replication
-KAD lacks entirely, a store that survives restart, roughly half the round trips
-per lookup (α=5 against KAD's 1 for `FindNode`), and a much richer diagnostic
-surface. The items below are where it does not, in leverage order.
-
-Everything here was verified in the code, not inferred from comments. Four
-silent-breakage bugs and five performance defects found by the same comparison
-were fixed before 1.5.3 and are not repeated here.
-
-**Shipped in 1.5.3:** item 3 (streaming) in full, item 6 (the republish cadence)
-in full, and the truncation counter that items 1 and 8 both depend on. Their
-sections below are kept rather than deleted, because each records why the change
-was made and what to watch now that it is live.
-
-**Shipped after 1.5.3 (no wire change):** item 1's cheap path (rotate the served
-window), item 5 (persist the Ember source publish schedule), item 6's leftover
-replication heartbeat, and item 8's store-rejection causes, search-quality
-averages, and persisted verified-contact high-water. Firewalled consume shipped
-as an additive record trailer plus two new message types that older v2 peers
-ignore.
-
-**Shipped in 1.5.5 (no wire change):** Ember BLAKE3 pin mismatch is a permanent
-download failure with a visible fail badge (it used to reopen every part and
-re-queue the search); keyword-publish stamps persist across restart like source
-stamps; transport sessions are keyed on `(address, static key)`; Connected /
-Search readiness use verified contacts so gossip does not look like a join.
-The anti-leech filter matches the software label plus the mod tag (outside
-the DHT).
-
-**Shipped as wire v3 — breaking.** The two items that needed a version bump went
-together, since one bump pays for both and item 2 was only worth having once item
-1 could serve the extra records:
-
-- Item 1's real fix: `start_position` paging on `FIND_VALUE`/`FOUND_VALUE`,
-  replacing the responder-side rotation cursor.
-- Item 7: `node_id` dropped from wire contacts (87 → 71 bytes, 14 → 17 contacts
-  per response).
-- Item 2, unblocked by the above: keyword capacity raised to KAD's 150 of 1000.
-
-**Every item in this list is now done.** What remains for the overlay is the
-standing work in the sections above (native transfers, routing a wire change
-around old peers now that they advertise, meeting a friend we cannot dial, cold
-join without eMule, validation past the happy path) and the "Future improvements"
-below — not this comparison.
-
-### 1. The serving ceiling — done (wire v3)
-
-A peer answers a keyword query with **only a few records**. `MAX_FOUND_VALUE_RECORD_BYTES`
-is 1231, a keyword blob for a 40-character filename costs 221, and packing used
-to fill from the front of insertion order, so the oldest five were the only ones
-that node would ever serve.
-
-Five was the figure while a record was header, name and signature. Keyword records
-now carry an optional media block (see
-[the search plan](ember-dht-search-plan.md#2-keyword-records-carry-no-metadata--done)),
-which costs around 75 bytes for an ordinary music file and up to 229 with every
-text field at its cap — so a media-bearing record packs four to a page, or two in
-the worst case. `RECORDS_PER_UNFRAGMENTED_PAGE` is 3 to reflect that, since its
-only job is to size the page ceiling so the ceiling never binds before the
-per-node allowance does.
-
-**Shipped, cheap path (1.5.3–1.5.5):** successive `FIND_VALUE`s rotated the
-served window per key, using a cursor the *responder* advanced.
-
-**Shipped, real fix (v3):** `FIND_VALUE` carries a `start_position` and
-`FOUND_VALUE` answers with `next_position` plus `total_available`. The searcher
-owns the offset, so a walk pages a well-stocked node until the key is exhausted
-instead of hoping its window had moved.
-
-The rotation cursor is **gone**, not kept alongside. It could not tell "this
-searcher wants the next page" from "a different searcher wants the first", so two
-searchers on the same hot key advanced each other's window and neither saw a
-contiguous run. Serving is now deterministic: the same request gets the same
-answer every time.
-
-`next_position` is reported rather than inferred. The packer skips a record too
-large for the budget *left* on a page and keeps scanning for one that still fits,
-so the records a page serves are not always a contiguous run, and `start + len`
-would step over the skipped position — the big record is then never first, so
-never faces an empty budget, so never served at all, while `get_live` and the
-diagnostics go on reporting it as held. A page therefore resumes at the earliest
-record it passed over, which costs re-sending the ones after it (absorbed by
-content dedup in `search.rs`) and guarantees nothing is stranded.
-`local_records` (seeding our own search) still does no packing at all.
-
-Paging is the one mechanism here where a *responder* influences how many queries
-we send, so the searcher bounds it independently of what `total_available`
-claims: `MAX_PAGES_PER_NODE` (25) follow-ups per node, each required to name an
-offset strictly past the one it answered.
-
-Both of those bounds are now two-tier, and the second tier is the newer half.
-While the shortlist still holds an unqueried hop — or any query is outstanding —
-one peer may offer `MAX_RESULTS_PER_NODE` (75, a quarter of the budget) and be
-asked for the 25 pages that allowance can be spent in. Once neither is true there
-is no hop left for extra records to crowd out, so a lone storer may spend what
-remains of the whole 300-file budget, over up to
-`MAX_PAGES_PER_NODE_EXHAUSTED` (100) pages. That second page tier has to be
-*earned*: past the base ceiling a node keeps paging only while it sustains
-`MIN_RECORDS_PER_PAGE_TO_CONTINUE` (2) records per page on average, so a peer
-answering one record at a time while claiming a huge total stops at the base
-ceiling. See
-[the search plan](ember-dht-search-plan.md#3-per-node-result-ceiling-is-an-eighth-of-kads--done).
-Positions are advisory — the responder's list shifts as records expire — so
-paging may repeat or skip an entry, which content-based dedup in `search.rs`
-already absorbs.
-
-The truncation counters (`ember_dht_found_value_truncated` /
-`ember_dht_found_value_withheld`, shipped 1.5.3) are still the way to read how
-far the datagram ceiling actually binds on real keys.
-
-Read `withheld` as *records past this page's window that it has not served* —
-`n - past_last_taken`. It previously counted from the rewound resume point, so
-it included records the same page had just put on the wire and over-reported
-accordingly; a page that rewound but still reached the end of its key now
-reports zero withheld and no longer increments `truncated`, because it truncated
-nothing. Both counters therefore read lower than they did before 1.5.9 on the
-same key. Re-sent records still cost bandwidth, but no longer consume the
-searcher's per-node offer allowance, which is charged per *distinct* blob.
-
-### 2. Per-publisher keyword capacity — done
-
-`MAX_RECORDS_PER_PUBLISHER_PER_KEY` was 45 of `MAX_RECORDS_PER_KEY` 300 against
-KAD's 150 of 1000. Both are 15%, but the absolute number is what a user feels:
-every storer applies the same cap to the same publisher key, so the ceiling is
-network-wide, not per-node. A user sharing 200 files with a common word got 45 of
-them findable under that word *anywhere* — 30% of what KAD serves.
-
-Both are now KAD's numbers, which keeps the ratio and triples capacity.
-`keyword_capacity_matches_kad` pins them together, since raising either alone
-breaks the property that no identity holds more than about a sixth of a key.
-
-This deliberately waited on item 1, and shipped in the same version: while a peer
-could only ever serve its first window, the extra stored records had no way to
-reach a searcher and the one certain effect would have been more
-storer-replication traffic.
-
-`MAX_STORE_BYTES` is unchanged at 48 MiB, so per-key capacity went up without
-raising what the process may resident-hold. When the byte budget binds first it
-still sheds the records this node is least responsible for (furthest key, then
-nearest expiry) rather than refusing newcomers.
-
-### 3. Stream search results as they arrive — done in 1.5.3
-
-Ember used to buffer everything and emit on completion; `FIND_VALUE` is
-deliberately excluded from early convergence, so on a cold table a user waited
-most of the 60-second cap while KAD hits were already on screen.
-
-The Ember keyword search now carries a cursor into the search's append-only
-result list, and the 1-second sweep emits everything past it on the same cadence
-the KAD path uses: the first record immediately, then every 20. Records seeded
-from the local store therefore reach the UI on the first tick. Batches run
-through `dedup_streamed_batch` / `mark_streamed_hashes`, so a hash KAD already
-streamed arrives as an availability update rather than a duplicate row, and only
-the batch flagged final clears `ember_pending` — the completion batch is still
-queued when it is empty, so that happens exactly once.
-
-Worth knowing when reading this code: the timeout backstop that reaps an expired
-keyword search runs earlier in the same sweep than both the streaming step and
-the emit step, and it removes the search from `ember_keyword_searches`. That
-ordering is what stops a reaped search from being streamed after its
-`search-complete`, and it is not obvious from either site alone.
-
-### 4. Firewalled sources are discoverable but not dialable — done
-
-Publish was already complete: a firewalled node sets `SOURCE_FLAG_FIREWALLED`,
-asks the named HighID to `PROXY_STORE`, and storers attribute the record to the
-forwarder. Consume now matches KAD's buddy callback without a DHT version bump.
-
-A firewalled source record may append a 70-byte trailer (publisher eD2K user
-hash + buddy IPv4 + buddy UDP port + buddy Noise key + 16-byte callback token)
-after the existing 41-byte contact. HighID records stay 41 bytes. New message
-types `CALLBACK_REQ` (0x0F) and `CALLBACK` (0x10) decode as `Unknown` on older
-peers.
-
-A reachable searcher sends `CALLBACK_REQ` (including the token from the signed
-trailer) to the named buddy. The buddy forwards `CALLBACK` only for a publisher
-it recently `PROXY_STORE`d for, copies the searcher's *observed* UDP address
-rather than a claimed IP, and copies the token. The publisher overlay-`STORE`s
-the firewalled record only after that buddy `PROXY_STORE_ACK`s, so `FIND_VALUE`
-cannot name a buddy that cannot bounce. The publisher accepts `CALLBACK` only
-from a buddy that ACKed a `PROXY_STORE` for that file, and only when the token
-matches the one it published. It then connects eD2K TCP back (the same
-upload-listener path as KAD `OP_CALLBACK`). Firewalled Ember DHT contacts are
-never registered in SourceManager (that map has no firewalled bit, so pending
-promotion would TCP-dial the claimed NAT IP). `WaitCallbackKad` rows are also
-kept out of TCP reask and pause/resume seeding; only `CALLBACK_REQ` retries
-them. A searcher that itself is
-TCP-firewalled (LowID, or KAD/server `Firewalled` — not the UPnP-pessimistic
-startup flag) does not send `CALLBACK_REQ`. Firewalled Ember DHT records also
-set `SOURCE_FLAG_RELAY_CAPABLE`, so ingest starts the same Ember punch/relay
-broker KAD uses for Ember-capable LowID sources instead of leaving both sides
-parked. An unusable named buddy still parks — including Searching-only pending
-downloads — rather than dropping the source. The broker still needs admitted
-ERAT candidates; it does not invent a relay.
-
-Diagnostics: `ember_dht_callback_sent / forwards / connects` on the Ember page.
-
-### 4a. The pre-endorsement buddy trailer — retired
-
-Naming a buddy used to be possible two ways: with the buddy's signed
-endorsement, or — for publishers whose build predated it — by naming the
-buddy's Noise static, which is on every signed frame that buddy sends. The
-second was never consent. Anyone who had ever heard from a node could name it
-and spend a replica, a twenty-node fan-out and a `callback_clients` slot.
-
-It is gone from both sides, because under wire v4 it could not help anyone.
-The endorsement shipped in `d87ae41a`, wire v4 in `68fce6ab` three days later,
-so every peer that can complete a frame exchange with us also speaks
-endorsements — and a current-build searcher refuses to dial an unendorsed
-buddy regardless (`DiscoveredSource::takes_callback` requires
-`has_identity()`). Publishing one produced a record every finder parked, and
-accepting one did that work on somebody else's say-so.
-
-`trailer_names_us` now always requires an endorsement we signed. The publish
-side no longer emits the compatibility trailer, which also retired
-`ember_unendorsed_source_buddy`, the `ember_source_published_unendorsed`
-latch, `ember_endorsement_supersedes_unendorsed_sources`, and the
-`ember_dht_buddy_unendorsed_publish` diagnostic. A firewalled publisher with
-no endorsement yet publishes nothing for that file and retries the next tick;
-nothing is stamped for a skipped file, so it stays due, and
-`ember_dht_waiting_buddy` is what surfaces the wait. Pairing costs one tick:
-`BUDDY_ENDORSE_REQ` is answered in a round trip and is not gated on the proxy
-budget.
-
-### 5. Persist the Ember source publish schedule — done
-
-`ember_source_publish_at` is keyed on `Instant`, so every restart used to mark
-the whole library as never-published and slam the backlog-drain term to its
-ceiling.
-
-The last successful source-publish is now written to known.met as
-`FT_EMBER_SOURCE_PUBLISH` (0xE4), distinct from KAD's `last_source_publish`.
-On start, a stamp still inside `EMBER_SOURCE_REPUBLISH` (2h) is hydrated back
-to an `Instant`; a stamp older than the interval, or one that cannot be
-represented because the process has not been up that long, is omitted and the
-file is due immediately — republish-too-eager, the safe direction. Keyword
-stamps use the same pattern (`FT_EMBER_KEYWORD_PUBLISH` = 0xE5) against
-`EMBER_KEYWORD_REPUBLISH` (12h), so a restart no longer republishes the whole
-library.
-
-### 6. Storer-side replication costs more than it buys
-
-**Halved in 1.5.3**: `EMBER_RECORD_REPUBLISH_SECS` is now 7200.
-
-At 200 records per cycle to 20 replicas, hourly was roughly **48,000 frames an
-hour** — Ember's single largest traffic item, about double its entire publish
-load. Two-hourly saves about half of that.
-
-The reasoning matters more than the number, because it is the argument against
-ever putting the cadence back. Replication cannot extend a record's lifetime:
-expiry is derived from the publisher's *signed* creation timestamp, and a storer
-re-sends the identical bytes, so every recipient computes the same absolute death
-time. What it buys is churn coverage, copies reaching nodes that joined since the
-publisher's last round, and two hours buys that as well as one given each record
-already has 20 replicas and lives at most 24 h. A shorter cadence would have to
-be justified on churn coverage measured, not on record survival.
-
-Still missing was any view of what this node republishes on others' behalf. The
-publish side logs a cycle heartbeat; this, the larger of the two traffic items,
-had no equivalent. **Shipped:** each maintenance cycle now logs an
-`Ember replication cycle` heartbeat — due, selected, queued, re-armed, leftover
-backlog — on the same cadence as the 60s maintenance tick. The two-hourly
-republish interval is unchanged.
-
-### 7. Contact encoding wasted 18% of every response — done (wire v3)
-
-Each wire contact used to carry both `node_id` (16 bytes) and `ed25519_pub` (32),
-but the ID *is* BLAKE3 of that key and every decoder re-derived and checked it
-rather than trusting the wire — so the only thing those bytes could do was
-disagree with the key beside them.
-
-Dropping them took a contact from 87 to 71 bytes: **17 contacts per `FOUND_NODE`
-instead of 14**, which is most of a hop on a sparse table. Bundled with item 1's
-version bump as planned. `a_found_node_carries_more_contacts_than_v2_could` pins
-both the 71-byte size and the resulting count, because the gain is purely a
-function of the byte budget and any field a future version adds to a contact
-spends it silently.
-
-Note this is the *wire* format only. `nodes_ember.dat` still persists a node ID
-per contact (advisory; `to_contact` re-derives the authoritative one), because
-changing the file format would cost every user their bootstrap set for no
-bandwidth saving.
-
-### 7a. Search slots were held by searches that had finished
-
-`MAX_ACTIVE_SEARCHES` is 64 and global, shared by every `FIND_NODE` and
-`FIND_VALUE` walk. `alloc_id` counts the entries the manager *holds*, not the
-walks still running, and completion alone never removed one: a search was only
-reaped by `maybe_finish_ember_search` — reached from a response, an expired
-query, or a dispatched batch — or by the `cleanup_expired` backstop at twice
-`SEARCH_TIMEOUT_SECS`. A walk that converged with nothing outstanding, or whose
-first batch failed to send at all, therefore sat in the map for two minutes
-holding a slot it was not using.
-
-That is enough to saturate the cap without anything leaking, because the
-creators are mostly background: channel presence starts one a second, source
-lookups up to five a minute, bucket refresh and publish-target lookups six
-more. Field evidence: a node with 14 contacts logged eleven consecutive
-`Too many active Ember searches (64)` inside two milliseconds — several
-subsystems each hitting a full pool in one turn of the event loop.
-
-The 1 s search timer now re-polls every held search and retires the ones that
-have converged or passed `SEARCH_TIMEOUT_SECS`, which also makes the 60 s
-timeout real rather than something only noticed if a wire event happened to
-land. It runs before the backstop so a reaped search is still streamed and
-emitted in the same tick — the ordering [item 3](#3-stream-search-results-as-they-arrive--done-in-153)
-describes. `a_converged_search_holds_its_slot_until_it_is_removed` pins the
-contract the sweep depends on.
-
-**Also done: background work now yields a reserve.** The pool was shared by
-everything, and almost every creator is automatic — so a saturated pool refused
-the user's keyword search, which has no second chance: `start_find_value`
-returning `None` drops the Ember leg for that query, `ember_pending` stays
-false, and the results arrive KAD-only with nothing said. Background callers go
-through `start_background_find_node` / `start_background_find_value` and stop at
-`MAX_BACKGROUND_SEARCHES` (three quarters of the pool); each of them re-queues
-and retries on its own tick, so a refusal costs them nothing. A refused
-background walk logs at debug, a refused user search still warns.
-`background_work_cannot_take_the_slots_held_for_the_user` pins the split.
-
-### 7b. A truncated `nodes_ember.dat` could still shrink itself away
-
-The loader already detected a header that declared more contacts than parsed,
-warned, and copied the damaged file to `nodes_ember.dat.bak.{ts}`. Nothing read
-that backup, and nothing stopped the session from writing its own smaller set
-straight back over the live file — so a truncation cost the difference
-permanently, and a second one cost the difference again. That is the same
-one-way ratchet [`peer_cache`](../src-tauri/src/network/ember/dht/peer_cache.rs)
-was written to break, arriving through the file format instead of through
-eviction.
-
-`load_nodes_with_state` now returns a `NodesFileState`, and `save_nodes` refuses
-to write fewer contacts than a truncated load recovered. Growing past that
-count is still allowed, which is how a node that has since met more peers
-replaces the damaged file with a whole one rather than being stuck behind the
-guard forever. `a_truncated_load_is_not_licence_to_shrink_the_file` covers both
-halves.
-
-### 7c. Transport hardening — one done, two decided against
-
-Long-lived transport secrets are wiped on drop: the static Noise private key
-and both XX cookie secrets, via `impl Drop for EmberTransport`. Defence in
-depth against a later heap disclosure (core dump, swapped page, reused
-allocation), not against an attacker who can read the process live. Out of
-reach are the per-session traffic keys inside snow's `StatelessTransportState`,
-which owns them and offers no way to clear them.
-
-Two related items were considered and deliberately **not** changed:
-
-- **The on-path XX msg3 stall.** A corrupted msg3 replaying the real `s` block
-  lets `Dh(se)` re-key before the payload fails, snow's rollback does not
-  restore the CipherState, and the genuine msg3 can then no longer decrypt —
-  the handshake waits out the 30 s pending sweep. Closing it means snapshotting
-  the responder handshake state around every inbound msg3. That cost lands on
-  the packet path for every peer, to deny an attacker who is *already on the
-  path* an outcome strictly weaker than the one they get for free by dropping
-  msg3 instead. Not worth it unless the snapshot becomes cheap.
-- **A replay window on friend chat.** `decrypt_chat_message` will decrypt the
-  same `(nonce, ciphertext)` twice, unlike the UDP transport, which has a
-  64-wide sliding window. It is not reachable: chat rides an authenticated
-  secure-v2 Noise stream over TCP, so an off-path attacker cannot inject the
-  bytes at all, and the only party who can resend them is the friend whose
-  session it is. `recent_ember_chat` already suppresses an accidental
-  same-text repeat inside five seconds. Adding a nonce ledger would cost
-  per-conversation state for a vector that has no path to the decrypt.
-
-### 8. Observability gaps
-
-The diagnostic surface is already better than KAD's. Three things are still
-missing that matter specifically for judging health after a long unattended run:
-
-- ~~**Nothing reports a truncated `FOUND_VALUE`.**~~ Shipped in 1.5.3, as
-  `ember_dht_found_value_truncated` and `ember_dht_found_value_withheld`. This
-  was the prerequisite for item 1; see there for how to read it.
-- ~~**Store rejections have no cause breakdown.**~~ Counted: verify, signature,
-  timestamp, anti-reflection IP, per-IP cap, publisher cap, per-key cap,
-  proximity, plus the existing key-cap counter.
-- ~~**No search outcome quality.**~~ Completed `FIND_VALUE`s (including
-  timeouts) accumulate nodes answered, elapsed milliseconds, and records
-  returned; the Ember page shows the averages.
-- ~~**Every counter resets on restart.**~~ A persisted daily and all-time
-  high-water of verified contacts (`ember_dht_highwater.json`) answers "is this
-  growing?" across restarts.
-
-### Outside the DHT
-
-- ~~**Transport session keying.**~~ Sessions are keyed on `(address, static key)`,
-  so claimants at one address coexist (capped at four, the old 1-live-plus-3-shadow
-  budget). A genuine first contact at an address already full of spoof sessions
-  is kept; a named outgoing identity no longer discards another key at that
-  address. Named in `install_session`.
-- **Updater recovery only protects 1.5.3 onward.** The 1.5.2 → 1.5.3 hop runs
-  1.5.2's updater, so if a hand-off fails silently again the user still sees
-  nothing and must install by hand. The root cause of the original failure was
-  never established; the recovery path is a mitigation for the symptom.
-
----
-
 ## Future improvements
 
 Ordered roughly by leverage. None block a release if the items above are
@@ -941,10 +608,10 @@ settled.
 
 ### Search and publish
 
-The gaps against KAD's *keyword search* specifically have their own plan file:
-[ember-dht-search-plan.md](ember-dht-search-plan.md). Wire-side constraint
-filtering, record metadata, and the per-node result ceiling live there. This list
-stays the home for indexing ideas that are not gaps against KAD.
+The gaps against KAD's *keyword search* specifically are closed — wire-side
+constraint filtering, record metadata and the per-node result ceiling are all in
+[Closed](#closed). This list stays the home for indexing ideas that are not gaps
+against KAD.
 
 - Richer keyword indexing (stemming, more than space-split tokens) if
   recall lags KAD on real libraries.
@@ -973,7 +640,7 @@ stays the home for indexing ideas that are not gaps against KAD.
 - Storer-side replication telemetry. The publish side logs an
   `Ember publish cycle` heartbeat each minute; maintenance now logs an
   `Ember replication cycle` heartbeat as well (see
-  [Planned next, item 6](#6-storer-side-replication-costs-more-than-it-buys)).
+  [Closed](#closed)).
 
 ### Integrity and downloads
 
@@ -1120,12 +787,94 @@ stays the home for indexing ideas that are not gaps against KAD.
 
 - Migration guidance when turning the DHT on alongside existing KAD/eD2K.
 
-### Explicitly not planned
+---
 
-- Hardcoded `seeds.txt` or DNS SRV seed lists — join stays the KAD
-  rendezvous key, the bridges, gossip, and the persisted contact file.
-- A rendezvous-hosted bootstrap pool. It leaks an identity-to-IP roster of
-  every participant to whoever runs the server.
+## Closed
+
+Every item here is finished. They were each carried as a numbered section with its
+own rationale; that detail is in git history rather than deleted, and the wire-level
+outcomes are in the specification. Kept as a ledger so this file reads as a plan.
+
+**From the KAD comparison (Aug 2026)** — the whole pass is done:
+
+- The serving ceiling — done, wire v3.
+- Per-publisher keyword capacity.
+- Stream search results as they arrive — done in 1.5.3.
+- Firewalled sources are discoverable but not dialable.
+- The pre-endorsement buddy trailer — retired rather than fixed.
+- Persist the Ember source publish schedule.
+- Storer-side replication costs more than it buys — settled, with an
+  `Ember replication cycle` heartbeat now logged each maintenance tick.
+- Contact encoding wasted 18% of every response — done, wire v3.
+- Search slots were held by searches that had finished.
+- A truncated `nodes_ember.dat` could still shrink itself away.
+- Transport hardening — one done, two decided against.
+- Observability gaps, and the items outside the DHT proper.
+
+**From the search comparison (Sep 2026)** — the whole pass is done, and none of the
+wire additions needed a version bump:
+
+- `FIND_VALUE` carries no constraints — done additively, and bumping would have
+  been actively wrong: the peers a bump exists to reach are the ones that would
+  refuse the frame carrying it.
+- Keyword records carry no metadata — media now rides the record.
+- Per-node result ceiling was an eighth of KAD's.
+- A corrected digest does not reach the row.
+- "Sources" meant two different things in one column.
+- Smaller items: surplus keywords ride the constraint block past
+  `MAX_FIND_VALUE_KEYS`; tab overflow sheds within an origin class instead of
+  dropping every Ember row; spam heuristics needed no Ember exemption; and
+  `CancelEmberSearch` was closed by the shared `release_ember_search_state`
+  teardown, with the buffered-batch half turning out to be unreachable rather
+  than unfixed.
+
+**From the standing list:**
+
+- Bootstrapping from a friend — a friend now hands over the contacts it holds
+  (`EMBER_EXT_DHT_CONTACT_REQ` / `EMBER_EXT_DHT_CONTACTS`), asked
+  least-recently-first, answered only from verified contacts, and the retry
+  interval no longer backs off while the table is starved.
+- `store_attributed` binds the key but not the author or the date — all three are
+  now derived from the one signed body rather than trusted from the caller.
+
+---
+
+## Carried over from the 2026-08-18 audit
+
+That audit's remediation plan closed all 33 of its findings and has been removed;
+these are the parts that outlived it.
+
+**`NetworkState` is still one struct on one task.** The parameter bundling and the
+6,251-line move out of `network/mod.rs` both landed, but the single-task ownership
+model that produced the original starvation bug is unchanged. Splitting
+`NetworkState` per stack and giving each stack its own task with an explicit message
+boundary is a redesign rather than code motion: it cannot be compiler-verified the
+way that pass was, and it needs integration testing against live peers. **This
+remains the single most pressing architectural risk in the codebase.** The
+groundwork is in place — `command.rs` is separable and `NetworkDeps` gives the entry
+point a real signature.
+
+**The clippy backlog is gone, which makes a CI change actionable.** That plan
+recorded 123 remaining library warnings, down from 415. `cargo clippy --all-targets`
+now reports **zero** at default lint levels. [`ci.yml`](../.github/workflows/ci.yml)
+says to tighten the lint step to `-- -D warnings` "once that backlog is at zero",
+and the condition is now met. The crate-level baseline in `lib.rs` still allows
+exactly four families, each with a written justification; anything outside those
+four is expected to stay at zero.
+
+## Working notes for this tree
+
+Not Ember-specific, but they cost time to rediscover and had no other home.
+
+- `src-tauri/src/network/mod.rs` is large enough that repo-wide search tools may
+  skip it on size. Search it explicitly if a result matters —
+  `Select-String -Path ...\network\mod.rs` — or you can draw the wrong conclusion.
+  This has already produced one false "dead code" finding.
+- The shell here is PowerShell: chain with `;`, not `&&`, and `head`/`tail` do not
+  exist. Backticks are the escape character, so they need care inside patterns.
+- Adding a `coded("...")` error requires `error_<code>` in all nine
+  `messages/*.json`, or an entry in `KNOWN_UNTRANSLATED` in
+  `scripts/error-codes.test.mjs`, or `npm test` fails.
 
 ---
 
@@ -1149,4 +898,5 @@ Protocol constants live in
 trims by bytes, and at 71 bytes per IPv4 contact (7 address + 32 Noise key + 32
 Ed25519 key) 17 fit the 1253-byte payload budget — up from 14 while contacts also
 carried a redundant 16-byte ID. A `FOUND_NODE` therefore never carries a full
-k-bucket. See item 7 above.
+k-bucket. The contact-encoding change that got it from 14 to 17 is in
+[Closed](#closed).
