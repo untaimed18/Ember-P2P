@@ -1254,7 +1254,13 @@ impl TransferManager {
                 self.active.insert(transfer.id.clone(), transfer);
                 return vec![promoted];
             }
-            self.queue.push_back(transfer);
+            // Back where it was, not onto the end. `promote_next` breaks
+            // priority ties by lowest index, so queue order is load-bearing
+            // FIFO within a band — and `push_back` here demoted a resumed
+            // download behind every same-priority entry it had been waiting
+            // ahead of. Only reachable with the concurrency cap full, and
+            // invisible in the UI, so it read as the resume being ignored.
+            self.queue.insert(idx, transfer);
         }
         if let Some(control) = self.controls.get(id) {
             control.resume();

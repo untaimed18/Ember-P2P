@@ -827,6 +827,11 @@ pub fn run() {
                 }
                 commands::backup::sweep_orphaned_scratch(&data_dir);
             }
+            // The same reclaim for `%TEMP%/Ember`, which the backup sweep above
+            // never looks at: previews land there and are only cleaned up by a
+            // clean shutdown, so a crash leaves up to 64 MiB apiece behind
+            // indefinitely.
+            security::filesystem::sweep_orphaned_temp_dirs();
 
             // Allow WebView media playback for files under shared/download dirs.
             commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
@@ -1731,8 +1736,39 @@ pub fn run() {
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
+            // Same containment as the network task above, and for the same
+            // reason: the release profile enables `overflow-checks`, so
+            // arithmetic reachable from a configured limit or a peer-fed RTT
+            // sample panics rather than wrapping. Uncontained, that panic drops
+            // `RefillAliveGuard`, which flips `refill_alive` so every
+            // `acquire_upload`/`acquire_download` caller aborts its transfer —
+            // the whole session's rate-limited traffic, with nothing in the UI
+            // to explain it. The guard still does its job here; this just adds
+            // the log line and the user-facing notice that were missing.
+            let refill_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown_spawn, bw_rtt, bw_uss_flag).await;
+                let outcome = std::panic::AssertUnwindSafe(bandwidth::limiter::start_token_refill(
+                    bw_limiter,
+                    bw_shutdown_spawn,
+                    bw_rtt,
+                    bw_uss_flag,
+                ))
+                .catch_unwind()
+                .await;
+                if outcome.is_err() {
+                    // Payload withheld for the same reason as the network task.
+                    tracing::error!(
+                        "Token refill task panicked; rate-limited transfers are stopped until restart"
+                    );
+                    let _ = refill_handle.emit(
+                        "network-fatal-error",
+                        crate::commands::errors::coded(
+                            "bandwidth_refill_panicked",
+                            "Bandwidth limiting stopped unexpectedly. \
+                             Restart Ember to resume limited transfers; see logs for details.",
+                        ),
+                    );
+                }
             });
 
             info!("Ember P2P application started");

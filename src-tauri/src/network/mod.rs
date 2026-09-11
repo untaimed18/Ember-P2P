@@ -212,6 +212,8 @@ struct ChannelNeighborLookupResult {
 enum ChannelRelayEvent {
     Opened {
         peer_pubkey: [u8; 32],
+        /// Which session this is. See [`ChannelRelayEvent::Closed`].
+        session_id: u64,
         outbound_tx: mpsc::Sender<Vec<u8>>,
     },
     Frame {
@@ -220,7 +222,50 @@ enum ChannelRelayEvent {
     },
     Closed {
         peer_pubkey: [u8; 32],
+        /// The session that ended, so its close cannot evict a newer one.
+        ///
+        /// This carried only the peer, and the handler removed whatever outbox
+        /// was registered for it. Two sessions to one peer overlap routinely —
+        /// both sides run `maybe_offer_channel_relay` over the same roster, so
+        /// a mutual simultaneous offer is the normal case, and the duplicate
+        /// guard reads a map that is not populated until `Opened` arrives,
+        /// which is after up to ~55s of ticket negotiation. The result was
+        /// deterministic rather than racy: session B registers, session A dies,
+        /// A's close deletes *B's* outbox, and B's reader and socket stay alive
+        /// so inbound frames keep arriving while every send is silently
+        /// discarded. That peer is one-way for the rest of the session, and the
+        /// map now undercounts, so `MAX_CHANNEL_RELAY_SESSIONS` can be exceeded
+        /// by zombies.
+        session_id: u64,
     },
+}
+
+/// Sends [`ChannelRelayEvent::Closed`] however a session task ends.
+///
+/// The task has several early returns — a ticket that is never accepted, a
+/// WebSocket that will not connect, a handshake that times out — and none of
+/// them used to report anything, so the peer stayed marked as negotiating with
+/// nothing to clear it. A guard covers those, the normal end, and a panic.
+struct ChannelRelaySessionGuard {
+    event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
+    peer_pubkey: [u8; 32],
+    session_id: u64,
+}
+
+impl Drop for ChannelRelaySessionGuard {
+    fn drop(&mut self) {
+        let _ = self.event_tx.send(ChannelRelayEvent::Closed {
+            peer_pubkey: self.peer_pubkey,
+            session_id: self.session_id,
+        });
+    }
+}
+
+/// Process-wide source of relay session ids. Monotonic, so a stale close can
+/// always be told from a live one.
+fn next_channel_relay_session_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn relay_ticket_next_round_delay(
@@ -11962,6 +12007,16 @@ pub enum NetworkCommand {
     PreviewFile {
         transfer_id: String,
         tx: oneshot::Sender<Result<String, String>>,
+        /// Carried with the command so the claim is released by the work
+        /// finishing rather than by the caller's timeout.
+        ///
+        /// `preview_file` waits 30 seconds and then returns, but the work it
+        /// started is a detached `spawn_blocking` that keeps going — and on an
+        /// AICH-pinned transfer that work is a full SHA-1 tree over the whole
+        /// file, minutes on a large download. Holding the guard in the command
+        /// meant every timeout admitted another one, so a user clicking Preview
+        /// again after each stall stacked concurrent whole-file hashes.
+        single_flight: crate::security::SingleFlightGuard<'static>,
     },
     SendChatMessage {
         ember_hash: [u8; 16],
@@ -14308,7 +14363,17 @@ struct NetworkState {
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
     /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
-    channel_relay_outboxes: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    ///
+    /// Keyed with the session id that registered the outbox so a close can be
+    /// matched against it — see [`ChannelRelayEvent::Closed`].
+    channel_relay_outboxes: HashMap<[u8; 32], (u64, mpsc::Sender<Vec<u8>>)>,
+    /// Peers with a session being negotiated but not yet open.
+    ///
+    /// The duplicate guard used to read `channel_relay_outboxes`, which is only
+    /// populated once the ticket dance, the WebSocket connect and the handshake
+    /// have all finished — up to ~55 seconds during which the guard saw nothing
+    /// and a second session was started for the same peer.
+    channel_relay_pending: HashSet<[u8; 32]>,
     channel_relay_offer_at: HashMap<[u8; 32], std::time::Instant>,
     /// In-flight FIND_VALUE of channel handoff keys (`search_id` → old id).
     ember_channel_handoff_searches: HashMap<u32, [u8; 16]>,
@@ -17222,10 +17287,18 @@ fn maybe_offer_channel_relay(
     if settings.rendezvous_url.is_empty() {
         return;
     }
-    if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+    // Pending counts as a session for both guards below. It is the whole point:
+    // negotiation takes up to ~55 seconds, and reading only the outbox map left
+    // that window open for a second session to the same peer — and for the cap
+    // to be exceeded by sessions that had not registered yet.
+    if state.channel_relay_outboxes.contains_key(&peer_pubkey)
+        || state.channel_relay_pending.contains(&peer_pubkey)
+    {
         return;
     }
-    if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+    if state.channel_relay_outboxes.len() + state.channel_relay_pending.len()
+        >= MAX_CHANNEL_RELAY_SESSIONS
+    {
         return;
     }
     let now = std::time::Instant::now();
@@ -17237,10 +17310,19 @@ fn maybe_offer_channel_relay(
         return;
     }
     state.channel_relay_offer_at.insert(peer_pubkey, now);
+    state.channel_relay_pending.insert(peer_pubkey);
     let rv_url = settings.rendezvous_url.clone();
     let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
     let event_tx = relay_event_tx.clone();
+    let session_id = next_channel_relay_session_id();
     tokio::spawn(async move {
+        // Clears `channel_relay_pending` on every exit below, including the
+        // ticket and handshake failures that return without ever opening.
+        let _session = ChannelRelaySessionGuard {
+            event_tx: event_tx.clone(),
+            peer_pubkey,
+            session_id,
+        };
         let offer = match rendezvous::offer_channel_relay_ticket(
             &rv_url,
             &ember_hash,
@@ -17289,7 +17371,7 @@ fn maybe_offer_channel_relay(
         match ember::relay::connect_server_relay(&rv_url, &offer.ticket_id, &offer.initiator_token)
             .await
         {
-            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, event_tx).await,
+            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, session_id, event_tx).await,
             Err(e) => debug!("Ember channel relay join failed: {e}"),
         }
     });
@@ -17298,6 +17380,7 @@ fn maybe_offer_channel_relay(
 async fn run_channel_relay_session(
     ws: ember::relay::WsStream,
     peer_pubkey: [u8; 32],
+    session_id: u64,
     event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(ws);
@@ -17341,6 +17424,7 @@ async fn run_channel_relay_session(
     if event_tx
         .send(ChannelRelayEvent::Opened {
             peer_pubkey,
+            session_id,
             outbound_tx,
         })
         .is_err()
@@ -17410,7 +17494,8 @@ async fn run_channel_relay_session(
         }
     }
     reader_task.abort();
-    let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+    // `Closed` is sent by `ChannelRelaySessionGuard` as this task unwinds, so
+    // that every exit path reports — not only this one.
 }
 
 async fn apply_channel_relay_event(
@@ -17423,12 +17508,29 @@ async fn apply_channel_relay_event(
     match event {
         ChannelRelayEvent::Opened {
             peer_pubkey,
+            session_id,
             outbound_tx,
         } => {
-            state.channel_relay_outboxes.insert(peer_pubkey, outbound_tx);
+            state.channel_relay_pending.remove(&peer_pubkey);
+            state
+                .channel_relay_outboxes
+                .insert(peer_pubkey, (session_id, outbound_tx));
         }
-        ChannelRelayEvent::Closed { peer_pubkey } => {
-            state.channel_relay_outboxes.remove(&peer_pubkey);
+        ChannelRelayEvent::Closed {
+            peer_pubkey,
+            session_id,
+        } => {
+            state.channel_relay_pending.remove(&peer_pubkey);
+            // Only if this is the session that registered it. A close from an
+            // older, overlapping session must not take the live one's outbox
+            // with it.
+            if state
+                .channel_relay_outboxes
+                .get(&peer_pubkey)
+                .is_some_and(|(registered, _)| *registered == session_id)
+            {
+                state.channel_relay_outboxes.remove(&peer_pubkey);
+            }
         }
         ChannelRelayEvent::Frame { peer_pubkey, body } => {
             let from_id =
@@ -17652,7 +17754,7 @@ async fn fanout_channel_gossip_retry(
         delivered = true;
     }
     for pk in &missing {
-        if let Some(tx) = state.channel_relay_outboxes.get(pk) {
+        if let Some((_, tx)) = state.channel_relay_outboxes.get(pk) {
             if tx.try_send(body.clone()).is_ok() {
                 delivered = true;
             }
@@ -18458,7 +18560,7 @@ async fn send_channel_gossip_unicast(
             }
         }
     }
-    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+    if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
         if tx.try_send(body.clone()).is_ok() {
             return true;
         }
@@ -18552,7 +18654,7 @@ async fn send_xfer_frame(
             }
         }
     }
-    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+    if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
         if tx.try_send(body.clone()).is_ok() {
             return true;
         }
@@ -18990,11 +19092,21 @@ fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             if tree.root_hash != recv.root {
                 return Ok(false);
             }
-            if let Some(parent) = recv.final_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            // Through the approved-root layer, like the eD2K completion path.
+            // This used to be `create_dir_all` plus a `rename`, both by
+            // pathname: a junction swapped in at `Downloads` was traversed, and
+            // the peer's bytes landed wherever it pointed under a name the peer
+            // also chose. `move_part_to_final_approved` re-pins the root, and
+            // the recorded identity refuses a `.part` swapped underneath the
+            // transfer.
             let target = unique_download_path(&recv.final_path);
-            std::fs::rename(&recv.part_path, &target)?;
+            ed2k::transfer::move_part_to_final_approved(
+                &recv.part_path,
+                &target,
+                &recv.download_root,
+                &recv.part_identity,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(true)
         })();
         let status = match outcome {
@@ -25065,6 +25177,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
     state.channel_relay_outboxes.clear();
+    state.channel_relay_pending.clear();
     state.channel_relay_offer_at.clear();
     state.ember_channel_handoff_searches.clear();
     state.ember_pending_channel_handoff.clear();
@@ -26108,6 +26221,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
         channel_relay_outboxes: HashMap::new(),
+        channel_relay_pending: HashSet::new(),
         channel_relay_offer_at: HashMap::new(),
         ember_channel_handoff_searches: HashMap::new(),
         ember_pending_channel_handoff: Vec::new(),
@@ -34956,7 +35070,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let mut rosters: HashMap<[u8; 16], Vec<[u8; 32]>> = HashMap::new();
                 for offer in offers {
                     if let Some(channel_id) = offer.channel_id {
-                        if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+                        if state.channel_relay_outboxes.len()
+                            + state.channel_relay_pending.len()
+                            >= MAX_CHANNEL_RELAY_SESSIONS
+                        {
                             continue;
                         }
                         let members = rosters.entry(channel_id).or_insert_with(|| {
@@ -34972,18 +35089,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             );
                             continue;
                         };
-                        if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+                        // Keyed by peer, not only by `ticket_id`. The in-flight
+                        // set below is per ticket, so it never stopped a second
+                        // session to the *same peer* from a different ticket —
+                        // which is exactly what a mutual simultaneous offer
+                        // produces, since this side's own outbound offer is in
+                        // negotiation at the same time.
+                        if state.channel_relay_outboxes.contains_key(&peer_pubkey)
+                            || state.channel_relay_pending.contains(&peer_pubkey)
+                        {
                             continue;
                         }
                         let ticket_id = offer.ticket_id;
                         if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
                             continue;
                         }
+                        state.channel_relay_pending.insert(peer_pubkey);
                         let rv_url = settings.rendezvous_url.clone();
                         let done_tx = friend_relay_ticket_session_done_tx.clone();
                         let event_tx = channel_relay_event_tx.clone();
                         let fc_our_ember_hash = ember_hash;
+                        let session_id = next_channel_relay_session_id();
                         tokio::spawn(async move {
+                            // Clears `channel_relay_pending` however this task
+                            // ends, including the accept failures below.
+                            let _session = ChannelRelaySessionGuard {
+                                event_tx: event_tx.clone(),
+                                peer_pubkey,
+                                session_id,
+                            };
                             let responder_token = match tokio::time::timeout(
                                 rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
                                 rendezvous::accept_friend_relay_ticket(
@@ -35015,7 +35149,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             .await
                             {
                                 Ok(ws) => {
-                                    run_channel_relay_session(ws, peer_pubkey, event_tx).await;
+                                    run_channel_relay_session(
+                                        ws, peer_pubkey, session_id, event_tx,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     tracing::debug!("Channel relay ticket join failed: {e}");

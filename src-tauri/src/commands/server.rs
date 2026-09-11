@@ -2,6 +2,7 @@ use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
+use tauri_plugin_dialog::DialogExt;
 use tracing::info;
 
 const MAX_SERVER_NAME_LEN: usize = 256;
@@ -95,6 +96,54 @@ async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
     Ok(addr.ip().to_string())
 }
 
+/// Collect native consent for introducing a new eD2K server.
+///
+/// Connecting to a server is not a neutral act: the login sends this machine's
+/// ed2k user hash, nickname and listening ports, exposes the public IP, and
+/// then pushes the **entire public share list** via `OP_OFFERFILES` along with
+/// every subsequent search. That is a larger disclosure than the ones this
+/// application already stops to ask about — opening a link, adding a web
+/// service because the site "learns which file you are looking for", replacing
+/// the IP filter from a URL — all of which are gated natively on the stated
+/// grounds that a request arriving from the renderer is not consent.
+///
+/// Asked once, on the addition, rather than on each connect, so routine
+/// reconnects to a server the user already chose stay prompt-free.
+async fn confirm_server_addition(app: &tauri::AppHandle, hosts: &[String]) -> bool {
+    let listed = hosts
+        .iter()
+        .map(|host| crate::commands::settings::elide_for_dialog(host))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "{listed}\n\nConnecting to an eD2K server tells it your nickname, your user hash and your \
+         IP address, and shares the list of files you are offering publicly. Ember asks once, \
+         here, and not again each time it reconnects.\n\nAdd it only if you recognise the server."
+    );
+    let title = if hosts.len() == 1 {
+        "Add this eD2K server?"
+    } else {
+        "Add these eD2K servers?"
+    };
+    let confirm_app = app.clone();
+    // `blocking_show` pumps the dialog on the main thread, so it cannot run on
+    // the command's own task. Same shape as `confirm_web_service_additions`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title(title)
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Add".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[tauri::command]
 pub async fn connect_to_server(
     state: tauri::State<'_, AppState>,
@@ -108,6 +157,21 @@ pub async fn connect_to_server(
         return Err(coded("server_port_invalid", "Port must be greater than 0"));
     }
     let resolved_ip = resolve_server_host(&ip, port).await?;
+
+    // Only somewhere the user has already agreed to. Without this the consent
+    // collected in `add_server` is bypassable in one call: a renderer could
+    // name any public endpoint here and reach a server that was never added,
+    // which is the whole disclosure the prompt exists to gate.
+    let known = server_list_snapshot(&state).await?;
+    if !known
+        .iter()
+        .any(|server| server.ip == resolved_ip && server.port == port)
+    {
+        return Err(coded(
+            "server_not_in_list",
+            "That server is not in your server list. Add it first.",
+        ));
+    }
 
     state
         .network_tx
@@ -132,6 +196,7 @@ pub async fn disconnect_server(state: tauri::State<'_, AppState>) -> Result<Stri
 
 #[tauri::command]
 pub async fn add_server(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     ip: String,
     port: u16,
@@ -156,6 +221,22 @@ pub async fn add_server(
     } else {
         name.clone()
     };
+
+    // Consent for the destination, collected natively — see
+    // `confirm_server_addition`. The host is shown as the user typed it *and*
+    // as it resolved, so a name that resolves somewhere unexpected is visible.
+    let shown = if resolved_ip == ip {
+        format!("{label_name} — {resolved_ip}:{port}")
+    } else {
+        format!("{label_name} — {ip} ({resolved_ip}):{port}")
+    };
+    if !confirm_server_addition(&app, std::slice::from_ref(&shown)).await {
+        return Err(coded(
+            "server_add_declined",
+            "The server was not added.",
+        ));
+    }
+
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     state
@@ -206,6 +287,17 @@ pub async fn get_server_list(state: tauri::State<'_, AppState>) -> Result<Vec<Se
     await_reply(rx, "server_list_failed", "Failed to get server list").await
 }
 
+/// The stored server list, for callers that need to check membership rather
+/// than display it. Shares the network round-trip with [`get_server_list`].
+async fn server_list_snapshot(state: &AppState) -> Result<Vec<ServerInfo>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetServerListSnapshot { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "server_list_failed", "Failed to get server list").await
+}
+
 #[tauri::command]
 pub async fn get_connected_server(
     state: tauri::State<'_, AppState>,
@@ -225,10 +317,26 @@ pub async fn get_connected_server(
 
 #[tauri::command]
 pub async fn download_server_met(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
     info!("Downloading server.met");
+
+    // The bundled community list is exempt, by byte-exact comparison so a
+    // lookalike URL cannot inherit the exemption — the same shape
+    // `update_ipfilter_from_url` uses for its own default. Everything else is a
+    // renderer-supplied URL introducing an unknown number of servers at once,
+    // so it is gated like a single addition is.
+    if url != DEFAULT_SERVER_MET_URL {
+        let host = crate::webservices::service_host(&url);
+        if !confirm_server_addition(&app, std::slice::from_ref(&host)).await {
+            return Err(coded(
+                "server_met_declined",
+                "The server list was not downloaded.",
+            ));
+        }
+    }
 
     let data = fetch_server_met_bytes(&url).await?;
 

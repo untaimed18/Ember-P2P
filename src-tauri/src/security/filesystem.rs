@@ -839,7 +839,7 @@ fn created_ns(metadata: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(unix)]
-fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
+pub(crate) fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
     Ok(ObjectIdentity {
@@ -852,7 +852,7 @@ fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
 }
 
 #[cfg(windows)]
-fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
+pub(crate) fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -1775,6 +1775,57 @@ pub struct PinnedTempDir {
     temp_root: PathBuf,
     temp_identity: ObjectIdentity,
     own_identity: ObjectIdentity,
+}
+
+/// Remove `%TEMP%/Ember` working directories belonging to a run that has ended.
+///
+/// A [`PinnedTempDir`] reclaims itself on `Drop`, and for previews the only
+/// production trigger for that drop is the graceful-shutdown path — so a crash,
+/// a kill, or an OS shutdown leaves the whole directory behind. The name carries
+/// the pid, so the next launch creates a fresh one and never looks at the old,
+/// and Windows does not reclaim `%TEMP%` on its own. Each preview inside is
+/// bounded only by `PREVIEW_MAX_BYTES` (64 MiB), so without this they accumulate
+/// across restarts for as long as the install lives.
+///
+/// Safe to key on the pid because single-instance is enforced at startup: a
+/// directory tagged with any other pid cannot belong to a live Ember.
+pub fn sweep_orphaned_temp_dirs() {
+    let Ok(temp_root) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    let base = temp_root.join("Ember");
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    let own_pid = std::process::id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `{kind}-{pid}-{hex}`. `kind` may itself contain a dash, and the hex
+        // suffix never does, so the pid is always the second-from-last segment.
+        let parts: Vec<&str> = name.split('-').collect();
+        let Some(pid) = parts.len().checked_sub(2).map(|index| parts[index]) else {
+            continue;
+        };
+        if pid == own_pid || pid.parse::<u32>().is_err() {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(
+                "Removed an abandoned Ember temp directory ({name}); a previous run did not \
+                 shut down cleanly"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not remove the abandoned Ember temp directory {name}"
+            ),
+        }
+    }
 }
 
 impl PinnedTempDir {

@@ -100,13 +100,27 @@ function withinRateLimit(now: number): boolean {
   return true;
 }
 
+/**
+ * Whether this exact notification was already shown inside the dedupe window.
+ *
+ * A pure query. Recording is {@link recordSignature}'s job and deliberately
+ * separate, because this used to record as a side effect and was called before
+ * the burst ceiling — so a flurry past the ceiling registered dedupe entries
+ * for notifications that were never shown, and a genuine re-emission of one of
+ * them within the next five seconds was swallowed as a duplicate of something
+ * the user never saw. The backend re-emits a chat message from both session
+ * loops, which is the duplication this exists for, so that was not theoretical.
+ */
 function isDuplicate(signature: string, now: number): boolean {
   for (const [key, expiry] of recentSignatures) {
     if (expiry <= now) recentSignatures.delete(key);
   }
-  if (recentSignatures.has(signature)) return true;
+  return recentSignatures.has(signature);
+}
+
+/** Remember a notification that actually reached the shell. */
+function recordSignature(signature: string, now: number): void {
   recentSignatures.set(signature, now + DEDUPE_WINDOW_MS);
-  return false;
 }
 
 /**
@@ -145,8 +159,13 @@ export async function notify(
   if (!trimmedTitle) return;
 
   const now = Date.now();
-  if (isDuplicate(`${category}|${trimmedTitle}|${body}`, now)) return;
+  const signature = `${category}|${trimmedTitle}|${body}`;
+  if (isDuplicate(signature, now)) return;
+  // Recorded only once this notification has cleared the burst ceiling and is
+  // actually going to the shell. Recording before the ceiling let a suppressed
+  // notification silence its own genuine re-emission for the next five seconds.
   if (!withinRateLimit(now)) return;
+  recordSignature(signature, now);
 
   try {
     await showNotification(trimmedTitle, body);

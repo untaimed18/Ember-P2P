@@ -178,20 +178,30 @@ fn own_execution_state(
                 applied = want;
                 effective.store(want, Ordering::Relaxed);
                 last_apply = Instant::now();
-            } else if !warned {
-                // Once only: a platform that refuses the call refuses it every
-                // second, and a log line a second is worse than the fault.
-                warned = true;
-                tracing::warn!(
-                    "The OS refused a sleep-inhibitor change; the system may sleep during transfers"
-                );
-                // Treat it as applied so the retry follows the re-assert
-                // cadence rather than hammering once per poll. `effective` is
-                // deliberately *not* moved with it: backing off is a decision
-                // about how often to retry, and it must not become a claim that
-                // the machine is being held awake when it is not.
+            } else {
+                // Back off on *every* refusal, not just the first. These two
+                // lines used to sit inside the `warned` guard below, which
+                // latches after one failure — so from then on `last_apply` was
+                // never refreshed, the re-assert condition stayed permanently
+                // true, and a platform that refuses the call got the syscall
+                // once per poll for the life of the session: sixty times the
+                // cadence the comment claimed.
+                //
+                // `effective` is deliberately not moved with them. Backing off
+                // is a decision about how often to retry, and it must never
+                // become a claim that the machine is being held awake when it
+                // is not.
                 applied = want;
                 last_apply = Instant::now();
+                if !warned {
+                    // Once only: a platform that refuses the call refuses it
+                    // every time, and a log line a second is worse than the
+                    // fault.
+                    warned = true;
+                    tracing::warn!(
+                        "The OS refused a sleep-inhibitor change; the system may sleep during transfers"
+                    );
+                }
             }
         }
         std::thread::sleep(POLL_INTERVAL);

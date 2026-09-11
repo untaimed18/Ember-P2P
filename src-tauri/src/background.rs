@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use futures::FutureExt;
 use tauri::{Emitter, Manager};
 
 use crate::app_state::AppState;
@@ -31,9 +32,39 @@ use crate::types::{RuntimeStatus, TransferDirection, TransferHealth, TransferSta
 const TICK: Duration = Duration::from_secs(1);
 
 /// Spawn the monitor. Call once, after `AppState` is managed.
+///
+/// Restarted rather than merely logged, because the loop carries no state worth
+/// preserving — the four `Option`s inside it start unset precisely so the first
+/// tick re-establishes the world — and because the consequences of it simply
+/// stopping are all silent: the schedule is never re-resolved, so an open
+/// throttle window's caps outlive it for the rest of the session; the sleep
+/// inhibitor is never released; and the tray tooltip freezes on a stale rate.
+/// The network task takes the same precaution (`lib.rs`), for the same reason:
+/// the release profile enables `overflow-checks`, so arithmetic reachable from
+/// hostile input panics rather than wrapping.
 pub fn spawn(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move { run(app).await });
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let handle = app.clone();
+            let result = std::panic::AssertUnwindSafe(run(handle))
+                .catch_unwind()
+                .await;
+            if result.is_ok() {
+                // `run` only returns when the app is shutting down.
+                return;
+            }
+            // Payload and location are already in the log via the panic hook
+            // installed at startup, and the payload can carry peer data — the
+            // network task withholds it from its own line for that reason.
+            tracing::error!("Background monitor panicked; restarting it");
+            tokio::time::sleep(RESTART_DELAY).await;
+        }
+    });
 }
+
+/// Pause before restarting a panicked monitor, so a panic that reproduces every
+/// tick cannot become a busy loop of panics.
+const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 async fn run(app: tauri::AppHandle) {
     let wake_lock = WakeLock::new();
@@ -42,7 +73,6 @@ async fn run(app: tauri::AppHandle) {
     // Every "last applied" value starts unset so the first tick establishes
     // the world rather than trusting that startup already matched it.
     let mut applied_limits: Option<(u64, u64)> = None;
-    let mut published: Option<RuntimeStatus> = None;
     let mut applied_tooltip: Option<String> = None;
     let mut holding_wake_lock = false;
 
@@ -131,12 +161,19 @@ async fn run(app: tauri::AppHandle) {
             // suspend.
             sleep_inhibit_held: wake_lock.is_held(),
         };
-        if published.as_ref() != Some(&status) {
+        // Compared against the published status itself, not a copy this task
+        // keeps. `apply_effective_limits` writes the same field on every
+        // settings save, so a task-local cache is a record of what *this loop*
+        // last published rather than of what the UI is currently being told —
+        // and the difference is not academic: after a save the guard below
+        // would see its own unchanged value, decline to publish, and leave the
+        // save's version in place indefinitely.
+        let changed = *state.runtime_status.read() != status;
+        if changed {
             *state.runtime_status.write() = status.clone();
             if let Err(error) = app.emit("ember:runtime-status", &status) {
                 tracing::debug!("Could not emit runtime status: {error}");
             }
-            published = Some(status);
         }
 
         let tooltip = tray_tooltip(&state, working);
@@ -270,9 +307,24 @@ pub fn apply_effective_limits(
     // that claim on screen for up to a second after the limits behind it were
     // gone — and the tick only emits on change, so a save that happens to
     // resolve to the same numbers would never correct the rule name at all.
-    let mut status = resolved_status(settings);
-    status.sleep_inhibit_held = state.runtime_status.read().sleep_inhibit_held;
-    *state.runtime_status.write() = status.clone();
+    //
+    // Only the three fields this call is authoritative for are written. The
+    // wake-lock pair belongs to the monitor, which owns the `WakeLock` and is
+    // the only thing that can say whether the OS accepted a request or whether
+    // the owning thread ever started; rebuilding the whole struct here answered
+    // both from compile-time constants and re-enabled a toggle that had been
+    // correctly greyed out. The upload figure is the limiter's, not the target
+    // just handed to it, for the reason given on the monitor's own publish.
+    let upload_in_force = state.bandwidth_limiter.effective_upload_rate();
+    let (weekday, minute) = schedule::local_now();
+    let resolved = schedule::resolve_settings(settings, weekday, minute);
+    let status = {
+        let mut published = state.runtime_status.write();
+        published.effective_upload_speed = upload_in_force;
+        published.effective_download_speed = resolved.max_download_speed;
+        published.schedule = resolved.active;
+        published.clone()
+    };
     if let Err(error) = app.emit("ember:runtime-status", &status) {
         tracing::debug!("Could not emit runtime status after a settings save: {error}");
     }

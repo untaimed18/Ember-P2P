@@ -20,6 +20,36 @@ static PREVIEW_TEMP: OnceLock<
     parking_lot::Mutex<Option<crate::security::filesystem::PinnedTempDir>>,
 > = OnceLock::new();
 
+/// The preview written by the previous call, so it can be reclaimed.
+///
+/// Only one preview is ever useful at a time — [`launch_preview`] hands the path
+/// to the shell and nothing else reads it — but each call used to add a new
+/// randomly-named file and leave every earlier one in place. Bounded only by
+/// [`PREVIEW_MAX_BYTES`] apiece, twenty previews in a session left well over a
+/// gigabyte behind, and previewing the same file twice left two copies.
+static LAST_PREVIEW: OnceLock<parking_lot::Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// Drop the preview from the previous call.
+///
+/// Best-effort: on Windows the media player may still hold the file open, in
+/// which case the removal fails and the shutdown `remove_dir_all` — plus the
+/// startup sweep for directories a crash left behind — remains the backstop.
+/// Replacing the path either way keeps at most one deletable file outstanding.
+fn reclaim_previous_preview(next: &Path) {
+    let mut guard = LAST_PREVIEW
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock();
+    if let Some(previous) = guard.replace(next.to_path_buf()) {
+        if previous != next {
+            if let Err(error) = std::fs::remove_file(&previous) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(%error, "could not remove the previous preview file");
+                }
+            }
+        }
+    }
+}
+
 const VIDEO_EXTENSIONS: &[&str] = &[
     "avi", "mp4", "mkv", "wmv", "mpg", "mpeg", "mov", "flv", "webm", "m4v", "3gp", "divx", "ogm",
     "ogv", "rm", "rmvb", "ts", "vob",
@@ -178,6 +208,10 @@ pub fn create_preview_file(
     }
 
     dst.sync_all()?;
+    // Only after the new one is complete on disk, so a failure above leaves the
+    // previous preview playable rather than deleting it for a replacement that
+    // never arrived.
+    reclaim_previous_preview(&preview_path);
     // Log the basename only — the full path can contain the username / folder
     // layout (PII) and shows up in default logs and support bundles.
     info!(
@@ -214,6 +248,9 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
 
 /// Clean up preview temp files. Removes all files in the preview directory.
 pub fn cleanup_previews() {
+    if let Some(last) = LAST_PREVIEW.get() {
+        last.lock().take();
+    }
     if let Some(temp) = PREVIEW_TEMP.get() {
         temp.lock().take();
     }

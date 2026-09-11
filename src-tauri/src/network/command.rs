@@ -3177,39 +3177,68 @@ async fn handle_command_inner(
                 }
                 // Part files sit beside the ones eD2K downloads use, so a
                 // half-received transfer never appears in the finished folder.
-                let temp_dir = download_folder.join("Temp");
-                let done_dir = download_folder.join("Downloads");
-                let part_path = temp_dir.join(format!("ember-xfer-{}.part", hex::encode(xfer_id)));
-                // Two directory creations and a truncating open, off the
-                // network task. The download folder can be a network share or
-                // a spinning disk behind a virus scanner, where these are
-                // hundreds of milliseconds — and this task also drives UDP
-                // receive, every timer and every IPC snapshot. Nothing else
-                // can touch `state` while we await here (the loop is one task
-                // and this handler holds `&mut`), so the capacity and ban
+                // Through the approved-root layer, exactly as the eD2K download
+                // path does it. This was the one download path in the
+                // application writing with bare `std::fs` — `create_dir_all`,
+                // a truncating `OpenOptions::open`, and later a `rename`, all
+                // by pathname with no root-identity pin and no reparse-point
+                // refusal. The `.part` name is derived from `xfer_id`, which is
+                // decoded straight off the wire, so the path a receive will
+                // write to is chosen by the *sending* peer: a symlink planted
+                // there is followed and truncated, and a junction at
+                // `Downloads` is traversed on completion. `prepare_approved_subdir`
+                // creates handle-relative and refuses a reparse point;
+                // `open_or_create_approved` refuses a path that resolves
+                // outside the approved root. Both also re-pin the root, so a
+                // download folder whose approval has been revoked is refused
+                // here rather than silently written to.
+                //
+                // Off the network task because the download folder can be a
+                // network share or a spinning disk behind a virus scanner,
+                // where these are hundreds of milliseconds — and this task also
+                // drives UDP receive, every timer and every IPC snapshot.
+                // Nothing else can touch `state` while we await (the loop is one
+                // task and this handler holds `&mut`), so the capacity and ban
                 // checks above still hold on the far side.
+                let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
+                let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
                 let prepared = tokio::task::spawn_blocking({
-                    let done_dir = done_dir.clone();
-                    let part_path = part_path.clone();
-                    move || {
-                        std::fs::create_dir_all(&temp_dir)
-                            .and_then(|_| std::fs::create_dir_all(&done_dir))
-                            .and_then(|_| {
-                                std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .write(true)
-                                    .read(true)
-                                    .truncate(true)
-                                    .open(&part_path)
-                            })
+                    let root = download_folder.clone();
+                    let allowed = allowed_roots.clone();
+                    let part_name = part_name.clone();
+                    move || -> std::io::Result<(
+                        std::path::PathBuf,
+                        std::path::PathBuf,
+                        crate::security::filesystem::ObjectIdentity,
+                        std::fs::File,
+                    )> {
+                        let temp_dir = crate::security::filesystem::prepare_approved_subdir(
+                            &root, "Temp", &allowed,
+                        )?;
+                        let done_dir = crate::security::filesystem::prepare_approved_subdir(
+                            &root,
+                            "Downloads",
+                            &allowed,
+                        )?;
+                        let (part_path, file) =
+                            crate::security::filesystem::open_or_create_approved(
+                                &temp_dir.join(part_name),
+                                &allowed,
+                                true,
+                            )?;
+                        // Recorded now so completion can refuse a `.part` that
+                        // was swapped underneath the transfer.
+                        let identity =
+                            crate::security::filesystem::object_identity_from_file(&file)?;
+                        Ok((part_path, done_dir, identity, file))
                     }
                 })
                 .await;
-                let file = match prepared
+                let (part_path, done_dir, part_identity, file) = match prepared
                     .map_err(|e| e.to_string())
                     .and_then(|opened| opened.map_err(|e| e.to_string()))
                 {
-                    Ok(file) => file,
+                    Ok(prepared) => prepared,
                     Err(e) => {
                         let _ = tx.send(Err(coded_ctx(
                             "channels_xfer_failed",
@@ -3230,6 +3259,8 @@ async fn handle_command_inner(
                         offer.root,
                         part_path,
                         done_dir.join(&offer.name),
+                        download_folder.clone(),
+                        part_identity,
                         file,
                     ),
                 );
@@ -5574,10 +5605,17 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
-        NetworkCommand::PreviewFile { transfer_id, tx } => {
+        NetworkCommand::PreviewFile {
+            transfer_id,
+            tx,
+            single_flight,
+        } => {
             let download_folder = settings.download_folder.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
+                // Dropped when this task ends, which is what makes the claim
+                // cover the blocking work rather than only the caller's wait.
+                let _single_flight = single_flight;
                 let result = async {
                     let mgr_guard = tm.read().await;
                     let transfer = mgr_guard
