@@ -134,11 +134,28 @@ const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 /// TTL survives a few missed republishes without keeping a departed member
 /// listed for a full day.
 const CHANNEL_PRESENCE_TTL: Duration = Duration::from_secs(45 * 60);
-/// Leave tombstones replace the live record under the same store key; they
-/// only need to outlive a republish interval so stragglers still see the
-/// departure. Storers that do not know `CHANNEL_FLAG_DEPARTED` keep applying
-/// the live TTL, which is why ingest also drops the member.
-const CHANNEL_PRESENCE_DEPARTED_TTL: Duration = Duration::from_secs(5 * 60);
+/// Leave tombstones replace the live record under the same store key. Storers
+/// that do not know `CHANNEL_FLAG_DEPARTED` keep applying the live TTL, which
+/// is why ingest also drops the member.
+///
+/// It must be at least [`CHANNEL_PRESENCE_TTL`], not merely long enough to
+/// outlive a republish interval. Expiry is absolute from `created_at`, so a
+/// shorter tombstone lapses while the live record it displaced would still have
+/// been valid — and presence records are public, held verbatim by every storer
+/// and every searcher that received them. Once the sweep reclaims the
+/// tombstone, re-storing a harvested live copy passes every check, because the
+/// newer-copy guard has no resident left to compare against. The member is then
+/// served as present, carrying its Noise key, so peers attempt rendezvous with
+/// someone who left — repeatable at one datagram per key for as long as the
+/// original record's own TTL had left to run.
+const CHANNEL_PRESENCE_DEPARTED_TTL: Duration = CHANNEL_PRESENCE_TTL;
+
+// Pinned for the same reason `CHANNEL_INDEX_TTL` is: a shorter value compiles,
+// passes every test below, and quietly reopens the resurrection window.
+const _: () = assert!(
+    CHANNEL_PRESENCE_DEPARTED_TTL.as_secs() >= CHANNEL_PRESENCE_TTL.as_secs(),
+    "a departure must outlive every live copy that could be replayed against it"
+);
 
 /// A room's public-index listing, which is what Discover walks.
 ///

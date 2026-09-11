@@ -89,6 +89,38 @@ pub(super) struct CompressedPartAccumulator {
 }
 
 impl CompressedPartAccumulator {
+    /// Drop reassembly state for blocks that are no longer outstanding.
+    ///
+    /// A partially reassembled block is abandoned whenever the receive loop
+    /// leaves a part mid-block — most often the ordinary `is_part_complete`
+    /// exit, when another source closes the last gap. Entries are otherwise
+    /// removed only when a block *completes*, so in the multi-source worker,
+    /// where this accumulator is session-scoped for cross-part pipelining, they
+    /// simply accumulated. Once `MAX_PENDING_COMPRESSED_BLOCKS` stranded
+    /// entries built up, `append` began returning an error that propagates out
+    /// of the download and drops an actively transferring peer, which then
+    /// reconnects with a fresh accumulator and repeats. Each entry can also
+    /// hold up to `MAX_PENDING_COMPRESSED_BYTES` of dead buffer.
+    ///
+    /// `retained` names the block starts still in flight. The single-source
+    /// path does not need this — it scopes its accumulator per part.
+    pub(super) fn retain_outstanding(&mut self, retained: impl Fn(u64) -> bool) {
+        let before = self.pending.len();
+        self.pending.retain(|start, block| {
+            let keep = retained(*start);
+            if !keep {
+                self.pending_bytes = self.pending_bytes.saturating_sub(block.bytes.len());
+            }
+            keep
+        });
+        if before != self.pending.len() {
+            debug!(
+                "Dropped {} abandoned compressed block(s) from reassembly",
+                before - self.pending.len()
+            );
+        }
+    }
+
     pub(super) fn append(
         &mut self,
         start: u64,
@@ -3857,6 +3889,27 @@ impl Ed2kDownload {
         })
         .await
         .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
+
+        // A `.part.met` claiming progress with no `.part` beside it means the
+        // sidecar is stale — the user deleted the data file, or a crash left it
+        // behind. `sync_to_on_disk_part_length` deliberately returns early when
+        // `metadata()` fails, and its own comment defers the case to "the resume
+        // reset path": `multi_source.rs` has one, and this path did not.
+        //
+        // The consequence is not a stuck download. The restored bitmap's
+        // complete-*and-verified* bits survive onto a `.part` that is about to
+        // be `set_len` to zeros, `needed_parts()` comes back empty so nothing is
+        // ever fetched, and `is_range_safe_to_serve` — the gate the upload path
+        // uses — then reports those zeroed parts as verified and serves them to
+        // peers as MD4-checked data.
+        if tracker.completed_bytes() > 0 && !part_path.exists() {
+            warn!(
+                "Part tracker shows progress but .part file is missing for {} — resetting",
+                self.transfer_id
+            );
+            tracker = PartTracker::new_empty(self.file_size, &part_path);
+        }
+
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
         if !part_hashes.is_empty() {

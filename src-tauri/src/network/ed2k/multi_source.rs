@@ -68,6 +68,16 @@ fn unregister_own_tracker(
 /// within a transfer because the failure was already observed.
 pub(crate) type SharedPeerMissingParts = Arc<std::sync::Mutex<HashMap<(String, u16), Vec<bool>>>>;
 
+/// Ceiling on peers tracked in [`SharedPeerMissingParts`]. Generous enough that
+/// an ordinary swarm never reaches it, and small enough that a long-running
+/// download cannot accumulate a per-peer vector for every peer it ever met.
+const MAX_PEERS_MISSING_PARTS: usize = 4096;
+
+/// Ceiling on remembered discovered sources for one transfer. Far above the
+/// number a transfer can usefully dial, and low enough that the per-round clone
+/// of the list stays cheap. See [`remember_injected_source`].
+const MAX_INJECTED_SOURCES: usize = 2048;
+
 /// Test whether `peers_missing_parts` is known to say peer `(ip, port)`
 /// does NOT have part `part_idx`. Returns `false` for unknown peers
 /// (no entry) and for parts inside a peer's recorded vector that are
@@ -151,6 +161,27 @@ pub(crate) fn record_peer_missing_parts(
     also_suspect: &[usize],
 ) {
     if let Ok(mut guard) = map.lock() {
+        // Bounded, because an entry is created whenever a peer grants a slot
+        // and then FINs with zero part bytes — ordinary behaviour for
+        // overloaded and anti-leecher-modded clients — and source exchange and
+        // KAD keep feeding fresh peers for the life of the download. Nothing
+        // removed one, and each costs `part_count` bytes: roughly 10 KB per
+        // peer for a 100 GB file, so a multi-day transfer that met a few
+        // thousand such peers held tens to hundreds of MB for a map that only
+        // exists to skip re-assigning parts.
+        //
+        // Evicting an arbitrary entry is safe in a way pruning most caches is
+        // not: forgetting a peer's missing-part set only means it becomes a
+        // candidate for that part again, which is the same answer as never
+        // having met it. Erring towards re-asking beats erring towards an
+        // unbounded map.
+        if guard.len() >= MAX_PEERS_MISSING_PARTS
+            && !guard.contains_key(&(peer_ip.to_string(), peer_port))
+        {
+            if let Some(victim) = guard.keys().next().cloned() {
+                guard.remove(&victim);
+            }
+        }
         let entry = guard
             .entry((peer_ip.to_string(), peer_port))
             .or_insert_with(|| vec![false; part_count]);
@@ -9087,6 +9118,30 @@ async fn download_parts_from_source(
             pipelined_next.as_ref().map(|p| p.part_idx),
         );
 
+            // Drop reassembly state for blocks this part will never finish.
+            // Leaving a part mid-block is the ordinary exit — `is_part_complete`
+            // fires whenever another source closes the last gap — and the
+            // accumulator is session-scoped here (it has to be, for cross-part
+            // pipelining), so abandoned fragments were invisible to every later
+            // part and simply accumulated. At sixteen of them `append` starts
+            // erroring, which propagates out and drops a peer that is actively
+            // transferring; it then reconnects with a fresh accumulator and does
+            // it again.
+            //
+            // Only `pipelined_next`'s ranges are still live here: the next
+            // iteration rebinds `outstanding_ranges` from the pipeline rather
+            // than carrying this part's leftovers forward, so keeping this
+            // part's entries alive would retain exactly the fragments this is
+            // meant to drop and defer the cleanup by a whole part — long enough
+            // to still trip the sixteen-block ceiling.
+            {
+                let still_outstanding: std::collections::HashSet<u64> = pipelined_next
+                    .iter()
+                    .flat_map(|p| p.outstanding_ranges.iter().map(|range| range.start))
+                    .collect();
+                pending_compressed.retain_outstanding(|start| still_outstanding.contains(&start));
+            }
+
             if peer_out_of_parts {
                 let snap = {
                     let mut t = tracker.write().await;
@@ -9346,15 +9401,51 @@ async fn download_parts_from_source(
                         per_part_credit.remove(&part_idx);
                         continue;
                     }
-                    let (ps, pe, snap) = {
+                    // Re-check under the lock that the bytes this MD4 was taken
+                    // over are still the bytes on disk.
+                    //
+                    // Several sources verify the same part by design, and the
+                    // hash above was computed with no lock held, across an fsync
+                    // and — on the mismatch path — an 8s AICH wait. In that
+                    // window another source can find corruption and reopen a
+                    // gap, or take the `Mismatch` arm and `mark_incomplete` the
+                    // whole part. `mark_complete` is an unconditional
+                    // `fill_range`, so committing regardless erased that repair
+                    // and then flagged the part verified over bytes nobody had
+                    // hashed in their current state.
+                    //
+                    // That does not stay local: the flag is persisted
+                    // immediately, survives restart, and is what
+                    // `is_range_safe_to_serve` gates on — so the unchecked bytes
+                    // are advertised and uploaded to peers as MD4-verified.
+                    //
+                    // Note the part is gap-free by the precondition above, so in
+                    // the ordinary case this check passes and `mark_complete`
+                    // was always a no-op. It only ever *did* anything in exactly
+                    // the case where it must not.
+                    let committed = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);
-                        t.mark_complete(part_idx);
-                        // Flip the persistent verified flag so the upload path
-                        // can serve this range (see is_range_safe_to_serve).
-                        t.set_part_verified(part_idx);
-                        ip_guard.release_locked(part_idx, &mut t);
-                        (ps, pe, t.snapshot_for_save())
+                        let reopened = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                        if reopened {
+                            ip_guard.release_locked(part_idx, &mut t);
+                            None
+                        } else {
+                            t.mark_complete(part_idx);
+                            // Flip the persistent verified flag so the upload
+                            // path can serve this range (is_range_safe_to_serve).
+                            t.set_part_verified(part_idx);
+                            ip_guard.release_locked(part_idx, &mut t);
+                            Some((ps, pe, t.snapshot_for_save()))
+                        }
+                    };
+                    let Some((ps, pe, snap)) = committed else {
+                        warn!(
+                            "Multi-source part {part_idx} was repaired by another source while \
+                             this one verified it; re-hashing instead of marking it verified"
+                        );
+                        per_part_credit.remove(&part_idx);
+                        continue;
                     };
                     save_snapshot_now(snap, "verified part").await;
                     // D12: flush accumulated bytes to the credit ledger now
@@ -9652,6 +9743,39 @@ async fn download_parts_from_source(
                 _src_idx, addr,
             );
                 peer_out_of_parts = false;
+                // Release every claim the outgoing queue still holds before it
+                // is thrown away. Claims are taken for parts pushed onto
+                // `part_queue` ahead of time — the stale-skip extend, the
+                // cross-part pipeline target, the post-verify dynamic extend —
+                // but every release site only ever releases the *current*
+                // `part_idx`, so a queued-ahead claim is released only when the
+                // loop reaches that entry. Replacing the queue wholesale here
+                // meant those claims stayed in `ip_guard.active` until the task
+                // exited, and eMule's `SESSIONMAXTRANS` makes this rotation fire
+                // about once per part.
+                //
+                // The cost was not just memory: `in_progress_flags()` then
+                // reports parts nobody is pulling, so the strict pass of
+                // `select_part` rejects them and the engine falls through to the
+                // relaxed fallback — defeating the very anti-herding mechanism
+                // the claims exist for — and `all_complete_and_settled()` stays
+                // false, so the parent's early-completion breaks never fire.
+                //
+                // `queue_idx` is incremented before the `peer_out_of_parts`
+                // break, so the entry that break consumed without processing is
+                // at `queue_idx - 1`. Starting one earlier covers it; on the
+                // paths where that part *was* processed the extra release is a
+                // no-op, because `release_locked` only acts while this guard
+                // still holds the claim.
+                {
+                    let mut t = tracker.write().await;
+                    for &stale in part_queue.iter().skip(queue_idx.saturating_sub(1)) {
+                        ip_guard.release_locked(stale, &mut t);
+                    }
+                    if let Some(pending) = pipelined_next.as_ref() {
+                        ip_guard.release_locked(pending.part_idx, &mut t);
+                    }
+                }
                 queue_idx = 0;
                 pipelined_next = None;
                 // Reset the speed-measurement window so the post-rotation
@@ -9770,12 +9894,26 @@ impl Drop for WireAvailabilityGuard {
 /// over during a long download, and every arrival used to append another row.
 /// The round's `HashSet` pass then hid the duplicates from the download while
 /// the vector — and the per-round scan over it — kept growing with the session.
+///
+/// Bounded as well as deduped. Nothing removed an entry, so every distinct peer
+/// KAD, the server, source exchange or EPX ever surfaced for this file stayed
+/// until the download ended — and two costs compounded: the dedupe below is a
+/// linear scan, so `n` injections cost O(n²) comparisons over a session, and
+/// every retry round rebuilds `all_sources` by cloning the whole list, each
+/// entry carrying its own `String` and availability vector.
+///
+/// Dropping the oldest entry at the cap is safe: an evicted peer is simply a
+/// peer this round will not dial, and any of the four discovery channels that
+/// still knows about it will re-announce it.
 fn remember_injected_source(injected: &mut Vec<DownloadSource>, source: DownloadSource) -> bool {
     if injected
         .iter()
         .any(|s| s.peer_ip == source.peer_ip && s.peer_port == source.peer_port)
     {
         return false;
+    }
+    if injected.len() >= MAX_INJECTED_SOURCES {
+        injected.remove(0);
     }
     injected.push(source);
     true

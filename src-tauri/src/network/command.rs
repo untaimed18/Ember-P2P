@@ -4875,6 +4875,42 @@ async fn handle_command_inner(
             }
             if !parsed.is_empty() {
                 known_files.mark_dirty();
+                // Ordered by restrictiveness rather than by file, because the
+                // two stores are only consistent if a crash between them leaves
+                // the pair no *less* restrictive than either of them says.
+                //
+                // Unsharing is self-healing in any order: `share_intent`'s
+                // migration re-derives a denial from every `!is_shared` record,
+                // so a crash after known.met lands simply reinstates it.
+                // Re-sharing was not. known.met dropped the unshared flag while
+                // share_intent.json still denied the hash, `effective_shared`
+                // consults `denied` first, and the migration loop only ever
+                // *inserts* denials — never clears one. The file stayed
+                // unshared permanently while the Library showed it as shared,
+                // with no surface anywhere explaining the difference.
+                //
+                // So: allows first, known.met second, denials last. A crash at
+                // any point leaves the file unshared and re-derivable rather
+                // than stuck.
+                //
+                // A *failed* known.met save is the one case that needs undoing
+                // rather than re-deriving: `effective_shared` consults
+                // `explicit_allow` ahead of the catalog value, so an allow that
+                // landed while the catalog write failed would leave the file
+                // shared against a catalog that says otherwise — less
+                // restrictive than either store, which is exactly what this
+                // ordering exists to prevent.
+                let (allows, denies): (Vec<_>, Vec<_>) =
+                    parsed.iter().copied().partition(|(_, shared)| *shared);
+                if !allows.is_empty() {
+                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&allows) {
+                        *known_files = before;
+                        let _ = tx.send(Err(format!(
+                            "Failed to persist independent share intent: {e}"
+                        )));
+                        return;
+                    }
+                }
                 // See SetUploadPriorities: persist before acknowledging so
                 // share/unshare cannot appear successful and then revert on
                 // the next application start.
@@ -4889,11 +4925,35 @@ async fn handle_command_inner(
                 .map_err(|e| format!("known.met share-state save task failed: {e}"))
                 .and_then(|result| result.map_err(|e| e.to_string()));
                 if let Err(e) = save_result {
+                    // Withdraw only the allows that made a previously unshared
+                    // file shared. An allow for a file the catalog already had
+                    // as shared agrees with the state we are reverting to, so
+                    // denying it would be a surprise unshare rather than a
+                    // rollback.
+                    let strays: Vec<([u8; 16], bool)> = allows
+                        .iter()
+                        .filter(|(hash, _)| {
+                            !before.find_by_hash(hash).is_some_and(|r| r.is_shared)
+                        })
+                        .map(|(hash, _)| (*hash, false))
+                        .collect();
+                    if !strays.is_empty() {
+                        if let Err(rollback_error) =
+                            crate::storage::share_intent::set_explicit_batch(&strays)
+                        {
+                            error!(
+                                "Failed to withdraw share intent after a known.met save failure; \
+                                 {} file(s) may remain shared until the next launch: {rollback_error}",
+                                strays.len()
+                            );
+                        }
+                    }
                     *known_files = before;
                     let _ = tx.send(Err(format!("Failed to persist file sharing state: {e}")));
                     return;
                 }
-                if let Err(e) = crate::storage::share_intent::set_explicit_batch(&parsed) {
+                if !denies.is_empty() {
+                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&denies) {
                     *known_files = before.clone();
                     let ownership = state.known_met_save_lock.clone().lock_owned().await;
                     let known_path = state.data_dir.join("known.met");
@@ -4916,6 +4976,7 @@ async fn handle_command_inner(
                         "Failed to persist independent share intent: {detail}"
                     )));
                     return;
+                    }
                 }
             }
             let _ = tx.send(Ok(parsed.len()));

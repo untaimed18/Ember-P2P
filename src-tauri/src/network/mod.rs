@@ -51617,6 +51617,14 @@ async fn run_ember_maintenance(
     // beside it. Runs after the demote/promote passes so it prunes against the
     // membership this tick settled on, and a peer that comes back through the
     // replacement cache re-advertises on its next ping anyway.
+    // Proxy asks and grants sweep here too, because the only other caller runs
+    // while we are actively sending `PROXY_STORE` — so a node that stopped
+    // publishing (HighID acquired, library unshared, transport disabled) never
+    // swept them again and froze the map at its high-water mark for the life of
+    // the process. This tick is unconditional.
+    state
+        .ember_dht
+        .prune_proxy_asks(std::time::Instant::now());
     let forgotten = state.ember_dht.prune_peer_versions();
     if forgotten > 0 {
         debug!("Ember DHT: forgot {forgotten} advertised version range(s) for departed peers");

@@ -432,7 +432,12 @@ pub struct EmberDht {
     local_contact_udp: u16,
     /// Endorsements candidate buddies have signed for us, keyed by their node
     /// ID. A firewalled publisher may only name a buddy it holds one of.
-    buddy_endorsements: HashMap<EmberNodeId, BuddyEndorsement>,
+    /// Endorsements candidate buddies have signed for us, paired with the order
+    /// we absorbed them in so the cap can evict by something the sender does
+    /// not choose. See [`EmberDht::absorb_buddy_endorsement`].
+    buddy_endorsements: HashMap<EmberNodeId, (BuddyEndorsement, u64)>,
+    /// Monotonic counter feeding the `u64` above.
+    buddy_endorsement_seq: u64,
     /// `BUDDY_ENDORSE_REQ`s we have sent and not yet had answered, so a tick
     /// that runs every few seconds does not re-ask a silent candidate on every
     /// pass.
@@ -530,6 +535,7 @@ impl EmberDht {
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
             buddy_endorsements: HashMap::new(),
+            buddy_endorsement_seq: 0,
             buddy_endorse_asked: HashMap::new(),
         }
     }
@@ -636,13 +642,14 @@ impl EmberDht {
     pub fn buddy_endorsement(&self, buddy: &EmberNodeId, now: i64) -> Option<BuddyEndorsement> {
         self.buddy_endorsements
             .get(buddy)
-            .copied()
+            .map(|(endorsement, _)| *endorsement)
             .filter(|e| e.expires_at > now)
     }
 
     /// Drop endorsements that have lapsed.
     pub fn prune_buddy_endorsements(&mut self, now: i64) {
-        self.buddy_endorsements.retain(|_, e| e.expires_at > now);
+        self.buddy_endorsements
+            .retain(|_, (e, _)| e.expires_at > now);
     }
 
     /// Absorb an endorsement a candidate buddy signed for us.
@@ -688,27 +695,53 @@ impl EmberDht {
         if noise_pub != session_noise_pub {
             return false;
         }
+        // `endorsement_covers` only rejects an expiry in the past. Nothing
+        // bounded it from above, and `expires_at` arrives as a raw i64 off the
+        // wire — so `i64::MAX` was accepted, never lapsed under the retain
+        // below, and, because the cap evicts the *soonest*-expiring entry,
+        // outranked every honest six-hour endorsement forever. Sixteen cheap
+        // identities could fill this table permanently and evict each honest
+        // reply with one datagram, which stops a firewalled or LowID node
+        // naming a buddy at all — and that is the sole gate on publishing any
+        // Ember source record, so its shares simply stop being findable.
+        //
+        // `sign_buddy_endorsement` never signs longer than the TTL, so this
+        // rejects nothing an honest buddy can produce. The skew allowance is
+        // for the signer's clock, not for the value's benefit.
+        const ENDORSEMENT_CLOCK_SKEW_SECS: i64 = 300;
+        if expires_at > now.saturating_add(BUDDY_ENDORSEMENT_TTL_SECS + ENDORSEMENT_CLOCK_SKEW_SECS)
+        {
+            return false;
+        }
         if !endorsement
             .as_source_buddy()
             .endorsement_covers(&self.local_id.0, now)
         {
             return false;
         }
-        self.buddy_endorsements.retain(|_, e| e.expires_at > now);
+        self.buddy_endorsements
+            .retain(|_, (e, _)| e.expires_at > now);
         if self.buddy_endorsements.len() >= MAX_BUDDY_ENDORSEMENTS
             && !self.buddy_endorsements.contains_key(&buddy)
         {
-            if let Some(soonest) = self
+            // Evict the endorsement we have held longest, not the one expiring
+            // soonest. Expiry order is attacker-chosen — a peer sets its own
+            // `expires_at` — so using it as the eviction key let a newcomer
+            // displace an endorsement we had just asked for and received.
+            // Insertion order is ours.
+            if let Some(oldest) = self
                 .buddy_endorsements
                 .iter()
-                .min_by_key(|(_, e)| e.expires_at)
+                .min_by_key(|(_, (_, seq))| *seq)
                 .map(|(id, _)| *id)
             {
-                self.buddy_endorsements.remove(&soonest);
+                self.buddy_endorsements.remove(&oldest);
             }
         }
         self.buddy_endorse_asked.remove(&buddy);
-        self.buddy_endorsements.insert(buddy, endorsement);
+        self.buddy_endorsement_seq = self.buddy_endorsement_seq.wrapping_add(1);
+        self.buddy_endorsements
+            .insert(buddy, (endorsement, self.buddy_endorsement_seq));
         true
     }
 
@@ -753,7 +786,21 @@ impl EmberDht {
         if !self.advertises_buddy_endpoint() || !buddy.is_routable() {
             return false;
         }
+        // The endpoint has to be the one we advertise *now*, not merely one we
+        // signed at some point. `endorsement_covers` proves our key signed it;
+        // it says nothing about whether that address is still ours. After a
+        // DHCP lease change, a port-mapping change or a Noise key rotation, a
+        // publisher holding an endorsement issued before the change kept
+        // passing here for the rest of its six-hour life — and we then spent a
+        // proxy-forward slot, a publish slot, a local replica and a callback
+        // slot fanning out a record naming an address that no longer resolves
+        // to us, which every searcher refuses at `buddy_endpoint_corroborated`
+        // and parks. Rejecting instead makes the publisher re-ask on the normal
+        // endorsement cadence and get a trailer that works.
         buddy.ed25519_pub == self.signing_key.verifying_key().to_bytes()
+            && buddy.ip == self.local_contact_ip
+            && buddy.udp_port == self.local_contact_udp
+            && buddy.noise_pub == self.local_noise_pub
             && buddy.endorsement_covers(&publisher.0, now)
     }
 
@@ -1458,13 +1505,38 @@ impl EmberDht {
         self.our_proxy_buddies.insert(buddy, now);
     }
 
-    fn prune_proxy_asks(&mut self, now: Instant) {
+    /// Ceiling on outstanding proxy grants.
+    ///
+    /// Every sibling map in this struct carries one; this was the exception,
+    /// holding only a TTL. A firewalled node with a large library inserts one
+    /// entry per ACKed (buddy, file) pair, so roughly 8,600 per buddy
+    /// accumulate across the six-hour window — and the TTL only runs when
+    /// [`Self::prune_proxy_asks`] is called, which until now happened solely
+    /// while we were actively sending `PROXY_STORE`. If publishing stopped for
+    /// any reason (a HighID acquired, the library unshared, the transport
+    /// disabled) nothing swept it again and the map froze at its high-water
+    /// mark for the life of the process, holding grants that had all lapsed.
+    const MAX_PROXY_FILE_GRANTS: usize = 8192;
+
+    pub(crate) fn prune_proxy_asks(&mut self, now: Instant) {
         self.pending_proxy_asks.retain(|_, asks| {
             asks.retain(|(_, _, at)| now.saturating_duration_since(*at) < PROXY_STORE_ASK_TTL);
             !asks.is_empty()
         });
         self.proxy_file_grants
             .retain(|_, at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL);
+        if self.proxy_file_grants.len() > Self::MAX_PROXY_FILE_GRANTS {
+            let excess = self.proxy_file_grants.len() - Self::MAX_PROXY_FILE_GRANTS;
+            let mut oldest: Vec<((EmberNodeId, [u8; 16]), Instant)> = self
+                .proxy_file_grants
+                .iter()
+                .map(|(key, at)| (*key, *at))
+                .collect();
+            oldest.sort_unstable_by_key(|(_, at)| *at);
+            for (key, _) in oldest.into_iter().take(excess) {
+                self.proxy_file_grants.remove(&key);
+            }
+        }
     }
 
     fn complete_proxy_store_ask(

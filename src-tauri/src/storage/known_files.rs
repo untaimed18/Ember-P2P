@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
@@ -79,6 +79,46 @@ const AICH_BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 // with that supported scale instead of silently retaining only the first
 // folder's worth of mappings.
 const MAX_KNOWN_PATH_MAPPINGS: usize = 512 * 100_000;
+
+/// Ceiling on the bytes `known.met` may occupy before the loader refuses it.
+///
+/// Bounds the worst-case allocation against a corrupt or maliciously swapped
+/// file. Note this is a *read* ceiling, not a capacity guarantee: at roughly
+/// 220 bytes plus 16 per 9.28 MiB part, a library of 1 GiB-average files
+/// crosses it near 140k records, far short of what `MAX_KNOWN_PATH_MAPPINGS`
+/// above claims to support. Crossing it is treated as "cannot read", never as
+/// "reset" — see the `oversize` handling in [`KnownFileList::load`].
+const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
+
+fn quarantined_paths() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether this catalog was already copied aside in this process. See the call
+/// site in [`KnownFileList::load`] for why the copy is latched rather than
+/// repeated.
+///
+/// Query only: the mark is set by [`mark_quarantined`] *after* a copy succeeds.
+/// Marking on the attempt would make a failed copy indistinguishable from a
+/// successful one on the next `load`, and the caller treats "quarantined" as
+/// proof a backup exists before it lets `save` overwrite the original.
+fn already_quarantined(path: &Path) -> bool {
+    quarantined_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
+}
+
+/// Record that `path` has a surviving backup copy.
+fn mark_quarantined(path: &Path) {
+    quarantined_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+}
 
 /// Set one field of a record's media, creating the struct on first sight.
 ///
@@ -323,15 +363,39 @@ impl KnownFileList {
     pub fn load_checked(path: &Path) -> anyhow::Result<Self> {
         let mut list = Self::new();
         crate::security::recover_interrupted_replace(path);
-        // known.met is app-managed, but a corrupt or maliciously-swapped file
-        // shouldn't be slurped wholesale. This ceiling bounds the worst-case
-        // allocation while allowing millions of ordinary records.
-        const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // No file is a real answer: this is a first run, and the empty
-                // catalog it produces is authoritative.
+                // Missing is only a real answer when nothing is parked beside
+                // it. `recover_interrupted_replace` above merely *attempts* the
+                // restore and logs a failure rather than reporting one, so an
+                // interrupted atomic replace whose restore then failed — an AV
+                // scanner or indexer holding the name, the same condition that
+                // pushed the write onto the replace fallback in the first place
+                // — arrives here looking exactly like a first run.
+                //
+                // Calling it one is the silent reset every other arm refuses,
+                // and worse than elsewhere: `atomic_write` retries the restore
+                // on the next save, so it would recover the real catalog and
+                // then immediately overwrite it with this empty one, consuming
+                // the backup in the process. Every ed2k hash, per-part MD4
+                // hashset, AICH root and Ember digest for the whole library,
+                // gone, with a full re-hash to rebuild them.
+                //
+                // `identity.rs` and `credits.rs` both guard this exact case by
+                // name; this is the third file that needed it.
+                if crate::security::interrupted_replace_backup_exists(path) {
+                    anyhow::bail!(
+                        "known.met is missing but {}.ember-replace-bak is parked beside it, so an \
+                         interrupted save could not be restored. Refusing to treat this as a first \
+                         run, because doing so would overwrite the recovered catalog with an empty \
+                         one. To recover, rename the .ember-replace-bak file back to known.met; to \
+                         reset deliberately, delete it.",
+                        path.display()
+                    );
+                }
+                // No file and nothing parked: a genuine first run, and the
+                // empty catalog it produces is authoritative.
                 list.authoritative = true;
                 return Ok(list);
             }
@@ -344,9 +408,11 @@ impl KnownFileList {
             );
         }
         let data = std::fs::read(path)?;
+        // Set before parsing, not after: a partial parse clears it, and that
+        // verdict has to survive rather than being overwritten here.
+        list.authoritative = true;
         list.parse_known_met(&data)?;
         list.load_path_index(&path.with_file_name("known_paths.dat"));
-        list.authoritative = true;
         Ok(list)
     }
 
@@ -375,10 +441,22 @@ impl KnownFileList {
                         "met.{}.corrupt",
                         chrono::Utc::now().format("%Y%m%d%H%M%S")
                     ));
-                    if let Err(backup_error) = std::fs::copy(path, &backup) {
+                    // Once per path per process. `load` runs at least four
+                    // times a launch — the AICH migration, the startup hashing
+                    // pass, the network task's deferred load, and the sharing
+                    // command, which also runs on every folder-add and library
+                    // reload — and the catalog is not repaired until the first
+                    // periodic save up to two minutes later. Copying on each of
+                    // them produced a distinct timestamped backup per call,
+                    // roughly a gigabyte of them on one launch against a
+                    // 256 MiB catalog, with nothing ever deleting any of it.
+                    if already_quarantined(path) {
+                        quarantined = true;
+                    } else if let Err(backup_error) = std::fs::copy(path, &backup) {
                         warn!("Failed to preserve corrupt known.met: {backup_error}");
                     } else {
                         crate::security::restrict_file_permissions(&backup);
+                        mark_quarantined(path);
                         quarantined = true;
                     }
                     warn!(
@@ -393,7 +471,28 @@ impl KnownFileList {
                     crate::storage::share_intent::force_unshared_all();
                 }
                 let mut list = Self::new();
-                list.authoritative = quarantined || !path.exists();
+                // A preserved copy is what makes an empty list safe to write
+                // back — `save` refuses to overwrite a catalog it never read,
+                // and after a failed quarantine the damaged file is the only
+                // copy of those hashes left.
+                //
+                // `!path.exists()` is deliberately *not* enough on its own any
+                // more. `load_checked` now refuses a missing catalog with a
+                // parked `.ember-replace-bak`, and that refusal arrives here as
+                // an `Err` on a path that does not exist — so without this the
+                // list would be marked authoritative and the very overwrite
+                // that check exists to prevent would happen one layer down.
+                let parked = crate::security::interrupted_replace_backup_exists(path);
+                // A catalog that is merely too large to read is not corrupt —
+                // every record in it is valid, it just exceeded the read
+                // ceiling. Quarantining preserves the bytes, but writing an
+                // empty catalog over the original still costs the user a full
+                // re-hash to recover from a file that was never damaged. Leave
+                // it alone and run with an empty in-memory index instead.
+                let oversize = std::fs::metadata(path)
+                    .map(|meta| meta.len() > MAX_KNOWN_MET_BYTES)
+                    .unwrap_or(false);
+                list.authoritative = (quarantined || !path.exists()) && !parked && !oversize;
                 list
             }
         }
@@ -425,21 +524,30 @@ impl KnownFileList {
 
         // No artificial record cap here: `save()` writes the full `files.len()`
         // header, so a hard parse cap would silently drop the tail on restart.
-        // A mid-record parse failure has no framing marker to resync from, so we
-        // bail and let the caller quarantine known.met rather than keep a prefix
-        // that the next dirty save would permanently truncate.
+        //
+        // A mid-record failure has no framing marker to resync from, so the
+        // tail is unreadable either way. What changed is what happens to the
+        // *prefix*: it used to be discarded along with it, on the reasoning
+        // that keeping it would let the next dirty save truncate the file
+        // permanently. That reasoning was sound only because the caller then
+        // marked the resulting empty list authoritative — so the choice was
+        // between losing the tail and losing everything, and it picked
+        // everything. Keeping the prefix and refusing to write it back is
+        // strictly better: the app runs with what could be read, and the file
+        // on disk is untouched until the user repairs it.
         for record_index in 0..count {
             let record = match Self::read_record(&mut cursor, version) {
                 Ok(record) => record,
                 Err(e) => {
-                    // Quarantine: a mid-file parse error means the on-disk
-                    // known.met is corrupt. Returning Ok with a prefix would
-                    // let the next dirty save permanently drop the unread tail.
-                    anyhow::bail!(
-                        "failed to parse known.met record {} of {count}: {e} (loaded {} records before failure)",
+                    warn!(
+                        "failed to parse known.met record {} of {count}: {e} (keeping the {} \
+                         records read before it; known.met will not be rewritten until it is \
+                         repaired)",
                         record_index + 1,
                         self.files.len()
                     );
+                    self.authoritative = false;
+                    return Ok(());
                 }
             };
             let hash = record.file_hash;
@@ -471,14 +579,19 @@ impl KnownFileList {
             }
         }
 
-        // Only after successfully reading all declared records: trailing bytes
-        // mean the file is malformed beyond a clean prefix truncate.
+        // Trailing bytes mean the file is malformed beyond a clean prefix
+        // truncate — but every declared record read cleanly, so the catalog in
+        // memory is complete and usable. Keep it and decline to write back,
+        // rather than throwing away a whole good catalog over a stray byte.
         let consumed = cursor.position() as usize;
         if consumed != data.len() {
-            anyhow::bail!(
-                "known.met has {} trailing bytes after its declared {count} records",
+            warn!(
+                "known.met has {} trailing bytes after its declared {count} records; keeping the \
+                 records that parsed and leaving the file alone until it is repaired",
                 data.len() - consumed
             );
+            self.authoritative = false;
+            return Ok(());
         }
 
         info!("Loaded {} known files from known.met", self.files.len());
@@ -651,6 +764,23 @@ impl KnownFileList {
                 }
                 0x05 => {
                     cursor.read_u8()?;
+                }
+                // eMule's `TAGTYPE_BOOLARRAY`. Skipped rather than read,
+                // exactly as the sibling `.part.met` reader does — without it
+                // any catalog carrying one (from eMule, aMule, a mod, or a
+                // future Ember build that is later downgraded) failed to parse,
+                // and a parse failure used to cost the user the whole index.
+                0x06 => {
+                    let count = cursor.read_u16::<LittleEndian>()? as u64;
+                    let byte_count = count.div_ceil(8);
+                    let new_pos = cursor
+                        .position()
+                        .checked_add(byte_count)
+                        .filter(|&p| p <= cursor.get_ref().len() as u64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("bool-array tag of {count} bits exceeds data")
+                        })?;
+                    cursor.set_position(new_pos);
                 }
                 0x07 => {
                     let blen = cursor.read_u32::<LittleEndian>()? as u64;
@@ -1031,6 +1161,52 @@ impl KnownFileList {
         self.dirty = true;
     }
 
+    /// Ceiling on records whose content is no longer at any indexed path.
+    ///
+    /// These are the only records that can accumulate without bound. A record
+    /// with a live path is bounded by the library itself (512 folders × 100,000
+    /// files), but nothing removed a record when its file was deleted, unshared
+    /// or dropped from a folder — the sole removal in the whole type is a hash
+    /// change with no other referencing path. At roughly 220 bytes plus 16 per
+    /// 9.28 MiB part, that reaches the loader's read ceiling near 140k records
+    /// on a 1 GiB-average library, and crossing it used to cost the user the
+    /// whole catalog.
+    ///
+    /// Kept generous because each record is a re-hash avoided if the file
+    /// comes back: 50,000 pathless records is tens of MB, far under the
+    /// ceiling, and outlives any ordinary reorganisation of a library.
+    const MAX_UNREFERENCED_RECORDS: usize = 50_000;
+
+    /// Drop the oldest records whose content is no longer at any indexed path,
+    /// down to [`Self::MAX_UNREFERENCED_RECORDS`].
+    ///
+    /// Records with a live path are never touched, so this can only discard
+    /// cached hashes for files the library no longer contains — at worst a
+    /// re-hash if one reappears, against an index that otherwise grows until it
+    /// can no longer be read.
+    fn prune_unreferenced(&mut self) {
+        let mut pathless: Vec<([u8; 16], i64)> = self
+            .files
+            .iter()
+            .filter(|(hash, _)| !self.path_refs.contains_key(*hash))
+            .map(|(hash, record)| (*hash, record.modified_at))
+            .collect();
+        if pathless.len() <= Self::MAX_UNREFERENCED_RECORDS {
+            return;
+        }
+        // Oldest first, so the most recently touched cached hashes survive.
+        pathless.sort_unstable_by_key(|(_, modified_at)| *modified_at);
+        let excess = pathless.len() - Self::MAX_UNREFERENCED_RECORDS;
+        for (hash, _) in pathless.into_iter().take(excess) {
+            self.files.remove(&hash);
+        }
+        warn!(
+            "Pruned {excess} known.met record(s) whose files are no longer in the library, \
+             keeping the {} most recent",
+            Self::MAX_UNREFERENCED_RECORDS
+        );
+    }
+
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
         // Refuse to write a catalog that was never read off disk over one that
         // exists. The network task starts from `new()` and absorbs known.met
@@ -1052,31 +1228,58 @@ impl KnownFileList {
             );
             return Ok(());
         }
-        let needs_i64 = self.files.values().any(|r| r.file_size > u32::MAX as u64);
+        // Bounded here rather than on every mutation: this is the one place the
+        // whole catalog is already being walked, and the only place its size
+        // has a consequence.
+        self.prune_unreferenced();
+
+        // Partitioned before the header is written, because the header commits
+        // a record count and there is no way to skip a record after it.
+        //
+        // A record with more than `u16::MAX` part hashes — a shared file above
+        // roughly 594 GiB — used to abort the save from inside the loop below.
+        // The periodic writer re-arms on failure, so it retried every two
+        // minutes and failed identically forever: `known.met` frozen at its
+        // last good state for the life of the install, every later completed
+        // download, counter and AICH root lost on restart, visible only as a
+        // repeating error line. Skipping the one record it cannot encode
+        // leaves the catalog writable, and the record stays in memory so it is
+        // still served this session.
+        let encodable: Vec<&KnownFileRecord> = self
+            .files
+            .values()
+            .filter(|record| {
+                if record.part_hashes.len() <= u16::MAX as usize {
+                    return true;
+                }
+                warn!(
+                    "known.met cannot encode {} part hashes for {} (max {}); skipping this record \
+                     so the rest of the catalog stays writable",
+                    record.part_hashes.len(),
+                    record.file_path,
+                    u16::MAX
+                );
+                false
+            })
+            .collect();
+
+        let needs_i64 = encodable.iter().any(|r| r.file_size > u32::MAX as u64);
         let mut buf = Vec::new();
         buf.write_u8(if needs_i64 {
             MET_HEADER_I64TAGS
         } else {
             MET_HEADER
         })?;
-        buf.write_u32::<LittleEndian>(self.files.len() as u32)?;
+        buf.write_u32::<LittleEndian>(encodable.len() as u32)?;
 
-        for record in self.files.values() {
+        for record in encodable {
             buf.write_u32::<LittleEndian>(
                 (record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32
             )?;
 
             buf.write_all(&record.file_hash)?;
-            let part_count = record.part_hashes.len();
-            if part_count > u16::MAX as usize {
-                anyhow::bail!(
-                    "known.met cannot encode {} part hashes for {} (max {})",
-                    part_count,
-                    record.file_path,
-                    u16::MAX
-                );
-            }
-            buf.write_u16::<LittleEndian>(part_count as u16)?;
+            // Bounded by the partition above, so this cast cannot truncate.
+            buf.write_u16::<LittleEndian>(record.part_hashes.len() as u16)?;
             for ph in &record.part_hashes {
                 buf.write_all(ph)?;
             }
