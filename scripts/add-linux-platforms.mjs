@@ -128,11 +128,24 @@ export function collectLinuxBundles({ directory }) {
  * runner built it.
  */
 export function addLinuxPlatforms({ manifest, bundles, assetBase }) {
+  // Every `linux-` entry is dropped first, so this rewrites rather than adds.
+  //
+  // A re-run of the signing job does not start from a clean manifest:
+  // `tauri-action` seeds `platforms` from the `latest.json` already attached to
+  // the release, so a retry after a failed upload finds the previous attempt's
+  // Linux entries carried straight back in. Refusing them — which this did —
+  // made a retried release unrecoverable without deleting that asset by hand,
+  // and keeping them would leave the previous run's signature against this
+  // run's bytes. Clearing the whole prefix also removes a bare `linux-x86_64`
+  // if anything ever writes one, which is the key this deliberately omits.
+  //
+  // The base URL is read after the clear so it can only come from an entry
+  // `tauri-action` wrote during this run.
+  for (const target of Object.keys(manifest.platforms)) {
+    if (target.startsWith("linux-")) delete manifest.platforms[target];
+  }
   const base = assetBase ?? releaseAssetBase(manifest);
   for (const { target, name, signature } of bundles) {
-    if (manifest.platforms[target]) {
-      throw new Error(`latest.json already has a ${target} entry`);
-    }
     manifest.platforms[target] = {
       url: `${base}/${encodeURIComponent(name)}`,
       signature,

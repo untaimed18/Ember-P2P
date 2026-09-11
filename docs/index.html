@@ -1850,7 +1850,101 @@ npm run tauri build</code></pre>
   <!-- Release History -->
   <section id="releases">
     <h2>Release History</h2>
-    <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+    <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-4">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.4" target="_blank" rel="noopener">Ember v1.6.4</a></h3>
+        <time class="release-date" datetime="2026-09-11">September 11, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.4" target="_blank" rel="noopener"><code>v1.6.4</code></a></p>
+      <div class="release-notes">
+        <p>A P2P client earns its keep in the hours nobody is watching it, and that is exactly when Ember was worst. A finished download, a friend coming online and a room mention were all announced by in-app toasts that vanish the moment the window goes to the tray. A six-hour transfer died when Windows reached its idle timer, and the Transfers page could not tell that from a stall. And the only speed limits were one pair of numbers, so the choice was between throttling all day or saturating the line during a video call. This release is about the unattended hours &mdash; and it is the first one Linux is actually part of.</p>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Linux</h5>
+        <ul>
+          <li><strong>Linux is a published platform.</strong> Every release now carries an x86-64 <code>.deb</code> and an AppImage alongside the Windows installers, built on Ubuntu 22.04 for its glibc baseline, and signed with the same key. Install the <code>.deb</code> with your package manager, or mark the AppImage executable and run it</li>
+          <li><strong>Both formats update themselves,</strong> the way the Windows build does. Ember notices which format it was installed from and updates with that one &mdash; a <code>.deb</code> install goes through <code>dpkg</code> and asks for authentication, an AppImage replaces itself in place. The release manifest and the package are both signature-checked before anything is installed</li>
+          <li><strong>Ctrl+ and Ctrl&minus; zoom the interface,</strong> so a compositor whose display scale never reaches the webview can be corrected by hand</li>
+        </ul>
+
+        <h5>Desktop notifications</h5>
+        <ul>
+          <li><strong>Ember can tell you about things while you are not looking at it.</strong> A download finishing or failing, a friend coming online, a message from a friend, and &mdash; if you switch it on &mdash; a room mention. Every one is composed and translated in Ember and handed to the desktop, so they read in your language rather than the backend&rsquo;s</li>
+          <li><strong>Nothing fires for something you are already watching.</strong> A window that is on screen <em>and</em> focused counts as watched; one sitting behind an editor on a second monitor does not, which is the case that matters. Identical notifications collapse, a burst is capped, and room notifications pass every suppression the in-app toast already applies &mdash; a muted room or an ignored member can never reach the desktop</li>
+          <li><strong>Each kind has its own switch</strong> in Settings &gt; General, under one master toggle, with room messages off by default</li>
+        </ul>
+
+        <h5>Leaving Ember running</h5>
+        <ul>
+          <li><strong>The machine stays awake while transfers are working.</strong> Only the system, never the display &mdash; an app that keeps a monitor lit all night to seed a file is worse than the problem it solves. A download with no sources does not count, and neither does one Ember has already called stalled, so a laptop is not pinned awake by a transfer that is going nowhere. Windows only for now; the toggle disables itself where there is nothing to hold</li>
+          <li><strong>The tray icon reports the current rates</strong> while the window is hidden, which is the one status surface available from there</li>
+        </ul>
+
+        <h5>Bandwidth schedule</h5>
+        <ul>
+          <li><strong>Day and night limits, as eMule had them.</strong> An ordered list of rules, each naming weekdays, a window of local time, and the upload and download caps that apply inside it. The first matching rule wins, and when none matches your manual limits apply unchanged</li>
+          <li><strong>A window may cross midnight,</strong> and its days name the day it <em>opens</em> &mdash; so <code>Mon 22:00</code> to <code>06:00</code> needs only Monday ticked, which is how a person reads it</li>
+          <li><strong>Settings names the rule in force and the time it runs until,</strong> because a user whose overnight rule is open would otherwise see one number in the field and a different speed everywhere else, and conclude the limit was broken</li>
+        </ul>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.6.4, 1.6.3, 1.6.2, 1.6.1 and 1.6.0 all see each other on the overlay normally. This is a compatible update; anything older than 1.6.0 is still invisible to all five</li>
+          <li><strong>On Linux, prefer the <code>.deb</code>.</strong> The AppImage needs FUSE &mdash; <code>libfuse2</code> on Ubuntu 22.04 &mdash; to start at all, and it is built against glibc 2.35, so it runs on Ubuntu 22.04, Debian 12 and newer but nothing older</li>
+          <li><strong>Notifications are on, room messages are not.</strong> A room you are in can be busy in a way a chat is not, so that one is opt-in; everything else follows the master switch in Settings &gt; General</li>
+          <li><strong>Adding a schedule rule copies your current manual limits into it,</strong> so a new rule changes nothing until you edit it. A rule set to zero means <em>unlimited</em> for its window, which is worth knowing before you type one</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Security</h5>
+        <ul>
+          <li><strong>A peer could put a working hyperlink in a desktop notification.</strong> Linux notification servers parse the body as markup, and Ember passed peer-supplied text &mdash; a file name, a chat preview &mdash; through unescaped, so a file named as an <code>&lt;a href&gt;</code> rendered as a clickable link that the desktop attributed to Ember, outside everything the app&rsquo;s own content policy covers. Markup is escaped now on the platforms that read it</li>
+          <li><strong>Peer-dialing diagnostics no longer exist in a release build.</strong> Two harness commands that dial an arbitrary address and ask it for sources were compiled into release binaries, unregistered but present; they and everything only they use are now debug-only, like the rest of that family</li>
+          <li><strong>The webview no longer holds file-picker permissions it never used.</strong> Every dialog in Ember is opened from the backend, so the two IPC grants left over from a removed frontend binding are gone</li>
+        </ul>
+
+        <h5>Transfers and limits</h5>
+        <ul>
+          <li><strong>A schedule rule with an absurd speed would have killed every rate-limited transfer.</strong> Rule speeds reached the limiter without passing the ceiling the manual limits pass through, and a large enough one overflowed the token refill, stopped the task that grants bandwidth, and left every limited transfer to abort &mdash; once per session, each time that window opened, because the rule is saved. Rules are now held to the same 100 GiB/s ceiling, on save and on load</li>
+          <li><strong>The limit shown in Settings is the one in force.</strong> While Ember&rsquo;s upload slow-start is still finding your line speed it holds uploads below the configured cap, and the banner reported the cap rather than the throttle</li>
+          <li><strong>An upload nobody is downloading from stops keeping the machine awake.</strong> An upload row holds its slot whether or not the peer is still asking for blocks, so a peer that connected and went quiet counted as work indefinitely &mdash; the same indefinite hold the stalled-download rule exists to prevent, on the side it could not see</li>
+          <li><strong>Sleep is only reported as deferred when it actually is.</strong> If the OS refuses the request, Ember backs off rather than asking every second &mdash; and used to go on claiming the machine was being held awake for the whole of that window</li>
+        </ul>
+
+        <h5>Notifications</h5>
+        <ul>
+          <li><strong>A conversation open on a second monitor now notifies.</strong> Having the chat or room on screen was treated as reading it, even with the window unfocused behind something else, so the one case a desktop notification is for was the case that stayed silent</li>
+          <li><strong>One unusable notification no longer silences the rest of the session.</strong> A message Ember could not title was treated as proof the desktop had stopped accepting notifications at all, and there was no way back short of restarting</li>
+          <li><strong>The burst ceiling counts correctly under concurrent notifications,</strong> rather than letting a handful arriving at once each see a full allowance</li>
+        </ul>
+
+        <h5>Linux</h5>
+        <ul>
+          <li><strong>Sharing a folder no longer rescans it forever.</strong> Linux reports a directory being opened, and the indexer&rsquo;s own walk of a shared folder therefore looked exactly like a user adding files: scan, event, rescan, once every couple of seconds, rewriting settings and re-announcing to KAD each time. Events are read by kind now &mdash; a finished copy still rescans, reading a folder does not</li>
+          <li><strong>A desktop with no notification area still starts.</strong> A tray icon that cannot be built is an ordinary Linux environment rather than a failure, and it was aborting startup</li>
+          <li><strong>Checking for updates no longer reports a failure</strong> when the published release carries nothing for your platform. The check said it had broken; it had simply found nothing</li>
+          <li><strong>The <code>.deb</code> declares the packages it shells out to</strong> for opening files and registering <code>ed2k://</code> links</li>
+        </ul>
+
+        <h5>Settings</h5>
+        <ul>
+          <li><strong>Save says which rule it is waiting on.</strong> A schedule rule the backend would refuse now blocks Save with the reason on the row, rather than failing the whole save with a message that named no rule &mdash; and a rule the backend would have accepted no longer blocks it, which a label of emoji used to do</li>
+          <li><strong>Turning the schedule off takes effect on screen immediately,</strong> instead of leaving the old rule named in the banner for a second after the limits behind it were gone</li>
+          <li><strong>A hand-edited schedule cannot cost you every other setting.</strong> A malformed rule is dropped on load, as a shared folder or an out-of-range number already was, rather than resetting the whole profile to defaults</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>The bundled country database is September 2026&rsquo;s,</strong> so peer flags and country columns reflect current address allocations</li>
+          <li><strong>Dead code that had no consumer on either side is gone,</strong> along with a Settings button that existed to prove notifications worked</li>
+        </ul>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-3">
       <div class="release-header">

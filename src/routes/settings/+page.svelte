@@ -68,6 +68,7 @@
     minutesToTimeValue,
     newScheduleRule,
     ruleProblem,
+    scheduleProblem,
     timeValueToMinutes,
     toggleDay,
   } from '$lib/bandwidthSchedule';
@@ -533,7 +534,10 @@
   function addScheduleRule() {
     if (!settings) return;
     if (settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES) return;
-    settings.bandwidth_schedule = [...settings.bandwidth_schedule, newScheduleRule()];
+    settings.bandwidth_schedule = [
+      ...settings.bandwidth_schedule,
+      newScheduleRule(settings.max_upload_speed, settings.max_download_speed),
+    ];
   }
 
   function removeScheduleRule(id: string) {
@@ -605,6 +609,8 @@
       case 'empty_window': return m.schedule_error_empty_window();
       case 'invalid_window': return m.schedule_error_invalid_window();
       case 'label_too_long': return m.schedule_error_label_too_long({ max: MAX_RULE_LABEL_CHARS });
+      case 'speed_too_high': return m.schedule_error_speed_too_high();
+      case 'invalid_id': return m.schedule_error_invalid_id();
       default: return null;
     }
   }
@@ -621,11 +627,21 @@
     return status?.schedule?.id ?? null;
   });
 
-  /** Whether any rule would be refused by the backend, which blocks Save. */
+  /**
+   * Whether the schedule would be refused by the backend, which blocks Save.
+   *
+   * The list-level checks are here as well as the per-rule ones. A duplicate id
+   * or an over-long list is refused by `schedule::validate` exactly as a
+   * malformed rule is, and without them Save stayed enabled and the failure
+   * came back as a page-level error naming no rule at all.
+   */
   let scheduleHasError = $derived.by(() => {
     const current = settings;
     if (!current) return false;
-    return current.bandwidth_schedule.some((rule) => ruleProblem(rule) !== null);
+    return (
+      scheduleProblem(current.bandwidth_schedule) !== null
+      || current.bandwidth_schedule.some((rule) => ruleProblem(rule) !== null)
+    );
   });
 
   let downloadingFilter = $state(false);

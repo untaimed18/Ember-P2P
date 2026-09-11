@@ -1963,6 +1963,11 @@ impl EmberDht {
 
     /// Sign a keyword record with our identity, ready to publish. The
     /// engine owns the signing key, so record construction lives here.
+    ///
+    /// The media-carrying variant below is what production publishes go
+    /// through; this one is reached only by the `debug_assertions` harness
+    /// publish command and by the tests, so it is gated with them.
+    #[cfg(debug_assertions)]
     pub fn build_keyword_record(
         &self,
         keyword: &str,

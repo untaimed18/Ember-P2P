@@ -530,6 +530,42 @@ test("composed Linux targets are hashed and size-bound like the Windows ones", (
   }
 });
 
+test("a re-run of the signing job rewrites the Linux targets rather than failing", () => {
+  // A retried `sign-publish` does not start from a clean manifest.
+  // `tauri-action` seeds `platforms` from the `latest.json` already attached to
+  // the release, so a retry after a failed upload finds the previous attempt's
+  // entries — hardening fields and all — carried straight back in. Refusing
+  // them left a retried release unrecoverable without deleting that asset by
+  // hand, and keeping them would pair the previous run's signature with the
+  // bytes this run is about to hash.
+  const { fixture, bundleDir, manifestPath } = linuxReleaseFixture();
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const bundles = collectLinuxBundles({ directory: bundleDir });
+    addLinuxPlatforms({ manifest, bundles });
+
+    Object.assign(manifest.platforms["linux-x86_64-deb"], {
+      signature: "a signature from the attempt that failed",
+      sha256: "a".repeat(64),
+      size: 999,
+    });
+    // And the bare key, which nothing writes today but which has to be cleared
+    // rather than left behind if anything ever does.
+    manifest.platforms["linux-x86_64"] = { url: "https://example.invalid/x", signature: "stale" };
+
+    addLinuxPlatforms({ manifest, bundles });
+
+    assert.deepEqual(manifest.platforms["linux-x86_64-deb"], {
+      url: `${releaseBase}/Ember_1.2.3_amd64.deb`,
+      signature: "signature for Ember_1.2.3_amd64.deb",
+    });
+    assert.equal(manifest.platforms["linux-x86_64"], undefined);
+    assert.ok(manifest.platforms["windows-x86_64"], "the Windows half must survive");
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("a Linux bundle with no signature beside it fails the release", () => {
   // The signature is the only thing binding those bytes to Ember's key. An
   // entry written without one is a platform the updater refuses at check time,

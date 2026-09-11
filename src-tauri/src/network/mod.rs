@@ -12057,6 +12057,8 @@ pub enum NetworkCommand {
     /// production peers will eventually dial each other without
     /// out-of-band key distribution. A cache miss with `None` is
     /// surfaced as a clear error rather than a silent timeout.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberPing {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -12249,6 +12251,8 @@ pub enum NetworkCommand {
     /// otherwise the KAD-fed Noise-key cache is consulted. The reply is
     /// delivered asynchronously on the receive loop, so the oneshot only
     /// reports whether the request was dispatched.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberExchangeRequest {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -12264,6 +12268,10 @@ pub enum NetworkCommand {
 /// Returned by the network task when an outgoing Ember ping has been
 /// scheduled. The Tauri command awaits the `pong_rx` oneshot with a
 /// timeout to convert this into a final `EmberPingResult`.
+///
+/// Compiled out of release alongside `ember_ping_peer`, like its
+/// `EmberDht*Pending` siblings below.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberPingPending {
     pub pong_rx: oneshot::Receiver<std::time::Duration>,
@@ -21318,6 +21326,9 @@ struct EmberKeywordResultBatch {
 /// Each entry costs ~24 B + a oneshot; this cap keeps the map under
 /// 50 KB even in a degenerate flood, while still allowing a harness
 /// to fan out hundreds of probes in parallel.
+/// Read only by the `debug_assertions` harness command arms that populate
+/// those maps, so gated with them.
+#[cfg(debug_assertions)]
 const MAX_EMBER_PENDING_PINGS: usize = 1024;
 
 /// How long an iterative-lookup `FIND_NODE` query may sit unanswered

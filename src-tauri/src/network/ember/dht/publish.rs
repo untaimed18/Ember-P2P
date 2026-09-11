@@ -843,6 +843,11 @@ pub struct SignedRecord {
 
 impl SignedRecord {
     /// Create a keyword record: associates a keyword hash with file metadata.
+    ///
+    /// Reached only through `build_keyword_record`, which is itself
+    /// `debug_assertions`-only — production publishes carry media metadata and
+    /// go through `keyword_with_media`.
+    #[cfg(debug_assertions)]
     pub fn keyword(
         keyword: &str,
         file_hash: [u8; 16],

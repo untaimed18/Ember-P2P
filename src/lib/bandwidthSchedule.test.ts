@@ -2,26 +2,24 @@ import { describe, expect, it } from 'vitest';
 import type { BandwidthScheduleRule } from '$lib/types';
 import {
   ALL_DAYS,
+  MAX_CONFIGURED_SPEED_BPS,
   MAX_RULE_LABEL_CHARS,
+  MAX_SCHEDULE_RULES,
   MINUTES_PER_DAY,
   WEEKDAYS_MASK,
-  WEEKEND_MASK,
   endTimeValueToMinutes,
-  firstScheduleProblem,
   hasDay,
   isOvernight,
-  localNow,
   minutesToTimeValue,
   newRuleId,
   newScheduleRule,
-  ruleMatches,
   ruleProblem,
+  scheduleProblem,
   timeValueToMinutes,
   toggleDay,
 } from './bandwidthSchedule';
 
 const MON = 0;
-const TUE = 1;
 const SAT = 5;
 const SUN = 6;
 
@@ -43,9 +41,9 @@ describe('day bitmask', () => {
   it('is Monday-first, matching the Rust bit order', () => {
     expect(hasDay(WEEKDAYS_MASK, MON)).toBe(true);
     expect(hasDay(WEEKDAYS_MASK, SAT)).toBe(false);
-    expect(hasDay(WEEKEND_MASK, SAT)).toBe(true);
-    expect(hasDay(WEEKEND_MASK, SUN)).toBe(true);
-    expect(hasDay(WEEKEND_MASK, MON)).toBe(false);
+    expect(hasDay(WEEKDAYS_MASK, SUN)).toBe(false);
+    expect(hasDay(0b0110_0000, SAT)).toBe(true);
+    expect(hasDay(0b0110_0000, SUN)).toBe(true);
   });
 
   it('toggles a day without disturbing the others or setting unknown bits', () => {
@@ -108,51 +106,53 @@ describe('ruleProblem mirrors the backend validator', () => {
     expect(ruleProblem(rule({ label: 'x'.repeat(MAX_RULE_LABEL_CHARS + 1) }))).toBe(
       'label_too_long',
     );
+    expect(ruleProblem(rule({ id: '' }))).toBe('invalid_id');
+    expect(ruleProblem(rule({ id: 'has space' }))).toBe('invalid_id');
+    expect(ruleProblem(rule({ id: 'a'.repeat(65) }))).toBe('invalid_id');
+  });
+
+  it('counts a label the way Rust does, not the way UTF-16 does', () => {
+    // Rust counts scalar values; `String#length` counts code units, so an
+    // astral character is 1 there and 2 here. Reporting a problem for a label
+    // the backend accepted disabled Save for the whole page.
+    const emoji = '\u{1f600}'.repeat(MAX_RULE_LABEL_CHARS);
+    expect([...emoji].length).toBe(MAX_RULE_LABEL_CHARS);
+    expect(emoji.length).toBe(MAX_RULE_LABEL_CHARS * 2);
+    expect(ruleProblem(rule({ label: emoji }))).toBeNull();
+    expect(ruleProblem(rule({ label: emoji + '\u{1f600}' }))).toBe('label_too_long');
+  });
+
+  it('refuses a speed the limiter cannot hold', () => {
+    // Unbounded rule speeds reach the token refill and overflow it, which
+    // panics the refill task under the release profile and aborts every
+    // rate-limited transfer for the session.
+    expect(ruleProblem(rule({ max_upload_speed: MAX_CONFIGURED_SPEED_BPS }))).toBeNull();
+    expect(ruleProblem(rule({ max_upload_speed: MAX_CONFIGURED_SPEED_BPS + 1 }))).toBe(
+      'speed_too_high',
+    );
+    expect(ruleProblem(rule({ max_download_speed: Number.MAX_SAFE_INTEGER }))).toBe(
+      'speed_too_high',
+    );
   });
 
   it('checks a disabled rule too, so enabling it later cannot fail the save', () => {
     expect(ruleProblem(rule({ enabled: false, days: 0 }))).toBe('no_days');
   });
 
-  it('reports the first offending rule for the save guard', () => {
-    const good = rule({ id: 'good' });
-    const bad = rule({ id: 'bad', days: 0 });
-    expect(firstScheduleProblem([good, good])).toBeNull();
-    expect(firstScheduleProblem([good, bad])).toEqual({ rule: bad, problem: 'no_days' });
+  it('mirrors the checks that belong to the list rather than a rule', () => {
+    // Both are refused by `schedule::validate` exactly as a malformed rule is.
+    // Without them Save stayed enabled and the rejection named no rule.
+    expect(scheduleProblem([rule({ id: 'a' }), rule({ id: 'b' })])).toBeNull();
+    expect(scheduleProblem([rule({ id: 'dup' }), rule({ id: 'dup' })])).toBe('duplicate_id');
+    const tooMany = Array.from({ length: MAX_SCHEDULE_RULES + 1 }, (_, i) =>
+      rule({ id: `r${i}` }),
+    );
+    expect(scheduleProblem(tooMany)).toBe('too_many');
+    expect(scheduleProblem(tooMany.slice(0, MAX_SCHEDULE_RULES))).toBeNull();
   });
 });
 
-describe('ruleMatches mirrors schedule::matches', () => {
-  it('treats the window as half-open so adjacent rules do not both claim a minute', () => {
-    const morning = rule({ start_minute: 9 * 60, end_minute: 17 * 60 });
-    expect(ruleMatches(morning, TUE, 9 * 60 - 1)).toBe(false);
-    expect(ruleMatches(morning, TUE, 9 * 60)).toBe(true);
-    expect(ruleMatches(morning, TUE, 17 * 60 - 1)).toBe(true);
-    expect(ruleMatches(morning, TUE, 17 * 60)).toBe(false);
-  });
-
-  it('carries an overnight window into the next day under the opening day', () => {
-    const overnight = rule({ days: 1 << MON, start_minute: 22 * 60, end_minute: 6 * 60 });
-    expect(ruleMatches(overnight, MON, 22 * 60)).toBe(true);
-    expect(ruleMatches(overnight, TUE, 0)).toBe(true);
-    expect(ruleMatches(overnight, TUE, 5 * 60 + 59)).toBe(true);
-    expect(ruleMatches(overnight, TUE, 6 * 60)).toBe(false);
-    expect(ruleMatches(overnight, MON, 6 * 60)).toBe(false);
-  });
-
-  it('wraps from Sunday into Monday', () => {
-    const overnight = rule({ days: 1 << SUN, start_minute: 23 * 60, end_minute: 2 * 60 });
-    expect(ruleMatches(overnight, SUN, 23 * 60 + 30)).toBe(true);
-    expect(ruleMatches(overnight, MON, 60)).toBe(true);
-    expect(ruleMatches(overnight, SAT, 60)).toBe(false);
-  });
-
-  it('never matches a disabled or malformed rule', () => {
-    expect(ruleMatches(rule({ enabled: false }), MON, 10 * 60)).toBe(false);
-    expect(ruleMatches(rule({ days: 0 }), MON, 10 * 60)).toBe(false);
-    expect(ruleMatches(rule({ start_minute: 600, end_minute: 600 }), MON, 600)).toBe(false);
-  });
-
+describe('overnight windows', () => {
   it('flags a window that crosses midnight', () => {
     expect(isOvernight(rule({ start_minute: 22 * 60, end_minute: 6 * 60 }))).toBe(true);
     expect(isOvernight(rule({ start_minute: 9 * 60, end_minute: 17 * 60 }))).toBe(false);
@@ -161,25 +161,21 @@ describe('ruleMatches mirrors schedule::matches', () => {
   });
 });
 
-describe('localNow', () => {
-  it('is Monday-first, unlike Date#getDay', () => {
-    // 2026-09-07 is a Monday, 2026-09-13 the Sunday that follows.
-    expect(localNow(new Date(2026, 8, 7, 0, 0)).weekday).toBe(MON);
-    expect(localNow(new Date(2026, 8, 13, 0, 0)).weekday).toBe(SUN);
-  });
-
-  it('reports minutes from local midnight', () => {
-    expect(localNow(new Date(2026, 8, 7, 0, 0)).minute).toBe(0);
-    expect(localNow(new Date(2026, 8, 7, 13, 37)).minute).toBe(13 * 60 + 37);
-    expect(localNow(new Date(2026, 8, 7, 23, 59)).minute).toBe(MINUTES_PER_DAY - 1);
-  });
-});
-
 describe('new rules', () => {
   it('starts from a window the backend accepts', () => {
     const created = newScheduleRule();
     expect(ruleProblem(created)).toBeNull();
     expect(created.enabled).toBe(true);
+  });
+
+  it('carries the manual limits forward instead of defaulting to unlimited', () => {
+    // `0` means unlimited, so a rule added with zeroes and then switched on
+    // *removed* the user's limit for its window — the opposite of what anyone
+    // adds a bandwidth timetable for. Seeded from the manual pair, a new rule
+    // is a no-op until it is deliberately changed.
+    const created = newScheduleRule(50_000, 500_000);
+    expect(created.max_upload_speed).toBe(50_000);
+    expect(created.max_download_speed).toBe(500_000);
   });
 
   it('generates ids the backend id check allows', () => {

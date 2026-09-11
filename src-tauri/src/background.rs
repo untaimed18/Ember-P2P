@@ -23,7 +23,7 @@ use tauri::{Emitter, Manager};
 use crate::app_state::AppState;
 use crate::bandwidth::schedule;
 use crate::power::WakeLock;
-use crate::types::{RuntimeStatus, TransferHealth, TransferStatus};
+use crate::types::{RuntimeStatus, TransferDirection, TransferHealth, TransferStatus};
 
 /// Housekeeping cadence. One second matches the limiter's own speed tick, and
 /// is the coarsest interval at which a schedule boundary still lands within a
@@ -114,11 +114,22 @@ async fn run(app: tauri::AppHandle) {
         }
 
         let status = RuntimeStatus {
-            effective_upload_speed: target.0,
+            // The limiter's own answer for uploads, not the target handed to
+            // it. `set_configured_limits` declines to raise the effective
+            // upload rate while USS is throttling, so publishing `target.0`
+            // reported the configured 200 KB/s while uploads were actually held
+            // at 15 — under a field documented as the cap in force. Downloads
+            // have no such arbitration, so the target *is* the answer there.
+            effective_upload_speed: state.bandwidth_limiter.effective_upload_rate(),
             effective_download_speed: target.1,
             schedule: resolved.active,
             sleep_inhibit_supported,
-            sleep_inhibit_held: holding_wake_lock,
+            // What the OS accepted, not what was asked for: a refused
+            // `SetThreadExecutionState` is backed off rather than retried every
+            // poll, and for that whole window `holding_wake_lock` would have
+            // claimed the machine was being kept awake while it was free to
+            // suspend.
+            sleep_inhibit_held: wake_lock.is_held(),
         };
         if published.as_ref() != Some(&status) {
             *state.runtime_status.write() = status.clone();
@@ -143,6 +154,15 @@ async fn run(app: tauri::AppHandle) {
 /// failure mode that makes users turn the whole feature off. Neither does a row
 /// the app's own health model has already called `Stalled` — that is precisely
 /// its judgement that nothing is happening.
+///
+/// An `Active` upload is judged on throughput instead, because neither of those
+/// two signals can speak for it. `compute_health_state` returns early for
+/// anything that is not a download, so an upload row's health is permanently
+/// `Healthy`, and uploads are unconditionally `Active` while they hold a slot.
+/// So a peer that takes an upload slot and then stops requesting blocks read as
+/// work forever — the same indefinite pin the `Stalled` exclusion exists to
+/// prevent, on the side it cannot see. `refresh_health` already decays `speed`
+/// to zero for exactly this case, so that is the signal to use.
 async fn count_working_transfers(state: &AppState) -> usize {
     let manager = state.transfer_manager.read().await;
     manager
@@ -154,7 +174,10 @@ async fn count_working_transfers(state: &AppState) -> usize {
             TransferStatus::Verifying
             | TransferStatus::Completing
             | TransferStatus::Hashing => true,
-            TransferStatus::Active => transfer.health != TransferHealth::Stalled,
+            TransferStatus::Active => match transfer.direction {
+                TransferDirection::Upload => transfer.speed > 0,
+                TransferDirection::Download => transfer.health != TransferHealth::Stalled,
+            },
             _ => false,
         })
         .count()
@@ -231,11 +254,28 @@ pub fn effective_limits_now(settings: &crate::types::AppSettings) -> (u64, u64) 
 /// The tick would get there within a second regardless, but the schedule can
 /// switch off mid-save and the limits it left behind should not outlive the
 /// command that removed them.
-pub fn apply_effective_limits(state: &AppState, settings: &crate::types::AppSettings) {
+pub fn apply_effective_limits(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    settings: &crate::types::AppSettings,
+) {
     let (upload, download) = effective_limits_now(settings);
     state
         .bandwidth_limiter
         .set_configured_limits(upload, download);
+
+    // Republish immediately rather than leaving it to the tick. The banner in
+    // Settings names the rule in force and the time it runs until, so a save
+    // that switches the schedule off or deletes the active rule otherwise left
+    // that claim on screen for up to a second after the limits behind it were
+    // gone — and the tick only emits on change, so a save that happens to
+    // resolve to the same numbers would never correct the rule name at all.
+    let mut status = resolved_status(settings);
+    status.sleep_inhibit_held = state.runtime_status.read().sleep_inhibit_held;
+    *state.runtime_status.write() = status.clone();
+    if let Err(error) = app.emit("ember:runtime-status", &status) {
+        tracing::debug!("Could not emit runtime status after a settings save: {error}");
+    }
 }
 
 /// The runtime snapshot for a first paint. Kept here so the shape of the
@@ -250,15 +290,29 @@ pub fn snapshot(state: &AppState) -> RuntimeStatus {
 /// all-zeroes snapshot would report "no schedule, unlimited" for a profile
 /// whose overnight window is open right now.
 pub fn seed_status(state: &AppState, settings: &crate::types::AppSettings) {
+    *state.runtime_status.write() = resolved_status(settings);
+}
+
+/// The status for a given settings snapshot, with nothing held yet.
+///
+/// Shared by the seed and by the post-save refresh so the two cannot describe
+/// the same settings differently.
+///
+/// `sleep_inhibit_supported` is the compile-time answer here, which the tick
+/// then narrows to `wake_lock.is_running()` — a thread that failed to spawn is
+/// a supported platform that cannot honour a request. The two disagree for at
+/// most the first tick, and erring towards "available" for that second is
+/// better than greying out a toggle that is about to work.
+fn resolved_status(settings: &crate::types::AppSettings) -> RuntimeStatus {
     let (weekday, minute) = schedule::local_now();
     let resolved = schedule::resolve_settings(settings, weekday, minute);
-    *state.runtime_status.write() = RuntimeStatus {
+    RuntimeStatus {
         effective_upload_speed: resolved.max_upload_speed,
         effective_download_speed: resolved.max_download_speed,
         schedule: resolved.active,
         sleep_inhibit_supported: crate::power::supported(),
         sleep_inhibit_held: false,
-    };
+    }
 }
 
 #[cfg(test)]

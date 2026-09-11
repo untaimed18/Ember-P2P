@@ -891,7 +891,7 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
                 background::seed_status(&state, &settings);
-                background::apply_effective_limits(&state, &settings);
+                background::apply_effective_limits(&app_handle, &state, &settings);
             }
             background::spawn(app_handle.clone());
 

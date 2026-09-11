@@ -208,11 +208,13 @@ impl FileIndexer {
 
         info!("Discovering files in: {dir}");
 
-        // `WalkDir::sort_by` sorts siblings, not the complete DFS traversal:
-        // on Windows `a\\child` may arrive before sibling `a0`, even though
-        // `a0` sorts first by our cursor key. A best-first directory queue
-        // produces a globally ordered stream, making an early page cutoff
-        // safe without dropping files between cursor pages.
+        // A recursive walker's sort orders siblings, not the complete DFS
+        // traversal: on Windows `a\\child` may arrive before sibling `a0`, even
+        // though `a0` sorts first by our cursor key. That is why this is a
+        // best-first directory queue rather than `walkdir` (a dependency this
+        // tree no longer carries, for the same reason) — it produces a globally
+        // ordered stream, which is what makes an early page cutoff safe without
+        // dropping files between cursor pages.
         let mut pending: BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>> =
             BinaryHeap::new();
         let enqueue_children = |directory: &Path,

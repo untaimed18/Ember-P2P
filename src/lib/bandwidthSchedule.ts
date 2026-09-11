@@ -22,12 +22,14 @@ export const MAX_SCHEDULE_RULES = 32;
 export const MAX_RULE_LABEL_CHARS = 48;
 /** `ALL_DAYS` in `schedule.rs`: Monday (bit 0) through Sunday (bit 6). */
 export const ALL_DAYS = 0b0111_1111;
+
+/** `MAX_CONFIGURED_SPEED_BPS` in `bandwidth/mod.rs`: 100 GiB/s. */
+export const MAX_CONFIGURED_SPEED_BPS = 100 * 1024 * 1024 * 1024;
 /** Monday-first, matching the bit order. */
 export const WEEKDAY_COUNT = 7;
-/** Bits 0–4. */
+/** Bits 0–4. Seeds a new rule; there is no weekend equivalent because nothing
+ *  needs one — `toggleDay` covers Saturday and Sunday like any other day. */
 export const WEEKDAYS_MASK = 0b0001_1111;
-/** Bits 5–6. */
-export const WEEKEND_MASK = 0b0110_0000;
 
 /** Whether `weekday` (0 = Monday) is selected in `days`. */
 export function hasDay(days: number, weekday: number): boolean {
@@ -100,11 +102,44 @@ export function isOvernight(rule: Pick<BandwidthScheduleRule, 'start_minute' | '
  * so the caller localizes it, and named after the same conditions so the two
  * lists can be read side by side.
  */
-export type RuleProblem = 'no_days' | 'empty_window' | 'invalid_window' | 'label_too_long';
+export type RuleProblem =
+  | 'no_days'
+  | 'empty_window'
+  | 'invalid_window'
+  | 'label_too_long'
+  | 'speed_too_high'
+  | 'invalid_id';
+
+/** `MAX_RULE_ID_BYTES` in `schedule.rs`, and the charset it accepts. */
+const MAX_RULE_ID_BYTES = 64;
+const RULE_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 export function ruleProblem(rule: BandwidthScheduleRule): RuleProblem | null {
+  // Ids come from `newRuleId`, so this should be unreachable — but the union
+  // above advertises parity with `schedule::validate`, and without it a rule
+  // from a hand-edited config leaves Save enabled and the save failing with a
+  // page-level error that names no rule. Byte length, matching Rust's
+  // `id.len()`, because an id is ASCII by that charset anyway.
+  if (
+    !rule.id
+    || new TextEncoder().encode(rule.id).length > MAX_RULE_ID_BYTES
+    || !RULE_ID_RE.test(rule.id)
+  ) {
+    return 'invalid_id';
+  }
   if ((rule.days & ALL_DAYS) === 0 || (rule.days & ~ALL_DAYS) !== 0) return 'no_days';
-  if (rule.label.length > MAX_RULE_LABEL_CHARS) return 'label_too_long';
+  // Spread rather than `.length`: Rust counts scalar values and JavaScript
+  // counts UTF-16 code units, so a label of 30 emoji is 30 to the backend and
+  // 60 here. The backend would accept and persist it, and this would then
+  // report a problem for a saved rule — which disables Save for the whole
+  // page until the user works out which rule is at fault.
+  if ([...rule.label].length > MAX_RULE_LABEL_CHARS) return 'label_too_long';
+  if (
+    rule.max_upload_speed > MAX_CONFIGURED_SPEED_BPS
+    || rule.max_download_speed > MAX_CONFIGURED_SPEED_BPS
+  ) {
+    return 'speed_too_high';
+  }
   if (
     !Number.isInteger(rule.start_minute)
     || !Number.isInteger(rule.end_minute)
@@ -119,48 +154,47 @@ export function ruleProblem(rule: BandwidthScheduleRule): RuleProblem | null {
   return null;
 }
 
-/** Whether every rule would be accepted, so Save can say so before trying. */
-export function firstScheduleProblem(
-  rules: BandwidthScheduleRule[],
-): { rule: BandwidthScheduleRule; problem: RuleProblem } | null {
+/** A fault that belongs to the list rather than to any one rule. */
+export type ScheduleProblem = 'too_many' | 'duplicate_id';
+
+/**
+ * Why the backend would refuse the list as a whole, or `null` if it would take
+ * it. Mirrors the two checks in `schedule::validate` that are not per-rule.
+ */
+export function scheduleProblem(rules: BandwidthScheduleRule[]): ScheduleProblem | null {
+  if (rules.length > MAX_SCHEDULE_RULES) return 'too_many';
+  const seen = new Set<string>();
   for (const rule of rules) {
-    const problem = ruleProblem(rule);
-    if (problem) return { rule, problem };
+    if (seen.has(rule.id)) return 'duplicate_id';
+    seen.add(rule.id);
   }
   return null;
 }
 
+// There is deliberately no local mirror of `schedule::matches` or
+// `schedule::local_now` here. One existed, with tests that read as though they
+// established Rust/TypeScript parity for the evaluation logic — but nothing
+// called either, so they proved parity for code the app never ran. Which rule
+// is in force comes from the backend's `RuntimeStatus`, which is the only
+// answer that can be right, since the backend is what the limiter obeys. A
+// preview of an *unsaved* edit is the one thing that would need a local
+// evaluator; build it here if that is ever wanted.
+
 /**
- * Whether `rule`'s window is open at `(weekday, minute)`.
+ * A fresh rule for the "Add" button: weekdays, 09:00–17:00, carrying the
+ * manual limits forward.
  *
- * A local mirror of `schedule::matches`, used only to preview a rule the user
- * is still editing. What is actually *in force* comes from the backend's
- * `RuntimeStatus`, so the two can never disagree on screen about a saved rule.
+ * Seeded from the manual pair rather than left at `0`, because `0` means
+ * *unlimited* here — so a rule added with the defaults and then switched on
+ * removed the user's limit between 09:00 and 17:00, which is the opposite of
+ * what anyone reaches for a bandwidth timetable to do. Copying the current
+ * numbers makes the new rule a no-op until it is deliberately changed, which is
+ * the safe starting point.
  */
-export function ruleMatches(rule: BandwidthScheduleRule, weekday: number, minute: number): boolean {
-  if (!rule.enabled) return false;
-  if (ruleProblem(rule)) return false;
-  const { start_minute: start, end_minute: end } = rule;
-  if (start < end) {
-    return hasDay(rule.days, weekday) && minute >= start && minute < end;
-  }
-  // Crosses midnight: the tail belongs to the day the window opened.
-  const yesterday = (weekday + WEEKDAY_COUNT - 1) % WEEKDAY_COUNT;
-  return (
-    (hasDay(rule.days, weekday) && minute >= start)
-    || (hasDay(rule.days, yesterday) && minute < end)
-  );
-}
-
-/** Local weekday (0 = Monday) and minute-of-day, matching `schedule::local_now`. */
-export function localNow(now: Date = new Date()): { weekday: number; minute: number } {
-  // `getDay()` is Sunday-first; the bitmask is Monday-first.
-  const weekday = (now.getDay() + 6) % 7;
-  return { weekday, minute: now.getHours() * 60 + now.getMinutes() };
-}
-
-/** A fresh rule for the "Add" button: weekdays, 09:00–17:00, limits unset. */
-export function newScheduleRule(): BandwidthScheduleRule {
+export function newScheduleRule(
+  manualUpload = 0,
+  manualDownload = 0,
+): BandwidthScheduleRule {
   return {
     id: newRuleId(),
     enabled: true,
@@ -168,8 +202,8 @@ export function newScheduleRule(): BandwidthScheduleRule {
     days: WEEKDAYS_MASK,
     start_minute: 9 * 60,
     end_minute: 17 * 60,
-    max_upload_speed: 0,
-    max_download_speed: 0,
+    max_upload_speed: manualUpload,
+    max_download_speed: manualDownload,
   };
 }
 

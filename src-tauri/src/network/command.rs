@@ -2277,6 +2277,7 @@ async fn handle_command_inner(
             let _ = tx.send(diag);
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberPing {
             addr,
             peer_pubkey,
@@ -2484,6 +2485,7 @@ async fn handle_command_inner(
             let _ = tx.send(entries);
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberExchangeRequest {
             addr,
             peer_pubkey,

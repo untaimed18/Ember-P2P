@@ -18,10 +18,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-# Local multi-node harness build. Enables Tauri's runtime devtools so
-# `scripts\harness.ps1` users can invoke `ember_ping_peer` and friends
-# from the webview console (Ctrl+Shift+I) without shipping that
-# capability to production builds.
+# Local multi-node harness build. Enables Tauri's runtime devtools so the
+# webview console (Ctrl+Shift+I) is available in a build that would not
+# otherwise have it.
+#
+# It does not control which commands exist. `ember_ping_peer` and friends are
+# gated on `debug_assertions`, so a harness build has to be a debug build to
+# reach them — `--features harness` on a release build gets devtools and
+# nothing to invoke from them. Gating them on this feature instead was
+# considered and rejected: a release build that carries peer-dialing IPC is
+# exactly what the gate is for, and a feature flag is too easy to turn on.
 harness = ["tauri/devtools"]
 
 [dependencies]

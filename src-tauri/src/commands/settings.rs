@@ -520,7 +520,7 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
-const MAX_CONFIGURED_SPEED_BPS: u64 = 100 * 1024 * 1024 * 1024;
+use crate::bandwidth::MAX_CONFIGURED_SPEED_BPS;
 
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
@@ -1391,7 +1391,11 @@ pub async fn update_settings(
     // numbers here would undo the schedule until the next background tick put
     // it back — a limit that visibly moves on its own a second after being
     // saved. Both paths resolve the same way, so they cannot disagree.
-    crate::background::apply_effective_limits(&state, &settings);
+    //
+    // Runs after the config write above, so the background tick cannot be
+    // holding a read of the previous settings and then overwrite this target
+    // with the stale one it resolved from them.
+    crate::background::apply_effective_limits(&app, &state, &settings);
 
     // Apply the new concurrent-download cap and promote any queued downloads
     // that the higher cap now allows. Previously this only set the field, so

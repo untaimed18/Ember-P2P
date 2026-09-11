@@ -237,7 +237,14 @@ impl BandwidthLimiter {
             let cap = max_up.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
-                let new_val = (current + add).min(cap);
+                // Saturating because the release profile sets
+                // `overflow-checks = true`, and a panic here is not a panic
+                // here: it takes the refill task down, which flips
+                // `refill_alive` and aborts every rate-limited transfer for the
+                // rest of the session. `MAX_CONFIGURED_SPEED_BPS` is what keeps
+                // the sum in range; this is the backstop for a rate that
+                // reaches the limiter without passing it.
+                let new_val = current.saturating_add(add).min(cap);
                 if self
                     .upload_tokens
                     .compare_exchange_weak(current, new_val, Ordering::Release, Ordering::Relaxed)
@@ -258,7 +265,8 @@ impl BandwidthLimiter {
             let cap = max_down.saturating_mul(2);
             loop {
                 let current = self.download_tokens.load(Ordering::Relaxed);
-                let new_val = (current + add).min(cap);
+                // See the upload side above.
+                let new_val = current.saturating_add(add).min(cap);
                 if self
                     .download_tokens
                     .compare_exchange_weak(current, new_val, Ordering::Release, Ordering::Relaxed)

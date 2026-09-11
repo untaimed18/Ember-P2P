@@ -81,6 +81,12 @@ let deliveryUnavailable = false;
  * behind whatever the user is actually working in. Treating a background but
  * visible window as "being watched" is what made the first cut of this silent
  * on a second monitor.
+ *
+ * This is the only place that question is answered for a notification. The
+ * store handlers have their own, looser "is the user looking at this
+ * conversation" test for the unread badge and the in-app toast, and gating the
+ * notification on *that* put the second-monitor case straight back — the
+ * handler returned before this check was ever consulted.
  */
 function emberIsFocused(): boolean {
   if (typeof document === 'undefined') return false;
@@ -145,20 +151,22 @@ export async function notify(
   try {
     await showNotification(trimmedTitle, body);
   } catch (error) {
-    // `notification_rate_limited` is the backend's own ceiling doing its job
-    // and says nothing about whether the OS works, so it must not latch the
-    // "give up" flag. Anything else means the shell refused, which it will keep
-    // doing until something changes.
-    if (!isCodedError(error, 'notification_rate_limited')) {
+    // Only a refusal by the shell may latch the "give up" flag, because only
+    // that will keep happening until something changes. The two codes below are
+    // facts about *this* message: the backend's own ceiling doing its job, and
+    // a title that sanitized away to nothing. Latching on either would be
+    // wrong in principle, and there is no longer any way back from it —
+    // `resetNotificationAvailability` was removed once the Settings test button
+    // went — so one bad message would silently cost the whole feature for the
+    // rest of the session.
+    const aboutThisMessage =
+      isCodedError(error, 'notification_rate_limited')
+      || isCodedError(error, 'notification_empty_title');
+    if (!aboutThisMessage) {
       deliveryUnavailable = true;
       console.warn('Desktop notifications unavailable; suppressing further attempts:', error);
     }
   }
-}
-
-/** Whether delivery has been observed to fail this session. */
-export function notificationsUnavailable(): boolean {
-  return deliveryUnavailable;
 }
 
 function isCodedError(error: unknown, code: string): boolean {

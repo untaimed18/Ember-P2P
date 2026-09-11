@@ -17,7 +17,11 @@
 //! the same thing every other wall-clock scheduler does and is what a user
 //! reading "09:00" expects.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
+
+use super::MAX_CONFIGURED_SPEED_BPS;
 
 /// Minutes in a day. A window's exclusive end may equal this ("until
 /// midnight"), which is why the end is stored as `1..=1440` rather than as a
@@ -95,8 +99,18 @@ pub struct ResolvedLimits {
 
 /// Local weekday (0 = Monday) and minute-of-day right now.
 pub fn local_now() -> (u8, u16) {
+    weekday_and_minute(chrono::Local::now())
+}
+
+/// The mapping itself, over any timestamp.
+///
+/// Split out so the Monday-first convention can be pinned to a known date.
+/// Every rule's `days` bitmask is indexed by this, so reading the day off a
+/// Sunday-first calendar instead would shift a user's entire timetable by a day
+/// — silently, and with `local_now`'s only assertion (that the values are in
+/// range) still passing every day of the week.
+fn weekday_and_minute<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> (u8, u16) {
     use chrono::{Datelike, Timelike};
-    let now = chrono::Local::now();
     let weekday = now.weekday().num_days_from_monday() as u8;
     // `hour()`/`minute()` are 0..=23 / 0..=59, so this cannot exceed 1439.
     let minute = (now.hour() * 60 + now.minute()) as u16;
@@ -211,6 +225,7 @@ enum RuleFault {
     Days,
     Window,
     EmptyWindow,
+    Speed,
 }
 
 /// The first fault in `rule`, or `None` if it is well-formed.
@@ -244,6 +259,18 @@ fn rule_fault(rule: &BandwidthScheduleRule) -> Option<RuleFault> {
     if rule.start_minute == rule.end_minute {
         return Some(RuleFault::EmptyWindow);
     }
+    // The same ceiling the manual limits are held to, and for a reason beyond
+    // input sanity: a rule's speeds reach the limiter exactly as the manual pair
+    // does, but by a path that skipped every bound the manual pair passes
+    // through. A rule near `u64::MAX` overflows the token refill, which panics
+    // under the release profile's `overflow-checks`, takes the refill task with
+    // it, and aborts every rate-limited transfer until Ember restarts — once per
+    // session, each time that window opens, because the rule is persisted.
+    if rule.max_upload_speed > MAX_CONFIGURED_SPEED_BPS
+        || rule.max_download_speed > MAX_CONFIGURED_SPEED_BPS
+    {
+        return Some(RuleFault::Speed);
+    }
     None
 }
 
@@ -263,7 +290,13 @@ pub fn validate(rules: &[BandwidthScheduleRule]) -> Result<(), String> {
             format!("At most {MAX_SCHEDULE_RULES} bandwidth schedule rules are allowed"),
         ));
     }
-    let mut seen: Vec<&str> = Vec::with_capacity(rules.len());
+    // A set, and one whose element type matches `repair`'s, because these two
+    // are the halves of a guarantee: whatever `repair` leaves behind has to be
+    // something this accepts. They were a `Vec<&str>` here and a `Vec<String>`
+    // there, compared linearly in both, which made the duplicate rule the one
+    // part of that guarantee written out twice — and quadratic on a config file
+    // nobody bounds the length of.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(rules.len());
     for rule in rules {
         if let Some(fault) = rule_fault(rule) {
             return Err(match fault {
@@ -289,15 +322,18 @@ pub fn validate(rules: &[BandwidthScheduleRule]) -> Result<(), String> {
                     "settings_bandwidth_schedule_empty_window",
                     "A schedule rule's start and end times must differ",
                 ),
+                RuleFault::Speed => coded(
+                    "settings_bandwidth_schedule_invalid_speed",
+                    "A schedule rule's speed limits are too high",
+                ),
             });
         }
-        if seen.contains(&rule.id.as_str()) {
+        if !seen.insert(rule.id.as_str()) {
             return Err(coded(
                 "settings_bandwidth_schedule_duplicate_id",
                 "Two schedule rules share an identifier",
             ));
         }
-        seen.push(rule.id.as_str());
     }
     Ok(())
 }
@@ -315,7 +351,10 @@ pub fn validate(rules: &[BandwidthScheduleRule]) -> Result<(), String> {
 /// Guaranteed to leave a list [`validate`] accepts; the tests pin that.
 pub fn repair(rules: &mut Vec<BandwidthScheduleRule>) -> bool {
     let before = rules.len();
-    let mut seen: Vec<String> = Vec::with_capacity(before);
+    // See `validate`: a set, of the same element type, so the duplicate rule is
+    // one rule rather than two lookalikes, and so a config carrying an absurd
+    // number of rules is linear work on load rather than quadratic.
+    let mut seen: HashSet<String> = HashSet::with_capacity(before);
     rules.retain(|rule| {
         if let Some(fault) = rule_fault(rule) {
             tracing::warn!(
@@ -324,14 +363,13 @@ pub fn repair(rules: &mut Vec<BandwidthScheduleRule>) -> bool {
             );
             return false;
         }
-        if seen.contains(&rule.id) {
+        if !seen.insert(rule.id.clone()) {
             tracing::warn!(
                 "Dropping duplicate bandwidth schedule rule {:?} on load",
                 rule.id
             );
             return false;
         }
-        seen.push(rule.id.clone());
         true
     });
     if rules.len() > MAX_SCHEDULE_RULES {
@@ -529,6 +567,43 @@ mod tests {
         assert!(minute < MINUTES_PER_DAY);
     }
 
+    /// Bit 0 means Monday, and every rule's `days` mask is indexed by this, so
+    /// reading the day off a Sunday-first calendar would shift a whole
+    /// timetable by one day. Asserted against known dates because the check
+    /// above exercises only whichever day it happens to run on, and would keep
+    /// passing — every day of the week — if the convention flipped.
+    #[test]
+    fn the_week_starts_on_monday_and_the_minute_is_local() {
+        use chrono::TimeZone;
+
+        // 2026-09-07 is a Monday; the week runs from there.
+        for (day, expected) in [
+            (7, MON),
+            (8, TUE),
+            (9, 2),
+            (10, 3),
+            (11, 4),
+            (12, SAT),
+            (13, SUN),
+        ] {
+            let at = chrono::Utc
+                .with_ymd_and_hms(2026, 9, day, 13, 37, 0)
+                .unwrap();
+            assert_eq!(
+                weekday_and_minute(at),
+                (expected, 13 * 60 + 37),
+                "2026-09-{day:02} must read as weekday {expected} at 13:37"
+            );
+        }
+
+        // Midnight is minute 0, not 1440 — the value a window's exclusive end
+        // uses for the same instant.
+        let midnight = chrono::Utc.with_ymd_and_hms(2026, 9, 7, 0, 0, 0).unwrap();
+        assert_eq!(weekday_and_minute(midnight), (MON, 0));
+        let last = chrono::Utc.with_ymd_and_hms(2026, 9, 7, 23, 59, 0).unwrap();
+        assert_eq!(weekday_and_minute(last), (MON, MINUTES_PER_DAY - 1));
+    }
+
     #[test]
     fn validate_accepts_a_reasonable_timetable() {
         let weekdays = BandwidthScheduleRule {
@@ -707,6 +782,11 @@ mod tests {
                 label: "x".repeat(MAX_RULE_LABEL_CHARS + 1),
                 ..base.clone()
             },
+            BandwidthScheduleRule {
+                id: "speed".to_string(),
+                max_upload_speed: u64::MAX,
+                ..base.clone()
+            },
         ];
 
         let mut rules = broken.to_vec();
@@ -715,6 +795,98 @@ mod tests {
         // Exactly the first "dup" survives — every other entry has a fault.
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, "dup");
+    }
+
+    /// The same property the test above only samples, over generated input.
+    ///
+    /// The enumerated version cannot fail for the reason the property exists:
+    /// a check added to `validate` but not to `repair` leaves every hand-written
+    /// case green while making a config both unloadable and unsavable. The speed
+    /// bound is exactly that shape — it only landed on both sides because
+    /// `rule_fault` is shared, and nothing here would have noticed if it had
+    /// been written into `validate` directly.
+    ///
+    /// Deterministic, so a failure is reproducible from the seed alone, and
+    /// drawn from values sitting on and just past every boundary `rule_fault`
+    /// tests rather than uniformly at random — a random `u16` is almost never an
+    /// interesting `end_minute`.
+    #[test]
+    fn repair_leaves_a_valid_schedule_for_any_input() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        let ids = ["ok", "", "dup", "dup", "has space", "a-_1", "\u{1f600}"];
+        let speeds = [
+            0,
+            1_000,
+            MAX_CONFIGURED_SPEED_BPS,
+            MAX_CONFIGURED_SPEED_BPS + 1,
+            u64::MAX,
+        ];
+        let minutes = [
+            0,
+            1,
+            600,
+            MINUTES_PER_DAY - 1,
+            MINUTES_PER_DAY,
+            MINUTES_PER_DAY + 1,
+        ];
+        let day_masks = [0, 1, ALL_DAYS, ALL_DAYS + 1, 0b0101_0101];
+
+        let mut state = 0x5eed_1234_9abc_def0_u64;
+        let pick = |len: usize, state: &mut u64| (xorshift(state) % len as u64) as usize;
+
+        for _ in 0..2_000 {
+            // Past MAX_SCHEDULE_RULES, so truncation is exercised too.
+            let count = (xorshift(&mut state) % 40) as usize;
+            let mut rules: Vec<BandwidthScheduleRule> = (0..count)
+                .map(|_| {
+                    let mut r = rule(ALL_DAYS, 60, 120);
+                    r.id = ids[pick(ids.len(), &mut state)].to_string();
+                    r.label = "x".repeat(
+                        (xorshift(&mut state) % (MAX_RULE_LABEL_CHARS as u64 + 3)) as usize,
+                    );
+                    r.days = day_masks[pick(day_masks.len(), &mut state)];
+                    r.start_minute = minutes[pick(minutes.len(), &mut state)];
+                    r.end_minute = minutes[pick(minutes.len(), &mut state)];
+                    r.max_upload_speed = speeds[pick(speeds.len(), &mut state)];
+                    r.max_download_speed = speeds[pick(speeds.len(), &mut state)];
+                    r.enabled = xorshift(&mut state).is_multiple_of(2);
+                    r
+                })
+                .collect();
+            repair(&mut rules);
+            assert!(
+                validate(&rules).is_ok(),
+                "repair left something validate refuses: {rules:?}"
+            );
+        }
+    }
+
+    /// A rule's speeds reach the limiter by a path that skips every bound the
+    /// manual limits pass through, and the limiter's refill adds ~a tenth of the
+    /// rate into a bucket capped at twice it — so a rule near `u64::MAX`
+    /// overflows that sum under the release profile's `overflow-checks`, kills
+    /// the refill task, and aborts every rate-limited transfer for the session.
+    #[test]
+    fn a_rule_cannot_carry_a_speed_the_limiter_cannot_hold() {
+        let mut over = rule(ALL_DAYS, 60, 120);
+        over.max_upload_speed = u64::MAX;
+        assert!(validate(std::slice::from_ref(&over)).is_err());
+
+        let mut over_down = rule(ALL_DAYS, 60, 120);
+        over_down.max_download_speed = MAX_CONFIGURED_SPEED_BPS + 1;
+        assert!(validate(std::slice::from_ref(&over_down)).is_err());
+
+        // The ceiling itself is allowed, and so is unlimited.
+        let mut at_cap = rule(ALL_DAYS, 60, 120);
+        at_cap.max_upload_speed = MAX_CONFIGURED_SPEED_BPS;
+        at_cap.max_download_speed = 0;
+        validate(std::slice::from_ref(&at_cap)).unwrap();
     }
 
     #[test]

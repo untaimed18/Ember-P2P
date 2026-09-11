@@ -54,9 +54,18 @@ fn monotonic_millis() -> u64 {
 
 /// Whether a notification may be shown now, spending a token if so.
 ///
-/// Single-threaded in practice (one webview), so a compare-exchange loop would
-/// buy nothing: a lost race costs at most one extra notification, which is
-/// three orders of magnitude away from the abuse this bounds.
+/// The renderer is one webview, but that says nothing about this function:
+/// `show_notification` is an `async` command, so every `invoke` is its own task
+/// on the multi-threaded runtime and a caller that does not await can have any
+/// number of them in here at once. A read-then-write pair would let every one
+/// of them see the same full bucket and pass, which is the whole burst this
+/// exists to bound — so the spend is a compare-exchange that re-reads on
+/// contention.
+///
+/// The refill timestamp is deliberately *not* folded into that exchange. Two
+/// atomics cannot be swapped together, and the consequence of losing the race
+/// on this one is that a concurrent caller's elapsed time reads as zero and
+/// refills nothing, which errs towards throttling.
 fn take_notify_token() -> bool {
     let now = monotonic_millis();
     let last = NOTIFY_LAST_REFILL_MILLIS.swap(now, Ordering::Relaxed);
@@ -64,14 +73,13 @@ fn take_notify_token() -> bool {
     let refilled = elapsed.saturating_mul(1_000) / NOTIFY_REFILL_MILLIS;
     let ceiling = NOTIFY_BURST * 1_000;
 
-    let current = NOTIFY_TOKENS_MILLI.load(Ordering::Relaxed);
-    let available = current.saturating_add(refilled).min(ceiling);
-    if available < 1_000 {
-        NOTIFY_TOKENS_MILLI.store(available, Ordering::Relaxed);
-        return false;
-    }
-    NOTIFY_TOKENS_MILLI.store(available - 1_000, Ordering::Relaxed);
-    true
+    let mut spent = false;
+    let _ = NOTIFY_TOKENS_MILLI.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let available = current.saturating_add(refilled).min(ceiling);
+        spent = available >= 1_000;
+        Some(if spent { available - 1_000 } else { available })
+    });
+    spent
 }
 
 /// Collapse a renderer-supplied string into something safe to hand a desktop
@@ -125,6 +133,51 @@ fn sanitize(raw: &str, max_chars: usize) -> String {
     trimmed
 }
 
+/// Escape a notification body for shells that parse it as markup.
+///
+/// The freedesktop notification spec lets a server advertise `body-markup` and
+/// then read the body as a Pango/HTML subset — `<b>`, `<img src>` and
+/// `<a href>` among them — which GNOME Shell, Plasma and dunst all do.
+/// `notify-rust` hands our strings to D-Bus verbatim, and every body here is
+/// peer-supplied: a file name, a chat preview, a room name. Without this, a
+/// peer who names a file `<a href="https://evil.example">Open your bank</a>`
+/// gets a clickable link rendered by the shell and attributed to Ember, drawn
+/// outside the webview's CSP — the same class of forgery the direction-override
+/// stripping above exists to stop, and one that only became reachable by users
+/// when Linux started shipping.
+///
+/// Escaped rather than stripped because a bare `&` is itself a markup parse
+/// error, and "Rock & Roll" is an ordinary file name.
+///
+/// Windows is deliberately left alone: `tauri-winrt-notification` escapes every
+/// field into the toast XML itself, so doing it here as well would put a
+/// literal `&amp;lt;` in front of the user. The summary is left alone on both,
+/// because the spec defines it as plain text and no server parses it — escaping
+/// it would show `&amp;` in an ordinary title. `cfg!` rather than `#[cfg]` so
+/// the body stays type-checked on every platform.
+fn escape_body_markup(body: String) -> String {
+    if cfg!(unix) {
+        escape_markup(&body)
+    } else {
+        body
+    }
+}
+
+/// The escaping itself, split out so it is compiled and tested on every
+/// platform rather than only on the one that applies it.
+fn escape_markup(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for ch in body.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Show a desktop notification.
 #[tauri::command]
 pub async fn show_notification(
@@ -142,7 +195,9 @@ pub async fn show_notification(
     }
 
     let title = sanitize(&title, MAX_TITLE_CHARS);
-    let body = sanitize(&body, MAX_BODY_CHARS);
+    // Escaped after the character cap, so the budget counts what the user will
+    // read rather than the `&amp;` an escape expands to.
+    let body = escape_body_markup(sanitize(&body, MAX_BODY_CHARS));
     if title.is_empty() {
         return Err(coded(
             "notification_empty_title",
@@ -223,6 +278,36 @@ mod tests {
     fn sanitize_reduces_invisible_only_input_to_nothing() {
         assert_eq!(sanitize("\u{200B}\u{202E}\u{0007}", 100), "");
         assert!(sanitize("", 100).is_empty());
+    }
+
+    /// A peer names the files it offers, and on a shell that advertises
+    /// `body-markup` an unescaped body is parsed as markup — so a file name
+    /// can carry a working hyperlink into a notification the user reads as
+    /// Ember's own. `notify-rust` does no escaping of its own on the D-Bus
+    /// path, which is what leaves this to us.
+    #[test]
+    fn a_peer_supplied_body_cannot_carry_markup_into_the_shell() {
+        let hostile = r#"<a href="https://evil.example">Open your bank</a>"#;
+        // Asserted unconditionally, because the platform that applies this is
+        // not the platform this suite usually runs on.
+        assert_eq!(
+            escape_markup(&sanitize(hostile, MAX_BODY_CHARS)),
+            "&lt;a href=\"https://evil.example\"&gt;Open your bank&lt;/a&gt;"
+        );
+        // A bare ampersand is a parse error on its own, and ordinary file names
+        // are full of them.
+        assert_eq!(escape_markup("Rock & Roll"), "Rock &amp; Roll");
+        assert_eq!(escape_markup("nothing to do here"), "nothing to do here");
+
+        // And the platform gate: Windows escapes into the toast XML inside
+        // `tauri-winrt-notification`, so a second pass here would show the user
+        // a literal `&amp;lt;`.
+        let delivered = escape_body_markup(sanitize(hostile, MAX_BODY_CHARS));
+        if cfg!(unix) {
+            assert!(!delivered.contains('<'));
+        } else {
+            assert_eq!(delivered, hostile);
+        }
     }
 
     /// The limiter has to allow a real flurry and then stop a loop. Runs

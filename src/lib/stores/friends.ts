@@ -274,16 +274,25 @@ export async function initFriendsStore() {
         // separately marks the message read on the backend.
         // A mounted conversation in a hidden/minimized window is NOT being
         // read, so it must still raise a badge.
-        if (isAppVisible() && get(activeChatHash) === hash) return;
-        unreadCounts.update((m) => {
-          const next = new Map(m);
-          next.set(hash, (next.get(hash) || 0) + 1);
-          return next;
-        });
-        // Same gate as the badge above, and for the same reason: a message the
-        // user is watching arrive is not news. The preview is capped hard —
-        // the shell renders it outside anything the webview controls, and the
-        // backend strips direction overrides from whatever gets there.
+        const beingRead = isAppVisible() && get(activeChatHash) === hash;
+        if (!beingRead) {
+          unreadCounts.update((m) => {
+            const next = new Map(m);
+            next.set(hash, (next.get(hash) || 0) + 1);
+            return next;
+          });
+        }
+        // Deliberately *not* gated on `beingRead`, which is what returning
+        // early here used to do. That test reads "visible" as "watched", so a
+        // chat open behind an editor on a second monitor counted as read and
+        // the handler returned before the notification policy was ever
+        // consulted — silencing the one case `emberIsFocused` exists for.
+        // `shouldNotify` owns this question and answers it with visible *and*
+        // focused.
+        //
+        // The preview is capped hard: the shell renders it outside anything the
+        // webview controls, and the backend strips direction overrides from
+        // whatever gets there and escapes markup on the shells that parse it.
         if (shouldNotify('friend_message')) {
           void notify(
             'friend_message',

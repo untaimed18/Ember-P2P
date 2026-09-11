@@ -50,6 +50,17 @@ pub const fn supported() -> bool {
 /// releases the inhibitor and stops the owning thread.
 pub struct WakeLock {
     desired: Arc<AtomicBool>,
+    /// What the OS last *accepted*, as opposed to what was asked for.
+    ///
+    /// Separate from `desired` because the two legitimately disagree: a refused
+    /// `SetThreadExecutionState` is backed off rather than retried every poll,
+    /// and for that whole window the request stands while nothing is held. The
+    /// UI publishes this one, because "sleep is being deferred" is a claim
+    /// about the machine and reporting the request instead would tell a user
+    /// their transfers are safe overnight when the box is free to suspend —
+    /// exactly the "did it stall or did it sleep?" ambiguity this module exists
+    /// to remove.
+    effective: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     /// Whether the owning thread actually started. A thread-spawn failure must
     /// not turn every later `set` into a silent lie, so it is reported once
@@ -62,22 +73,28 @@ impl WakeLock {
     /// allocates the atomics and spawns nothing, so callers need no `cfg`.
     pub fn new() -> Self {
         let desired = Arc::new(AtomicBool::new(false));
+        let effective = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         if !supported() {
             return Self {
                 desired,
+                effective,
                 stop,
                 running: false,
             };
         }
         let thread_desired = desired.clone();
+        let thread_effective = effective.clone();
         let thread_stop = stop.clone();
         let spawned = std::thread::Builder::new()
             .name("ember-wake-lock".to_string())
-            .spawn(move || own_execution_state(thread_desired, thread_stop));
+            .spawn(move || {
+                own_execution_state(thread_desired, thread_effective, thread_stop)
+            });
         match spawned {
             Ok(_handle) => Self {
                 desired,
+                effective,
                 stop,
                 running: true,
             },
@@ -88,6 +105,7 @@ impl WakeLock {
                 );
                 Self {
                     desired,
+                    effective,
                     stop,
                     running: false,
                 }
@@ -105,6 +123,15 @@ impl WakeLock {
     /// owning thread started. `false` means [`set`](Self::set) is a no-op.
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Whether an inhibitor is actually held right now, as last accepted by the
+    /// OS. This is what the UI should report — see [`WakeLock::effective`].
+    ///
+    /// Lags a [`POLL_INTERVAL`] behind a `set`, which is the same lag the
+    /// inhibitor itself has.
+    pub fn is_held(&self) -> bool {
+        self.effective.load(Ordering::Relaxed)
     }
 }
 
@@ -127,7 +154,11 @@ impl Default for WakeLock {
 
 /// Body of the owning thread: mirror `desired` into this thread's execution
 /// state until `stop`, then release.
-fn own_execution_state(desired: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+fn own_execution_state(
+    desired: Arc<AtomicBool>,
+    effective: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
     let mut applied = false;
     let mut last_apply = Instant::now();
     let mut warned = false;
@@ -145,6 +176,7 @@ fn own_execution_state(desired: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
                     );
                 }
                 applied = want;
+                effective.store(want, Ordering::Relaxed);
                 last_apply = Instant::now();
             } else if !warned {
                 // Once only: a platform that refuses the call refuses it every
@@ -154,7 +186,10 @@ fn own_execution_state(desired: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
                     "The OS refused a sleep-inhibitor change; the system may sleep during transfers"
                 );
                 // Treat it as applied so the retry follows the re-assert
-                // cadence rather than hammering once per poll.
+                // cadence rather than hammering once per poll. `effective` is
+                // deliberately *not* moved with it: backing off is a decision
+                // about how often to retry, and it must not become a claim that
+                // the machine is being held awake when it is not.
                 applied = want;
                 last_apply = Instant::now();
             }
@@ -164,6 +199,7 @@ fn own_execution_state(desired: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
     if applied {
         apply(false);
     }
+    effective.store(false, Ordering::Relaxed);
 }
 
 /// Set or clear this thread's inhibitor. Returns whether the OS accepted it.
@@ -232,5 +268,33 @@ mod tests {
             !desired.load(Ordering::Relaxed),
             "drop must clear the request"
         );
+    }
+
+    /// A request is not a fact. The UI reports "sleep is being deferred", so it
+    /// has to read what the OS accepted rather than what was asked for —
+    /// otherwise a platform that refuses the call, or one where the owning
+    /// thread never started, shows a badge claiming transfers are safe
+    /// overnight on a machine that is free to suspend.
+    #[test]
+    fn held_reports_the_os_answer_not_the_request() {
+        let lock = WakeLock::new();
+        assert!(!lock.is_held(), "nothing is held before anything is asked");
+
+        lock.set(true);
+        if !supported() {
+            // No owning thread here, so a request can never become a hold.
+            std::thread::sleep(POLL_INTERVAL + Duration::from_millis(250));
+            assert!(
+                !lock.is_held(),
+                "an unsupported platform must never report a hold"
+            );
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL + Duration::from_millis(250));
+        assert!(lock.is_held(), "an accepted request has to read as held");
+
+        lock.set(false);
+        std::thread::sleep(POLL_INTERVAL + Duration::from_millis(250));
+        assert!(!lock.is_held(), "and a release has to read as released");
     }
 }
