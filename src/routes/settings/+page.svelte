@@ -2799,127 +2799,139 @@
             />
           </div>
 
-          <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled}>
-            {#if settings.bandwidth_schedule.length === 0}
-              <p class="schedule-empty">{m.schedule_empty()}</p>
-            {:else}
-              <p class="hint">{m.schedule_order_hint()}</p>
-            {/if}
+          <!-- Hidden while the feature is off: the rules are not in force, and
+               a timetable nobody is using is a card of controls that do
+               nothing. They are kept, not discarded — flipping the toggle back
+               brings them straight back.
 
-            {#each settings.bandwidth_schedule as rule, index (rule.id)}
-              {@const problem = scheduleRuleError(rule)}
-              {@const isActive = settings.bandwidth_schedule_enabled && rule.id === activeScheduleRuleId}
-              <div class="schedule-rule" class:is-active={isActive} class:has-error={!!problem}>
-                <div class="schedule-rule-head">
-                  <ToggleSwitch
-                    bind:checked={rule.enabled}
-                    ariaLabel={m.schedule_rule_enabled_aria()}
-                  />
-                  <input
-                    class="schedule-name"
-                    type="text"
-                    bind:value={rule.label}
-                    maxlength={MAX_RULE_LABEL_CHARS}
-                    placeholder={m.schedule_name_placeholder()}
-                    aria-label={m.schedule_name_placeholder()}
-                  />
-                  {#if isActive}
-                    <span class="live-badge">{m.schedule_active_now()}</span>
-                  {/if}
-                  <div class="schedule-rule-actions">
-                    <button
-                      type="button"
-                      class="icon-btn"
-                      onclick={() => moveScheduleRule(index, -1)}
-                      disabled={index === 0}
-                      aria-label={m.schedule_move_up()}
-                      title={m.schedule_move_up()}
-                    >&#9650;</button>
-                    <button
-                      type="button"
-                      class="icon-btn"
-                      onclick={() => moveScheduleRule(index, 1)}
-                      disabled={index === settings.bandwidth_schedule.length - 1}
-                      aria-label={m.schedule_move_down()}
-                      title={m.schedule_move_down()}
-                    >&#9660;</button>
-                    <button
-                      type="button"
-                      class="icon-btn danger"
-                      onclick={() => removeScheduleRule(rule.id)}
-                      aria-label={m.schedule_remove_rule()}
-                      title={m.schedule_remove_rule()}
-                    >&times;</button>
+               The exception is a rule the backend would refuse. `validate`
+               checks the list whether or not the feature is enabled, so such a
+               rule blocks Save either way, and hiding it would leave Save
+               blocked with nothing on screen to fix. Shown dimmed in that case:
+               still not in force, but reachable. -->
+          {#if settings.bandwidth_schedule_enabled || scheduleHasError}
+            <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled}>
+              {#if settings.bandwidth_schedule.length === 0}
+                <p class="schedule-empty">{m.schedule_empty()}</p>
+              {:else}
+                <p class="hint">{m.schedule_order_hint()}</p>
+              {/if}
+
+              {#each settings.bandwidth_schedule as rule, index (rule.id)}
+                {@const problem = scheduleRuleError(rule)}
+                {@const isActive = settings.bandwidth_schedule_enabled && rule.id === activeScheduleRuleId}
+                <div class="schedule-rule" class:is-active={isActive} class:has-error={!!problem}>
+                  <div class="schedule-rule-head">
+                    <ToggleSwitch
+                      bind:checked={rule.enabled}
+                      ariaLabel={m.schedule_rule_enabled_aria()}
+                    />
+                    <input
+                      class="schedule-name"
+                      type="text"
+                      bind:value={rule.label}
+                      maxlength={MAX_RULE_LABEL_CHARS}
+                      placeholder={m.schedule_name_placeholder()}
+                      aria-label={m.schedule_name_placeholder()}
+                    />
+                    {#if isActive}
+                      <span class="live-badge">{m.schedule_active_now()}</span>
+                    {/if}
+                    <div class="schedule-rule-actions">
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        onclick={() => moveScheduleRule(index, -1)}
+                        disabled={index === 0}
+                        aria-label={m.schedule_move_up()}
+                        title={m.schedule_move_up()}
+                      >&#9650;</button>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        onclick={() => moveScheduleRule(index, 1)}
+                        disabled={index === settings.bandwidth_schedule.length - 1}
+                        aria-label={m.schedule_move_down()}
+                        title={m.schedule_move_down()}
+                      >&#9660;</button>
+                      <button
+                        type="button"
+                        class="icon-btn danger"
+                        onclick={() => removeScheduleRule(rule.id)}
+                        aria-label={m.schedule_remove_rule()}
+                        title={m.schedule_remove_rule()}
+                      >&times;</button>
+                    </div>
                   </div>
-                </div>
 
-                <div class="schedule-days" role="group" aria-label={m.schedule_days_label()}>
-                  {#each weekdayLabels as dayLabel, weekday (weekday)}
-                    <button
-                      type="button"
-                      class="day-chip"
-                      class:selected={hasDay(rule.days, weekday)}
-                      aria-pressed={hasDay(rule.days, weekday)}
-                      onclick={() => setRuleDays(rule.id, weekday)}
-                    >{dayLabel}</button>
-                  {/each}
-                </div>
+                  <div class="schedule-days" role="group" aria-label={m.schedule_days_label()}>
+                    {#each weekdayLabels as dayLabel, weekday (weekday)}
+                      <button
+                        type="button"
+                        class="day-chip"
+                        class:selected={hasDay(rule.days, weekday)}
+                        aria-pressed={hasDay(rule.days, weekday)}
+                        onclick={() => setRuleDays(rule.id, weekday)}
+                      >{dayLabel}</button>
+                    {/each}
+                  </div>
 
-                <div class="schedule-times">
-                  <label class="schedule-time">
-                    <span>{m.schedule_from()}</span>
-                    <input
-                      type="time"
-                      value={minutesToTimeValue(rule.start_minute)}
-                      onchange={(e) => setRuleStart(rule.id, e.currentTarget)}
+                  <div class="schedule-times">
+                    <label class="schedule-time">
+                      <span>{m.schedule_from()}</span>
+                      <input
+                        type="time"
+                        value={minutesToTimeValue(rule.start_minute)}
+                        onchange={(e) => setRuleStart(rule.id, e.currentTarget)}
+                      />
+                    </label>
+                    <label class="schedule-time">
+                      <span>{m.schedule_to()}</span>
+                      <input
+                        type="time"
+                        value={minutesToTimeValue(rule.end_minute)}
+                        onchange={(e) => setRuleEnd(rule.id, e.currentTarget)}
+                      />
+                    </label>
+                    {#if isOvernight(rule)}
+                      <span class="schedule-overnight">{m.schedule_overnight()}</span>
+                    {/if}
+                  </div>
+
+                  <div class="schedule-limits">
+                    <!-- `idScope` keeps each rule's two fields from colliding
+                         with every other rule's, and with the manual limits
+                         above, which all share these labels. -->
+                    <SpeedInput
+                      label={m.settings_max_upload_speed()}
+                      idScope={rule.id}
+                      bind:value={rule.max_upload_speed}
                     />
-                  </label>
-                  <label class="schedule-time">
-                    <span>{m.schedule_to()}</span>
-                    <input
-                      type="time"
-                      value={minutesToTimeValue(rule.end_minute)}
-                      onchange={(e) => setRuleEnd(rule.id, e.currentTarget)}
+                    <SpeedInput
+                      label={m.settings_max_download_speed()}
+                      idScope={rule.id}
+                      bind:value={rule.max_download_speed}
                     />
-                  </label>
-                  {#if isOvernight(rule)}
-                    <span class="schedule-overnight">{m.schedule_overnight()}</span>
+                  </div>
+
+                  {#if problem}
+                    <span class="schedule-error">{problem}</span>
                   {/if}
                 </div>
+              {/each}
 
-                <div class="schedule-limits">
-                  <!-- `idScope` keeps each rule's two fields from colliding
-                       with every other rule's, and with the manual limits
-                       above, which all share these labels. -->
-                  <SpeedInput
-                    label={m.settings_max_upload_speed()}
-                    idScope={rule.id}
-                    bind:value={rule.max_upload_speed}
-                  />
-                  <SpeedInput
-                    label={m.settings_max_download_speed()}
-                    idScope={rule.id}
-                    bind:value={rule.max_download_speed}
-                  />
-                </div>
-
-                {#if problem}
-                  <span class="schedule-error">{problem}</span>
-                {/if}
-              </div>
-            {/each}
-
-            <button
-              type="button"
-              class="schedule-add"
-              onclick={addScheduleRule}
-              disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
-            >
-              {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
-                ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
-                : m.schedule_add_rule()}
-            </button>
-          </div>
+              <button
+                type="button"
+                class="schedule-add"
+                onclick={addScheduleRule}
+                disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
+              >
+                {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
+                  ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
+                  : m.schedule_add_rule()}
+              </button>
+            </div>
+          {/if}
 
           <div class="divider"></div>
           <div class="field speed-test-section">
@@ -5214,9 +5226,9 @@
     gap: 10px;
   }
 
-  /* The rules stay readable and editable while the feature is off — they are
-     still what will apply once it is switched on — but are visibly not in
-     force. */
+  /* Only reachable now when the feature is off *and* a rule would block the
+     save, so the editor is showing solely to be corrected. Dimmed to keep
+     saying what it said before: these rules are not in force. */
   .schedule-editor.is-inactive {
     opacity: 0.62;
   }
