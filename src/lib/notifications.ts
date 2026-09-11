@@ -68,9 +68,8 @@ let recentSends: number[] = [];
 /**
  * Set once the OS has refused to show a notification, so a machine with
  * notifications disabled at the system level stops paying for an IPC round trip
- * per event. Cleared by {@link resetNotificationAvailability}, which the
- * Settings test button calls — that is the one moment a user has plausibly just
- * fixed it.
+ * per event. Lasts for the rest of the session; restarting Ember is how a
+ * user who later allows notifications at the OS level gets another try.
  */
 let deliveryUnavailable = false;
 
@@ -155,23 +154,6 @@ export async function notify(
       console.warn('Desktop notifications unavailable; suppressing further attempts:', error);
     }
   }
-}
-
-/**
- * Send a notification the user explicitly asked for, from Settings.
- *
- * Skips every policy check — they are testing whether the OS shows anything at
- * all, usually while looking straight at the window with the master switch
- * toggled but not yet saved. Rethrows so the button can report the reason.
- */
-export async function sendTestNotification(title: string, body: string): Promise<void> {
-  resetNotificationAvailability();
-  await showNotification(title, body, true);
-}
-
-/** Give delivery another chance after the user changes something. */
-export function resetNotificationAvailability(): void {
-  deliveryUnavailable = false;
 }
 
 /** Whether delivery has been observed to fail this session. */

@@ -126,28 +126,19 @@ fn sanitize(raw: &str, max_chars: usize) -> String {
 }
 
 /// Show a desktop notification.
-///
-/// `force` is set only by the "Send a test notification" button in Settings, so
-/// a user who has just switched notifications on can confirm the OS will
-/// actually show them without saving first. It skips the persisted master
-/// switch and nothing else: sanitization and the rate limit still apply.
 #[tauri::command]
 pub async fn show_notification(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     title: String,
     body: String,
-    force: Option<bool>,
 ) -> Result<(), String> {
-    let force = force.unwrap_or(false);
-    if !force {
-        // Authoritative, not the caller's claim: a Settings save that switches
-        // notifications off must silence a renderer whose cached copy of the
-        // settings has not caught up yet.
-        let enabled = state.config.read().await.settings.notifications_enabled;
-        if !enabled {
-            return Ok(());
-        }
+    // Authoritative, not the caller's claim: a Settings save that switches
+    // notifications off must silence a renderer whose cached copy of the
+    // settings has not caught up yet.
+    let enabled = state.config.read().await.settings.notifications_enabled;
+    if !enabled {
+        return Ok(());
     }
 
     let title = sanitize(&title, MAX_TITLE_CHARS);

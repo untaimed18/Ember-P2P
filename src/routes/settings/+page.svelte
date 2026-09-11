@@ -59,7 +59,6 @@
   } from '$lib/api/backup';
   import { formatSize, formatSpeed, shortPubkey } from '$lib/utils';
   import { getRuntimeStatus } from '$lib/api/system';
-  import { sendTestNotification } from '$lib/notifications';
   import {
     MAX_RULE_LABEL_CHARS,
     MAX_SCHEDULE_RULES,
@@ -509,28 +508,6 @@
   // only when something actually changes.
   // ---------------------------------------------------------------------
   let runtimeStatus: RuntimeStatus | null = $state(null);
-
-  let testingNotification = $state(false);
-  let notificationTestError: string | null = $state(null);
-  let notificationTestSent = $state(false);
-
-  async function sendTestNotificationClick() {
-    testingNotification = true;
-    notificationTestError = null;
-    notificationTestSent = false;
-    try {
-      await sendTestNotification(
-        m.notify_test_title(),
-        m.notify_test_body(),
-      );
-      notificationTestSent = true;
-      trackedTimeout(() => { notificationTestSent = false; }, 6000);
-    } catch (e: unknown) {
-      notificationTestError = translateError(e, m.settings_notifications_test_failed());
-    } finally {
-      testingNotification = false;
-    }
-  }
 
   // ---------------------------------------------------------------------
   // Bandwidth schedule editing.
@@ -2438,24 +2415,6 @@
               disabled={!settings.notifications_enabled}
               ariaLabel={m.settings_notify_channel_message()}
             />
-          </div>
-
-          <div class="divider"></div>
-
-          <div class="field">
-            <div class="speed-test-header">
-              <span class="toggle-title">{m.settings_notifications_test_label()}</span>
-              <button class="speed-test-btn" onclick={sendTestNotificationClick} disabled={testingNotification}>
-                {testingNotification ? m.settings_notifications_testing() : m.settings_notifications_test_button()}
-              </button>
-            </div>
-            <span class="hint">{m.settings_notifications_test_hint()}</span>
-            {#if notificationTestSent}
-              <span class="inline-ok">{m.settings_notifications_test_sent()}</span>
-            {/if}
-            {#if notificationTestError}
-              <span class="speed-error">{notificationTestError}</span>
-            {/if}
           </div>
         </div>
       </section>
@@ -5189,13 +5148,6 @@
     display: block;
     margin-top: 6px;
     color: var(--danger);
-    font-size: 12px;
-  }
-
-  .inline-ok {
-    display: block;
-    margin-top: 6px;
-    color: var(--success, var(--accent));
     font-size: 12px;
   }
 

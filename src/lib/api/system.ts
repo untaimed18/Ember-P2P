@@ -11,16 +11,12 @@ import type { RuntimeStatus } from '$lib/types';
  *
  * Prefer {@link notify} in `$lib/notifications` over calling this directly: it
  * applies the per-category switches and the "only while unfocused" rule.
- *
- * `force` is for the Settings test button only — it skips the persisted master
- * switch so a user can verify the OS will show anything at all before saving.
  */
 export async function showNotification(
   title: string,
   body: string,
-  force = false,
 ): Promise<void> {
-  return invoke('show_notification', { title, body, force });
+  return invoke('show_notification', { title, body });
 }
 
 /**
