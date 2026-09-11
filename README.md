@@ -338,10 +338,10 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 
 ### For users
 
-Ember currently ships for **Windows 10 and Windows 11**. No external runtimes are required — no Java, no .NET, no separate browser engine download.
+Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.deb` and an AppImage. No external runtimes are required — no Java, no .NET, no separate browser engine download.
 
 1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
-2. Run the installer (`.exe`).
+2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed; the AppImage needs FUSE (`libfuse2` on Ubuntu 22.04) to start at all.
 3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, and theme.
 4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
@@ -388,7 +388,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
   xdg-utils desktop-file-utils
 ```
 
-Official releases are still Windows-only. A Linux build from this tree produces a `.deb` and an AppImage locally; those formats are not yet published or auto-updated. For a tester, prefer the `.deb`. The AppImage needs FUSE (`libfuse2` on Ubuntu 22.04); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
+A Linux build from this tree produces the same `.deb` and AppImage the release publishes, built on Ubuntu 22.04 for its glibc baseline — an AppImage bundles everything except glibc, so it runs on that release or newer and nothing older. The AppImage needs FUSE (`libfuse2` on Ubuntu 22.04); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
 
 #### Development
 

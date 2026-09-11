@@ -15,6 +15,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  addLinuxPlatforms,
+  collectLinuxBundles,
+} from "./add-linux-platforms.mjs";
+import {
   collectArtifactPaths,
   hardenManifest,
   parseArtifactPaths,
@@ -401,6 +405,215 @@ test("version policy requires Linux bundle targets alongside Windows", () => {
           requireTag: true,
         }),
       /bundle\.targets must include deb/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A release directory as `sign-publish` sees it: the manifest `tauri-action`
+ * just wrote, the Windows artifact behind it, and the downloaded Linux bundles
+ * with the signatures the signing step put beside them.
+ *
+ * The bundles sit in `appimage/` and `deb/` rather than side by side because
+ * that is what comes back out of `download-artifact` — `upload-artifact` keeps
+ * the structure below the common ancestor of the paths it was given, and a
+ * non-recursive scan of the directory finds nothing at all.
+ */
+function linuxReleaseFixture() {
+  const fixture = mkdtempSync(join(tmpdir(), "ember-linux-platforms-"));
+  const bundleDir = join(fixture, "linux-bundles");
+  const artifacts = [];
+
+  const windows = join(fixture, "Ember_1.2.3_x64-setup.exe");
+  writeFileSync(windows, "windows installer bytes");
+  artifacts.push(windows);
+
+  for (const [directory, name] of [
+    ["appimage", "Ember_1.2.3_amd64.AppImage"],
+    ["deb", "Ember_1.2.3_amd64.deb"],
+  ]) {
+    mkdirSync(join(bundleDir, directory), { recursive: true });
+    const path = join(bundleDir, directory, name);
+    writeFileSync(path, `${name} bytes`);
+    writeFileSync(`${path}.sig`, `signature for ${name}\n`);
+    artifacts.push(path);
+  }
+
+  const manifestPath = join(fixture, "latest.json");
+  writeFileSync(
+    manifestPath,
+    `${JSON.stringify({
+      version: "1.2.3",
+      platforms: {
+        "windows-x86_64": {
+          url: "https://github.com/untaimed18/Ember-P2P/releases/download/v1.2.3/Ember_1.2.3_x64-setup.exe",
+          signature: "windows-signature",
+        },
+      },
+    })}\n`,
+  );
+  return { fixture, bundleDir, manifestPath, artifacts };
+}
+
+const releaseBase =
+  "https://github.com/untaimed18/Ember-P2P/releases/download/v1.2.3";
+
+test("the Linux updater targets are composed from the signed bundles", () => {
+  const { fixture, bundleDir, manifestPath } = linuxReleaseFixture();
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    addLinuxPlatforms({
+      manifest,
+      bundles: collectLinuxBundles({ directory: bundleDir }),
+    });
+
+    assert.deepEqual(manifest.platforms["linux-x86_64-appimage"], {
+      url: `${releaseBase}/Ember_1.2.3_amd64.AppImage`,
+      signature: "signature for Ember_1.2.3_amd64.AppImage",
+    });
+    assert.deepEqual(manifest.platforms["linux-x86_64-deb"], {
+      url: `${releaseBase}/Ember_1.2.3_amd64.deb`,
+      signature: "signature for Ember_1.2.3_amd64.deb",
+    });
+
+    // The absence of the bare key is the point, so it is asserted rather than
+    // left to the two checks above. It is what an install whose format the
+    // bundler marker does not identify falls back to, and no artifact is right
+    // for those: a `.deb` install reaching it would hand an AppImage to `dpkg`,
+    // and an RPM install would hand one to `rpm`.
+    assert.equal(manifest.platforms["linux-x86_64"], undefined);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("composed Linux targets are hashed and size-bound like the Windows ones", () => {
+  // The composition step writes only `url` and `signature`, exactly as
+  // `tauri-action` does for Windows, and leaves `target`, `sha256` and `size`
+  // to the hardening pass. If that split ever broke, a Linux user would be
+  // offered an artifact whose length and digest the updater cannot check —
+  // silently, because the manifest would still be signed and still parse.
+  const { fixture, bundleDir, manifestPath, artifacts } = linuxReleaseFixture();
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    addLinuxPlatforms({
+      manifest,
+      bundles: collectLinuxBundles({ directory: bundleDir }),
+    });
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+
+    const hardened = hardenManifest({
+      manifestPath,
+      artifactPaths: artifacts,
+      securityEpoch: 1,
+    });
+
+    for (const [target, name] of [
+      ["linux-x86_64-appimage", "Ember_1.2.3_amd64.AppImage"],
+      ["linux-x86_64-deb", "Ember_1.2.3_amd64.deb"],
+      ["windows-x86_64", "Ember_1.2.3_x64-setup.exe"],
+    ]) {
+      const bytes = Buffer.from(
+        name.endsWith(".exe") ? "windows installer bytes" : `${name} bytes`,
+      );
+      assert.equal(hardened.platforms[target].target, target);
+      assert.equal(hardened.platforms[target].size, bytes.length);
+      assert.equal(
+        hardened.platforms[target].sha256,
+        createHash("sha256").update(bytes).digest("hex"),
+      );
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("a Linux bundle with no signature beside it fails the release", () => {
+  // The signature is the only thing binding those bytes to Ember's key. An
+  // entry written without one is a platform the updater refuses at check time,
+  // which would surface as a broken release rather than a missing signature.
+  const { fixture, bundleDir } = linuxReleaseFixture();
+  try {
+    rmSync(join(bundleDir, "deb", "Ember_1.2.3_amd64.deb.sig"));
+    assert.throws(
+      () => collectLinuxBundles({ directory: bundleDir }),
+      /Ember_1\.2\.3_amd64\.deb has no .* beside it/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("two builds of one format cannot be collected into a release", () => {
+  // Nothing here could say which of them the signature belongs to, and picking
+  // either would publish a digest for one build against the bytes of another.
+  const { fixture, bundleDir } = linuxReleaseFixture();
+  try {
+    writeFileSync(
+      join(bundleDir, "appimage", "Ember_1.2.2_amd64.AppImage"),
+      "a second build",
+    );
+    assert.throws(
+      () => collectLinuxBundles({ directory: bundleDir }),
+      /expected exactly one \.appimage bundle .*, found 2/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+/** The release workflow with one targeted substitution applied. */
+function tamperedWorkflow(from, to) {
+  const fixture = policyFixture();
+  const workflowPath = join(fixture, ".github/workflows/release.yml");
+  const workflow = readFileSync(workflowPath, "utf8");
+  assert.ok(workflow.includes(from), `release.yml no longer contains: ${from}`);
+  writeFileSync(workflowPath, workflow.replace(from, to));
+  return fixture;
+}
+
+test("the signing key and release write stay in the one protected job", () => {
+  // These were slice checks running from `sign-publish` to the end of the file,
+  // which meant they were answered by anything after it: a second job could
+  // request `contents: write`, or enter the signing environment, and satisfy
+  // the very checks written to stop that. Adding a Linux build job is exactly
+  // the change that made the difference observable.
+  for (const [from, to, expected] of [
+    [
+      "    name: Build Linux packages\n",
+      "    name: Build Linux packages\n    environment: release-signing\n",
+      /only sign-publish may enter the release-signing environment, not build-linux/,
+    ],
+    [
+      "          APPIMAGE_EXTRACT_AND_RUN: 1",
+      "          APPIMAGE_EXTRACT_AND_RUN: 1\n          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
+      /build-linux must not reference a secret/,
+    ],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a release cannot be signed without the Linux packages it publishes", () => {
+  // Dropping the dependency does not fail anything on its own: the draft is
+  // still created and still signed, and `latest.json` still advertises whatever
+  // Windows built. It is the Linux half that disappears, from a release that
+  // otherwise looks complete.
+  const fixture = tamperedWorkflow(
+    "    needs: [verify, build, build-linux]",
+    "    needs: [verify, build]",
+  );
+  try {
+    assert.throws(
+      () => verifyWorkflow({ root: fixture }),
+      /sign-publish must depend on every build job; it is missing build-linux/,
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });

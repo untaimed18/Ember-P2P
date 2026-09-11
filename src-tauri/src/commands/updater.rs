@@ -824,6 +824,29 @@ fn save_handoff(
     manifest_signature: &str,
     artifact: &[u8],
 ) -> Result<()> {
+    // Windows only, because the dead end being recovered from is a Windows one.
+    // There `Update::install` hands the bundle to NSIS/MSI and then calls
+    // `exit(0)`, so a refusal to run the freshly written installer is
+    // indistinguishable from success: Ember closes and nothing happens. Linux
+    // installs in-process instead — `dpkg -i` behind a pkexec prompt for the
+    // `.deb`, an in-place rewrite for the AppImage — and returns a `Result` the
+    // caller already turns into a visible error, so there is nothing silent to
+    // recover from and no reason to keep a second copy of a 100 MB bundle.
+    //
+    // Staging there would also have nothing coherent to offer: re-running a
+    // staged AppImage just runs the new version out of the data folder without
+    // installing anything, and leaves the old one in place. Refusing at the top
+    // is what keeps `installer_kind` and `installer_name` total as well — they
+    // only ever name an `exe` or an `msi` because only Windows reaches them.
+    //
+    // `cfg!` rather than `#[cfg]` so the body below stays type-checked
+    // everywhere this compiles.
+    if !cfg!(windows) {
+        tracing::debug!(
+            "Not staging a hand-off record: an install failure is reported directly on this platform"
+        );
+        return Ok(());
+    }
     let kind = installer_kind(&platform.url);
     let dir = pending_dir(app)?;
     std::fs::create_dir_all(&dir).context("failed to create the update staging directory")?;
@@ -1105,6 +1128,26 @@ fn retain_only_pending_at_floor(pending: &mut Option<PendingUpdate>) -> Result<(
     Ok(())
 }
 
+/// The targets a check went looking for, when it failed because the manifest
+/// held none of them.
+///
+/// Both variants mean that, and which one arrives is decided by something Ember
+/// does not do: the plugin reports the singular `TargetNotFound` only for a
+/// target the caller pinned, and falls back to searching
+/// `{os}-{arch}-{installer}` then `{os}-{arch}` otherwise, ending in the plural
+/// `TargetsNotFound` that lists both. Ember pins nothing, so every real miss is
+/// the plural one — and matching only the singular variant, as this did, left
+/// the Linux branch in [`secure_check`] unreachable. A Linux build checking a
+/// Windows-only manifest reported a failed update check rather than the "no
+/// update" the branch was written to give it.
+fn missing_updater_targets(error: &tauri_plugin_updater::Error) -> Option<String> {
+    match error {
+        tauri_plugin_updater::Error::TargetNotFound(target) => Some(target.clone()),
+        tauri_plugin_updater::Error::TargetsNotFound(targets) => Some(targets.join(", ")),
+        _ => None,
+    }
+}
+
 fn matching_platform(manifest: &SignedManifest, update: &Update) -> Result<SignedPlatform> {
     let matches: Vec<&SignedPlatform> = manifest
         .platforms
@@ -1252,19 +1295,21 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     let update = match updater.check().await {
         Ok(update) => update,
         Err(error) => {
-            // A signed, otherwise valid manifest that carries no artifact for
-            // the running target. Releases are Windows-only, so on Linux this
-            // is the ordinary state rather than a failure: reporting it as one
-            // tells a Linux tester their update check is broken when there is
-            // simply nothing published for them. It stays a hard error on the
-            // platforms we do publish for, where a missing target means the
-            // release itself is malformed. `cfg!` rather than `#[cfg]` so both
-            // arms are type-checked wherever this is compiled.
-            if let tauri_plugin_updater::Error::TargetNotFound(target) = &error {
+            // A signed, otherwise valid manifest carrying no artifact for the
+            // running install. Ember publishes `linux-x86_64-appimage` and
+            // `linux-x86_64-deb` for Linux and nothing else, so an install that
+            // is neither — an RPM, a tarball, a local `cargo build` — reaches
+            // this legitimately, and calling it a failure would tell that user
+            // their update check is broken when there is simply nothing
+            // published for them. It stays a hard error on Windows, where every
+            // shape we ship has a target and a missing one means the release
+            // itself is malformed. `cfg!` rather than `#[cfg]` so both arms are
+            // type-checked wherever this is compiled.
+            if let Some(targets) = missing_updater_targets(&error) {
                 if cfg!(target_os = "linux") {
                     tracing::debug!(
                         "Signed updater manifest advertises {manifest_version} but has no \
-                         {target} artifact; treating as no update"
+                         {targets} artifact; treating as no update"
                     );
                     return Ok(None);
                 }
@@ -2177,6 +2222,36 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         save_rollback_state(&path, &pending).unwrap();
         assert!(pending_meets_persisted_floor(&path, &pending).unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The plural variant is the one that actually arrives.
+    ///
+    /// Ember pins no updater target, so a manifest holding nothing for this
+    /// install always fails with `TargetsNotFound` naming the two keys the
+    /// fallback search tried. `secure_check` matched only the singular
+    /// `TargetNotFound`, which the plugin reserves for a target the caller
+    /// named — so the Linux "nothing published for you yet" branch had never
+    /// once been taken, and every Linux check against a Windows-only manifest
+    /// surfaced as a failed update check instead.
+    #[test]
+    fn a_manifest_with_no_artifact_for_this_install_is_recognised() {
+        assert_eq!(
+            missing_updater_targets(&tauri_plugin_updater::Error::TargetsNotFound(vec![
+                "linux-x86_64-deb".to_string(),
+                "linux-x86_64".to_string(),
+            ])),
+            Some("linux-x86_64-deb, linux-x86_64".to_string()),
+        );
+        assert_eq!(
+            missing_updater_targets(&tauri_plugin_updater::Error::TargetNotFound(
+                "linux-x86_64-appimage".to_string(),
+            )),
+            Some("linux-x86_64-appimage".to_string()),
+        );
+        // Every other failure is a real one and has to keep reporting as such,
+        // on Linux as much as anywhere else.
+        assert!(missing_updater_targets(&tauri_plugin_updater::Error::ReleaseNotFound).is_none());
+        assert!(missing_updater_targets(&tauri_plugin_updater::Error::UnsupportedOs).is_none());
     }
 
     #[test]

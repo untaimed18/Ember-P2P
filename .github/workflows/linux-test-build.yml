@@ -6,10 +6,11 @@ name: Linux test build
 # Debian 13 renamed and does not install by default; the .deb is an ordinary apt
 # install but has to satisfy Debian's own package versions.
 #
-# Deliberately separate from release.yml. Shipping Linux for real still needs
-# updater-manifest work for linux-x86_64 and a decision on AppImage vs .deb as
-# the updater artifact, and this workflow settles none of that: it never touches
-# a signing key, never creates a release, and only runs when someone asks it to.
+# Separate from release.yml, which now builds and signs Linux on every `v*` tag
+# and is the only thing that publishes. This one exists for the questions a tag
+# cannot answer on demand: whether a change still packages, and whether a fault
+# a tester reports is the distro or Ember. It never touches a signing key, never
+# creates a release, and only runs when someone asks it to.
 #
 # Two jobs, because the distro an AppImage is built on decides what it can run
 # on. glibc is the one thing an AppImage does not bundle, and it is only
