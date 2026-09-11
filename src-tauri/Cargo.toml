@@ -69,6 +69,12 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-deep-link = "2"
 
 tauri-plugin-process = "2"
+# Desktop notifications for the events that happen while nobody is looking at
+# the window: a download finishing, a friend coming online, a chat message.
+# Only ever reached through our own `show_notification` command — the plugin's
+# JS API is not exposed to the webview, so the text is composed (and localized)
+# in the frontend and the OS call is made here.
+tauri-plugin-notification = "2"
 # In-app auto-update: fetches the signed `latest.json` manifest from
 # GitHub Releases, verifies the bundle against the minisign `pubkey` in
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
@@ -138,6 +144,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # `SetThreadExecutionState`, the sleep inhibitor held during transfers
+    # (see `src/power.rs`).
+    "Win32_System_Power",
     "Win32_System_Threading",
 ] }
 

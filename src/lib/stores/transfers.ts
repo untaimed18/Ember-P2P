@@ -1,9 +1,12 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { Transfer } from '$lib/types';
 import { getTransfers } from '$lib/api/transfers';
-import { withTimeout } from '$lib/utils';
+import { formatBytes, withTimeout } from '$lib/utils';
+import { notify, shouldNotify } from '$lib/notifications';
+import { transferFailureReasonText } from '$lib/i18n';
+import * as m from '$lib/paraglide/messages';
 
 interface ProgressPayload {
   id: string;
@@ -458,6 +461,78 @@ function flushProgress() {
   }
 }
 
+/**
+ * Transfer ids whose terminal outcome has already been announced.
+ *
+ * The backend can re-emit a terminal event for a row it has already finished,
+ * and the store's own D30 guard only stops that from *changing* the row — it
+ * does not stop a second notification. Keying on the id rather than on the
+ * row's status handles the reverse race too: if the reconciling poll marks the
+ * row `completed` a few milliseconds before the event is delivered, a
+ * status-based check would swallow the one notification the user wanted.
+ *
+ * Cleared per id by {@link forgetTransfer}, so a row that is removed and
+ * re-added (a re-download of the same file) can announce again.
+ */
+const announcedTerminal = new Set<string>();
+
+/**
+ * The download row a terminal event refers to, or `null` when the event is not
+ * about a download worth telling the user about.
+ *
+ * Uploads are excluded on purpose: an upload session ends every time a peer
+ * disconnects, dozens of times an hour on a well-seeded library, and none of
+ * those endings is news. The direction comes from the event when the backend
+ * sent one and from the stored row otherwise, exactly as the listeners do.
+ */
+function finishedDownloadRow(id: string, direction?: string): Transfer | null {
+  if (announcedTerminal.has(id)) return null;
+  const existing = get(transfers).find((t) => t.id === id);
+  const isUpload = direction === 'upload' || existing?.direction === 'upload';
+  if (isUpload || !existing) return null;
+  // Claimed only once the row is one we would actually announce, so an event
+  // that arrives before the row exists does not burn the id.
+  announcedTerminal.add(id);
+  return existing;
+}
+
+/** Announce a finished download. */
+function notifyDownloadFinished(id: string, direction?: string): void {
+  if (!shouldNotify('download_complete')) return;
+  const row = finishedDownloadRow(id, direction);
+  if (!row) return;
+  void notify(
+    'download_complete',
+    m.notify_download_complete_title(),
+    m.notify_download_complete_body({
+      name: row.file_name,
+      size: formatBytes(row.total_size),
+    }),
+  );
+}
+
+/** Announce a failed download, unless the user is the one who stopped it. */
+function notifyDownloadFailed(
+  id: string,
+  direction: string | undefined,
+  error: string | undefined,
+  failureCode: string | undefined,
+): void {
+  // A cancel is a user action with its own visible outcome — the row leaves the
+  // list — so reporting it back as a failure would be telling someone what they
+  // just did.
+  if (failureCode === 'cancelled') return;
+  if (!shouldNotify('download_failed')) return;
+  const row = finishedDownloadRow(id, direction);
+  if (!row) return;
+  const reason = transferFailureReasonText(error, failureCode);
+  void notify(
+    'download_failed',
+    m.notify_download_failed_title({ name: row.file_name }),
+    reason,
+  );
+}
+
 export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
@@ -533,6 +608,11 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
       const { id, direction, ember_verified } = event.payload;
+      // Read the row before the update rather than inside it: a store updater
+      // must stay a pure function of its input, and the download branch below
+      // is unreachable for uploads (they return early), so there is nowhere
+      // inside to hang this without duplicating the direction check.
+      notifyDownloadFinished(id, direction);
       // Row is terminal from here on — reversible-state tracking no longer
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
@@ -583,6 +663,7 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
+      notifyDownloadFailed(id, direction, error, failure_code);
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
       transfers.update((list) => {
@@ -946,6 +1027,7 @@ export function forgetTransfer(id: string) {
   missingFromApiSince.delete(id);
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
+  announcedTerminal.delete(id);
 }
 
 export function cleanupTransferStore() {
@@ -972,6 +1054,7 @@ export function cleanupTransferStore() {
   sourceCountsUpdatedAt.clear();
   lastApiCompleted.clear();
   progressRewindHold.clear();
+  announcedTerminal.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {

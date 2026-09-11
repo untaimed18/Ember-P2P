@@ -26,6 +26,8 @@
     fileOffers as fileOffersStore,
     clearFileOffer,
     clearFileOffersForFriend,
+    rememberFriendName,
+    rememberFriendNames,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
@@ -521,6 +523,10 @@
       friends = list;
       friendsLoaded = true;
       retainChatTabs(list.map((f) => f.user_hash));
+      // Keep the store's name cache current for surfaces that only hold a hash
+      // — desktop notifications in particular, which have to name a friend from
+      // an event payload that carries none.
+      rememberFriendNames(list);
     } catch (e: unknown) {
       if (destroyed || seq !== loadFriendsSeq) return;
       error = toErr(e);
@@ -710,6 +716,7 @@
       // Push the rename through to any open chat tab so the strip
       // and the conversation header don't keep the old nickname.
       renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
+      rememberFriendName(hash, nick);
       // Blur-to-save means the user may already be renaming a different friend
       // by the time this resolves; only close the editor if it is still ours.
       if (editingHash === hash) editingHash = null;

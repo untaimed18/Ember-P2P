@@ -4,16 +4,29 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import { isAppVisible } from '$lib/utils';
 import {
   getFriendRequests,
+  getFriends,
   getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
+  type FriendInfo,
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
 import { toastError, toastSuccess } from '$lib/stores/toast';
+import { notify, shouldNotify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
+/**
+ * Friend hash → nickname, for surfaces that have only a hash in hand.
+ *
+ * Desktop notifications are the reason this exists at the store level rather
+ * than on the Friends page: "Ana is online" has to work on a launch where the
+ * user never opened `/friends`, and `a1b2c3d4… is online` is not a sentence
+ * worth interrupting anyone for. Seeded once during init and kept fresh by
+ * {@link rememberFriendName} from the pages that already hold the list.
+ */
+export const friendNames = writable<Map<string, string>>(new Map());
 export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
@@ -60,6 +73,48 @@ function validFriendHash(raw: unknown): string | null {
 
 function safeEventText(raw: unknown, max = 4096): string {
   return typeof raw === 'string' ? raw.slice(0, max) : '';
+}
+
+/**
+ * Display name for a friend hash, falling back to a short form of the hash.
+ *
+ * The fallback is deliberately still shown rather than suppressing whatever
+ * needed a name: a nickname is empty for a friend added by code who never
+ * chose one, and "someone you added is online" is worse than eight hex digits.
+ */
+export function friendDisplayName(friendHash: string): string {
+  const hash = friendHash.toLowerCase();
+  const known = get(friendNames).get(hash);
+  return known && known.trim() ? known : `${hash.slice(0, 8)}\u2026`;
+}
+
+/** Record (or refresh) one friend's nickname. */
+export function rememberFriendName(friendHash: string, nickname: string): void {
+  const hash = friendHash.toLowerCase();
+  const name = nickname.trim();
+  if (!name) return;
+  friendNames.update((names) => {
+    if (names.get(hash) === name) return names;
+    const next = new Map(names);
+    next.set(hash, name);
+    return next;
+  });
+}
+
+/** Replace the cache from an authoritative list (the Friends page's own load). */
+export function rememberFriendNames(friends: FriendInfo[]): void {
+  friendNames.update((names) => {
+    let changed = false;
+    const next = new Map(names);
+    for (const friend of friends) {
+      const hash = friend.user_hash.toLowerCase();
+      const name = (friend.nickname ?? '').trim();
+      if (!name || next.get(hash) === name) continue;
+      next.set(hash, name);
+      changed = true;
+    }
+    return changed ? next : names;
+  });
 }
 
 function clearSearchTimer(hash: string) {
@@ -176,9 +231,18 @@ export async function initFriendsStore() {
       await listen<{ user_hash: string }>('ember:friend-online', (event) => {
         const hash = validFriendHash(event.payload?.user_hash);
         if (!hash) return;
+        // Only notify on an actual offline→online edge. The backend re-emits
+        // this for a friend already in the set (a second session, a heartbeat
+        // that re-confirms presence), and "Ana is online" arriving every few
+        // minutes for a friend who never left is the fastest way to get the
+        // whole feature switched off.
+        const wasOnline = get(onlineFriends).has(hash);
         onlineFriends.update((s) => (s.has(hash) ? s : new Set([...s, hash])));
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
+        if (!wasOnline && shouldNotify('friend_online')) {
+          void notify('friend_online', m.notify_friend_online({ name: friendDisplayName(hash) }));
+        }
       }),
     );
     registered.push(
@@ -216,6 +280,17 @@ export async function initFriendsStore() {
           next.set(hash, (next.get(hash) || 0) + 1);
           return next;
         });
+        // Same gate as the badge above, and for the same reason: a message the
+        // user is watching arrive is not news. The preview is capped hard —
+        // the shell renders it outside anything the webview controls, and the
+        // backend strips direction overrides from whatever gets there.
+        if (shouldNotify('friend_message')) {
+          void notify(
+            'friend_message',
+            friendDisplayName(hash),
+            safeEventText(p.message, 200),
+          );
+        }
       }),
     );
     registered.push(
@@ -237,6 +312,13 @@ export async function initFriendsStore() {
           // Bound the list so a misbehaving friend cannot grow it without end.
           return [...rest, { user_hash, file_hash, file_name, file_size, ember_file_hash }].slice(-20);
         });
+        if (shouldNotify('friend_message')) {
+          void notify(
+            'friend_message',
+            m.notify_file_offer_title({ name: friendDisplayName(user_hash) }),
+            file_name,
+          );
+        }
       }),
     );
     registered.push(
@@ -247,6 +329,13 @@ export async function initFriendsStore() {
           if (!sender_hash) return;
           const nickname = safeEventText(event.payload?.nickname, 128);
           const verified = event.payload?.verified;
+          // Only for a request that is genuinely new. The backend can emit the
+          // same one twice (see the dedupe note below), and a duplicate must
+          // not produce a second notification even though the merge below is
+          // idempotent.
+          const alreadyPending = get(friendRequests).some(
+            (r) => r.sender_hash === sender_hash,
+          );
           // Optimistic merge from the event payload so we don't pay
           // for a full DB round-trip on every inbound request. The
           // backend may emit the same logical request twice in quick
@@ -285,6 +374,15 @@ export async function initFriendsStore() {
           // we don't carry on the event). Coalesces bursts into a
           // single fetch.
           scheduleFriendRequestRefetch();
+
+          if (!alreadyPending && shouldNotify('friend_request')) {
+            const name = nickname.trim() || `${sender_hash.slice(0, 8)}\u2026`;
+            void notify(
+              'friend_request',
+              m.notify_friend_request_title(),
+              m.notify_friend_request_body({ name }),
+            );
+          }
         },
       ),
     );
@@ -316,7 +414,9 @@ export async function initFriendsStore() {
         // the reply the user was waiting for arrives with no sign at all.
         friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
         scheduleFriendRequestRefetch();
-        const name = safeEventText(event.payload?.nickname, 128) || `${hash.slice(0, 8)}\u2026`;
+        const nickname = safeEventText(event.payload?.nickname, 128);
+        rememberFriendName(hash, nickname);
+        const name = nickname || `${hash.slice(0, 8)}\u2026`;
         toastSuccess(m.friends_auto_confirmed({ name }));
       }),
     );
@@ -432,6 +532,17 @@ export async function initFriendsStore() {
   } catch (e) {
     noteFriendsSeedFailure('getOnlineFriends', e);
   }
+
+  // Names, so a notification raised before the user has opened /friends can
+  // still say who it is about. Last of the seeds because nothing blocks on it:
+  // `friendDisplayName` degrades to a short hash until this lands.
+  try {
+    const friends = await getFriends();
+    if (myEpoch !== storeEpoch) return;
+    rememberFriendNames(friends);
+  } catch (e) {
+    noteFriendsSeedFailure('getFriends', e);
+  }
 }
 
 export function clearUnread(friendHash: string) {
@@ -483,6 +594,7 @@ export function cleanupFriendsStore() {
   searchTimers.clear();
   recentChatSigs.clear();
   onlineFriends.set(new Set());
+  friendNames.set(new Map());
   unreadCounts.set(new Map());
   friendRequests.set([]);
   searchingFriends.set(new Set());

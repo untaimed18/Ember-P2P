@@ -22,10 +22,12 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+mod background;
 mod bandwidth;
 mod commands;
 mod geoip;
 mod network;
+mod power;
 mod search;
 pub mod security;
 mod sharing;
@@ -494,6 +496,7 @@ pub fn run() {
         .manage(commands::updater::UpdaterService::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -876,7 +879,21 @@ pub fn run() {
                     settings.close_to_tray_behavior.clone(),
                 )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
+                runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
             });
+
+            // Seed the schedule/sleep snapshot and apply whatever bandwidth
+            // window is open *before* the first background tick, so a profile
+            // whose overnight rule is in force does not spend its first second
+            // running at the daytime cap — and so Settings, which can be opened
+            // inside that second, does not report "no schedule" while one
+            // applies.
+            {
+                let state = app.state::<AppState>();
+                background::seed_status(&state, &settings);
+                background::apply_effective_limits(&state, &settings);
+            }
+            background::spawn(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -1943,6 +1960,8 @@ pub fn run() {
             commands::collections::download_collection_files,
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
+            commands::system::show_notification,
+            commands::system::get_runtime_status,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,

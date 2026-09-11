@@ -13,5 +13,6 @@ pub mod settings;
 pub mod sharing;
 pub mod speed_test;
 pub mod statistics;
+pub mod system;
 pub mod transfers;
 pub mod updater;

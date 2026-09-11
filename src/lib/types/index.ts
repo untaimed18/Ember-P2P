@@ -905,4 +905,85 @@ export interface AppSettings {
   auto_check_updates: boolean;
   /** How often the automatic background update check may run. */
   update_check_frequency: 'daily' | 'weekly' | 'monthly';
+
+  /** Master switch for desktop notifications. Off silences every category
+   *  below, and the backend re-checks it so a stale renderer cannot notify
+   *  after it was turned off. */
+  notifications_enabled: boolean;
+  /** Only notify while Ember is not the focused window (including hidden to
+   *  tray). On by default, which is what makes `notifications_enabled`
+   *  defaulting to on non-intrusive for an upgrading profile. */
+  notifications_only_when_unfocused: boolean;
+  notify_download_complete: boolean;
+  notify_download_failed: boolean;
+  notify_friend_online: boolean;
+  /** Friend chat messages and incoming file offers. */
+  notify_friend_message: boolean;
+  notify_friend_request: boolean;
+  /** Messages in joined rooms. The one category that defaults **off** — a room
+   *  can carry hundreds of messages an hour. Muted rooms and ignored members
+   *  are excluded regardless. */
+  notify_channel_message: boolean;
+
+  /** Hold a system sleep inhibitor while a transfer is working, so an
+   *  overnight download survives the OS idle timer. Only the system is kept
+   *  awake; the display is free to turn off. Honored where
+   *  `RuntimeStatus.sleep_inhibit_supported` is true. */
+  prevent_sleep_while_active: boolean;
+
+  /** Apply {@link bandwidth_schedule} instead of using the manual speed limits
+   *  at every hour of every day. */
+  bandwidth_schedule_enabled: boolean;
+  /** Ordered timetable of clock-driven caps. The first rule whose window is
+   *  open wins; when none is, the manual limits apply. */
+  bandwidth_schedule: BandwidthScheduleRule[];
+}
+
+/** One window of the bandwidth timetable.
+ *
+ *  `start_minute` / `end_minute` are minutes from local midnight. When
+ *  `end_minute <= start_minute` the window crosses midnight and `days` names
+ *  the day it **opens**, so `Mon 22:00 → 06:00` needs only Monday ticked.
+ *  Mirrors `BandwidthScheduleRule` in
+ *  `src-tauri/src/bandwidth/schedule.rs`. */
+export interface BandwidthScheduleRule {
+  id: string;
+  enabled: boolean;
+  label: string;
+  /** Weekday bitmask: bit 0 = Monday … bit 6 = Sunday. */
+  days: number;
+  /** Inclusive start, 0–1439. */
+  start_minute: number;
+  /** Exclusive end, 1–1440. 1440 is midnight at the end of the day. */
+  end_minute: number;
+  /** Bytes/sec while in force; 0 is unlimited, as in `AppSettings`. */
+  max_upload_speed: number;
+  max_download_speed: number;
+}
+
+/** The schedule rule in force right now. */
+export interface ActiveScheduleRule {
+  id: string;
+  label: string;
+  /** Exclusive end of the open window, minutes from local midnight. */
+  end_minute: number;
+}
+
+/** State that changes without anybody pressing anything: which bandwidth
+ *  window is open and whether sleep is being deferred.
+ *
+ *  Seeded by `get_runtime_status` and refreshed by the `ember:runtime-status`
+ *  event, which the backend emits only on change. */
+export interface RuntimeStatus {
+  /** Caps actually in force, whatever their source. Equal to the manual
+   *  settings unless {@link schedule} is set. */
+  effective_upload_speed: number;
+  effective_download_speed: number;
+  /** Absent when the manual limits are in force. */
+  schedule?: ActiveScheduleRule;
+  /** Whether this platform can hold a sleep inhibitor at all. False means the
+   *  `prevent_sleep_while_active` toggle would do nothing, so the UI disables
+   *  it rather than offering a dead switch. */
+  sleep_inhibit_supported: boolean;
+  sleep_inhibit_held: boolean;
 }

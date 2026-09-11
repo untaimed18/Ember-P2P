@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { listChannels, listChannelTransfers, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
 import { toast } from '$lib/stores/toast';
+import { notify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
 
 export const channels = writable<ChannelInfo[]>([]);
@@ -460,6 +461,11 @@ function maybeToastChannelMessage(channelId: string, message: string, senderPubk
   const preview = previewText(message);
   if (!preview) return;
   toast(m.channels_message_toast({ name, preview }));
+  // Past every suppression the toast already applies — muted room, ignored
+  // member, room being read, the per-room gap — so a desktop notification can
+  // never say something the in-app toast decided not to. The notification's own
+  // category switch is off by default; see `notify_channel_message`.
+  void notify('channel_message', name, preview);
 }
 
 export async function initChannelsStore() {

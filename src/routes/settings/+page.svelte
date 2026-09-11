@@ -58,7 +58,27 @@
     type RestoreSummary,
   } from '$lib/api/backup';
   import { formatSize, formatSpeed, shortPubkey } from '$lib/utils';
-  import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
+  import { getRuntimeStatus } from '$lib/api/system';
+  import { sendTestNotification } from '$lib/notifications';
+  import {
+    MAX_RULE_LABEL_CHARS,
+    MAX_SCHEDULE_RULES,
+    endTimeValueToMinutes,
+    hasDay,
+    isOvernight,
+    minutesToTimeValue,
+    newScheduleRule,
+    ruleProblem,
+    timeValueToMinutes,
+    toggleDay,
+  } from '$lib/bandwidthSchedule';
+  import type {
+    AppSettings,
+    BandwidthScheduleRule,
+    RuntimeStatus,
+    SpamStats,
+    DownloadHistoryStats,
+  } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
@@ -481,6 +501,156 @@
     settings.max_download_speed = speedResult.recommended_download_limit;
   }
 
+  // ---------------------------------------------------------------------
+  // Runtime status: the bandwidth window in force and the sleep inhibitor.
+  //
+  // Both change on a clock with nobody at the keyboard, so the page seeds from
+  // a command and then follows `ember:runtime-status`, which the backend emits
+  // only when something actually changes.
+  // ---------------------------------------------------------------------
+  let runtimeStatus: RuntimeStatus | null = $state(null);
+
+  let testingNotification = $state(false);
+  let notificationTestError: string | null = $state(null);
+  let notificationTestSent = $state(false);
+
+  async function sendTestNotificationClick() {
+    testingNotification = true;
+    notificationTestError = null;
+    notificationTestSent = false;
+    try {
+      await sendTestNotification(
+        m.notify_test_title(),
+        m.notify_test_body(),
+      );
+      notificationTestSent = true;
+      trackedTimeout(() => { notificationTestSent = false; }, 6000);
+    } catch (e: unknown) {
+      notificationTestError = translateError(e, m.settings_notifications_test_failed());
+    } finally {
+      testingNotification = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Bandwidth schedule editing.
+  //
+  // Rules are edited in place on `settings.bandwidth_schedule` and saved with
+  // the rest of the form, so the schedule follows the same unsaved-changes,
+  // Discard, and stale-revision rules as every other setting. Nothing here
+  // applies a limit — the backend resolves the timetable once a second, and
+  // `runtimeStatus` is what says which rule won.
+  // ---------------------------------------------------------------------
+
+  /** Monday-first labels for the day toggles, in bit order. */
+  const weekdayLabels = $derived([
+    m.schedule_day_mon(),
+    m.schedule_day_tue(),
+    m.schedule_day_wed(),
+    m.schedule_day_thu(),
+    m.schedule_day_fri(),
+    m.schedule_day_sat(),
+    m.schedule_day_sun(),
+  ]);
+
+  function addScheduleRule() {
+    if (!settings) return;
+    if (settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES) return;
+    settings.bandwidth_schedule = [...settings.bandwidth_schedule, newScheduleRule()];
+  }
+
+  function removeScheduleRule(id: string) {
+    if (!settings) return;
+    settings.bandwidth_schedule = settings.bandwidth_schedule.filter((r) => r.id !== id);
+  }
+
+  /** Move a rule up or down. Order is priority — the first open window wins —
+   *  so this is the only way to resolve two rules that overlap. */
+  function moveScheduleRule(index: number, delta: -1 | 1) {
+    if (!settings) return;
+    const next = [...settings.bandwidth_schedule];
+    const target = index + delta;
+    if (index < 0 || index >= next.length || target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    settings.bandwidth_schedule = next;
+  }
+
+  // The three field editors below mutate the rule in place rather than mapping
+  // the array to fresh objects. The name and enabled switch use `bind:`, which
+  // is a mutation, so replacing the array underneath them would mean two
+  // different update styles racing over the same keyed `{#each}` row. Deep
+  // `$state` proxying makes an in-place write reactive either way.
+  function ruleById(id: string): BandwidthScheduleRule | undefined {
+    return settings?.bandwidth_schedule.find((r) => r.id === id);
+  }
+
+  function setRuleDays(id: string, weekday: number) {
+    const rule = ruleById(id);
+    if (rule) rule.days = toggleDay(rule.days, weekday);
+  }
+
+  /**
+   * A time field the user cleared (or left half-typed) parses to nothing.
+   * Keeping the old minute is right — a rule always has a window — but the
+   * input is now visibly blank, and Svelte will not re-apply an attribute whose
+   * bound value did not change. So put the stored time back on screen.
+   */
+  function restoreTimeInput(input: HTMLInputElement, minute: number) {
+    input.value = minutesToTimeValue(minute);
+  }
+
+  function setRuleStart(id: string, input: HTMLInputElement) {
+    const rule = ruleById(id);
+    if (!rule) return;
+    const minute = timeValueToMinutes(input.value);
+    if (minute === null) {
+      restoreTimeInput(input, rule.start_minute);
+      return;
+    }
+    rule.start_minute = minute;
+  }
+
+  function setRuleEnd(id: string, input: HTMLInputElement) {
+    const rule = ruleById(id);
+    if (!rule) return;
+    const minute = endTimeValueToMinutes(input.value);
+    if (minute === null) {
+      restoreTimeInput(input, rule.end_minute);
+      return;
+    }
+    rule.end_minute = minute;
+  }
+
+  /** Localized reason a rule would be refused, or `null` if it is fine. */
+  function scheduleRuleError(rule: BandwidthScheduleRule): string | null {
+    switch (ruleProblem(rule)) {
+      case 'no_days': return m.schedule_error_no_days();
+      case 'empty_window': return m.schedule_error_empty_window();
+      case 'invalid_window': return m.schedule_error_invalid_window();
+      case 'label_too_long': return m.schedule_error_label_too_long({ max: MAX_RULE_LABEL_CHARS });
+      default: return null;
+    }
+  }
+
+  // Both read a `$state` binding through a local const first, for the reason
+  // spelled out at `antileechDraftDirty` below: TS does not narrow a
+  // `$state`-backed getter read directly inside the expression.
+
+  /** The saved rule the backend says is in force, if any. Compared by id so a
+   *  rule the user is mid-edit stops being marked active the moment its window
+   *  no longer matches what was saved. */
+  let activeScheduleRuleId = $derived.by(() => {
+    const status = runtimeStatus;
+    return status?.schedule?.id ?? null;
+  });
+
+  /** Whether any rule would be refused by the backend, which blocks Save. */
+  let scheduleHasError = $derived.by(() => {
+    const current = settings;
+    if (!current) return false;
+    return current.bandwidth_schedule.some((rule) => ruleProblem(rule) !== null);
+  });
+
   let downloadingFilter = $state(false);
   let filterResult: string | null = $state(null);
   let filterResultWarning = $state(false);
@@ -489,10 +659,11 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'backup' | 'about';
 
   const sections: SettingsSection[] = [
     'general',
+    'notifications',
     'downloads',
     'bandwidth',
     'network',
@@ -531,6 +702,7 @@
   function sectionLabel(id: SettingsSection): string {
     switch (id) {
       case 'general': return m.settings_section_general();
+      case 'notifications': return m.settings_section_notifications();
       case 'downloads': return m.settings_section_downloads();
       case 'bandwidth': return m.settings_section_bandwidth();
       case 'network': return m.settings_section_network();
@@ -593,6 +765,26 @@
       })
       .catch((e) => console.error('Failed to register nodes bootstrap listener:', e));
 
+    // Seed the schedule/sleep snapshot, then follow it. The event fires only on
+    // change, so without the seed a page opened between two boundaries would
+    // show nothing at all until the next one.
+    let unlistenRuntimeStatus: UnlistenFn | null = null;
+    getRuntimeStatus()
+      .then((status) => {
+        if (unmounted) return;
+        runtimeStatus = status;
+      })
+      .catch((e) => console.warn('Settings: runtime status unavailable', e));
+    listen<RuntimeStatus>('ember:runtime-status', (event) => {
+      if (unmounted) return;
+      runtimeStatus = event.payload;
+    })
+      .then((fn) => {
+        if (unmounted) fn();
+        else unlistenRuntimeStatus = fn;
+      })
+      .catch((e) => console.error('Failed to register runtime-status listener:', e));
+
     refreshSpamStats();
     refreshHistoryStats();
     getSettings()
@@ -629,6 +821,7 @@
       unmounted = true;
       unlistenIpFilterReload?.();
       unlistenNodesBootstrap?.();
+      unlistenRuntimeStatus?.();
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('keydown', handleKeyboardSave);
       for (const id of activeTimers) clearTimeout(id);
@@ -1749,13 +1942,18 @@
     {#if saveMessage}
       <span class="save-status" class:warning={saveIsWarning} role="status">{saveMessage}</span>
     {/if}
-    {#if hasUnsavedChanges}
+    {#if scheduleHasError}
+      <!-- The backend refuses the whole save for one malformed rule, and the
+           rejection names no rule. Blocking here instead points at the row
+           that is wrong, which is already showing its own reason. -->
+      <span class="save-status warning" role="status">{m.schedule_blocks_save()}</span>
+    {:else if hasUnsavedChanges}
       <span class="unsaved-indicator">{m.settings_unsaved_changes()}</span>
     {/if}
     <button class="ghost" onclick={resetChanges} disabled={!hasUnsavedChanges || !settings}>
       {m.settings_discard()}
     </button>
-    <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges}>
+    <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges || scheduleHasError}>
       {#if saving}
         <span class="spinner"></span> {m.settings_saving()}
       {:else}
@@ -1793,6 +1991,11 @@
                   <line x1="3" y1="5.5" x2="17" y2="5.5"/>
                   <line x1="3" y1="10" x2="17" y2="10"/>
                   <line x1="3" y1="14.5" x2="17" y2="14.5"/>
+                </svg>
+              {:else if section === 'notifications'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5c0 3.5-1.5 4.5-1.5 5.5h12c0-1-1.5-2-1.5-5.5A4.5 4.5 0 0 0 10 2.5z"/>
+                  <path d="M8.25 15a1.75 1.75 0 0 0 3.5 0"/>
                 </svg>
               {:else if section === 'downloads'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2015,6 +2218,26 @@
             </div>
             <ToggleSwitch bind:checked={settings.launch_maximized} ariaLabel={m.settings_launch_maximized_label()} />
           </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_prevent_sleep_label()}</span>
+              <span class="hint">
+                {#if runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
+                  {m.settings_prevent_sleep_unsupported()}
+                {:else}
+                  {m.settings_prevent_sleep_hint()}
+                {/if}
+              </span>
+              {#if runtimeStatus?.sleep_inhibit_held}
+                <span class="live-badge">{m.settings_prevent_sleep_active()}</span>
+              {/if}
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.prevent_sleep_while_active}
+              disabled={!!runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
+              ariaLabel={m.settings_prevent_sleep_label()}
+            />
+          </div>
           <div class="field">
             <span class="field-label">{m.settings_close_behavior_label()}</span>
             <span class="hint">
@@ -2109,6 +2332,130 @@
                 {#if settings.close_to_tray_behavior === 'exit'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
               </button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Notifications -->
+      <section class="card" class:hidden={activeSection !== 'notifications'}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5c0 3.5-1.5 4.5-1.5 5.5h12c0-1-1.5-2-1.5-5.5A4.5 4.5 0 0 0 10 2.5z"/>
+              <path d="M8.25 15a1.75 1.75 0 0 0 3.5 0"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.settings_section_notifications()}</h3>
+            <p class="card-desc">{m.settings_notifications_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notifications_enabled_label()}</span>
+              <span class="hint">{m.settings_notifications_enabled_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notifications_enabled}
+              ariaLabel={m.settings_notifications_enabled_label()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notifications_unfocused_label()}</span>
+              <span class="hint">{m.settings_notifications_unfocused_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notifications_only_when_unfocused}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notifications_unfocused_label()}
+            />
+          </div>
+
+          <div class="divider"></div>
+
+          <span class="field-label">{m.settings_notifications_events_label()}</span>
+          <span class="hint">{m.settings_notifications_events_hint()}</span>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_download_complete()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_download_complete}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_download_complete()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_download_failed()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_download_failed}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_download_failed()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_friend_online()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_friend_online}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_friend_online()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_friend_message()}</span>
+              <span class="hint">{m.settings_notify_friend_message_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_friend_message}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_friend_message()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_friend_request()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_friend_request}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_friend_request()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_channel_message()}</span>
+              <span class="hint">{m.settings_notify_channel_message_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_channel_message}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_channel_message()}
+            />
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <div class="speed-test-header">
+              <span class="toggle-title">{m.settings_notifications_test_label()}</span>
+              <button class="speed-test-btn" onclick={sendTestNotificationClick} disabled={testingNotification}>
+                {testingNotification ? m.settings_notifications_testing() : m.settings_notifications_test_button()}
+              </button>
+            </div>
+            <span class="hint">{m.settings_notifications_test_hint()}</span>
+            {#if notificationTestSent}
+              <span class="inline-ok">{m.settings_notifications_test_sent()}</span>
+            {/if}
+            {#if notificationTestError}
+              <span class="speed-error">{notificationTestError}</span>
+            {/if}
           </div>
         </div>
       </section>
@@ -2422,6 +2769,30 @@
           </div>
         </div>
         <div class="card-body">
+          {#if runtimeStatus?.schedule}
+            <!-- Without this, a user whose overnight rule is open sees the
+                 manual number in the field and a different speed everywhere
+                 else, and concludes the limit is broken. -->
+            <div class="schedule-active-banner" role="status">
+              <span class="live-dot" aria-hidden="true"></span>
+              <span>
+                {m.schedule_active_banner({
+                  name: runtimeStatus.schedule.label || m.schedule_unnamed_rule(),
+                  until: minutesToTimeValue(runtimeStatus.schedule.end_minute),
+                })}
+              </span>
+              <span class="schedule-active-limits">
+                {m.schedule_active_limits({
+                  up: runtimeStatus.effective_upload_speed === 0
+                    ? m.schedule_unlimited()
+                    : formatSpeed(runtimeStatus.effective_upload_speed),
+                  down: runtimeStatus.effective_download_speed === 0
+                    ? m.schedule_unlimited()
+                    : formatSpeed(runtimeStatus.effective_download_speed),
+                })}
+              </span>
+            </div>
+          {/if}
           <div class="field">
             <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
           </div>
@@ -2439,6 +2810,142 @@
               ariaLabel={m.settings_uss_label()}
             />
           </div>
+
+          <div class="divider"></div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_schedule_label()}</span>
+              <span class="hint">{m.settings_schedule_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.bandwidth_schedule_enabled}
+              ariaLabel={m.settings_schedule_label()}
+            />
+          </div>
+
+          <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled}>
+            {#if settings.bandwidth_schedule.length === 0}
+              <p class="schedule-empty">{m.schedule_empty()}</p>
+            {:else}
+              <p class="hint">{m.schedule_order_hint()}</p>
+            {/if}
+
+            {#each settings.bandwidth_schedule as rule, index (rule.id)}
+              {@const problem = scheduleRuleError(rule)}
+              {@const isActive = settings.bandwidth_schedule_enabled && rule.id === activeScheduleRuleId}
+              <div class="schedule-rule" class:is-active={isActive} class:has-error={!!problem}>
+                <div class="schedule-rule-head">
+                  <ToggleSwitch
+                    bind:checked={rule.enabled}
+                    ariaLabel={m.schedule_rule_enabled_aria()}
+                  />
+                  <input
+                    class="schedule-name"
+                    type="text"
+                    bind:value={rule.label}
+                    maxlength={MAX_RULE_LABEL_CHARS}
+                    placeholder={m.schedule_name_placeholder()}
+                    aria-label={m.schedule_name_placeholder()}
+                  />
+                  {#if isActive}
+                    <span class="live-badge">{m.schedule_active_now()}</span>
+                  {/if}
+                  <div class="schedule-rule-actions">
+                    <button
+                      type="button"
+                      class="icon-btn"
+                      onclick={() => moveScheduleRule(index, -1)}
+                      disabled={index === 0}
+                      aria-label={m.schedule_move_up()}
+                      title={m.schedule_move_up()}
+                    >&#9650;</button>
+                    <button
+                      type="button"
+                      class="icon-btn"
+                      onclick={() => moveScheduleRule(index, 1)}
+                      disabled={index === settings.bandwidth_schedule.length - 1}
+                      aria-label={m.schedule_move_down()}
+                      title={m.schedule_move_down()}
+                    >&#9660;</button>
+                    <button
+                      type="button"
+                      class="icon-btn danger"
+                      onclick={() => removeScheduleRule(rule.id)}
+                      aria-label={m.schedule_remove_rule()}
+                      title={m.schedule_remove_rule()}
+                    >&times;</button>
+                  </div>
+                </div>
+
+                <div class="schedule-days" role="group" aria-label={m.schedule_days_label()}>
+                  {#each weekdayLabels as dayLabel, weekday (weekday)}
+                    <button
+                      type="button"
+                      class="day-chip"
+                      class:selected={hasDay(rule.days, weekday)}
+                      aria-pressed={hasDay(rule.days, weekday)}
+                      onclick={() => setRuleDays(rule.id, weekday)}
+                    >{dayLabel}</button>
+                  {/each}
+                </div>
+
+                <div class="schedule-times">
+                  <label class="schedule-time">
+                    <span>{m.schedule_from()}</span>
+                    <input
+                      type="time"
+                      value={minutesToTimeValue(rule.start_minute)}
+                      onchange={(e) => setRuleStart(rule.id, e.currentTarget)}
+                    />
+                  </label>
+                  <label class="schedule-time">
+                    <span>{m.schedule_to()}</span>
+                    <input
+                      type="time"
+                      value={minutesToTimeValue(rule.end_minute)}
+                      onchange={(e) => setRuleEnd(rule.id, e.currentTarget)}
+                    />
+                  </label>
+                  {#if isOvernight(rule)}
+                    <span class="schedule-overnight">{m.schedule_overnight()}</span>
+                  {/if}
+                </div>
+
+                <div class="schedule-limits">
+                  <!-- `idScope` keeps each rule's two fields from colliding
+                       with every other rule's, and with the manual limits
+                       above, which all share these labels. -->
+                  <SpeedInput
+                    label={m.settings_max_upload_speed()}
+                    idScope={rule.id}
+                    bind:value={rule.max_upload_speed}
+                  />
+                  <SpeedInput
+                    label={m.settings_max_download_speed()}
+                    idScope={rule.id}
+                    bind:value={rule.max_download_speed}
+                  />
+                </div>
+
+                {#if problem}
+                  <span class="schedule-error">{problem}</span>
+                {/if}
+              </div>
+            {/each}
+
+            <button
+              type="button"
+              class="schedule-add"
+              onclick={addScheduleRule}
+              disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
+            >
+              {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
+                ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
+                : m.schedule_add_rule()}
+            </button>
+          </div>
+
           <div class="divider"></div>
           <div class="field speed-test-section">
             <div class="speed-test-header">
@@ -4683,6 +5190,219 @@
     margin-top: 6px;
     color: var(--danger);
     font-size: 12px;
+  }
+
+  .inline-ok {
+    display: block;
+    margin-top: 6px;
+    color: var(--success, var(--accent));
+    font-size: 12px;
+  }
+
+  /* Shared "this is happening right now" marker: the sleep inhibitor being
+     held, and the schedule rule currently in force. */
+  .live-badge {
+    align-self: flex-start;
+    margin-top: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .schedule-active-banner {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    font-size: 13px;
+  }
+
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .schedule-active-limits {
+    margin-left: auto;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .schedule-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* The rules stay readable and editable while the feature is off — they are
+     still what will apply once it is switched on — but are visibly not in
+     force. */
+  .schedule-editor.is-inactive {
+    opacity: 0.62;
+  }
+
+  .schedule-empty {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .schedule-rule {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+
+  .schedule-rule.is-active {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+
+  .schedule-rule.has-error {
+    border-color: var(--danger);
+  }
+
+  .schedule-rule-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .schedule-name {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .schedule-rule-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .icon-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated, var(--bg-surface));
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .icon-btn:hover:not(:disabled) {
+    color: var(--text-primary);
+    border-color: var(--accent);
+  }
+
+  .icon-btn.danger:hover:not(:disabled) {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  .icon-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .schedule-days {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .day-chip {
+    padding: 4px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .day-chip.selected {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .schedule-times {
+    display: flex;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .schedule-time {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .schedule-time input {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .schedule-overnight {
+    padding-bottom: 6px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .schedule-limits {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 10px;
+  }
+
+  .schedule-error {
+    color: var(--danger);
+    font-size: 12px;
+  }
+
+  .schedule-add {
+    align-self: flex-start;
+    padding: 6px 12px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary, var(--text-muted));
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .schedule-add:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .schedule-add:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .spam-stats-grid {
