@@ -1890,6 +1890,11 @@ npm run tauri build</code></pre>
           <li><strong>Settings names the rule in force and the time it runs until,</strong> because a user whose overnight rule is open would otherwise see one number in the field and a different speed everywhere else, and conclude the limit was broken</li>
         </ul>
 
+        <h5>Servers</h5>
+        <ul>
+          <li><strong>The server list says how much room a server has.</strong> Max Users and Max Files/User sit beside the live counts, both sortable, with servers that advertise no limit held at the bottom whichever way you sort &mdash; and one inside a tenth of its user capacity is flagged, because nobody should have to divide two columns in their head on every row. Ember already read all three limits out of <code>server.met</code> and discarded two of them, so a large library now has something to pick a server on: a server that caps each user at a few thousand files cannot represent it, however many users it has</li>
+        </ul>
+
         <h4>Before you upgrade</h4>
 
         <ul>
@@ -1906,6 +1911,9 @@ npm run tauri build</code></pre>
           <li><strong>A peer could put a working hyperlink in a desktop notification.</strong> Linux notification servers parse the body as markup, and Ember passed peer-supplied text &mdash; a file name, a chat preview &mdash; through unescaped, so a file named as an <code>&lt;a href&gt;</code> rendered as a clickable link that the desktop attributed to Ember, outside everything the app&rsquo;s own content policy covers. Markup is escaped now on the platforms that read it</li>
           <li><strong>Peer-dialing diagnostics no longer exist in a release build.</strong> Two harness commands that dial an arbitrary address and ask it for sources were compiled into release binaries, unregistered but present; they and everything only they use are now debug-only, like the rest of that family</li>
           <li><strong>The webview no longer holds file-picker permissions it never used.</strong> Every dialog in Ember is opened from the backend, so the two IPC grants left over from a removed frontend binding are gone</li>
+          <li><strong>A room file transfer could write outside your download folder.</strong> The channel receive path used plain filesystem calls by pathname &mdash; no approved-root check, no identity pin, no refusal of reparse points &mdash; while the name it wrote to was derived from a transfer id decoded straight off the wire. The sending peer therefore chose the path: a symlink planted there was followed and truncated, and a junction at the download folder was traversed on completion, landing a peer&rsquo;s bytes under a peer-chosen name outside the root. It also wrote to a root whose approval had been revoked, which is the condition the re-approval prompt exists to gate. It goes through the same helpers every other download path does now, and a swap underneath a transfer is refused at completion rather than moved into place</li>
+          <li><strong>Adding an eD2K server asks first.</strong> Logging in to a server sends your ed2k user hash, nickname and ports, exposes your public IP, and pushes your entire public share list &mdash; and any renderer request could previously introduce and attach to a server of its choosing. Ember already collects native consent for strictly weaker disclosures, so the destination is now confirmed natively when a server is added, showing the host both as typed and as resolved. Connecting is restricted to servers already in the list so the prompt cannot be stepped around, the default community <code>server.met</code> is exempt by byte-exact comparison, and asking on addition rather than on connect keeps reconnects prompt-free</li>
+          <li><strong>Queue seniority is no longer inherited from a user hash alone.</strong> That hash travels in the clear, so replaying a disconnected peer&rsquo;s hash collected its accrued wait and jumped the queue ahead of everyone who had actually been waiting</li>
         </ul>
 
         <h5>Transfers and limits</h5>
@@ -1914,6 +1922,24 @@ npm run tauri build</code></pre>
           <li><strong>The limit shown in Settings is the one in force.</strong> While Ember&rsquo;s upload slow-start is still finding your line speed it holds uploads below the configured cap, and the banner reported the cap rather than the throttle</li>
           <li><strong>An upload nobody is downloading from stops keeping the machine awake.</strong> An upload row holds its slot whether or not the peer is still asking for blocks, so a peer that connected and went quiet counted as work indefinitely &mdash; the same indefinite hold the stalled-download rule exists to prevent, on the side it could not see</li>
           <li><strong>Sleep is only reported as deferred when it actually is.</strong> If the OS refuses the request, Ember backs off rather than asking every second &mdash; and used to go on claiming the machine was being held awake for the whole of that window</li>
+          <li><strong>A crash in the bandwidth machinery no longer takes your transfers with it silently.</strong> The task that grants bandwidth and the one that re-resolves the schedule had none of the panic containment the network task carries, so a fault in the first aborted every rate-limited transfer for the session with nothing on screen to say why, and a fault in the second left an open throttle window outliving itself. Both are contained now, and the schedule monitor restarts</li>
+        </ul>
+
+        <h5>Uploads</h5>
+        <ul>
+          <li><strong>Uploads no longer stop because KAD did.</strong> The upload gate was keyed to KAD&rsquo;s connection status, which has no part in serving a file &mdash; that needs the shared file, the listener, and for a LowID a server to relay callbacks. So on a session running a server without KAD, the first brief server drop stopped every upload and nothing turned them back on. An explicit Disconnect was also being undone about two seconds later by the reconnect logic, leaving a node that read &ldquo;server connected&rdquo; on screen and refused every upload for the rest of the session</li>
+          <li><strong>Ember was banning the peers it seeded to.</strong> The bad-request counter only ever rose and its expiry was refreshed by every request, so an actively downloading peer&rsquo;s entry never aged out and two infractions any distance apart were enough. Ember then manufactured those infractions itself: the uploader rotates a peer out when others are queued, and the peer&rsquo;s own client answers by asking again. Roughly 19 MB of honest seeding reached a threshold that applies a seven-day IP ban surviving restart &mdash; so an unattended node worked its way through its own swarm. The counter falls again when a peer waits out the window, and a rotation Ember asked for is no longer charged to the peer that complied with it</li>
+          <li><strong>One parts request can no longer be expanded without bound,</strong> and the set of ranges a long-lived session has served is bounded rather than growing for as long as it stays open</li>
+          <li><strong>Three requests that each read an entire shared file to answer about 22 bytes are now metered per connection.</strong> They need no slot, no queue position and no identity, and the small caches in front of them miss every time against a peer cycling more hashes than they hold. A full share listing &mdash; which walks the whole index and can reach 500 KiB in reply to a six-byte request &mdash; is one per connection per minute</li>
+        </ul>
+
+        <h5>Downloads</h5>
+        <ul>
+          <li><strong>A verified part could be committed over another source&rsquo;s repair.</strong> The hash is computed with no lock held, across an fsync and sometimes an 8s wait, and several sources verify the same part by design. In that window another source can find corruption and reopen the gap &mdash; and committing anyway erased the repair and flagged the part verified over bytes nobody had hashed in their current state. That flag persists, survives a restart, and decides what is safe to serve, so Ember advertised and uploaded the unchecked bytes to peers as verified. The commit re-checks inside the write lock and re-hashes instead</li>
+          <li><strong>A cancelled download stopped writing when you cancelled it.</strong> The abandon message was sent in a way that is dropped silently on a full queue, and it was the only mid-queue exit, so a deep queue on a slow volume executed up to about 720 MB of unwanted writes, missed its cleanup budget, and orphaned the part file on Windows</li>
+          <li><strong>Resuming a queued download keeps its place.</strong> With the concurrency cap full, resuming demoted the transfer behind every other entry of the same priority &mdash; invisibly, so it read as the resume having been ignored</li>
+          <li><strong>A resume whose part file is gone starts over</strong> rather than trusting a tracker that still claims progress</li>
+          <li><strong>Multi-source downloads stopped leaking part claims</strong> on the re-queue that fires about once per part, which had been defeating the anti-herding those claims exist for and leaving a download unable to settle. Abandoned compressed fragments are pruned at each exit too; sixteen of them were enough to drop an actively transferring peer, which reconnected and did the same thing again</li>
         </ul>
 
         <h5>Notifications</h5>
@@ -1921,6 +1947,7 @@ npm run tauri build</code></pre>
           <li><strong>A conversation open on a second monitor now notifies.</strong> Having the chat or room on screen was treated as reading it, even with the window unfocused behind something else, so the one case a desktop notification is for was the case that stayed silent</li>
           <li><strong>One unusable notification no longer silences the rest of the session.</strong> A message Ember could not title was treated as proof the desktop had stopped accepting notifications at all, and there was no way back short of restarting</li>
           <li><strong>The burst ceiling counts correctly under concurrent notifications,</strong> rather than letting a handful arriving at once each see a full allowance</li>
+          <li><strong>A notification held back by the burst ceiling no longer suppresses the real one.</strong> The duplicate check recorded as a side effect and ran before the ceiling, so a flurry registered entries for notifications that were never shown and a genuine re-send was then swallowed as a duplicate of something invisible</li>
         </ul>
 
         <h5>Linux</h5>
@@ -1936,6 +1963,40 @@ npm run tauri build</code></pre>
           <li><strong>Save says which rule it is waiting on.</strong> A schedule rule the backend would refuse now blocks Save with the reason on the row, rather than failing the whole save with a message that named no rule &mdash; and a rule the backend would have accepted no longer blocks it, which a label of emoji used to do</li>
           <li><strong>Turning the schedule off takes effect on screen immediately,</strong> instead of leaving the old rule named in the banner for a second after the limits behind it were gone</li>
           <li><strong>A hand-edited schedule cannot cost you every other setting.</strong> A malformed rule is dropped on load, as a shared folder or an out-of-range number already was, rather than resetting the whole profile to defaults</li>
+          <li><strong>The timetable is hidden while the schedule is switched off.</strong> It was dimmed rather than hidden, and a card of day pickers and speed fields governing nothing is a card the reader has to work out is inert. The rules are kept, not discarded &mdash; switching the toggle back brings them straight back &mdash; and the editor still appears, dimmed, when a rule would block Save, so there is no way to be refused a save with nothing on screen to fix</li>
+        </ul>
+
+        <h5>Shared files</h5>
+        <ul>
+          <li><strong>A corrupt catalog could be replaced with an empty one on the next launch.</strong> A crash partway through saving <code>known.met</code> leaves no catalog in place and every byte of it in a backup file. Ember read that absence as &ldquo;new install, nothing shared yet&rdquo;, treated the answer as authoritative, and the first periodic save wrote an empty catalog over the recoverable one. It now detects the interrupted save and recovers instead</li>
+          <li><strong>A damaged catalog keeps the records it could read.</strong> A parse failure partway through, or trailing garbage, used to discard everything; and an unrecognised tag no longer aborts the record it appears in. The safety copy taken at startup is also no longer remade on every launch &mdash; it was producing roughly a gigabyte of timestamped backups per launch against a large catalog &mdash; and a copy that fails can no longer pass itself off as having succeeded</li>
+          <li><strong>A failed catalog save withdraws the sharing it could not record,</strong> so a crash between two stores can no longer leave a file offered to peers against a catalog that says otherwise</li>
+          <li><strong>Picking a folder that is already shared says so.</strong> The folder picker is the operating system&rsquo;s own dialog, which cannot mark what you already share, and re-picking a shared folder looked exactly like adding one: a scanning banner, then nothing new. Ember now tells you which of the two happened</li>
+        </ul>
+
+        <h5>Rooms and friends</h5>
+        <ul>
+          <li><strong>A room relay could go one-way for the rest of its life.</strong> Two sessions to the same peer overlap as a matter of course &mdash; both sides offer a relay over the same roster, so a mutual offer is normal rather than a race &mdash; and a close reported by the losing session deleted the surviving one&rsquo;s outbox. Its reader and socket stayed alive, so messages kept arriving from that peer while everything sent to them was silently discarded. Closes are now matched to the session that owned them</li>
+          <li><strong>Changing the spam filter with search tabs open no longer freezes the network.</strong> A rescore accepted 15,000 rows and walked every learned name for each one while holding a lock the network loop takes on the download-complete path &mdash; and because it blocks inside that loop, UDP receive, every timer and all app communication stopped with it. The work is chunked and yields between chunks now</li>
+        </ul>
+
+        <h5>KAD</h5>
+        <ul>
+          <li><strong>Publish rows in KAD &gt; Searches say what they are publishing.</strong> The Name column was a dash for every &ldquo;Publish file&rdquo; and &ldquo;Publish keyword&rdquo; row, which left nothing to tell them apart: their target is a hash, and the maps holding the readable name are cleared the moment the operation finishes while the row stays listed for another fifteen seconds. Each publish now carries its file name or keyword from the moment it is scheduled</li>
+          <li><strong>Buddy endorsements expire by date rather than by arrival order,</strong> so a flood of short-lived ones can no longer push out live ones, and an endorsement dated implausibly far ahead is refused</li>
+        </ul>
+
+        <h5>Servers</h5>
+        <ul>
+          <li><strong>Server messages survive leaving the tab.</strong> The log belonged to the page, which is destroyed on every navigation, so a server&rsquo;s greeting was gone the moment you looked at anything else &mdash; and anything that arrived while you were away was never recorded at all, because the listener went with the page. It is kept for the session now, with a timestamp on each line, and follows new messages unless you have scrolled up to read</li>
+        </ul>
+
+        <h5>Windows and tables</h5>
+        <ul>
+          <li><strong>The transfer tables stopped resizing themselves.</strong> They asked for fixed column widths and for a width derived from their contents in the same breath, and the second wins &mdash; so columns were sized by their longest cell rather than by the widths you set. One long upload name took the name column from 260 to 549 pixels and pushed two columns off the edge, which is why the layout slid sideways every time a transfer with a long name started or finished. Long text is truncated now, and the columns stay where you put them. All five tables on the page shared the fault</li>
+          <li><strong>The source list of a download sorts, and stays sorted.</strong> Clicking a column in Download Clients did nothing: the rows were always ordered by activity, which sorts the transferring ones by speed, so they rearranged themselves every time a speed ticked. Those columns are sortable now and the choice is remembered, with a tie-break that keeps equal rows in the same order rather than letting arrival order show through as movement. A third click returns to the activity ordering, which is still the more useful one while a download is running</li>
+          <li><strong>Copy and paste work on Linux.</strong> Pasting an eD2K link reported the clipboard as unavailable however much text was on it: the webview Linux uses refuses to read the clipboard programmatically, and refuses the fallback too, and Ember had no other route to it. Both directions go through the operating system&rsquo;s clipboard now, which also makes copying behave the same way everywhere rather than depending on how the click arrived</li>
+          <li><strong>Preview stopped stacking whole-file hashes.</strong> The guard meant to allow one preview at a time was released by the caller&rsquo;s 30-second timeout while the work it was guarding &mdash; a hash of the entire file &mdash; carried on in the background, so clicking Preview again after each timeout started another one. Preview temporary files, up to 64 MiB each, are also no longer kept forever: the previous one is deleted once the new one is written, and a startup sweep clears any left behind by a crash</li>
         </ul>
 
         <h5>Everywhere else</h5>
