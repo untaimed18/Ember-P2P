@@ -19,6 +19,7 @@
   import { copyToClipboard, formatCompactCount } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { toastError } from '$lib/stores/toast';
+  import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
 
   let servers: ServerInfo[] = $state([]);
@@ -29,7 +30,6 @@
   let confirmRemoveAll = $state(false);
   let confirmRemoveOpen = $state(false);
   let pendingRemoveServers: ServerInfo[] = $state([]);
-  let logMessages: string[] = $state([]);
 
   // Add server form
   let newIp = $state('');
@@ -56,7 +56,7 @@
   // ignored on load so a stale or hand-edited localStorage entry
   // can't break the table.
   const VALID_SORT_COLS = new Set([
-    'name', 'ip', 'description', 'users', 'files', 'failed', 'static',
+    'name', 'ip', 'description', 'users', 'maxusers', 'files', 'maxfiles', 'failed', 'static',
   ]);
   let sortCol: string = $state('name');
   let sortAsc = $state(true);
@@ -113,6 +113,32 @@
   let mounted = false;
   let logArea: HTMLDivElement | undefined = $state(undefined);
 
+  // Follow the tail as lines arrive, and land at the tail on mount so
+  // returning to the tab shows the newest messages rather than the oldest
+  // surviving one. Suspended while the user has scrolled up, which only
+  // became possible to do usefully now that the history outlives the page —
+  // yanking them back to the bottom mid-read would undo the fix.
+  const STICK_TO_BOTTOM_SLACK_PX = 24;
+  let logScrollSettled = false;
+  $effect(() => {
+    // Track length only: re-running per entry would re-read the scroll
+    // position after the user moved and defeat the scrolled-up check.
+    const count = $serverLog.length;
+    const el = logArea;
+    if (!el || count === 0) return;
+    if (logScrollSettled) {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (distanceFromBottom > STICK_TO_BOTTOM_SLACK_PX) return;
+    }
+    // First run for this mount: the pane opens at scrollTop 0, which for a
+    // session's worth of restored history is the oldest line, so jump to the
+    // tail unconditionally before the slack check starts applying.
+    logScrollSettled = true;
+    requestAnimationFrame(() => {
+      if (logArea) logArea.scrollTop = logArea.scrollHeight;
+    });
+  });
+
   onMount(() => {
     mounted = true;
     // Restore the user's sort choice BEFORE the first refresh paints
@@ -130,31 +156,22 @@
     const unlisteners: Array<() => void> = [];
     let destroyed = false;
 
-    // Sequential listen + rollback on partial failure. Earlier this
-    // used `Promise.all([listen, listen])`, which would leak the
-    // first subscription's unlisten function if the second rejected.
+    // `server-log` is deliberately NOT listened to here: the log is collected
+    // by the network store for the app's lifetime (see `stores/serverLog.ts`),
+    // because this component is destroyed on every tab switch and took the
+    // history with it.
     (async () => {
       let u1: (() => void) | null = null;
-      let u2: (() => void) | null = null;
       try {
-        u1 = await listen<{ message: string }>('server-log', (event) => {
-          if (!mounted) return;
-          log(event.payload.message);
-          requestAnimationFrame(() => {
-            if (logArea) logArea.scrollTop = logArea.scrollHeight;
-          });
-        });
-        if (destroyed) { u1(); return; }
-        u2 = await listen<{ status: 'connected' | 'connecting' | 'disconnected' }>('server-status-changed', (_event) => {
+        u1 = await listen<{ status: 'connected' | 'connecting' | 'disconnected' }>('server-status-changed', (_event) => {
           if (!mounted) return;
           refresh();
         });
-        if (destroyed) { u1(); u2(); return; }
-        unlisteners.push(u1, u2);
+        if (destroyed) { u1(); return; }
+        unlisteners.push(u1);
       } catch (e) {
         console.warn('servers: failed to register server event listeners', e);
         if (u1) u1();
-        if (u2) u2();
       }
     })();
 
@@ -234,8 +251,11 @@
   }
 
   function log(msg: string) {
-    const ts = new Date().toLocaleTimeString();
-    logMessages = [...logMessages.slice(-199), `[${ts}] ${msg}`];
+    appendServerLog(msg);
+  }
+
+  function formatLogTime(at: number): string {
+    return new Date(at).toLocaleTimeString();
   }
 
   async function handleConnect(server?: ServerInfo) {
@@ -603,6 +623,16 @@
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); }
   }
 
+  /** Order two advertised limits, keeping "not advertised" (0) at the bottom
+   *  whichever way the column is sorted. Returns a value that, once the
+   *  caller's ascending/descending flip is applied, still places 0 last. */
+  function compareLimit(a: number, b: number): number {
+    if (a === b) return 0;
+    if (a === 0) return sortAsc ? 1 : -1;
+    if (b === 0) return sortAsc ? -1 : 1;
+    return a - b;
+  }
+
   let sortedServers = $derived.by(() => {
     const sorted = [...servers];
     sorted.sort((a, b) => {
@@ -624,7 +654,13 @@
         }
         case 'description': cmp = a.description.localeCompare(b.description); break;
         case 'users': cmp = a.user_count - b.user_count; break;
+        // Servers that don't advertise a limit report 0. Sort those last in
+        // both directions rather than letting them monopolise the "smallest
+        // capacity" end, where they would bury the small servers the column
+        // exists to find.
+        case 'maxusers': cmp = compareLimit(a.max_users, b.max_users); break;
         case 'files': cmp = a.file_count - b.file_count; break;
+        case 'maxfiles': cmp = compareLimit(perUserFileLimit(a), perUserFileLimit(b)); break;
         case 'failed': cmp = a.fail_count - b.fail_count; break;
         case 'static': cmp = Number(a.is_static) - Number(b.is_static); break;
       }
@@ -645,6 +681,40 @@
   function formatCount(n: number): string {
     if (n === 0) return '\u2014';
     return formatCompactCount(n);
+  }
+
+  /** The per-user file limit to show for a server.
+   *
+   *  The soft limit is the one that actually bites — eMule caps what it offers
+   *  at `min(soft, 200)` — but a server may advertise only a hard limit, and
+   *  reporting "no limit" for one that has stated a cap of 5,000 is the wrong
+   *  answer. Falls back so the column says something whenever the server said
+   *  anything. */
+  function perUserFileLimit(server: ServerInfo): number {
+    return server.soft_files || server.hard_files;
+  }
+
+  /** Fraction of the server's user capacity currently in use, or null when the
+   *  server doesn't advertise a capacity (most don't). */
+  function userCapacityRatio(server: ServerInfo): number | null {
+    if (server.max_users === 0 || server.user_count === 0) return null;
+    return server.user_count / server.max_users;
+  }
+
+  // The point of knowing the capacity is knowing when a server is about to run
+  // out of it, so flag the last tenth rather than making the user divide two
+  // columns in their head on every row.
+  const NEAR_CAPACITY_RATIO = 0.9;
+
+  function isNearUserCapacity(server: ServerInfo): boolean {
+    const ratio = userCapacityRatio(server);
+    return ratio !== null && ratio >= NEAR_CAPACITY_RATIO;
+  }
+
+  function capacityHint(server: ServerInfo): string | undefined {
+    const ratio = userCapacityRatio(server);
+    if (ratio === null) return undefined;
+    return m.servers_capacity_used({ percent: Math.min(100, Math.round(ratio * 100)) });
   }
 
   function handleKeydownAdd(e: KeyboardEvent) {
@@ -827,8 +897,14 @@
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('users')} onclick={() => toggleSort('users')} onkeydown={(e) => sortOnKey(e, () => toggleSort('users'))}>
                   {m.servers_col_users()}{sortIndicator('users')}
                 </th>
+                <th class="sortable num" tabindex="0" role="columnheader" title={m.servers_col_max_users_hint()} aria-sort={ariaSortValue('maxusers')} onclick={() => toggleSort('maxusers')} onkeydown={(e) => sortOnKey(e, () => toggleSort('maxusers'))}>
+                  {m.servers_col_max_users()}{sortIndicator('maxusers')}
+                </th>
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('files')} onclick={() => toggleSort('files')} onkeydown={(e) => sortOnKey(e, () => toggleSort('files'))}>
                   {m.servers_col_files()}{sortIndicator('files')}
+                </th>
+                <th class="sortable num" tabindex="0" role="columnheader" title={m.servers_col_max_files_hint()} aria-sort={ariaSortValue('maxfiles')} onclick={() => toggleSort('maxfiles')} onkeydown={(e) => sortOnKey(e, () => toggleSort('maxfiles'))}>
+                  {m.servers_col_max_files()}{sortIndicator('maxfiles')}
                 </th>
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('failed')} onclick={() => toggleSort('failed')} onkeydown={(e) => sortOnKey(e, () => toggleSort('failed'))}>
                   {m.servers_col_failed()}{sortIndicator('failed')}
@@ -858,7 +934,11 @@
                   <td class="ip-cell">{server.ip} : {server.port}</td>
                   <td class="desc-cell" title={server.description}><bdi dir="auto">{server.description || '—'}</bdi></td>
                   <td class="num">{formatCount(server.user_count)}</td>
+                  <td class="num" class:near-capacity={isNearUserCapacity(server)} title={capacityHint(server)}>
+                    {formatCount(server.max_users)}
+                  </td>
                   <td class="num">{formatCount(server.file_count)}</td>
+                  <td class="num">{formatCount(perUserFileLimit(server))}</td>
                   <td class="num" class:fail-warn={server.fail_count > 0}>
                     {server.fail_count > 0 ? server.fail_count : '—'}
                   </td>
@@ -969,12 +1049,32 @@
             </div>
             <div class="info-row">
               <span class="info-label">{m.servers_col_users()}</span>
-              <span class="info-value">{connectedServer.user_count.toLocaleString()}</span>
+              <span class="info-value">
+                {connectedServer.user_count.toLocaleString()}
+                {#if connectedServer.max_users > 0}
+                  <span class="muted">/ {connectedServer.max_users.toLocaleString()}</span>
+                {/if}
+              </span>
             </div>
             <div class="info-row">
               <span class="info-label">{m.servers_col_files()}</span>
               <span class="info-value">{connectedServer.file_count.toLocaleString()}</span>
             </div>
+            {@const perUserLimit = perUserFileLimit(connectedServer)}
+            {#if perUserLimit > 0}
+              <!-- The limit that decides how much of the user's library this
+                   server can actually index, which is exactly the thing worth
+                   knowing while connected to it. -->
+              <div class="info-row">
+                <span class="info-label">{m.servers_col_max_files()}</span>
+                <span class="info-value">
+                  {perUserLimit.toLocaleString()}
+                  {#if connectedServer.hard_files > perUserLimit}
+                    <span class="muted">({m.servers_hard_limit({ count: connectedServer.hard_files.toLocaleString() })})</span>
+                  {/if}
+                </span>
+              </div>
+            {/if}
           {:else if connecting}
             <div class="info-row">
               <span class="info-label">{m.servers_info_status()}</span>
@@ -1001,17 +1101,17 @@
   <div class="server-lower">
     <div class="log-toolbar">
       <span class="toolbar-label">{m.servers_log_title()}</span>
-      <button class="ghost btn-sm" onclick={() => (logMessages = [])}>{m.common_clear()}</button>
+      <button class="ghost btn-sm" onclick={clearServerLog}>{m.common_clear()}</button>
     </div>
     <div class="log-area" bind:this={logArea}>
-      {#if logMessages.length === 0}
+      {#if $serverLog.length === 0}
         <span class="log-placeholder">{m.servers_log_placeholder()}</span>
       {:else}
-        <!-- Unkeyed on purpose: the list is append-only and two identical
-             lines can share a second-resolution timestamp, which Svelte 5
-             treats as a duplicate key and throws on (in production too). -->
-        {#each logMessages as msg}
-          <div class="log-line"><bdi dir="auto">{msg}</bdi></div>
+        {#each $serverLog as entry (entry.id)}
+          <div class="log-line">
+            <span class="log-time">{formatLogTime(entry.at)}</span>
+            <bdi dir="auto">{entry.message}</bdi>
+          </div>
         {/each}
       {/if}
     </div>
@@ -1326,6 +1426,13 @@
     font-weight: 600;
   }
 
+  /* A server within a tenth of its user capacity may refuse the connection, so
+     it is worth spotting before picking it out of the list. */
+  .near-capacity {
+    color: var(--warning);
+    font-weight: 600;
+  }
+
   /* Side panel */
   .server-side-panel {
     width: 300px;
@@ -1464,6 +1571,13 @@
     padding: 1px 0;
     white-space: pre-wrap;
     word-break: break-all;
+  }
+
+  /* Dimmed so a column of timestamps doesn't compete with the messages
+     themselves, which is what the user is scanning for. */
+  .log-time {
+    color: var(--text-muted);
+    margin-right: 8px;
   }
 
   .empty-state.compact {

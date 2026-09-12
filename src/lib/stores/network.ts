@@ -8,6 +8,7 @@ import { withTimeout } from '$lib/utils';
 import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+import { appendServerLog } from '$lib/stores/serverLog';
 import * as m from '$lib/paraglide/messages';
 import { translateError } from '$lib/i18n';
 
@@ -398,6 +399,16 @@ export async function initNetworkStore() {
       if (msg) {
         toastWarning(translateError(msg, msg));
       }
+    }));
+    // Registered here, alongside `server-status-changed`, so the log survives
+    // leaving the Servers tab: the page component is destroyed on every
+    // navigation, and while it owned this listener the server's greeting was
+    // both forgotten and, for anything that arrived while the user was
+    // elsewhere, never recorded. Nothing replays it — the backend emits and
+    // forgets — so the listener has to outlive the view.
+    registered.push(await listen<{ message: string }>('server-log', (event) => {
+      const message = event.payload?.message;
+      if (typeof message === 'string') appendServerLog(message);
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       const status = narrowServerStatus(event.payload?.status);

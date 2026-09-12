@@ -234,9 +234,172 @@ pub async fn get_runtime_status(
     Ok(crate::background::snapshot(&state))
 }
 
+/// Ceiling on clipboard text crossing the IPC boundary, in characters.
+///
+/// Generous next to the longest thing the app actually moves — a page of eD2K
+/// links is a few hundred characters each — while bounding what an unrelated
+/// clipboard (a copied document, a spreadsheet) can make us allocate and hand
+/// the renderer on a paste.
+///
+/// The two directions treat the cap differently on purpose. A read truncates,
+/// because the alternative is refusing to paste at all over something the user
+/// did not choose to put there, and the caller rejects an over-long paste on
+/// its own terms anyway. A write refuses, because silently copying a prefix
+/// hands the user a corrupted link they have no way to notice.
+const MAX_CLIPBOARD_CHARS: usize = 1_000_000;
+
+/// Truncate on a character boundary, returning the text and whether anything
+/// was dropped.
+fn cap_chars(text: &str, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => (text[..byte_idx].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// The one clipboard handle, kept for the life of the process.
+///
+/// Deliberately not a fresh `arboard::Clipboard` per call. On X11 and Wayland
+/// the clipboard has no storage of its own: the contents are *owned* by a live
+/// window that is expected to answer every other process's requests for them.
+/// `arboard` destroys that window when its last handle drops, and tries to
+/// hand the contents to a clipboard manager on the way out — so a handle
+/// created per call meant that on any desktop without a clipboard manager
+/// running, a copied eD2K link was discarded the instant the command returned,
+/// and where one *was* running every copy still paid up to 100 ms waiting for
+/// the handover. Holding the handle keeps us the owner for as long as the app
+/// is up, which is the lifetime a user expects a copy to have.
+///
+/// Free on Windows, where `arboard::Clipboard` is a zero-sized shim that opens
+/// and closes the real clipboard around each operation (Windows only permits
+/// one holder system-wide, so nothing may hold it open).
+///
+/// Statics are never dropped, so arboard's hand-off-on-exit does not run: on
+/// X11 without a clipboard manager, a copy is lost when Ember exits. That is
+/// the ordinary X11 contract for any application, and paying a shutdown stall
+/// to improve on it is not worth it for a link the user has almost certainly
+/// already pasted.
+static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+
+/// Run `op` against the shared clipboard handle, opening it on first use.
+///
+/// Blocking: every backend does a synchronous round trip (an X11 selection
+/// exchange, a Wayland data-offer, `OpenClipboard` contending with whichever
+/// app holds it), so callers must be on `spawn_blocking`. The mutex serialises
+/// those round trips, which costs nothing for an action only a user click
+/// starts, and the default `arboard` write does not wait for a new owner, so
+/// no operation can park here holding the lock.
+fn with_clipboard<T>(
+    op: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, arboard::Error> {
+    // Recovered rather than propagated: a panic in an earlier caller says
+    // nothing about whether the handle still works, and refusing every later
+    // copy for the rest of the process is worse than retrying.
+    let mut guard = CLIPBOARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clipboard = match guard.as_mut() {
+        Some(clipboard) => clipboard,
+        None => guard.insert(arboard::Clipboard::new()?),
+    };
+    op(clipboard)
+}
+
+/// Read the system clipboard as text.
+///
+/// Exists because the webview cannot do this. `navigator.clipboard.readText()`
+/// is gated on a user-activation + permission model that WebKitGTK — the
+/// webview Tauri uses on Linux — does not grant to programmatic reads at all,
+/// and the `document.execCommand('paste')` fallback is refused there too. So
+/// "Paste eD2K link" reported the clipboard as unavailable on Linux no matter
+/// what was actually on it. The OS clipboard was never the problem; the
+/// renderer just had no way to reach it.
+///
+/// `Ok(None)` means there is no text to be had — an empty or image-only
+/// clipboard, or one that would not open. The caller treats all of those as
+/// "nothing to paste", which is why they are not distinguished here: telling
+/// them apart would mean matching on an error string that is not ours, and an
+/// image-only clipboard is an ordinary state rather than a fault worth
+/// reporting as one.
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+    // `spawn_blocking` because the read is a synchronous cross-process round
+    // trip; see `with_clipboard`.
+    let text = tokio::task::spawn_blocking(|| with_clipboard(|clipboard| clipboard.get_text()).ok())
+        .await
+        .map_err(|error| coded_ctx("clipboard_task_failed", "Clipboard read failed", error))?;
+
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    let (text, truncated) = cap_chars(&text, MAX_CLIPBOARD_CHARS);
+    if truncated {
+        tracing::debug!("Clipboard read truncated to {MAX_CLIPBOARD_CHARS} characters");
+    }
+    Ok(Some(text))
+}
+
+/// Write text to the system clipboard.
+///
+/// Copying works in the webview more often than pasting does, but not
+/// everywhere: `navigator.clipboard.writeText()` needs a secure context and a
+/// live user activation, so a copy triggered from a context menu or after an
+/// `await` can be refused. Routing it through here makes the affordance behave
+/// the same on every platform rather than depending on how the click arrived.
+#[tauri::command]
+pub async fn write_clipboard_text(text: String) -> Result<(), String> {
+    let (text, truncated) = cap_chars(&text, MAX_CLIPBOARD_CHARS);
+    if truncated {
+        return Err(coded_ctx(
+            "clipboard_text_too_long",
+            "That is too much text to copy at once",
+            MAX_CLIPBOARD_CHARS,
+        ));
+    }
+    // `spawn_blocking` and the shared handle: see `with_clipboard`. The handle
+    // is what makes the copy outlive this call on X11/Wayland, where the
+    // clipboard is owned rather than stored.
+    tokio::task::spawn_blocking(move || {
+        with_clipboard(|clipboard| clipboard.set_text(text)).map_err(|error| {
+            coded_ctx(
+                "clipboard_write_failed",
+                "The system clipboard could not be written",
+                error,
+            )
+        })
+    })
+    .await
+    .map_err(|error| coded_ctx("clipboard_task_failed", "Clipboard write failed", error))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cap_chars` slices by a byte index derived from a character count, so a
+    /// clipboard of multi-byte text is where it would panic if the index were
+    /// ever taken as a byte offset. Asserted rather than assumed because the
+    /// input is whatever the user happened to copy.
+    #[test]
+    fn cap_chars_truncates_on_character_boundaries() {
+        assert_eq!(cap_chars("hello", 100), ("hello".to_string(), false));
+        assert_eq!(cap_chars("hello", 5), ("hello".to_string(), false));
+        assert_eq!(cap_chars("hello", 2), ("he".to_string(), true));
+        assert_eq!(cap_chars("", 4), (String::new(), false));
+
+        // Three bytes per character: a byte-indexed cut would land mid-scalar
+        // and panic, and the budget must count characters rather than bytes.
+        let (capped, truncated) = cap_chars("夜明けの街", 3);
+        assert_eq!(capped, "夜明け");
+        assert!(truncated);
+        assert_eq!(cap_chars("夜明けの街", 5), ("夜明けの街".to_string(), false));
+
+        // A combining sequence is more than one `char`, so cutting between the
+        // base and its mark is possible. It must still produce valid UTF-8.
+        let (capped, truncated) = cap_chars("e\u{0301}x", 1);
+        assert_eq!(capped, "e");
+        assert!(truncated);
+    }
 
     #[test]
     fn sanitize_folds_newlines_and_collapses_the_runs() {

@@ -13998,24 +13998,29 @@ struct NetworkState {
     recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
-    /// Shared flag: set to true when network is disconnected so the upload
-    /// listener rejects new connections and terminates active sessions.
-    /// The upload TCP listener binds and starts accepting connections as
-    /// soon as `start_network` runs, independent of KAD/server connection
-    /// state, so this must track `stats.status` (see `start_network`) — a
-    /// node that reads "Disconnected" in the UI must not still be serving
-    /// uploads to peers who remember our IP:port from a prior session.
+    /// Shared flag: set to true when the user is offline so the upload listener
+    /// rejects new connections and terminates active sessions. The upload TCP
+    /// listener binds and starts accepting connections as soon as
+    /// `start_network` runs, independent of KAD/server connection state, so a
+    /// node the user has taken offline must not still be serving uploads to
+    /// peers who remember our IP:port from a prior session.
+    ///
+    /// Explicitly *not* tied to `stats.status`, which only ever reports KAD:
+    /// serving an upload needs the shared file, the TCP listener and — for
+    /// LowID — a server for callbacks, none of which involve KAD, and eD2K is
+    /// opt-in independently of it. Raised by an explicit Disconnect and by the
+    /// shutdown save sequence; cleared by every path back online, including a
+    /// successful server login.
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// The user asked activity to stop: set by an explicit `KadDisconnect`,
     /// cleared by every path back off `Disconnected`.
     ///
     /// Deliberately not `upload_disconnected`, which answers a different
     /// question — "are we accepting inbound connections?" — and is *also*
-    /// raised when an eD2K server drops a session whose KAD side is already
-    /// disconnected, and by the shutdown save sequence. Neither of those is
-    /// the user asking to go offline. This one is only ever set by an explicit
-    /// Disconnect, so it can gate the outbound side: starting download
-    /// workers, dialling friends, and UDP server search.
+    /// raised by the shutdown save sequence, which is not the user asking to go
+    /// offline. This one is only ever set by an explicit Disconnect, so it can
+    /// gate the outbound side: starting download workers, dialling friends, and
+    /// UDP server search, plus whether eD2K auto-reconnect may fire at all.
     ///
     /// Shared rather than a plain `bool` because friend dials outlive the
     /// network task's borrow — one spawned before the click can still be
@@ -23157,6 +23162,21 @@ fn start_kad_search(
     sid
 }
 
+/// eMule `CSearch::SetGUIName`: record what the KAD → Searches list should show
+/// in its Name column for a just-started search. Publish searches are the ones
+/// that need it — their target is a hash of the file or keyword, so the row is
+/// unreadable without the subject being carried alongside. Call right after
+/// `start_kad_search`; a rejected start (`SearchId(0)`, search-storm cap) and an
+/// empty name are both no-ops.
+fn name_kad_search(state: &mut NetworkState, sid: SearchId, name: &str) {
+    if sid == SearchId(0) || name.is_empty() {
+        return;
+    }
+    if let Some(search) = state.search_manager.get_mut(&sid) {
+        search.display_name = name.to_string();
+    }
+}
+
 /// Split a `Transfer::peer_id` into its address and port halves.
 ///
 /// `peer_id` is a display string, not a parsed socket address, and it can carry
@@ -23431,10 +23451,26 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
-    // A session whose KAD side is disconnected has no other reason to be
-    // accepting inbound connections, so re-arm the upload gate on server
-    // drop; otherwise peers keep uploading after we go offline.
-    if state.stats.status == NetworkStatus::Disconnected {
+    // Re-arm the upload gate only if the user actually asked to go offline.
+    //
+    // This used to key off `stats.status == Disconnected`, which is KAD's
+    // status and nothing else (see the `stats.status` comment in the KAD
+    // bootstrap arm). Serving an upload needs the shared file, the TCP
+    // listener and — for LowID — a server to relay callbacks; KAD has no part
+    // in it, and eD2K is deliberately opt-in independently of KAD. So on a
+    // server-only session the first transient server drop (the 120s activity
+    // watchdog, a server-side disconnect, a failed reconnect attempt) silently
+    // stopped every upload, and auto-reconnect never cleared the flag again
+    // because only `initiate_server_connect` and `KadConnect` do. Uploads
+    // stayed dead for the rest of the session with the UI showing a healthy
+    // server.
+    //
+    // `user_offline` is set by an explicit Disconnect and cleared by every
+    // path back online, which is exactly the question being asked here.
+    if state
+        .user_offline
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         state
             .upload_disconnected
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -24031,17 +24067,24 @@ fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
     let conn = state.server_connection.as_ref()?;
     let session = conn.session.as_ref()?;
     let addr = state.server_addr?;
+    // The live session carries the user/file counts but not the capacity
+    // limits — those come from `server.met` (ST_MAXUSERS / ST_SOFTFILES /
+    // ST_HARDFILES) or an extended UDP status reply. Zeroing them here meant
+    // the server the user is actually on was the one row that could never show
+    // its limits, which is backwards. Borrow them from the list entry.
+    let ip = addr.ip().to_string();
+    let limits = state.server_list.find_by_addr(&ip, addr.port());
     Some(ServerInfo {
-        ip: addr.ip().to_string(),
+        ip,
         port: addr.port(),
         name: session.server_name.clone(),
-        description: String::new(),
+        description: limits.map(|s| s.description.clone()).unwrap_or_default(),
         user_count: session.user_count,
         file_count: session.file_count,
-        max_users: 0,
-        soft_files: 0,
-        hard_files: 0,
-        is_static: false,
+        max_users: limits.map(|s| s.max_users).unwrap_or(0),
+        soft_files: limits.map(|s| s.soft_files).unwrap_or(0),
+        hard_files: limits.map(|s| s.hard_files).unwrap_or(0),
+        is_static: limits.is_some_and(|s| s.is_static),
         fail_count: 0,
         client_id: state.server_client_id,
         is_low_id: state.low_id,
@@ -24464,7 +24507,15 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
                     })
                     .unwrap_or_else(|| "Source Search".to_string()),
                 SearchType::FindBuddy => "Find Buddy".to_string(),
-                _ => String::new(),
+                // Publishes carry their own subject (file name / keyword),
+                // stamped by `name_kad_search` at scheduling time — the
+                // publish side-maps cannot answer for them here because they
+                // are cleared as soon as the search completes, while the row
+                // remains listed as "STOPPING" for `STOP_GRACE_SECS`.
+                SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => {
+                    search.display_name.clone()
+                }
+                SearchType::FindNode | SearchType::FindNotes { .. } => String::new(),
             };
             let is_store = matches!(
                 search.search_type,
@@ -35733,6 +35784,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    name_kad_search(&mut state, sid, &file.file_name);
                                     // Fresh publish cycle: reset before lookup-time
                                     // publishes can receive acks.
                                     state.source_publish_acks.insert(file.file_hash, 0);
@@ -35806,6 +35858,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    // The advert is synthetic and has no file
+                                    // name, so label the row by what it is.
+                                    // `kadSearchNameLabel` translates this
+                                    // sentinel on the way to the UI.
+                                    name_kad_search(&mut state, sid, "Ember Rendezvous");
                                     state.ember_rendezvous_published_at = rendezvous_now;
                                     state.source_publish_acks.insert(key, 0);
                                     state.store_source_searches.insert(sid, (key, msg));
@@ -35841,6 +35898,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    name_kad_search(&mut state, sid, &batch.keyword);
                                     state.store_keyword_searches.insert(sid, batch);
                                 }
                             }
@@ -35883,6 +35941,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 closest,
                             );
                             if sid != SearchId(0) {
+                                name_kad_search(
+                                    &mut state,
+                                    sid,
+                                    file_name.as_deref().unwrap_or_default(),
+                                );
                                 let local_note_file = {
                                     let index = local_index.read().await;
                                     index.get_by_hash(&file_hash.to_hex()).cloned()
@@ -40882,7 +40945,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.server_search_age = 0;
                 }
 
+                // An explicit Disconnect has to outlast this tick. `preferred_ed2k_server`
+                // and `server_auto_reconnect` both survive going offline, so without this
+                // guard the disconnect the user just asked for was undone ~2s later by
+                // the drop-recovery path: the server came back on its own while
+                // `upload_disconnected` stayed raised, leaving a session that reads
+                // "server connected" in the UI and refuses every upload.
                 if state.server_auto_reconnect
+                    && !state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
                     && !state.server_connected
                     && state.pending_server_connect.is_none()
                     && state.server_connection.is_none()
@@ -41097,7 +41167,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                     }
                     match resp {
-                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, soft_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
+                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, max_users, soft_files, hard_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                             // eMule: verify challenge to prevent spoofed status responses
                             let expected = server_udp.take_challenge(&addr);
                             if expected != Some(challenge) {
@@ -41107,11 +41177,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 state.server_list.update_server_stats(
                                     &addr.ip().to_string(), tcp_port, user_count, file_count, obfuscation_port_tcp,
                                 );
-                                // Learn the server's soft per-client file limit so
-                                // OP_OFFERFILES gets capped like eMule on the next
-                                // connect (persisted to server.met via ST_SOFTFILES).
-                                state.server_list.update_soft_files(
-                                    &addr.ip().to_string(), tcp_port, soft_files,
+                                // Learn the server's capacity limits: the soft
+                                // per-client file limit so OP_OFFERFILES gets capped
+                                // like eMule on the next connect, plus the user
+                                // capacity and hard file limit the Servers page shows
+                                // (all persisted to server.met as ST_MAXUSERS /
+                                // ST_SOFTFILES / ST_HARDFILES).
+                                state.server_list.update_capacity_limits(
+                                    &addr.ip().to_string(), tcp_port, max_users, soft_files, hard_files,
                                 );
                                 // L11: Store per-server UDP flags for feature gating
                                 state.server_list.update_udp_flags(
@@ -41691,6 +41764,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed2k::server::set_server_flags_mirror(session.server_flags);
                         state.server_reconnect_failures = 0;
                         state.preferred_ed2k_server = Some((ip.clone(), port));
+                        // Being logged in to a server means we are reachable and
+                        // expected to serve, whatever KAD is doing. Only the
+                        // Servers-page path went through `initiate_server_connect`
+                        // and cleared this; auto-reconnect after a drop landed
+                        // here instead and left the gate shut, so uploads stayed
+                        // dead for the rest of the session. The guard keeps an
+                        // explicit Disconnect authoritative.
+                        if !state.user_offline.load(std::sync::atomic::Ordering::Relaxed) {
+                            state
+                                .upload_disconnected
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                         {
                             let last = ed2k::server_list::LastEd2kServer {
                                 ip: ip.clone(),
@@ -46024,65 +46109,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     format!("{:?}", state.firewall_checker.udp_status());
                 update_publish_manager_state(&mut state);
 
-                let cached_s: Vec<KadSearchInfo> = state
-                    .search_manager
-                    .active
-                    .iter()
-                    .map(|(sid, search)| {
-                        let type_name = match search.search_type {
-                            SearchType::FindNode => "Node",
-                            SearchType::FindKeyword => "Keyword",
-                            SearchType::FindSource { .. } => "File",
-                            SearchType::FindNotes { .. } => "Notes",
-                            SearchType::FindBuddy => "Buddy",
-                            SearchType::StoreFile => "Store File",
-                            SearchType::StoreKeyword => "Store Keyword",
-                            SearchType::StoreNotes => "Store Notes",
-                        };
-                        let name = match search.search_type {
-                            SearchType::FindKeyword => "Keyword Search".to_string(),
-                            SearchType::FindSource { .. } => {
-                                // pending_downloads may have been consumed
-                                // already by `try_start_from_known`; fall
-                                // back to whatever the transfer manager
-                                // knows for a display-name.
-                                state.download_source_searches.get(sid)
-                                    .and_then(|(tid, _)| state.pending_downloads.get(tid).map(|pd| pd.file_name.clone()))
-                                    .unwrap_or_else(|| "Source Search".to_string())
-                            }
-                            SearchType::FindBuddy => "Find Buddy".to_string(),
-                            _ => String::new(),
-                        };
-                        let is_store = matches!(search.search_type,
-                            SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes);
-                        let responses = if is_store {
-                            search.closest.len() as u32
-                        } else {
-                            search.results.len() as u32
-                        };
-                        // K11: see `kad_searches_snapshot` for the same
-                        // computation — keep them in sync.
-                        let queried = search.queried.len() as u32;
-                        let responded = search.responded_during_lookup.len() as u32;
-                        let pending = search.pending.len() as u32;
-                        let load_total = queried.saturating_add(pending);
-                        let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
-                        KadSearchInfo {
-                            id: sid.0,
-                            target: search.target.to_hex(),
-                            search_type: type_name.to_string(),
-                            name,
-                            status: if search.completed { "stopping".to_string() } else { "active".to_string() },
-                            load: load_pct,
-                            load_response: responded,
-                            load_total,
-                            packets_sent: queried,
-                            request_answer: pending,
-                            responses,
-                            started_at: search.started_at,
-                        }
-                    })
-                    .collect();
+                // Was a second, hand-copied transcription of
+                // `kad_searches_snapshot` kept in sync by comment alone, and it
+                // had already drifted: the copy never grew the routing-walk
+                // branch of the `responses` count, so whichever of the poll and
+                // the cache answered first decided what FindNode/FindBuddy rows
+                // reported. Call the one implementation instead.
+                let cached_s: Vec<KadSearchInfo> = kad_searches_snapshot(&state);
 
                 let stats_snapshot = state.stats.clone();
 

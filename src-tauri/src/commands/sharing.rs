@@ -1337,6 +1337,22 @@ pub(crate) async fn persist_scan_cursors(
     Ok(())
 }
 
+/// What a successful [`add_shared_folder`] actually did.
+///
+/// Re-adding a folder is a no-op rather than an error, but the two are worth
+/// telling apart when reporting back: the folder picker is the OS dialog, which
+/// cannot mark the folders already being shared, so "you already share this
+/// one" is the only way the user finds out — and reporting it as a fresh add
+/// (which is what a bare `Ok(())` made every caller do) is the answer that
+/// leaves them none the wiser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderAddOutcome {
+    /// Newly shared; a background discovery + hash pass is running.
+    Added,
+    /// Already in the shared list, so nothing changed and nothing was scanned.
+    AlreadyShared,
+}
+
 /// eMule-style shared folder addition -- returns IMMEDIATELY.
 /// All discovery and hashing runs in a background task:
 ///   Phase 1: discover files (metadata only) → show in UI via event
@@ -1345,7 +1361,7 @@ pub async fn add_shared_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<(), String> {
+) -> Result<FolderAddOutcome, String> {
     if path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "sharing_folder_path_too_long",
@@ -1464,7 +1480,7 @@ pub async fn add_shared_folder(
     };
     let Some((data, tmp, final_path)) = save_data else {
         info!("Folder {canonical_str} is already shared, skipping duplicate scan");
-        return Ok(());
+        return Ok(FolderAddOutcome::AlreadyShared);
     };
     let mut roots = {
         let config = state.config.read().await;
@@ -1534,7 +1550,10 @@ pub async fn add_shared_folder(
     // every share (including the folder just added) and clears the dirty bit.
     if state.hashing_fs_dirty.load(Ordering::Relaxed) {
         info!("FS changes deferred during pause; running full shared-folder reload");
-        return reload_shared_files(app, state).await;
+        // Still an add from the caller's point of view: the folder went into the
+        // shared list above, and the reload is how it gets scanned.
+        reload_shared_files(app, state).await?;
+        return Ok(FolderAddOutcome::Added);
     }
 
     let local_index = state.local_index.clone();
@@ -1909,21 +1928,37 @@ pub async fn add_shared_folder(
     // hash walk is still mutating them.
     state.register_background_scan(scan_handle).await;
 
-    Ok(())
+    Ok(FolderAddOutcome::Added)
+}
+
+/// Outcome of one trip through the folder picker.
+///
+/// Split rather than a flat "these are shared now" list because the OS dialog
+/// shows a plain folder tree with no way to mark what is already shared, so a
+/// selection that changed nothing is indistinguishable from one that worked
+/// unless the result says so.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct SharedFolderPick {
+    /// Folders this selection newly shared. A background scan is running for
+    /// each.
+    pub added: Vec<String>,
+    /// Folders the user picked that were already in the shared list.
+    pub already_shared: Vec<String>,
 }
 
 /// Open a trusted native directory picker and add the selected folder.
 ///
 /// The renderer never receives authority to submit an arbitrary path to the
 /// sharing mutator: the only registered IPC command obtains its path directly
-/// from the OS picker. The selected path is returned solely so the Library can
-/// update its display; it cannot be replayed as authorization.
+/// from the OS picker. The selected paths are returned solely so the Library can
+/// update its display and report what happened; they cannot be replayed as
+/// authorization.
 #[tauri::command]
 pub async fn pick_shared_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+) -> Result<SharedFolderPick, String> {
     if window.label() != "main" {
         return Err(coded(
             "sharing_picker_wrong_window",
@@ -1960,15 +1995,16 @@ pub async fn pick_shared_folder(
     .map_err(|error| coded_ctx("sharing_picker_task_failed", "Folder picker failed", error))??;
 
     let Some(paths) = selected else {
-        return Ok(Vec::new());
+        return Ok(SharedFolderPick::default());
     };
-    let mut added = Vec::with_capacity(paths.len());
+    let mut result = SharedFolderPick::default();
     let mut first_error: Option<String> = None;
     for path in paths {
         let display_path = path.to_string_lossy().into_owned();
         // One bad folder must not discard the rest of the selection.
         match add_shared_folder(app.clone(), state.clone(), display_path.clone()).await {
-            Ok(()) => added.push(display_path),
+            Ok(FolderAddOutcome::Added) => result.added.push(display_path),
+            Ok(FolderAddOutcome::AlreadyShared) => result.already_shared.push(display_path),
             Err(error) => {
                 tracing::warn!("Selected folder {display_path} was not shared: {error}");
                 if first_error.is_none() {
@@ -1979,14 +2015,16 @@ pub async fn pick_shared_folder(
     }
     // Picking folders and being told nothing at all is worse than the single-add
     // version this replaced, which propagated its error to the UI. Report only
-    // when *nothing* landed: on a partial success the folders that worked are
-    // visible in the library, and failing the whole call would hide them.
-    if added.is_empty() {
+    // when *nothing* landed at all — neither a fresh add nor an
+    // already-shared one, which the caller reports on its own terms. On a
+    // partial success the folders that worked are visible in the library, and
+    // failing the whole call would hide them.
+    if result.added.is_empty() && result.already_shared.is_empty() {
         if let Some(error) = first_error {
             return Err(error);
         }
     }
-    Ok(added)
+    Ok(result)
 }
 
 /// Paths a single drop may carry before it is refused outright. Generous for
@@ -2151,7 +2189,10 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
     let mut failed = 0usize;
     for folder in share_now {
         match add_shared_folder(app.clone(), state.clone(), folder.clone()).await {
-            Ok(()) => added += 1,
+            // A re-drop of an already-shared folder still counts as success
+            // here: the drop confirmation only reports how many landed, and
+            // "already shared" is not a failure to tell the user about.
+            Ok(_) => added += 1,
             Err(error) => {
                 failed += 1;
                 tracing::warn!("Dropped folder {folder} was not shared: {error}");
@@ -2223,7 +2264,8 @@ pub async fn confirm_dropped_folders(
     let mut failed = 0usize;
     for folder in folders {
         match add_shared_folder(app.clone(), state.clone(), folder.clone()).await {
-            Ok(()) => added += 1,
+            // See the folder-drop path: an already-shared folder is a success.
+            Ok(_) => added += 1,
             Err(error) => {
                 failed += 1;
                 tracing::warn!("Dropped file's folder {folder} was not shared: {error}");

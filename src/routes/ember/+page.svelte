@@ -24,7 +24,7 @@
     EmberDhtSearchEntry,
     EmberDhtStoreEntry,
   } from '$lib/types';
-  import { formatDurationSecs } from '$lib/utils';
+  import { copyToClipboard, formatDurationSecs } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { checkForUpdates, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
@@ -165,12 +165,9 @@
 
   async function copyText(value: string, key: string) {
     if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-      copiedKey = key;
-    } catch {
-      copiedKey = `${key}:error`;
-    }
+    // See `copyToClipboard`: the webview API alone fails on platforms where
+    // the OS clipboard is fine.
+    copiedKey = (await copyToClipboard(value)) ? key : `${key}:error`;
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = setTimeout(() => { copiedKey = null; }, 1500);
   }

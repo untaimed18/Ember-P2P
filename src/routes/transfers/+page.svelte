@@ -156,15 +156,20 @@
     { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-k-ident', sortField: 'ident_state' },
     { key: 'last_seen', get label() { return m.transfers_col_last_seen(); }, width: 140, minWidth: 110, className: 'col-k-seen', sortField: 'last_seen' },
   ];
-  const CLIENT_COLUMNS: TransferColumn[] = [
-    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client' },
+  // CLIENT_COLUMNS backs the per-download source list (the expanded row and the
+  // "Download Clients" tab). Sortable everywhere the column says something
+  // per-row; the user's choice is persisted via `transfers-cl-sort-field` /
+  // `transfers-cl-sort-asc` (see `ClSortField` and `toggleClSort`), and with no
+  // choice made the rows keep their activity-priority default.
+  const CLIENT_COLUMNS: TransferColumn<ClSortField>[] = [
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client', sortField: 'peer_name' },
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-c-flag' },
-    { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft' },
+    { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft', sortField: 'client_software' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
-    { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed' },
-    { key: 'downloaded', get label() { return m.transfers_col_downloaded(); }, width: 65, minWidth: 65, className: 'col-c-down' },
-    { key: 'parts', get label() { return m.transfers_col_parts(); }, width: 60, minWidth: 50, className: 'col-c-parts' },
-    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 88, className: 'col-c-status' },
+    { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed', sortField: 'speed' },
+    { key: 'downloaded', get label() { return m.transfers_col_downloaded(); }, width: 65, minWidth: 65, className: 'col-c-down', sortField: 'downloaded' },
+    { key: 'parts', get label() { return m.transfers_col_parts(); }, width: 60, minWidth: 50, className: 'col-c-parts', sortField: 'parts' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 88, className: 'col-c-status', sortField: 'status' },
   ];
   const TABLE_COLUMNS: Record<TableKey, TransferColumn[]> = {
     downloads: DOWNLOAD_COLUMNS,
@@ -649,6 +654,79 @@
         return a.i - b.i;
       })
       .map((x) => x.s);
+  }
+
+  // Display order for the source Status column, roughly "how close is this
+  // source to sending us bytes".
+  const SOURCE_STATUS_ORDER: Record<SourceInfo['status'], number> = {
+    transferring: 0,
+    queued: 1,
+    connecting: 2,
+    wait_callback: 3,
+    friend_connect: 4,
+    stalled: 5,
+    queue_full: 6,
+    no_needed_parts: 7,
+    unreachable: 8,
+    completed: 9,
+    failed: 10,
+  };
+
+  /** Sort order for a status this build does not know about: last, with the
+   *  other unhelpful ones. */
+  const UNKNOWN_STATUS_ORDER = 99;
+
+  /**
+   * Order the source rows of one download for display.
+   *
+   * With no column picked this is the activity-priority ordering, which sorts
+   * the transferring tier by speed — fine as a default, but it meant a list the
+   * user had asked to sort by name still reshuffled every time a speed ticked,
+   * because nothing anywhere applied their choice. A picked column now wins
+   * outright, and every comparison falls back to the peer's address so equal
+   * keys resolve the same way on every re-render rather than letting the
+   * arrival order show through as movement.
+   *
+   * Returns a new array; the input is not mutated.
+   */
+  function sortSources(sources: SourceInfo[]): SourceInfo[] {
+    const field = clSortField;
+    if (!field) return sortSourcesByPriority(sources);
+    const dir = clSortAsc ? 1 : -1;
+    const parts = (s: SourceInfo): number => s.available_parts ?? -1;
+    return [...sources].sort((a, b) => {
+      let cmp = 0;
+      switch (field) {
+        case 'peer_name':
+          cmp = sortCollator.compare(a.peer_name || a.ip, b.peer_name || b.ip);
+          break;
+        case 'client_software':
+          cmp = sortCollator.compare(a.client_software || '', b.client_software || '');
+          break;
+        case 'speed':
+          cmp = a.speed - b.speed;
+          break;
+        case 'downloaded':
+          cmp = a.transferred - b.transferred;
+          break;
+        case 'parts':
+          cmp = parts(a) - parts(b);
+          break;
+        case 'status':
+          // `?? UNKNOWN_STATUS_ORDER`: the map is keyed by the declared union,
+          // but the values arrive from the backend at runtime. A status added
+          // there and not here would otherwise make both sides `undefined` and
+          // the comparator return NaN, which is not a valid ordering and would
+          // leave the rows in whatever arrangement the sort happened to stop at.
+          cmp = (SOURCE_STATUS_ORDER[a.status] ?? UNKNOWN_STATUS_ORDER)
+            - (SOURCE_STATUS_ORDER[b.status] ?? UNKNOWN_STATUS_ORDER);
+          break;
+      }
+      if (cmp !== 0) return cmp * dir;
+      // Tie-break on the row's own identity, in a fixed direction: it exists to
+      // make the order deterministic, not to be part of what the user chose.
+      return sortCollator.compare(`${a.ip}:${a.port}`, `${b.ip}:${b.port}`);
+    });
   }
 
   function toErrorMsg(e: unknown): string {
@@ -1246,9 +1324,13 @@
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
   type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
   type KnSortField = 'user_hash' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
+  // No `file_name`: that column shows the parent download's name, which is the
+  // same string on every row here, so sorting by it would do nothing.
+  type ClSortField = 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
   const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
   const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
+  const CL_SORT_FIELDS: ClSortField[] = ['peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
   // localStorage can throw in private mode / on quota-exceeded, and
   // `loadStoredColumnWidths` runs during mount — an escaped throw there
   // aborted page initialization. The sort and column-setup persistence below
@@ -1269,6 +1351,12 @@
   // first) to match the backend.
   let knSortField: KnSortField = $state(KN_SORT_FIELDS.includes(safeGetItem('transfers-kn-sort-field') as KnSortField) ? safeGetItem('transfers-kn-sort-field') as KnSortField : 'last_seen');
   let knSortAsc = $state(safeGetItem('transfers-kn-sort-asc') === 'true');
+  // Source/client list sort. `null` means "no column picked", which keeps the
+  // activity-priority default (`sortSourcesByPriority`) these rows have always
+  // used. A picked column wins outright — the whole point of the fix is that a
+  // source's speed changing must not move its row.
+  let clSortField: ClSortField | null = $state(CL_SORT_FIELDS.includes(safeGetItem('transfers-cl-sort-field') as ClSortField) ? safeGetItem('transfers-cl-sort-field') as ClSortField : null);
+  let clSortAsc = $state(safeGetItem('transfers-cl-sort-asc') !== 'false');
 
   function toggleDlSort(field: DlSortField) {
     if (dlSortField === field) dlSortAsc = !dlSortAsc;
@@ -1295,6 +1383,30 @@
     }
     safeSetItem('transfers-kn-sort-field', knSortField);
     safeSetItem('transfers-kn-sort-asc', String(knSortAsc));
+  }
+  /** Cycle a source-list column: ascending, descending, then back to the
+   *  activity-priority default. The third step matters because that default is
+   *  otherwise unreachable once a column has been picked, and it is the more
+   *  useful ordering while a download is running. */
+  function toggleClSort(field: ClSortField) {
+    if (clSortField !== field) {
+      clSortField = field;
+      // Text columns read best A-Z; numbers and status read best largest- /
+      // most-active-first, matching the Known Clients table.
+      clSortAsc = field === 'peer_name' || field === 'client_software';
+    } else if (clSortAsc) {
+      clSortAsc = false;
+    } else {
+      clSortField = null;
+      clSortAsc = true;
+    }
+    if (clSortField) {
+      safeSetItem('transfers-cl-sort-field', clSortField);
+      safeSetItem('transfers-cl-sort-asc', String(clSortAsc));
+    } else {
+      safeRemoveItem('transfers-cl-sort-field');
+      safeRemoveItem('transfers-cl-sort-asc');
+    }
   }
   function sortArrow(current: string, field: string, asc: boolean): string {
     if (current !== field) return '';
@@ -2285,7 +2397,11 @@
     try {
       const text = await readFromClipboard();
       if (text == null) {
-        transferError = m.kad_clipboard_unavailable();
+        // Not "clipboard unavailable" any more: the read goes through the OS
+        // clipboard now, so the realistic reason to get nothing back is that
+        // there is nothing on it — and reporting a working clipboard as broken
+        // sent users looking for a permissions problem that wasn't there.
+        transferError = m.transfers_clipboard_not_ed2k();
         return;
       }
       await queuePastedLinks(text);
@@ -2621,6 +2737,18 @@
     sortOnKey(event, () => toggleKnSort(sortField));
   }
 
+  function onClientHeaderClick(column: TransferColumn<ClSortField>) {
+    if (Date.now() < suppressHeaderClickUntil) return;
+    if (!column.sortField) return;
+    toggleClSort(column.sortField);
+  }
+
+  function onClientHeaderKeydown(event: KeyboardEvent, column: TransferColumn<ClSortField>) {
+    const sortField = column.sortField;
+    if (!sortField) return;
+    sortOnKey(event, () => toggleClSort(sortField));
+  }
+
   function getFixedColumnKey(table: TableKey): string {
     return TABLE_COLUMNS[table][0].key;
   }
@@ -2667,7 +2795,7 @@
   let visibleUploadColumns = $derived.by(() => getVisibleColumns('uploads') as TransferColumn<UlSortField>[]);
   let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue'));
   let visibleKnownColumns = $derived.by(() => getVisibleColumns('known') as TransferColumn<KnSortField>[]);
-  let visibleClientColumns = $derived.by(() => getVisibleColumns('clients'));
+  let visibleClientColumns = $derived.by(() => getVisibleColumns('clients') as TransferColumn<ClSortField>[]);
 
   function getTableElement(table: TableKey): HTMLTableElement | undefined {
     switch (table) {
@@ -3468,7 +3596,7 @@
       <table
         class="transfer-table dl-table"
         bind:this={downloadTableEl}
-        style={`min-width: max(100%, ${getTableMinWidth('downloads', visibleDownloadColumns) + 32}px);`}
+        style={`width: max(100%, ${getTableMinWidth('downloads', visibleDownloadColumns) + 32}px);`}
       >
         <colgroup>
           <col style="width: 32px;" />
@@ -3635,7 +3763,7 @@
                 </tr>
               {:else}
                 {@const transferPaused = t.status === 'paused'}
-                {@const visibleSources = sortSourcesByPriority(
+                {@const visibleSources = sortSources(
                   expandedSources.filter((s) => transferPaused || s.status !== 'failed'),
                 )}
                 {@const failedCount = expandedSources.length - visibleSources.length}
@@ -3982,7 +4110,7 @@
         <table
           class="transfer-table ul-table"
           bind:this={uploadTableEl}
-          style={`min-width: max(100%, ${getTableMinWidth('uploads', visibleUploadColumns)}px);`}
+          style={`width: max(100%, ${getTableMinWidth('uploads', visibleUploadColumns)}px);`}
         >
           <colgroup>
             {#each visibleUploadColumns as column (column.key)}
@@ -4138,7 +4266,7 @@
         <table
           class="transfer-table queue-table"
           bind:this={queueTableEl}
-          style={`min-width: max(100%, ${getTableMinWidth('queue', visibleQueueColumns)}px);`}
+          style={`width: max(100%, ${getTableMinWidth('queue', visibleQueueColumns)}px);`}
         >
           <colgroup>
             {#each visibleQueueColumns as column (column.key)}
@@ -4298,7 +4426,7 @@
         <table
           class="transfer-table clients-table"
           bind:this={knownTableEl}
-          style={`min-width: max(100%, ${getTableMinWidth('known', visibleKnownColumns)}px);`}
+          style={`width: max(100%, ${getTableMinWidth('known', visibleKnownColumns)}px);`}
         >
           <colgroup>
             {#each visibleKnownColumns as column (column.key)}
@@ -4466,7 +4594,7 @@
         <table
           class="transfer-table clients-table"
           bind:this={clientsTableEl}
-          style={`min-width: max(100%, ${getTableMinWidth('clients', visibleClientColumns)}px);`}
+          style={`width: max(100%, ${getTableMinWidth('clients', visibleClientColumns)}px);`}
         >
           <colgroup>
             {#each visibleClientColumns as column (column.key)}
@@ -4478,18 +4606,25 @@
               {#each visibleClientColumns as column (column.key)}
                 <th
                   class={column.className}
+                  class:sortable={Boolean(column.sortField)}
                   class:resizing={isResizingColumn('clients', column.key)}
                   class:drag-enabled={canDragColumn('clients', column.key)}
                   class:drop-before={isDropBefore('clients', column.key)}
                   class:drop-after={isDropAfter('clients', column.key)}
+                  tabindex={column.sortField ? 0 : undefined}
                   role="columnheader"
                   draggable={canDragColumn('clients', column.key)}
+                  aria-sort={column.sortField ? ariaSortValue(clSortField ?? '', column.sortField, clSortAsc) : undefined}
+                  onclick={() => onClientHeaderClick(column)}
+                  onkeydown={(e) => onClientHeaderKeydown(e, column)}
                   ondragstart={(e) => handleColumnDragStart(e, 'clients', column.key)}
                   ondragover={(e) => handleColumnDragOver(e, 'clients', column.key)}
                   ondrop={(e) => handleColumnDrop(e, 'clients', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">{column.label}</span>
+                  <span class="header-content">
+                    {column.label}{column.sortField ? sortArrow(clSortField ?? '', column.sortField, clSortAsc) : ''}
+                  </span>
                   <button
                     type="button"
                     class="col-resize-handle"
@@ -4507,7 +4642,7 @@
             {#if expandedSources.length > 0 && expandedTransferId}
               {@const clientParent = allDownloads.find((d) => d.id === expandedTransferId)}
               {@const clientPaused = clientParent?.status === 'paused'}
-              {@const clientSources = sortSourcesByPriority(
+              {@const clientSources = sortSources(
                 expandedSources.filter((s) => clientPaused || s.status !== 'failed'),
               )}
               {#each clientSources as src (src.ip + ':' + src.port)}
@@ -5345,9 +5480,17 @@
   }
 
   /* --- Tables --- */
+  /* `table-layout: fixed` only engages when the table has a definite width.
+     This was `width: max-content`, an intrinsic keyword, which leaves the
+     browser sizing the table from its contents — so column widths were decided
+     by the longest cell in each column instead of by the `<colgroup>`, and the
+     tables behaved as if the fixed layout here did nothing. Every upload with a
+     long file name widened the name column and squeezed the rest, and the whole
+     row of columns slid sideways each time such a transfer started or finished.
+     Each table sets its own definite `width` inline from the summed column
+     widths (see `getTableMinWidth`); this is the fallback for the shared rule. */
   .transfer-table {
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
     border-collapse: collapse;
     font-size: 11px;
     table-layout: fixed;
@@ -5538,6 +5681,14 @@
   }
   .bar-cell {
     padding: 4px 6px;
+  }
+  /* Both bar components carry `min-width: 100px` for the standalone contexts
+     they're also used in. Inside a fixed-layout column that floor can't widen
+     the column any more, so it would just overflow and get clipped at whatever
+     width the user dragged the column to. Let them track the column instead. */
+  .bar-cell :global(.parts-bar),
+  .bar-cell :global(.progress-bar) {
+    min-width: 0;
   }
   .no-bar {
     color: var(--text-muted);

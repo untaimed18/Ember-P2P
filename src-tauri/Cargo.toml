@@ -81,6 +81,26 @@ tauri-plugin-process = "2"
 # JS API is not exposed to the webview, so the text is composed (and localized)
 # in the frontend and the OS call is made here.
 tauri-plugin-notification = "2"
+# Clipboard access for the copy/paste affordances (eD2K links, Ember IDs,
+# channel invites). The webview's own `navigator.clipboard` is not a
+# substitute — WebKitGTK, the Linux webview, refuses programmatic reads
+# outright, which is what made pasting an eD2K link impossible there.
+#
+# `arboard` directly rather than `tauri-plugin-clipboard-manager`, which is a
+# thin wrapper over this same crate: the plugin's JS API would not be exposed
+# to the webview anyway (the renderer goes through our own
+# `read_clipboard_text` / `write_clipboard_text` so the text crossing the
+# boundary can be bounded), so it would only add a renderer-reachable command
+# surface this app deliberately keeps minimal. Calling it ourselves also lets
+# the blocking clipboard round-trip run on `spawn_blocking` instead of on a
+# command's async task.
+#
+# Features are the default set minus `image-data`, which pulls in `image` plus
+# PNG/BMP decoders for a clipboard-image API nothing here calls.
+# `wayland-data-control` is kept: without it the Linux backend is X11 only, so
+# a Wayland session with no XWayland — a plausible AppImage host, and the very
+# platform this was reported on — would be right back to having no clipboard.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # In-app auto-update: fetches the signed `latest.json` manifest from
 # GitHub Releases, verifies the bundle against the minisign `pubkey` in
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.

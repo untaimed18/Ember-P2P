@@ -29,3 +29,21 @@ export async function showNotification(
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   return invoke('get_runtime_status');
 }
+
+/**
+ * Read the system clipboard as text, or `null` when it holds none.
+ *
+ * Goes through the backend because the webview cannot do this reliably:
+ * WebKitGTK (Tauri's Linux webview) refuses programmatic
+ * `navigator.clipboard.readText()` outright. Callers should prefer
+ * {@link readFromClipboard} in `$lib/utils`, which falls back to the webview
+ * APIs if this command is unavailable.
+ */
+export async function readClipboardText(): Promise<string | null> {
+  return invoke('read_clipboard_text');
+}
+
+/** Write text to the system clipboard. See {@link readClipboardText}. */
+export async function writeClipboardText(text: string): Promise<void> {
+  return invoke('write_clipboard_text', { text });
+}

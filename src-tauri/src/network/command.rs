@@ -4416,7 +4416,12 @@ async fn handle_command_inner(
             state.stats.stores_acknowledged = 0;
             let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
 
-            // Tear down eD2K server — it should only be up while KAD is connected
+            // Tear down the eD2K server too. Not because eD2K depends on KAD —
+            // it does not, and treating the two as coupled is what used to stop
+            // uploads on a session that only ever had a server (see
+            // `handle_server_disconnect`) — but because this command is the
+            // app's single Disconnect: the user asked to go offline, not to
+            // leave one network.
             if let Some(handle) = state.pending_server_connect.take() {
                 handle.abort();
             }

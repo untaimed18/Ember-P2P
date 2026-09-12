@@ -1998,6 +1998,8 @@ pub fn run() {
             commands::speed_test::run_speed_test,
             commands::system::show_notification,
             commands::system::get_runtime_status,
+            commands::system::read_clipboard_text,
+            commands::system::write_clipboard_text,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,

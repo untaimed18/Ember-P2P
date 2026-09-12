@@ -198,6 +198,15 @@ pub struct SearchState {
     /// KADEMLIA2_RES handler siphons the returned contacts into the firewall
     /// test pool and keeps them out of the routing table.
     pub is_udp_fw_probe_search: bool,
+    /// eMule `CSearch::SetGUIName`/`GetGUIName`: what the KAD → Searches list
+    /// shows in its Name column. The target hash alone identifies a publish
+    /// only to whoever can reverse it, so the scheduling site records the
+    /// human-readable subject here — the file name for `StoreFile`/`StoreNotes`,
+    /// the keyword for `StoreKeyword`. Kept on the search rather than looked up
+    /// from the publish side-maps at render time because those are cleared the
+    /// moment the search completes, while the row stays visible as "STOPPING"
+    /// for `STOP_GRACE_SECS` afterwards.
+    pub display_name: String,
 }
 
 impl SearchState {
@@ -237,6 +246,7 @@ impl SearchState {
             store_acks_received: 0,
             parked_at: None,
             is_udp_fw_probe_search: false,
+            display_name: String::new(),
         }
     }
 

@@ -220,8 +220,24 @@ export function withTimeout<T>(promise: Promise<T>, label: string, ms = 20_000):
   });
 }
 
-/** Copy text to clipboard with a DOM fallback for WebView2 / denied permissions. */
+/**
+ * Copy text to the clipboard.
+ *
+ * Tries the OS clipboard through the backend first, then the webview's own
+ * APIs. The order matters: `navigator.clipboard.writeText()` requires a secure
+ * context and a live user activation, so a copy fired from a context menu or
+ * after an `await` can be refused even on platforms where it usually works.
+ * The DOM `execCommand` path is kept last as a fallback for a build running
+ * without the backend command.
+ */
 export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    const { writeClipboardText } = await import('$lib/api/system');
+    await writeClipboardText(text);
+    return true;
+  } catch {
+    // Fall through to the webview paths.
+  }
   try {
     await navigator.clipboard.writeText(text);
     return true;
@@ -415,8 +431,32 @@ export function insertMention(
   };
 }
 
-/** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */
+/**
+ * Read text from the clipboard, or `null` when there is none to read.
+ *
+ * The backend is tried first and is the only path that works everywhere.
+ * `navigator.clipboard.readText()` is gated on a permission model WebKitGTK —
+ * Tauri's Linux webview — does not grant to programmatic reads at all, and
+ * `execCommand('paste')` is refused there too, so on Linux both webview paths
+ * fail and "Paste eD2K link" reported the clipboard as unavailable however
+ * much text was actually on it. They stay as fallbacks for a build whose
+ * backend lacks the command.
+ *
+ * `null` is returned for "nothing readable" as well as for an empty clipboard;
+ * callers treat both as nothing to paste.
+ */
 export async function readFromClipboard(): Promise<string | null> {
+  try {
+    const { readClipboardText } = await import('$lib/api/system');
+    const text = await readClipboardText();
+    if (text) return text;
+    // An empty (or image-only) clipboard is an answer, not a failure — don't
+    // retry the webview paths, which cannot do better and on Linux report a
+    // permission error that would be shown as if the read had broken.
+    return null;
+  } catch {
+    // Fall through to the webview paths.
+  }
   try {
     return await navigator.clipboard.readText();
   } catch {
