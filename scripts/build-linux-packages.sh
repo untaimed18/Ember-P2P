@@ -64,6 +64,16 @@ if (( ${#apt_missing[@]} > 0 )); then
   exit 1
 fi
 
+# rustup puts cargo in ~/.cargo/bin and adds it to PATH from ~/.profile and
+# ~/.bashrc, neither of which a non-interactive shell reads. So invoking this
+# from Windows as `wsl bash .../build-linux-packages.sh` — a reasonable thing to
+# try, and not the "typed into WSL" usage above — reached the check below with
+# an installed toolchain it could not see, and was told to install Rust again.
+if ! command -v cargo >/dev/null 2>&1 && [[ -r "$HOME/.cargo/env" ]]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: cargo is not on PATH. Install Rust (1.94+) with:" >&2
   echo >&2
