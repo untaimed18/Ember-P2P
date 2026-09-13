@@ -634,6 +634,8 @@
       case 'stalled': return m.transfers_src_stalled();
       case 'queue_full': return m.transfers_src_queue_full();
       case 'no_needed_parts': return m.transfers_src_no_needed_parts();
+      case 'parts_busy': return m.transfers_src_parts_busy();
+      case 'waiting_for_slot': return m.transfers_src_waiting_for_slot();
       case 'transferring': return m.transfers_src_transferring();
       case 'completed': return m.transfers_src_done();
       case 'failed': return m.transfers_src_status_failed();
@@ -685,14 +687,21 @@
     transferring: 0,
     queued: 1,
     connecting: 2,
-    wait_callback: 3,
-    friend_connect: 4,
-    stalled: 5,
-    queue_full: 6,
-    no_needed_parts: 7,
-    unreachable: 8,
-    completed: 9,
-    failed: 10,
+    // Not yet dialled, but only because of our own connection cap, so it is
+    // about as close to sending bytes as one that is dialling.
+    waiting_for_slot: 3,
+    wait_callback: 4,
+    friend_connect: 5,
+    stalled: 6,
+    queue_full: 7,
+    // Reachable and willing, just with nothing to give this minute. Ranked
+    // ahead of `no_needed_parts`, which means the peer has nothing at all, so
+    // the drawer sheds the genuinely useless rows first.
+    parts_busy: 8,
+    no_needed_parts: 9,
+    unreachable: 10,
+    completed: 11,
+    failed: 12,
   };
 
   /** Sort order for a status this build does not know about: last, with the
@@ -704,7 +713,7 @@
    *  drawer's rows however the status vocabulary grows. */
   const SOURCE_CHIP_STATUSES: ReadonlySet<SourceInfo['status']> = new Set([
     'transferring', 'queued', 'wait_callback', 'friend_connect',
-    'unreachable', 'connecting', 'failed',
+    'unreachable', 'connecting', 'waiting_for_slot', 'parts_busy', 'failed',
   ]);
 
   /**
@@ -3816,6 +3825,8 @@
                 {@const friendConnectCount = expandedSources.filter(s => s.status === 'friend_connect').length}
                 {@const unreachableCount = expandedSources.filter(s => s.status === 'unreachable').length}
                 {@const connectCount = expandedSources.filter(s => s.status === 'connecting').length}
+                {@const waitingSlotCount = expandedSources.filter(s => s.status === 'waiting_for_slot').length}
+                {@const partsBusyCount = expandedSources.filter(s => s.status === 'parts_busy').length}
                 {@const otherCount = expandedSources.filter(s => !SOURCE_CHIP_STATUSES.has(s.status)).length}
                 <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
@@ -3827,6 +3838,8 @@
                       {#if friendConnectCount > 0}<span class="ss-chip ss-friend-connect">{m.transfers_chip_friend_connect({ count: friendConnectCount })}</span>{/if}
                       {#if unreachableCount > 0}<span class="ss-chip ss-unreachable">{m.transfers_chip_unreachable({ count: unreachableCount })}</span>{/if}
                       {#if connectCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_connecting({ count: connectCount })}</span>{/if}
+                      {#if waitingSlotCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_waiting_for_slot({ count: waitingSlotCount })}</span>{/if}
+                      {#if partsBusyCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_parts_busy({ count: partsBusyCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
                       {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
                     </span>

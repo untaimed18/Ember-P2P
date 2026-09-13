@@ -56707,25 +56707,20 @@ async fn handle_download_event(
                 // source that is waiting perfectly healthily.
                 "friend_connect" => crate::types::SourceStatus::FriendConnect,
                 "unreachable" => crate::types::SourceStatus::Unreachable,
-                // Transient hold-offs, not failures. Both are routine — the
-                // connection semaphore saturates on any busy download
-                // (`too_many_conns`), and every source that arrives once all
-                // remaining parts are already in flight gets `parts_busy`,
-                // which is the normal endgame of a well-swarmed file. Falling
-                // to `Failed` meant the drawer deleted these perfectly healthy
-                // rows and counted them into "N failed sources hidden", and
-                // `update_source_detail` evicted them first at the 500-row cap.
-                // `set_too_many_conns` / `set_parts_busy` both arm a short
-                // retry, so `Connecting` is the honest rendering.
-                "too_many_conns" => crate::types::SourceStatus::Connecting,
-                // `Connecting`, as the comment above concludes for both of these
-                // and as `too_many_conns` already did. This arm said
-                // `NoNeededParts`, contradicting its own rationale two lines up
-                // and telling the user a peer held nothing we needed when the
-                // truth was that another source had the part claimed — routinely
-                // a source merely sitting at a queue rank, since claims are taken
-                // before the queue wait.
-                "parts_busy" => crate::types::SourceStatus::Connecting,
+                // Transient hold-offs, not failures, and each now says which one
+                // it is. Both are routine — the connection cap saturates on any
+                // busy download, and a source arriving while every part it holds
+                // is already in flight is the normal endgame of a well-swarmed
+                // file — but neither is a failure and neither is a dial.
+                //
+                // These have been rendered two wrong ways already. `Failed` meant
+                // the drawer deleted healthy rows and counted them as failures;
+                // `Connecting` meant a row could sit claiming to be connecting for
+                // as long as the hold-off lasted, which is what a stalled download
+                // looks like from the outside and what made a real stall
+                // impossible to tell apart from a busy one.
+                "too_many_conns" => crate::types::SourceStatus::WaitingForSlot,
+                "parts_busy" => crate::types::SourceStatus::PartsBusy,
                 // The LowID/callback path reports its post-handshake state with
                 // this string rather than a bare "connecting".
                 "connected (callback)" => crate::types::SourceStatus::Connecting,

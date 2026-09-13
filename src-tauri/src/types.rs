@@ -404,6 +404,23 @@ pub enum SourceStatus {
     /// we sit behind a symmetric NAT. Shown rather than dropped so the cause
     /// is visible; it clears by itself once our reachability changes.
     Unreachable,
+    /// Every part this peer holds is already being fetched from someone else, so
+    /// there is nothing to ask it for yet. Re-offered about a minute later.
+    ///
+    /// Its own state because the alternatives both lie. It was rendered as
+    /// [`Self::NoNeededParts`], which says the peer is useless when it is not,
+    /// and then as [`Self::Connecting`], which says a dial is in progress when
+    /// none is — and a row that sits at "Connecting" for minutes is the single
+    /// thing that makes a healthy download look broken.
+    PartsBusy,
+    /// Waiting for one of our own connection slots, having not dialled yet. Also
+    /// re-offered shortly; the cap is per file and saturates on any busy
+    /// download.
+    ///
+    /// Distinct from [`Self::Connecting`] for the same reason as
+    /// [`Self::PartsBusy`]: nothing is being attempted, so reporting an attempt
+    /// hides the one fact that explains the wait.
+    WaitingForSlot,
 }
 
 impl SourceStatus {
@@ -430,6 +447,8 @@ impl SourceStatus {
             Self::Failed => "failed",
             Self::FriendConnect => "friend_connect",
             Self::Unreachable => "unreachable",
+            Self::PartsBusy => "parts_busy",
+            Self::WaitingForSlot => "waiting_for_slot",
         }
     }
 }

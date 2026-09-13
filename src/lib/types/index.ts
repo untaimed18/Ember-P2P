@@ -177,7 +177,7 @@ export interface Transfer {
 export interface SourceInfo {
   ip: string;
   port: number;
-  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'unreachable' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
+  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'unreachable' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed' | 'parts_busy' | 'waiting_for_slot';
   queue_rank?: number;
   speed: number;
   transferred: number;

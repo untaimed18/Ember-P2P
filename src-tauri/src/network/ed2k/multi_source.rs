@@ -10080,7 +10080,25 @@ async fn download_parts_from_source(
         .await
         .ok();
 
-    emit_source!("completed", None, 0u64);
+    // Four different endings reach here and they are not the same event: the
+    // source delivered the parts it was given, or its queue was exhausted with
+    // nothing it could serve, or the peer ran out of part requests and had
+    // nothing left for us, or the in-session re-queue timed out waiting for a
+    // slot. All four reported "completed", which the UI renders as "Done" — so a
+    // peer that had handed over nothing at all, and a peer whose wait for a slot
+    // simply expired, both read as having finished their work.
+    //
+    // That is also why it survived a restart and looked like remembered state:
+    // nothing is persisted, so on every launch these sources reconnected, found
+    // nothing to serve, and reported "Done" again within seconds.
+    //
+    // `src_transferred` is what this source actually contributed, so it settles
+    // which ending this was without any new bookkeeping.
+    if src_transferred > 0 {
+        emit_source!("completed", None, 0u64);
+    } else {
+        emit_source!("no_needed_parts", None, 0u64);
+    }
 
     // Wire-learned availability is released by `_wire_avail_guard` on the way
     // out, whichever exit this source takes. Sources with pre-existing
