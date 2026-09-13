@@ -55,7 +55,19 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   // active/searching/queued in STATUS_PRIORITY, so the poll merge kept
   // preferring the stale stored value over the live status the backend now
   // reports after the user resumed.
-  if (eventStatus === 'paused' || eventStatus === 'stopped' || eventStatus === 'insufficient') {
+  // `noneneeded` and `hashing` have the same shape as the three above — both
+  // out-rank `active`/`queued`/`searching` in the table while being reversible
+  // side-states, so a stored row in either would pin itself against a fresher
+  // API status. Not reachable today (nothing emits them on a live transition,
+  // only on DB restore), which is exactly why they belong here now rather than
+  // after someone makes them reachable.
+  if (
+    eventStatus === 'paused' ||
+    eventStatus === 'stopped' ||
+    eventStatus === 'insufficient' ||
+    eventStatus === 'noneneeded' ||
+    eventStatus === 'hashing'
+  ) {
     return false;
   }
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
@@ -68,13 +80,63 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
  * API snapshot (read live from the transfer manager) still carries a positive
  * rate — and vice-versa — so the higher value is the freshest truth.
  */
+/** Statuses that are definitionally not moving bytes, so their displayed rate
+ *  must read zero rather than whatever the last progress event left behind.
+ *
+ *  `insufficient` and `noneneeded` belong here and were missing from all three
+ *  of the lists that model this. The backend does its part — `refresh_health`
+ *  zeroes `transfer.speed` and emits `transfer-speed-decay` — but the row was
+ *  absent from `SPEED_DECAY_APPLIES` so the decay was dropped, and `mergeSpeed`
+ *  then re-maxed the stale value against the poll's 0 forever. A download that
+ *  filled the disk went on showing its last rate indefinitely, counted itself
+ *  into the "Active" chip via `displaySpeed(t) > 0`, and rendered a
+ *  counting-down ETA for a transfer that had stopped.
+ *
+ *  Deliberately excludes `searching` / `verifying` / `hashing` / `completing`:
+ *  those are in `SPEED_DECAY_APPLIES` so the backend fades their rate towards
+ *  zero, and the row is meant to show that fade. */
+export const IDLE_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'completed',
+  'failed',
+  'stopped',
+  'paused',
+  'insufficient',
+  'noneneeded',
+]);
+
+/**
+ * Reconcile the three health-detail fields, letting an explicit backend clear
+ * win over a stale event value.
+ *
+ * These are `#[serde(default)]` with no `skip_serializing_if` on the Rust side,
+ * so the snapshot carries them as `null` — not as absent keys. A plain
+ * `apiItem.health_reason ?? eventItem.health_reason` therefore fell through to
+ * the stored event value in exactly the case the backend had *cleared* it,
+ * which is the opposite of what "prefer API health" intends. A download that
+ * went degraded and then recovered while already `active` (so no
+ * `transfer-status` event fires and `HEALTH_RESET_STATUSES` never applies) had
+ * its `health` corrected to `healthy` while the tooltip went on reading
+ * "connected but not receiving data" at full speed.
+ */
+function mergeHealthDetail(
+  apiItem: Transfer,
+  eventItem: Transfer,
+): Pick<Transfer, 'health_reason' | 'health_code' | 'stalled_since'> {
+  const pick = <K extends 'health_reason' | 'health_code' | 'stalled_since'>(
+    key: K,
+  ): Transfer[K] =>
+    key in apiItem && apiItem[key] === null
+      ? undefined
+      : ((apiItem[key] ?? eventItem[key]) as Transfer[K]);
+  return {
+    health_reason: pick('health_reason'),
+    health_code: pick('health_code'),
+    stalled_since: pick('stalled_since'),
+  };
+}
+
 function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): number {
-  if (
-    status === 'completed' ||
-    status === 'failed' ||
-    status === 'stopped' ||
-    status === 'paused'
-  ) {
+  if (IDLE_STATUSES.has(status as Transfer['status'])) {
     return 0;
   }
   return Math.max(apiSpeed ?? 0, eventSpeed ?? 0);
@@ -202,6 +264,12 @@ const SPEED_DECAY_APPLIES: ReadonlySet<Transfer['status']> = new Set<Transfer['s
   'verifying',
   'completing',
   'hashing',
+  // Accept the decay for these two as well. The backend zeroes their speed and
+  // emits the event; dropping it left the stored row carrying a stale rate.
+  // `IDLE_STATUSES` makes the *displayed* value 0 regardless, but the stored
+  // field feeds other readers, so let the authoritative 0 land.
+  'insufficient',
+  'noneneeded',
 ]);
 
 /** Statuses that should NOT accept `transfer-progress` payloads. Hoisted to
@@ -725,6 +793,15 @@ export async function initTransferStore() {
           health_code,
           stalled_since,
         } = event.payload;
+        // A cancel that did not originate on this page arrives here rather than
+        // on `transfer-failed`, whose handler has the matching branch. Without
+        // it the row landed in Completed/Failed as a red "Cancelled" entry — the
+        // exact outcome that handler's comment says user cancels must avoid.
+        if (failure_code === 'cancelled') {
+          forgetTransfer(id);
+          transfers.update((list) => list.filter((t) => t.id !== id));
+          return;
+        }
         transfers.update((list) =>
           list.map((t) => {
             if (t.id !== id) return t;
@@ -943,9 +1020,7 @@ export async function initTransferStore() {
             // Prefer API health: events often omit/stale-carry `health`, and a
             // prior `degraded` on the event row would otherwise stick forever.
             health: apiItem.health ?? eventItem.health,
-            health_reason: apiItem.health_reason ?? eventItem.health_reason,
-            health_code: apiItem.health_code ?? eventItem.health_code,
-            stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
+            ...mergeHealthDetail(apiItem, eventItem),
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_code: eventItem.failure_code ?? apiItem.failure_code,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
@@ -1225,9 +1300,7 @@ export function startTransferPoll() {
               speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
               // Prefer API health over a possibly-stale event value.
               health: apiItem.health ?? eventItem.health,
-              health_reason: apiItem.health_reason ?? eventItem.health_reason,
-              health_code: apiItem.health_code ?? eventItem.health_code,
-              stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
+              ...mergeHealthDetail(apiItem, eventItem),
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_code: eventItem.failure_code ?? apiItem.failure_code,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,

@@ -87,8 +87,27 @@ impl TransferControl {
         self.pause_notify.notify_waiters();
     }
 
+    /// Undo everything a pause set — both flags.
+    ///
+    /// Pause sets `paused` *and* `cancelled` (the latter is how the worker and
+    /// its detached per-source children are torn down; see [`Self::cancel`],
+    /// which Pause and Stop share with Cancel). Clearing only `paused` left the
+    /// registered control — the same `Arc` the row's `PendingDownload` holds —
+    /// permanently cancelled. For an active row that is masked, because
+    /// `start_promoted_downloads` installs a fresh control. For a row that
+    /// resume leaves in the queue (the concurrency cap is still full) nothing
+    /// ever replaces it, and the source-retry timer skips on either flag — so
+    /// the row read `Queued`/`Searching` while doing zero source discovery, and
+    /// only started, from a cold source list, if a slot happened to free up.
+    ///
+    /// Safe to clear here: this is reachable only from
+    /// [`TransferManager::resume`], which finds the row in `active` or `queue`.
+    /// A cancelled or removed transfer is in neither, and a paused worker has
+    /// already been aborted rather than merely signalled, so un-cancelling
+    /// cannot revive one.
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Release);
+        self.cancelled.store(false, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {

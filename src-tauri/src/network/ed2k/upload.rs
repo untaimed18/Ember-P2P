@@ -542,6 +542,22 @@ pub struct ConnectServeRequest {
 struct UploadSlotGuard {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     slot_notify: Arc<tokio::sync::Notify>,
+    /// Identities that currently hold an upload slot.
+    ///
+    /// eMule cannot give one client two slots: `AttachToAlreadyKnown` merges a
+    /// second connection from a known peer into the existing `CUpDownClient`,
+    /// so the slot belongs to the client, not the socket. Here admission was a
+    /// bare `AtomicUsize`, and nothing keyed *granted* slots by identity — so a
+    /// peer opening `MAX_CONNECTIONS_PER_IP` sockets, saying Hello with the same
+    /// user hash on each, and sending `OP_STARTUPLOADREQ` on all of them while
+    /// the waiting list was empty took every one of them down the
+    /// `queue_empty → should_accept` path independently. With
+    /// `ADMISSION_FLOOR_SLOTS` at 4 that is 3 of 4 slots to one peer.
+    /// `queue_row_owned_by_session` and friends only ever policed the *waiting*
+    /// row, never the grant.
+    slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
+    /// The identity this guard admitted, so Drop can release it.
+    held: Option<QueueIdentity>,
     armed: bool,
 }
 
@@ -579,10 +595,13 @@ impl UploadSlotGuard {
     fn new(
         active_count: Arc<std::sync::atomic::AtomicUsize>,
         slot_notify: Arc<tokio::sync::Notify>,
+        slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
     ) -> Self {
         Self {
             active_count,
             slot_notify,
+            slot_holders,
+            held: None,
             armed: false,
         }
     }
@@ -593,9 +612,16 @@ impl UploadSlotGuard {
     /// where several connection tasks each observe an open slot across their
     /// `.await` points and all increment past `limit`. Already-armed guards
     /// return `true` without double-counting.
-    fn try_activate(&mut self, limit: usize) -> bool {
+    /// One slot per identity, enforced under the `slot_holders` lock so the
+    /// identity check and the count increment cannot interleave with another
+    /// connection from the same peer. See [`Self::slot_holders`].
+    fn try_activate(&mut self, limit: usize, identity: &QueueIdentity) -> bool {
         if self.armed {
             return true;
+        }
+        let mut holders = self.slot_holders.lock();
+        if holders.contains(identity) {
+            return false;
         }
         let mut current = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         loop {
@@ -609,11 +635,20 @@ impl UploadSlotGuard {
                 std::sync::atomic::Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    holders.insert(identity.clone());
+                    self.held = Some(identity.clone());
                     self.armed = true;
                     return true;
                 }
                 Err(actual) => current = actual,
             }
+        }
+    }
+
+    /// Release the identity's claim on a slot. Idempotent.
+    fn release_identity(&mut self) {
+        if let Some(id) = self.held.take() {
+            self.slot_holders.lock().remove(&id);
         }
     }
 
@@ -626,6 +661,7 @@ impl UploadSlotGuard {
             self.active_count
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.armed = false;
+            self.release_identity();
             self.slot_notify.notify_waiters();
         }
     }
@@ -636,6 +672,7 @@ impl Drop for UploadSlotGuard {
         if self.armed {
             self.active_count
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.release_identity();
             self.slot_notify.notify_waiters();
         }
     }
@@ -1041,12 +1078,27 @@ const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
 
 /// eMule-style per-file request frequency tracker for detecting aggressive leechers.
 /// MIN_REQUESTTIME (eMule) is 590 seconds. After BADCLIENTBAN infractions, ban the client.
-const MIN_REQUESTTIME_SECS: u64 = 590;
+///
+/// Shared with the download side rather than re-declared: our own downloader
+/// re-asking faster than this is exactly what this tracker bans, so the two
+/// must not drift. A 60 s download-side reask floor against this 590 s ban
+/// threshold is what got Ember banned by its own peers.
+const MIN_REQUESTTIME_SECS: u64 = super::dead_sources::MIN_REQUESTTIME_SECS as u64;
 const BADCLIENTBAN: u32 = 2;
 
 struct FileRequestTracker {
-    /// Maps (peer_ip, file_hash) -> (last_request_time, bad_request_count)
-    entries: HashMap<(Ipv4Addr, [u8; 16]), (std::time::Instant, u32)>,
+    /// Maps (peer_identity, file_hash) -> (last_request_time, bad_request_count)
+    ///
+    /// Keyed on [`QueueIdentity`], not on the raw IP. eMule's
+    /// `AddRequestCount` counts against a `CUpDownClient`, i.e. one client —
+    /// and the queue code here already distinguishes clients per address
+    /// (`MAX_CONNECTIONS_PER_IP` / `MAX_QUEUE_ENTRIES_PER_IP` both permit 3).
+    /// With an IP key, every eMule behind one NAT/CGNAT/VPN egress shared a
+    /// single counter and a single `last_time`, so ordinary interleaved
+    /// requests from different people looked like one client re-asking inside
+    /// `MIN_REQUESTTIME` and `BADCLIENTBAN` banned the whole address for
+    /// seven days. Only a peer that sent no user hash falls back to its IP.
+    entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32)>,
 }
 
 impl FileRequestTracker {
@@ -1070,9 +1122,9 @@ impl FileRequestTracker {
     /// seeding reached the threshold, and the result is a seven-day persisted
     /// IP ban — so an unattended node progressively banned its own swarm, at a
     /// rate any peer sitting in the queue could accelerate.
-    fn record_request(&mut self, ip: Ipv4Addr, file_hash: [u8; 16]) -> bool {
+    fn record_request(&mut self, identity: QueueIdentity, file_hash: [u8; 16]) -> bool {
         let now = std::time::Instant::now();
-        let key = (ip, file_hash);
+        let key = (identity, file_hash);
         if let Some((last_time, bad_count)) = self.entries.get_mut(&key) {
             if last_time.elapsed().as_secs() < MIN_REQUESTTIME_SECS {
                 *bad_count += 1;
@@ -1095,8 +1147,8 @@ impl FileRequestTracker {
     /// Called when *we* asked the peer to re-request — after
     /// `OP_OUTOFPARTREQS` — so a rotation we initiated cannot be counted
     /// against the peer that complied with it.
-    fn forgive_requeue(&mut self, ip: Ipv4Addr, file_hash: [u8; 16]) {
-        if let Some((_, bad_count)) = self.entries.get_mut(&(ip, file_hash)) {
+    fn forgive_requeue(&mut self, identity: QueueIdentity, file_hash: [u8; 16]) {
+        if let Some((_, bad_count)) = self.entries.get_mut(&(identity, file_hash)) {
             *bad_count = 0;
         }
     }
@@ -1112,10 +1164,13 @@ impl FileRequestTracker {
         // entry only resets a stale, near-expiry counter.
         const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
         if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
-            let mut by_age: Vec<((Ipv4Addr, [u8; 16]), std::time::Instant)> =
-                self.entries.iter().map(|(k, (t, _))| (*k, *t)).collect();
+            let mut by_age: Vec<((QueueIdentity, [u8; 16]), std::time::Instant)> = self
+                .entries
+                .iter()
+                .map(|(k, (t, _))| (k.clone(), *t))
+                .collect();
             by_age.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-            let keep: std::collections::HashSet<(Ipv4Addr, [u8; 16])> = by_age
+            let keep: std::collections::HashSet<(QueueIdentity, [u8; 16])> = by_age
                 .into_iter()
                 .take(MAX_FILE_REQUEST_ENTRIES)
                 .map(|(k, _)| k)
@@ -1974,6 +2029,9 @@ struct UploadHandler {
     /// Notify queued clients when a slot becomes available (fired by UploadSlotGuard
     /// on deactivate/drop, and by the proactive slot opener timer).
     slot_notify: Arc<tokio::sync::Notify>,
+    /// Identities currently holding an upload slot, so one peer cannot occupy
+    /// several. See [`UploadSlotGuard::slot_holders`].
+    slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
     /// Identities currently being dialed for HighID AddUpNextClient push-grants.
     push_grant_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<QueueIdentity>>>,
     /// Per-identity backoff after a failed HighID push dial.
@@ -2191,8 +2249,22 @@ struct AbuseEntry {
 
 /// eMule: BAN_TIMEOUT = 2 hours
 const BAN_DURATION_SECS: u64 = 7200;
-/// Max requests per 5-minute window before auto-ban
-const MAX_REQUESTS_PER_WINDOW: u32 = 40;
+/// Max requests per 5-minute window before auto-ban, per address.
+///
+/// eMule has no connection-rate ban at all, so this is ours and it must err
+/// heavily toward false negatives: the cost of missing a flood is small (the
+/// concurrency caps already bound it) while the cost of a false positive is a
+/// two-hour ban plus a persisted `PeerAutoBanned` entry for *every* client
+/// behind the address. `AbuseTracker` keys on the IP with no identity
+/// component, and [`MAX_CONNECTIONS_PER_IP`] / [`MAX_QUEUE_ENTRIES_PER_IP`]
+/// both deliberately allow several distinct clients per address — so a CGNAT,
+/// campus or VPN egress hosting a handful of eD2K clients could trip a flat 40
+/// (one admitted connection every 7.5 s) purely by being busy.
+///
+/// Scaled by the per-IP connection allowance for that reason. Hash probing,
+/// which is the abuse actually worth banning, is caught far more precisely by
+/// [`MAX_FILE_NOT_FOUND`] on a signal a legitimate downloader does not produce.
+const MAX_REQUESTS_PER_WINDOW: u32 = 40 * MAX_CONNECTIONS_PER_IP as u32;
 /// Window size for tracking request rate
 const ABUSE_WINDOW_SECS: u64 = 300;
 /// Max "file not found" hits before ban (prevents hash-probing)
@@ -2880,6 +2952,7 @@ pub async fn start_upload_server(
         geoip,
         file_request_tracker: Arc::new(tokio::sync::Mutex::new(FileRequestTracker::new())),
         slot_notify,
+        slot_holders: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         push_grant_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         push_grant_backoff: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         push_grant_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -6212,6 +6285,19 @@ impl UploadHandler {
         // Budget for hash requests that miss the memos and therefore re-read a
         // whole shared file. See `UncachedHashBudget`.
         let mut uncached_hash_budget = UncachedHashBudget::new();
+        // Per-session allowance for *answered* hash requests (hashset / AICH).
+        // `uncached_hash_budget` meters whole-file reads; this meters the
+        // answers themselves, which are orders of magnitude larger than the
+        // requests that trigger them and can be served from a memo for free.
+        //
+        // Charging every answer to `note_abusive_request` would be wrong: AICH
+        // is one request per part being repaired and a hashset is one per file,
+        // so a downloader doing legitimate multi-part recovery would trip the
+        // shared auto-ban window while behaving exactly as the protocol
+        // expects. This allowance is set well above any honest use, so only a
+        // peer looping requests reaches it.
+        const MAX_HASH_ANSWERS_PER_SESSION: u32 = 64;
+        let mut hash_answers_served: u32 = 0;
         // When this connection last received a full shared-file listing.
         let mut last_browse: Option<std::time::Instant> = None;
         // eMule `m_abyUpPartStatus`: the parts the downloader told us it
@@ -6239,8 +6325,11 @@ impl UploadHandler {
         // flag and terminates the connection, letting all the normal
         // cleanup (slot guard drop, queue retain, completion event) run.
         let mut user_cancelled = false;
-        let mut slot_guard =
-            UploadSlotGuard::new(self.active_count.clone(), self.slot_notify.clone());
+        let mut slot_guard = UploadSlotGuard::new(
+            self.active_count.clone(),
+            self.slot_notify.clone(),
+            self.slot_holders.clone(),
+        );
         let mut session_start: Option<std::time::Instant> = None;
         let mut rate_tracker = SessionRateTracker::new();
         // (SecureIdent state `pending_secident_challenge` / `pending_peer_challenge`
@@ -6267,7 +6356,7 @@ impl UploadHandler {
         // packet loop (peer will follow with OP_REQUESTPARTS).
         if let Some(fh) = push_grant_file_hash {
             let dynamic_slots = self.compute_dynamic_slot_count();
-            if !slot_guard.try_activate(dynamic_slots) {
+            if !slot_guard.try_activate(dynamic_slots, &queue_identity) {
                 anyhow::bail!("push-grant session {peer_addr}: no free upload slot after dial");
             }
             current_file_hash = Some(fh);
@@ -6406,8 +6495,16 @@ impl UploadHandler {
         // middle of a frame, causing desync and connection loss. Moving the
         // read into its own task keeps frame state private; the select! site
         // consumes whole packets from a channel and is trivially cancel-safe.
+        // Depth 1, not 4. A frame can be up to 512 KiB (1 MiB after
+        // `OP_PACKEDPROT` inflation), and the serve loop routinely blocks for
+        // tens of seconds inside an `OP_REQUESTPARTS` batch (`WRITE_PACKET_TIMEOUT`
+        // is 60 s), so a peer that stops reading our writes could park several
+        // maximum-size frames per connection — heap it chooses and we never
+        // look at, multiplied by `MAX_TOTAL_CONNECTIONS`. One in flight plus one
+        // buffered is all the decoupling this needs: the reason the task exists
+        // is frame-state isolation from `select!` cancellation, not throughput.
         let (pkt_tx, mut pkt_rx) =
-            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(4);
+            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(1);
         let reader_task = tokio::spawn(async move {
             loop {
                 let res = read_packet_async_inner(&mut reader).await;
@@ -6833,7 +6930,7 @@ impl UploadHandler {
                                     // on a lost race we keep the queue entry and retry on
                                     // the next poll instead of over-granting.
                                     if best_identity.as_ref() == Some(queued_key)
-                                        && slot_guard.try_activate(dynamic_slots)
+                                        && slot_guard.try_activate(dynamic_slots, &queue_identity)
                                     {
                                         let mut queue = self.upload_queue.lock().await;
                                         // Remove by IDENTITY, not the snapshot index:
@@ -7238,15 +7335,31 @@ impl UploadHandler {
                             }
                         }
                         current_file_hash = Some(hash);
-                        self.sync_queue_file_hash(
-                            &queue_identity,
-                            hash,
-                            peer_addr,
-                            hello_caps.tcp_port,
-                        )
-                        .await;
 
                         if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
+                            // Adopt the peer-named hash into its queue row only
+                            // after confirming we will actually serve that file
+                            // to this peer — eMule likewise sets `reqfile` only
+                            // once `GetFileByID` has succeeded. Writing it first
+                            // let a *waiting* peer name our highest-priority
+                            // share purely to multiply its queue score by
+                            // `priority_weight` (1.8 for release against 0.7 for
+                            // normal), win the slot, and then switch to the file
+                            // it actually wanted: the mid-slot switch path
+                            // re-resolves and resets the counters, so the
+                            // transfer proceeded normally afterwards.
+                            //
+                            // The `OP_REQUESTPARTS` sync below is left as-is on
+                            // purpose: it can only run for a peer that already
+                            // holds a slot, and score inflation buys nothing
+                            // once you are no longer competing for one.
+                            self.sync_queue_file_hash(
+                                &queue_identity,
+                                hash,
+                                peer_addr,
+                                hello_caps.tcp_port,
+                            )
+                            .await;
                             self.record_share_request_once(&hash, &mut recorded_share_request)
                                 .await;
                             let Some(ed2k_part_count) = ed2k_wire_part_count_u16(file.size) else {
@@ -7498,7 +7611,10 @@ impl UploadHandler {
                             let should_ban = {
                                 let mut tracker = self.file_request_tracker.lock().await;
                                 tracker.cleanup_stale();
-                                tracker.record_request(peer_v4, h)
+                                tracker.record_request(
+                                    QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                                    h,
+                                )
                             };
                             if should_ban {
                                 warn!("Banning {} for excessive file request frequency (AddRequestCount)", peer_addr);
@@ -7705,7 +7821,8 @@ impl UploadHandler {
                     // succeeds while we are still under `dynamic_slots`; on a lost
                     // race we fall through to the queue path (which re-inserts the
                     // entry that the `should_accept` scoring may have removed).
-                    let should_accept = should_accept && slot_guard.try_activate(dynamic_slots);
+                    let should_accept =
+                        should_accept && slot_guard.try_activate(dynamic_slots, &queue_identity);
                     if let Some(removed) = removed_queue_entry {
                         if session_may_inherit_seniority(
                             &removed,
@@ -8294,6 +8411,8 @@ impl UploadHandler {
                     // legitimate reaches this.
                     {
                         let before = offsets.len();
+                        let offsets_total_before: u64 =
+                            offsets.iter().map(|&(s, e)| e.saturating_sub(s)).sum();
                         let mut budget = MAX_REQUESTPARTS_BYTES;
                         let mut capped: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
                         for (s, e) in offsets {
@@ -8307,9 +8426,14 @@ impl UploadHandler {
                             capped.push((s, s + take));
                             budget -= take;
                         }
+                        // `<` , not `==`: the sum test was meant to catch a
+                        // request whose ranges were shortened to fit the cap, but
+                        // equality both fired for an *untrimmed* request that
+                        // happened to sum to exactly the cap and stayed silent
+                        // for one trimmed below it. Log-only either way.
                         let trimmed = capped.len() != before
                             || capped.iter().map(|&(s, e)| e - s).sum::<u64>()
-                                == MAX_REQUESTPARTS_BYTES;
+                                < offsets_total_before;
                         if trimmed {
                             debug!(
                                 "Trimmed OP_REQUESTPARTS from {peer_addr}: {before} range(s) \
@@ -9160,11 +9284,11 @@ impl UploadHandler {
                                 std::net::IpAddr::V4(v4) => Some(v4),
                                 std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                             };
-                            if let Some(peer_v4) = peer_v4 {
-                                self.file_request_tracker
-                                    .lock()
-                                    .await
-                                    .forgive_requeue(peer_v4, h);
+                            if peer_v4.is_some() {
+                                self.file_request_tracker.lock().await.forgive_requeue(
+                                    QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                                    h,
+                                );
                             }
                         }
                         let session_secs = session_start
@@ -9525,6 +9649,13 @@ impl UploadHandler {
                             .external_ip_shared
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let resp = self.build_shared_files_answer(client_id).await;
+                        // A full shared-file listing can reach ~500 KiB from a
+                        // 6-byte request. `MIN_BROWSE_INTERVAL` bounds the rate
+                        // per connection, but writing it unmetered still pushed
+                        // those bytes outside the user's configured upload cap —
+                        // across many connections, a meaningful share of it.
+                        self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                            .await?;
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -9565,7 +9696,19 @@ impl UploadHandler {
                             self.part_hash_cache.lock().await.get(&cache_key)
                         };
                         let hashset_result = match memoized {
-                            Some(hashes) => Ok(Some(hashes)),
+                            Some(hashes) => {
+                                // A memo hit costs us no file read, so it spends
+                                // no `uncached_hash_budget` — but the *answer*
+                                // is still `16 + 2 + parts*16` bytes (~86 KB for
+                                // a 50 GB share) for a 22-byte request, and
+                                // nothing else bounded how often a peer could
+                                // ask. See `MAX_HASH_ANSWERS_PER_SESSION`.
+                                hash_answers_served += 1;
+                                if hash_answers_served > MAX_HASH_ANSWERS_PER_SESSION {
+                                    self.note_abusive_request(peer_addr.ip()).await;
+                                }
+                                Ok(Some(hashes))
+                            }
                             // Partial files answer from `.part.met` without
                             // reading the file, so they are not what the budget
                             // meters — and charging them would spend it on work
@@ -9616,6 +9759,12 @@ impl UploadHandler {
                                     );
                                     continue;
                                 };
+                                // Charge the user's upload cap. A hashset answer
+                                // is far larger than the request that triggered
+                                // it, and writing it unmetered let this handler
+                                // push bytes outside the configured limit.
+                                self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                                    .await?;
                                 write_packet_async(
                                     &mut writer,
                                     OP_EDONKEYHEADER,
@@ -9688,6 +9837,17 @@ impl UploadHandler {
                                     self.aich_cache.lock().await.get(&cache_key)
                                 };
                                 let compute_aich = request_aich && memoized_aich.is_none();
+                                // A request answered entirely from the memos
+                                // spends no budget (it reads no file), but the
+                                // answer is still orders of magnitude larger
+                                // than the request, so bound how often a peer
+                                // may ask. See the legacy handler above.
+                                if !compute_md4 && !compute_aich {
+                                    hash_answers_served += 1;
+                                    if hash_answers_served > MAX_HASH_ANSWERS_PER_SESSION {
+                                        self.note_abusive_request(peer_addr.ip()).await;
+                                    }
+                                }
                                 // Both branches below read the whole file, so
                                 // charge the connection's budget whenever either
                                 // missed its memo.
@@ -9769,6 +9929,9 @@ impl UploadHandler {
                                     );
                                     continue;
                                 };
+                                // Same accounting as the legacy answer above.
+                                self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                                    .await?;
                                 write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,
@@ -10154,8 +10317,37 @@ impl UploadHandler {
                                         }
                                     }
                                     // Create recovery data for the requested part
-                                    // PARTSIZE is constant 9.28MB
-                                    let recovery_data = hs.create_part_recovery_data(part_idx, PARTSIZE as usize);
+                                    // (PARTSIZE is constant 9.28MB).
+                                    //
+                                    // Off the async runtime: this walks every leaf
+                                    // hash in the file through the Merkle tree, and
+                                    // ran inline on this task while every
+                                    // neighbouring whole-file hash path uses
+                                    // `spawn_blocking`. A peer that warmed
+                                    // `aich_cache` with one request could then loop
+                                    // 20-byte `OP_AICHREQUEST` packets, and because
+                                    // the memo-hit branch above spends no
+                                    // `uncached_hash_budget`, each one pinned a
+                                    // Tokio worker for the rebuild — starving
+                                    // downloads, KAD and the accept loop, three
+                                    // connections at a time per IP. The packet-level
+                                    // abuse charge below is what eventually stops
+                                    // the loop; this keeps it off the reactor
+                                    // meanwhile. The charge is gated on the
+                                    // per-session allowance so honest
+                                    // multi-part recovery — one request per
+                                    // part being repaired — is never penalised.
+                                    hash_answers_served += 1;
+                                    if hash_answers_served > MAX_HASH_ANSWERS_PER_SESSION {
+                                        self.note_abusive_request(peer_addr.ip()).await;
+                                    }
+                                    let recovery_hs = hs.clone();
+                                    let recovery_data = tokio::task::spawn_blocking(move || {
+                                        recovery_hs
+                                            .create_part_recovery_data(part_idx, PARTSIZE as usize)
+                                    })
+                                    .await
+                                    .unwrap_or_default();
 
                                     let mut resp = Vec::with_capacity(16 + 2 + 20 + recovery_data.len());
                                     resp.extend_from_slice(&req_hash);
@@ -10163,6 +10355,11 @@ impl UploadHandler {
                                     resp.extend_from_slice(&hs.root_hash);
                                     resp.extend_from_slice(&recovery_data);
 
+                                    // Recovery data is ~180 KiB of tree hashes
+                                    // for a 20-byte request; meter it like any
+                                    // other upload.
+                                    self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                                        .await?;
                                     write_packet_async(
                                         &mut writer,
                                         OP_EMULEPROT,
@@ -12796,29 +12993,105 @@ mod abuse_and_seniority_tests {
         format!("{ip}:4662").parse().unwrap()
     }
 
-    fn backdate(tracker: &mut FileRequestTracker, ip: Ipv4Addr, hash: [u8; 16], secs: u64) {
-        tracker.entries.get_mut(&(ip, hash)).unwrap().0 =
+    fn backdate(
+        tracker: &mut FileRequestTracker,
+        id: &QueueIdentity,
+        hash: [u8; 16],
+        secs: u64,
+    ) {
+        tracker.entries.get_mut(&(id.clone(), hash)).unwrap().0 =
             std::time::Instant::now() - std::time::Duration::from_secs(secs);
+    }
+
+    fn ident(ip: &str) -> QueueIdentity {
+        QueueIdentity::Ip(ip.parse().unwrap())
+    }
+
+    /// Two eMules behind one NAT are two clients, and eMule's own
+    /// `AddRequestCount` counts per client. Sharing one counter meant their
+    /// ordinary interleaved requests looked like a single peer re-asking
+    /// inside `MIN_REQUESTTIME`, and `BADCLIENTBAN` then banned the whole
+    /// address — everyone behind it — for seven days.
+    #[test]
+    fn two_clients_behind_one_address_do_not_share_a_strike_counter() {
+        let mut tracker = FileRequestTracker::new();
+        let hash = [7u8; 16];
+        let a = QueueIdentity::UserHash([0xAA; 16]);
+        let b = QueueIdentity::UserHash([0xBB; 16]);
+
+        // Both clients ask, then each re-asks immediately. Per-identity that
+        // is one strike each, nowhere near BADCLIENTBAN.
+        assert!(!tracker.record_request(a.clone(), hash));
+        assert!(!tracker.record_request(b.clone(), hash));
+        backdate(&mut tracker, &a, hash, 1);
+        backdate(&mut tracker, &b, hash, 1);
+        assert!(!tracker.record_request(a.clone(), hash));
+        assert!(
+            !tracker.record_request(b.clone(), hash),
+            "one client's re-ask must not push another client toward a ban"
+        );
+        assert_eq!(tracker.entries[&(a, hash)].1, 1);
+        assert_eq!(tracker.entries[&(b, hash)].1, 1);
     }
 
     /// `bad_count` only ever rose, and `cleanup_stale` keyed expiry on a
     /// timestamp every request refreshed — so two infractions an arbitrary
     /// distance apart earned a seven-day ban.
+    /// eMule cannot hand one client two slots: `AttachToAlreadyKnown` merges a
+    /// second connection from a known peer into the existing `CUpDownClient`,
+    /// so the slot belongs to the client. Admission here was a bare counter with
+    /// no identity component, so one peer opening `MAX_CONNECTIONS_PER_IP`
+    /// sockets and saying Hello with the same user hash on each could take a
+    /// slot per socket while the waiting list was empty.
+    #[test]
+    fn one_identity_cannot_hold_two_upload_slots() {
+        use std::sync::atomic::Ordering;
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let holders = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let peer = QueueIdentity::UserHash([0xA1; 16]);
+        let other = QueueIdentity::UserHash([0xB2; 16]);
+
+        let mut first = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
+        let mut second = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
+        let mut third = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
+
+        assert!(first.try_activate(4, &peer));
+        assert!(
+            !second.try_activate(4, &peer),
+            "a second connection from the same client must not take another slot"
+        );
+        assert!(
+            third.try_activate(4, &other),
+            "a different client must be unaffected"
+        );
+        assert_eq!(active.load(Ordering::Relaxed), 2);
+
+        // Releasing frees the identity for a later session.
+        first.deactivate();
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        assert!(
+            second.try_activate(4, &peer),
+            "the identity is claimable again once its slot is released"
+        );
+        assert_eq!(active.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn a_well_spaced_request_pays_down_an_earlier_strike() {
         let mut tracker = FileRequestTracker::new();
-        let ip = Ipv4Addr::new(203, 0, 113, 9);
+        let id = ident("203.0.113.9");
         let hash = [3u8; 16];
 
-        tracker.record_request(ip, hash);
-        backdate(&mut tracker, ip, hash, 1);
-        assert!(!tracker.record_request(ip, hash));
-        assert_eq!(tracker.entries[&(ip, hash)].1, 1);
+        tracker.record_request(id.clone(), hash);
+        backdate(&mut tracker, &id, hash, 1);
+        assert!(!tracker.record_request(id.clone(), hash));
+        assert_eq!(tracker.entries[&(id.clone(), hash)].1, 1);
 
-        backdate(&mut tracker, ip, hash, MIN_REQUESTTIME_SECS + 1);
-        assert!(!tracker.record_request(ip, hash));
+        backdate(&mut tracker, &id, hash, MIN_REQUESTTIME_SECS + 1);
+        assert!(!tracker.record_request(id.clone(), hash));
         assert_eq!(
-            tracker.entries[&(ip, hash)].1,
+            tracker.entries[&(id, hash)].1,
             0,
             "waiting out the window must clear the strike, not leave it on the record"
         );
@@ -12830,17 +13103,17 @@ mod abuse_and_seniority_tests {
     #[test]
     fn a_requeue_we_asked_for_is_not_held_against_the_peer() {
         let mut tracker = FileRequestTracker::new();
-        let ip = Ipv4Addr::new(203, 0, 113, 10);
+        let id = ident("203.0.113.10");
         let hash = [4u8; 16];
 
-        tracker.record_request(ip, hash);
-        backdate(&mut tracker, ip, hash, 1);
-        assert!(!tracker.record_request(ip, hash));
+        tracker.record_request(id.clone(), hash);
+        backdate(&mut tracker, &id, hash, 1);
+        assert!(!tracker.record_request(id.clone(), hash));
 
-        tracker.forgive_requeue(ip, hash);
-        backdate(&mut tracker, ip, hash, 1);
+        tracker.forgive_requeue(id.clone(), hash);
+        backdate(&mut tracker, &id, hash, 1);
         assert!(
-            !tracker.record_request(ip, hash),
+            !tracker.record_request(id, hash),
             "a forgiven rotation must not leave the peer one request from a ban"
         );
     }
@@ -12848,14 +13121,14 @@ mod abuse_and_seniority_tests {
     #[test]
     fn back_to_back_requests_inside_the_window_still_ban() {
         let mut tracker = FileRequestTracker::new();
-        let ip = Ipv4Addr::new(203, 0, 113, 11);
+        let id = ident("203.0.113.11");
         let hash = [5u8; 16];
 
-        tracker.record_request(ip, hash);
+        tracker.record_request(id.clone(), hash);
         let mut banned = false;
         for _ in 0..4 {
-            backdate(&mut tracker, ip, hash, 1);
-            banned |= tracker.record_request(ip, hash);
+            backdate(&mut tracker, &id, hash, 1);
+            banned |= tracker.record_request(id.clone(), hash);
         }
         assert!(banned, "the ban must stay reachable for a genuinely abusive peer");
     }

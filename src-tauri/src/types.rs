@@ -406,6 +406,34 @@ pub enum SourceStatus {
     Unreachable,
 }
 
+impl SourceStatus {
+    /// The exact wire string this variant serializes to, and the closed
+    /// vocabulary the frontend's `SourceInfo['status']` union enumerates.
+    ///
+    /// `transfer-source-detail` events used to carry the raw status string the
+    /// download worker produced, while the `list_transfer_sources` snapshot
+    /// carried this normalized enum. Worker-only strings therefore reached the
+    /// UI, which has no case for them and rendered "Unknown" — and on the next
+    /// snapshot the same row came back as `Failed` via the normalizer's
+    /// catch-all, which the drawer *deletes*. Emitting this keeps both paths on
+    /// one vocabulary.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::WaitCallback => "wait_callback",
+            Self::Queued => "queued",
+            Self::QueueFull => "queue_full",
+            Self::NoNeededParts => "no_needed_parts",
+            Self::Stalled => "stalled",
+            Self::Transferring => "transferring",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::FriendConnect => "friend_connect",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
 /// optional because a remote node only fills the ones it knows. Grouped into a
 /// single optional struct so a hit with no media info serializes to nothing.
@@ -2103,6 +2131,37 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `as_wire` is what `transfer-source-detail` events carry and what the
+    /// frontend's `SourceInfo['status']` union enumerates, while the
+    /// `list_transfer_sources` snapshot carries the serde rendering of the same
+    /// value. If the two ever disagree the UI silently shows "Unknown" for a
+    /// live source, so pin them to each other rather than trusting them to be
+    /// edited together.
+    #[test]
+    fn source_status_wire_strings_match_their_serialization() {
+        let all = [
+            SourceStatus::Connecting,
+            SourceStatus::WaitCallback,
+            SourceStatus::Queued,
+            SourceStatus::QueueFull,
+            SourceStatus::NoNeededParts,
+            SourceStatus::Stalled,
+            SourceStatus::Transferring,
+            SourceStatus::Completed,
+            SourceStatus::Failed,
+            SourceStatus::FriendConnect,
+            SourceStatus::Unreachable,
+        ];
+        for status in &all {
+            let serialized = serde_json::to_value(status).expect("serializes");
+            assert_eq!(
+                serialized.as_str(),
+                Some(status.as_wire()),
+                "{status:?} serializes to something other than its wire string"
+            );
+        }
+    }
 
     /// A fresh profile can answer "why will this download not finish?" without
     /// being set up first, which is the whole point of shipping the lookup

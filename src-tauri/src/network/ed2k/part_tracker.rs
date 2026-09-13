@@ -367,7 +367,22 @@ impl PartTracker {
     }
 
     /// Check if a part (9.28 MB chunk) is fully downloaded.
+    ///
+    /// An out-of-range index is not complete, it is not a part at all. Without
+    /// the bound this answered `true` for any `part_idx >= part_count`:
+    /// `part_range` yields `start >= end` (both at or past `file_size`),
+    /// `first_gap_reaching` walks off the end of the gap list, and
+    /// `gap_overlaps_from` returns `false`, which the negation turns into
+    /// "complete". `upload.rs` already passes `part_idx == part_count` for any
+    /// file that is an exact multiple of `PARTSIZE`, because it iterates to the
+    /// *wire* part count (`floor(size/PARTSIZE) + 1`); that is harmless today
+    /// only because its `&& is_part_verified(part_idx)` conjunct is bounds
+    /// checked, so an unbounded "yes" here is a live footgun for the next
+    /// caller that checks completeness alone.
     pub fn is_part_complete(&self, part_idx: usize) -> bool {
+        if part_idx >= self.part_count {
+            return false;
+        }
         let (start, end) = self.part_range(part_idx);
         !self.gap_overlaps_from(self.first_gap_reaching(start), end)
     }
@@ -1119,6 +1134,14 @@ impl PartTracker {
                     self.file_size
                 );
                 self.gaps = vec![(0, self.file_size)];
+                // Drop the hashset and filename this sidecar donated too. They
+                // were read before this check, so a sidecar we have just
+                // declared untrustworthy still handed us its part hashes — the
+                // two sibling rejection paths (hash mismatch, hash-count
+                // mismatch) both bail before reading any. Downstream
+                // `verify_hashset` would catch a wrong set, but there is no
+                // reason to carry it that far.
+                self.clear_part_hashes_and_verified();
                 return Ok(());
             }
         }
@@ -1127,11 +1150,36 @@ impl PartTracker {
         // picture may be incomplete.  With zero gap tags we'd falsely show a
         // fully-complete file; with a partial set we'd show *more* complete
         // than reality.  In either case, reset to "all incomplete".
-        if tags_parsed < tag_count && self.file_size > 0 {
+        // Compare against the RAW count, not the clamped one. Clamping first
+        // defeated this guard exactly when it was needed: with a declared count
+        // above `MAX_TAG_COUNT` the loop parses `tag_count` tags, so
+        // `tags_parsed < tag_count` is false and the reset never ran — while
+        // every gap tag past the cut is simply missing from the rebuilt list.
+        // Gap tags are written in ascending offset order, so that silently
+        // reported the whole tail of the file as present.
+        if (tags_parsed < tag_count || raw_tag_count > MAX_TAG_COUNT) && self.file_size > 0 {
             tracing::warn!(
-                "part.met parse truncated ({tags_parsed}/{tag_count} tags, {} gap starts found), \
+                "part.met parse truncated ({tags_parsed}/{raw_tag_count} tags, {} gap starts found), \
                  assuming file is incomplete",
                 gap_starts.len(),
+            );
+            self.gaps = vec![(0, self.file_size)];
+            return Ok(());
+        }
+
+        // An end tag with no matching start describes a gap we cannot place.
+        // The orphaned-*start* case below fails closed (extends to
+        // `file_size`); this direction silently dropped the gap, so bytes that
+        // were never received counted as present and could be served to peers
+        // once the covering part's verified bit was restored. Fail closed the
+        // same way rather than trusting a half-paired sidecar.
+        if self.file_size > 0 && gap_ends.keys().any(|idx| !gap_starts.contains_key(idx)) {
+            tracing::warn!(
+                "part.met has {} gap end tag(s) with no matching start; assuming file is incomplete",
+                gap_ends
+                    .keys()
+                    .filter(|idx| !gap_starts.contains_key(idx))
+                    .count(),
             );
             self.gaps = vec![(0, self.file_size)];
             return Ok(());

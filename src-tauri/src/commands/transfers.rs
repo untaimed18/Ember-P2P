@@ -204,9 +204,36 @@ fn verify_recovery_ranges(
         anyhow::bail!("archive recovery cancelled");
     }
 
-    let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, part_path);
+    // A `.part.met` is not authenticated, and `PartTracker::new` deliberately
+    // adopts whatever ed2k hash the sidecar carries — which meant this function
+    // took both the part hashes and the verified bitmap from the same
+    // unvalidated file it was supposed to be checking, and `expected_file_hash`
+    // only mattered on the single-part branch below. A stale, hand-moved or
+    // tampered sidecar could therefore have `.part` content "verified" against
+    // its own hashes, and archive recovery would extract from ranges never tied
+    // to the file the user asked for.
+    //
+    // `new_with_identity` refuses a sidecar whose hash disagrees with the
+    // caller's file (and takes it at construction time, because a later
+    // `set_file_hash` would hide the mismatch), and `verify_hashset` binds the
+    // hashset itself back to that hash — so a forged hashset carrying the right
+    // file hash cannot pass either. With no trustworthy hashset we fall through
+    // to the single-part branch, which demands a full file-level ed2k match.
+    let tracker = crate::network::ed2k::part_tracker::PartTracker::new_with_identity(
+        file_size,
+        part_path,
+        expected_file_hash,
+    );
     let flags = tracker.verified_parts();
-    let hashes = tracker.part_hashes();
+    let hashes: &[[u8; 16]] = if crate::network::ed2k::transfer::verify_hashset(
+        &expected_file_hash,
+        tracker.part_hashes(),
+        file_size,
+    ) {
+        tracker.part_hashes()
+    } else {
+        &[]
+    };
     // Pin the .part through the approved Temp parent so a symlink swap after
     // verify_existing_path cannot redirect recovery reads.
     let (_, mut file) =
@@ -1115,10 +1142,25 @@ pub async fn resume_transfers_batch(
     for transfer_id in transfer_ids {
         let (was_paused_active, promoted) = {
             let mut manager = state.transfer_manager.write().await;
+            // `Insufficient` belongs here alongside `Paused`, as it does in
+            // `resume_transfer` and `resume_all_transfers`. `resume` clears
+            // that state in place and returns no promotions (the row never
+            // left `active`), so without it nothing reaches `restart_ids`,
+            // `start_promoted_downloads` is never called, and no
+            // `PendingDownload` is re-inserted — `mark_download_insufficient`
+            // dropped it. The row then reads `Searching`, which
+            // `active_download_count` *does* count, so the cap is
+            // oversubscribed and the transfer never dials again: the retry
+            // timer only walks `pending_downloads`.
             let was_paused_active = manager
                 .active
                 .get(&transfer_id)
-                .map(|t| t.status == TransferStatus::Paused)
+                .map(|t| {
+                    matches!(
+                        t.status,
+                        TransferStatus::Paused | TransferStatus::Insufficient
+                    )
+                })
                 .unwrap_or(false);
             if manager.get_control(&transfer_id).is_none() {
                 manager.register_control(&transfer_id, TransferControl::new());

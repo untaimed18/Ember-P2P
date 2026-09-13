@@ -946,6 +946,17 @@ async fn reseed_friend_endpoint(
     let mut file_hashes = std::collections::HashSet::new();
     for (file_hash, old_ip, old_port) in &relocated {
         file_hashes.insert(*file_hash);
+        // `relocate_user_hash` reports the *current* address when the peer was
+        // already at this endpoint (deliberately — see its doc and
+        // `relocate_user_hash_moves_endpoint_and_reports_old`), so `old ==
+        // new` means nothing actually moved. Clearing the dead-source entries
+        // in that case removed the last rate brake on a peer we may have just
+        // failed against, on every repeat friend hello or reconnect. A real
+        // relocation still clears both endpoints: the old address's block says
+        // nothing about the new one.
+        if (*old_ip, *old_port) == (ip, port) {
+            continue;
+        }
         state.dead_sources.remove(0, u32::from(*old_ip), *old_port);
         state
             .dead_sources
@@ -5873,6 +5884,32 @@ fn pending_download_retry_interval(search_count: u32) -> i64 {
     }
 }
 
+/// Install a fresh [`TransferControl`] for `transfer_id`, cancelling whatever
+/// control was registered before it.
+///
+/// The cancel is load-bearing, not hygiene. A worker's per-source tasks are
+/// detached `tokio::spawn`s that stop only when their control is cancelled, so
+/// aborting the worker's own `JoinHandle` never reaches them. Overwriting the
+/// registration without cancelling left the previous generation's children
+/// running against an orphaned control that no later Stop, Pause or disconnect
+/// could reach, still holding their sockets and part-writer reservations. The
+/// IPC path has done this since `start_promoted_downloads`; these network-loop
+/// respawn sites had not, and a following `StartDownload` cannot compensate —
+/// its guard compares `get_control` against the control it was handed with
+/// `Arc::ptr_eq`, which now matches, so it skips the cancel itself.
+async fn reregister_transfer_control(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    transfer_id: &str,
+) -> Arc<TransferControl> {
+    let control = TransferControl::new();
+    let mut mgr = transfer_manager.write().await;
+    if let Some(old) = mgr.get_control(transfer_id) {
+        old.cancel();
+    }
+    mgr.register_control(transfer_id, control.clone());
+    control
+}
+
 fn insert_pending_download_bounded(
     pending: &mut HashMap<String, PendingDownload>,
     transfer_id: String,
@@ -7044,6 +7081,29 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// Uploads must not depend on KAD. eMule treats KAD and eD2K as independent
+    /// subsystems — running with KAD off is an ordinary configuration that seeds
+    /// normally — but `KadDisconnect` raised the upload gate unconditionally, so
+    /// a user who turned KAD off while logged in to a server stopped serving
+    /// every peer while their downloads carried on. The gate now asks whether
+    /// any transport is left, and a live-or-pending server session is one.
+    #[test]
+    fn a_live_server_session_keeps_uploads_enabled_when_kad_goes_down() {
+        // Logged in, socket held, or a login still in flight: any of the three
+        // means we are still reachable for eD2K and must keep serving.
+        assert!(ed2k_server_session_live(true, true, false));
+        assert!(ed2k_server_session_live(false, true, false));
+        assert!(ed2k_server_session_live(
+            false, false,
+            /* pending login */ true
+        ));
+        assert!(ed2k_server_session_live(true, false, false));
+
+        // KAD was the last transport standing, so the node really is offline
+        // and the upload listener should come down with it.
+        assert!(!ed2k_server_session_live(false, false, false));
+    }
 
     /// Firsthand session contacts sit beside the routing table and are exempt
     /// from everything that disciplines a resident: no liveness ping reaches
@@ -23477,6 +23537,22 @@ async fn handle_server_disconnect(
     }
 }
 
+/// Whether an eD2K server session is live, or an in-flight login is about to
+/// produce one.
+///
+/// All three inputs are consulted because they are set at different points in
+/// the connect/disconnect sequence: `server_connected` is the logged-in flag,
+/// `server_connection` holds the live socket, and `pending_server_connect` is a
+/// login still in progress. Checking only the first would read a session that
+/// is mid-login as absent.
+pub(super) fn ed2k_server_session_live(
+    server_connected: bool,
+    has_connection: bool,
+    has_pending_connect: bool,
+) -> bool {
+    server_connected || has_connection || has_pending_connect
+}
+
 /// Tear down an already-up eD2K session whose IP is now blocked.
 ///
 /// First-launch merge admits servers while `!ranges_ready` so `server.met`
@@ -29556,11 +29632,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &t.id,
                                 &t.status,
                             );
-                            let control = TransferControl::new();
-                            {
-                                let mut mgr = transfer_manager.write().await;
-                                mgr.register_control(&t.id, control.clone());
-                            }
+                            let control =
+                                reregister_transfer_control(&transfer_manager, &t.id).await;
                             handle_command(
                                 &udp_socket,
                                 NetworkCommand::StartDownload {
@@ -29635,11 +29708,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if let Some(t) = transfer_info {
                             // Pause/Stop/Insufficient must not be undone by a
                             // late Failed requeue (T1/T3).
+                            //
+                            // `Completed`/`Failed` belong here for the reason the
+                            // `Failed` arm of `handle_download_event` documents: a
+                            // worker that raced completion must not persist a
+                            // failure for a download whose bytes verified. That
+                            // guard cannot help us — this block ends in `continue`,
+                            // so it is never reached. Without these two states a
+                            // late duplicate `Failed` wrote `failure_reason` and a
+                            // "Retrying after …" health onto the terminal row
+                            // (`get_transfer_mut` searches `completed` too),
+                            // re-registered a control `complete()` had removed,
+                            // re-inserted a pending entry that can never start, and
+                            // queued a `"searching"` status write whose sequence is
+                            // NEWER than the completion write — so the DB row
+                            // regressed from `completed` and the finished file was
+                            // re-downloaded on the next launch.
                             if matches!(
                                 t.status,
                                 TransferStatus::Paused
                                     | TransferStatus::Stopped
                                     | TransferStatus::Insufficient
+                                    | TransferStatus::Completed
+                                    | TransferStatus::Failed
                             ) {
                                 continue;
                             }
@@ -29654,6 +29745,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         TransferStatus::Paused
                                             | TransferStatus::Stopped
                                             | TransferStatus::Insufficient
+                                            | TransferStatus::Completed
+                                            | TransferStatus::Failed
                                     )
                                 });
                                 if blocked {
@@ -30324,11 +30417,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &t.id,
                         &t.status,
                     );
-                    let control = TransferControl::new();
-                    {
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.register_control(&t.id, control.clone());
-                    }
+                    let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                     let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
@@ -31742,11 +31831,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &t.id,
                         &t.status,
                     );
-                    let control = TransferControl::new();
-                    {
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.register_control(&t.id, control.clone());
-                    }
+                    let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                     let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
@@ -38145,11 +38230,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &t.id,
                             &t.status,
                         );
-                        let control = TransferControl::new();
-                        {
-                            let mut mgr = transfer_manager.write().await;
-                            mgr.register_control(&t.id, control.clone());
-                        }
+                        let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                         insert_pending_download_bounded(&mut state.pending_downloads,
                             t.id.clone(),
                             PendingDownload {
@@ -38338,11 +38419,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &t.id,
                                     &t.status,
                                 );
-                                let control = TransferControl::new();
-                                {
-                                    let mut mgr = transfer_manager.write().await;
-                                    mgr.register_control(&t.id, control.clone());
-                                }
+                                let control =
+                                    reregister_transfer_control(&transfer_manager, &t.id).await;
                                 insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
@@ -38539,11 +38617,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &t.id,
                                     &t.status,
                                 );
-                                let control = TransferControl::new();
-                                {
-                                    let mut mgr = transfer_manager.write().await;
-                                    mgr.register_control(&t.id, control.clone());
-                                }
+                                let control =
+                                    reregister_transfer_control(&transfer_manager, &t.id).await;
                                 insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
@@ -38934,12 +39009,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
                         // Track which (ip, tcp_port) pairs we sent to in this
                         // tick so the persistent-list pass below doesn't
-                        // double-fire to the same peer (the SM cooldown is
-                        // already active from the `mark_asked` call below,
-                        // but `can_request_sources_for` returning false is
-                        // *exactly* the gate the persistent loop currently
-                        // proceeds past — so without an explicit set we'd
-                        // emit two identical OP_REASKFILEPING in one tick).
+                        // double-fire to the same peer. This set is the only
+                        // dedup between the two passes: the SourceManager
+                        // cooldown is bumped by `mark_asked` below, but the
+                        // persistent pass keys on its own `last_udp_reask`.
                         let mut sent_this_tick: HashSet<(Ipv4Addr, u16)> =
                             HashSet::with_capacity(udp_sources.len());
                         let mut sent = 0usize;
@@ -38947,9 +39020,25 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             if state.dead_sources.is_dead_source_for_file(&fh, u32::from(*ip), *tcp_port) {
                                 continue;
                             }
-                            if sm.can_request_sources_for(&fh, *ip, *tcp_port) {
-                                continue;
-                            }
+                            // Deliberately NOT gated on the source-exchange
+                            // cooldown. eMule drives `OP_REASKFILEPING` purely
+                            // off the reask timer and the source's queue state
+                            // (`CPartFile::Process` → `UDPReaskForDownload`);
+                            // `OP_REQUESTSOURCES` piggybacks on a *TCP* reask
+                            // when its own interval allows, but never suppresses
+                            // the UDP ping. Gating on it here did two harmful
+                            // things: `can_request_sources_for` returns true when
+                            // `last_sx_sent == 0`, so a source we had never
+                            // source-exchanged with — every row loaded from
+                            // `sources.met` — was never reasked at all; and for
+                            // the rest the ping stopped once the 40-minute SX
+                            // window lapsed, because `last_sx_sent` only advances
+                            // on a live TCP connection. The population that
+                            // depends on this ping is precisely the detached
+                            // `OnQueue` sources of *active* downloads, and the
+                            // TCP reask path only runs for pending ones, so the
+                            // deep queue positions the detach model is built to
+                            // accumulate were being dropped.
                             let addr = SocketAddr::new((*ip).into(), *udp_port);
                             let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                             pkt.extend_from_slice(&reask_payload);
@@ -39006,10 +39095,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                                     continue;
                                 }
-                                if sm.can_request_sources_for(&pfs.file_hash, ip, tcp_port) {
-                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
-                                    continue;
-                                }
+                                // Not gated on the source-exchange cooldown —
+                                // see the SourceManager pass above. This pass
+                                // is the one that maintains queue position for
+                                // an active download's detached sources, so the
+                                // gate hit it hardest.
                                 let addr = SocketAddr::new(ip.into(), udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                 pkt.extend_from_slice(&reask_payload);
@@ -42243,7 +42333,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             .map(|(tid, _)| tid.clone());
 
                         if let Some(tid) = matching_tid {
-                            if let Some(pd) = state.pending_downloads.remove(&tid) {
+                            // Respect pause/cancel and the concurrency cap exactly as the
+                            // KAD-callback arm below does. A paused download deliberately
+                            // stays in `pending_downloads` with a cancelled control, so
+                            // without this guard a buddy connect-back resurrected it: the
+                            // worker bails at once on the cancelled control, its `Failed` is
+                            // classified as a user cancel and suppressed, and the row is left
+                            // `Active` with no worker and no pending entry — a slot consumed
+                            // for the rest of the session that `resume()` cannot reach,
+                            // because `resume` is a no-op for a row already reading `Active`.
+                            // The `active` membership test additionally keeps a row still
+                            // waiting in the queue from starting a worker outside its slot
+                            // (`try_start_pending_download_from_known_sources` checks the
+                            // same thing, since a queued download legitimately keeps a
+                            // pending entry for source discovery).
+                            let blocked = state
+                                .pending_downloads
+                                .get(&tid)
+                                .map(|pd| pd.control.is_paused() || pd.control.is_cancelled())
+                                .unwrap_or(true)
+                                || !transfer_manager.read().await.active.contains_key(&tid);
+                            if blocked {
+                                debug!(
+                                    "Ignoring buddy callback for {tid}: paused, cancelled, or not holding an active slot"
+                                );
+                            } else if let Some(pd) = state.pending_downloads.remove(&tid) {
                                 let source_addr = SocketAddr::new(dest_ip.into(), dest_port);
                                 info!("Starting callback download {} to {source_addr}", pd.transfer_id);
 
@@ -56110,6 +56224,30 @@ async fn handle_download_event(
             );
         }
         DownloadEvent::Verifying { transfer_id } => {
+            // A `Verifying` that was queued before the user paused or stopped
+            // must not undo them. This arm had no guard at all, unlike the
+            // `Failed` and `SourcesUpdate` arms, and `Verifying` is the worst
+            // state to be stranded in: `active_download_count` counts it, so
+            // the slot stays consumed after `pause_and_promote` already gave
+            // it away; `resume()` does not handle it, so the user cannot get
+            // out; and `compute_health_state` calls it Healthy, so no stall
+            // detection fires. Same settled-state set the `Failed` arm uses.
+            let settled_by_user = {
+                let mgr = transfer_manager.read().await;
+                mgr.get_transfer(&transfer_id).is_some_and(|t| {
+                    matches!(
+                        t.status,
+                        TransferStatus::Paused
+                            | TransferStatus::Stopped
+                            | TransferStatus::Insufficient
+                            | TransferStatus::Completed
+                            | TransferStatus::Failed
+                    )
+                })
+            };
+            if settled_by_user {
+                return;
+            }
             {
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_status(&transfer_id, crate::types::TransferStatus::Verifying);
@@ -56231,8 +56369,32 @@ async fn handle_download_event(
                 // source that is waiting perfectly healthily.
                 "friend_connect" => crate::types::SourceStatus::FriendConnect,
                 "unreachable" => crate::types::SourceStatus::Unreachable,
+                // Transient hold-offs, not failures. Both are routine — the
+                // connection semaphore saturates on any busy download
+                // (`too_many_conns`), and every source that arrives once all
+                // remaining parts are already in flight gets `parts_busy`,
+                // which is the normal endgame of a well-swarmed file. Falling
+                // to `Failed` meant the drawer deleted these perfectly healthy
+                // rows and counted them into "N failed sources hidden", and
+                // `update_source_detail` evicted them first at the 500-row cap.
+                // `set_too_many_conns` / `set_parts_busy` both arm a short
+                // retry, so `Connecting` is the honest rendering.
+                "too_many_conns" => crate::types::SourceStatus::Connecting,
+                "parts_busy" => crate::types::SourceStatus::NoNeededParts,
+                // The LowID/callback path reports its post-handshake state with
+                // this string rather than a bare "connecting".
+                "connected (callback)" => crate::types::SourceStatus::Connecting,
+                // `duplicate` deliberately lands on `Failed`: another live route
+                // already owns this peer, and `Failed` is the frontend's
+                // documented remove-on-terminal-status signal, so the redundant
+                // row disappears instead of lingering. It carries no fail_count
+                // penalty — see the `emit_source!("duplicate", ..)` site.
                 _ => crate::types::SourceStatus::Failed,
             };
+            // Both the snapshot and the event below must speak the same closed
+            // vocabulary; `status` is the worker's raw string and may not be in
+            // it. `&'static str`, so it outlives the move of `source_status`.
+            let status_wire = source_status.as_wire();
             // Every event here comes from a real download worker
             // (multi_source / transfer) reporting a *live* peer connection on
             // (ip, port). Placeholder rows we seed from KAD/server source
@@ -56350,7 +56512,7 @@ async fn handle_download_event(
                     "transfer_id": transfer_id,
                     "ip": ip,
                     "port": port,
-                    "status": status,
+                    "status": status_wire,
                     "queue_rank": queue_rank,
                     "speed": speed,
                     "transferred": transferred,

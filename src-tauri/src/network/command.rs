@@ -4396,11 +4396,42 @@ async fn handle_command_inner(
                 }
             }
 
-            // Signal the upload listener to reject new connections and
-            // terminate active upload sessions (eMule: all uploads stop on disconnect).
-            state
-                .upload_disconnected
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Take the upload listener down only if KAD was the last transport
+            // standing.
+            //
+            // This used to fire unconditionally, justified as "eMule: all
+            // uploads stop on disconnect" — which is true of eMule's *global*
+            // Disconnect, but not of turning KAD off. eMule treats KAD and eD2K
+            // as independent subsystems; running with KAD disabled is an
+            // ordinary configuration that seeds perfectly well, because serving
+            // an upload needs a shared file, the TCP listener, and — for LowID —
+            // a server to relay callbacks, none of which involve KAD. The
+            // `upload_disconnected` field comment says exactly this. So a user
+            // who disconnected KAD while logged in to a server stopped serving
+            // every peer, while their downloads carried on, and the control that
+            // did it is labelled from a KAD-only status field.
+            //
+            // The flag's intent survives: a node the user has taken offline must
+            // not keep serving peers who remember its address. That condition is
+            // "no transport left", and the other half of it is already handled —
+            // `KadDisconnect` sets `user_offline` below, and
+            // `handle_server_disconnect` re-arms this gate whenever the server
+            // goes away while `user_offline` is set. So disconnecting KAD and
+            // then losing the server still stops uploads.
+            let server_online = ed2k_server_session_live(
+                state.server_connected,
+                state.server_connection.is_some(),
+                state.pending_server_connect.is_some(),
+            );
+            if !server_online {
+                state
+                    .upload_disconnected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                info!(
+                    "KAD disconnected but an eD2K server session is live — uploads stay enabled"
+                );
+            }
             // And stop the outbound half, which the upload gate cannot speak
             // for: no new download workers, no friend dials, no server search
             // until the user comes back online.

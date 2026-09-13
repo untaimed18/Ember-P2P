@@ -2,7 +2,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
+  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -319,7 +319,17 @@
           expandedSources = expandedSources.filter((_, i) => i !== idx);
         } else {
           const s = expandedSources[idx];
-          const updated: SourceInfo = { ...s, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
+          // Keep a known queue rank when the incoming event omits it and the
+          // peer is still queued. Every neighbouring field already falls back
+          // to the stored value, and the backend's own merge preserves a known
+          // rank the same way — but `queue_rank: d.queue_rank` did not, so any
+          // rank-less `queued` emit (a re-ask, a reconnect) blanked "QR: 23"
+          // and, because the comparator treats a missing rank as
+          // `MAX_SAFE_INTEGER`, dropped the row to the bottom of the queued
+          // tier until the next ranked event put it back.
+          const queue_rank =
+            d.queue_rank ?? (status === 'queued' ? s.queue_rank : undefined);
+          const updated: SourceInfo = { ...s, status, queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
           expandedSources[idx] = updated;
           expandedSources = [...expandedSources];
         }
@@ -1485,7 +1495,7 @@
     // Searching / verifying / hashing are deliberately not here: they are in
     // `SPEED_DECAY_APPLIES`, so the backend decays their rate towards zero
     // rather than dropping it, and the row is meant to show that fade.
-    if (t.status === 'paused' || t.status === 'stopped' || t.status === 'completed' || t.status === 'failed') {
+    if (IDLE_STATUSES.has(t.status)) {
       return 0;
     }
     // Prefer the backend's real-time rolling-window rate. It's pushed on every

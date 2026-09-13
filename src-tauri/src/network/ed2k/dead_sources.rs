@@ -14,6 +14,11 @@ const BLOCKTIME_PER_FILE_SECS: i64 = 2700;
 const BLOCKTIME_TRANSIENT_SECS: i64 = 600;
 /// eMule: FILEREASKTIME — minimum time between file re-asks (29 minutes)
 pub const FILEREASKTIME_SECS: i64 = 1740;
+/// eMule `MIN_REQUESTTIME` (~10 minutes). Uploaders treat a second
+/// `OP_STARTUPLOADREQ` / reconnect faster than this as a bad client and
+/// ban the user hash. Hello/connect failures must cool at least this
+/// long or we look like a bot and the next dial is RST'd immediately.
+pub const MIN_REQUESTTIME_SECS: i64 = 590;
 /// How long the upload listener remembers an expected inbound KAD callback.
 /// Matches [`FILEREASKTIME_SECS`] so a slow buddy relay is not dropped while
 /// we are still within the normal reask window.
@@ -344,5 +349,18 @@ mod tests {
         let mut d = DeadSourceList::new();
         d.add_transient_dead_source_for_file(file_hash(7), 0xFFEEDDCC, 4662);
         assert!(d.is_dead_source_for_file(&file_hash(7), 0xFFEEDDCC, 4662));
+    }
+
+    /// `multi_source`'s hello/connect-failure cooldown is derived from this
+    /// constant. It used to be a flat 60 s, which re-asked far inside eMule's
+    /// `MIN_REQUESTTIME` and got our user hash banned by the uploader — after
+    /// which every dial to that peer was refused and the UI painted a
+    /// reachable source as Failed. Pinning the value keeps the reask floor
+    /// above the ban threshold; the ordering keeps a hello failure cheaper
+    /// than a confirmed queue slot, which cools for the full reask interval.
+    #[test]
+    fn hello_fail_cooldown_is_emule_min_request_time() {
+        assert_eq!(MIN_REQUESTTIME_SECS, 590);
+        const { assert!(MIN_REQUESTTIME_SECS < FILEREASKTIME_SECS) };
     }
 }

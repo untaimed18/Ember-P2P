@@ -722,8 +722,14 @@ pub fn is_disk_full_error(err: &str) -> bool {
         || lower.contains("not enough space")
         || lower.contains("disk full")
         || lower.contains("there is not enough space")
-        || lower.contains("os error 28") // ENOSPC
-        || lower.contains("os error 112") // ERROR_DISK_FULL (Windows)
+        // Raw errno text is platform-specific and these two numbers collide
+        // with unrelated errors on the other platform: OS error 28 is
+        // ERROR_OUT_OF_PAPER on Windows, and 112 is EHOSTDOWN on Linux — which
+        // a download folder on an NFS/SMB share returns when the host goes
+        // away. Reporting that as `InsufficientDisk` put a recoverable
+        // transfer into a terminal state instead of retrying it.
+        || (cfg!(unix) && lower.contains("os error 28")) // ENOSPC
+        || (cfg!(windows) && lower.contains("os error 112")) // ERROR_DISK_FULL
         || lower.contains("storagefull")
 }
 
@@ -873,6 +879,17 @@ pub(crate) fn infer_stage_from_error(error: &str) -> &'static str {
     if error.contains("stage:data_wait") {
         return "data_wait";
     }
+    // Both of these carry a `stage:` prefix that had no arm here, so they fell
+    // through every check (and match none of the keyword fallbacks below) and
+    // ended up as the generic `TransientFailure` rather than the specific code
+    // the UI has a translation for. `stage:peer_dropped_after_accept` was added
+    // precisely so that failure would read distinctly.
+    if error.contains("stage:peer_dropped_after_accept") {
+        return "data_wait";
+    }
+    if error.contains("stage:tcp_obfuscation") {
+        return "tcp_connect";
+    }
     if error.contains("stage:hashset_wait") {
         return "hashset_wait";
     }
@@ -892,6 +909,34 @@ pub(crate) fn is_queue_detached_error(error: &str) -> bool {
     error.contains("stage:queue_detached") || error.contains("connection lost while queued")
 }
 
+/// True when the source task ended in a normal eMule queue state rather than
+/// a handshake or transfer failure. The per-source loop already emitted
+/// `queued` / `queue_full`; overlaying `SourceDetail{status:"failed"}` would
+/// penalize the peer and paint a red row for a source eMule keeps OnQueue.
+pub(crate) fn is_queue_state_error(error: &str) -> bool {
+    is_queue_detached_error(error)
+        || error.contains("peer queue is full")
+        || error.contains("timed out waiting for upload slot")
+        || error.contains("OutOfPartReqs")
+        || error.contains("peer revoked upload slot")
+        // The uploader recalculated its queue and pushed us back to a rank
+        // mid-transfer. eMule does this routinely; the worker has already
+        // emitted `queued` with the new rank, so overlaying `failed` both
+        // contradicts it and drops the peer out of `OnQueue` (and therefore
+        // out of the Path-B push-grant index).
+        || error.contains("put us back in queue")
+        // Peer holds nothing we still need. The worker emitted
+        // `no_needed_parts`; `multi_source`'s retry-round comment lists this
+        // with the queue states that must not be penalized.
+        || error.contains("no parts we need")
+}
+
+/// False for user Stop/Pause and for queue-state exits. Those must not emit
+/// `SourceDetail{status:"failed"}` — that applies `set_failed_with_penalty`.
+pub(crate) fn should_emit_source_failed(error: &str) -> bool {
+    !is_user_cancel_error(error) && !is_queue_state_error(error)
+}
+
 /// True when a per-source download task unwound because the user
 /// Stopped/Cancelled/Paused the transfer (the strings produced by the
 /// `TransferControl` cancel/pause arms and `check_control`), rather than
@@ -901,6 +946,13 @@ pub(crate) fn is_queue_detached_error(error: &str) -> bool {
 /// per-file source list for fast resume, so repeated pause/resume cycles
 /// would otherwise steadily degrade and eventually evict a transfer's best
 /// peers. eMule treats a user pause/stop as a clean teardown.
+pub(crate) fn is_user_cancel_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("cancelled by user")
+        || lower.contains("cancelled while paused")
+        || lower.contains("download cancelled")
+}
+
 /// Aborts a spawned task when it leaves scope, however the scope exits.
 ///
 /// The verification cancel-watchers are only ever released by an explicit
@@ -914,13 +966,6 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-pub(crate) fn is_user_cancel_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("cancelled by user")
-        || lower.contains("cancelled while paused")
-        || lower.contains("download cancelled")
 }
 
 #[cfg(test)]
@@ -1001,6 +1046,11 @@ mod tests {
                 C::PeerHandshakeFailed,
             ),
             (
+                "stage:file_status_wait never received FileStatus (last packet proto=0xC5 op=0x93 len=0)",
+                Transient,
+                C::PeerHandshakeFailed,
+            ),
+            (
                 "stage:queue_wait dropped",
                 Transient,
                 C::QueueWaitInterrupted,
@@ -1011,6 +1061,16 @@ mod tests {
                 C::HashsetRequestFailed,
             ),
             ("stage:data_wait eof", Transient, C::ConnectionLost),
+            (
+                "stage:peer_dropped_after_accept peer FIN'd with no data",
+                Transient,
+                C::ConnectionLost,
+            ),
+            (
+                "stage:tcp_obfuscation required by peer but failed",
+                Transient,
+                C::ConnectionFailed,
+            ),
             ("unrecognised", Permanent, C::PermanentFailure),
             ("unrecognised", Transient, C::TransientFailure),
             ("unrecognised", DownloadTimeout, C::DownloadTimedOut),
@@ -1040,6 +1100,51 @@ mod tests {
                 produced.contains(failure) || assigned_elsewhere.contains(failure),
                 "{failure:?} has no producer"
             );
+        }
+    }
+
+    /// A peer that queues us is not a peer that failed. eMule holds such a
+    /// source at DS_ONQUEUE and reasks it for hours; emitting
+    /// `SourceDetail{status:"failed"}` applies `set_failed_with_penalty`, which
+    /// eventually evicts exactly the sources that were about to grant a slot.
+    /// Every string here is one a per-source task really bails with.
+    #[test]
+    fn queue_state_and_user_cancel_do_not_emit_source_failed() {
+        for queue_state in [
+            "peer queue is full",
+            "stage:queue_wait peer queue is full",
+            "stage:queue_detached connection lost while queued",
+            // Queue wait exceeded: the worker lets the TCP session go but the
+            // peer stays OnQueue, maintained by UDP reask / push-grant.
+            "stage:queue_detached queue wait exceeded 1800s (rank Some(42))",
+            "stage:queue_wait timed out waiting for upload slot after 1800s",
+            "peer has no free upload slots (OutOfPartReqs)",
+            "peer revoked upload slot (QueueFull during transfer)",
+            "peer put us back in queue at rank 7 during transfer",
+        ] {
+            assert!(
+                !should_emit_source_failed(queue_state),
+                "{queue_state:?} is a queue state, not a failure"
+            );
+            assert_eq!(
+                classify_failure(queue_state, &classify_error(queue_state)),
+                TransferFailureCode::QueueWaitInterrupted,
+                "{queue_state:?} must read as a queue interruption"
+            );
+        }
+
+        // Not a queue *wait*, but equally not the peer failing: it answered
+        // our file request and simply holds nothing we still need.
+        assert!(!should_emit_source_failed("peer has no parts we need"));
+
+        assert!(!should_emit_source_failed("cancelled by user"));
+
+        // Handshake failures are still real failures.
+        for failure in [
+            "stage:file_status_wait never received FileStatus",
+            "stage:hello_wait timed out",
+        ] {
+            assert!(should_emit_source_failed(failure), "{failure:?}");
         }
     }
 
@@ -1173,6 +1278,41 @@ mod tests {
         let h1: [u8; 16] = Md4::digest(&data[..PARTSIZE as usize]).into();
         let h2: [u8; 16] = Md4::digest(&data[PARTSIZE as usize..]).into();
         assert!(verify_hashset(&file_hash, &[h1, h2], n as u64));
+    }
+
+    /// eMule writes a trailing `MD4("")` for a file that is an exact multiple of
+    /// PARTSIZE, and `part_tracker::load_emule_format` normalizes that form on
+    /// disk. The wire path rejected it, which silently disabled per-part MD4
+    /// verification for the whole file rather than failing loudly.
+    #[test]
+    fn verify_hashset_accepts_the_known_met_sentinel_form() {
+        let part = vec![0x5Au8; PARTSIZE as usize];
+        let mut data = part.clone();
+        data.extend_from_slice(&part);
+        let file_size = data.len() as u64;
+        assert_eq!(file_size % PARTSIZE, 0, "test needs an exact multiple");
+
+        let mut file_hash = [0u8; 16];
+        file_hash.copy_from_slice(&hex::decode(ed2k_hash_bytes(&data)).unwrap());
+        let h = |b: &[u8]| -> [u8; 16] { Md4::digest(b).into() };
+        let two = vec![h(&part), h(&part)];
+        assert!(
+            verify_hashset(&file_hash, &two, file_size),
+            "the plain per-part form must still verify"
+        );
+
+        let mut with_sentinel = two.clone();
+        with_sentinel.push(h(&[]));
+        assert!(
+            verify_hashset(&file_hash, &with_sentinel, file_size),
+            "and so must the known.met form eMule writes for exact multiples"
+        );
+
+        // A third real hash is not the sentinel form and must still be refused.
+        let mut padded = two;
+        padded.push(h(&part));
+        padded.push(h(&[]));
+        assert!(!verify_hashset(&file_hash, &padded, file_size));
     }
 
     #[test]
@@ -2532,35 +2672,12 @@ impl Ed2kDownload {
             }
         }
 
-        // Send our `OP_EMBER_HELLO` unconditionally so any real Ember
-        // peer can BLAKE3-bind our advertised identity — mirrors the
-        // unconditional send in `multi_source.rs`. Vanilla eMule peers
-        // silently ignore the unknown opcode (`ListenSocket.cpp`'s
-        // ProcessExtPacket default branch just logs + returns), so
-        // this is invisible to non-Ember clients and keeps our public
-        // handshake byte-identical to vanilla eMule (important for
-        // anti-leecher queue-ban avoidance).
-        //
-        // Skipped if the peer beat us to it during the pre-control
-        // loop above (we replied with HELLOANSWER there and set
-        // `sent_ember_hello = true`). Otherwise the peer's
-        // HELLOANSWER will land in the file-status-wait loop below
-        // and set `peer_is_ember = true`, populate
-        // `peer_ember_pubkey`, and flip `ember_hash_binding_verified`
-        // when the BLAKE3 check passes.
-        if !sent_ember_hello {
-            let payload = build_ember_hello(
-                &self.ember_hash,
-                &self.our_nickname,
-                Some(&self.ed25519_public_key),
-            );
-            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
-                .await
-                .is_ok()
-            {
-                sent_ember_hello = true;
-            }
-        }
+        // `OP_EMBER_HELLO` is sent below, once the file request is on the
+        // wire. Shipping it here spliced an unknown OP_EMULEPROT opcode
+        // between EmuleInfo and RequestFilename — the one window where our
+        // handshake stopped being byte-identical to vanilla eMule. Peers that
+        // beat us to it in the pre-control loop above already set
+        // `sent_ember_hello` and got a HELLOANSWER there.
 
         // Ember Peer Exchange: share sources after Ember identity binding.
         // Snapshot the generation we sent so the periodic resend loop below
@@ -2716,7 +2833,30 @@ impl Ed2kDownload {
             }
         }
 
+        // Identify Ember only once the vanilla file request is on the wire —
+        // same placement and rationale as `multi_source.rs`: eMule's sequence
+        // is Hello → EmuleInfo → RequestFilename / MultiPacket, and an unknown
+        // opcode spliced into the middle of that is what anti-leech mods
+        // fingerprint. Vanilla eMule ignores 0xF8. The peer's HELLOANSWER is
+        // picked up by the file-status-wait loop below.
+        if !sent_ember_hello {
+            let payload = build_ember_hello(
+                &self.ember_hash,
+                &self.our_nickname,
+                Some(&self.ed25519_public_key),
+            );
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
+                .await
+                .is_ok()
+            {
+                sent_ember_hello = true;
+            }
+        }
+
         // Read FileStatus and FileName responses
+        // AICH root harvested from an `OP_AICHFILEHASHANS` sub-answer inside a
+        // MultiPacket reply, held until `aich_master_hash` is declared below.
+        let mut mp_aich_root: Option<[u8; 20]> = None;
         let mut got_status = single_part;
         let mut got_filename = false;
         let mut available_parts: Vec<bool> = if single_part { vec![true] } else { Vec::new() };
@@ -2739,13 +2879,31 @@ impl Ed2kDownload {
 
             match (proto, opcode) {
                 (OP_EDONKEYHEADER, OP_FILESTATUS) => {
-                    let (hash, parts) = parse_file_status(&payload)?;
+                    // One bad packet must not end the session. `?` here let a
+                    // 17-byte `OP_FILESTATUS` (or one carrying any other MD4)
+                    // tear the whole download down — a single packet a hostile
+                    // or buggy peer sends for free — and because neither error
+                    // carried a `stage:` prefix the UI reported it as a generic
+                    // transient failure rather than a handshake one. The
+                    // multi-source twin ignores the packet and keeps waiting;
+                    // do the same, and let the loop's own bound decide when to
+                    // give up.
+                    let Ok((hash, parts)) = parse_file_status(&payload) else {
+                        debug!(
+                            "Ignoring malformed OP_FILESTATUS ({} bytes) from {}",
+                            payload.len(),
+                            self.source_addr
+                        );
+                        continue;
+                    };
                     if hash != self.file_hash {
-                        anyhow::bail!(
-                            "peer sent FileStatus for wrong file: expected={} got={}",
+                        debug!(
+                            "Ignoring FileStatus for wrong file from {}: expected={} got={}",
+                            self.source_addr,
                             hex::encode(self.file_hash),
                             hex::encode(hash)
                         );
+                        continue;
                     }
                     if parts.is_empty() {
                         // Only trust the `part_count == 0` "complete file"
@@ -2771,9 +2929,15 @@ impl Ed2kDownload {
                     } else {
                         debug!("FileStatus: {} parts", parts.len());
                         let mut padded = parts;
-                        if padded.len() < part_count {
-                            padded.resize(part_count, false);
-                        }
+                        // Resize unconditionally: pad a short bitmap AND
+                        // truncate a long one. Only padding left
+                        // `available_parts.len()` at whatever the peer
+                        // declared (up to `ED2K_MAX_WIRE_PARTS`), and
+                        // `src_avail_parts` / `src_total_parts` are derived
+                        // straight from it — so a peer could make the source
+                        // row claim more parts than the file has. Matches the
+                        // multi-source path.
+                        padded.resize(part_count, false);
                         available_parts = padded;
                     }
                     got_status = true;
@@ -2784,6 +2948,25 @@ impl Ed2kDownload {
                 }
                 (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
                     anyhow::bail!("peer does not have the file");
+                }
+                // OP_QUEUEFULL shares 0x93 with OP_MULTIPACKETANSWER (matched
+                // below). Empty payload is QueueFull; a real multipacket answer
+                // carries at least a 16-byte hash. Without this arm the peer's
+                // "you're queued, no slot" answer fell through to the generic
+                // handler and surfaced as a FileStatus failure.
+                (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
+                    self.file_req_overhead.record_download(6u64);
+                    self.emit_source_detail(
+                        event_tx,
+                        "queue_full",
+                        None,
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                    )
+                    .await;
+                    anyhow::bail!("peer queue is full");
                 }
                 (OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ) => {
                     early_upload_accept = true;
@@ -2912,6 +3095,13 @@ impl Ed2kDownload {
                         if mp.no_file {
                             anyhow::bail!("peer does not have the file");
                         }
+                        // Stash the AICH root we asked for; it is applied once
+                        // `aich_master_hash` exists, below. See the identical
+                        // site in `multi_source.rs` for why dropping it
+                        // disabled block-level recovery for every peer we ask.
+                        if mp_aich_root.is_none() {
+                            mp_aich_root = mp.aich_hash;
+                        }
                         if let Some(parts) = mp.file_status {
                             if parts.is_empty() {
                                 // See the standalone OP_FILESTATUS branch above:
@@ -2926,9 +3116,9 @@ impl Ed2kDownload {
                             } else {
                                 debug!("FileStatus via MultiPacket: {} parts", parts.len());
                                 let mut padded = parts;
-                                if padded.len() < part_count {
-                                    padded.resize(part_count, false);
-                                }
+                                // Pad short, truncate long — see the standalone
+                                // `OP_FILESTATUS` branch above.
+                                padded.resize(part_count, false);
                                 available_parts = padded;
                             }
                             got_status = true;
@@ -3294,7 +3484,7 @@ impl Ed2kDownload {
         }
 
         if !got_status {
-            anyhow::bail!("never received FileStatus");
+            anyhow::bail!("stage:file_status_wait never received FileStatus");
         }
 
         let src_avail_parts: Option<u32> =
@@ -3318,6 +3508,11 @@ impl Ed2kDownload {
 
         let mut part_hashes: Vec<[u8; 16]> = Vec::new();
         let mut aich_master_hash: Option<[u8; 20]> = self.trusted_aich_master;
+        // Apply an AICH root harvested from the MultiPacket answer. Same voting
+        // rule as the HashSet2 root, so an unverified single source cannot pin.
+        if let Some(root) = mp_aich_root {
+            consider_hashset2_aich_pin(&mut aich_master_hash, self.expected_aich_master, None, 0, root);
+        }
         if aich_master_hash.is_some() {
             debug!(
                 "Seeded trusted AICH master for callback download {}",
@@ -5588,13 +5783,48 @@ impl Ed2kDownload {
             if self.control.is_cancelled() {
                 anyhow::bail!("cancelled by user");
             }
-            for i in 0..tracker.part_count {
-                tracker.mark_incomplete(i);
-            }
+            // Narrow to the parts that actually mismatch, as the multi-source
+            // path does. Re-opening every part cost a full re-download of a
+            // multi-GB file for one bad 9.28 MB chunk — and the per-part MD4s
+            // all passed during transfer, so the usual causes (a write lost to
+            // a crash, external modification of `Temp/`) are localized. Falls
+            // back to every part when there is no hashset to diagnose with, or
+            // the re-read itself fails.
+            let diagnosed = if part_hashes.is_empty() {
+                None
+            } else {
+                let diagnose_path = part_path.clone();
+                let diagnose_size = self.file_size;
+                let expected = part_hashes.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::multi_source::corrupt_part_indices_on_disk(
+                        &diagnose_path,
+                        diagnose_size,
+                        &expected,
+                    )
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+            };
+            let reopened = match diagnosed {
+                Some(parts) if !parts.is_empty() => {
+                    for i in &parts {
+                        tracker.mark_incomplete(*i);
+                    }
+                    parts.len()
+                }
+                _ => {
+                    for i in 0..tracker.part_count {
+                        tracker.mark_incomplete(i);
+                    }
+                    tracker.part_count
+                }
+            };
             super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             warn!(
-                "Final hash failed for {} — re-opened all {} parts for retry",
-                self.file_name, tracker.part_count
+                "Final hash failed for {} — re-opened {} of {} parts for retry",
+                self.file_name, reopened, tracker.part_count
             );
             anyhow::bail!(
                 "Final hash verification failed — .part and .part.met preserved for retry"
@@ -6056,7 +6286,7 @@ fn remove_completed_part_best_effort(
 ///
 /// Special case: `file_size < PARTSIZE` with a single hash — the file hash is `MD4(data)` (not `MD4(MD4(data)‖…)`),
 /// so we compare the lone part hash to the file hash directly.
-pub(super) fn verify_hashset(
+pub(crate) fn verify_hashset(
     file_hash: &[u8; 16],
     part_hashes: &[[u8; 16]],
     file_size: u64,
@@ -6065,14 +6295,36 @@ pub(super) fn verify_hashset(
     if part_hashes.is_empty() {
         return false;
     }
-    // The on-wire hashset is exactly one MD4 per ed2k part
-    // (GetPartCount = ceil(file_size / PARTSIZE)). Reject any other count up
-    // front: a correct hashset always has this many entries, so this only
-    // rejects sets that would fail the MD4 check anyway, while stopping a peer
-    // from padding the set to force extra allocation/hashing per connection.
-    if part_hashes.len() != super::messages::ed2k_part_count_for_size(file_size) {
+    // One MD4 per ed2k part (`ceil(file_size / PARTSIZE)`), optionally followed
+    // by the trailing `MD4("")` sentinel that eMule stores for a file whose size
+    // is an exact multiple of PARTSIZE.
+    //
+    // Accepting that second form is the interop-correct choice and matches what
+    // this codebase already does on disk: `part_tracker::load_emule_format`
+    // takes both counts and truncates the sentinel, with a test noting that
+    // "eMule stores one extra MD4("") for a file that is an exact multiple of
+    // PARTSIZE". Rejecting it here meant a peer that sent that form had its
+    // hashset dropped whole — `part_hashes` stayed empty, so per-part MD4
+    // verification was silently off for the file's entire life, AICH narrowing
+    // had no hashes to work from, `part_verified` was never set (so we
+    // advertised zero serveable parts of it), and one bad block surfaced only at
+    // the final whole-file hash, which then reopened every part.
+    //
+    // Permissiveness on the count cannot weaken the check: the recombination
+    // below still has to reproduce the ed2k file hash exactly, and that is the
+    // real gate. The anti-padding bound the strict count was protecting also
+    // survives — `n + 1` is still `O(n)`.
+    let expected_count = super::messages::ed2k_part_count_for_size(file_size);
+    let part_hashes: &[[u8; 16]] = if part_hashes.len() == expected_count {
+        part_hashes
+    } else if part_hashes.len() == expected_count + 1
+        && file_size > 0
+        && file_size.is_multiple_of(super::hash::PARTSIZE)
+    {
+        &part_hashes[..expected_count]
+    } else {
         return false;
-    }
+    };
     if part_hashes.len() == 1 && file_size < super::hash::PARTSIZE {
         return part_hashes[0] == *file_hash;
     }
@@ -6438,11 +6690,23 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
     }
 }
 
+/// Read a single packet during the pre-transfer handshake, bounded by
+/// [`super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS`] of silence.
+///
+/// Every call site is a handshake wait (`emule_info_wait`, `file_status_wait`,
+/// `hashset_wait`); the data loop computes its own budget from
+/// `READ_TIMEOUT_SECS` / `INITIAL_DATA_TIMEOUT_SECS` and does not come through
+/// here. This used to reuse `READ_TIMEOUT_SECS` — the 100 s *in-transfer*
+/// no-data budget — and each of the 1 + 12 + 5 reads got a fresh one, so a peer
+/// that answered Hello and then emitted one unrecognised packet every ~99 s
+/// could hold a callback download at 0% for close to half an hour without ever
+/// timing out. `multi_source` has always used the short handshake bound here,
+/// for the reason its constant documents.
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        std::time::Duration::from_secs(super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS),
         read_packet_async(reader),
     )
     .await
