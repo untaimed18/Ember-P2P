@@ -4599,6 +4599,11 @@ async fn download_parts_from_source(
     };
 
     macro_rules! emit_source {
+        // `$speed` is the rate to show against this source, and it must be 0 for
+        // every status except `transferring`. The row keeps whatever is sent here
+        // until the next event, so passing the last measured rate alongside a
+        // status that has stopped moving bytes leaves "Done" or "Queued" sitting
+        // next to a live-looking figure indefinitely.
         ($status:expr, $qr:expr, $speed:expr) => {
             if let Some(ref etx) = event_tx {
                 let _ = etx
@@ -8614,19 +8619,19 @@ async fn download_parts_from_source(
                     // QueueFull always has an empty payload.
                     (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
                         file_req_overhead.record_download(6u64);
-                        emit_source!("queue_full", None, measured_speed);
+                        emit_source!("queue_full", None, 0u64);
                         anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
                     }
                     (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
                         file_req_overhead.record_download((6 + payload.len()) as u64);
                         let rank = u16::from_le_bytes([payload[0], payload[1]]);
-                        emit_source!("queued", Some(rank as u32), measured_speed);
+                        emit_source!("queued", Some(rank as u32), 0u64);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
                     }
                     (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
                         let rank =
                             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                        emit_source!("queued", Some(rank), measured_speed);
+                        emit_source!("queued", Some(rank), 0u64);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
                     }
                     (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
@@ -9947,7 +9952,10 @@ async fn download_parts_from_source(
         }
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
-        emit_source!("queued", None, measured_speed);
+        // Zero for the same reason the counters were just moved: reporting the
+        // last measured rate here put a live-looking speed on a row the lines
+        // above went out of their way to stop presenting as active.
+        emit_source!("queued", None, 0u64);
 
         let requeue_outcome = try_in_session_requeue(
             &mut *writer,
@@ -10072,7 +10080,7 @@ async fn download_parts_from_source(
         .await
         .ok();
 
-    emit_source!("completed", None, measured_speed);
+    emit_source!("completed", None, 0u64);
 
     // Wire-learned availability is released by `_wire_avail_guard` on the way
     // out, whichever exit this source takes. Sources with pre-existing
