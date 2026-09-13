@@ -2561,33 +2561,16 @@ impl MultiSourceDownload {
                             // the lifetime of the download. Compute first,
                             // commit only on success.
                             let parts = {
-                                let cs = chunk_selector.read().await;
-                                let t = tracker.read().await;
-                                let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress_flags();
-                                let endgame_prefer =
-                                    t.remaining_count() <= 3 && t.part_count > 1;
-                                let gap_bytes = t.part_gap_bytes_vec();
-                                let avail = if source.available_parts.is_empty() {
-                                    vec![true; t.part_count]
-                                } else {
-                                    source.available_parts.clone()
-                                };
-                                let pp = self.control.is_preview_priority();
-                                let active: Vec<usize> = in_prog.iter().enumerate()
-                                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                                if let Some(p) = cs.select_part(
-                                    &completed,
-                                    &in_prog,
-                                    &avail,
-                                    &active,
-                                    &gap_bytes,
-                                    pp,
-                                    endgame_prefer,
-                                ) {
-                                    vec![p]
-                                } else {
-                                    Vec::new()
+                                match select_part_for_new_source(
+                                    &chunk_selector,
+                                    &tracker,
+                                    &source.available_parts,
+                                    self.control.is_preview_priority(),
+                                )
+                                .await
+                                {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
                                 }
                             };
                             if parts.is_empty() {
@@ -2846,33 +2829,16 @@ impl MultiSourceDownload {
                             // unusable callback inflates `total_sources`
                             // and the UI's source count permanently.
                             let parts = {
-                                let cs = chunk_selector.read().await;
-                                let t = tracker.read().await;
-                                let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress_flags();
-                                let endgame_prefer =
-                                    t.remaining_count() <= 3 && t.part_count > 1;
-                                let gap_bytes = t.part_gap_bytes_vec();
-                                let avail = if source.available_parts.is_empty() {
-                                    vec![true; t.part_count]
-                                } else {
-                                    source.available_parts.clone()
-                                };
-                                let pp = self.control.is_preview_priority();
-                                let active: Vec<usize> = in_prog.iter().enumerate()
-                                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                                if let Some(p) = cs.select_part(
-                                    &completed,
-                                    &in_prog,
-                                    &avail,
-                                    &active,
-                                    &gap_bytes,
-                                    pp,
-                                    endgame_prefer,
-                                ) {
-                                    vec![p]
-                                } else {
-                                    Vec::new()
+                                match select_part_for_new_source(
+                                    &chunk_selector,
+                                    &tracker,
+                                    &source.available_parts,
+                                    self.control.is_preview_priority(),
+                                )
+                                .await
+                                {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
                                 }
                             };
                             if parts.is_empty() {
@@ -3382,36 +3348,16 @@ impl MultiSourceDownload {
                 // (everything already complete / in-progress in endgame) the
                 // live stream is dropped — only one task can read a socket.
                 let parts = {
-                    let cs = chunk_selector.read().await;
-                    let t = tracker.read().await;
-                    let completed = t.completed_parts().to_vec();
-                    let in_prog = t.in_progress_flags();
-                    let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
-                    let gap_bytes = t.part_gap_bytes_vec();
-                    let avail = if source.available_parts.is_empty() {
-                        vec![true; t.part_count]
-                    } else {
-                        source.available_parts.clone()
-                    };
-                    let pp = self.control.is_preview_priority();
-                    let active: Vec<usize> = in_prog
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, &ip)| ip)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if let Some(p) = cs.select_part(
-                        &completed,
-                        &in_prog,
-                        &avail,
-                        &active,
-                        &gap_bytes,
-                        pp,
-                        endgame_prefer,
-                    ) {
-                        vec![p]
-                    } else {
-                        Vec::new()
+                    match select_part_for_new_source(
+                        &chunk_selector,
+                        &tracker,
+                        &source.available_parts,
+                        self.control.is_preview_priority(),
+                    )
+                    .await
+                    {
+                        Some(p) => vec![p],
+                        None => Vec::new(),
                     }
                 };
                 if parts.is_empty() {
@@ -6866,7 +6812,7 @@ async fn download_parts_from_source(
                     .filter(|(_, &ip)| ip)
                     .map(|(i, _)| i)
                     .collect();
-                if let Some(p) = cs.select_part(
+                let mut chosen = cs.select_part(
                     &completed,
                     &in_prog,
                     &avail,
@@ -6874,7 +6820,30 @@ async fn download_parts_from_source(
                     &gap_bytes,
                     pp,
                     prefer_higher,
-                ) {
+                );
+                // Relaxed retry, as `select_part_for_new_source` and the
+                // pre-pipeline path do. Without it this reported
+                // `no_needed_parts` — "peer has no parts we need" — about a peer
+                // that demonstrably holds a part we need, purely because another
+                // source had claimed it. Claims are taken before the queue wait,
+                // so the claim holder may be sitting at a queue rank for hours,
+                // and every other source holding only that part was turned away
+                // with a status saying it was useless. On a file whose peers all
+                // hold the same part that left the download at 0% with a drawer
+                // full of "No needed parts".
+                if chosen.is_none() {
+                    let free = vec![false; pc];
+                    chosen = cs.select_part(
+                        &completed,
+                        &free,
+                        &avail,
+                        &active,
+                        &gap_bytes,
+                        pp,
+                        prefer_higher,
+                    );
+                }
+                if let Some(p) = chosen {
                     debug!(
                         "Source {} pre-assigned parts unavailable, dynamically selected part {}",
                         _src_idx, p
@@ -6886,6 +6855,8 @@ async fn download_parts_from_source(
             }
         }
         if filtered_parts.is_empty() {
+            // Genuinely nothing here: either the file is complete or every part
+            // the peer advertised is one we already hold.
             emit_source!("no_needed_parts", None, 0u64);
             anyhow::bail!("peer has no parts we need");
         }
@@ -7256,7 +7227,14 @@ async fn download_parts_from_source(
                 anyhow::bail!("peer queue is full");
             }
             if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
-                emit_source!("no_needed_parts", None, 0u64);
+                // A queue state, not a parts state. eMule answers this opcode with
+                // `SetDownloadState(DS_ONQUEUE, "The remote client decided to
+                // stop/complete the transfer")` (`ListenSocket.cpp:588`): the peer
+                // has rotated us off its slot, and we are back in its queue.
+                // Reporting `no_needed_parts` here told the user the peer held
+                // nothing they needed, which is a different thing entirely and one
+                // that reads as permanent.
+                emit_source!("queued", last_rank, 0u64);
                 anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
@@ -10313,6 +10291,73 @@ async fn pre_pipeline_next_part_ms(
         batches,
         needs_i64,
     })
+}
+
+/// Pick the part to assign a freshly arrived source, or `None` when it holds
+/// nothing we still need.
+///
+/// Two passes, matching the dynamic-extend and pre-pipeline paths: strict first,
+/// so sources spread across distinct parts whenever that is possible, then
+/// relaxed, treating every part as free.
+///
+/// The relaxed pass is what keeps a download from deadlocking at 0%. A part claim
+/// is taken just after the handshake — before the queue wait — so a source parked
+/// at a queue rank holds one for as long as it sits there. With a strict pass
+/// alone, a swarm whose peers all hold the same part (the ordinary shape early in
+/// a download, and exactly the shape of a 5-part file whose sources each have one
+/// part) went nowhere: the first source claimed the part and queued, every other
+/// source found nothing assignable, and each was deferred about a minute at a
+/// time indefinitely while the file sat at zero.
+///
+/// eMule applies no such exclusion at all. It reserves blocks only when a client
+/// actually asks for data, so a queued client never holds a part against anyone.
+/// Piling on is also cheap now that in-flight ranges are published — two sources
+/// on one part order their requests around each other instead of duplicating.
+async fn select_part_for_new_source(
+    chunk_selector: &Arc<RwLock<ChunkSelector>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    source_available: &[bool],
+    preview_priority: bool,
+) -> Option<usize> {
+    let cs = chunk_selector.read().await;
+    let t = tracker.read().await;
+    let completed = t.completed_parts().to_vec();
+    let in_prog = t.in_progress_flags();
+    let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
+    let gap_bytes = t.part_gap_bytes_vec();
+    let avail = if source_available.is_empty() {
+        vec![true; t.part_count]
+    } else {
+        source_available.to_vec()
+    };
+    let active: Vec<usize> = in_prog
+        .iter()
+        .enumerate()
+        .filter(|(_, &ip)| ip)
+        .map(|(i, _)| i)
+        .collect();
+    let strict = cs.select_part(
+        &completed,
+        &in_prog,
+        &avail,
+        &active,
+        &gap_bytes,
+        preview_priority,
+        endgame_prefer,
+    );
+    if strict.is_some() {
+        return strict;
+    }
+    let free = vec![false; t.part_count];
+    cs.select_part(
+        &completed,
+        &free,
+        &avail,
+        &active,
+        &gap_bytes,
+        preview_priority,
+        endgame_prefer,
+    )
 }
 
 /// Compute the gap-aware OP_REQUESTPARTS block list for `part_idx`.

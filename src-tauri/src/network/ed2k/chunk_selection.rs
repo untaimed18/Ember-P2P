@@ -223,6 +223,39 @@ mod tests {
         assert_eq!(selected, Some(0));
     }
 
+    /// The shape that deadlocked a download at 0%: five parts, and every source
+    /// holds only part 2, which one of them has claimed while sitting at a queue
+    /// rank. A strict pass alone turns the rest away — and the callers reported
+    /// that as "no needed parts", about peers demonstrably holding a part that was
+    /// needed. Every caller now falls back to treating parts as free, so the pass
+    /// modelled here is what has to succeed.
+    #[test]
+    fn a_claimed_part_is_still_offered_when_it_is_all_a_source_has() {
+        let selector = ChunkSelector {
+            part_frequency: vec![0, 0, 4, 0, 0],
+            total_sources: 4,
+        };
+        let completed = [false; 5];
+        let only_part_2 = [false, false, true, false, false];
+        let claimed = [false, false, true, false, false];
+
+        // Strict: the one part this source has is already claimed, so nothing.
+        assert_eq!(
+            selector.select_part(&completed, &claimed, &only_part_2, &[2], &[], false, false),
+            None,
+            "strict selection is expected to refuse — that is why callers retry"
+        );
+
+        // Relaxed, which is the retry every caller now performs.
+        let free = [false; 5];
+        assert_eq!(
+            selector.select_part(&completed, &free, &only_part_2, &[2], &[], false, false),
+            Some(2),
+            "a source whose only part is claimed must still be given it, or a swarm \
+             where every peer holds the same part can never start"
+        );
+    }
+
     #[test]
     fn rarest_first_prefers_lowest_frequency_part() {
         let selector = ChunkSelector {

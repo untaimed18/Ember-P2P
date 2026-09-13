@@ -56718,7 +56718,14 @@ async fn handle_download_event(
                 // `set_too_many_conns` / `set_parts_busy` both arm a short
                 // retry, so `Connecting` is the honest rendering.
                 "too_many_conns" => crate::types::SourceStatus::Connecting,
-                "parts_busy" => crate::types::SourceStatus::NoNeededParts,
+                // `Connecting`, as the comment above concludes for both of these
+                // and as `too_many_conns` already did. This arm said
+                // `NoNeededParts`, contradicting its own rationale two lines up
+                // and telling the user a peer held nothing we needed when the
+                // truth was that another source had the part claimed — routinely
+                // a source merely sitting at a queue rank, since claims are taken
+                // before the queue wait.
+                "parts_busy" => crate::types::SourceStatus::Connecting,
                 // The LowID/callback path reports its post-handshake state with
                 // this string rather than a bare "connecting".
                 "connected (callback)" => crate::types::SourceStatus::Connecting,
