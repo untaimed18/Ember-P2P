@@ -3936,7 +3936,12 @@
                 <dd><span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
                   <dt>{m.search_progress_label()}</dt>
-                  <dd>{m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</dd>
+                  <!--
+                    Paired with the total and the percentage, so this is the
+                    on-disk figure. `transferred` counts re-fetched bytes and
+                    would read as more than the file size at 100%.
+                  -->
+                  <dd>{m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.completed_size ?? selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</dd>
                 {/if}
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
                   <dt>{m.search_speed_label()}</dt>

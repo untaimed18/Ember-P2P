@@ -141,11 +141,16 @@ impl ChunkSelector {
             }
 
             let freq = self.part_frequency[i] as u32;
-            let zone = if freq < t1 {
+            // Inclusive bounds, as eMule's are: it tests
+            // `cur_chunk.frequency <= veryRareBound` and the same for the other
+            // two zones (`PartFile.cpp:4816`, `:4829`, `:4838`). With strict
+            // `<`, a part sitting exactly on a boundary was scored one zone
+            // *less* rare than eMule would score it.
+            let zone = if freq <= t1 {
                 0 // very rare
-            } else if freq < t2 {
+            } else if freq <= t2 {
                 1 // rare
-            } else if freq < t3 {
+            } else if freq <= t3 {
                 2 // almost rare
             } else {
                 3 // common

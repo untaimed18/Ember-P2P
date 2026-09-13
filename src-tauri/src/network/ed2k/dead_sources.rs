@@ -127,9 +127,24 @@ impl DeadSourceList {
     }
 
     /// Add a source to the global dead list.
-    pub fn add_dead_source(&mut self, client_id: u32, ip: u32, port: u16, firewalled: bool) {
+    ///
+    /// `source_is_firewalled` selects the longer block time, and it is a property
+    /// of *the source*: eMule writes
+    /// `curTick + (client.HasLowID() ? BLOCKTIMEFW : BLOCKTIME)`
+    /// (`DeadSourceList.cpp:121`). Callers used to pass our own firewall state
+    /// instead, which got it wrong in both directions — a HighID node blocked
+    /// firewalled sources for the short window and re-dialled peers unlikely to
+    /// have become reachable, while a LowID node applied the long window to every
+    /// source including reachable HighID peers that had merely blipped.
+    pub fn add_dead_source(
+        &mut self,
+        client_id: u32,
+        ip: u32,
+        port: u16,
+        source_is_firewalled: bool,
+    ) {
         let now = chrono::Utc::now().timestamp();
-        let block_time = if firewalled {
+        let block_time = if source_is_firewalled {
             BLOCKTIMEFW_SECS
         } else {
             BLOCKTIME_SECS

@@ -593,8 +593,16 @@ impl TransferManager {
     /// Maintains a history of (cumulative_bytes, timestamp) samples and computes
     /// speed as bytes_delta * 1000 / time_delta_ms over the window.
     ///
-    /// `unique_completed` is upload-only unique per-part coverage. Downloads
-    /// pass `None` and derive `completed_size` / `progress` from `transferred`.
+    /// `transferred` is cumulative wire bytes and `unique_completed` the coverage
+    /// figure, for both directions — eMule's `GetTransferred()` and
+    /// `GetCompletedSize()`, the two numbers behind its Transferred and Completed
+    /// columns (`DownloadListCtrl.cpp:1984`, `:1987`). Uploads pass per-part
+    /// uniqueness; downloads pass the gap-derived bytes on disk.
+    ///
+    /// Only `unique_completed` may drive `progress`. eMule computes percentage and
+    /// remaining bytes from Completed alone (`:1698`, `:1731`), and it has to:
+    /// `transferred` counts duplicates and re-fetches, so a download that
+    /// recovered a corrupt part would otherwise report over 100%.
     pub fn update_progress(&mut self, id: &str, transferred: u64, unique_completed: Option<u64>) {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
@@ -633,45 +641,33 @@ impl TransferManager {
                 0
             };
 
-            // Uploads: `transferred` is cumulative session wire bytes
-            // (eMule GetTransferred) and routinely exceeds `total_size`
-            // when the peer re-requests overlapping blocks. Capping it
-            // made the UI claim the whole file had been sent while unique
-            // coverage — and the parts bar — was still halfway.
-            // `unique_completed` is that coverage and drives `completed_size`
-            // / `progress`. Downloads: cap at `total_size` so a coalesced
-            // tick cannot report more than the file.
-            let is_upload = transfer.direction == TransferDirection::Upload;
-            if is_upload {
-                transfer.transferred = transferred;
-                if let Some(unique) = unique_completed {
-                    let unique_capped = if transfer.total_size > 0 {
-                        unique.min(transfer.total_size)
-                    } else {
-                        unique
-                    };
-                    transfer.completed_size = unique_capped;
-                    if transfer.total_size > 0 {
-                        transfer.progress = ((unique_capped as f64 / transfer.total_size as f64)
-                            * 100.0)
-                            .min(100.0);
-                    }
+            // `transferred` is cumulative wire bytes for both directions now, so
+            // both follow eMule's rule: never capped, because a peer re-requesting
+            // overlapping blocks or a part we re-fetched after a failed hash
+            // legitimately pushes it past the file size. Capping it made the UI
+            // claim the whole file had moved while coverage was still halfway.
+            //
+            // `unique_completed` is the coverage figure — per-part uniqueness for
+            // uploads, gap-derived bytes on disk for downloads — and it alone
+            // drives `completed_size` and `progress`, as in eMule
+            // (`DownloadListCtrl.cpp:1698`).
+            transfer.transferred = transferred;
+            if let Some(unique) = unique_completed {
+                let unique_capped = if transfer.total_size > 0 {
+                    unique.min(transfer.total_size)
+                } else {
+                    unique
+                };
+                transfer.completed_size = unique_capped;
+                if transfer.total_size > 0 {
+                    transfer.progress =
+                        ((unique_capped as f64 / transfer.total_size as f64) * 100.0).min(100.0);
                 }
-            } else if transfer.total_size > 0 {
-                transfer.transferred = transferred.min(transfer.total_size);
-                transfer.completed_size = transfer.transferred;
-            } else {
-                transfer.transferred = transferred;
-                transfer.completed_size = transferred;
             }
             transfer.speed = speed;
             transfer.last_received = Some(chrono::Utc::now().timestamp());
             Self::clear_failure_context(transfer);
             Self::clear_runtime_health(transfer);
-            if !is_upload && transfer.total_size > 0 {
-                transfer.progress =
-                    ((transferred as f64 / transfer.total_size as f64) * 100.0).min(100.0);
-            }
         }
     }
 
@@ -710,18 +706,23 @@ impl TransferManager {
             // Snap the byte counter to the full size ONLY for downloads. A
             // download reaches Completed after every part is hash-verified, so
             // the terminal row is by definition the whole file; without this a
-            // coalesced/late final progress tick could leave `transferred`
-            // (and the UI's "x / total") short even though progress is 100%.
+            // coalesced/late final progress tick could leave the count (and the
+            // UI's "x / total") short even though progress is 100%.
             //
             // Uploads also flow through `complete()` (a session ending is
             // reported as Completed, matching eMule UX), but an upload session
             // almost never sends the entire file — the peer pulls a handful of
-            // parts. Snapping `transferred` to `total_size` there would falsely
-            // claim we uploaded the whole file this session, so we keep the real
+            // parts. Snapping to `total_size` there would falsely claim we
+            // uploaded the whole file this session, so we keep the real
             // per-session byte count for uploads.
             if transfer.direction == TransferDirection::Download {
-                transfer.transferred = transfer.total_size;
                 transfer.completed_size = transfer.total_size;
+                // A floor, not an assignment: a download that re-fetched a
+                // corrupt part legitimately finishes with more bytes off the wire
+                // than the file holds, and that overage is the whole reason this
+                // column is separate from Completed. eMule likewise never trims
+                // `m_uTransferred` on completion.
+                transfer.transferred = transfer.transferred.max(transfer.total_size);
             }
             transfer.speed = 0;
             Self::clear_failure_context(&mut transfer);
@@ -887,6 +888,52 @@ impl TransferManager {
     /// expire or a file loses availability — but never drops below `xx`.
     pub fn update_source_total(&mut self, id: &str, total: u32) {
         self.apply_source_column_counts(id, Some(total), None);
+    }
+
+    /// True when some active download is currently taking data from `ip`.
+    ///
+    /// eMule's leech counter adds no strike while `GetDownloadState() ==
+    /// DS_DOWNLOADING` (`UploadClient.cpp:605`): a peer that is uploading to us
+    /// is helping, and its re-asks about our own files must not earn it a ban.
+    pub fn is_downloading_from_ip(&self, ip: std::net::IpAddr) -> bool {
+        let needle = ip.to_string();
+        self.source_details.iter().any(|(id, rows)| {
+            // Only a running transfer can be taking data from this peer. Source
+            // rows outlive the connections they describe — they are kept for
+            // display after a pause, and a worker killed without writing a final
+            // status leaves its row at `Transferring` indefinitely. Trusting the
+            // row alone therefore granted a permanent leech-ban exemption to any
+            // IP that had once served us, which is exactly the kind of standing
+            // immunity the ban exists to deny.
+            self.active.get(id).is_some_and(|t| {
+                !matches!(
+                    t.status,
+                    TransferStatus::Paused
+                        | TransferStatus::Stopped
+                        | TransferStatus::Completed
+                        | TransferStatus::Failed
+                )
+            }) && rows.iter().any(|s| {
+                    s.ip == needle
+                        && matches!(
+                            s.status,
+                            crate::types::SourceStatus::Transferring
+                                | crate::types::SourceStatus::Stalled
+                        )
+                })
+        })
+    }
+
+    /// Publish the A4AF candidate count (`+aa` in the Sources column).
+    ///
+    /// The field existed and was rendered, but every construction site set it to
+    /// zero and nothing ever wrote it, so the segment could not appear — a file
+    /// looked source-starved while the A4AF manager was holding usable peers for
+    /// it.
+    pub fn set_a4af_count(&mut self, id: &str, count: u32) {
+        if let Some(transfer) = self.get_transfer_mut(id) {
+            transfer.a4af_sources = count;
+        }
     }
 
     pub fn source_counts(&self, id: &str) -> Option<(u32, u32, u32)> {
@@ -2040,6 +2087,52 @@ mod tests {
         assert!(
             !manager.completed.iter().any(|t| t.id == "a"),
             "a cancelled transfer must not survive as a failed row"
+        );
+    }
+
+    /// The leech-ban exemption for a peer that is uploading to us must expire
+    /// with the download, not persist for as long as its row is displayed.
+    /// Source rows outlive their connections, so a row is only evidence of a
+    /// live download while its transfer is actually running.
+    #[test]
+    fn leech_ban_exemption_needs_a_running_transfer_not_just_a_row() {
+        let ip: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        manager.update_source_detail(
+            "a",
+            crate::types::SourceInfo {
+                ip: ip.to_string(),
+                port: 4662,
+                status: crate::types::SourceStatus::Transferring,
+                queue_rank: None,
+                speed: 40_000,
+                transferred: 1_000_000,
+                client_software: String::new(),
+                peer_name: String::new(),
+                available_parts: None,
+                total_parts: None,
+                country_code: None,
+                user_hash: None,
+            },
+        );
+        assert!(
+            manager.is_downloading_from_ip(ip),
+            "a peer serving a running download is exempt"
+        );
+
+        // Pausing tears the connection down. The row survives for display, and
+        // a worker that dies without a final update leaves it mid-transfer.
+        manager.pause("a");
+        if let Some(rows) = manager.source_details.get_mut("a") {
+            for s in rows.iter_mut() {
+                s.status = crate::types::SourceStatus::Transferring;
+            }
+        }
+        assert!(
+            !manager.is_downloading_from_ip(ip),
+            "a stale row must not grant a standing exemption from leech banning"
         );
     }
 

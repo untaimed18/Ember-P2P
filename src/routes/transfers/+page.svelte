@@ -76,8 +76,13 @@
   const DOWNLOAD_COLUMNS: TransferColumn<DlSortField>[] = [
     { key: 'file_name', get label() { return m.transfers_col_file_name(); }, width: 260, minWidth: 140, className: 'col-dl-name', sortField: 'file_name' },
     { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'total_size' },
-    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'transferred' },
-    { key: 'completed_size', get label() { return m.transfers_col_completed(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'completed_size' },
+    // Two different numbers, as in eMule: Transferred is cumulative wire bytes
+    // (GetTransferred) and Completed is what is on disk (GetCompletedSize), so
+    // re-fetching a corrupt part moves the first and not the second. Both carry
+    // a hint, because a Transferred above the file size looks like a bug
+    // otherwise.
+    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, get title() { return m.transfers_col_transferred_download_hint(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'transferred' },
+    { key: 'completed_size', get label() { return m.transfers_col_completed(); }, get title() { return m.transfers_col_completed_hint(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'completed_size' },
     { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 65, minWidth: 56, className: 'col-dl-speed', sortField: 'speed' },
     { key: 'progress', get label() { return m.transfers_col_progress(); }, width: 170, minWidth: 96, className: 'col-dl-progress', sortField: 'progress' },
     { key: 'sources', get label() { return m.transfers_col_sources(); }, width: 60, minWidth: 56, className: 'col-dl-sources', sortField: 'sources' },
@@ -335,13 +340,24 @@
         }
       } else if (!isDead) {
         // L16: cap the expanded list so a transfer with hundreds of
-        // sources doesn't grow the DOM indefinitely. Drop the oldest
-        // idle entry first, falling back to head-trim.
+        // sources doesn't grow the DOM indefinitely. Evict the row furthest
+        // from sending us bytes, oldest first among equals, so a full drawer
+        // sheds Failed / Unreachable before it touches a peer that is
+        // transferring, connecting or holding a queue slot. The previous
+        // `speed === 0 && status !== 'transferring'` probe matched connecting
+        // / queued / wait_callback as well, and took the first such row, so a
+        // full drawer dropped the oldest peer waiting on a queue slot and
+        // kept every dead row that arrived after it.
         const MAX_EXPANDED = 200;
         if (expandedSources.length >= MAX_EXPANDED) {
-          const victim = expandedSources.findIndex((s) => s.speed === 0 && s.status !== 'transferring');
+          let victim = 0;
+          let worstRank = -1;
+          for (let i = 0; i < expandedSources.length; i++) {
+            const rank = SOURCE_STATUS_ORDER[expandedSources[i].status] ?? UNKNOWN_STATUS_ORDER;
+            if (rank > worstRank) { worstRank = rank; victim = i; }
+          }
           const next = [...expandedSources];
-          if (victim >= 0) next.splice(victim, 1); else next.shift();
+          next.splice(victim, 1);
           expandedSources = next;
         }
         expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
@@ -629,10 +645,15 @@
   // info: who's actively sending us bytes), queued comes next (the
   // ones we're waiting on, ordered by closest-to-top-of-queue), then
   // everything else (connecting / queue_full / no_needed_parts /
-  // completed) in stable insertion order. Within the transferring
-  // tier, sort by speed descending so the fastest sources are easy
-  // to find. Within the queued tier, sort by queue_rank ascending
-  // (smaller rank = closer to a slot).
+  // completed).
+  //
+  // Ordering inside a tier has to be a function of data that survives a
+  // refresh, or rows move out from under the pointer. `speed` is rewritten
+  // by every progress event, so ordering the transferring tier by it
+  // reshuffled the top of the drawer roughly once a second; the peer address
+  // decides instead, and the Speed column is there for users who do want
+  // fastest-first. `queue_rank` only moves when the remote queue position
+  // does, which is slow enough to be worth ordering by.
   //
   // Returns a new sorted array; the caller's input is not mutated.
   function sortSourcesByPriority(sources: SourceInfo[]): SourceInfo[] {
@@ -641,29 +662,21 @@
       if (s.status === 'queued') return 1;
       return 2;
     };
-    return sources
-      .map((s, i) => ({ s, i }))
-      .sort((a, b) => {
-        const ta = tier(a.s);
-        const tb = tier(b.s);
-        if (ta !== tb) return ta - tb;
-        if (ta === 0) {
-          // Transferring: faster on top.
-          return (b.s.speed ?? 0) - (a.s.speed ?? 0);
-        }
-        if (ta === 1) {
-          // Queued: smaller queue_rank on top. Treat null/0 (queue
-          // position unknown) as worst so known ranks float up.
-          const ar = a.s.queue_rank != null && a.s.queue_rank > 0
-            ? a.s.queue_rank : Number.MAX_SAFE_INTEGER;
-          const br = b.s.queue_rank != null && b.s.queue_rank > 0
-            ? b.s.queue_rank : Number.MAX_SAFE_INTEGER;
-          if (ar !== br) return ar - br;
-        }
-        // Stable within tier: preserve original insertion order.
-        return a.i - b.i;
-      })
-      .map((x) => x.s);
+    return [...sources].sort((a, b) => {
+      const ta = tier(a);
+      const tb = tier(b);
+      if (ta !== tb) return ta - tb;
+      if (ta === 1) {
+        // Queued: smaller queue_rank on top. Treat null/0 (queue
+        // position unknown) as worst so known ranks float up.
+        const ar = a.queue_rank != null && a.queue_rank > 0
+          ? a.queue_rank : Number.MAX_SAFE_INTEGER;
+        const br = b.queue_rank != null && b.queue_rank > 0
+          ? b.queue_rank : Number.MAX_SAFE_INTEGER;
+        if (ar !== br) return ar - br;
+      }
+      return sortCollator.compare(`${a.ip}:${a.port}`, `${b.ip}:${b.port}`);
+    });
   }
 
   // Display order for the source Status column, roughly "how close is this
@@ -686,15 +699,22 @@
    *  other unhelpful ones. */
   const UNKNOWN_STATUS_ORDER = 99;
 
+  /** The statuses the source-drawer summary gives their own chip. Everything
+   *  else is counted by the "other" chip, so the chips stay a partition of the
+   *  drawer's rows however the status vocabulary grows. */
+  const SOURCE_CHIP_STATUSES: ReadonlySet<SourceInfo['status']> = new Set([
+    'transferring', 'queued', 'wait_callback', 'friend_connect',
+    'unreachable', 'connecting', 'failed',
+  ]);
+
   /**
    * Order the source rows of one download for display.
    *
-   * With no column picked this is the activity-priority ordering, which sorts
-   * the transferring tier by speed — fine as a default, but it meant a list the
-   * user had asked to sort by name still reshuffled every time a speed ticked,
-   * because nothing anywhere applied their choice. A picked column now wins
-   * outright, and every comparison falls back to the peer's address so equal
-   * keys resolve the same way on every re-render rather than letting the
+   * With no column picked this is the activity-priority ordering. A picked
+   * column wins outright — a list the user had asked to sort by name still
+   * reshuffled every time a speed ticked, because nothing anywhere applied
+   * their choice — and every comparison falls back to the peer's address so
+   * equal keys resolve the same way on every re-render rather than letting the
    * arrival order show through as movement.
    *
    * Returns a new array; the input is not mutated.
@@ -3726,11 +3746,14 @@
                 {:else if column.key === 'remaining'}
                   {@const spd = liveSpeed(t)}
                   <!--
-                    D22: use `completed_size` for byte accounting so the
-                    rendered Remaining matches what etaSeconds() uses for
-                    sort. `transferred` can include transient re-fetched
-                    ranges that later get invalidated, which shifts sort
-                    vs display apart.
+                    D22: `completed_size` is the only correct field here, and the
+                    one etaSeconds() sorts on. It is the gap-derived bytes on
+                    disk (eMule's GetCompletedSize), whereas `transferred` is
+                    cumulative wire bytes (GetTransferred) and counts duplicates
+                    and re-fetches after a failed part hash — so it can exceed
+                    the file size and would render a negative remaining.
+                    eMule computes remaining the same way, from Completed
+                    (DownloadListCtrl.cpp:1731).
                   -->
                   <td class="num-cell">{formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
                 {:else if column.key === 'last_seen_complete'}
@@ -3776,18 +3799,28 @@
                 {@const visibleSources = sortSources(
                   expandedSources.filter((s) => transferPaused || s.status !== 'failed'),
                 )}
-                {@const failedCount = expandedSources.length - visibleSources.length}
-                {@const xferCount = visibleSources.filter(s => s.status === 'transferring').length}
-                {@const queuedCount = visibleSources.filter(s => s.status === 'queued').length}
-                {@const waitCallbackCount = visibleSources.filter(s => s.status === 'wait_callback').length}
-                {@const friendConnectCount = visibleSources.filter(s => s.status === 'friend_connect').length}
-                {@const unreachableCount = visibleSources.filter(s => s.status === 'unreachable').length}
-                {@const connectCount = visibleSources.filter(s => s.status === 'connecting').length}
-                {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount - waitCallbackCount - friendConnectCount - unreachableCount}
+                <!--
+                  Every chip counts over `expandedSources`, not the rendered
+                  `visibleSources`, so the breakdown is one bucket per status
+                  and sums to the headline. Deriving Failed from "rows the
+                  filter dropped" did neither: on a paused transfer the filter
+                  drops nothing, so the chip read 0 while its rows were counted
+                  under "other", and everywhere else it counted rows the
+                  headline had already excluded, leaving the chips totalling
+                  more than the number beside them.
+                -->
+                {@const failedCount = expandedSources.filter(s => s.status === 'failed').length}
+                {@const xferCount = expandedSources.filter(s => s.status === 'transferring').length}
+                {@const queuedCount = expandedSources.filter(s => s.status === 'queued').length}
+                {@const waitCallbackCount = expandedSources.filter(s => s.status === 'wait_callback').length}
+                {@const friendConnectCount = expandedSources.filter(s => s.status === 'friend_connect').length}
+                {@const unreachableCount = expandedSources.filter(s => s.status === 'unreachable').length}
+                {@const connectCount = expandedSources.filter(s => s.status === 'connecting').length}
+                {@const otherCount = expandedSources.filter(s => !SOURCE_CHIP_STATUSES.has(s.status)).length}
                 <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
-                      <strong>{visibleSources.length}</strong> {visibleSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
+                      <strong>{expandedSources.length}</strong> {expandedSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
                       {#if xferCount > 0}<span class="ss-chip ss-xfer">{m.transfers_chip_transferring({ count: xferCount })}</span>{/if}
                       {#if queuedCount > 0}<span class="ss-chip ss-queued">{m.transfers_chip_queued({ count: queuedCount })}</span>{/if}
                       {#if waitCallbackCount > 0}<span class="ss-chip ss-wait-callback">{m.transfers_chip_wait_callback({ count: waitCallbackCount })}</span>{/if}
@@ -3966,7 +3999,12 @@
       <div class="selection-footer">
         <div class="selection-meta" title={selectedTransfer.file_name}>
           <strong>{selectedTransfer.file_name}</strong>
-          <span>{formatSize(selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
+          <!--
+            `completed_size`, because this reads as a fraction of the file.
+            `transferred` is cumulative wire bytes and counts a re-fetched part
+            twice, so it would show more than the total.
+          -->
+          <span>{formatSize(selectedTransfer.completed_size ?? selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
           <span>{sourcesLabel(selectedTransfer)} {m.transfers_src_suffix()}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>

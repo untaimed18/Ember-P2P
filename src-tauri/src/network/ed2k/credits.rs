@@ -648,13 +648,9 @@ impl CreditManager {
         record
     }
 
-    /// eMule: only accumulate credits when identity is verified via SecIdent.
-    /// When crypto is available we require `IdentState::Verified` — Unknown,
-    /// Needed, Failed, and BadGuy all reject. A peer that never completes the
-    /// public-key + challenge/response exchange cannot farm credits.
-    /// When crypto is unavailable (no local RSA key) we fall back to the
-    /// permissive behavior but still reject Failed/BadGuy.
-    /// Returns false if credits were rejected due to identity state.
+    /// Accumulate upload credit, unless the peer's identity state forbids it —
+    /// see [`Self::credit_accepted`] for which states those are and why.
+    /// Returns false if the accrual was rejected.
     pub fn add_uploaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
         if !self.credit_accepted(&user_hash) {
             return false;
@@ -675,24 +671,48 @@ impl CreditManager {
         true
     }
 
-    /// Whether a credit accrual for `user_hash` is allowed, judged from the
-    /// *existing* record only. Crucially this does NOT create an entry: the
-    /// previous code called `get_or_create` before the identity check, so a
-    /// peer rotating user-hashes that never complete SecIdent (rejected in
-    /// crypto mode) still seeded a `CreditRecord` per hash, growing the map
-    /// until the 90-day sweep. With crypto available we require `Verified`;
-    /// without it we only reject `Failed`/`BadGuy` (permissive fallback,
-    /// matching the prior behaviour for genuinely-credited unknown peers).
+    /// Whether a credit accrual for `user_hash` is allowed.
+    ///
+    /// Mirrors eMule's rule, which rejects exactly three states and only when
+    /// crypto is available: `IS_IDFAILED`, `IS_IDBADGUY` and `IS_IDNEEDED`
+    /// (`ClientCredits.cpp:55-85`). `IS_NOTAVAILABLE` — a peer that has never
+    /// advertised a public key, which is [`IdentState::Unknown`] here — falls
+    /// through and accrues normally.
+    ///
+    /// This used to demand `Verified` whenever crypto was available, which meant
+    /// a peer that does not do SecIdent at all could never accumulate
+    /// `downloaded`. Its ratio was then pinned at `MIN_CREDIT_RATIO` forever, so
+    /// `has_download_bonus` could never fire and the soft-zone gate refused it
+    /// once the queue filled — a peer permanently denied the standing its
+    /// uploads had earned.
+    ///
+    /// Framing it as anti-farming did not hold up either: `add_uploaded` records
+    /// bytes that *lower* a peer's ratio, and `add_downloaded` only counts bytes
+    /// the peer actually sent us. Rotating user hashes to dodge either one just
+    /// resets the peer to neutral, which is worse for it than keeping its record.
+    /// What hash rotation can still do is grow the map, and that is bounded
+    /// where it should be — by `MAX_CREDIT_RECORDS` and the sweep — rather than
+    /// by refusing honest peers credit.
+    ///
+    /// Still judged from the *existing* record without creating one, so the
+    /// rejected states cannot seed an entry per rotated hash.
     fn credit_accepted(&self, user_hash: &[u8; 16]) -> bool {
         if self.crypto_unreadable {
             return false;
         }
         let ident_state = self.credits.get(user_hash).map(|r| r.ident_state);
-        if self.crypto_available {
-            matches!(ident_state, Some(IdentState::Verified))
+        let rejected = if self.crypto_available {
+            matches!(
+                ident_state,
+                Some(IdentState::Failed | IdentState::BadGuy | IdentState::Needed)
+            )
         } else {
-            !matches!(ident_state, Some(IdentState::Failed | IdentState::BadGuy))
-        }
+            // No local key, so `Needed` is a state we can never resolve and must
+            // not punish; eMule likewise skips the whole check when
+            // `CryptoAvailable()` is false.
+            matches!(ident_state, Some(IdentState::Failed | IdentState::BadGuy))
+        };
+        !rejected
     }
 
     pub fn crypto_unreadable(&self) -> bool {

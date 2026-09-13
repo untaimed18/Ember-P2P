@@ -540,6 +540,15 @@
   const IS_WINDOWS =
     typeof navigator !== 'undefined' &&
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
+  // Linux does not get the in-app player at all: WebKitGTK hands a custom
+  // scheme to GStreamer, which has no source element for `ember-media://`, so
+  // the element can only ever fail. Rather than mount it and show a playback
+  // error, every media file on Linux goes straight to the desktop's own
+  // player — see `inAppPlayerKind` and `openSharedFile`.
+  const IS_LINUX_DESKTOP =
+    typeof navigator !== 'undefined' &&
+    /Linux/i.test(navigator.userAgent) &&
+    !/Android/i.test(navigator.userAgent);
 
   function normalizePathForMatch(path: string): string {
     let normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -762,6 +771,12 @@
   }
 
   async function openSharedFile(path: string) {
+    // No in-app player on Linux, so there is nothing to open "into": media and
+    // everything else alike go to the user's default application.
+    if (IS_LINUX_DESKTOP) {
+      await openSharedFileExternally(path);
+      return;
+    }
     const file = fileByPath.get(path);
     const ext = file?.extension || extensionFromPath(path);
     if (playableKind(ext)) {
@@ -1613,6 +1628,9 @@
   let selectedPlayableKind = $derived(
     selectedFile ? playableKind(selectedFile.extension || extensionFromPath(selectedFile.path)) : null,
   );
+  /** The kind the *in-app* player may handle, which on Linux is nothing. Gates
+   *  both the player itself and the Open button that assumes one exists. */
+  let inAppPlayerKind = $derived(IS_LINUX_DESKTOP ? null : selectedPlayableKind);
   function fileType(ext: string): string {
     const lower = ext.toLowerCase();
     if (audioExts.has(lower)) return m.library_type_audio();
@@ -3464,7 +3482,7 @@
       </div>
 
       <div class="drawer-actions">
-        {#if selectedPlayableKind}
+        {#if inAppPlayerKind}
           <button class="drawer-action-btn" onclick={() => openSharedFileExternally(selectedFile.path)} title={m.library_open_externally_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M9 3h4v4"/>
@@ -3625,11 +3643,11 @@
           </section>
         {/if}
 
-        {#if selectedPlayableKind && selectedPath}
+        {#if inAppPlayerKind && selectedPath}
           {#key selectedPath}
             <LibraryMediaPlayer
               path={selectedPath}
-              kind={selectedPlayableKind}
+              kind={inAppPlayerKind}
               playId={mediaPlayId}
               playPath={mediaPlayPath}
               stopToken={playerStopToken}

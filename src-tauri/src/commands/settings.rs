@@ -1953,7 +1953,7 @@ const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
 /// arbitrary destination.
 #[tauri::command]
 pub async fn open_ember_website() -> Result<(), String> {
-    opener::open(EMBER_WEBSITE_URL).map_err(|e| {
+    crate::security::filesystem::open_url_with_default_app(EMBER_WEBSITE_URL).map_err(|e| {
         coded_ctx(
             "settings_open_website_failed",
             "Failed to open the Ember website",
@@ -2247,7 +2247,7 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
         info!("External link was not opened: the native confirmation was declined");
         return Ok(());
     }
-    opener::open(&safe).map_err(|e| {
+    crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
         coded_ctx(
             "settings_open_link_failed",
             "Failed to open the link",
@@ -2333,7 +2333,7 @@ pub async fn open_web_service(
     );
     let safe = validate_external_url(&filled)?;
     reject_non_public_external_host(&safe).await?;
-    opener::open(&safe).map_err(|e| {
+    crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
         coded_ctx(
             "settings_open_link_failed",
             "Failed to open the link",
@@ -2482,7 +2482,7 @@ pub async fn open_log_folder() -> Result<(), String> {
             e,
         )
     })?;
-    opener::open(&dir).map_err(|e| {
+    crate::security::filesystem::open_with_default_app(&dir).map_err(|e| {
         coded_ctx(
             "settings_open_logs_failed",
             "Failed to open the log folder",
@@ -2556,7 +2556,7 @@ fn ember_share_intent_url(target: &str, text: &str) -> Result<String, String> {
 #[tauri::command]
 pub async fn open_ember_share(target: String, text: String) -> Result<(), String> {
     let intent = ember_share_intent_url(&target, &text)?;
-    opener::open(&intent).map_err(|e| {
+    crate::security::filesystem::open_url_with_default_app(&intent).map_err(|e| {
         coded_ctx(
             "settings_open_share_failed",
             "Failed to open the share link",

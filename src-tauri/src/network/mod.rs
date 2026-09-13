@@ -3247,14 +3247,87 @@ fn drain_active_source_overflow(state: &mut NetworkState) -> Vec<(String, usize,
 const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 =
     crate::network::ed2k::dead_sources::PENDING_KAD_CALLBACK_SECS;
 
-/// Per-file flood-safe interval for re-asking the connected eD2K server for
-/// sources when a download is *starved* (no source currently transferring).
-/// eMule keeps pulling the server's evolving source list for a starved file;
-/// a fresh download's first source set is often dead, and waiting the full
-/// 4-minute batch interval (`server_tcp_source_timer`) leaves it idle. 45s is
-/// frequent enough to recover quickly while staying well clear of server
-/// source-request flood limits (Lugdunum tolerates well under this rate).
+/// Per-file interval for re-asking the connected eD2K server for sources when a
+/// download is *starved* (no source currently transferring).
+///
+/// This is a *priority ordering* within [`SERVER_TCP_SRCREQ_INTERVAL_SECS`], not
+/// a licence to send: a file becomes eligible after 45 s, but nothing leaves
+/// until the shared frame budget below opens. It used to be the only gate, which
+/// put the real rate an order of magnitude above what eMule permits itself.
 const STARVED_SERVER_REASK_SECS: i64 = 45;
+
+/// Hashes one TCP `OP_GETSOURCES` frame may carry, and how long the connection
+/// must then rest — eMule's `iMaxFilesPerTcpFrame` and `m_dwNextTCPSrcReq`
+/// (`DownloadQueue.cpp:1307`, `:1387`).
+///
+/// eMule spells the reason out where it computes the delay: *"server credits:
+/// 16 * iMaxFilesPerTcpFrame + 1 = 241"*. A Lugdunum server accounts for source
+/// requests per connection and answers with silence once a client outruns its
+/// credit, which takes the *whole* server half of source discovery down for the
+/// session — so exceeding this is self-defeating rather than merely impolite.
+///
+/// Every path that can send `OP_GETSOURCES` over the server connection shares
+/// this one budget (starved re-ask, periodic sweep, warm-start), because the
+/// server's accounting is per connection and does not care which of our code
+/// paths a request came from. Between them they previously reached roughly 40 a
+/// minute against eMule's ceiling of 3.
+const SERVER_TCP_SRCREQ_MAX_PER_FRAME: usize = 15;
+const SERVER_TCP_SRCREQ_INTERVAL_SECS: i64 =
+    (SERVER_TCP_SRCREQ_MAX_PER_FRAME as i64) * (16 + 4);
+
+// The starved clock is an ordering hint *within* a frame interval, never a
+// licence to send. Making it the longer of the two would silently restore an
+// independent second rate, which is the bug this budget exists to close.
+const _: () = assert!(STARVED_SERVER_REASK_SECS < SERVER_TCP_SRCREQ_INTERVAL_SECS);
+
+/// Drop a written-off source from the persistent registry, so it stops counting
+/// as a source we know about.
+///
+/// eMule pairs its dead-source marking with `RemoveSource` on every retire path
+/// — connect failure and `DS_ERROR` (`BaseClient.cpp:1191-1193`), TCP
+/// `OP_FILEREQANSNOFIL` (`ListenSocket.cpp:420-429`), UDP file-not-found
+/// (`DownloadClient.cpp:1316-1325`) — and its `GetSourceCount()` is just
+/// `srclist.GetCount()` (`PartFile.h:216`), so the number falls the moment a
+/// source is written off.
+///
+/// Ember only did the marking. The row stayed in the registry, kept being
+/// refreshed by whichever server or DHT answer re-offered it, and so kept
+/// counting for up to `SOURCE_EXPIRY_SECS`. That matters twice over: it
+/// overstates the swarm in the Sources column by however many peers we are
+/// simultaneously refusing to contact, and the same figure gates every further
+/// lookup against `MAX_SOURCES_FOR_UDP` — so a file whose sources have all died
+/// reads as fully sourced and stops looking for more, which is exactly when it
+/// needs to.
+async fn retire_dead_source_from_registry(
+    source_manager: &Arc<RwLock<SourceManager>>,
+    file_hash: &[u8; 16],
+    ip: Ipv4Addr,
+    port: u16,
+) {
+    source_manager
+        .write()
+        .await
+        .remove_source(file_hash, &ip, port);
+}
+
+/// Whether another TCP source-request frame may go out now.
+///
+/// Also enforces the post-login settle window, so callers do not have to repeat
+/// both checks.
+fn server_tcp_srcreq_frame_open(state: &NetworkState, now: i64) -> bool {
+    state.server_connected
+        && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
+        && now >= state.server_tcp_srcreq_next_at
+}
+
+/// Close the frame after sending, mirroring eMule's
+/// `m_dwNextTCPSrcReq = curTick + SEC2MS(...)`.
+///
+/// Charged once per frame regardless of how many of the 15 slots were used, as
+/// eMule does — the credit is spent on the frame, not the hash.
+fn close_server_tcp_srcreq_frame(state: &mut NetworkState, now: i64) {
+    state.server_tcp_srcreq_next_at = now + SERVER_TCP_SRCREQ_INTERVAL_SECS;
+}
 
 /// Grace period after a successful server login before we send the connection
 /// its first OP_GETSOURCES requests. The server streams its post-login welcome
@@ -5832,6 +5905,34 @@ async fn register_or_refresh_pending_kad_callback(
     }
 }
 
+/// Which of the buddy's two candidate UDP ports this attempt targets.
+///
+/// Publishers disagree about what `TAG_SERVERPORT` carries, so both
+/// `buddy_port` and `buddy_port + 3` have to be tried — see the KAD
+/// source-found call site for that history. What they must not do is go out in
+/// the same instant.
+///
+/// eMule prices `KADEMLIA_CALLBACK_REQ` at a full minute's tokens per packet
+/// (`PacketTracking.cpp:144-145`) against a bucket that is keyed on the sender
+/// IP alone (`:161`) and caps at one minute (`:176-177`). A second packet to the
+/// same IP is therefore always over budget, and the deficit does not clear
+/// between attempts: from the second attempt onward the *primary* packet is
+/// dropped as well, and on the sixth the buddy calls `AddBannedClient`
+/// (`:188-192`) and ignores all our UDP for `CLIENTBANTIME` — two hours. Sending
+/// both ports was thus a reliable way to never have a callback relayed at all,
+/// which is what the "never relayed our CallbackReq" note elsewhere describes.
+///
+/// Alternating spends one token per 90 s attempt, which the bucket fully
+/// replenishes, and still gives each candidate port three of the six tries
+/// `MAX_CALLBACK_REASKS` allows.
+fn kad_callback_buddy_port(buddy_port: u16, attempt: u32) -> u16 {
+    if attempt.is_multiple_of(2) {
+        buddy_port
+    } else {
+        buddy_port.saturating_add(3)
+    }
+}
+
 async fn send_kad_callback_req(
     udp_socket: &UdpSocket,
     state: &NetworkState,
@@ -5839,8 +5940,8 @@ async fn send_kad_callback_req(
     buddy_port_raw: u16,
     buddy_hash: KadId,
     file_hash: [u8; 16],
+    attempt: u32,
 ) -> bool {
-    let buddy_port_alt = buddy_port_raw.saturating_add(3);
     let callback_req = KadMessage::CallbackReq {
         buddy_id: buddy_hash,
         // eMule writes `CUInt128(reqfile->GetFileHash())` here, i.e. the
@@ -5855,21 +5956,23 @@ async fn send_kad_callback_req(
     let Ok(packet) = kad::messages::encode_packet(&callback_req) else {
         return false;
     };
-    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
-    let buddy_addr_alt = SocketAddr::new(buddy_ip.into(), buddy_port_alt);
+    let buddy_addr = SocketAddr::new(
+        buddy_ip.into(),
+        kad_callback_buddy_port(buddy_port_raw, attempt),
+    );
     // eMule BaseClient.cpp TryToConnect sends CallbackReq unencrypted
     // (`SendPacket(..., false, NULL, true, 0)`). Encrypting here breaks
     // delivery to buddies that expect a plain KADEMLIA_CALLBACK_REQ.
-    let mut sent_any = false;
-    match udp_socket.send_to(&packet, buddy_addr_raw).await {
-        Ok(_) => sent_any = true,
-        Err(e) => warn!("Failed to send KAD CallbackReq to {buddy_addr_raw}: {e}"),
+    //
+    // One packet per attempt, matching `BaseClient.cpp:1451` — see
+    // `kad_callback_buddy_port` for what a second one costs.
+    match udp_socket.send_to(&packet, buddy_addr).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("Failed to send KAD CallbackReq to {buddy_addr}: {e}");
+            false
+        }
     }
-    match udp_socket.send_to(&packet, buddy_addr_alt).await {
-        Ok(_) => sent_any = true,
-        Err(e) => warn!("Failed to send KAD CallbackReq to {buddy_addr_alt}: {e}"),
-    }
-    sent_any
 }
 
 fn pending_download_retry_interval(search_count: u32) -> i64 {
@@ -9617,6 +9720,73 @@ mod tests {
             EMBER_KEYWORD_PUBLISH_MAX_PER_TICK,
             "the hard ceiling still bounds the extreme"
         );
+    }
+
+    /// A ban earned by timing alone must not outlive eMule's `CLIENTBANTIME`,
+    /// and it must agree with the in-memory tracker that granted it — those two
+    /// disagreed, so `AbuseTracker` considered a peer forgiven after two hours
+    /// while the persisted mirror kept its address blocked for a week. Because
+    /// the key is an IP, that week fell on every client behind it.
+    #[test]
+    fn a_timing_ban_lasts_emules_two_hours_not_a_week() {
+        assert_eq!(
+            AUTO_BAN_TTL_BEHAVIOUR_SECS, 2 * 3600,
+            "eMule CLIENTBANTIME (Opcodes.h:122)"
+        );
+        assert_eq!(
+            AUTO_BAN_TTL_BEHAVIOUR_SECS,
+            crate::network::ed2k::upload::BAN_DURATION_SECS,
+            "the persisted lifetime and the in-memory tracker's must be one number"
+        );
+        // Content evidence keeps the long ban; that the two stay distinct is
+        // pinned at compile time beside the constants.
+        assert_eq!(AUTO_BAN_TTL_CONTENT_SECS, 7 * 24 * 3600);
+    }
+
+    /// The server accounts for source requests per connection, so the ceiling
+    /// has to match eMule's arithmetic exactly rather than approximately: 15
+    /// hashes per frame and one frame per 300 s (`DownloadQueue.cpp:1307`,
+    /// `:1387`, whose comment reads "server credits: 16 * iMaxFilesPerTcpFrame +
+    /// 1 = 241"). Three separate Ember paths used to send `OP_GETSOURCES` on
+    /// their own clocks, reaching roughly 40 a minute against eMule's 3.
+    #[test]
+    fn server_source_requests_match_emules_credit_ceiling() {
+        assert_eq!(SERVER_TCP_SRCREQ_MAX_PER_FRAME, 15);
+        assert_eq!(SERVER_TCP_SRCREQ_INTERVAL_SECS, 300);
+        // The starved clock's relationship to the interval is pinned at compile
+        // time next to the constants themselves.
+
+        // Worst case across every path is one frame per interval.
+        let per_minute =
+            60.0 * SERVER_TCP_SRCREQ_MAX_PER_FRAME as f64 / SERVER_TCP_SRCREQ_INTERVAL_SECS as f64;
+        assert!(
+            per_minute <= 3.0,
+            "{per_minute} source requests/minute exceeds eMule's ceiling of 3"
+        );
+    }
+
+    /// Both candidate buddy ports have to be reachable across a row's retry
+    /// budget, but never within one attempt: two `KADEMLIA_CALLBACK_REQ`s to one
+    /// IP exceed eMule's per-opcode budget, and the deficit compounds until the
+    /// buddy bans us for two hours — taking the callback route down with it.
+    #[test]
+    fn callback_retries_alternate_ports_instead_of_doubling_up() {
+        let port = 4672u16;
+
+        assert_eq!(kad_callback_buddy_port(port, 0), port);
+        assert_eq!(kad_callback_buddy_port(port, 1), port + 3);
+        assert_eq!(kad_callback_buddy_port(port, 2), port);
+        assert_eq!(kad_callback_buddy_port(port, 3), port + 3);
+
+        // Across the six tries `MAX_CALLBACK_REASKS` allows, each candidate has
+        // to get a real share — one port winning every attempt would reproduce
+        // the "failed ~100% against opposite-flavour publishers" bug.
+        let tried: Vec<u16> = (0..6).map(|a| kad_callback_buddy_port(port, a)).collect();
+        assert_eq!(tried.iter().filter(|p| **p == port).count(), 3);
+        assert_eq!(tried.iter().filter(|p| **p == port + 3).count(), 3);
+
+        // A port near the top of the range must not wrap into a low one.
+        assert_eq!(kad_callback_buddy_port(u16::MAX, 1), u16::MAX);
     }
 
     /// Source records had the fixed budget the keyword path was already fixed
@@ -13561,6 +13731,11 @@ struct NetworkState {
     offered_ed2k_hashes: HashSet<[u8; 16]>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
+    /// Earliest unix-second at which another TCP `OP_GETSOURCES` frame may go
+    /// out, shared by every path that sends one. eMule's `m_dwNextTCPSrcReq`;
+    /// see `SERVER_TCP_SRCREQ_INTERVAL_SECS` for the server-credit accounting
+    /// this protects. 0 means "may send now".
+    server_tcp_srcreq_next_at: i64,
     /// Unix-seconds timestamp of the most recent successful server login.
     /// Server source requests (OP_GETSOURCES) are held off until the
     /// connection has settled for `SERVER_SOURCE_SETTLE_SECS` so we don't
@@ -24655,24 +24830,27 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
 /// upload set, and persist it to the DB `banned_ips` table with a finite
 /// expiry. Persisting is what lets these bans survive both a process
 /// restart and the periodic `banned_ips` cap-reset (which rebuilds the
-/// in-memory set from the database). Used for the deterministic abuse
-/// auto-bans — request flooding and sustained corruption — that warrant
-/// surviving longer than a single session, as opposed to reputation
-/// bans whose lifetime is already governed (with its own TTL) by
-/// `reputation.json` + per-user-hash enforcement.
+/// in-memory set from the database), as opposed to reputation bans whose
+/// lifetime is already governed (with its own TTL) by `reputation.json` +
+/// per-user-hash enforcement.
+///
+/// `ttl_secs` is the caller's judgement about what the ban is evidence *of*:
+/// [`AUTO_BAN_TTL_BEHAVIOUR_SECS`] for a timing heuristic, and
+/// [`AUTO_BAN_TTL_CONTENT_SECS`] for bytes that failed a hash or a broken
+/// protocol exchange. One constant used to serve both, at the longer value.
 fn apply_persistent_ip_ban(
     banned_ips: &mut HashSet<Ipv4Addr>,
     shared_banned_ips: &ed2k::upload::SharedBannedIps,
     db: &Arc<Database>,
     ip: Ipv4Addr,
     reason: &str,
+    ttl_secs: u64,
 ) {
-    // 7 days: long enough to shrug off a determined abuser across
-    // restarts, short enough that the persistent ban list is
-    // self-healing and never grows without bound.
-    const AUTO_BAN_TTL_SECS: u64 = 7 * 24 * 3600;
     if banned_ips.insert(ip) {
-        warn!("Auto-ban: banning IP {ip} ({reason})");
+        warn!(
+            "Auto-ban: banning IP {ip} for {}h ({reason})",
+            ttl_secs / 3600
+        );
     }
     if let Ok(mut shared) = shared_banned_ips.write() {
         *shared = banned_ips.clone();
@@ -24681,11 +24859,49 @@ fn apply_persistent_ip_ban(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-        .saturating_add(AUTO_BAN_TTL_SECS);
+        .saturating_add(ttl_secs);
     if let Err(e) = db.ban_ip(ip, reason, expires_at) {
         warn!("Failed to persist auto-ban for {ip}: {e}");
     }
 }
+
+/// Lifetime for a ban earned by *behaviour we inferred from timing* — asking too
+/// often, or too many connections in a window.
+///
+/// eMule's `CLIENTBANTIME` (`Opcodes.h:122`), two hours, and it is what
+/// `CUpDownClient::Ban()` grants for the `AddRequestCount` strike that Ember's
+/// leech counter reproduces. Ember was applying seven days to the same evidence,
+/// which is 84 times as long — and per IP, so one misbehaving client behind a
+/// CGNAT or VPN egress took every other client at that address down with it for
+/// a week.
+///
+/// It was also internally inconsistent: `AbuseTracker`'s own in-memory ban already
+/// expires after `BAN_DURATION_SECS` (two hours, eMule's `BAN_TIMEOUT`), so the
+/// tracker considered a peer forgiven while its persisted mirror kept the address
+/// blocked for the rest of the week.
+///
+/// Unlike eMule's these are still written to the database. That is deliberate:
+/// the periodic ban-set rebuild reads from durable sources, so an in-memory-only
+/// entry would be dropped at an arbitrary moment rather than at a known time. A
+/// two-hour ban that also survives a restart is both more predictable and
+/// slightly stricter than eMule, which is the right direction for the one
+/// property we are choosing not to copy.
+const AUTO_BAN_TTL_BEHAVIOUR_SECS: u64 = 2 * 3600;
+
+/// Lifetime for a ban earned by *evidence about content*, where the peer either
+/// sent bytes that failed a hash or broke the protocol outright.
+///
+/// eMule has no equivalent — its corruption handling drops the source rather than
+/// banning the address — so this is Ember's own, and the long durable ban is
+/// defensible here in a way it is not for a timing heuristic: the signal is
+/// deterministic, the peer produced it by sending us data, and no honest client
+/// behind a shared address can trip it on another's behalf.
+const AUTO_BAN_TTL_CONTENT_SECS: u64 = 7 * 24 * 3600;
+
+// The split only means something while the two differ. Collapsing them — in
+// either direction — would silently restore one lifetime for both kinds of
+// evidence, which is the bug this pair replaced.
+const _: () = assert!(AUTO_BAN_TTL_CONTENT_SECS > AUTO_BAN_TTL_BEHAVIOUR_SECS);
 
 /// Ceiling on the enforced ban set, above which it is rebuilt from durable
 /// sources rather than allowed to grow.
@@ -26121,6 +26337,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         request_offer_files: false,
         offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
+        server_tcp_srcreq_next_at: 0,
         server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
@@ -27949,10 +28166,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if let Some((completed_bytes, preview_ready, _)) =
                         progress_map.get(&transfer.id).copied()
                     {
-                        transfer.transferred = completed_bytes;
-                        transfer.completed_size = transfer.transferred;
+                        // `completed_bytes` is the on-disk figure, so it restores
+                        // Completed and drives progress. Transferred takes it as a
+                        // floor only: the real cumulative wire total is in the
+                        // `.part.met` and lands once the resumed download reports
+                        // progress, and claiming a smaller number here would make
+                        // the column jump backwards.
+                        transfer.completed_size = completed_bytes;
+                        transfer.transferred = transfer.transferred.max(completed_bytes);
                         transfer.progress =
-                            ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
+                            ((completed_bytes as f64 / transfer.total_size as f64) * 100.0)
                                 .min(100.0);
                         control.set_preview_ready(preview_ready);
                     }
@@ -29525,17 +29748,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // For single-source downloads that set peer_id, apply a
                     // belt-and-suspenders mark here as well.
                     {
+                        // Sources retired below are also dropped from the
+                        // registry, which is what makes the count honest — see
+                        // `retire_dead_source_from_registry`. Collected while the
+                        // manager lock is held and applied after it is released.
+                        let mut retire: Option<([u8; 16], Ipv4Addr, u16)> = None;
                         let mgr = transfer_manager.read().await;
                         if let Some(t) = mgr.get_transfer(transfer_id) {
                             if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
                                 if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                                     if *failure_kind == SourceFailureKind::Permanent {
-                                        state.dead_sources.add_dead_source(0, u32::from(ip), port, state.firewalled);
+                                        // The block time follows the *source's*
+                                        // reachability, not ours — see
+                                        // `add_dead_source`.
+                                        let src_fw = state
+                                            .per_file_sources
+                                            .get(transfer_id)
+                                            .is_some_and(|pfs| pfs.source_is_firewalled(ip, port, None));
+                                        state.dead_sources.add_dead_source(0, u32::from(ip), port, src_fw);
                                         if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
                                             if fh_bytes.len() == 16 {
                                                 let mut fh = [0u8; 16];
                                                 fh.copy_from_slice(&fh_bytes);
                                                 state.dead_sources.add_dead_source_for_file(fh, u32::from(ip), port);
+                                                retire = Some((fh, ip, port));
                                             }
                                         }
                                         debug!("Marked source {}:{} as dead after permanent failure: {}", ip, port, error);
@@ -29552,6 +29788,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             }
                         }
                         drop(mgr);
+                        if let Some((fh, ip, port)) = retire {
+                            retire_dead_source_from_registry(&source_manager, &fh, ip, port).await;
+                        }
                     }
 
                     // eMule-style: downloads never auto-fail. Re-queue for source
@@ -30120,7 +30359,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if let (false, Ok(v4)) = (friend_escalated, ip.parse::<Ipv4Addr>()) {
                             let is_permanent = matches!(failure_kind, Some(SourceFailureKind::Permanent));
                             if is_permanent {
-                                state.dead_sources.add_dead_source(0, u32::from(v4), port, state.firewalled);
+                                let src_fw = state
+                                    .per_file_sources
+                                    .get(transfer_id)
+                                    .is_some_and(|pfs| pfs.source_is_firewalled(v4, port, None));
+                                state.dead_sources.add_dead_source(0, u32::from(v4), port, src_fw);
+                                let mut retire: Option<[u8; 16]> = None;
                                 let mgr = transfer_manager.read().await;
                                 if let Some(t) = mgr.get_transfer(transfer_id) {
                                     if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
@@ -30128,8 +30372,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             let mut fh = [0u8; 16];
                                             fh.copy_from_slice(&fh_bytes);
                                             state.dead_sources.add_dead_source_for_file(fh, u32::from(v4), port);
+                                            retire = Some(fh);
                                         }
                                     }
+                                }
+                                drop(mgr);
+                                if let Some(fh) = retire {
+                                    retire_dead_source_from_registry(&source_manager, &fh, v4, port)
+                                        .await;
                                 }
                                 debug!("Marked source {}:{} as dead (permanent failure)", ip, port);
                             } else {
@@ -30239,6 +30489,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &db,
                             ip,
                             &reason,
+                            AUTO_BAN_TTL_CONTENT_SECS,
                         );
                     }
                     // `sender_user_hash` is whichever peer's connection
@@ -30327,6 +30578,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &db,
                             sender_ip,
                             "protocol violation (no user hash)",
+                            AUTO_BAN_TTL_CONTENT_SECS,
                         );
                     }
                 }
@@ -31804,13 +32056,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 }
                             }
                         } else {
-                            // Abuse / AddRequestCount: canonical + durable auto-ban.
+                            // Abuse / AddRequestCount: a timing heuristic, so it
+                            // gets eMule's `CLIENTBANTIME` rather than the long
+                            // ban reserved for content evidence.
                             apply_persistent_ip_ban(
                                 &mut state.banned_ips,
                                 &shared_banned_ips,
                                 &db,
                                 *ip,
                                 reason,
+                                AUTO_BAN_TTL_BEHAVIOUR_SECS,
                             );
                         }
                     }
@@ -32866,23 +33121,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     // unconditionally — both failed ~100%
                                     // of the time against the
                                     // opposite-flavour publishers),
-                                    // fire the callback at **both**
-                                    // `TAG_SERVERPORT` and
-                                    // `TAG_SERVERPORT + 3`. Exactly one
+                                    // try `TAG_SERVERPORT` and
+                                    // `TAG_SERVERPORT + 3` on
+                                    // *alternating* attempts. Exactly one
                                     // of the two lands on the buddy's
                                     // actual UDP listener; the other is
                                     // dropped by the OS as "no such
-                                    // socket" with zero protocol
-                                    // impact. Tracking the attempt as a
-                                    // single logical attempt (not two)
-                                    // is correct — the peer only sees
-                                    // one.
+                                    // socket".
+                                    //
+                                    // Sending both at once is what must
+                                    // not happen: it is two packets to
+                                    // one IP inside eMule's one-per-minute
+                                    // budget for this opcode, which after
+                                    // a couple of attempts starts dropping
+                                    // the *primary* packet too and ends in
+                                    // a two-hour ban. See
+                                    // `kad_callback_buddy_port`.
                                     let buddy_port_raw = cb_src.buddy_port.unwrap_or(0);
                                     if buddy_port_raw == 0 {
                                         debug!("Skipping callback source: no buddy UDP port in TAG_SERVERPORT");
                                         continue;
                                     }
-                                    let buddy_port_alt = buddy_port_raw.saturating_add(3);
                                     // `cb_src.buddy_hash` is the
                                     // `TAG_BUDDYHASH` value published by
                                     // the LowID peer, which eMule
@@ -32969,16 +33228,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         }
                                     }
 
-                                    let should_send = state
+                                    let (should_send, attempt) = state
                                         .per_file_sources
                                         .get(&transfer_id)
-                                        .map(|pfs| pfs.callback_reask_due(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash))
-                                        .unwrap_or(false);
+                                        .map(|pfs| {
+                                            (
+                                                pfs.callback_reask_due(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash),
+                                                pfs.callback_attempts(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash),
+                                            )
+                                        })
+                                        .unwrap_or((false, 0));
                                     if !should_send {
                                         continue;
                                     }
 
-                                    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
+                                    let buddy_addr_sent = SocketAddr::new(
+                                        buddy_ip.into(),
+                                        kad_callback_buddy_port(buddy_port_raw, attempt),
+                                    );
                                     if send_kad_callback_req(
                                         &udp_socket,
                                         &state,
@@ -32986,6 +33253,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         buddy_port_raw,
                                         buddy_hash,
                                         fh,
+                                        attempt,
                                     ).await {
                                         if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                                             pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
@@ -32998,10 +33266,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             cb_src.source_user_hash,
                                         ).await;
                                         info!(
-                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {}",
+                                            "Sent KAD CallbackReq to buddy {} at {} (attempt {}) for file {}",
                                             buddy_hash,
-                                            buddy_addr_raw,
-                                            buddy_port_alt,
+                                            buddy_addr_sent,
+                                            attempt + 1,
                                             hex::encode(fh),
                                         );
                                     }
@@ -37888,6 +38156,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         buddy_port: u16,
                         buddy_hash: KadId,
                         user_hash: Option<[u8; 16]>,
+                        /// Chooses which candidate buddy port this try uses; see
+                        /// `kad_callback_buddy_port`.
+                        attempt: u32,
                     }
                     let mut reask_jobs: Vec<KadCallbackReaskJob> = Vec::new();
                     for (tid, pfs) in &state.per_file_sources {
@@ -37916,6 +38187,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 buddy_port,
                                 buddy_hash: KadId(buddy_hash),
                                 user_hash: src.source_user_hash,
+                                attempt: src.callback_reasks_sent,
                             });
                         }
                     }
@@ -37927,6 +38199,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             job.buddy_port,
                             job.buddy_hash,
                             job.file_hash,
+                            job.attempt,
                         ).await {
                             if let Some(pfs) = state.per_file_sources.get_mut(&job.transfer_id) {
                                 pfs.mark_callback_requested(job.src_ip, job.src_port, job.user_hash);
@@ -38198,8 +38471,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                     let completed = {
                         let mgr = transfer_manager.read().await;
+                        // Bytes on disk only. This used to take
+                        // `transferred.max(completed_size)`, which was harmless
+                        // while the two were equal but now overstates progress —
+                        // `transferred` counts re-fetched bytes and can exceed the
+                        // file size, so the space still needed would come out too
+                        // small and let a download start that cannot fit.
                         mgr.get_transfer(tid)
-                            .map(|t| t.transferred.max(t.completed_size))
+                            .map(|t| t.completed_size)
                             .unwrap_or(0)
                     };
                     let needed = remaining_download_bytes(pd.file_size, completed);
@@ -38398,7 +38677,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let completed = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(tid)
-                                .map(|t| t.transferred.max(t.completed_size))
+                                .map(|t| t.completed_size)
                                 .unwrap_or(0)
                         };
                         let needed = remaining_download_bytes(pending.file_size, completed);
@@ -38596,7 +38875,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let completed = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(tid)
-                                .map(|t| t.transferred.max(t.completed_size))
+                                .map(|t| t.completed_size)
                                 .unwrap_or(0)
                         };
                         let needed = remaining_download_bytes(pending.file_size, completed);
@@ -38869,9 +39148,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // sends the initial batch; this on-demand kick would just
                         // add to a premature, flood-prone burst.
                         if !state.low_id
-                            && state.server_connected
                             && state.server_connection.is_some()
-                            && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
+                            && server_tcp_srcreq_frame_open(&state, now)
                         {
                             // Bounded, and it stops at the first write failure.
                             // Each `send_get_sources` is a TCP write on the
@@ -38885,10 +39163,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             // this tick does not reach, which is why dropping
                             // the tail costs nothing but a few seconds of
                             // discovery latency.
-                            const MAX_WARM_START_GETSOURCES_PER_TICK: usize = 10;
+                            close_server_tcp_srcreq_frame(&mut state, now);
                             if let Some(conn) = state.server_connection.as_mut() {
                                 for (tid, fh, file_size) in
-                                    targets.iter().take(MAX_WARM_START_GETSOURCES_PER_TICK)
+                                    targets.iter().take(SERVER_TCP_SRCREQ_MAX_PER_FRAME)
                                 {
                                     match conn.send_get_sources(fh, *file_size).await {
                                         Ok(bytes) => {
@@ -39484,8 +39762,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // for that file's sources on a flood-safe per-file cadence
                 // (STARVED_SERVER_REASK_SECS). This is the path that surfaces
                 // the LowID server sources eMule reaches via OP_CALLBACKREQUEST.
-                if state.server_connected && state.server_connection.is_some() {
-                    const MAX_STARVED_REASK_PER_TICK: usize = 10;
+                // Gated on the shared frame budget, so the 45 s per-file clock
+                // only decides *which* starved files ride the next frame.
+                if state.server_connection.is_some() && server_tcp_srcreq_frame_open(&state, now) {
                     let starved: Vec<(String, [u8; 16], u64)> = {
                         let mgr = transfer_manager.read().await;
                         let mut out = Vec::new();
@@ -39506,23 +39785,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            if out.len() >= MAX_STARVED_REASK_PER_TICK { break; }
+                            if out.len() >= SERVER_TCP_SRCREQ_MAX_PER_FRAME { break; }
                         }
                         out
                     };
-                    // Hold off until the connection has settled past its
-                    // post-login welcome (see `SERVER_SOURCE_SETTLE_SECS`); the
-                    // periodic source timer covers the initial batch.
-                    if !starved.is_empty()
-                        && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
-                    {
+                    if !starved.is_empty() {
+                        close_server_tcp_srcreq_frame(&mut state, now);
                         if let Some(conn) = state.server_connection.as_mut() {
                             for (tid, fh, file_size) in &starved {
                                 // Stop at the first failed write: these are
                                 // sequential 30 s-timeout TCP writes on the
                                 // network task, so a server that has stopped
                                 // reading turns a capped batch into
-                                // `MAX_STARVED_REASK_PER_TICK` back-to-back
+                                // `SERVER_TCP_SRCREQ_MAX_PER_FRAME` back-to-back
                                 // stalls of everything else.
                                 match conn.send_get_sources(fh, *file_size).await {
                                     Ok(bytes) => {
@@ -39702,44 +39977,67 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // downloads/source lists make the work below a no-op.
                 let mut file_priorities: HashMap<[u8; 16], ed2k::a4af::FileSwapInfo> = HashMap::new();
                 let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
+
+                // Every download a source could be swapped *to* or *from* needs an
+                // entry here: `process_swaps` skips a candidate whose target or
+                // assigned file is missing from this map.
+                //
+                // It used to be built from `pending_downloads` alone, while the
+                // NNP candidates below are harvested from `per_file_sources` —
+                // the *active* downloads, which are a disjoint set (see the
+                // `pending_downloads.contains_key` guards on the retry paths). So
+                // both halves of every candidate were absent and the swap engine
+                // could never act, where eMule reconsiders each `DS_NONEEDEDPARTS`
+                // source on every downloading file's `Process()` pass
+                // (`PartFile.cpp:2320-2324`).
+                let mut swap_files: Vec<(String, [u8; 16])> = Vec::new();
                 for (tid, pd) in &state.pending_downloads {
-                    let hash_hex = &pd.file_hash;
-                    if let Ok(raw) = hex::decode(hash_hex) {
-                        if raw.len() >= 16 {
-                            let mut hash = [0u8; 16];
-                            hash.copy_from_slice(&raw[..16]);
-                            let active_sources = state.active_source_senders
-                                .get(tid)
-                                .map(|s| s.max_capacity().saturating_sub(s.capacity()))
-                                .unwrap_or(0);
-                            let has_active = state.active_source_senders.contains_key(tid);
-                            let priority = {
-                                let mgr = transfer_manager.read().await;
-                                let prio_str = mgr.active.get(tid)
-                                    .map(|t| t.priority.as_str())
-                                    .unwrap_or("normal");
-                                if prio_str == "auto" {
-                                    let sm = source_manager.read().await;
-                                    let src_count = sm.source_count(&hash);
-                                    if src_count > 100 { 2 } else if src_count > 20 { 7 } else { 9 }
-                                } else {
-                                    match prio_str {
-                                        "release" => 10,
-                                        "high" => 9,
-                                        "low" => 2,
-                                        "verylow" => 1,
-                                        _ => 7,
-                                    }
-                                }
-                            };
-                            file_priorities.insert(hash, ed2k::a4af::FileSwapInfo {
-                                priority,
-                                active_source_count: if has_active { active_sources.max(1) } else { 0 },
-                                has_needed_parts: true,
-                            });
-                            dl_hashes_vec.push(hash);
-                        }
+                    if let Some(hash) = parse_ed2k_hash16(&pd.file_hash) {
+                        swap_files.push((tid.clone(), hash));
                     }
+                }
+                for (tid, pfs) in &state.per_file_sources {
+                    if state.pending_downloads.contains_key(tid) {
+                        continue;
+                    }
+                    swap_files.push((tid.clone(), pfs.file_hash));
+                }
+
+                for (tid, hash) in &swap_files {
+                    let active_sources = state.active_source_senders
+                        .get(tid)
+                        .map(|s| s.max_capacity().saturating_sub(s.capacity()))
+                        .unwrap_or(0);
+                    let has_active = state.active_source_senders.contains_key(tid);
+                    let priority = {
+                        let mgr = transfer_manager.read().await;
+                        let prio_str = mgr.active.get(tid)
+                            .map(|t| t.priority.as_str())
+                            .unwrap_or("normal");
+                        if prio_str == "auto" {
+                            let sm = source_manager.read().await;
+                            let src_count = sm.source_count(hash);
+                            if src_count > 100 { 2 } else if src_count > 20 { 7 } else { 9 }
+                        } else {
+                            match prio_str {
+                                "release" => 10,
+                                "high" => 9,
+                                "low" => 2,
+                                "verylow" => 1,
+                                _ => 7,
+                            }
+                        }
+                    };
+                    file_priorities.insert(*hash, ed2k::a4af::FileSwapInfo {
+                        priority,
+                        active_source_count: if has_active { active_sources.max(1) } else { 0 },
+                        // A file we are downloading wants bytes by definition. This
+                        // is the *file's* appetite, not the peer's usefulness to it
+                        // — `evaluate_swap` takes that separately as
+                        // `has_needed_parts_on_assigned`.
+                        has_needed_parts: true,
+                    });
+                    dl_hashes_vec.push(*hash);
                 }
 
                 {
@@ -39766,11 +40064,32 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             other_hash,
                                             addr,
                                             pfs.file_hash,
+                                            // This sweep selects on
+                                            // `NoneNeededParts`, so by
+                                            // construction the peer has nothing
+                                            // left for the file it is on — which
+                                            // is the whole reason to retask it.
+                                            false,
                                         );
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                // Surface the candidate counts the feed just built, so the `+aa`
+                // term of the Sources column reflects them.
+                {
+                    let a4af = a4af_shared.read().await;
+                    let counts: Vec<(String, u32)> = swap_files
+                        .iter()
+                        .map(|(tid, hash)| (tid.clone(), a4af.a4af_count(hash) as u32))
+                        .collect();
+                    drop(a4af);
+                    let mut mgr = transfer_manager.write().await;
+                    for (tid, count) in counts {
+                        mgr.set_a4af_count(&tid, count);
                     }
                 }
 
@@ -40416,7 +40735,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                         src.crypt_options.unwrap_or(0),
                                                     );
                                                 }
-                                            } else {
+                                            } else if !state.low_id {
                                                 sm.register_lowid_source(
                                                     file_hash,
                                                     src.client_id,
@@ -40426,19 +40745,28 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     src.user_hash.unwrap_or([0u8; 16]),
                                                     src.crypt_options.unwrap_or(0),
                                                 );
-                                                // Mirror the `!state.low_id` gate below: when
-                                                // we're LowID/firewalled ourselves, asking the
-                                                // server to relay OP_CALLBACKREQUEST is pointless
-                                                // (it would tell this LowID peer to dial *us*
-                                                // back, which fails the same way). Rather than
-                                                // silently dropping the source, track it as a
-                                                // known low-to-low dead end so it's visible and
-                                                // can be transparently upgraded later — see
+                                            } else {
+                                                // We are LowID too, so this source is a dead end:
+                                                // asking the server to relay OP_CALLBACKREQUEST
+                                                // would only tell the peer to dial an address as
+                                                // unreachable as its own. eMule declines to create
+                                                // the source at all in that case — `CanAddSource`
+                                                // returns false for `IsLowID(hybridID) &&
+                                                // IsFirewalled()` (`PartFile.cpp:2438-2442`) — so it
+                                                // never enters `srclist` and never counts.
+                                                //
+                                                // Keeping it out of the registry is the part that
+                                                // matters: `source_count` gates every further
+                                                // server, KAD and Ember lookup against
+                                                // `MAX_SOURCES_FOR_UDP`, so a LowID user's popular
+                                                // file used to accumulate enough undialable rows to
+                                                // switch its own discovery off — while the Sources
+                                                // column showed hundreds. The visible row below is
+                                                // still added: the dead end is worth showing, and
+                                                // it can be upgraded later — see
                                                 // `set_low_to_low_by_identity`.
-                                                if state.low_id {
-                                                    if let Some(uh) = src.user_hash.filter(|h| *h != [0u8; 16]) {
-                                                        lowid_unreachable_hashes.push(uh);
-                                                    }
+                                                if let Some(uh) = src.user_hash.filter(|h| *h != [0u8; 16]) {
+                                                    lowid_unreachable_hashes.push(uh);
                                                 }
                                             }
                                         }
@@ -41392,6 +41720,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             // upload listener filter
                                             // when the callback
                                             // actually arrives.
+                                            //
+                                            // Unless we are LowID
+                                            // ourselves, in which case
+                                            // the callback can never
+                                            // work and eMule refuses
+                                            // the source outright
+                                            // (`CanAddSource`,
+                                            // `PartFile.cpp:2438-2442`).
+                                            // This path carries no user
+                                            // hash, so unlike the TCP
+                                            // poll it cannot even leave
+                                            // a visible dead-end row.
+                                            if state.low_id {
+                                                continue;
+                                            }
                                             sm.register_lowid_source(
                                                 file_hash,
                                                 *client_id,
@@ -42153,6 +42496,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // download). The on-demand warm-start / starved-re-ask
                         // paths below are likewise gated on `server_connected_at`.
                         state.server_tcp_getsources_cursor = 0;
+                        // A new connection carries no spent credit, so the first
+                        // frame may go out as soon as the welcome has settled.
+                        state.server_tcp_srcreq_next_at = 0;
                         server_tcp_source_timer.reset_after(std::time::Duration::from_secs(
                             SERVER_SOURCE_SETTLE_SECS as u64,
                         ));
@@ -45943,9 +46289,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // active server connection every 4 min, up to 15 per frame.
             _ = server_tcp_source_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if !state.server_connected || state.server_connection.is_none() { return; }
-
-                const MAX_TCP_GETSOURCES_PER_FRAME: usize = 15;
+                if state.server_connection.is_none() { return; }
+                // Shares the frame budget with the starved re-ask and warm-start
+                // paths, so this 4-minute tick is a poll rather than a licence:
+                // whichever path last spent the frame sets the floor for all
+                // three. See `SERVER_TCP_SRCREQ_INTERVAL_SECS`.
+                let srcreq_now = chrono::Utc::now().timestamp();
+                if !server_tcp_srcreq_frame_open(&state, srcreq_now) { return; }
 
                 let mut all_downloads: Vec<(String, [u8; 16], u64, usize)> = Vec::new();
 
@@ -45992,8 +46342,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 let total = all_downloads.len();
                 let cursor = state.server_tcp_getsources_cursor % total;
-                let batch_size = MAX_TCP_GETSOURCES_PER_FRAME.min(total);
+                let batch_size = SERVER_TCP_SRCREQ_MAX_PER_FRAME.min(total);
                 let mut sent = 0u32;
+                close_server_tcp_srcreq_frame(&mut state, srcreq_now);
 
                 if let Some(conn) = state.server_connection.as_mut() {
                     for i in 0..batch_size {
@@ -53454,6 +53805,31 @@ async fn handle_udp_packet_inner(
                             }
                         }
                     }
+                    // "I don't have that file" is a lasting answer about this
+                    // file, not a transient error, so eMule writes the source off
+                    // for the file and drops it: `UDPReaskFNF` calls
+                    // `AddDeadSource` on the *file's* list and then `RemoveSource`
+                    // (`DownloadClient.cpp:1316-1325`). Marking it `Failed` alone
+                    // left it eligible again one `FILEREASKTIME` later, so we
+                    // re-asked a peer that had already told us the answer, every
+                    // 29 minutes, for as long as the download ran. `QUEUEFULL` is
+                    // deliberately excluded: that peer *has* the file.
+                    if !is_banned && opcode != ed2k::messages::OP_QUEUEFULL_UDP {
+                        state
+                            .dead_sources
+                            .add_dead_source_for_file(file_hash, u32::from(v4), from.port());
+                        retire_dead_source_from_registry(
+                            source_manager,
+                            &file_hash,
+                            v4,
+                            from.port(),
+                        )
+                        .await;
+                        debug!(
+                            "UDP reask: {v4} reports it does not have {} — written off for this file",
+                            hex::encode(file_hash)
+                        );
+                    }
                 }
                 debug!("UDP reask negative response (opcode 0x{opcode:02X}) from {from}");
                 return;
@@ -56152,6 +56528,7 @@ async fn handle_download_event(
         DownloadEvent::Progress {
             transfer_id,
             downloaded,
+            transferred,
             total,
         } => {
             let capped_downloaded = if total > 0 {
@@ -56161,7 +56538,17 @@ async fn handle_download_event(
             };
             let speed = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_progress(&transfer_id, capped_downloaded, None);
+                // eMule's split: `transferred` is the wire counter behind its
+                // Transferred column, `capped_downloaded` the on-disk figure
+                // behind Completed, and progress comes from the latter
+                // (`DownloadListCtrl.cpp:1984`, `:1987`, `:1698`). Emitters with
+                // no tracker send `None`, and then the on-disk figure stands in
+                // for both rather than being reported as a wire total.
+                mgr.update_progress(
+                    &transfer_id,
+                    transferred.unwrap_or(capped_downloaded),
+                    Some(capped_downloaded),
+                );
                 if let Some(t) = mgr.active.get(&transfer_id) {
                     t.speed
                 } else {
@@ -56209,12 +56596,18 @@ async fn handle_download_event(
                 "transfer-progress",
                 &crate::types::TransferProgressPayload {
                     id: &transfer_id,
-                    downloaded: capped_downloaded,
+                    // Wire bytes, mirroring `uploaded` on the upload side. This is
+                    // the Transferred column.
+                    downloaded: transferred.unwrap_or(capped_downloaded),
                     total,
                     progress,
                     speed,
                     uploaded: None,
-                    completed_size: None,
+                    // Bytes on disk — the Completed column, and what `progress`
+                    // above was computed from. Sending it matters: the frontend
+                    // otherwise derives Completed from Transferred, which now
+                    // counts re-fetched bytes and would drive the bar past 100%.
+                    completed_size: Some(capped_downloaded),
                     direction: None,
                     upload_time: None,
                     up_part_status: None,
@@ -56496,12 +56889,25 @@ async fn handle_download_event(
                 );
             }
             if status == "queued" || status == "transferring" {
-                if let Ok(addr) = format!("{ip}:{port}").parse::<std::net::SocketAddr>() {
+                // Scoped to the file this status is about — see
+                // `update_source_state`. Queued or transferring means the peer
+                // still has something this file wants, so it is not run dry here
+                // whatever its queue position.
+                let assigned = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id)
+                        .and_then(|t| parse_ed2k_hash16(&t.file_hash))
+                };
+                if let (Some(assigned), Ok(addr)) = (
+                    assigned,
+                    format!("{ip}:{port}").parse::<std::net::SocketAddr>(),
+                ) {
                     let mut a4af_lock = a4af.write().await;
                     a4af_lock.update_source_state(
                         addr,
+                        assigned,
                         queue_rank.unwrap_or(0).min(u16::MAX as u32) as u16,
-                        status != "queued" || queue_rank.unwrap_or(u32::MAX) < 500,
+                        true,
                         1.0,
                     );
                 }
@@ -56676,8 +57082,14 @@ async fn handle_download_event(
             // with a fresh budget.
             let final_progress = {
                 let mgr = transfer_manager.read().await;
+                // `completed_size`, not `transferred`: the DB column is resume
+                // progress, and the periodic writer above persists the same
+                // on-disk figure. `transferred` is cumulative wire bytes and can
+                // exceed the file size, which would both misreport progress on
+                // restart and break the `total_size - transferred` remaining
+                // calculation the queue-overflow query runs.
                 mgr.get_transfer(&transfer_id)
-                    .map(|t| (t.transferred, t.progress, t.speed))
+                    .map(|t| (t.completed_size, t.progress, t.speed))
             };
             if let Some((transferred, progress, speed)) = final_progress {
                 let db = db.clone();

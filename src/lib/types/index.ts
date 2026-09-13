@@ -97,9 +97,15 @@ export interface Transfer {
   progress: number;
   speed: number;
   total_size: number;
+  /** Cumulative wire bytes, in either direction — eMule's `GetTransferred`.
+   *  Counts anything transferred twice (a re-requested block, a part re-fetched
+   *  after a failed hash check), so it may exceed `total_size`. Never use it for
+   *  progress or remaining bytes; use `completed_size`. */
   transferred: number;
-  /** Unique completed size. Downloads include resumed data; uploads are
-   *  unique per-part coverage this session (re-requests do not inflate it). */
+  /** Coverage, bounded by `total_size` — eMule's `GetCompletedSize`. Bytes on
+   *  disk for downloads; unique per-part coverage this session for uploads
+   *  (re-requests do not inflate it). This is what the progress bar, the
+   *  percentage and the remaining byte count derive from. */
   completed_size: number;
   started_at: number;
   failure_reason?: string;

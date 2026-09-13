@@ -426,6 +426,16 @@ impl BandwidthLimiter {
         self.max_upload_rate.load(Ordering::Relaxed)
     }
 
+    /// Upload tokens sitting unclaimed in the bucket right now.
+    ///
+    /// eMule's throttler reads the same quantity — `bytesToSpend - spentBytes`,
+    /// what the slots collectively left unspent — to decide whether a slot may
+    /// send past its equal share (`UploadBandwidthThrottler.cpp:586`). The ed2k
+    /// per-slot pacer uses it for exactly that.
+    pub fn available_upload_tokens(&self) -> u64 {
+        self.upload_tokens.load(Ordering::Relaxed)
+    }
+
     pub fn total_uploaded(&self) -> u64 {
         self.total_uploaded.load(Ordering::Relaxed)
     }

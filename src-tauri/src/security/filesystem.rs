@@ -1926,9 +1926,17 @@ const PASSIVE_EXTENSIONS: &[&str] = &[
     // Plain, non-script text/data.
     "txt", "md", "csv", "json", "xml",
     // Raster images (SVG/HTML deliberately excluded).
-    "bmp", "gif", "jpeg", "jpg", "png", "webp", // Media handled by passive players.
-    "aac", "avi", "flac", "m4a", "m4v", "mkv", "mov", "mp3", "mp4", "mpeg", "mpg", "ogg", "opus",
-    "wav", "webm", "wmv",
+    "bmp", "gif", "jpeg", "jpg", "png", "webp",
+    // Media handled by passive players. This has to cover every extension
+    // `network::ed2k::preview` will offer to preview, or the Preview button
+    // enables itself and `launch_preview` then refuses after copying the
+    // verified prefix — see
+    // `preview::tests::every_previewable_extension_can_actually_be_launched`.
+    // All of these are container/codec formats a media player decodes; none
+    // carries script or markup, which is the line this list draws.
+    "3gp", "aac", "ape", "avi", "divx", "flac", "flv", "m4a", "m4v", "mkv", "mov", "mp3", "mp4",
+    "mpeg", "mpg", "ogg", "ogm", "ogv", "opus", "rm", "rmvb", "ts", "vob", "wav", "webm", "wma",
+    "wmv",
     // PDF is retained for ordinary document usability; active office and
     // archive/container formats remain reveal-only.
     "pdf",
@@ -2031,9 +2039,200 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     opener::open(clean).map_err(|e| io::Error::other(e.to_string()))
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Launch `path` in the user's default application.
+///
+/// Linux cannot hand this straight to `opener`, because an AppImage does not
+/// run in an ordinary environment. The `AppRun` prepends the bundled tree to
+/// `LD_LIBRARY_PATH`, the GStreamer plugin paths and `XDG_DATA_DIRS` so *this*
+/// process can find its own WebKit; `xdg-open` then hands the file to Totem,
+/// mpv or VLC, which start against those libraries and die immediately. Both
+/// Preview and Open end up here, which is why both looked like they did
+/// nothing at all. So the AppDir is subtracted from the child's environment
+/// before the host's `xdg-open` is asked to take over.
+#[cfg(target_os = "linux")]
 pub fn open_with_default_app(path: &Path) -> io::Result<()> {
-    opener::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    spawn_linux_host_open(path.as_os_str())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn open_with_default_app(path: &Path) -> io::Result<()> {
+    opener::open(path).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Launch an already-validated URL with the user's default handler.
+///
+/// Same AppImage problem as [`open_with_default_app`], and worse in one
+/// respect: a browser started with the bundle's `LD_LIBRARY_PATH` in place
+/// usually refuses to come up at all, so the website button, the share targets
+/// and a link opened from a room were dead on Linux for the same reason
+/// Preview was.
+///
+/// Deciding whether a URL is *safe* to open belongs to the caller — see
+/// `validate_external_url` and the consent gates in `commands::settings`. This
+/// only decides how it is launched.
+pub fn open_url_with_default_app(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        spawn_linux_host_open(std::ffi::OsStr::new(url))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        opener::open(url).map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+/// Environment the AppImage `AppRun` points at the bundled tree so *this*
+/// process can load its own WebKit and GStreamer. A child that is meant to be
+/// the user's own desktop application must not inherit any of it.
+///
+/// Every entry is *reduced*, never blanked: the `AppRun` prepends its paths to
+/// whatever the session already had, so only the entries under `$APPDIR` come
+/// off and the user's own values survive. `Some(fallback)` marks the three
+/// where an empty result would leave the child unable to find the host's
+/// programs, `.desktop` files or configuration at all, so those fall back to
+/// the filesystem defaults instead of being unset.
+///
+/// Deliberately absent: `GTK_IM_MODULE`, `GTK_MODULES` and their relatives.
+/// Those hold module *names* (`ibus`), not paths, so nothing distinguishes a
+/// bundled value from the session's own — and dropping the session's would take
+/// the user's input method away from whatever we launch.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+const APPIMAGE_PATH_VARS: &[(&str, Option<&str>)] = &[
+    ("PATH", Some("/usr/local/bin:/usr/bin:/bin")),
+    ("XDG_DATA_DIRS", Some("/usr/local/share:/usr/share")),
+    ("XDG_CONFIG_DIRS", Some("/etc/xdg")),
+    ("LD_LIBRARY_PATH", None),
+    ("LD_PRELOAD", None),
+    ("GDK_PIXBUF_MODULEDIR", None),
+    ("GDK_PIXBUF_MODULE_FILE", None),
+    ("GIO_MODULE_DIR", None),
+    ("GI_TYPELIB_PATH", None),
+    ("GSETTINGS_SCHEMA_DIR", None),
+    ("GST_PLUGIN_PATH", None),
+    ("GST_PLUGIN_SCANNER", None),
+    ("GST_PLUGIN_SYSTEM_PATH", None),
+    ("GST_PLUGIN_SYSTEM_PATH_1_0", None),
+    ("GST_REGISTRY", None),
+    ("GST_REGISTRY_1_0", None),
+    ("GTK_DATA_PREFIX", None),
+    ("GTK_EXE_PREFIX", None),
+    ("GTK_IM_MODULE_FILE", None),
+    ("GTK_PATH", None),
+    ("PERL5LIB", None),
+    ("PERLLIB", None),
+    ("PYTHONHOME", None),
+    ("PYTHONPATH", None),
+    ("QT_PLUGIN_PATH", None),
+    ("QT_QPA_PLATFORM_PLUGIN_PATH", None),
+];
+
+/// Variables naming the bundle itself. Unlike the paths above there is nothing
+/// to reduce — the whole value is about this AppImage, and `ARGV0` in
+/// particular confuses any shell that inherits it.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+const APPIMAGE_MARKER_VARS: &[&str] = &["APPDIR", "APPIMAGE", "APPIMAGE_UUID", "ARGV0", "OWD"];
+
+/// Drop colon-separated entries that live inside `appdir` (the bundled tree).
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn strip_colon_prefix_entries(value: &std::ffi::OsStr, appdir: &Path) -> std::ffi::OsString {
+    let raw = value.to_string_lossy();
+    let kept: Vec<&str> = raw
+        .split(':')
+        .filter(|part| !part.is_empty() && !Path::new(part).starts_with(appdir))
+        .collect();
+    std::ffi::OsString::from(kept.join(":"))
+}
+
+/// What [`apply_host_desktop_env`] should do with one inherited variable.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[derive(Debug, PartialEq, Eq)]
+enum HostEnvAction {
+    /// Nothing in the value came from the bundle, so it is the session's own.
+    Leave,
+    Remove,
+    Set(std::ffi::OsString),
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn host_env_action(value: &std::ffi::OsStr, appdir: &Path, fallback: Option<&str>) -> HostEnvAction {
+    let kept = strip_colon_prefix_entries(value, appdir);
+    if kept.as_os_str() == value {
+        return HostEnvAction::Leave;
+    }
+    if !kept.is_empty() {
+        return HostEnvAction::Set(kept);
+    }
+    match fallback {
+        Some(default) => HostEnvAction::Set(std::ffi::OsString::from(default)),
+        None => HostEnvAction::Remove,
+    }
+}
+
+/// Point a child at the host desktop instead of this AppImage's runtime.
+///
+/// Gated on `APPDIR` rather than on `APPIMAGE`, because the AppDir is the tree
+/// being subtracted and every `AppRun` exports it. A `.deb` install or a
+/// `cargo run` has neither and needs nothing done.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn apply_host_desktop_env(cmd: &mut std::process::Command) {
+    let Some(appdir) = std::env::var_os("APPDIR").map(PathBuf::from) else {
+        return;
+    };
+    for key in APPIMAGE_MARKER_VARS {
+        cmd.env_remove(key);
+    }
+    for (key, fallback) in APPIMAGE_PATH_VARS {
+        let Some(value) = std::env::var_os(key) else {
+            continue;
+        };
+        match host_env_action(&value, &appdir, *fallback) {
+            HostEnvAction::Leave => {}
+            HostEnvAction::Remove => {
+                cmd.env_remove(key);
+            }
+            HostEnvAction::Set(value) => {
+                cmd.env(key, value);
+            }
+        }
+    }
+}
+
+/// Ask the host's opener to handle `target`, with the AppImage runtime removed.
+///
+/// `xdg-open` is spawned directly instead of through `opener` because `opener`
+/// inherits our environment. The absolute path is tried first so a bundled
+/// `xdg-open` earlier in `PATH` cannot win; `gio open` covers hosts that ship
+/// GLib's opener but not `xdg-utils`.
+///
+/// Nothing is waited on, matching what `opener` does here: `xdg-open` may
+/// `exec` the player it picked, so waiting would block Open and Preview until
+/// the user quit VLC.
+#[cfg(any(target_os = "linux", test))]
+fn spawn_linux_host_open(target: &std::ffi::OsStr) -> io::Result<()> {
+    use std::process::Stdio;
+    let attempts: [(&str, &[&str]); 4] = [
+        ("/usr/bin/xdg-open", &[]),
+        ("xdg-open", &[]),
+        ("/usr/bin/gio", &["open"]),
+        ("gio", &["open"]),
+    ];
+    for (program, leading_args) in attempts {
+        let mut cmd = std::process::Command::new(program);
+        apply_host_desktop_env(&mut cmd);
+        cmd.args(leading_args)
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
+    }
+    // `opener` carries its own copy of the `xdg-open` script for hosts that
+    // have none, and knows to reach for `wslview` under WSL — both of which the
+    // attempts above give up on. It runs with our environment, which is why it
+    // is the last resort rather than the first choice.
+    opener::open(target).map_err(|e| io::Error::other(e.to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -2048,19 +2247,18 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     for command in ["nautilus", "dolphin", "nemo"] {
-        if std::process::Command::new(command)
-            .arg("--select")
-            .arg(path)
-            .spawn()
-            .is_ok()
-        {
+        let mut cmd = std::process::Command::new(command);
+        apply_host_desktop_env(&mut cmd);
+        if cmd.arg("--select").arg(path).spawn().is_ok() {
             return Ok(());
         }
     }
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target has no parent directory"))?;
-    std::process::Command::new("xdg-open").arg(parent).spawn()?;
+    let mut cmd = std::process::Command::new("xdg-open");
+    apply_host_desktop_env(&mut cmd);
+    cmd.arg(parent).spawn()?;
     Ok(())
 }
 
@@ -2156,6 +2354,86 @@ mod tests {
             strip_extended_path_prefix(r"\\server\share\file.txt"),
             r"\\server\share\file.txt"
         );
+    }
+
+    #[test]
+    fn strip_colon_prefix_entries_drops_the_appdir_tree() {
+        let appdir = Path::new("/tmp/Ember.AppDir");
+        let value = std::ffi::OsString::from(
+            "/tmp/Ember.AppDir/usr/bin:/usr/bin:/tmp/Ember.AppDir/usr/lib:/usr/local/bin",
+        );
+        assert_eq!(
+            strip_colon_prefix_entries(&value, appdir).to_string_lossy(),
+            "/usr/bin:/usr/local/bin"
+        );
+        // Component-wise, so a sibling directory whose name merely starts with
+        // the AppDir's is not mistaken for part of the bundle.
+        let neighbour = std::ffi::OsString::from("/tmp/Ember.AppDirOld/usr/bin");
+        assert_eq!(
+            strip_colon_prefix_entries(&neighbour, appdir).to_string_lossy(),
+            "/tmp/Ember.AppDirOld/usr/bin"
+        );
+    }
+
+    /// The rule that keeps this from breaking the launched application: a
+    /// variable the *session* set is none of our business, and one the bundle
+    /// filled entirely has to go away rather than be handed over empty — an
+    /// empty `GST_PLUGIN_SYSTEM_PATH_1_0` means "no plugins", not "the
+    /// defaults".
+    #[test]
+    fn host_env_action_only_subtracts_what_the_bundle_added() {
+        let appdir = Path::new("/tmp/Ember.AppDir");
+
+        assert_eq!(
+            host_env_action(std::ffi::OsStr::new("ibus"), appdir, None),
+            HostEnvAction::Leave
+        );
+        assert_eq!(
+            host_env_action(std::ffi::OsStr::new("/usr/lib/x86_64-linux-gnu"), appdir, None),
+            HostEnvAction::Leave
+        );
+        assert_eq!(
+            host_env_action(
+                std::ffi::OsStr::new("/tmp/Ember.AppDir/usr/lib:/usr/lib"),
+                appdir,
+                None
+            ),
+            HostEnvAction::Set(std::ffi::OsString::from("/usr/lib"))
+        );
+        assert_eq!(
+            host_env_action(
+                std::ffi::OsStr::new("/tmp/Ember.AppDir/usr/lib/gstreamer-1.0"),
+                appdir,
+                None
+            ),
+            HostEnvAction::Remove
+        );
+        // PATH and XDG_DATA_DIRS carry a fallback, because a child with neither
+        // cannot find the host's programs or its `.desktop` files.
+        assert_eq!(
+            host_env_action(
+                std::ffi::OsStr::new("/tmp/Ember.AppDir/usr/bin"),
+                appdir,
+                Some("/usr/bin")
+            ),
+            HostEnvAction::Set(std::ffi::OsString::from("/usr/bin"))
+        );
+    }
+
+    #[test]
+    fn host_desktop_env_is_callable_without_appimage_vars() {
+        let mut cmd = std::process::Command::new("true");
+        apply_host_desktop_env(&mut cmd);
+    }
+
+    /// The Linux launch path cannot be compiled on Windows, where this is
+    /// normally developed, so it is `cfg`-visible to tests purely so that
+    /// `cargo test` type checks its body. Referencing it is the whole point —
+    /// calling it would hand a file to the developer's own desktop.
+    #[test]
+    fn the_host_open_path_type_checks_off_linux() {
+        let launcher: fn(&std::ffi::OsStr) -> io::Result<()> = spawn_linux_host_open;
+        let _ = launcher;
     }
 
     /// Both orderings are asserted because the predicate is symmetric as
