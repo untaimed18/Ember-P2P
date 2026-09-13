@@ -36,7 +36,7 @@
     incomingCollection,
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
-  import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
+  import { toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
@@ -414,7 +414,6 @@
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
   let missingScanInFlight = $state(false);
-  let missingScanDone = $state(false);
   // `scanMissingFiles` stats every shared file on disk, so it must not run on
   // every data refresh — and `refresh()` itself fires every 3s while hashing.
   // Throttle background scans to once per interval; user-initiated paths pass
@@ -440,7 +439,6 @@
       missingPathSet = new Set(result.paths);
       missingScanTruncated = result.truncated;
       missingTotalCount = result.totalMissing;
-      missingScanDone = true;
       missingScanFailToasted = false;
       // Apply a deferred persisted "missing only" filter now that we know
       // whether any files are actually missing — only enable it if so.
@@ -889,7 +887,22 @@
     error = null;
     try {
       const selected = await addSharedFolder();
-      if (!mounted || selected.length === 0) return;
+      if (!mounted) return;
+      // The OS folder dialog shows a plain tree with no way to mark what is
+      // already shared, so picking a folder that was already in the list used
+      // to look exactly like adding one: a scanning banner, then nothing new.
+      // Say so instead — it is the only chance the user gets to find out.
+      if (selected.already_shared.length === 1) {
+        const path = selected.already_shared[0];
+        toastInfo(m.library_folder_already_shared({
+          name: path.split(/[\\/]/).filter(Boolean).pop() || path,
+        }));
+      } else if (selected.already_shared.length > 1) {
+        toastInfo(m.library_folders_already_shared({
+          count: selected.already_shared.length.toLocaleString(),
+        }));
+      }
+      if (selected.added.length === 0) return;
       stoppedByUser = false;
       scanning = true;
       scanTruncated = false;

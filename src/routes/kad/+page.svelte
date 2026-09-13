@@ -18,6 +18,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
   import { inertBackground } from '$lib/a11y';
+  import { copyToClipboard } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
 
@@ -356,10 +357,13 @@
   }
 
   async function copyText(text: string, label?: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+    // `copyToClipboard`, not `navigator.clipboard` directly: the webview API
+    // needs a live user activation and is refused outright on some platforms,
+    // so this reported the clipboard as unavailable where the OS clipboard was
+    // perfectly writable.
+    if (await copyToClipboard(text)) {
       toastInfo(label ?? m.common_copied());
-    } catch {
+    } else {
       toastError(m.kad_clipboard_unavailable());
     }
   }
@@ -442,6 +446,7 @@
       case 'Keyword Search': return m.kad_search_name_keyword();
       case 'Source Search': return m.kad_search_name_source();
       case 'Find Buddy': return m.kad_search_name_buddy();
+      case 'Ember Rendezvous': return m.kad_search_name_rendezvous();
       default: return name;
     }
   }

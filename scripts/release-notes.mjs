@@ -27,6 +27,9 @@ const ENTITIES = new Map([
   ["&rdquo;", "\u201d"],
   ["&mdash;", "\u2014"],
   ["&ndash;", "\u2013"],
+  // Not decorative: the Linux zoom note writes "Ctrl&minus;", which reached
+  // both the release body and the updater's notes field as that literal text.
+  ["&minus;", "\u2212"],
   ["&hellip;", "\u2026"],
   ["&nbsp;", " "],
   ["&quot;", '"'],

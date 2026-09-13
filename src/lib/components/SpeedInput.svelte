@@ -12,9 +12,21 @@
   let {
     value = $bindable(0),
     label = '',
+    idScope = '',
   }: {
     value: number;
     label?: string;
+    /**
+     * Disambiguates the generated element id when several of these share a
+     * label on one page.
+     *
+     * The id is derived from `label`, which is fine while there is one upload
+     * and one download field per page — but the bandwidth schedule renders a
+     * pair per rule with the same two labels. Duplicate ids make every
+     * `<label for>` point at the first match, so clicking a rule's caption
+     * focuses the manual limit at the top of the card instead.
+     */
+    idScope?: string;
   } = $props();
 
   let unit: Unit = $state('KB/s');
@@ -38,7 +50,13 @@
   // no longer matched the setting underneath it.
   let lastSyncedValue = -1;
   const inputId = $derived(
-    `speed-input-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'limit'}`,
+    [
+      'speed-input',
+      idScope.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+      label.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'limit',
+    ]
+      .filter(Boolean)
+      .join('-'),
   );
 
   function syncFromBytes(bytes: number) {

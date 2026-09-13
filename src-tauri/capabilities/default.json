@@ -1,12 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "default",
-  "description": "Default capability for the main window",
+  "description": "Default capability for the main window. Deliberately minimal: this grants the webview IPC access to plugin commands, and every dialog in Ember is opened from Rust through `DialogExt`, which does not go through this ACL. `dialog:allow-open` and `dialog:allow-save` were removed with the `@tauri-apps/plugin-dialog` JS binding that never called them - a file picker the renderer can reach is worth having only if something reaches it.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:allow-open",
-    "dialog:allow-save",
     "core:window:allow-set-theme",
     "process:allow-restart"
   ]

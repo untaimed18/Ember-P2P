@@ -2,9 +2,19 @@ import { invoke } from '@tauri-apps/api/core';
 import { withTimeout } from '$lib/utils';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
-/** Open the backend-owned native picker and add every selected folder.
- *  Returns the folders actually added, which is empty when the user cancels. */
-export async function addSharedFolder(): Promise<string[]> {
+/** Result of one trip through the folder picker. Both lists are empty when the
+ *  user cancels. */
+export interface SharedFolderPick {
+  /** Folders this selection newly shared; a scan is running for each. */
+  added: string[];
+  /** Folders the user picked that were already shared. Reported separately
+   *  because the picker is the OS dialog and cannot mark them in the tree, so
+   *  this is the user's only indication. */
+  already_shared: string[];
+}
+
+/** Open the backend-owned native picker and add every selected folder. */
+export async function addSharedFolder(): Promise<SharedFolderPick> {
   return invoke('pick_shared_folder');
 }
 

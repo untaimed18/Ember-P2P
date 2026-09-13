@@ -228,6 +228,16 @@ pub struct RecvState {
     pub part_path: PathBuf,
     /// Where the finished file is moved to.
     pub final_path: PathBuf,
+    /// The approved download root both of the above must stay inside.
+    ///
+    /// Carried so completion can re-verify rather than renaming by pathname:
+    /// the `.part` name is derived from a wire-supplied `xfer_id`, so the paths
+    /// here are partly peer-chosen, and the download root's approval can be
+    /// revoked between the offer and the last block.
+    pub download_root: PathBuf,
+    /// What the `.part` was when it was opened, so a swap underneath the
+    /// transfer is refused at completion instead of moved into place.
+    pub part_identity: crate::security::filesystem::ObjectIdentity,
     /// Buffered so a window's worth of blocks costs one write syscall instead
     /// of one each. Blocks are 1008 bytes and arrive at up to
     /// `XFER_BLOCKS_OUT_PER_SEC` across `XFER_MAX_ACTIVE` transfers, and this
@@ -261,6 +271,8 @@ impl RecvState {
         root: [u8; 32],
         part_path: PathBuf,
         final_path: PathBuf,
+        download_root: PathBuf,
+        part_identity: crate::security::filesystem::ObjectIdentity,
         file: std::fs::File,
     ) -> Self {
         let total_blocks = xfer_block_count(size);
@@ -274,6 +286,8 @@ impl RecvState {
             root,
             part_path,
             final_path,
+            download_root,
+            part_identity,
             file: std::io::BufWriter::with_capacity(
                 XFER_WINDOW_BLOCKS * XFER_BLOCK_SIZE,
                 file,
@@ -468,6 +482,8 @@ mod tests {
             .truncate(true)
             .open(&part)
             .unwrap();
+        let part_identity =
+            crate::security::filesystem::object_identity_from_file(&file).unwrap();
         let state = RecvState::new(
             [1u8; 16],
             [2u8; 32],
@@ -475,8 +491,10 @@ mod tests {
             "x.bin".into(),
             size,
             [0u8; 32],
-            part,
+            part.clone(),
             dir.join("x.bin"),
+            dir.clone(),
+            part_identity,
             file,
         );
         (state, TempDir(dir))

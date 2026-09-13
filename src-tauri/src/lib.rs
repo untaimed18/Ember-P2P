@@ -22,10 +22,12 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+mod background;
 mod bandwidth;
 mod commands;
 mod geoip;
 mod network;
+mod power;
 mod search;
 pub mod security;
 mod sharing;
@@ -494,6 +496,7 @@ pub fn run() {
         .manage(commands::updater::UpdaterService::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -824,6 +827,11 @@ pub fn run() {
                 }
                 commands::backup::sweep_orphaned_scratch(&data_dir);
             }
+            // The same reclaim for `%TEMP%/Ember`, which the backup sweep above
+            // never looks at: previews land there and are only cleaned up by a
+            // clean shutdown, so a crash leaves up to 64 MiB apiece behind
+            // indefinitely.
+            security::filesystem::sweep_orphaned_temp_dirs();
 
             // Allow WebView media playback for files under shared/download dirs.
             commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
@@ -876,7 +884,21 @@ pub fn run() {
                     settings.close_to_tray_behavior.clone(),
                 )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
+                runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
             });
+
+            // Seed the schedule/sleep snapshot and apply whatever bandwidth
+            // window is open *before* the first background tick, so a profile
+            // whose overnight rule is in force does not spend its first second
+            // running at the daytime cap — and so Settings, which can be opened
+            // inside that second, does not report "no schedule" while one
+            // applies.
+            {
+                let state = app.state::<AppState>();
+                background::seed_status(&state, &settings);
+                background::apply_effective_limits(&app_handle, &state, &settings);
+            }
+            background::spawn(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -958,7 +980,7 @@ pub fn run() {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing default window icon for tray"))?;
 
-            let _tray = TrayIconBuilder::with_id("main")
+            let tray_result = TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .tooltip("Ember")
                 .menu(&tray_menu)
@@ -1003,7 +1025,22 @@ pub fn run() {
                         }
                     }
                 })
-                .build(app)?;
+                .build(app);
+            if let Err(e) = tray_result {
+                // No session bus / AppIndicator host (WSL, some live sessions,
+                // GNOME without the extension). Failing `setup` here would
+                // never show a window.
+                #[cfg(target_os = "linux")]
+                {
+                    tracing::warn!(
+                        "System tray unavailable ({e}); close-to-tray will not have an icon"
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(e.into());
+                }
+            }
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
@@ -1699,8 +1736,39 @@ pub fn run() {
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
+            // Same containment as the network task above, and for the same
+            // reason: the release profile enables `overflow-checks`, so
+            // arithmetic reachable from a configured limit or a peer-fed RTT
+            // sample panics rather than wrapping. Uncontained, that panic drops
+            // `RefillAliveGuard`, which flips `refill_alive` so every
+            // `acquire_upload`/`acquire_download` caller aborts its transfer —
+            // the whole session's rate-limited traffic, with nothing in the UI
+            // to explain it. The guard still does its job here; this just adds
+            // the log line and the user-facing notice that were missing.
+            let refill_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown_spawn, bw_rtt, bw_uss_flag).await;
+                let outcome = std::panic::AssertUnwindSafe(bandwidth::limiter::start_token_refill(
+                    bw_limiter,
+                    bw_shutdown_spawn,
+                    bw_rtt,
+                    bw_uss_flag,
+                ))
+                .catch_unwind()
+                .await;
+                if outcome.is_err() {
+                    // Payload withheld for the same reason as the network task.
+                    tracing::error!(
+                        "Token refill task panicked; rate-limited transfers are stopped until restart"
+                    );
+                    let _ = refill_handle.emit(
+                        "network-fatal-error",
+                        crate::commands::errors::coded(
+                            "bandwidth_refill_panicked",
+                            "Bandwidth limiting stopped unexpectedly. \
+                             Restart Ember to resume limited transfers; see logs for details.",
+                        ),
+                    );
+                }
             });
 
             info!("Ember P2P application started");
@@ -1836,12 +1904,10 @@ pub fn run() {
             commands::peers::get_peer_reputation_batch,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
-            commands::peers::ember_ping_peer,
             commands::peers::get_ember_dht_contacts,
             commands::peers::get_ember_dht_searches,
             commands::peers::get_ember_dht_store,
             $($harness,)*
-            commands::peers::ember_request_sources,
             commands::channels::list_channels,
             commands::channels::create_channel,
             commands::channels::join_channel,
@@ -1930,6 +1996,10 @@ pub fn run() {
             commands::collections::download_collection_files,
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
+            commands::system::show_notification,
+            commands::system::get_runtime_status,
+            commands::system::read_clipboard_text,
+            commands::system::write_clipboard_text,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,
@@ -1941,9 +2011,17 @@ pub fn run() {
                     ]
                 };
             }
+            // Harness-only commands, reachable by hand from devtools and never
+            // called by the UI. They dial arbitrary peers and ask them for
+            // sources, so a release build has no reason to carry them as
+            // callable IPC. `ember_ping_peer` and `ember_request_sources` were
+            // registered unconditionally while the rest of this list was
+            // already gated; that was an oversight rather than a decision.
             #[cfg(debug_assertions)]
             {
                 ember_invoke_handler![
+                    commands::peers::ember_ping_peer,
+                    commands::peers::ember_request_sources,
                     commands::peers::add_ember_dht_contact,
                     commands::peers::ember_dht_ping_peer,
                     commands::peers::ember_dht_find_node,

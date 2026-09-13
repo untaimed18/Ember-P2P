@@ -1,9 +1,12 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { Transfer } from '$lib/types';
 import { getTransfers } from '$lib/api/transfers';
-import { withTimeout } from '$lib/utils';
+import { formatBytes, withTimeout } from '$lib/utils';
+import { notify, shouldNotify } from '$lib/notifications';
+import { transferFailureReasonText } from '$lib/i18n';
+import * as m from '$lib/paraglide/messages';
 
 interface ProgressPayload {
   id: string;
@@ -52,7 +55,19 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   // active/searching/queued in STATUS_PRIORITY, so the poll merge kept
   // preferring the stale stored value over the live status the backend now
   // reports after the user resumed.
-  if (eventStatus === 'paused' || eventStatus === 'stopped' || eventStatus === 'insufficient') {
+  // `noneneeded` and `hashing` have the same shape as the three above — both
+  // out-rank `active`/`queued`/`searching` in the table while being reversible
+  // side-states, so a stored row in either would pin itself against a fresher
+  // API status. Not reachable today (nothing emits them on a live transition,
+  // only on DB restore), which is exactly why they belong here now rather than
+  // after someone makes them reachable.
+  if (
+    eventStatus === 'paused' ||
+    eventStatus === 'stopped' ||
+    eventStatus === 'insufficient' ||
+    eventStatus === 'noneneeded' ||
+    eventStatus === 'hashing'
+  ) {
     return false;
   }
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
@@ -65,13 +80,63 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
  * API snapshot (read live from the transfer manager) still carries a positive
  * rate — and vice-versa — so the higher value is the freshest truth.
  */
+/** Statuses that are definitionally not moving bytes, so their displayed rate
+ *  must read zero rather than whatever the last progress event left behind.
+ *
+ *  `insufficient` and `noneneeded` belong here and were missing from all three
+ *  of the lists that model this. The backend does its part — `refresh_health`
+ *  zeroes `transfer.speed` and emits `transfer-speed-decay` — but the row was
+ *  absent from `SPEED_DECAY_APPLIES` so the decay was dropped, and `mergeSpeed`
+ *  then re-maxed the stale value against the poll's 0 forever. A download that
+ *  filled the disk went on showing its last rate indefinitely, counted itself
+ *  into the "Active" chip via `displaySpeed(t) > 0`, and rendered a
+ *  counting-down ETA for a transfer that had stopped.
+ *
+ *  Deliberately excludes `searching` / `verifying` / `hashing` / `completing`:
+ *  those are in `SPEED_DECAY_APPLIES` so the backend fades their rate towards
+ *  zero, and the row is meant to show that fade. */
+export const IDLE_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'completed',
+  'failed',
+  'stopped',
+  'paused',
+  'insufficient',
+  'noneneeded',
+]);
+
+/**
+ * Reconcile the three health-detail fields, letting an explicit backend clear
+ * win over a stale event value.
+ *
+ * These are `#[serde(default)]` with no `skip_serializing_if` on the Rust side,
+ * so the snapshot carries them as `null` — not as absent keys. A plain
+ * `apiItem.health_reason ?? eventItem.health_reason` therefore fell through to
+ * the stored event value in exactly the case the backend had *cleared* it,
+ * which is the opposite of what "prefer API health" intends. A download that
+ * went degraded and then recovered while already `active` (so no
+ * `transfer-status` event fires and `HEALTH_RESET_STATUSES` never applies) had
+ * its `health` corrected to `healthy` while the tooltip went on reading
+ * "connected but not receiving data" at full speed.
+ */
+function mergeHealthDetail(
+  apiItem: Transfer,
+  eventItem: Transfer,
+): Pick<Transfer, 'health_reason' | 'health_code' | 'stalled_since'> {
+  const pick = <K extends 'health_reason' | 'health_code' | 'stalled_since'>(
+    key: K,
+  ): Transfer[K] =>
+    key in apiItem && apiItem[key] === null
+      ? undefined
+      : ((apiItem[key] ?? eventItem[key]) as Transfer[K]);
+  return {
+    health_reason: pick('health_reason'),
+    health_code: pick('health_code'),
+    stalled_since: pick('stalled_since'),
+  };
+}
+
 function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): number {
-  if (
-    status === 'completed' ||
-    status === 'failed' ||
-    status === 'stopped' ||
-    status === 'paused'
-  ) {
+  if (IDLE_STATUSES.has(status as Transfer['status'])) {
     return 0;
   }
   return Math.max(apiSpeed ?? 0, eventSpeed ?? 0);
@@ -199,6 +264,12 @@ const SPEED_DECAY_APPLIES: ReadonlySet<Transfer['status']> = new Set<Transfer['s
   'verifying',
   'completing',
   'hashing',
+  // Accept the decay for these two as well. The backend zeroes their speed and
+  // emits the event; dropping it left the stored row carrying a stale rate.
+  // `IDLE_STATUSES` makes the *displayed* value 0 regardless, but the stored
+  // field feeds other readers, so let the authoritative 0 land.
+  'insufficient',
+  'noneneeded',
 ]);
 
 /** Statuses that should NOT accept `transfer-progress` payloads. Hoisted to
@@ -458,6 +529,78 @@ function flushProgress() {
   }
 }
 
+/**
+ * Transfer ids whose terminal outcome has already been announced.
+ *
+ * The backend can re-emit a terminal event for a row it has already finished,
+ * and the store's own D30 guard only stops that from *changing* the row — it
+ * does not stop a second notification. Keying on the id rather than on the
+ * row's status handles the reverse race too: if the reconciling poll marks the
+ * row `completed` a few milliseconds before the event is delivered, a
+ * status-based check would swallow the one notification the user wanted.
+ *
+ * Cleared per id by {@link forgetTransfer}, so a row that is removed and
+ * re-added (a re-download of the same file) can announce again.
+ */
+const announcedTerminal = new Set<string>();
+
+/**
+ * The download row a terminal event refers to, or `null` when the event is not
+ * about a download worth telling the user about.
+ *
+ * Uploads are excluded on purpose: an upload session ends every time a peer
+ * disconnects, dozens of times an hour on a well-seeded library, and none of
+ * those endings is news. The direction comes from the event when the backend
+ * sent one and from the stored row otherwise, exactly as the listeners do.
+ */
+function finishedDownloadRow(id: string, direction?: string): Transfer | null {
+  if (announcedTerminal.has(id)) return null;
+  const existing = get(transfers).find((t) => t.id === id);
+  const isUpload = direction === 'upload' || existing?.direction === 'upload';
+  if (isUpload || !existing) return null;
+  // Claimed only once the row is one we would actually announce, so an event
+  // that arrives before the row exists does not burn the id.
+  announcedTerminal.add(id);
+  return existing;
+}
+
+/** Announce a finished download. */
+function notifyDownloadFinished(id: string, direction?: string): void {
+  if (!shouldNotify('download_complete')) return;
+  const row = finishedDownloadRow(id, direction);
+  if (!row) return;
+  void notify(
+    'download_complete',
+    m.notify_download_complete_title(),
+    m.notify_download_complete_body({
+      name: row.file_name,
+      size: formatBytes(row.total_size),
+    }),
+  );
+}
+
+/** Announce a failed download, unless the user is the one who stopped it. */
+function notifyDownloadFailed(
+  id: string,
+  direction: string | undefined,
+  error: string | undefined,
+  failureCode: string | undefined,
+): void {
+  // A cancel is a user action with its own visible outcome — the row leaves the
+  // list — so reporting it back as a failure would be telling someone what they
+  // just did.
+  if (failureCode === 'cancelled') return;
+  if (!shouldNotify('download_failed')) return;
+  const row = finishedDownloadRow(id, direction);
+  if (!row) return;
+  const reason = transferFailureReasonText(error, failureCode);
+  void notify(
+    'download_failed',
+    m.notify_download_failed_title({ name: row.file_name }),
+    reason,
+  );
+}
+
 export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
@@ -533,6 +676,11 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
       const { id, direction, ember_verified } = event.payload;
+      // Read the row before the update rather than inside it: a store updater
+      // must stay a pure function of its input, and the download branch below
+      // is unreachable for uploads (they return early), so there is nowhere
+      // inside to hang this without duplicating the direction check.
+      notifyDownloadFinished(id, direction);
       // Row is terminal from here on — reversible-state tracking no longer
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
@@ -583,6 +731,7 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
+      notifyDownloadFailed(id, direction, error, failure_code);
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
       transfers.update((list) => {
@@ -644,6 +793,15 @@ export async function initTransferStore() {
           health_code,
           stalled_since,
         } = event.payload;
+        // A cancel that did not originate on this page arrives here rather than
+        // on `transfer-failed`, whose handler has the matching branch. Without
+        // it the row landed in Completed/Failed as a red "Cancelled" entry — the
+        // exact outcome that handler's comment says user cancels must avoid.
+        if (failure_code === 'cancelled') {
+          forgetTransfer(id);
+          transfers.update((list) => list.filter((t) => t.id !== id));
+          return;
+        }
         transfers.update((list) =>
           list.map((t) => {
             if (t.id !== id) return t;
@@ -862,9 +1020,7 @@ export async function initTransferStore() {
             // Prefer API health: events often omit/stale-carry `health`, and a
             // prior `degraded` on the event row would otherwise stick forever.
             health: apiItem.health ?? eventItem.health,
-            health_reason: apiItem.health_reason ?? eventItem.health_reason,
-            health_code: apiItem.health_code ?? eventItem.health_code,
-            stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
+            ...mergeHealthDetail(apiItem, eventItem),
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_code: eventItem.failure_code ?? apiItem.failure_code,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
@@ -946,6 +1102,7 @@ export function forgetTransfer(id: string) {
   missingFromApiSince.delete(id);
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
+  announcedTerminal.delete(id);
 }
 
 export function cleanupTransferStore() {
@@ -972,6 +1129,7 @@ export function cleanupTransferStore() {
   sourceCountsUpdatedAt.clear();
   lastApiCompleted.clear();
   progressRewindHold.clear();
+  announcedTerminal.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {
@@ -1142,9 +1300,7 @@ export function startTransferPoll() {
               speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
               // Prefer API health over a possibly-stale event value.
               health: apiItem.health ?? eventItem.health,
-              health_reason: apiItem.health_reason ?? eventItem.health_reason,
-              health_code: apiItem.health_code ?? eventItem.health_code,
-              stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
+              ...mergeHealthDetail(apiItem, eventItem),
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_code: eventItem.failure_code ?? apiItem.failure_code,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,

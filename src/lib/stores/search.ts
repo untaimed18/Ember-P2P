@@ -65,10 +65,6 @@ export function newSearchNonce(): number {
   return searchNonce;
 }
 
-export function currentSearchNonce(): number {
-  return searchNonce;
-}
-
 function newTabId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -597,7 +593,16 @@ function spamSettingsKey(
  *  user mark/unmark overrides so an explicit classification is not overwritten. */
 async function rescoreOpenTabs() {
   const tabs = get(searchTabs);
-  for (const tab of tabs) {
+  // Active tab first, so the one the user is looking at is corrected before the
+  // work for up to nineteen others they cannot see. Each call is a full re-pass
+  // over that tab's results against every learned spam name, so fanning all of
+  // them out at once was the heaviest thing a single settings change could ask
+  // the backend to do.
+  const activeId = get(activeSearchTabId);
+  const ordered = [...tabs].sort((a, b) =>
+    a.id === activeId ? -1 : b.id === activeId ? 1 : 0,
+  );
+  for (const tab of ordered) {
     if (tab.results.length === 0) continue;
     const tabId = tab.id;
     try {

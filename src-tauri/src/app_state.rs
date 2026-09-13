@@ -192,6 +192,16 @@ pub struct AppState {
     /// is used because the single-instance callback runs on the OS event
     /// thread (no async context) and pushes into it directly.
     pub pending_deep_links: Arc<parking_lot::Mutex<Vec<PendingDeepLink>>>,
+    /// Latest snapshot of the state that changes without anybody pressing
+    /// anything: which bandwidth-schedule window is open and whether a sleep
+    /// inhibitor is held. Written by the background monitor
+    /// ([`crate::background`]), which also emits `ember:runtime-status` on
+    /// change; cached here so `get_runtime_status` can answer a first paint
+    /// that happens between two of those events.
+    ///
+    /// Synchronous `parking_lot` because both writer and readers only ever
+    /// swap a small value and never await while holding it.
+    pub runtime_status: Arc<parking_lot::RwLock<crate::types::RuntimeStatus>>,
 }
 
 impl AppState {

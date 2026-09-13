@@ -1,3 +1,6 @@
+// Only the `debug_assertions` harness commands below build an address from
+// parts; everything production reaches goes through the network task.
+#[cfg(debug_assertions)]
 use std::net::{IpAddr, SocketAddr};
 
 use crate::app_state::AppState;
@@ -15,7 +18,8 @@ use crate::types::*;
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
-/// transport could not deliver it.
+/// transport could not deliver it. Gated with that command.
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberPingResult {
     pub success: bool,
@@ -43,8 +47,13 @@ pub struct EmberDhtFindResult {
 /// Default round-trip timeout in milliseconds for `ember_ping_peer`.
 /// Matches what the harness defaults the TS side to; explicit value
 /// here so the backend has a sane bound even if the caller omits it.
+/// Read only by the `debug_assertions` harness commands, so compiled out of
+/// release with them.
+#[cfg(debug_assertions)]
 const DEFAULT_EMBER_PING_TIMEOUT_MS: u64 = 5_000;
+#[cfg(debug_assertions)]
 const MIN_EMBER_PING_TIMEOUT_MS: u64 = 100;
+#[cfg(debug_assertions)]
 const MAX_EMBER_PING_TIMEOUT_MS: u64 = 60_000;
 
 /// Default timeout for an iterative lookup — longer than a single-hop
@@ -1777,6 +1786,12 @@ pub async fn get_ember_diagnostics(
 /// `peer_ip` is parsed as an IPv4 / IPv6 literal — DNS is
 /// intentionally not resolved here, since the harness deals in
 /// `127.0.0.1` and explicit addresses only.
+///
+/// Registered only under `debug_assertions`, so the definition is gated too —
+/// its `ember_dht_*` siblings already were, and leaving these two ungated left
+/// them (and everything only they call) compiled into release builds as
+/// unreachable code.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_ping_peer(
     state: tauri::State<'_, AppState>,
@@ -1878,6 +1893,9 @@ pub async fn ember_ping_peer(
 /// Pubkey resolution mirrors [`ember_ping_peer`]: an explicit
 /// `peer_pubkey_hex` wins, otherwise the KAD-fed Noise-key cache is
 /// consulted. `peer_ip` is parsed as an IP literal (no DNS).
+///
+/// `debug_assertions`-only for the same reason as [`ember_ping_peer`].
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_request_sources(
     state: tauri::State<'_, AppState>,
@@ -1930,6 +1948,9 @@ pub async fn ember_request_sources(
 }
 
 /// Parse a 64-char hex string into a 32-byte key (Ed25519 / X25519).
+/// Only the harness commands take a key as a hex argument, so this is
+/// compiled out of release builds with them.
+#[cfg(debug_assertions)]
 fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| {
         coded_ctx(
@@ -1953,10 +1974,17 @@ fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
 /// Local multi-node harnesses intentionally target loopback/LAN peers, but a
 /// production webview must not be able to turn a diagnostic IPC command into
 /// an outbound probe of private or special-use infrastructure.
+///
+/// These three are reachable only from the harness commands, all of which are
+/// `debug_assertions`-only, so they are gated with them. The guard is not
+/// thereby weakened: the only callers it ever protected are the commands a
+/// release build no longer has.
+#[cfg(debug_assertions)]
 fn ember_harness_mode() -> bool {
     cfg!(debug_assertions) || std::env::var_os("EMBER_HARNESS").is_some()
 }
 
+#[cfg(debug_assertions)]
 fn require_public_ember_peer_ip_for_mode(
     ip: IpAddr,
     harness_mode: bool,
@@ -1968,6 +1996,7 @@ fn require_public_ember_peer_ip_for_mode(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 fn require_public_ember_peer_ip(ip: IpAddr, message: &'static str) -> Result<(), String> {
     require_public_ember_peer_ip_for_mode(ip, ember_harness_mode(), message)
 }

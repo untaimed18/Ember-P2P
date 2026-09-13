@@ -406,6 +406,34 @@ pub enum SourceStatus {
     Unreachable,
 }
 
+impl SourceStatus {
+    /// The exact wire string this variant serializes to, and the closed
+    /// vocabulary the frontend's `SourceInfo['status']` union enumerates.
+    ///
+    /// `transfer-source-detail` events used to carry the raw status string the
+    /// download worker produced, while the `list_transfer_sources` snapshot
+    /// carried this normalized enum. Worker-only strings therefore reached the
+    /// UI, which has no case for them and rendered "Unknown" — and on the next
+    /// snapshot the same row came back as `Failed` via the normalizer's
+    /// catch-all, which the drawer *deletes*. Emitting this keeps both paths on
+    /// one vocabulary.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::WaitCallback => "wait_callback",
+            Self::Queued => "queued",
+            Self::QueueFull => "queue_full",
+            Self::NoNeededParts => "no_needed_parts",
+            Self::Stalled => "stalled",
+            Self::Transferring => "transferring",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::FriendConnect => "friend_connect",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
 /// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
 /// optional because a remote node only fills the ones it knows. Grouped into a
 /// single optional struct so a hit with no media info serializes to nothing.
@@ -1538,6 +1566,88 @@ pub struct AppSettings {
     /// already lives there with no backend involvement.
     #[serde(default = "default_update_check_frequency")]
     pub update_check_frequency: String,
+
+    /// Master switch for desktop notifications. Off means Ember never asks the
+    /// OS to show anything, whatever the per-event switches below say.
+    ///
+    /// Defaults on, because it pairs with
+    /// [`notifications_only_when_unfocused`], which also defaults on — so an
+    /// existing profile upgrading into this gains notifications only for the
+    /// moments it was previously silent, not a stream of them while the user
+    /// is looking at the window.
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+    /// Only notify while Ember is not the focused window (including hidden to
+    /// tray). Turn off to be told regardless of what is on screen.
+    #[serde(default = "default_true")]
+    pub notifications_only_when_unfocused: bool,
+    /// A download finished and verified.
+    #[serde(default = "default_true")]
+    pub notify_download_complete: bool,
+    /// A download failed for a reason that is not the user cancelling it.
+    #[serde(default = "default_true")]
+    pub notify_download_failed: bool,
+    /// A mutual friend came online.
+    #[serde(default = "default_true")]
+    pub notify_friend_online: bool,
+    /// A friend sent a chat message, or offered a file.
+    #[serde(default = "default_true")]
+    pub notify_friend_message: bool,
+    /// Somebody asked to be friends.
+    #[serde(default = "default_true")]
+    pub notify_friend_request: bool,
+    /// A message arrived in a joined channel.
+    ///
+    /// The only one of these that defaults **off**: a room is a group
+    /// conversation that can carry hundreds of messages an hour, and the
+    /// per-room mute in Settings → Channels is a poor substitute for never
+    /// having opted in. Muted rooms and ignored members are excluded either
+    /// way.
+    #[serde(default)]
+    pub notify_channel_message: bool,
+
+    /// Hold a system sleep inhibitor while a transfer is actually working, so
+    /// an overnight download is not cut off by the OS idle timer. The display
+    /// is left alone — only sleep is deferred, and only while there is work.
+    ///
+    /// Honored on Windows; see [`crate::power::supported`]. The Settings
+    /// toggle is disabled where no inhibitor exists rather than offering a
+    /// switch that does nothing.
+    #[serde(default = "default_true")]
+    pub prevent_sleep_while_active: bool,
+
+    /// Apply [`Self::bandwidth_schedule`] instead of using
+    /// [`Self::max_upload_speed`] / [`Self::max_download_speed`] at every hour
+    /// of every day. Off means the rules are stored but never consulted.
+    #[serde(default)]
+    pub bandwidth_schedule_enabled: bool,
+    /// Ordered timetable of clock-driven upload/download caps. The first rule
+    /// whose window is open wins; when none is, the manual limits above apply.
+    /// See [`crate::bandwidth::schedule`].
+    #[serde(default)]
+    pub bandwidth_schedule: Vec<crate::bandwidth::schedule::BandwidthScheduleRule>,
+}
+
+/// Live state of the features that act on their own between saves: the
+/// bandwidth timetable and the sleep inhibitor.
+///
+/// Both change without anybody pressing anything — a window opens at 23:00, a
+/// download finishes at 03:00 — so the UI could not derive either from
+/// settings alone. Cached in `AppState` for first paint and re-emitted as
+/// `ember:runtime-status` whenever it changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RuntimeStatus {
+    /// Caps actually in force, whatever their source. Equal to the manual
+    /// settings unless `schedule` is set.
+    pub effective_upload_speed: u64,
+    pub effective_download_speed: u64,
+    /// The schedule rule in force, or `None` when the manual limits are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<crate::bandwidth::schedule::ActiveScheduleRule>,
+    /// Whether this platform can hold a sleep inhibitor at all.
+    pub sleep_inhibit_supported: bool,
+    /// Whether one is held right now.
+    pub sleep_inhibit_held: bool,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -1941,6 +2051,19 @@ impl Default for AppSettings {
             launch_maximized: false,
             auto_check_updates: true,
             update_check_frequency: default_update_check_frequency(),
+            notifications_enabled: true,
+            notifications_only_when_unfocused: true,
+            notify_download_complete: true,
+            notify_download_failed: true,
+            notify_friend_online: true,
+            notify_friend_message: true,
+            notify_friend_request: true,
+            // See the field docs: a room is chatty enough that this is the one
+            // notification a user has to ask for.
+            notify_channel_message: false,
+            prevent_sleep_while_active: true,
+            bandwidth_schedule_enabled: false,
+            bandwidth_schedule: Vec::new(),
         }
     }
 }
@@ -2008,6 +2131,37 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `as_wire` is what `transfer-source-detail` events carry and what the
+    /// frontend's `SourceInfo['status']` union enumerates, while the
+    /// `list_transfer_sources` snapshot carries the serde rendering of the same
+    /// value. If the two ever disagree the UI silently shows "Unknown" for a
+    /// live source, so pin them to each other rather than trusting them to be
+    /// edited together.
+    #[test]
+    fn source_status_wire_strings_match_their_serialization() {
+        let all = [
+            SourceStatus::Connecting,
+            SourceStatus::WaitCallback,
+            SourceStatus::Queued,
+            SourceStatus::QueueFull,
+            SourceStatus::NoNeededParts,
+            SourceStatus::Stalled,
+            SourceStatus::Transferring,
+            SourceStatus::Completed,
+            SourceStatus::Failed,
+            SourceStatus::FriendConnect,
+            SourceStatus::Unreachable,
+        ];
+        for status in &all {
+            let serialized = serde_json::to_value(status).expect("serializes");
+            assert_eq!(
+                serialized.as_str(),
+                Some(status.as_wire()),
+                "{status:?} serializes to something other than its wire string"
+            );
+        }
+    }
 
     /// A fresh profile can answer "why will this download not finish?" without
     /// being set up first, which is the whole point of shipping the lookup
@@ -2155,5 +2309,112 @@ mod tests {
             !parsed.auto_connect_server,
             "auto_connect_server should default to false when absent from a saved config"
         );
+    }
+
+    /// Generalizes the `auto_connect_server` guard above to every field, so a
+    /// field added later cannot reintroduce the same split. `impl Default` and
+    /// `#[serde(default)]` are two hand-written lists of the same decisions,
+    /// and only one of them runs on an upgrade.
+    ///
+    /// One field is exempt, and deliberately so. A **one-shot migration
+    /// marker** means "has this migration already run against this profile?",
+    /// and the honest answer differs by construction: a fresh install has
+    /// nothing to migrate (`true`), while a config written before the field
+    /// existed has not been migrated yet (`false`). Making those agree would
+    /// either re-run the migration on every new profile or never run it on an
+    /// old one. Any *preference* landing on this list is a bug; only a marker
+    /// belongs here.
+    #[test]
+    fn every_field_defaults_the_same_whether_fresh_or_absent_from_a_saved_config() {
+        const MIGRATION_MARKERS: &[&str] = &["ember_default_on_migrated"];
+
+        let defaults = AppSettings::default();
+        let serialized =
+            serde_json::to_value(&defaults).expect("default settings serialize to an object");
+        let keys: Vec<String> = serialized
+            .as_object()
+            .expect("AppSettings serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let mut checked = 0usize;
+        for key in keys {
+            if MIGRATION_MARKERS.contains(&key.as_str()) {
+                continue;
+            }
+            let mut value = serialized.clone();
+            value
+                .as_object_mut()
+                .expect("still an object")
+                .remove(&key)
+                .expect("key came from this object");
+            // A field with no `#[serde(default)]` is required, and every config
+            // on disk carries it — there is no "absent" case to disagree about,
+            // so skip rather than assert. Only fields that *can* be missing are
+            // exposed to the two-defaults hazard.
+            let Ok(parsed) = serde_json::from_value::<AppSettings>(value) else {
+                continue;
+            };
+            checked += 1;
+            let round_tripped =
+                serde_json::to_value(&parsed).expect("reparsed settings re-serialize");
+            assert_eq!(
+                round_tripped.get(&key),
+                serialized.get(&key),
+                "{key:?} defaults differently for a fresh install than for a config saved \
+                 before the field existed"
+            );
+        }
+        // Guards the loop itself: a change that made every field required (or
+        // broke the serialization) would otherwise leave this passing vacuously.
+        assert!(
+            checked > 30,
+            "expected most settings fields to be optional, only checked {checked}"
+        );
+
+        // And guards the exemption list: a marker that stops diverging (or is
+        // removed) must come off it, or it silently permits a real split under
+        // that name later.
+        for marker in MIGRATION_MARKERS {
+            let mut value = serialized.clone();
+            let object = value.as_object_mut().expect("still an object");
+            assert!(
+                object.remove(*marker).is_some(),
+                "{marker:?} is exempt but no longer exists"
+            );
+            let parsed: AppSettings =
+                serde_json::from_value(value).expect("a marker field must be optional");
+            let round_tripped =
+                serde_json::to_value(&parsed).expect("reparsed settings re-serialize");
+            assert_ne!(
+                round_tripped.get(*marker),
+                serialized.get(*marker),
+                "{marker:?} no longer diverges, so it is an ordinary field — drop the exemption"
+            );
+        }
+    }
+
+    /// The notification defaults are a pair: telling an upgrading user about
+    /// everything is only acceptable because it happens while they are not
+    /// looking at the window. Flipping one without the other turns a quiet
+    /// upgrade into a stream of interruptions.
+    #[test]
+    fn notifications_default_on_but_only_while_unfocused() {
+        let defaults = AppSettings::default();
+        assert!(defaults.notifications_enabled);
+        assert!(defaults.notifications_only_when_unfocused);
+        assert!(
+            !defaults.notify_channel_message,
+            "room chatter must be opt-in"
+        );
+    }
+
+    /// Storing rules is harmless; applying them without being asked is not.
+    #[test]
+    fn the_bandwidth_schedule_starts_empty_and_switched_off() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.bandwidth_schedule_enabled);
+        assert!(defaults.bandwidth_schedule.is_empty());
     }
 }

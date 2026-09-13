@@ -755,8 +755,15 @@ impl AICHRecoveryHashSet {
         };
 
         let start_block = part_index * BLOCKS_PER_FULL_PART;
-        while self.leaf_hashes.len() < start_block + leaves.len() {
-            self.leaf_hashes.push([0u8; 20]);
+        // One `resize`, not a push per leaf. `corrupt_blocks_from_aich_recovery`
+        // builds a fresh hash set per call, so recovering a part near the end of
+        // a large file zero-filled the whole table an element at a time — about
+        // 3.5 million pushes and ~69 MB allocated then discarded at the 593 GiB
+        // ceiling, repeated for every failing part. Purely wasted work; the
+        // leaves still land at the same indices.
+        if self.leaf_hashes.len() < start_block + leaves.len() {
+            self.leaf_hashes
+                .resize(start_block + leaves.len(), [0u8; 20]);
         }
         for (i, hash) in leaves.into_iter().enumerate() {
             self.leaf_hashes[start_block + i] = hash;

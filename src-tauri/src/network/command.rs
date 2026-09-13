@@ -2277,6 +2277,7 @@ async fn handle_command_inner(
             let _ = tx.send(diag);
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberPing {
             addr,
             peer_pubkey,
@@ -2484,6 +2485,7 @@ async fn handle_command_inner(
             let _ = tx.send(entries);
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberExchangeRequest {
             addr,
             peer_pubkey,
@@ -3175,39 +3177,68 @@ async fn handle_command_inner(
                 }
                 // Part files sit beside the ones eD2K downloads use, so a
                 // half-received transfer never appears in the finished folder.
-                let temp_dir = download_folder.join("Temp");
-                let done_dir = download_folder.join("Downloads");
-                let part_path = temp_dir.join(format!("ember-xfer-{}.part", hex::encode(xfer_id)));
-                // Two directory creations and a truncating open, off the
-                // network task. The download folder can be a network share or
-                // a spinning disk behind a virus scanner, where these are
-                // hundreds of milliseconds — and this task also drives UDP
-                // receive, every timer and every IPC snapshot. Nothing else
-                // can touch `state` while we await here (the loop is one task
-                // and this handler holds `&mut`), so the capacity and ban
+                // Through the approved-root layer, exactly as the eD2K download
+                // path does it. This was the one download path in the
+                // application writing with bare `std::fs` — `create_dir_all`,
+                // a truncating `OpenOptions::open`, and later a `rename`, all
+                // by pathname with no root-identity pin and no reparse-point
+                // refusal. The `.part` name is derived from `xfer_id`, which is
+                // decoded straight off the wire, so the path a receive will
+                // write to is chosen by the *sending* peer: a symlink planted
+                // there is followed and truncated, and a junction at
+                // `Downloads` is traversed on completion. `prepare_approved_subdir`
+                // creates handle-relative and refuses a reparse point;
+                // `open_or_create_approved` refuses a path that resolves
+                // outside the approved root. Both also re-pin the root, so a
+                // download folder whose approval has been revoked is refused
+                // here rather than silently written to.
+                //
+                // Off the network task because the download folder can be a
+                // network share or a spinning disk behind a virus scanner,
+                // where these are hundreds of milliseconds — and this task also
+                // drives UDP receive, every timer and every IPC snapshot.
+                // Nothing else can touch `state` while we await (the loop is one
+                // task and this handler holds `&mut`), so the capacity and ban
                 // checks above still hold on the far side.
+                let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
+                let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
                 let prepared = tokio::task::spawn_blocking({
-                    let done_dir = done_dir.clone();
-                    let part_path = part_path.clone();
-                    move || {
-                        std::fs::create_dir_all(&temp_dir)
-                            .and_then(|_| std::fs::create_dir_all(&done_dir))
-                            .and_then(|_| {
-                                std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .write(true)
-                                    .read(true)
-                                    .truncate(true)
-                                    .open(&part_path)
-                            })
+                    let root = download_folder.clone();
+                    let allowed = allowed_roots.clone();
+                    let part_name = part_name.clone();
+                    move || -> std::io::Result<(
+                        std::path::PathBuf,
+                        std::path::PathBuf,
+                        crate::security::filesystem::ObjectIdentity,
+                        std::fs::File,
+                    )> {
+                        let temp_dir = crate::security::filesystem::prepare_approved_subdir(
+                            &root, "Temp", &allowed,
+                        )?;
+                        let done_dir = crate::security::filesystem::prepare_approved_subdir(
+                            &root,
+                            "Downloads",
+                            &allowed,
+                        )?;
+                        let (part_path, file) =
+                            crate::security::filesystem::open_or_create_approved(
+                                &temp_dir.join(part_name),
+                                &allowed,
+                                true,
+                            )?;
+                        // Recorded now so completion can refuse a `.part` that
+                        // was swapped underneath the transfer.
+                        let identity =
+                            crate::security::filesystem::object_identity_from_file(&file)?;
+                        Ok((part_path, done_dir, identity, file))
                     }
                 })
                 .await;
-                let file = match prepared
+                let (part_path, done_dir, part_identity, file) = match prepared
                     .map_err(|e| e.to_string())
                     .and_then(|opened| opened.map_err(|e| e.to_string()))
                 {
-                    Ok(file) => file,
+                    Ok(prepared) => prepared,
                     Err(e) => {
                         let _ = tx.send(Err(coded_ctx(
                             "channels_xfer_failed",
@@ -3228,6 +3259,8 @@ async fn handle_command_inner(
                         offer.root,
                         part_path,
                         done_dir.join(&offer.name),
+                        download_folder.clone(),
+                        part_identity,
                         file,
                     ),
                 );
@@ -4363,11 +4396,42 @@ async fn handle_command_inner(
                 }
             }
 
-            // Signal the upload listener to reject new connections and
-            // terminate active upload sessions (eMule: all uploads stop on disconnect).
-            state
-                .upload_disconnected
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Take the upload listener down only if KAD was the last transport
+            // standing.
+            //
+            // This used to fire unconditionally, justified as "eMule: all
+            // uploads stop on disconnect" — which is true of eMule's *global*
+            // Disconnect, but not of turning KAD off. eMule treats KAD and eD2K
+            // as independent subsystems; running with KAD disabled is an
+            // ordinary configuration that seeds perfectly well, because serving
+            // an upload needs a shared file, the TCP listener, and — for LowID —
+            // a server to relay callbacks, none of which involve KAD. The
+            // `upload_disconnected` field comment says exactly this. So a user
+            // who disconnected KAD while logged in to a server stopped serving
+            // every peer, while their downloads carried on, and the control that
+            // did it is labelled from a KAD-only status field.
+            //
+            // The flag's intent survives: a node the user has taken offline must
+            // not keep serving peers who remember its address. That condition is
+            // "no transport left", and the other half of it is already handled —
+            // `KadDisconnect` sets `user_offline` below, and
+            // `handle_server_disconnect` re-arms this gate whenever the server
+            // goes away while `user_offline` is set. So disconnecting KAD and
+            // then losing the server still stops uploads.
+            let server_online = ed2k_server_session_live(
+                state.server_connected,
+                state.server_connection.is_some(),
+                state.pending_server_connect.is_some(),
+            );
+            if !server_online {
+                state
+                    .upload_disconnected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                info!(
+                    "KAD disconnected but an eD2K server session is live — uploads stay enabled"
+                );
+            }
             // And stop the outbound half, which the upload gate cannot speak
             // for: no new download workers, no friend dials, no server search
             // until the user comes back online.
@@ -4383,7 +4447,12 @@ async fn handle_command_inner(
             state.stats.stores_acknowledged = 0;
             let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
 
-            // Tear down eD2K server — it should only be up while KAD is connected
+            // Tear down the eD2K server too. Not because eD2K depends on KAD —
+            // it does not, and treating the two as coupled is what used to stop
+            // uploads on a session that only ever had a server (see
+            // `handle_server_disconnect`) — but because this command is the
+            // app's single Disconnect: the user asked to go offline, not to
+            // leave one network.
             if let Some(handle) = state.pending_server_connect.take() {
                 handle.abort();
             }
@@ -4842,6 +4911,42 @@ async fn handle_command_inner(
             }
             if !parsed.is_empty() {
                 known_files.mark_dirty();
+                // Ordered by restrictiveness rather than by file, because the
+                // two stores are only consistent if a crash between them leaves
+                // the pair no *less* restrictive than either of them says.
+                //
+                // Unsharing is self-healing in any order: `share_intent`'s
+                // migration re-derives a denial from every `!is_shared` record,
+                // so a crash after known.met lands simply reinstates it.
+                // Re-sharing was not. known.met dropped the unshared flag while
+                // share_intent.json still denied the hash, `effective_shared`
+                // consults `denied` first, and the migration loop only ever
+                // *inserts* denials — never clears one. The file stayed
+                // unshared permanently while the Library showed it as shared,
+                // with no surface anywhere explaining the difference.
+                //
+                // So: allows first, known.met second, denials last. A crash at
+                // any point leaves the file unshared and re-derivable rather
+                // than stuck.
+                //
+                // A *failed* known.met save is the one case that needs undoing
+                // rather than re-deriving: `effective_shared` consults
+                // `explicit_allow` ahead of the catalog value, so an allow that
+                // landed while the catalog write failed would leave the file
+                // shared against a catalog that says otherwise — less
+                // restrictive than either store, which is exactly what this
+                // ordering exists to prevent.
+                let (allows, denies): (Vec<_>, Vec<_>) =
+                    parsed.iter().copied().partition(|(_, shared)| *shared);
+                if !allows.is_empty() {
+                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&allows) {
+                        *known_files = before;
+                        let _ = tx.send(Err(format!(
+                            "Failed to persist independent share intent: {e}"
+                        )));
+                        return;
+                    }
+                }
                 // See SetUploadPriorities: persist before acknowledging so
                 // share/unshare cannot appear successful and then revert on
                 // the next application start.
@@ -4856,11 +4961,35 @@ async fn handle_command_inner(
                 .map_err(|e| format!("known.met share-state save task failed: {e}"))
                 .and_then(|result| result.map_err(|e| e.to_string()));
                 if let Err(e) = save_result {
+                    // Withdraw only the allows that made a previously unshared
+                    // file shared. An allow for a file the catalog already had
+                    // as shared agrees with the state we are reverting to, so
+                    // denying it would be a surprise unshare rather than a
+                    // rollback.
+                    let strays: Vec<([u8; 16], bool)> = allows
+                        .iter()
+                        .filter(|(hash, _)| {
+                            !before.find_by_hash(hash).is_some_and(|r| r.is_shared)
+                        })
+                        .map(|(hash, _)| (*hash, false))
+                        .collect();
+                    if !strays.is_empty() {
+                        if let Err(rollback_error) =
+                            crate::storage::share_intent::set_explicit_batch(&strays)
+                        {
+                            error!(
+                                "Failed to withdraw share intent after a known.met save failure; \
+                                 {} file(s) may remain shared until the next launch: {rollback_error}",
+                                strays.len()
+                            );
+                        }
+                    }
                     *known_files = before;
                     let _ = tx.send(Err(format!("Failed to persist file sharing state: {e}")));
                     return;
                 }
-                if let Err(e) = crate::storage::share_intent::set_explicit_batch(&parsed) {
+                if !denies.is_empty() {
+                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&denies) {
                     *known_files = before.clone();
                     let ownership = state.known_met_save_lock.clone().lock_owned().await;
                     let known_path = state.data_dir.join("known.met");
@@ -4883,6 +5012,7 @@ async fn handle_command_inner(
                         "Failed to persist independent share intent: {detail}"
                     )));
                     return;
+                    }
                 }
             }
             let _ = tx.send(Ok(parsed.len()));
@@ -5572,10 +5702,17 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
-        NetworkCommand::PreviewFile { transfer_id, tx } => {
+        NetworkCommand::PreviewFile {
+            transfer_id,
+            tx,
+            single_flight,
+        } => {
             let download_folder = settings.download_folder.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
+                // Dropped when this task ends, which is what makes the claim
+                // cover the blocking work rather than only the caller's wait.
+                let _single_flight = single_flight;
                 let result = async {
                     let mgr_guard = tm.read().await;
                     let transfer = mgr_guard

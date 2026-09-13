@@ -8,8 +8,11 @@ pub async fn preview_file(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
-    let _single_flight =
-        crate::security::try_begin_single_flight(&PREVIEW_IN_FLIGHT).ok_or_else(|| {
+    // Handed to the network task rather than held here. The timeout below ends
+    // this call but not the work it started, so releasing the claim on the way
+    // out admitted a second preview while the first was still hashing.
+    let single_flight = crate::security::try_begin_single_flight(&PREVIEW_IN_FLIGHT)
+        .ok_or_else(|| {
             coded(
                 "preview_request_in_flight",
                 "Another media preview request is already running",
@@ -18,7 +21,11 @@ pub async fn preview_file(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(crate::network::NetworkCommand::PreviewFile { transfer_id, tx })
+        .try_send(crate::network::NetworkCommand::PreviewFile {
+            transfer_id,
+            tx,
+            single_flight,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     tokio::time::timeout(std::time::Duration::from_secs(30), rx)

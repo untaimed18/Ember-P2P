@@ -39,6 +39,17 @@ function assertUsableNotes(notes, version) {
     notes.length > 400,
     `notes for ${version} are suspiciously short (${notes.length} chars)`,
   );
+  // An entity the decoder has no entry for survives into the release body and
+  // the updater's notes as literal text, which is how `Ctrl&minus;` reached
+  // users. Asserted against the whole rendered output rather than against a
+  // list of the entities we happened to think of, so the next one that gets
+  // written on the page fails here instead of shipping.
+  const leaked = notes.match(/&[a-zA-Z#][a-zA-Z0-9]*;/g);
+  assert.equal(
+    leaked,
+    null,
+    `undecoded HTML entities in the ${version} notes: ${[...new Set(leaked ?? [])].join(", ")}`,
+  );
 }
 
 test("the version being tagged has notes on the site", {
@@ -107,4 +118,32 @@ test("a section that lost its content is rejected rather than published", () => 
 test("an unclosed article is reported instead of silently truncating", () => {
   const html = '<article class="release" id="release-9-9-9"><h4>Hi</h4>';
   assert.throws(() => extractReleaseNotes(html, "9.9.9"), /is not closed/);
+});
+
+test("an entity the decoder does not know is caught before it ships", () => {
+  // Long enough on its own to clear both the extractor's floor and the
+  // usable-notes length guard, so the only thing under test is the entity.
+  const body = (entity) => `
+    <article class="release" id="release-9-9-9">
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+        <ul>
+          <li><strong>Ctrl+ and Ctrl${entity} zoom the interface,</strong> so a compositor whose
+            display scale never reaches the webview can be corrected by hand, which is the whole
+            of the reason this exists and is quite enough prose to be a realistic bullet.</li>
+          <li><strong>A second bullet, for length.</strong> The usable-notes guard refuses a
+            section short enough to look like a structural failure of the page, so a fixture
+            testing anything else has to be long enough not to trip it on the way past.</li>
+        </ul>
+      </div>
+    </article>`;
+
+  // `&minus;` has an entry, so the real note passes.
+  assertUsableNotes(extractReleaseNotes(body("&minus;"), "9.9.9"), "9.9.9");
+
+  // One that does not is refused rather than published as literal text.
+  assert.throws(
+    () => assertUsableNotes(extractReleaseNotes(body("&plusmn;"), "9.9.9"), "9.9.9"),
+    /undecoded HTML entities.*&plusmn;/s,
+  );
 });

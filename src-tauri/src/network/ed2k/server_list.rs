@@ -1064,13 +1064,27 @@ impl ServerList {
         }
     }
 
-    /// Store the server's soft per-client file limit (from extended UDP
-    /// status). eMule caps `OP_OFFERFILES` at `min(soft_files, 200)`; we
-    /// learn + persist it (ST_SOFTFILES) so the cap matches on later
-    /// connects. Only overwrite with a non-zero value so a status reply
+    /// Store the server's advertised capacity limits (from extended UDP
+    /// status): user capacity and the soft/hard per-client file limits.
+    ///
+    /// eMule caps `OP_OFFERFILES` at `min(soft_files, 200)`, so learning and
+    /// persisting that (ST_SOFTFILES) makes the cap match on later connects.
+    /// `max_users` (ST_MAXUSERS) and `hard_files` (ST_HARDFILES) were parsed
+    /// off the wire and thrown away, which left the Servers page unable to say
+    /// how close a server was to full or how much of a large library it could
+    /// actually index — so they are stored on the same footing now.
+    ///
+    /// Each field only overwrites with a non-zero value, so a status reply
     /// without the extended fields can't clear a previously learned limit.
-    pub fn update_soft_files(&mut self, ip: &str, port: u16, soft_files: u32) {
-        if soft_files == 0 {
+    pub fn update_capacity_limits(
+        &mut self,
+        ip: &str,
+        port: u16,
+        max_users: u32,
+        soft_files: u32,
+        hard_files: u32,
+    ) {
+        if max_users == 0 && soft_files == 0 && hard_files == 0 {
             return;
         }
         if let Some(entry) = self
@@ -1078,11 +1092,23 @@ impl ServerList {
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            if entry.soft_files != soft_files {
+            if max_users != 0 && entry.max_users != max_users {
+                tracing::info!(
+                    "Learned user capacity {max_users} for server {ip}:{port} from UDP status"
+                );
+                entry.max_users = max_users;
+            }
+            if soft_files != 0 && entry.soft_files != soft_files {
                 tracing::info!(
                     "Learned soft file limit {soft_files} for server {ip}:{port} from UDP status"
                 );
                 entry.soft_files = soft_files;
+            }
+            if hard_files != 0 && entry.hard_files != hard_files {
+                tracing::info!(
+                    "Learned hard file limit {hard_files} for server {ip}:{port} from UDP status"
+                );
+                entry.hard_files = hard_files;
             }
         }
     }

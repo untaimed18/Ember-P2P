@@ -1447,7 +1447,25 @@ pub async fn rescore_search_results(
     // No batch-local heuristics: this is a re-pass over already-shown rows,
     // and same-name/many-hashes context can flip a clean streamed row to spam.
     // Per-row `origin_server_ip` still feeds server reputation.
-    enrich_results_with_batch(&mut results, &state, &keywords, None, false).await;
+    //
+    // Chunked, because this is the one enrichment path whose batch is large
+    // enough to matter and the only one that can be triggered at will from the
+    // UI. `enrich_results_with_batch` holds `spam_filter.read()` for as long as
+    // it runs, and scoring a clean row walks all `MAX_SPAM_SIMILAR_NAMES`
+    // learned names through Levenshtein — so 15,000 rows is a long time to hold
+    // it. The network loop takes `spam_filter.write()` when a download
+    // completes, and Tokio's `RwLock` is fair: that writer blocks, and because
+    // it blocks *inside* the `select!` loop, UDP receive, every timer and all
+    // IPC park behind it. Releasing between chunks bounds that to one chunk,
+    // and the yield lets other tasks onto this worker.
+    //
+    // Safe to split only because `use_batch_context` is false here: nothing in
+    // this pass looks across rows, so a chunk boundary changes no verdict.
+    const RESCORE_CHUNK: usize = 256;
+    for chunk in results.chunks_mut(RESCORE_CHUNK) {
+        enrich_results_with_batch(chunk, &state, &keywords, None, false).await;
+        tokio::task::yield_now().await;
+    }
     if !spam_enabled {
         for result in &mut results {
             result.spam_rating = 0;

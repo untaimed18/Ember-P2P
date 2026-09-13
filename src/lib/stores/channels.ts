@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { listChannels, listChannelTransfers, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
 import { toast } from '$lib/stores/toast';
+import { notify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
 
 export const channels = writable<ChannelInfo[]>([]);
@@ -443,7 +444,13 @@ function previewText(raw: unknown): string {
 }
 
 function maybeToastChannelMessage(channelId: string, message: string, senderPubkey?: string) {
-  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  // Whether the user already has this room on screen. No longer an early
+  // return: it still suppresses the in-app toast, but it used to suppress the
+  // desktop notification with it, and `isAppVisible` answers this far too
+  // loosely for that — a window sitting behind an editor counts as watched,
+  // which is precisely when a desktop notification is the point. `notify`
+  // applies its own visible-*and*-focused test.
+  const roomOnScreen = isAppVisible() && get(activeChannelId) === channelId;
   if (get(mutedChannels).includes(channelId)) return;
   // Ignoring somebody is presentational, and a toast quoting them is the least
   // ignorable presentation there is: it interrupts whatever page the user is on
@@ -459,7 +466,14 @@ function maybeToastChannelMessage(channelId: string, message: string, senderPubk
   const name = row?.name ?? m.nav_channels();
   const preview = previewText(message);
   if (!preview) return;
-  toast(m.channels_message_toast({ name, preview }));
+  if (!roomOnScreen) toast(m.channels_message_toast({ name, preview }));
+  // Past every suppression that governs *what* may be said — muted room,
+  // ignored member, a room that is gone, the per-room gap — so a desktop
+  // notification still cannot carry something the in-app toast refused. The one
+  // it no longer inherits is `roomOnScreen`, which is about whether the user is
+  // already looking rather than about the message. The notification's own
+  // category switch is off by default; see `notify_channel_message`.
+  void notify('channel_message', name, preview);
 }
 
 export async function initChannelsStore() {

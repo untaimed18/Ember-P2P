@@ -552,7 +552,19 @@ fn writer_loop(
         // ancient queued block could land on top of a newer one for the same
         // offsets: precisely the torn part `PART_WRITER_GATES` exists to stop,
         // reintroduced inside a single writer. Drop the handle instead.
-        if wedged.load(Ordering::Acquire) {
+        //
+        // The discard flag is read in the same place and for a related reason.
+        // It used to be read only at loop entry and inside the `SyncData` arm,
+        // leaving `WriteOp::Abandon` as the only thing that could cut a discard
+        // short mid-queue — and both senders of it use `try_send`, which drops
+        // silently when the 4096-slot queue is full. `Inner::poison` reasons
+        // that a dropped `Abandon` is safe because "the flag alone still makes
+        // the worker exit when it next dequeues", which was true of `wedged`
+        // and not of this one. Cancelling a download with a deep queue on a
+        // slow volume therefore executed up to ~720 MB of writes nobody wanted
+        // before releasing the handle, missing the ~8s cleanup budget and
+        // orphaning the `.part` on Windows.
+        if wedged.load(Ordering::Acquire) || discarding(&discard) {
             abandon = true;
             break;
         }

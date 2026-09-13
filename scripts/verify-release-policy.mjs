@@ -280,6 +280,37 @@ function workflowFiles(root) {
     }));
 }
 
+/** Every job the release workflow must still have, in dependency order. */
+const REQUIRED_JOBS = ["verify", "build", "build-linux", "sign-publish"];
+
+/**
+ * The release workflow's jobs, each mapped to its own body.
+ *
+ * The checks below used to read one slice running from `sign-publish` to the
+ * end of the file, which quietly stopped meaning what it said as soon as a
+ * second job could follow it: "only sign-publish may request contents: write"
+ * was satisfied by *any* job after it doing so, and the dependency check could
+ * be answered by a `needs:` belonging to something else. Splitting first is
+ * what lets each check below name the job it is actually about.
+ *
+ * Sliced from `jobs:` rather than the whole file, because `on:` nests `push:`
+ * at the same two-space indent that job names use.
+ */
+function releaseJobs(source) {
+  const jobsIndex = source.indexOf("\njobs:");
+  const body = jobsIndex >= 0 ? source.slice(jobsIndex) : "";
+  const headers = [...body.matchAll(/^ {2}([A-Za-z][\w-]*):[ \t]*$/gm)];
+  return new Map(
+    headers.map((header, index) => [
+      header[1],
+      body.slice(
+        header.index + header[0].length,
+        index + 1 < headers.length ? headers[index + 1].index : body.length,
+      ),
+    ]),
+  );
+}
+
 export function verifyWorkflow({ root = scriptRoot } = {}) {
   const errors = [];
   let actions = 0;
@@ -323,27 +354,72 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
   }
 
   const workflow = read(root, ".github/workflows/release.yml");
-  for (const job of ["verify", "build", "sign-publish"]) {
-    if (!new RegExp(`^  ${job}:\\s*$`, "m").test(workflow)) {
-      errors.push(`missing ${job} job`);
-    }
+  const jobs = releaseJobs(workflow);
+  for (const job of REQUIRED_JOBS) {
+    if (!jobs.has(job)) errors.push(`missing ${job} job`);
   }
 
-  const signStart = workflow.search(/^  sign-publish:\s*$/m);
-  const signJob = signStart >= 0 ? workflow.slice(signStart) : "";
+  const signJob = jobs.get("sign-publish") ?? "";
   if (!/^\s{4}environment:\s*release-signing\s*$/m.test(signJob)) {
     errors.push(
       "sign-publish must use the protected release-signing environment",
     );
   }
   if (!/permissions:\s*\r?\n\s{6}contents:\s*write\b/.test(signJob)) {
-    errors.push("only sign-publish may request contents: write");
+    errors.push("sign-publish must request contents: write");
   }
-  if (!/needs:\s*\[verify,\s*build\]/.test(signJob)) {
-    errors.push("sign-publish must depend on both verify and build");
+
+  // The privileges above are only worth anything if they stay where they are.
+  // Every other job builds or checks something and needs neither the signing
+  // key nor the ability to write a release, so the absence is asserted job by
+  // job rather than inferred from sign-publish having them.
+  for (const [name, body] of jobs) {
+    if (name === "sign-publish") continue;
+    if (/^\s{6}contents:\s*write\b/m.test(body)) {
+      errors.push(`only sign-publish may request contents: write, not ${name}`);
+    }
+    if (/^\s{4}environment:\s*release-signing\s*$/m.test(body)) {
+      errors.push(
+        `only sign-publish may enter the release-signing environment, not ${name}`,
+      );
+    }
+    if (body.includes("secrets.")) {
+      errors.push(`${name} must not reference a secret`);
+    }
+  }
+
+  const needs = signJob.match(/^\s{4}needs:\s*\[([^\]]*)\]\s*$/m);
+  const declared = needs ? needs[1].split(",").map((job) => job.trim()) : [];
+  const undeclared = REQUIRED_JOBS.filter(
+    (job) => job !== "sign-publish" && !declared.includes(job),
+  );
+  if (undeclared.length) {
+    errors.push(
+      `sign-publish must depend on every build job; it is missing ${undeclared.join(", ")}`,
+    );
   }
   if (!/releaseDraft:\s*true\b/.test(signJob)) {
     errors.push("release must remain a draft");
+  }
+
+  // A Linux release is three things that have to stay together: both formats
+  // built, neither of them asking a keyless runner to produce updater
+  // signatures, and both reaching the manifest. Dropping any one of them still
+  // produces a green release — one that silently stops offering Linux users an
+  // update, or offers them an artifact with no signature to verify.
+  const linuxJob = jobs.get("build-linux") ?? "";
+  if (!/--bundles\s+appimage,deb\b/.test(linuxJob)) {
+    errors.push("build-linux must build both the AppImage and the .deb");
+  }
+  if (!/"createUpdaterArtifacts"\s*:\s*false/.test(linuxJob)) {
+    errors.push(
+      "build-linux holds no signing key, so it must disable createUpdaterArtifacts",
+    );
+  }
+  if (!signJob.includes("scripts/add-linux-platforms.mjs")) {
+    errors.push(
+      "sign-publish must add the Linux updater targets to latest.json",
+    );
   }
 
   const policyGate = signJob.indexOf("Re-verify release policy before secrets");

@@ -236,6 +236,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Non-queuing resource guard for expensive IPC operations. A compromised
 /// renderer cannot build an unbounded waiter backlog: concurrent attempts fail
 /// immediately and the flag is released on every return/panic unwind.
+#[derive(Debug)]
 pub struct SingleFlightGuard<'a>(&'a AtomicBool);
 
 impl Drop for SingleFlightGuard<'_> {

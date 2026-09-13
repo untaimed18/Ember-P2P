@@ -520,7 +520,7 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
-const MAX_CONFIGURED_SPEED_BPS: u64 = 100 * 1024 * 1024 * 1024;
+use crate::bandwidth::MAX_CONFIGURED_SPEED_BPS;
 
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
@@ -640,6 +640,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // Drop malformed schedule rules rather than letting `validate_settings`
+    // refuse the file, which on load means backing up `config.json` and
+    // resetting every other setting. One bad window is not worth a user's
+    // whole configuration, and an inert rule was never throttling anything.
+    changed |= crate::bandwidth::schedule::repair(&mut settings.bandwidth_schedule);
+
     // Drop shared folders that would fail validate (sensitive segments) or that
     // contain / are the Ember data directory. Older builds allowed some AppData
     // paths; rejecting them in validate alone would wipe the entire config.
@@ -724,6 +730,10 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Update check frequency must be 'daily', 'weekly', or 'monthly'",
         ));
     }
+    // Checked whether or not the timetable is switched on: the rules persist
+    // either way, and reporting a malformed window only once the feature is
+    // enabled would surface it long after the edit that caused it.
+    crate::bandwidth::schedule::validate(&settings.bandwidth_schedule)?;
     if settings.download_folder.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "settings_download_folder_too_long",
@@ -1376,9 +1386,16 @@ pub async fn update_settings(
     // effect on the very next title-bar X click without restarting.
     *state.close_behavior.write() = settings.close_to_tray_behavior.clone();
 
-    state
-        .bandwidth_limiter
-        .set_configured_limits(settings.max_upload_speed, settings.max_download_speed);
+    // Through the schedule, not straight from the form. While a timetable
+    // window is open the caps in force are the rule's, and applying the manual
+    // numbers here would undo the schedule until the next background tick put
+    // it back — a limit that visibly moves on its own a second after being
+    // saved. Both paths resolve the same way, so they cannot disagree.
+    //
+    // Runs after the config write above, so the background tick cannot be
+    // holding a read of the previous settings and then overwrite this target
+    // with the stale one it resolved from them.
+    crate::background::apply_effective_limits(&app, &state, &settings);
 
     // Apply the new concurrent-download cap and promote any queued downloads
     // that the higher cap now allows. Previously this only set the field, so

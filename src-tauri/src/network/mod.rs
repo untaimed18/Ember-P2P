@@ -212,6 +212,8 @@ struct ChannelNeighborLookupResult {
 enum ChannelRelayEvent {
     Opened {
         peer_pubkey: [u8; 32],
+        /// Which session this is. See [`ChannelRelayEvent::Closed`].
+        session_id: u64,
         outbound_tx: mpsc::Sender<Vec<u8>>,
     },
     Frame {
@@ -220,7 +222,50 @@ enum ChannelRelayEvent {
     },
     Closed {
         peer_pubkey: [u8; 32],
+        /// The session that ended, so its close cannot evict a newer one.
+        ///
+        /// This carried only the peer, and the handler removed whatever outbox
+        /// was registered for it. Two sessions to one peer overlap routinely —
+        /// both sides run `maybe_offer_channel_relay` over the same roster, so
+        /// a mutual simultaneous offer is the normal case, and the duplicate
+        /// guard reads a map that is not populated until `Opened` arrives,
+        /// which is after up to ~55s of ticket negotiation. The result was
+        /// deterministic rather than racy: session B registers, session A dies,
+        /// A's close deletes *B's* outbox, and B's reader and socket stay alive
+        /// so inbound frames keep arriving while every send is silently
+        /// discarded. That peer is one-way for the rest of the session, and the
+        /// map now undercounts, so `MAX_CHANNEL_RELAY_SESSIONS` can be exceeded
+        /// by zombies.
+        session_id: u64,
     },
+}
+
+/// Sends [`ChannelRelayEvent::Closed`] however a session task ends.
+///
+/// The task has several early returns — a ticket that is never accepted, a
+/// WebSocket that will not connect, a handshake that times out — and none of
+/// them used to report anything, so the peer stayed marked as negotiating with
+/// nothing to clear it. A guard covers those, the normal end, and a panic.
+struct ChannelRelaySessionGuard {
+    event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
+    peer_pubkey: [u8; 32],
+    session_id: u64,
+}
+
+impl Drop for ChannelRelaySessionGuard {
+    fn drop(&mut self) {
+        let _ = self.event_tx.send(ChannelRelayEvent::Closed {
+            peer_pubkey: self.peer_pubkey,
+            session_id: self.session_id,
+        });
+    }
+}
+
+/// Process-wide source of relay session ids. Monotonic, so a stale close can
+/// always be told from a live one.
+fn next_channel_relay_session_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn relay_ticket_next_round_delay(
@@ -901,6 +946,17 @@ async fn reseed_friend_endpoint(
     let mut file_hashes = std::collections::HashSet::new();
     for (file_hash, old_ip, old_port) in &relocated {
         file_hashes.insert(*file_hash);
+        // `relocate_user_hash` reports the *current* address when the peer was
+        // already at this endpoint (deliberately — see its doc and
+        // `relocate_user_hash_moves_endpoint_and_reports_old`), so `old ==
+        // new` means nothing actually moved. Clearing the dead-source entries
+        // in that case removed the last rate brake on a peer we may have just
+        // failed against, on every repeat friend hello or reconnect. A real
+        // relocation still clears both endpoints: the old address's block says
+        // nothing about the new one.
+        if (*old_ip, *old_port) == (ip, port) {
+            continue;
+        }
         state.dead_sources.remove(0, u32::from(*old_ip), *old_port);
         state
             .dead_sources
@@ -5828,6 +5884,32 @@ fn pending_download_retry_interval(search_count: u32) -> i64 {
     }
 }
 
+/// Install a fresh [`TransferControl`] for `transfer_id`, cancelling whatever
+/// control was registered before it.
+///
+/// The cancel is load-bearing, not hygiene. A worker's per-source tasks are
+/// detached `tokio::spawn`s that stop only when their control is cancelled, so
+/// aborting the worker's own `JoinHandle` never reaches them. Overwriting the
+/// registration without cancelling left the previous generation's children
+/// running against an orphaned control that no later Stop, Pause or disconnect
+/// could reach, still holding their sockets and part-writer reservations. The
+/// IPC path has done this since `start_promoted_downloads`; these network-loop
+/// respawn sites had not, and a following `StartDownload` cannot compensate —
+/// its guard compares `get_control` against the control it was handed with
+/// `Arc::ptr_eq`, which now matches, so it skips the cancel itself.
+async fn reregister_transfer_control(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    transfer_id: &str,
+) -> Arc<TransferControl> {
+    let control = TransferControl::new();
+    let mut mgr = transfer_manager.write().await;
+    if let Some(old) = mgr.get_control(transfer_id) {
+        old.cancel();
+    }
+    mgr.register_control(transfer_id, control.clone());
+    control
+}
+
 fn insert_pending_download_bounded(
     pending: &mut HashMap<String, PendingDownload>,
     transfer_id: String,
@@ -6999,6 +7081,29 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// Uploads must not depend on KAD. eMule treats KAD and eD2K as independent
+    /// subsystems — running with KAD off is an ordinary configuration that seeds
+    /// normally — but `KadDisconnect` raised the upload gate unconditionally, so
+    /// a user who turned KAD off while logged in to a server stopped serving
+    /// every peer while their downloads carried on. The gate now asks whether
+    /// any transport is left, and a live-or-pending server session is one.
+    #[test]
+    fn a_live_server_session_keeps_uploads_enabled_when_kad_goes_down() {
+        // Logged in, socket held, or a login still in flight: any of the three
+        // means we are still reachable for eD2K and must keep serving.
+        assert!(ed2k_server_session_live(true, true, false));
+        assert!(ed2k_server_session_live(false, true, false));
+        assert!(ed2k_server_session_live(
+            false, false,
+            /* pending login */ true
+        ));
+        assert!(ed2k_server_session_live(true, false, false));
+
+        // KAD was the last transport standing, so the node really is offline
+        // and the upload listener should come down with it.
+        assert!(!ed2k_server_session_live(false, false, false));
+    }
 
     /// Firsthand session contacts sit beside the routing table and are exempt
     /// from everything that disciplines a resident: no liveness ping reaches
@@ -11962,6 +12067,16 @@ pub enum NetworkCommand {
     PreviewFile {
         transfer_id: String,
         tx: oneshot::Sender<Result<String, String>>,
+        /// Carried with the command so the claim is released by the work
+        /// finishing rather than by the caller's timeout.
+        ///
+        /// `preview_file` waits 30 seconds and then returns, but the work it
+        /// started is a detached `spawn_blocking` that keeps going — and on an
+        /// AICH-pinned transfer that work is a full SHA-1 tree over the whole
+        /// file, minutes on a large download. Holding the guard in the command
+        /// meant every timeout admitted another one, so a user clicking Preview
+        /// again after each stall stacked concurrent whole-file hashes.
+        single_flight: crate::security::SingleFlightGuard<'static>,
     },
     SendChatMessage {
         ember_hash: [u8; 16],
@@ -12057,6 +12172,8 @@ pub enum NetworkCommand {
     /// production peers will eventually dial each other without
     /// out-of-band key distribution. A cache miss with `None` is
     /// surfaced as a clear error rather than a silent timeout.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberPing {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -12249,6 +12366,8 @@ pub enum NetworkCommand {
     /// otherwise the KAD-fed Noise-key cache is consulted. The reply is
     /// delivered asynchronously on the receive loop, so the oneshot only
     /// reports whether the request was dispatched.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberExchangeRequest {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -12264,6 +12383,10 @@ pub enum NetworkCommand {
 /// Returned by the network task when an outgoing Ember ping has been
 /// scheduled. The Tauri command awaits the `pong_rx` oneshot with a
 /// timeout to convert this into a final `EmberPingResult`.
+///
+/// Compiled out of release alongside `ember_ping_peer`, like its
+/// `EmberDht*Pending` siblings below.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberPingPending {
     pub pong_rx: oneshot::Receiver<std::time::Duration>,
@@ -13935,24 +14058,29 @@ struct NetworkState {
     recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
-    /// Shared flag: set to true when network is disconnected so the upload
-    /// listener rejects new connections and terminates active sessions.
-    /// The upload TCP listener binds and starts accepting connections as
-    /// soon as `start_network` runs, independent of KAD/server connection
-    /// state, so this must track `stats.status` (see `start_network`) — a
-    /// node that reads "Disconnected" in the UI must not still be serving
-    /// uploads to peers who remember our IP:port from a prior session.
+    /// Shared flag: set to true when the user is offline so the upload listener
+    /// rejects new connections and terminates active sessions. The upload TCP
+    /// listener binds and starts accepting connections as soon as
+    /// `start_network` runs, independent of KAD/server connection state, so a
+    /// node the user has taken offline must not still be serving uploads to
+    /// peers who remember our IP:port from a prior session.
+    ///
+    /// Explicitly *not* tied to `stats.status`, which only ever reports KAD:
+    /// serving an upload needs the shared file, the TCP listener and — for
+    /// LowID — a server for callbacks, none of which involve KAD, and eD2K is
+    /// opt-in independently of it. Raised by an explicit Disconnect and by the
+    /// shutdown save sequence; cleared by every path back online, including a
+    /// successful server login.
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// The user asked activity to stop: set by an explicit `KadDisconnect`,
     /// cleared by every path back off `Disconnected`.
     ///
     /// Deliberately not `upload_disconnected`, which answers a different
     /// question — "are we accepting inbound connections?" — and is *also*
-    /// raised when an eD2K server drops a session whose KAD side is already
-    /// disconnected, and by the shutdown save sequence. Neither of those is
-    /// the user asking to go offline. This one is only ever set by an explicit
-    /// Disconnect, so it can gate the outbound side: starting download
-    /// workers, dialling friends, and UDP server search.
+    /// raised by the shutdown save sequence, which is not the user asking to go
+    /// offline. This one is only ever set by an explicit Disconnect, so it can
+    /// gate the outbound side: starting download workers, dialling friends, and
+    /// UDP server search, plus whether eD2K auto-reconnect may fire at all.
     ///
     /// Shared rather than a plain `bool` because friend dials outlive the
     /// network task's borrow — one spawned before the click can still be
@@ -14300,7 +14428,17 @@ struct NetworkState {
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
     /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
-    channel_relay_outboxes: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    ///
+    /// Keyed with the session id that registered the outbox so a close can be
+    /// matched against it — see [`ChannelRelayEvent::Closed`].
+    channel_relay_outboxes: HashMap<[u8; 32], (u64, mpsc::Sender<Vec<u8>>)>,
+    /// Peers with a session being negotiated but not yet open.
+    ///
+    /// The duplicate guard used to read `channel_relay_outboxes`, which is only
+    /// populated once the ticket dance, the WebSocket connect and the handshake
+    /// have all finished — up to ~55 seconds during which the guard saw nothing
+    /// and a second session was started for the same peer.
+    channel_relay_pending: HashSet<[u8; 32]>,
     channel_relay_offer_at: HashMap<[u8; 32], std::time::Instant>,
     /// In-flight FIND_VALUE of channel handoff keys (`search_id` → old id).
     ember_channel_handoff_searches: HashMap<u32, [u8; 16]>,
@@ -17214,10 +17352,18 @@ fn maybe_offer_channel_relay(
     if settings.rendezvous_url.is_empty() {
         return;
     }
-    if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+    // Pending counts as a session for both guards below. It is the whole point:
+    // negotiation takes up to ~55 seconds, and reading only the outbox map left
+    // that window open for a second session to the same peer — and for the cap
+    // to be exceeded by sessions that had not registered yet.
+    if state.channel_relay_outboxes.contains_key(&peer_pubkey)
+        || state.channel_relay_pending.contains(&peer_pubkey)
+    {
         return;
     }
-    if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+    if state.channel_relay_outboxes.len() + state.channel_relay_pending.len()
+        >= MAX_CHANNEL_RELAY_SESSIONS
+    {
         return;
     }
     let now = std::time::Instant::now();
@@ -17229,10 +17375,19 @@ fn maybe_offer_channel_relay(
         return;
     }
     state.channel_relay_offer_at.insert(peer_pubkey, now);
+    state.channel_relay_pending.insert(peer_pubkey);
     let rv_url = settings.rendezvous_url.clone();
     let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
     let event_tx = relay_event_tx.clone();
+    let session_id = next_channel_relay_session_id();
     tokio::spawn(async move {
+        // Clears `channel_relay_pending` on every exit below, including the
+        // ticket and handshake failures that return without ever opening.
+        let _session = ChannelRelaySessionGuard {
+            event_tx: event_tx.clone(),
+            peer_pubkey,
+            session_id,
+        };
         let offer = match rendezvous::offer_channel_relay_ticket(
             &rv_url,
             &ember_hash,
@@ -17281,7 +17436,7 @@ fn maybe_offer_channel_relay(
         match ember::relay::connect_server_relay(&rv_url, &offer.ticket_id, &offer.initiator_token)
             .await
         {
-            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, event_tx).await,
+            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, session_id, event_tx).await,
             Err(e) => debug!("Ember channel relay join failed: {e}"),
         }
     });
@@ -17290,6 +17445,7 @@ fn maybe_offer_channel_relay(
 async fn run_channel_relay_session(
     ws: ember::relay::WsStream,
     peer_pubkey: [u8; 32],
+    session_id: u64,
     event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(ws);
@@ -17333,6 +17489,7 @@ async fn run_channel_relay_session(
     if event_tx
         .send(ChannelRelayEvent::Opened {
             peer_pubkey,
+            session_id,
             outbound_tx,
         })
         .is_err()
@@ -17402,7 +17559,8 @@ async fn run_channel_relay_session(
         }
     }
     reader_task.abort();
-    let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+    // `Closed` is sent by `ChannelRelaySessionGuard` as this task unwinds, so
+    // that every exit path reports — not only this one.
 }
 
 async fn apply_channel_relay_event(
@@ -17415,12 +17573,29 @@ async fn apply_channel_relay_event(
     match event {
         ChannelRelayEvent::Opened {
             peer_pubkey,
+            session_id,
             outbound_tx,
         } => {
-            state.channel_relay_outboxes.insert(peer_pubkey, outbound_tx);
+            state.channel_relay_pending.remove(&peer_pubkey);
+            state
+                .channel_relay_outboxes
+                .insert(peer_pubkey, (session_id, outbound_tx));
         }
-        ChannelRelayEvent::Closed { peer_pubkey } => {
-            state.channel_relay_outboxes.remove(&peer_pubkey);
+        ChannelRelayEvent::Closed {
+            peer_pubkey,
+            session_id,
+        } => {
+            state.channel_relay_pending.remove(&peer_pubkey);
+            // Only if this is the session that registered it. A close from an
+            // older, overlapping session must not take the live one's outbox
+            // with it.
+            if state
+                .channel_relay_outboxes
+                .get(&peer_pubkey)
+                .is_some_and(|(registered, _)| *registered == session_id)
+            {
+                state.channel_relay_outboxes.remove(&peer_pubkey);
+            }
         }
         ChannelRelayEvent::Frame { peer_pubkey, body } => {
             let from_id =
@@ -17644,7 +17819,7 @@ async fn fanout_channel_gossip_retry(
         delivered = true;
     }
     for pk in &missing {
-        if let Some(tx) = state.channel_relay_outboxes.get(pk) {
+        if let Some((_, tx)) = state.channel_relay_outboxes.get(pk) {
             if tx.try_send(body.clone()).is_ok() {
                 delivered = true;
             }
@@ -18450,7 +18625,7 @@ async fn send_channel_gossip_unicast(
             }
         }
     }
-    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+    if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
         if tx.try_send(body.clone()).is_ok() {
             return true;
         }
@@ -18544,7 +18719,7 @@ async fn send_xfer_frame(
             }
         }
     }
-    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+    if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
         if tx.try_send(body.clone()).is_ok() {
             return true;
         }
@@ -18982,11 +19157,21 @@ fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             if tree.root_hash != recv.root {
                 return Ok(false);
             }
-            if let Some(parent) = recv.final_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            // Through the approved-root layer, like the eD2K completion path.
+            // This used to be `create_dir_all` plus a `rename`, both by
+            // pathname: a junction swapped in at `Downloads` was traversed, and
+            // the peer's bytes landed wherever it pointed under a name the peer
+            // also chose. `move_part_to_final_approved` re-pins the root, and
+            // the recorded identity refuses a `.part` swapped underneath the
+            // transfer.
             let target = unique_download_path(&recv.final_path);
-            std::fs::rename(&recv.part_path, &target)?;
+            ed2k::transfer::move_part_to_final_approved(
+                &recv.part_path,
+                &target,
+                &recv.download_root,
+                &recv.part_identity,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(true)
         })();
         let status = match outcome {
@@ -21318,6 +21503,9 @@ struct EmberKeywordResultBatch {
 /// Each entry costs ~24 B + a oneshot; this cap keeps the map under
 /// 50 KB even in a degenerate flood, while still allowing a harness
 /// to fan out hundreds of probes in parallel.
+/// Read only by the `debug_assertions` harness command arms that populate
+/// those maps, so gated with them.
+#[cfg(debug_assertions)]
 const MAX_EMBER_PENDING_PINGS: usize = 1024;
 
 /// How long an iterative-lookup `FIND_NODE` query may sit unanswered
@@ -23034,6 +23222,21 @@ fn start_kad_search(
     sid
 }
 
+/// eMule `CSearch::SetGUIName`: record what the KAD → Searches list should show
+/// in its Name column for a just-started search. Publish searches are the ones
+/// that need it — their target is a hash of the file or keyword, so the row is
+/// unreadable without the subject being carried alongside. Call right after
+/// `start_kad_search`; a rejected start (`SearchId(0)`, search-storm cap) and an
+/// empty name are both no-ops.
+fn name_kad_search(state: &mut NetworkState, sid: SearchId, name: &str) {
+    if sid == SearchId(0) || name.is_empty() {
+        return;
+    }
+    if let Some(search) = state.search_manager.get_mut(&sid) {
+        search.display_name = name.to_string();
+    }
+}
+
 /// Split a `Transfer::peer_id` into its address and port halves.
 ///
 /// `peer_id` is a display string, not a parsed socket address, and it can carry
@@ -23308,14 +23511,46 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
-    // A session whose KAD side is disconnected has no other reason to be
-    // accepting inbound connections, so re-arm the upload gate on server
-    // drop; otherwise peers keep uploading after we go offline.
-    if state.stats.status == NetworkStatus::Disconnected {
+    // Re-arm the upload gate only if the user actually asked to go offline.
+    //
+    // This used to key off `stats.status == Disconnected`, which is KAD's
+    // status and nothing else (see the `stats.status` comment in the KAD
+    // bootstrap arm). Serving an upload needs the shared file, the TCP
+    // listener and — for LowID — a server to relay callbacks; KAD has no part
+    // in it, and eD2K is deliberately opt-in independently of KAD. So on a
+    // server-only session the first transient server drop (the 120s activity
+    // watchdog, a server-side disconnect, a failed reconnect attempt) silently
+    // stopped every upload, and auto-reconnect never cleared the flag again
+    // because only `initiate_server_connect` and `KadConnect` do. Uploads
+    // stayed dead for the rest of the session with the UI showing a healthy
+    // server.
+    //
+    // `user_offline` is set by an explicit Disconnect and cleared by every
+    // path back online, which is exactly the question being asked here.
+    if state
+        .user_offline
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         state
             .upload_disconnected
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Whether an eD2K server session is live, or an in-flight login is about to
+/// produce one.
+///
+/// All three inputs are consulted because they are set at different points in
+/// the connect/disconnect sequence: `server_connected` is the logged-in flag,
+/// `server_connection` holds the live socket, and `pending_server_connect` is a
+/// login still in progress. Checking only the first would read a session that
+/// is mid-login as absent.
+pub(super) fn ed2k_server_session_live(
+    server_connected: bool,
+    has_connection: bool,
+    has_pending_connect: bool,
+) -> bool {
+    server_connected || has_connection || has_pending_connect
 }
 
 /// Tear down an already-up eD2K session whose IP is now blocked.
@@ -23908,17 +24143,24 @@ fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
     let conn = state.server_connection.as_ref()?;
     let session = conn.session.as_ref()?;
     let addr = state.server_addr?;
+    // The live session carries the user/file counts but not the capacity
+    // limits — those come from `server.met` (ST_MAXUSERS / ST_SOFTFILES /
+    // ST_HARDFILES) or an extended UDP status reply. Zeroing them here meant
+    // the server the user is actually on was the one row that could never show
+    // its limits, which is backwards. Borrow them from the list entry.
+    let ip = addr.ip().to_string();
+    let limits = state.server_list.find_by_addr(&ip, addr.port());
     Some(ServerInfo {
-        ip: addr.ip().to_string(),
+        ip,
         port: addr.port(),
         name: session.server_name.clone(),
-        description: String::new(),
+        description: limits.map(|s| s.description.clone()).unwrap_or_default(),
         user_count: session.user_count,
         file_count: session.file_count,
-        max_users: 0,
-        soft_files: 0,
-        hard_files: 0,
-        is_static: false,
+        max_users: limits.map(|s| s.max_users).unwrap_or(0),
+        soft_files: limits.map(|s| s.soft_files).unwrap_or(0),
+        hard_files: limits.map(|s| s.hard_files).unwrap_or(0),
+        is_static: limits.is_some_and(|s| s.is_static),
         fail_count: 0,
         client_id: state.server_client_id,
         is_low_id: state.low_id,
@@ -24341,7 +24583,15 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
                     })
                     .unwrap_or_else(|| "Source Search".to_string()),
                 SearchType::FindBuddy => "Find Buddy".to_string(),
-                _ => String::new(),
+                // Publishes carry their own subject (file name / keyword),
+                // stamped by `name_kad_search` at scheduling time — the
+                // publish side-maps cannot answer for them here because they
+                // are cleared as soon as the search completes, while the row
+                // remains listed as "STOPPING" for `STOP_GRACE_SECS`.
+                SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => {
+                    search.display_name.clone()
+                }
+                SearchType::FindNode | SearchType::FindNotes { .. } => String::new(),
             };
             let is_store = matches!(
                 search.search_type,
@@ -25054,6 +25304,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
     state.channel_relay_outboxes.clear();
+    state.channel_relay_pending.clear();
     state.channel_relay_offer_at.clear();
     state.ember_channel_handoff_searches.clear();
     state.ember_pending_channel_handoff.clear();
@@ -26097,6 +26348,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
         channel_relay_outboxes: HashMap::new(),
+        channel_relay_pending: HashSet::new(),
         channel_relay_offer_at: HashMap::new(),
         ember_channel_handoff_searches: HashMap::new(),
         ember_pending_channel_handoff: Vec::new(),
@@ -29380,11 +29632,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &t.id,
                                 &t.status,
                             );
-                            let control = TransferControl::new();
-                            {
-                                let mut mgr = transfer_manager.write().await;
-                                mgr.register_control(&t.id, control.clone());
-                            }
+                            let control =
+                                reregister_transfer_control(&transfer_manager, &t.id).await;
                             handle_command(
                                 &udp_socket,
                                 NetworkCommand::StartDownload {
@@ -29459,11 +29708,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if let Some(t) = transfer_info {
                             // Pause/Stop/Insufficient must not be undone by a
                             // late Failed requeue (T1/T3).
+                            //
+                            // `Completed`/`Failed` belong here for the reason the
+                            // `Failed` arm of `handle_download_event` documents: a
+                            // worker that raced completion must not persist a
+                            // failure for a download whose bytes verified. That
+                            // guard cannot help us — this block ends in `continue`,
+                            // so it is never reached. Without these two states a
+                            // late duplicate `Failed` wrote `failure_reason` and a
+                            // "Retrying after …" health onto the terminal row
+                            // (`get_transfer_mut` searches `completed` too),
+                            // re-registered a control `complete()` had removed,
+                            // re-inserted a pending entry that can never start, and
+                            // queued a `"searching"` status write whose sequence is
+                            // NEWER than the completion write — so the DB row
+                            // regressed from `completed` and the finished file was
+                            // re-downloaded on the next launch.
                             if matches!(
                                 t.status,
                                 TransferStatus::Paused
                                     | TransferStatus::Stopped
                                     | TransferStatus::Insufficient
+                                    | TransferStatus::Completed
+                                    | TransferStatus::Failed
                             ) {
                                 continue;
                             }
@@ -29478,6 +29745,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         TransferStatus::Paused
                                             | TransferStatus::Stopped
                                             | TransferStatus::Insufficient
+                                            | TransferStatus::Completed
+                                            | TransferStatus::Failed
                                     )
                                 });
                                 if blocked {
@@ -30148,11 +30417,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &t.id,
                         &t.status,
                     );
-                    let control = TransferControl::new();
-                    {
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.register_control(&t.id, control.clone());
-                    }
+                    let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                     let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
@@ -31566,11 +31831,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &t.id,
                         &t.status,
                     );
-                    let control = TransferControl::new();
-                    {
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.register_control(&t.id, control.clone());
-                    }
+                    let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                     let (resume_peer_ip, resume_peer_port) = split_peer_id(&t.peer_id);
                     handle_command(
                         &udp_socket,
@@ -34945,7 +35206,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let mut rosters: HashMap<[u8; 16], Vec<[u8; 32]>> = HashMap::new();
                 for offer in offers {
                     if let Some(channel_id) = offer.channel_id {
-                        if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+                        if state.channel_relay_outboxes.len()
+                            + state.channel_relay_pending.len()
+                            >= MAX_CHANNEL_RELAY_SESSIONS
+                        {
                             continue;
                         }
                         let members = rosters.entry(channel_id).or_insert_with(|| {
@@ -34961,18 +35225,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             );
                             continue;
                         };
-                        if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+                        // Keyed by peer, not only by `ticket_id`. The in-flight
+                        // set below is per ticket, so it never stopped a second
+                        // session to the *same peer* from a different ticket —
+                        // which is exactly what a mutual simultaneous offer
+                        // produces, since this side's own outbound offer is in
+                        // negotiation at the same time.
+                        if state.channel_relay_outboxes.contains_key(&peer_pubkey)
+                            || state.channel_relay_pending.contains(&peer_pubkey)
+                        {
                             continue;
                         }
                         let ticket_id = offer.ticket_id;
                         if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
                             continue;
                         }
+                        state.channel_relay_pending.insert(peer_pubkey);
                         let rv_url = settings.rendezvous_url.clone();
                         let done_tx = friend_relay_ticket_session_done_tx.clone();
                         let event_tx = channel_relay_event_tx.clone();
                         let fc_our_ember_hash = ember_hash;
+                        let session_id = next_channel_relay_session_id();
                         tokio::spawn(async move {
+                            // Clears `channel_relay_pending` however this task
+                            // ends, including the accept failures below.
+                            let _session = ChannelRelaySessionGuard {
+                                event_tx: event_tx.clone(),
+                                peer_pubkey,
+                                session_id,
+                            };
                             let responder_token = match tokio::time::timeout(
                                 rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
                                 rendezvous::accept_friend_relay_ticket(
@@ -35004,7 +35285,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             .await
                             {
                                 Ok(ws) => {
-                                    run_channel_relay_session(ws, peer_pubkey, event_tx).await;
+                                    run_channel_relay_session(
+                                        ws, peer_pubkey, session_id, event_tx,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     tracing::debug!("Channel relay ticket join failed: {e}");
@@ -35585,6 +35869,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    name_kad_search(&mut state, sid, &file.file_name);
                                     // Fresh publish cycle: reset before lookup-time
                                     // publishes can receive acks.
                                     state.source_publish_acks.insert(file.file_hash, 0);
@@ -35658,6 +35943,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    // The advert is synthetic and has no file
+                                    // name, so label the row by what it is.
+                                    // `kadSearchNameLabel` translates this
+                                    // sentinel on the way to the UI.
+                                    name_kad_search(&mut state, sid, "Ember Rendezvous");
                                     state.ember_rendezvous_published_at = rendezvous_now;
                                     state.source_publish_acks.insert(key, 0);
                                     state.store_source_searches.insert(sid, (key, msg));
@@ -35693,6 +35983,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     closest,
                                 );
                                 if sid != SearchId(0) {
+                                    name_kad_search(&mut state, sid, &batch.keyword);
                                     state.store_keyword_searches.insert(sid, batch);
                                 }
                             }
@@ -35735,6 +36026,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 closest,
                             );
                             if sid != SearchId(0) {
+                                name_kad_search(
+                                    &mut state,
+                                    sid,
+                                    file_name.as_deref().unwrap_or_default(),
+                                );
                                 let local_note_file = {
                                     let index = local_index.read().await;
                                     index.get_by_hash(&file_hash.to_hex()).cloned()
@@ -37934,11 +38230,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &t.id,
                             &t.status,
                         );
-                        let control = TransferControl::new();
-                        {
-                            let mut mgr = transfer_manager.write().await;
-                            mgr.register_control(&t.id, control.clone());
-                        }
+                        let control = reregister_transfer_control(&transfer_manager, &t.id).await;
                         insert_pending_download_bounded(&mut state.pending_downloads,
                             t.id.clone(),
                             PendingDownload {
@@ -38127,11 +38419,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &t.id,
                                     &t.status,
                                 );
-                                let control = TransferControl::new();
-                                {
-                                    let mut mgr = transfer_manager.write().await;
-                                    mgr.register_control(&t.id, control.clone());
-                                }
+                                let control =
+                                    reregister_transfer_control(&transfer_manager, &t.id).await;
                                 insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
@@ -38328,11 +38617,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &t.id,
                                     &t.status,
                                 );
-                                let control = TransferControl::new();
-                                {
-                                    let mut mgr = transfer_manager.write().await;
-                                    mgr.register_control(&t.id, control.clone());
-                                }
+                                let control =
+                                    reregister_transfer_control(&transfer_manager, &t.id).await;
                                 insert_pending_download_bounded(&mut state.pending_downloads,
                                     t.id.clone(),
                                     PendingDownload {
@@ -38723,12 +39009,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
                         // Track which (ip, tcp_port) pairs we sent to in this
                         // tick so the persistent-list pass below doesn't
-                        // double-fire to the same peer (the SM cooldown is
-                        // already active from the `mark_asked` call below,
-                        // but `can_request_sources_for` returning false is
-                        // *exactly* the gate the persistent loop currently
-                        // proceeds past — so without an explicit set we'd
-                        // emit two identical OP_REASKFILEPING in one tick).
+                        // double-fire to the same peer. This set is the only
+                        // dedup between the two passes: the SourceManager
+                        // cooldown is bumped by `mark_asked` below, but the
+                        // persistent pass keys on its own `last_udp_reask`.
                         let mut sent_this_tick: HashSet<(Ipv4Addr, u16)> =
                             HashSet::with_capacity(udp_sources.len());
                         let mut sent = 0usize;
@@ -38736,9 +39020,25 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             if state.dead_sources.is_dead_source_for_file(&fh, u32::from(*ip), *tcp_port) {
                                 continue;
                             }
-                            if sm.can_request_sources_for(&fh, *ip, *tcp_port) {
-                                continue;
-                            }
+                            // Deliberately NOT gated on the source-exchange
+                            // cooldown. eMule drives `OP_REASKFILEPING` purely
+                            // off the reask timer and the source's queue state
+                            // (`CPartFile::Process` → `UDPReaskForDownload`);
+                            // `OP_REQUESTSOURCES` piggybacks on a *TCP* reask
+                            // when its own interval allows, but never suppresses
+                            // the UDP ping. Gating on it here did two harmful
+                            // things: `can_request_sources_for` returns true when
+                            // `last_sx_sent == 0`, so a source we had never
+                            // source-exchanged with — every row loaded from
+                            // `sources.met` — was never reasked at all; and for
+                            // the rest the ping stopped once the 40-minute SX
+                            // window lapsed, because `last_sx_sent` only advances
+                            // on a live TCP connection. The population that
+                            // depends on this ping is precisely the detached
+                            // `OnQueue` sources of *active* downloads, and the
+                            // TCP reask path only runs for pending ones, so the
+                            // deep queue positions the detach model is built to
+                            // accumulate were being dropped.
                             let addr = SocketAddr::new((*ip).into(), *udp_port);
                             let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                             pkt.extend_from_slice(&reask_payload);
@@ -38795,10 +39095,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                                     continue;
                                 }
-                                if sm.can_request_sources_for(&pfs.file_hash, ip, tcp_port) {
-                                    pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
-                                    continue;
-                                }
+                                // Not gated on the source-exchange cooldown —
+                                // see the SourceManager pass above. This pass
+                                // is the one that maintains queue position for
+                                // an active download's detached sources, so the
+                                // gate hit it hardest.
                                 let addr = SocketAddr::new(ip.into(), udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                 pkt.extend_from_slice(&reask_payload);
@@ -40734,7 +41035,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.server_search_age = 0;
                 }
 
+                // An explicit Disconnect has to outlast this tick. `preferred_ed2k_server`
+                // and `server_auto_reconnect` both survive going offline, so without this
+                // guard the disconnect the user just asked for was undone ~2s later by
+                // the drop-recovery path: the server came back on its own while
+                // `upload_disconnected` stayed raised, leaving a session that reads
+                // "server connected" in the UI and refuses every upload.
                 if state.server_auto_reconnect
+                    && !state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
                     && !state.server_connected
                     && state.pending_server_connect.is_none()
                     && state.server_connection.is_none()
@@ -40949,7 +41257,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                     }
                     match resp {
-                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, soft_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
+                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, max_users, soft_files, hard_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                             // eMule: verify challenge to prevent spoofed status responses
                             let expected = server_udp.take_challenge(&addr);
                             if expected != Some(challenge) {
@@ -40959,11 +41267,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 state.server_list.update_server_stats(
                                     &addr.ip().to_string(), tcp_port, user_count, file_count, obfuscation_port_tcp,
                                 );
-                                // Learn the server's soft per-client file limit so
-                                // OP_OFFERFILES gets capped like eMule on the next
-                                // connect (persisted to server.met via ST_SOFTFILES).
-                                state.server_list.update_soft_files(
-                                    &addr.ip().to_string(), tcp_port, soft_files,
+                                // Learn the server's capacity limits: the soft
+                                // per-client file limit so OP_OFFERFILES gets capped
+                                // like eMule on the next connect, plus the user
+                                // capacity and hard file limit the Servers page shows
+                                // (all persisted to server.met as ST_MAXUSERS /
+                                // ST_SOFTFILES / ST_HARDFILES).
+                                state.server_list.update_capacity_limits(
+                                    &addr.ip().to_string(), tcp_port, max_users, soft_files, hard_files,
                                 );
                                 // L11: Store per-server UDP flags for feature gating
                                 state.server_list.update_udp_flags(
@@ -41543,6 +41854,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed2k::server::set_server_flags_mirror(session.server_flags);
                         state.server_reconnect_failures = 0;
                         state.preferred_ed2k_server = Some((ip.clone(), port));
+                        // Being logged in to a server means we are reachable and
+                        // expected to serve, whatever KAD is doing. Only the
+                        // Servers-page path went through `initiate_server_connect`
+                        // and cleared this; auto-reconnect after a drop landed
+                        // here instead and left the gate shut, so uploads stayed
+                        // dead for the rest of the session. The guard keeps an
+                        // explicit Disconnect authoritative.
+                        if !state.user_offline.load(std::sync::atomic::Ordering::Relaxed) {
+                            state
+                                .upload_disconnected
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                         {
                             let last = ed2k::server_list::LastEd2kServer {
                                 ip: ip.clone(),
@@ -42010,7 +42333,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             .map(|(tid, _)| tid.clone());
 
                         if let Some(tid) = matching_tid {
-                            if let Some(pd) = state.pending_downloads.remove(&tid) {
+                            // Respect pause/cancel and the concurrency cap exactly as the
+                            // KAD-callback arm below does. A paused download deliberately
+                            // stays in `pending_downloads` with a cancelled control, so
+                            // without this guard a buddy connect-back resurrected it: the
+                            // worker bails at once on the cancelled control, its `Failed` is
+                            // classified as a user cancel and suppressed, and the row is left
+                            // `Active` with no worker and no pending entry — a slot consumed
+                            // for the rest of the session that `resume()` cannot reach,
+                            // because `resume` is a no-op for a row already reading `Active`.
+                            // The `active` membership test additionally keeps a row still
+                            // waiting in the queue from starting a worker outside its slot
+                            // (`try_start_pending_download_from_known_sources` checks the
+                            // same thing, since a queued download legitimately keeps a
+                            // pending entry for source discovery).
+                            let blocked = state
+                                .pending_downloads
+                                .get(&tid)
+                                .map(|pd| pd.control.is_paused() || pd.control.is_cancelled())
+                                .unwrap_or(true)
+                                || !transfer_manager.read().await.active.contains_key(&tid);
+                            if blocked {
+                                debug!(
+                                    "Ignoring buddy callback for {tid}: paused, cancelled, or not holding an active slot"
+                                );
+                            } else if let Some(pd) = state.pending_downloads.remove(&tid) {
                                 let source_addr = SocketAddr::new(dest_ip.into(), dest_port);
                                 info!("Starting callback download {} to {source_addr}", pd.transfer_id);
 
@@ -45876,65 +46223,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     format!("{:?}", state.firewall_checker.udp_status());
                 update_publish_manager_state(&mut state);
 
-                let cached_s: Vec<KadSearchInfo> = state
-                    .search_manager
-                    .active
-                    .iter()
-                    .map(|(sid, search)| {
-                        let type_name = match search.search_type {
-                            SearchType::FindNode => "Node",
-                            SearchType::FindKeyword => "Keyword",
-                            SearchType::FindSource { .. } => "File",
-                            SearchType::FindNotes { .. } => "Notes",
-                            SearchType::FindBuddy => "Buddy",
-                            SearchType::StoreFile => "Store File",
-                            SearchType::StoreKeyword => "Store Keyword",
-                            SearchType::StoreNotes => "Store Notes",
-                        };
-                        let name = match search.search_type {
-                            SearchType::FindKeyword => "Keyword Search".to_string(),
-                            SearchType::FindSource { .. } => {
-                                // pending_downloads may have been consumed
-                                // already by `try_start_from_known`; fall
-                                // back to whatever the transfer manager
-                                // knows for a display-name.
-                                state.download_source_searches.get(sid)
-                                    .and_then(|(tid, _)| state.pending_downloads.get(tid).map(|pd| pd.file_name.clone()))
-                                    .unwrap_or_else(|| "Source Search".to_string())
-                            }
-                            SearchType::FindBuddy => "Find Buddy".to_string(),
-                            _ => String::new(),
-                        };
-                        let is_store = matches!(search.search_type,
-                            SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes);
-                        let responses = if is_store {
-                            search.closest.len() as u32
-                        } else {
-                            search.results.len() as u32
-                        };
-                        // K11: see `kad_searches_snapshot` for the same
-                        // computation — keep them in sync.
-                        let queried = search.queried.len() as u32;
-                        let responded = search.responded_during_lookup.len() as u32;
-                        let pending = search.pending.len() as u32;
-                        let load_total = queried.saturating_add(pending);
-                        let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
-                        KadSearchInfo {
-                            id: sid.0,
-                            target: search.target.to_hex(),
-                            search_type: type_name.to_string(),
-                            name,
-                            status: if search.completed { "stopping".to_string() } else { "active".to_string() },
-                            load: load_pct,
-                            load_response: responded,
-                            load_total,
-                            packets_sent: queried,
-                            request_answer: pending,
-                            responses,
-                            started_at: search.started_at,
-                        }
-                    })
-                    .collect();
+                // Was a second, hand-copied transcription of
+                // `kad_searches_snapshot` kept in sync by comment alone, and it
+                // had already drifted: the copy never grew the routing-walk
+                // branch of the `responses` count, so whichever of the poll and
+                // the cache answered first decided what FindNode/FindBuddy rows
+                // reported. Call the one implementation instead.
+                let cached_s: Vec<KadSearchInfo> = kad_searches_snapshot(&state);
 
                 let stats_snapshot = state.stats.clone();
 
@@ -51469,6 +51764,14 @@ async fn run_ember_maintenance(
     // beside it. Runs after the demote/promote passes so it prunes against the
     // membership this tick settled on, and a peer that comes back through the
     // replacement cache re-advertises on its next ping anyway.
+    // Proxy asks and grants sweep here too, because the only other caller runs
+    // while we are actively sending `PROXY_STORE` — so a node that stopped
+    // publishing (HighID acquired, library unshared, transport disabled) never
+    // swept them again and froze the map at its high-water mark for the life of
+    // the process. This tick is unconditional.
+    state
+        .ember_dht
+        .prune_proxy_asks(std::time::Instant::now());
     let forgotten = state.ember_dht.prune_peer_versions();
     if forgotten > 0 {
         debug!("Ember DHT: forgot {forgotten} advertised version range(s) for departed peers");
@@ -55921,6 +56224,30 @@ async fn handle_download_event(
             );
         }
         DownloadEvent::Verifying { transfer_id } => {
+            // A `Verifying` that was queued before the user paused or stopped
+            // must not undo them. This arm had no guard at all, unlike the
+            // `Failed` and `SourcesUpdate` arms, and `Verifying` is the worst
+            // state to be stranded in: `active_download_count` counts it, so
+            // the slot stays consumed after `pause_and_promote` already gave
+            // it away; `resume()` does not handle it, so the user cannot get
+            // out; and `compute_health_state` calls it Healthy, so no stall
+            // detection fires. Same settled-state set the `Failed` arm uses.
+            let settled_by_user = {
+                let mgr = transfer_manager.read().await;
+                mgr.get_transfer(&transfer_id).is_some_and(|t| {
+                    matches!(
+                        t.status,
+                        TransferStatus::Paused
+                            | TransferStatus::Stopped
+                            | TransferStatus::Insufficient
+                            | TransferStatus::Completed
+                            | TransferStatus::Failed
+                    )
+                })
+            };
+            if settled_by_user {
+                return;
+            }
             {
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_status(&transfer_id, crate::types::TransferStatus::Verifying);
@@ -56042,8 +56369,32 @@ async fn handle_download_event(
                 // source that is waiting perfectly healthily.
                 "friend_connect" => crate::types::SourceStatus::FriendConnect,
                 "unreachable" => crate::types::SourceStatus::Unreachable,
+                // Transient hold-offs, not failures. Both are routine — the
+                // connection semaphore saturates on any busy download
+                // (`too_many_conns`), and every source that arrives once all
+                // remaining parts are already in flight gets `parts_busy`,
+                // which is the normal endgame of a well-swarmed file. Falling
+                // to `Failed` meant the drawer deleted these perfectly healthy
+                // rows and counted them into "N failed sources hidden", and
+                // `update_source_detail` evicted them first at the 500-row cap.
+                // `set_too_many_conns` / `set_parts_busy` both arm a short
+                // retry, so `Connecting` is the honest rendering.
+                "too_many_conns" => crate::types::SourceStatus::Connecting,
+                "parts_busy" => crate::types::SourceStatus::NoNeededParts,
+                // The LowID/callback path reports its post-handshake state with
+                // this string rather than a bare "connecting".
+                "connected (callback)" => crate::types::SourceStatus::Connecting,
+                // `duplicate` deliberately lands on `Failed`: another live route
+                // already owns this peer, and `Failed` is the frontend's
+                // documented remove-on-terminal-status signal, so the redundant
+                // row disappears instead of lingering. It carries no fail_count
+                // penalty — see the `emit_source!("duplicate", ..)` site.
                 _ => crate::types::SourceStatus::Failed,
             };
+            // Both the snapshot and the event below must speak the same closed
+            // vocabulary; `status` is the worker's raw string and may not be in
+            // it. `&'static str`, so it outlives the move of `source_status`.
+            let status_wire = source_status.as_wire();
             // Every event here comes from a real download worker
             // (multi_source / transfer) reporting a *live* peer connection on
             // (ip, port). Placeholder rows we seed from KAD/server source
@@ -56161,7 +56512,7 @@ async fn handle_download_event(
                     "transfer_id": transfer_id,
                     "ip": ip,
                     "port": port,
-                    "status": status,
+                    "status": status_wire,
                     "queue_rank": queue_rank,
                     "speed": speed,
                     "transferred": transferred,

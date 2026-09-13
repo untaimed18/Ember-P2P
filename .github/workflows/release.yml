@@ -18,11 +18,19 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password set during key generation
 # (GITHUB_TOKEN is provided automatically.)
 #
-# Linux `.deb` / AppImage targets are declared in tauri.conf.json and compiled
-# on CI (`check-linux`), but this workflow still builds and signs Windows only.
-# Shipping Linux needs a second runner (ubuntu-22.04), updater-manifest work
-# for linux-x86_64, and a decision on AppImage vs .deb as the in-app updater
-# artifact. Do not add those here until that path is designed.
+# Windows and Linux are built on separate runners but signed in one place.
+# `build-linux` is an ordinary no-secret job: it produces the AppImage and the
+# `.deb` with `createUpdaterArtifacts` off and hands them over as a workflow
+# artifact. `sign-publish` then signs those bundles with the same key, in the
+# same protected environment, as the Windows ones — so the updater's signing key
+# still only ever exists inside a single job, on a single runner.
+#
+# Both Linux formats self-update. `tauri-plugin-updater` chooses its artifact
+# from a marker the bundler writes into each package it builds, so a `.deb`
+# install resolves `linux-x86_64-deb` and installs it with `dpkg -i`, while an
+# AppImage resolves `linux-x86_64-appimage` and rewrites itself in place.
+# `scripts/add-linux-platforms.mjs` composes both entries, and says there why no
+# bare `linux-x86_64` key is published.
 
 on:
   push:
@@ -99,14 +107,96 @@ jobs:
       - name: Test hardened updater
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml commands::updater::tests
 
+  build-linux:
+    name: Build Linux packages
+    needs: verify
+    runs-on: ubuntu-22.04
+    # The glibc baseline (2.35) Tauri recommends for shipping, and the same
+    # runner `check-linux` compiles on. An AppImage bundles everything except
+    # glibc and glibc is only forwards compatible, so the distro this is built
+    # on is the oldest one the result can run on.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # `xdg-utils` and `desktop-file-utils` are not in `check-linux`'s list
+      # because that job only compiles. The AppImage bundler shells out to
+      # `xdg-mime` for the `.emulecollection` file association and fails at the
+      # very last step without it.
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            pkg-config \
+            file \
+            xdg-utils \
+            desktop-file-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `createUpdaterArtifacts` is forced off because this job holds no signing
+      # key: tauri.conf.json enables it for the release, and the bundler would
+      # fail at the updater step after paying for a full compile. The bundles
+      # themselves still carry the marker that tells the updater which format
+      # each one is, so signing them in `sign-publish` loses nothing.
+      #
+      # `APPIMAGE_EXTRACT_AND_RUN` is set because the bundler runs linuxdeploy,
+      # which is itself an AppImage and therefore wants FUSE the runner has not
+      # got.
+      - name: Build packages
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          npm run tauri build -- --bundles appimage,deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-linux-x86_64
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
   sign-publish:
     name: Sign and create draft release
-    needs: [verify, build]
+    needs: [verify, build, build-linux]
     runs-on: windows-latest
     timeout-minutes: 90
     environment: release-signing
     permissions:
       contents: write
+    env:
+      # Named once because four steps have to agree on it: the download, the
+      # signing pass, the upload, and the script that reads the signatures back.
+      EMBER_LINUX_BUNDLE_DIR: src-tauri/target/linux-bundles
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,6 +249,52 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
+
+      # Under `src-tauri/target` because that is the tree `collectArtifactPaths`
+      # walks. The hardening step below resolves every platform entry in
+      # latest.json to a local file so it can hash it, and it can only hash what
+      # is on this runner — so the Linux bundles have to land somewhere it looks
+      # before their entries are added.
+      - name: Download the Linux packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ember-linux-x86_64
+          path: ${{ env.EMBER_LINUX_BUNDLE_DIR }}
+
+      # Signed here rather than on the Linux runner so the updater's signing key
+      # is reachable from exactly one job. `signer sign` writes `<file>.sig`
+      # beside each bundle, which is both what the manifest carries and what the
+      # plugin verifies the downloaded bytes against before installing.
+      #
+      # `$LASTEXITCODE` is checked explicitly: a failing native command inside
+      # `ForEach-Object` does not stop a pwsh step, and an unsigned bundle would
+      # otherwise surface much later as a missing `.sig`.
+      - name: Sign the Linux packages
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          Get-ChildItem $env:EMBER_LINUX_BUNDLE_DIR -File -Recurse |
+            Where-Object { $_.Extension -ne ".sig" } |
+            ForEach-Object {
+              npm run tauri -- signer sign $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "failed to sign $($_.Name)" }
+            }
+
+      - name: Attach the Linux packages to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $assets = Get-ChildItem $env:EMBER_LINUX_BUNDLE_DIR -File -Recurse |
+            ForEach-Object { $_.FullName }
+          gh release upload "$env:GITHUB_REF_NAME" $assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw "failed to upload the Linux packages" }
+
+      # After the upload, so the manifest can never name an asset that is not on
+      # the release, and before hardening, so the Linux entries are hashed and
+      # size-bound by the same pass as the Windows ones.
+      - name: Add the Linux targets to latest.json
+        run: node scripts/add-linux-platforms.mjs
 
       - name: Add signed security metadata to latest.json
         id: manifest

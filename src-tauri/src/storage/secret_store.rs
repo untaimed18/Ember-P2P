@@ -300,9 +300,7 @@ mod unix {
     use super::{KEY_SRC_HKDF, KEY_SRC_KEYRING, MAGIC_V2, MAGIC_V3, MAGIC_V4};
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
-    use hkdf::Hkdf;
     use rand::{rngs::OsRng, RngCore};
-    use sha2::Sha256;
     use zeroize::{Zeroize, Zeroizing};
 
     const NONCE_LEN: usize = 24;

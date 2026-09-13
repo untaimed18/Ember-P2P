@@ -533,10 +533,17 @@ pub enum ServerUdpResponse {
         challenge: u32,
         user_count: u32,
         file_count: u32,
+        /// Server's user capacity (extended status, offset 12, u32 LE). `0` if
+        /// not advertised. Mirrors `server.met`'s ST_MAXUSERS so the Servers
+        /// page can show how close a server is to full.
+        max_users: u32,
         /// Server's soft per-client file limit (extended status, offset 16,
         /// u32 LE). `0` if not advertised. eMule caps OP_OFFERFILES at this
         /// (or 200), so we learn + persist it to apply the same cap.
         soft_files: u32,
+        /// Server's hard per-client file limit (extended status, offset 20,
+        /// u32 LE). `0` if not advertised. Mirrors `server.met`'s ST_HARDFILES.
+        hard_files: u32,
         obfuscation_port_tcp: u16,
         /// Alternate UDP port the server uses for **obfuscated** UDP
         /// traffic (extended status, offset 32, u16 LE). `0` if the
@@ -602,11 +609,13 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             let user_count = cursor.read_u32::<LittleEndian>().ok()?;
             let file_count = cursor.read_u32::<LittleEndian>().ok()?;
 
+            let mut max_users: u32 = 0;
             let mut soft_files: u32 = 0;
+            let mut hard_files: u32 = 0;
             let udp_flags = if payload.len() >= 28 {
-                let _ = cursor.read_u32::<LittleEndian>(); // max_users (offset 12)
+                max_users = cursor.read_u32::<LittleEndian>().unwrap_or(0); // max_users (offset 12)
                 soft_files = cursor.read_u32::<LittleEndian>().unwrap_or(0); // soft_files (offset 16)
-                let _ = cursor.read_u32::<LittleEndian>(); // hard_files (offset 20)
+                hard_files = cursor.read_u32::<LittleEndian>().unwrap_or(0); // hard_files (offset 20)
                 cursor.read_u32::<LittleEndian>().unwrap_or(0) // udp_flags (offset 24)
             } else {
                 0
@@ -652,7 +661,9 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 challenge,
                 user_count,
                 file_count,
+                max_users,
                 soft_files,
+                hard_files,
                 obfuscation_port_tcp: tcp_obf_port,
                 obfuscation_port_udp: udp_obf_port,
                 udp_flags,
@@ -1576,6 +1587,70 @@ mod tests {
                 assert_eq!(user_count, 123);
                 assert_eq!(file_count, 456);
                 assert_eq!(obfuscation_port_tcp, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// Extended `OP_GLOBSERVSTATRES` carries the capacity limits at fixed
+    /// offsets after users/files: max_users(12), soft_files(16),
+    /// hard_files(20). Two of the three used to be read and discarded, so this
+    /// pins the offsets now that the Servers page displays them — a misread
+    /// here would surface as a plausible-looking wrong limit rather than as an
+    /// obvious failure.
+    #[test]
+    fn extended_status_response_parses_capacity_limits() {
+        let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
+        let mut payload = vec![OP_GLOBSERVSTATRES];
+        payload.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // challenge
+        payload.extend_from_slice(&5_000u32.to_le_bytes()); // users
+        payload.extend_from_slice(&900_000u32.to_le_bytes()); // files
+        payload.extend_from_slice(&20_000u32.to_le_bytes()); // max_users
+        payload.extend_from_slice(&1_000u32.to_le_bytes()); // soft_files
+        payload.extend_from_slice(&1_500u32.to_le_bytes()); // hard_files
+        payload.extend_from_slice(&0u32.to_le_bytes()); // udp_flags
+
+        match parse_server_udp_response(&payload, addr) {
+            Some(ServerUdpResponse::StatusResponse {
+                user_count,
+                file_count,
+                max_users,
+                soft_files,
+                hard_files,
+                ..
+            }) => {
+                assert_eq!(user_count, 5_000);
+                assert_eq!(file_count, 900_000);
+                assert_eq!(max_users, 20_000);
+                assert_eq!(soft_files, 1_000);
+                assert_eq!(hard_files, 1_500);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A server that answers with only the 12-byte core must leave the limits
+    /// at zero rather than inventing them from whatever follows, because
+    /// `update_capacity_limits` treats zero as "not advertised" and a non-zero
+    /// value as ground truth worth persisting to `server.met`.
+    #[test]
+    fn short_status_response_leaves_capacity_limits_zero() {
+        let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
+        let mut payload = vec![OP_GLOBSERVSTATRES];
+        payload.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+
+        match parse_server_udp_response(&payload, addr) {
+            Some(ServerUdpResponse::StatusResponse {
+                max_users,
+                soft_files,
+                hard_files,
+                ..
+            }) => {
+                assert_eq!(max_users, 0);
+                assert_eq!(soft_files, 0);
+                assert_eq!(hard_files, 0);
             }
             other => panic!("unexpected response: {other:?}"),
         }

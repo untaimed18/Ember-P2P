@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.6.3"
+version = "1.6.4"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
@@ -18,10 +18,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-# Local multi-node harness build. Enables Tauri's runtime devtools so
-# `scripts\harness.ps1` users can invoke `ember_ping_peer` and friends
-# from the webview console (Ctrl+Shift+I) without shipping that
-# capability to production builds.
+# Local multi-node harness build. Enables Tauri's runtime devtools so the
+# webview console (Ctrl+Shift+I) is available in a build that would not
+# otherwise have it.
+#
+# It does not control which commands exist. `ember_ping_peer` and friends are
+# gated on `debug_assertions`, so a harness build has to be a debug build to
+# reach them — `--features harness` on a release build gets devtools and
+# nothing to invoke from them. Gating them on this feature instead was
+# considered and rejected: a release build that carries peer-dialing IPC is
+# exactly what the gate is for, and a feature flag is too easy to turn on.
 harness = ["tauri/devtools"]
 
 [dependencies]
@@ -44,7 +50,6 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-walkdir = "2"
 md4 = "0.10"
 md-5 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
@@ -70,12 +75,37 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-deep-link = "2"
 
 tauri-plugin-process = "2"
+# Desktop notifications for the events that happen while nobody is looking at
+# the window: a download finishing, a friend coming online, a chat message.
+# Only ever reached through our own `show_notification` command — the plugin's
+# JS API is not exposed to the webview, so the text is composed (and localized)
+# in the frontend and the OS call is made here.
+tauri-plugin-notification = "2"
+# Clipboard access for the copy/paste affordances (eD2K links, Ember IDs,
+# channel invites). The webview's own `navigator.clipboard` is not a
+# substitute — WebKitGTK, the Linux webview, refuses programmatic reads
+# outright, which is what made pasting an eD2K link impossible there.
+#
+# `arboard` directly rather than `tauri-plugin-clipboard-manager`, which is a
+# thin wrapper over this same crate: the plugin's JS API would not be exposed
+# to the webview anyway (the renderer goes through our own
+# `read_clipboard_text` / `write_clipboard_text` so the text crossing the
+# boundary can be bounded), so it would only add a renderer-reachable command
+# surface this app deliberately keeps minimal. Calling it ourselves also lets
+# the blocking clipboard round-trip run on `spawn_blocking` instead of on a
+# command's async task.
+#
+# Features are the default set minus `image-data`, which pulls in `image` plus
+# PNG/BMP decoders for a clipboard-image API nothing here calls.
+# `wayland-data-control` is kept: without it the Linux backend is X11 only, so
+# a Wayland session with no XWayland — a plausible AppImage host, and the very
+# platform this was reported on — would be right back to having no clipboard.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # In-app auto-update: fetches the signed `latest.json` manifest from
 # GitHub Releases, verifies the bundle against the minisign `pubkey` in
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
 tauri-plugin-updater = "2"
 rsa = "0.9"
-signature = "2"
 num-bigint-dig = "0.8"
 opener = "0.8"
 crc32fast = "1"
@@ -83,7 +113,6 @@ zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
-lz4_flex = "0.13"
 quinn = "0.11"
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
@@ -101,7 +130,10 @@ fs2 = "0.4"
 maxminddb = "0.29"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
-notify-debouncer-mini = { version = "0.7", default-features = false }
+# Direct `notify` rather than `notify-debouncer-mini`: the mini crate drops
+# EventKind, and Linux inotify OPEN/ATTRIB from our own directory walk would
+# otherwise look like a user change and rescan in a loop.
+notify = "8"
 # Used by the AntiLeech filter to compile the user-editable pattern list
 # into matchable regex automata. `default-features = false` strips the
 # Unicode tables we don't need (we match ASCII-only client-software
@@ -138,6 +170,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # `SetThreadExecutionState`, the sleep inhibitor held during transfers
+    # (see `src/power.rs`).
+    "Win32_System_Power",
     "Win32_System_Threading",
 ] }
 

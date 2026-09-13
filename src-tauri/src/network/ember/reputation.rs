@@ -20,7 +20,6 @@ const SCORE_CORRUPT_DATA: i32 = -50;
 const SCORE_TIMEOUT: i32 = -2;
 const SCORE_SUCCESSFUL_HANDSHAKE: i32 = 3;
 const SCORE_PROTOCOL_VIOLATION: i32 = -20;
-const SCORE_DHT_RESPONSE: i32 = 1;
 
 /// Decay interval: scores decay toward zero once per hour.
 const DECAY_INTERVAL: Duration = Duration::from_secs(3600);
@@ -42,6 +41,35 @@ const MAX_TRACKED_PEERS: usize = 10_000;
 const MAX_TRACKED_IPS: usize = 10_000;
 
 /// Represents a tracked event type for reputation scoring.
+///
+/// Every variant here is scored against a peer identified by its **eD2K user
+/// hash** — that is what every production caller passes and what
+/// [`ReputationManager::is_banned`] is consulted with before an upload slot or
+/// a source re-ask is granted.
+///
+/// There is deliberately no variant for answering a DHT query, and a
+/// `DhtResponse` one was removed rather than wired up. Three things ruled it
+/// out, and all three still apply:
+///
+/// 1. **It is a different identity.** A `KadId` and an `EmberNodeId` are both
+///    `[u8; 16]`, exactly like a user hash, and a `KadId` is generated at
+///    random rather than derived from one. Scoring DHT traffic here would file
+///    one identity's behaviour under another's name, in a map read for ban
+///    decisions — and because all three are the same type, nothing would
+///    catch it.
+/// 2. **It would evict the records that matter.** [`MAX_TRACKED_PEERS`] is
+///    10,000, and a routing table plus ordinary lookup traffic meets far more
+///    distinct contacts than that in one session. DHT entries would crowd out
+///    the eD2K peers this map exists to gate.
+/// 3. **It would dilute the scale.** At the +1 such an event is worth, fifty
+///    answered queries — nothing for a well-connected node — would absorb a
+///    [`SCORE_CORRUPT_DATA`] strike, letting a peer buy immunity with cheap
+///    traffic.
+///
+/// DHT liveness is already tracked where it is also used, as `last_seen` and
+/// `failed_queries` on an `EmberContact` and as `verified` / `contact_type` on
+/// a `KadContact`. "Does this node answer queries" is a routing concern; this
+/// enum answers "should we serve this peer".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReputationEvent {
     SuccessfulChunk,
@@ -50,11 +78,6 @@ pub enum ReputationEvent {
     Timeout,
     SuccessfulHandshake,
     ProtocolViolation,
-    /// Reserved for scoring a peer's DHT/KAD query responses once that
-    /// traffic is wired to report reputation events; `SCORE_DHT_RESPONSE`
-    /// already exists for it but nothing constructs this variant yet.
-    #[allow(dead_code)]
-    DhtResponse,
 }
 
 impl ReputationEvent {
@@ -66,7 +89,6 @@ impl ReputationEvent {
             ReputationEvent::Timeout => SCORE_TIMEOUT,
             ReputationEvent::SuccessfulHandshake => SCORE_SUCCESSFUL_HANDSHAKE,
             ReputationEvent::ProtocolViolation => SCORE_PROTOCOL_VIOLATION,
-            ReputationEvent::DhtResponse => SCORE_DHT_RESPONSE,
         }
     }
 }
@@ -730,8 +752,8 @@ mod tests {
     fn tracked_count() {
         let mut mgr = ReputationManager::new();
         assert_eq!(mgr.tracked_count(), 0);
-        mgr.record_event(&[11u8; 16], ReputationEvent::DhtResponse);
-        mgr.record_event(&[12u8; 16], ReputationEvent::DhtResponse);
+        mgr.record_event(&[11u8; 16], ReputationEvent::SuccessfulChunk);
+        mgr.record_event(&[12u8; 16], ReputationEvent::SuccessfulChunk);
         assert_eq!(mgr.tracked_count(), 2);
     }
 
@@ -762,7 +784,7 @@ mod tests {
             let mut id = [0u8; 16];
             id[..8].copy_from_slice(&(i as u64).to_le_bytes());
             id[15] = 0xFF; // keep distinct from `banned_id`
-            mgr.record_event(&id, ReputationEvent::DhtResponse);
+            mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         }
 
         assert!(

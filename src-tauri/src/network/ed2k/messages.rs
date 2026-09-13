@@ -2609,6 +2609,18 @@ pub fn parse_multipacket(
         }
     }
 
+    // One answer per sub-request kind. Repeats were accepted (bounded only by
+    // `MAX_MULTIPACKET_SUBOPS`), and the upload handler loops the list building
+    // a complete answer for each entry — so a 48-byte packet carrying 32
+    // repeats of `OP_REQUESTSOURCES` fanned out into 32 full source-exchange
+    // answers, each taking the source-manager lock and cloning + sorting the
+    // source list. Keyed on the discriminant so `RequestSources2`'s payload
+    // cannot be varied to slip past the dedup.
+    {
+        let mut seen = std::collections::HashSet::new();
+        sub_opcodes.retain(|s| seen.insert(std::mem::discriminant(s)));
+    }
+
     Ok(MultiPacketRequest {
         file_hash,
         file_size,
@@ -3460,5 +3472,12 @@ mod tests {
         assert_eq!(ed2k_wire_part_count(PARTSIZE + 1), 2);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2), 3);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2 + 1), 3);
+    }
+
+    #[test]
+    fn empty_0x93_is_queue_full_not_a_multipacket_answer() {
+        assert_eq!(OP_QUEUEFULL, OP_MULTIPACKETANSWER);
+        let err = parse_multipacket_answer(&[], OP_MULTIPACKETANSWER).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
