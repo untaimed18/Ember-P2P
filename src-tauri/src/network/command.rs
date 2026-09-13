@@ -4017,10 +4017,10 @@ async fn handle_command_inner(
 
         NetworkCommand::KadConnect => {
             info!("KAD connect requested");
-            state
-                .upload_disconnected
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            // Lift the outbound stop too: downloads, friend dials and server
+            // Nothing to un-gate for uploads: the listener is not taken down by
+            // going offline, only by shutdown, which does not come back.
+            //
+            // Lift the outbound stop: downloads, friend dials and server
             // search are suspended for exactly as long as the user is offline.
             state
                 .user_offline
@@ -4396,45 +4396,38 @@ async fn handle_command_inner(
                 }
             }
 
-            // Take the upload listener down only if KAD was the last transport
-            // standing.
+            // Disconnecting does NOT stop serving uploads, and nothing here
+            // touches the upload listener.
             //
-            // This used to fire unconditionally, justified as "eMule: all
-            // uploads stop on disconnect" — which is true of eMule's *global*
-            // Disconnect, but not of turning KAD off. eMule treats KAD and eD2K
-            // as independent subsystems; running with KAD disabled is an
-            // ordinary configuration that seeds perfectly well, because serving
-            // an upload needs a shared file, the TCP listener, and — for LowID —
-            // a server to relay callbacks, none of which involve KAD. The
-            // `upload_disconnected` field comment says exactly this. So a user
-            // who disconnected KAD while logged in to a server stopped serving
-            // every peer, while their downloads carried on, and the control that
-            // did it is labelled from a KAD-only status field.
+            // eMule's own global Disconnect is three calls — `StopConnectionTry`,
+            // `serverconnect->Disconnect()` and `Kademlia::CKademlia::Stop()`
+            // (`emuleDlg.cpp`, `CemuleDlg::CloseConnection`) — and none of them
+            // goes near the listen socket. `CListenSocket::StopListening` is
+            // called from exactly one place, `OnAccept` shedding load when there
+            // are too many sockets (`ListenSocket.cpp:2014`), never from a
+            // disconnect. So a disconnected eMule keeps accepting: a peer holding
+            // a queue slot, or one that learned our address by source exchange,
+            // can still finish its download. That is why a queue survives a
+            // reconnect.
             //
-            // The flag's intent survives: a node the user has taken offline must
-            // not keep serving peers who remember its address. That condition is
-            // "no transport left", and the other half of it is already handled —
-            // `KadDisconnect` sets `user_offline` below, and
-            // `handle_server_disconnect` re-arms this gate whenever the server
-            // goes away while `user_offline` is set. So disconnecting KAD and
-            // then losing the server still stops uploads.
-            let server_online = ed2k_server_session_live(
-                state.server_connected,
-                state.server_connection.is_some(),
-                state.pending_server_connect.is_some(),
-            );
-            if !server_online {
-                state
-                    .upload_disconnected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                info!(
-                    "KAD disconnected but an eD2K server session is live — uploads stay enabled"
-                );
-            }
-            // And stop the outbound half, which the upload gate cannot speak
-            // for: no new download workers, no friend dials, no server search
-            // until the user comes back online.
+            // An earlier attempt kept uploads alive only while an eD2K server
+            // session was still live, which read as a reasonable "no transport
+            // left" rule but could never work from here: this handler sets
+            // `user_offline` immediately below and then tears the server session
+            // down itself a few lines later, and `handle_server_disconnect` used
+            // to re-raise the gate whenever the server went away while
+            // `user_offline` was set. The exemption was undone by its own handler
+            // before any upload could benefit from it, so uploads still stopped.
+            //
+            // The old justification also sat badly with what this command
+            // deliberately keeps running: the Ember overlay, its DHT, channel
+            // transfers and the publish cycle all carry on (see the note further
+            // down). A node still publishing to one DHT is not a node that has
+            // gone offline, so refusing to serve the peers who already know it
+            // was never coherent.
+            //
+            // Stop the outbound half only: no new download workers, no friend
+            // dials, no server search until the user comes back online.
             state
                 .user_offline
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4520,12 +4513,8 @@ async fn handle_command_inner(
                                     state.stats.status = NetworkStatus::Connecting;
                                     // Same rule as `KadConnect`: this is the
                                     // one path that actually moves us off
-                                    // Disconnected, so the upload listener
-                                    // and the outbound stop must be told at
-                                    // the same moment.
-                                    state
-                                        .upload_disconnected
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    // Disconnected, so the outbound stop must
+                                    // be lifted at this moment.
                                     state
                                         .user_offline
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -4571,11 +4560,6 @@ async fn handle_command_inner(
             }
             if state.stats.status == NetworkStatus::Disconnected {
                 state.stats.status = NetworkStatus::Connecting;
-                // See `KadBootstrapIp`: keep the upload gate in sync with
-                // every path off Disconnected.
-                state
-                    .upload_disconnected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             info!("Loaded {count} contacts from URL, bootstrapping");
             let _ = tx.send(Ok(format!("Loaded {count} contacts from nodes.dat")));
@@ -4610,11 +4594,8 @@ async fn handle_command_inner(
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
             if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
                 state.stats.status = NetworkStatus::Connecting;
-                // See `KadBootstrapIp`: keep the upload gate and the outbound
-                // stop in sync with every path off Disconnected.
-                state
-                    .upload_disconnected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // See `KadBootstrapIp`: keep the outbound stop in sync with
+                // every path off Disconnected.
                 state
                     .user_offline
                     .store(false, std::sync::atomic::Ordering::Relaxed);

@@ -66,6 +66,41 @@ pub const KADEMLIA_FIND_NODE: u8 = 0x0B;
 
 pub const UDP_KAD_MAXFRAGMENT: usize = 1420;
 
+/// Wire ceiling for a publish *request*, which eMule deliberately lets exceed
+/// [`UDP_KAD_MAXFRAGMENT`].
+///
+/// eMule applies its 1420-byte fragment limit only to responses it splits
+/// itself (`Indexed.cpp:651`, `:731`, `:803`); on the send path the limit is a
+/// debug-only warning (`ClientUDPSocket.cpp:506-507`). A keyword publish is
+/// built into a 50 KB buffer and packed 50 entries at a time
+/// (`Search.cpp:719-723`), so a keyword backing 150 files leaves eMule as three
+/// datagrams.
+///
+/// Holding a publish to 1420 instead turned that into 17-25 datagrams, and a
+/// storing eMule prices `KADEMLIA2_PUBLISH_KEY_REQ` at a quarter of its
+/// per-minute, per-IP budget (`PacketTracking.cpp:129-130`): it takes four in a
+/// row, silently drops everything after, and once the deficit passes three
+/// minutes' worth it bans the sender for two hours (`:188-192`). So most of a
+/// popular keyword was never stored anywhere while we recorded it as published,
+/// and a large library eventually got itself banned by the nodes closest to its
+/// hottest keys.
+///
+/// The value is bounded by what an eMule receiver can physically take: its
+/// client UDP socket reads into `BYTE buffer[8192]` (`ClientUDPSocket.cpp:72`),
+/// and anything longer is truncated. This leaves room under that for
+/// obfuscation overhead. Our own receive path takes a full 64 KiB datagram, so
+/// Ember-to-Ember is unaffected either way.
+pub const UDP_KAD_MAX_PUBLISH_FRAGMENT: usize = 7600;
+
+/// The wire ceiling that applies to `opcode`.
+const fn max_fragment_for(opcode: u8) -> usize {
+    match opcode {
+        KADEMLIA2_PUBLISH_KEY_REQ | KADEMLIA2_PUBLISH_SOURCE_REQ
+        | KADEMLIA2_PUBLISH_NOTES_REQ => UDP_KAD_MAX_PUBLISH_FRAGMENT,
+        _ => UDP_KAD_MAXFRAGMENT,
+    }
+}
+
 /// Absolute ceiling on a decompressed payload (512 KiB). The effective limit
 /// is the smaller of this and the wire-proportional bound in `decode_packet`.
 const MAX_DECOMPRESSED_SIZE: usize = 512 * 1024;
@@ -768,7 +803,8 @@ pub fn encode_packet(msg: &KadMessage) -> io::Result<Vec<u8>> {
     // Wire format: [header][opcode][body]
     // Compressed:  [0xE5][opcode][zlib(body)]   -- opcode is NOT compressed
     // Uncompressed:[0xE4][opcode][body]
-    if payload.len() > UDP_KAD_MAXFRAGMENT - 1 {
+    let max_fragment = max_fragment_for(payload.first().copied().unwrap_or(0));
+    if payload.len() > max_fragment - 1 {
         let opcode = payload[0];
         let body = &payload[1..];
         let mut compressed_body = Vec::with_capacity(body.len());
@@ -777,7 +813,7 @@ pub fn encode_packet(msg: &KadMessage) -> io::Result<Vec<u8>> {
             encoder.write_all(body)?;
             encoder.finish()?;
         }
-        if 2 + compressed_body.len() > UDP_KAD_MAXFRAGMENT {
+        if 2 + compressed_body.len() > max_fragment {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "compressed KAD packet still exceeds UDP fragment limit",

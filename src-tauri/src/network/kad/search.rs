@@ -17,7 +17,21 @@ const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_CONTACT_POOL: usize = 200;
 const LOOKUP_FORCE_FETCH_SECS: i64 = 15;
 pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
-const SOURCE_SEARCH_STOP_THRESHOLD: usize = 20;
+/// eMule Defines.h `SEARCHFILE_TOTAL`, checked at `SearchManager.cpp:275`.
+///
+/// [`SearchType::FindSource`] sends `KADEMLIA2_SEARCH_SOURCE_REQ` (see
+/// `fetch_message`), which is eMule's `CSearch::FILE` — `Search.cpp:489-512`.
+/// This used to hold 20, which is `SEARCHFINDSOURCE_TOTAL`: the limit for
+/// `CSearch::FINDSOURCE`, a different search that sends `KADEMLIA_CALLBACK_REQ`
+/// (`Search.cpp:845-870`) to locate a firewalled peer's buddy. Ember has no
+/// equivalent of that one — it takes the buddy address straight from the source
+/// record — so the constant was simply the wrong one of the pair.
+///
+/// At 20 a single well-stocked index node could satisfy the whole threshold with
+/// its first response page, so a source lookup stopped querying almost
+/// immediately and found a fraction of the sources eMule would for the same
+/// popular file.
+const SOURCE_SEARCH_STOP_THRESHOLD: usize = 300;
 const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
 /// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
 /// contacts queried. Both the stop-querying check and the reservation
@@ -31,7 +45,7 @@ pub const SEARCH_INITIAL_CONTACTS: usize = 50;
 /// eMule Defines.h search lifetime values (in seconds)
 const TIMEOUT_FIND_NODE: i64 = 45; // SEARCHNODE_LIFETIME
 const TIMEOUT_KEYWORD: i64 = 45; // SEARCHKEYWORD_LIFETIME
-const TIMEOUT_SOURCE: i64 = 45; // SEARCHFINDSOURCE_LIFETIME
+const TIMEOUT_SOURCE: i64 = 45; // SEARCHFILE_LIFETIME (same 45 s as the rest)
 const TIMEOUT_NOTES: i64 = 45; // SEARCHNOTES_LIFETIME
 const TIMEOUT_STORE_KEYWORD: i64 = 140; // SEARCHSTOREKEYWORD_LIFETIME
 const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME

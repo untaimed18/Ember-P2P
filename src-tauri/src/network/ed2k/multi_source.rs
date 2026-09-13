@@ -834,7 +834,7 @@ impl Drop for SourceAbortSet {
 }
 
 enum DropReleaseOp {
-    InProgress(Vec<usize>),
+    InProgress { parts: Vec<usize>, worker: usize },
     WriteRanges(Vec<(u64, u64)>),
     Frequency(Vec<bool>),
 }
@@ -851,11 +851,12 @@ fn spawn_drop_release_worker(
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                DropReleaseOp::InProgress(parts) => {
+                DropReleaseOp::InProgress { parts, worker } => {
                     let mut t = tracker.write().await;
                     for p in parts {
                         t.release_in_progress(p);
                     }
+                    t.clear_in_flight_requests(worker);
                 }
                 DropReleaseOp::WriteRanges(ranges) => {
                     let mut t = tracker.write().await;
@@ -881,27 +882,48 @@ fn spawn_drop_release_worker(
 /// doubles as the de-duplication set: the pipelined / resumed / stale-skip
 /// paths all re-claim the part they are already working on, and counting
 /// those again would leave a claim behind that nothing releases.
+/// Also owns this worker's published in-flight request ranges, so they are
+/// dropped on the same exit paths as its part claims. The ranges are advisory,
+/// but a worker that never withdrew them would keep steering its peers' block
+/// ordering long after it stopped asking for anything.
 struct InProgressGuard {
     tracker: Arc<RwLock<PartTracker>>,
     active: Vec<usize>,
+    worker: usize,
     drop_tx: Option<DropReleaseTx>,
 }
 
 impl InProgressGuard {
-    fn new(tracker: Arc<RwLock<PartTracker>>) -> Self {
+    fn new(tracker: Arc<RwLock<PartTracker>>, worker: usize) -> Self {
         Self {
             tracker,
             active: Vec::new(),
+            worker,
             drop_tx: None,
         }
     }
 
-    fn with_release_tx(tracker: Arc<RwLock<PartTracker>>, drop_tx: DropReleaseTx) -> Self {
+    fn with_release_tx(
+        tracker: Arc<RwLock<PartTracker>>,
+        worker: usize,
+        drop_tx: DropReleaseTx,
+    ) -> Self {
         Self {
             tracker,
             active: Vec::new(),
+            worker,
             drop_tx: Some(drop_tx),
         }
+    }
+
+    /// Publish what this worker currently has requested and unreceived, so other
+    /// workers cutting a block list can order around it.
+    async fn publish_in_flight(&self, outstanding: &[OutstandingRange]) {
+        let ranges: Vec<(u64, u64)> = outstanding.iter().map(|r| (r.start, r.end)).collect();
+        self.tracker
+            .write()
+            .await
+            .publish_in_flight_requests(self.worker, ranges);
     }
 
     /// Claim `part_idx` for this source. Idempotent per guard.
@@ -969,19 +991,24 @@ fn release_chunk_frequency(chunk_sel: Arc<RwLock<ChunkSelector>>, avail: Vec<boo
 
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
-        if self.active.is_empty() {
-            return;
-        }
         let to_clear = std::mem::take(&mut self.active);
+        let worker = self.worker;
         if let Some(tx) = &self.drop_tx {
-            if tx.send(DropReleaseOp::InProgress(to_clear.clone())).is_ok() {
+            if tx
+                .send(DropReleaseOp::InProgress {
+                    parts: to_clear.clone(),
+                    worker,
+                })
+                .is_ok()
+            {
                 return;
             }
         }
-        release_tracker_claims(&self.tracker, to_clear, |t, parts| {
+        release_tracker_claims(&self.tracker, to_clear, move |t, parts| {
             for p in parts {
                 t.release_in_progress(p);
             }
+            t.clear_in_flight_requests(worker);
         });
     }
 }
@@ -1562,6 +1589,7 @@ impl MultiSourceDownload {
                 .send(DownloadEvent::Progress {
                     transfer_id: self.transfer_id.clone(),
                     downloaded: 0,
+                    transferred: None,
                     total: 0,
                 })
                 .await;
@@ -1904,8 +1932,26 @@ impl MultiSourceDownload {
             );
         }
 
-        // Source status counters (shared by all per-source tasks)
-        let total_sources = Arc::new(AtomicU32::new(self.sources.len() as u32));
+        // Source status counters (shared by all per-source tasks).
+        //
+        // `total_sources` is the Sources column's `yy`, which is the size of the
+        // source list — a gauge of *distinct* peers, not a count of attempts. It
+        // used to be bumped once per commit below, and committing the same peer
+        // more than once is routine rather than exceptional: one released as
+        // `parts_busy` is deliberately re-offered about a minute later, an
+        // inbound callback can be adopted after its earlier session ended, and
+        // every retry round re-dials known sources once their cooldown expires.
+        // So a handful of peers walked the total upwards for as long as the
+        // download ran, and the column ended up reporting several times the
+        // sources that had ever existed. `known_sources` is what keeps it
+        // distinct; a peer that dies still counts, matching both eMule's srclist
+        // and `TransferManager::apply_source_column_counts`.
+        let mut known_sources: HashSet<(String, u16)> = self
+            .sources
+            .iter()
+            .map(|source| (source.peer_ip.clone(), source.peer_port))
+            .collect();
+        let total_sources = Arc::new(AtomicU32::new(known_sources.len() as u32));
         let active_count = Arc::new(AtomicU32::new(0));
         let queued_count = Arc::new(AtomicU32::new(0));
 
@@ -1974,7 +2020,7 @@ impl MultiSourceDownload {
                             || cur_total != last_total;
 
                         if pending_progress || sources_changed {
-                            let capped = {
+                            let (capped, wire_total) = {
                                 let t = agg_tracker.read().await;
                                 // Refresh preview-readiness while we hold the
                                 // lock: cheap, and this is the cadence at which
@@ -1983,7 +2029,7 @@ impl MultiSourceDownload {
                                     !agg_requires_final_aich
                                         && t.is_preview_ready(&agg_file_name, file_size),
                                 );
-                                t.progress_bytes().min(file_size)
+                                (t.progress_bytes().min(file_size), t.transferred())
                             };
                             // Skip the Progress emit when nothing actually
                             // changed (e.g. only `pending_progress` from a
@@ -1995,6 +2041,7 @@ impl MultiSourceDownload {
                                     .send(DownloadEvent::Progress {
                                         transfer_id: transfer_id.clone(),
                                         downloaded: capped,
+                                        transferred: Some(wire_total),
                                         total: file_size,
                                     })
                                     .await;
@@ -2021,18 +2068,19 @@ impl MultiSourceDownload {
             }
             // Final flush so the UI sees the final byte count when the
             // last source closes.
-            let capped = {
+            let (capped, wire_total) = {
                 let t = agg_tracker.read().await;
                 agg_control.set_preview_ready(
                     !agg_requires_final_aich && t.is_preview_ready(&agg_file_name, file_size),
                 );
-                t.progress_bytes().min(file_size)
+                (t.progress_bytes().min(file_size), t.transferred())
             };
             if capped != last_emitted_bytes {
                 let _ = event_tx_clone
                     .send(DownloadEvent::Progress {
                         transfer_id: transfer_id.clone(),
                         downloaded: capped,
+                        transferred: Some(wire_total),
                         total: file_size,
                     })
                     .await;
@@ -2513,33 +2561,16 @@ impl MultiSourceDownload {
                             // the lifetime of the download. Compute first,
                             // commit only on success.
                             let parts = {
-                                let cs = chunk_selector.read().await;
-                                let t = tracker.read().await;
-                                let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress_flags();
-                                let endgame_prefer =
-                                    t.remaining_count() <= 3 && t.part_count > 1;
-                                let gap_bytes = t.part_gap_bytes_vec();
-                                let avail = if source.available_parts.is_empty() {
-                                    vec![true; t.part_count]
-                                } else {
-                                    source.available_parts.clone()
-                                };
-                                let pp = self.control.is_preview_priority();
-                                let active: Vec<usize> = in_prog.iter().enumerate()
-                                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                                if let Some(p) = cs.select_part(
-                                    &completed,
-                                    &in_prog,
-                                    &avail,
-                                    &active,
-                                    &gap_bytes,
-                                    pp,
-                                    endgame_prefer,
-                                ) {
-                                    vec![p]
-                                } else {
-                                    Vec::new()
+                                match select_part_for_new_source(
+                                    &chunk_selector,
+                                    &tracker,
+                                    &source.available_parts,
+                                    self.control.is_preview_priority(),
+                                )
+                                .await
+                                {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
                                 }
                             };
                             if parts.is_empty() {
@@ -2590,7 +2621,12 @@ impl MultiSourceDownload {
                             injection_deadline = None;
                             let src_idx = next_src_idx;
                             next_src_idx += 1;
-                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                            let new_total = commit_known_source(
+                                &mut known_sources,
+                                &total_sources,
+                                &source.peer_ip,
+                                source.peer_port,
+                            );
                             let _ = event_tx
                                 .send(DownloadEvent::SourcesUpdate {
                                     transfer_id: self.transfer_id.clone(),
@@ -2793,33 +2829,16 @@ impl MultiSourceDownload {
                             // unusable callback inflates `total_sources`
                             // and the UI's source count permanently.
                             let parts = {
-                                let cs = chunk_selector.read().await;
-                                let t = tracker.read().await;
-                                let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress_flags();
-                                let endgame_prefer =
-                                    t.remaining_count() <= 3 && t.part_count > 1;
-                                let gap_bytes = t.part_gap_bytes_vec();
-                                let avail = if source.available_parts.is_empty() {
-                                    vec![true; t.part_count]
-                                } else {
-                                    source.available_parts.clone()
-                                };
-                                let pp = self.control.is_preview_priority();
-                                let active: Vec<usize> = in_prog.iter().enumerate()
-                                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                                if let Some(p) = cs.select_part(
-                                    &completed,
-                                    &in_prog,
-                                    &avail,
-                                    &active,
-                                    &gap_bytes,
-                                    pp,
-                                    endgame_prefer,
-                                ) {
-                                    vec![p]
-                                } else {
-                                    Vec::new()
+                                match select_part_for_new_source(
+                                    &chunk_selector,
+                                    &tracker,
+                                    &source.available_parts,
+                                    self.control.is_preview_priority(),
+                                )
+                                .await
+                                {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
                                 }
                             };
                             if parts.is_empty() {
@@ -2857,7 +2876,12 @@ impl MultiSourceDownload {
                             injection_deadline = None;
                             let src_idx = next_src_idx;
                             next_src_idx += 1;
-                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                            let new_total = commit_known_source(
+                                &mut known_sources,
+                                &total_sources,
+                                &source.peer_ip,
+                                source.peer_port,
+                            );
                             let _ = event_tx
                                 .send(DownloadEvent::SourcesUpdate {
                                     transfer_id: self.transfer_id.clone(),
@@ -3194,14 +3218,15 @@ impl MultiSourceDownload {
             let adopt_fs = self.file_size;
             tokio::spawn(async move {
                 while adopt_progress_rx.recv().await.is_some() {
-                    let capped = {
+                    let (capped, wire_total) = {
                         let t = adopt_tracker.read().await;
-                        t.progress_bytes().min(adopt_fs)
+                        (t.progress_bytes().min(adopt_fs), t.transferred())
                     };
                     let _ = adopt_etx
                         .send(DownloadEvent::Progress {
                             transfer_id: adopt_tid.clone(),
                             downloaded: capped,
+                            transferred: Some(wire_total),
                             total: adopt_fs,
                         })
                         .await;
@@ -3323,36 +3348,16 @@ impl MultiSourceDownload {
                 // (everything already complete / in-progress in endgame) the
                 // live stream is dropped — only one task can read a socket.
                 let parts = {
-                    let cs = chunk_selector.read().await;
-                    let t = tracker.read().await;
-                    let completed = t.completed_parts().to_vec();
-                    let in_prog = t.in_progress_flags();
-                    let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
-                    let gap_bytes = t.part_gap_bytes_vec();
-                    let avail = if source.available_parts.is_empty() {
-                        vec![true; t.part_count]
-                    } else {
-                        source.available_parts.clone()
-                    };
-                    let pp = self.control.is_preview_priority();
-                    let active: Vec<usize> = in_prog
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, &ip)| ip)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if let Some(p) = cs.select_part(
-                        &completed,
-                        &in_prog,
-                        &avail,
-                        &active,
-                        &gap_bytes,
-                        pp,
-                        endgame_prefer,
-                    ) {
-                        vec![p]
-                    } else {
-                        Vec::new()
+                    match select_part_for_new_source(
+                        &chunk_selector,
+                        &tracker,
+                        &source.available_parts,
+                        self.control.is_preview_priority(),
+                    )
+                    .await
+                    {
+                        Some(p) => vec![p],
+                        None => Vec::new(),
                     }
                 };
                 if parts.is_empty() {
@@ -3383,7 +3388,12 @@ impl MultiSourceDownload {
 
                 let src_idx = next_src_idx;
                 next_src_idx += 1;
-                let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                let new_total = commit_known_source(
+                    &mut known_sources,
+                    &total_sources,
+                    &source.peer_ip,
+                    source.peer_port,
+                );
                 let _ = event_tx
                     .send(DownloadEvent::SourcesUpdate {
                         transfer_id: self.transfer_id.clone(),
@@ -3843,14 +3853,15 @@ impl MultiSourceDownload {
             let retry_agg_tracker = tracker.clone();
             let retry_agg = tokio::spawn(async move {
                 while let Some((_source_idx, _bytes)) = retry_rx.recv().await {
-                    let capped = {
+                    let (capped, wire_total) = {
                         let t = retry_agg_tracker.read().await;
-                        t.progress_bytes().min(fs)
+                        (t.progress_bytes().min(fs), t.transferred())
                     };
                     let _ = etx
                         .send(DownloadEvent::Progress {
                             transfer_id: tid.clone(),
                             downloaded: capped,
+                            transferred: Some(wire_total),
                             total: fs,
                         })
                         .await;
@@ -4328,7 +4339,7 @@ impl MultiSourceDownload {
                 .ok()
                 .and_then(Result::ok);
 
-                let (corrected_bytes, snap) = {
+                let (corrected_bytes, corrected_wire, snap) = {
                     let mut t = tracker.write().await;
                     let mut parts_to_reopen = corrupt_parts.unwrap_or_default();
                     if parts_to_reopen.is_empty() {
@@ -4345,7 +4356,7 @@ impl MultiSourceDownload {
                         parts_to_reopen.len(),
                         t.part_count
                     );
-                    (t.completed_bytes(), t.snapshot_for_save())
+                    (t.completed_bytes(), t.transferred(), t.snapshot_for_save())
                 };
                 // Awaited save here: this is a terminal failure path and
                 // we want the .part.met on disk to reflect the reset
@@ -4356,6 +4367,10 @@ impl MultiSourceDownload {
                     .send(DownloadEvent::Progress {
                         transfer_id: self.transfer_id.clone(),
                         downloaded: corrected_bytes.min(self.file_size),
+                        // The re-open dropped Completed back by the failed
+                        // part(s); Transferred keeps every byte those parts cost,
+                        // which is the point of having both numbers.
+                        transferred: Some(corrected_wire),
                         total: self.file_size,
                     })
                     .await;
@@ -4579,11 +4594,16 @@ async fn download_parts_from_source(
     let mut src_total_parts: Option<u32> = None;
     let src_country_code: Option<String> = crate::geoip::lookup_country(&geoip, addr.ip());
     let mut ip_guard = match drop_tx.clone() {
-        Some(tx) => InProgressGuard::with_release_tx(tracker.clone(), tx),
-        None => InProgressGuard::new(tracker.clone()),
+        Some(tx) => InProgressGuard::with_release_tx(tracker.clone(), _src_idx, tx),
+        None => InProgressGuard::new(tracker.clone(), _src_idx),
     };
 
     macro_rules! emit_source {
+        // `$speed` is the rate to show against this source, and it must be 0 for
+        // every status except `transferring`. The row keeps whatever is sent here
+        // until the next event, so passing the last measured rate alongside a
+        // status that has stopped moving bytes leaves "Done" or "Queued" sitting
+        // next to a live-looking figure indefinitely.
         ($status:expr, $qr:expr, $speed:expr) => {
             if let Some(ref etx) = event_tx {
                 let _ = etx
@@ -6797,7 +6817,7 @@ async fn download_parts_from_source(
                     .filter(|(_, &ip)| ip)
                     .map(|(i, _)| i)
                     .collect();
-                if let Some(p) = cs.select_part(
+                let mut chosen = cs.select_part(
                     &completed,
                     &in_prog,
                     &avail,
@@ -6805,7 +6825,30 @@ async fn download_parts_from_source(
                     &gap_bytes,
                     pp,
                     prefer_higher,
-                ) {
+                );
+                // Relaxed retry, as `select_part_for_new_source` and the
+                // pre-pipeline path do. Without it this reported
+                // `no_needed_parts` — "peer has no parts we need" — about a peer
+                // that demonstrably holds a part we need, purely because another
+                // source had claimed it. Claims are taken before the queue wait,
+                // so the claim holder may be sitting at a queue rank for hours,
+                // and every other source holding only that part was turned away
+                // with a status saying it was useless. On a file whose peers all
+                // hold the same part that left the download at 0% with a drawer
+                // full of "No needed parts".
+                if chosen.is_none() {
+                    let free = vec![false; pc];
+                    chosen = cs.select_part(
+                        &completed,
+                        &free,
+                        &avail,
+                        &active,
+                        &gap_bytes,
+                        pp,
+                        prefer_higher,
+                    );
+                }
+                if let Some(p) = chosen {
                     debug!(
                         "Source {} pre-assigned parts unavailable, dynamically selected part {}",
                         _src_idx, p
@@ -6817,6 +6860,8 @@ async fn download_parts_from_source(
             }
         }
         if filtered_parts.is_empty() {
+            // Genuinely nothing here: either the file is complete or every part
+            // the peer advertised is one we already hold.
             emit_source!("no_needed_parts", None, 0u64);
             anyhow::bail!("peer has no parts we need");
         }
@@ -7187,7 +7232,14 @@ async fn download_parts_from_source(
                 anyhow::bail!("peer queue is full");
             }
             if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
-                emit_source!("no_needed_parts", None, 0u64);
+                // A queue state, not a parts state. eMule answers this opcode with
+                // `SetDownloadState(DS_ONQUEUE, "The remote client decided to
+                // stop/complete the transfer")` (`ListenSocket.cpp:588`): the peer
+                // has rotated us off its slot, and we are back in its queue.
+                // Reporting `no_needed_parts` here told the user the peer held
+                // nothing they needed, which is a different thing entirely and one
+                // that reads as permanent.
+                emit_source!("queued", last_rank, 0u64);
                 anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
@@ -7303,6 +7355,9 @@ async fn download_parts_from_source(
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
     let mut pending_compressed = CompressedPartAccumulator::default();
+    // Taken once, outside the receive loop: the wire-byte counter is incremented
+    // on every packet and must not cost a tracker lock each time.
+    let wire_bytes_counter = tracker.read().await.transferred_counter();
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -7426,6 +7481,20 @@ async fn download_parts_from_source(
 
             let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
 
+            // eMule's `blockCount` for this source's current speed, decided
+            // before the blocks are cut so the packet shape can honour it.
+            let (remaining, gap_rem) = {
+                let t = tracker.read().await;
+                (t.remaining_count(), t.remaining_gap_bytes())
+            };
+            let max_outstanding_blocks =
+                outstanding_blocks_for_speed_ms(measured_speed, remaining, gap_rem);
+            // A request packet carries at most 3 blocks (the wire format has
+            // exactly 3 offset slots), but it must not carry more than the whole
+            // budget either — that is the trickle case eMule's comment is about.
+            let blocks_per_packet = max_outstanding_blocks.min(MAX_BLOCKS_PER_REQUEST);
+            let max_outstanding = max_outstanding_blocks.div_ceil(blocks_per_packet);
+
             // Either resume from a pre-pipelined state (the previous
             // iteration's send-ahead already shipped the first batch
             // for this part) or compute fresh.
@@ -7441,9 +7510,10 @@ async fn download_parts_from_source(
                         p.outstanding_ranges,
                     )
                 } else {
-                    let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
+                    let (all_blocks, _ps, _pe) =
+                        compute_part_blocks_ms(&tracker, part_idx, _src_idx).await;
                     let batches: Vec<Vec<(u64, u64)>> = all_blocks
-                        .chunks(MAX_BLOCKS_PER_REQUEST)
+                        .chunks(blocks_per_packet)
                         .map(|c| c.to_vec())
                         .collect();
                     let needs_large_offsets =
@@ -7486,13 +7556,6 @@ async fn download_parts_from_source(
             // already claimed it, and another source may hold its own claim
             // for MAX_SOURCES_PER_PART-style piling on).
             ip_guard.claim(part_idx).await;
-
-            let (remaining, gap_rem) = {
-                let t = tracker.read().await;
-                (t.remaining_count(), t.remaining_gap_bytes())
-            };
-            let max_outstanding =
-                outstanding_requests_for_speed_ms(measured_speed, remaining, gap_rem);
 
             if all_blocks.is_empty() {
                 debug!(
@@ -7551,6 +7614,11 @@ async fn download_parts_from_source(
                 push_outstanding_batch(&mut outstanding_ranges, batch);
                 sent_idx += 1;
             }
+            // Republished at each send rather than on every receipt: another
+            // worker only reads this when it cuts a block list, which happens
+            // once per part, so a snapshot that lags by one block costs nothing
+            // and this keeps the tracker write lock off the receive path.
+            ip_guard.publish_in_flight(&outstanding_ranges).await;
 
             let mut blocks_received_in_current_req: usize = 0;
             let mut completed_reqs: usize = 0;
@@ -7856,8 +7924,7 @@ async fn download_parts_from_source(
                                     if expired > 0 {
                                         let before = sent_idx;
                                         while sent_idx < batches.len()
-                                            && outstanding_ranges.len()
-                                                < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                                            && outstanding_ranges.len() < max_outstanding_blocks
                                         {
                                             let batch = batches[sent_idx].clone();
                                             if write_part_request_batch(
@@ -7882,6 +7949,9 @@ async fn download_parts_from_source(
                                         if sent_idx > before {
                                             hard_deadline =
                                                 tokio::time::Instant::now() + read_timeout;
+                                            ip_guard
+                                                .publish_in_flight(&outstanding_ranges)
+                                                .await;
                                         } else if outstanding_ranges.is_empty()
                                             && sent_idx >= batches.len()
                                         {
@@ -8125,6 +8195,19 @@ async fn download_parts_from_source(
                         if !bw.acquire_download(piece_len).await {
                             anyhow::bail!("bandwidth limiter stopped");
                         }
+                        // Counted per packet, before anything decides whether these
+                        // bytes were still needed — eMule adds
+                        // `uTransferredFileDataSize` on the way into
+                        // `WriteToBuffer` (`DownloadClient.cpp:1035`,
+                        // `PartFile.cpp:3957`). Duplicates and re-fetches after a
+                        // failed part hash therefore count, which is why the figure
+                        // can exceed the file size. This is the Transferred column;
+                        // the gap map behind it is the Completed column.
+                        //
+                        // Lock-free: this fires on every packet, and the tracker's
+                        // write lock serialises every reader including the network
+                        // event loop.
+                        wire_bytes_counter.fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
 
                         // D21: never overwrite bytes we already have. With several
                         // sources in flight (and cross-part pipelining), source B
@@ -8282,6 +8365,15 @@ async fn download_parts_from_source(
                                 hex::encode(hash)
                             );
                         }
+                        // The *compressed* length, and counted here at the packet
+                        // rather than below at the write: eMule passes the same
+                        // `uTransferredFileDataSize` for packed and unpacked blocks
+                        // (`DownloadClient.cpp:1035`, `:1066`) — hence its note that
+                        // the counter "includes compressed packets" — and it counts
+                        // every packet, whereas Ember reaches the write only once
+                        // enough has inflated to be worth one.
+                        wire_bytes_counter
+                            .fetch_add(compressed.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
                         let requested_end = outstanding_ranges
                             .iter()
@@ -8335,7 +8427,7 @@ async fn download_parts_from_source(
                             );
                             continue;
                         };
-                        let Some(decompressed) = pending_compressed.append(
+                        let Some(fragment) = pending_compressed.append(
                             start,
                             Some(requested_end),
                             compressed_total_size,
@@ -8356,6 +8448,14 @@ async fn download_parts_from_source(
                             refresh_outstanding_range(&mut pending.outstanding_ranges, start);
                         }
 
+                        // Where this packet's inflated bytes belong, which is the
+                        // block start only for the first packet. Everything below
+                        // works from the fragment, not the block: the request range
+                        // is completed by whichever fragment ends on
+                        // `requested_end`, so partial blocks leave it outstanding
+                        // and simply get re-requested.
+                        let decompressed = fragment.data;
+                        let start = fragment.offset;
                         let piece_len = decompressed.len() as u64;
                         if start.saturating_add(piece_len) > file_size {
                             consecutive_bad_blocks += 1;
@@ -8519,19 +8619,19 @@ async fn download_parts_from_source(
                     // QueueFull always has an empty payload.
                     (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
                         file_req_overhead.record_download(6u64);
-                        emit_source!("queue_full", None, measured_speed);
+                        emit_source!("queue_full", None, 0u64);
                         anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
                     }
                     (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
                         file_req_overhead.record_download((6 + payload.len()) as u64);
                         let rank = u16::from_le_bytes([payload[0], payload[1]]);
-                        emit_source!("queued", Some(rank as u32), measured_speed);
+                        emit_source!("queued", Some(rank as u32), 0u64);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
                     }
                     (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
                         let rank =
                             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                        emit_source!("queued", Some(rank), measured_speed);
+                        emit_source!("queued", Some(rank), 0u64);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
                     }
                     (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
@@ -8928,15 +9028,14 @@ async fn download_parts_from_source(
                 let blocks_in_batch = if completed_reqs < batches.len() {
                     batches[completed_reqs].len()
                 } else {
-                    MAX_BLOCKS_PER_REQUEST
+                    blocks_per_packet
                 };
                 if blocks_received_in_current_req >= blocks_in_batch {
                     blocks_received_in_current_req = 0;
                     completed_reqs += 1;
                     if sent_idx < batches.len()
                         && sent_idx.saturating_sub(completed_reqs) < max_outstanding
-                        && outstanding_ranges.len()
-                            <= 2 * max_outstanding * MAX_BLOCKS_PER_REQUEST
+                        && outstanding_ranges.len() <= 2 * max_outstanding_blocks
                     {
                         let batch = &batches[sent_idx];
                         let (req_payload, req_proto, req_op) = if needs_i64 {
@@ -8956,6 +9055,7 @@ async fn download_parts_from_source(
                             .await?;
                         push_outstanding_batch(&mut outstanding_ranges, batch);
                         sent_idx += 1;
+                        ip_guard.publish_in_flight(&outstanding_ranges).await;
                     } else if sent_idx >= batches.len()
                         && pipelined_next.is_none()
                         && !batches.is_empty()
@@ -9034,6 +9134,8 @@ async fn download_parts_from_source(
                                     &part_queue,
                                     peer_supports_large_files,
                                     file_size,
+                                    blocks_per_packet,
+                                    _src_idx,
                                 )
                                 .await
                                 {
@@ -9050,7 +9152,7 @@ async fn download_parts_from_source(
 
                         if let Some(target_part_idx) = pipeline_target {
                             let (target_blocks, _ps, _pe) =
-                                compute_part_blocks_ms(&tracker, target_part_idx).await;
+                                compute_part_blocks_ms(&tracker, target_part_idx, _src_idx).await;
                             if target_blocks.is_empty() {
                                 info!(
                                 "DIAG: source {} ({}) cross-part pipeline target part {} has no remaining gaps — skipping",
@@ -9073,7 +9175,7 @@ async fn download_parts_from_source(
                             );
                             } else {
                                 let target_batches: Vec<Vec<(u64, u64)>> = target_blocks
-                                    .chunks(MAX_BLOCKS_PER_REQUEST)
+                                    .chunks(blocks_per_packet)
                                     .map(|c| c.to_vec())
                                     .collect();
                                 let target_needs_i64 = peer_supports_large_files
@@ -9180,14 +9282,18 @@ async fn download_parts_from_source(
                 }
 
                 if expired > 0 {
+                    let before = sent_idx;
                     while sent_idx < batches.len()
-                        && outstanding_ranges.len() < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                        && outstanding_ranges.len() < max_outstanding_blocks
                     {
                         let batch = batches[sent_idx].clone();
                         write_part_request_batch(&mut *writer, file_hash, &batch, needs_i64)
                             .await?;
                         push_outstanding_batch(&mut outstanding_ranges, &batch);
                         sent_idx += 1;
+                    }
+                    if sent_idx > before {
+                        ip_guard.publish_in_flight(&outstanding_ranges).await;
                     }
                 }
 
@@ -9846,7 +9952,10 @@ async fn download_parts_from_source(
         }
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
-        emit_source!("queued", None, measured_speed);
+        // Zero for the same reason the counters were just moved: reporting the
+        // last measured rate here put a live-looking speed on a row the lines
+        // above went out of their way to stop presenting as active.
+        emit_source!("queued", None, 0u64);
 
         let requeue_outcome = try_in_session_requeue(
             &mut *writer,
@@ -9971,7 +10080,7 @@ async fn download_parts_from_source(
         .await
         .ok();
 
-    emit_source!("completed", None, measured_speed);
+    emit_source!("completed", None, 0u64);
 
     // Wire-learned availability is released by `_wire_avail_guard` on the way
     // out, whichever exit this source takes. Sources with pre-existing
@@ -10038,6 +10147,22 @@ impl Drop for WireAvailabilityGuard {
 /// Dropping the oldest entry at the cap is safe: an evicted peer is simply a
 /// peer this round will not dial, and any of the four discovery channels that
 /// still knows about it will re-announce it.
+/// Record a committed source and return the distinct-source total (`yy`).
+///
+/// See `known_sources` in `run_inner` for why the Sources column's denominator
+/// has to be a set of endpoints rather than a running count of commits.
+fn commit_known_source(
+    known: &mut HashSet<(String, u16)>,
+    total: &AtomicU32,
+    ip: &str,
+    port: u16,
+) -> u32 {
+    known.insert((ip.to_string(), port));
+    let distinct = known.len() as u32;
+    total.store(distinct, Ordering::Relaxed);
+    distinct
+}
+
 fn remember_injected_source(injected: &mut Vec<DownloadSource>, source: DownloadSource) -> bool {
     if injected
         .iter()
@@ -10076,6 +10201,12 @@ async fn pre_pipeline_next_part_ms(
     part_queue: &[usize],
     peer_supports_large_files: bool,
     file_size: u64,
+    // Blocks per request packet for this source's current speed tier, so a
+    // pipelined part is cut to the same width the budget allows.
+    blocks_per_packet: usize,
+    // This source's worker index, so the block list is ordered around what the
+    // *other* workers have in flight rather than around itself.
+    worker: usize,
 ) -> Option<PipelineCandidate> {
     let cs = chunk_sel.as_ref()?.read().await;
 
@@ -10139,14 +10270,14 @@ async fn pre_pipeline_next_part_ms(
         return None;
     }
 
-    let (all_blocks, _ps, _pe) = compute_part_blocks_ms(tracker, next_part).await;
+    let (all_blocks, _ps, _pe) = compute_part_blocks_ms(tracker, next_part, worker).await;
     if all_blocks.is_empty() {
         // Race: another source filled the part between select_part and
         // now. Caller can re-try on the next iteration.
         return None;
     }
     let batches: Vec<Vec<(u64, u64)>> = all_blocks
-        .chunks(MAX_BLOCKS_PER_REQUEST)
+        .chunks(blocks_per_packet)
         .map(|c| c.to_vec())
         .collect();
     if batches.is_empty() {
@@ -10170,19 +10301,91 @@ async fn pre_pipeline_next_part_ms(
     })
 }
 
+/// Pick the part to assign a freshly arrived source, or `None` when it holds
+/// nothing we still need.
+///
+/// Two passes, matching the dynamic-extend and pre-pipeline paths: strict first,
+/// so sources spread across distinct parts whenever that is possible, then
+/// relaxed, treating every part as free.
+///
+/// The relaxed pass is what keeps a download from deadlocking at 0%. A part claim
+/// is taken just after the handshake — before the queue wait — so a source parked
+/// at a queue rank holds one for as long as it sits there. With a strict pass
+/// alone, a swarm whose peers all hold the same part (the ordinary shape early in
+/// a download, and exactly the shape of a 5-part file whose sources each have one
+/// part) went nowhere: the first source claimed the part and queued, every other
+/// source found nothing assignable, and each was deferred about a minute at a
+/// time indefinitely while the file sat at zero.
+///
+/// eMule applies no such exclusion at all. It reserves blocks only when a client
+/// actually asks for data, so a queued client never holds a part against anyone.
+/// Piling on is also cheap now that in-flight ranges are published — two sources
+/// on one part order their requests around each other instead of duplicating.
+async fn select_part_for_new_source(
+    chunk_selector: &Arc<RwLock<ChunkSelector>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    source_available: &[bool],
+    preview_priority: bool,
+) -> Option<usize> {
+    let cs = chunk_selector.read().await;
+    let t = tracker.read().await;
+    let completed = t.completed_parts().to_vec();
+    let in_prog = t.in_progress_flags();
+    let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
+    let gap_bytes = t.part_gap_bytes_vec();
+    let avail = if source_available.is_empty() {
+        vec![true; t.part_count]
+    } else {
+        source_available.to_vec()
+    };
+    let active: Vec<usize> = in_prog
+        .iter()
+        .enumerate()
+        .filter(|(_, &ip)| ip)
+        .map(|(i, _)| i)
+        .collect();
+    let strict = cs.select_part(
+        &completed,
+        &in_prog,
+        &avail,
+        &active,
+        &gap_bytes,
+        preview_priority,
+        endgame_prefer,
+    );
+    if strict.is_some() {
+        return strict;
+    }
+    let free = vec![false; t.part_count];
+    cs.select_part(
+        &completed,
+        &free,
+        &avail,
+        &active,
+        &gap_bytes,
+        preview_priority,
+        endgame_prefer,
+    )
+}
+
 /// Compute the gap-aware OP_REQUESTPARTS block list for `part_idx`.
 /// Returns (`all_blocks`, `part_start`, `part_end`). Splits each
 /// in-part gap into EMBLOCKSIZE chunks (eMule's request granularity).
 /// Used by both the cold path at the top of the per-part loop and the
 /// pipeline send-ahead.
+///
+/// Blocks another worker already has in flight are sorted to the back rather
+/// than dropped, which is how this avoids duplicate requests without giving up
+/// the endgame pile-on. See [`PartTracker::requested_by_others`].
 async fn compute_part_blocks_ms(
     tracker: &Arc<RwLock<PartTracker>>,
     part_idx: usize,
+    worker: usize,
 ) -> (Vec<(u64, u64)>, u64, u64) {
     use super::messages::EMBLOCKSIZE;
     let t = tracker.read().await;
     let (part_start, part_end) = t.part_range(part_idx);
-    let all_blocks: Vec<(u64, u64)> = t
+    let mut all_blocks: Vec<(u64, u64)> = t
         .gap_list()
         .iter()
         .filter_map(|&(gs, ge)| {
@@ -10201,10 +10404,41 @@ async fn compute_part_blocks_ms(
             blocks
         })
         .collect();
+
+    let busy = t.requested_by_others(worker);
+    if !busy.is_empty() {
+        // Stable partition, so blocks keep their ascending order within each
+        // group and a part is still filled front-to-back.
+        all_blocks.sort_by_key(|&(bs, be)| {
+            u8::from(busy.iter().any(|&(rs, re)| rs < be && re > bs))
+        });
+    }
     (all_blocks, part_start, part_end)
 }
 
-fn outstanding_requests_for_speed_ms(
+/// eMule's `blockCount`: how many blocks may be *pending* (requested and not
+/// yet received) on one source at a time.
+///
+/// This is a block budget, not a packet budget. eMule sets `blockCount` from the
+/// observed rate, tops its pending list up to that many entries, and then packs
+/// at most 3 of them into each `OP_REQUESTPARTS` (`DownloadClient.cpp:804-810`,
+/// `:837`). The distinction only shows up in the two slow tiers, and that is
+/// exactly where it matters — the comment above eMule's tier ladder
+/// (`DownloadClient.cpp:795-803`) explains why the budget drops to 1 or 2:
+///
+/// > For example, getting 360 KB (2 blocks) at 9 KB/s rate takes 40 seconds.
+/// > An uploader with 100 Mbit/s connection delivers the data in a fraction of a
+/// > second while downloader would be receiving the data long after. Should it be
+/// > longer than 40 s, uploader will disconnect on time out.
+///
+/// Ember used to divide this by 3 to get a packet count and then always fill
+/// each packet with 3 blocks, so a budget of 1 still asked for 3 — 540 KB, over
+/// two minutes of data on a 4 KB/s trickle slot. The eMule on the other end hit
+/// its send timeout and dropped us, and because we were slow we landed on a
+/// trickle slot again next time, so the slowest peers were the ones that could
+/// never finish. Every tier at or above 3 is a multiple of 3, so those are
+/// unaffected either way.
+fn outstanding_blocks_for_speed_ms(
     speed: u64,
     remaining_parts: usize,
     remaining_gap_bytes: u64,
@@ -10264,8 +10498,7 @@ fn outstanding_requests_for_speed_ms(
     } else if remaining_parts <= 4 || remaining_gap_bytes <= PARTSIZE.saturating_mul(3) {
         blocks = blocks.min(6);
     }
-    // Convert block count to packet count (3 blocks per packet), min 1
-    ((blocks + 2) / 3).max(1)
+    blocks.max(1)
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {
@@ -10573,6 +10806,27 @@ mod tests {
 
     use super::super::messages::PARTSIZE;
 
+    /// `yy` in the Sources column is the size of the source list, so committing
+    /// a peer that is already in it must not raise the total. Re-committing is
+    /// routine — a `parts_busy` source is re-offered about a minute later, an
+    /// inbound callback can be adopted after an earlier session, and every
+    /// retry round re-dials known sources — and while this was a `fetch_add`
+    /// each of those walked the number upwards for the life of the download.
+    #[test]
+    fn recommitting_a_known_source_does_not_inflate_the_total() {
+        let total = AtomicU32::new(0);
+        let mut known: HashSet<(String, u16)> = HashSet::new();
+
+        assert_eq!(commit_known_source(&mut known, &total, "10.0.0.1", 4662), 1);
+        assert_eq!(commit_known_source(&mut known, &total, "10.0.0.2", 4662), 2);
+        // The same endpoint again, as a re-injection or adopted callback does.
+        assert_eq!(commit_known_source(&mut known, &total, "10.0.0.1", 4662), 2);
+        assert_eq!(commit_known_source(&mut known, &total, "10.0.0.2", 4662), 2);
+        // A different port is a different peer, as it is everywhere else here.
+        assert_eq!(commit_known_source(&mut known, &total, "10.0.0.1", 4663), 3);
+        assert_eq!(total.load(Ordering::Relaxed), 3);
+    }
+
     fn test_tracker(name: &str, file_size: u64) -> (Arc<RwLock<PartTracker>>, PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "ember-ms-{}-{}-{name}.part",
@@ -10596,8 +10850,8 @@ mod tests {
     async fn one_sources_teardown_does_not_free_a_part_another_is_still_pulling() {
         let (tracker, path) = test_tracker("claim-refcount", PARTSIZE * 2);
         {
-            let mut a = InProgressGuard::new(tracker.clone());
-            let mut b = InProgressGuard::new(tracker.clone());
+            let mut a = InProgressGuard::new(tracker.clone(), 0);
+            let mut b = InProgressGuard::new(tracker.clone(), 1);
             a.claim(1).await;
             // The pipelined / stale-skip paths re-claim the part they are
             // already on; a second increment here would outlive the guard.
@@ -10619,13 +10873,80 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("part.met"));
     }
 
+    /// Two workers sharing a part must not ask for the same blocks, which is
+    /// what eMule's file-wide `requestedblocks_list` prevents. Ember's part
+    /// claims cannot: the endgame fallback deliberately puts a second worker on
+    /// a part already in flight, and both then cut from the same gap list.
+    #[tokio::test]
+    async fn a_second_worker_on_one_part_starts_where_the_first_left_off() {
+        use crate::network::ed2k::messages::EMBLOCKSIZE;
+        let (tracker, path) = test_tracker("req-dedup", PARTSIZE);
+
+        // Worker 0 has the first three blocks of part 0 in flight.
+        let held: Vec<(u64, u64)> = (0..3)
+            .map(|i| (i * EMBLOCKSIZE, (i + 1) * EMBLOCKSIZE))
+            .collect();
+        tracker
+            .write()
+            .await
+            .publish_in_flight_requests(0, held.clone());
+
+        let (blocks, _, _) = compute_part_blocks_ms(&tracker, 0, 1).await;
+        assert!(blocks.len() > held.len(), "part 0 has more blocks than this");
+        for (i, held_range) in held.iter().enumerate() {
+            assert_ne!(
+                blocks[i], *held_range,
+                "worker 1's block {i} duplicates what worker 0 already requested"
+            );
+        }
+        // The held blocks are still reachable, just last — nothing is dropped.
+        for held_range in &held {
+            assert!(blocks.contains(held_range));
+        }
+        // And worker 0 still sees its own ranges first: the exclusion is only
+        // ever against *other* workers.
+        let (own, _, _) = compute_part_blocks_ms(&tracker, 0, 0).await;
+        assert_eq!(own[0], held[0]);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    /// The reordering must never make a block unrequestable, or a download
+    /// stalls short of complete. When duplicate work is all that is left, it is
+    /// still offered — the endgame pile-on `in_progress_claims` documents.
+    #[tokio::test]
+    async fn every_block_stays_requestable_when_another_worker_holds_them_all() {
+        use crate::network::ed2k::messages::EMBLOCKSIZE;
+        let (tracker, path) = test_tracker("req-dedup-endgame", EMBLOCKSIZE * 2);
+
+        let all: Vec<(u64, u64)> = vec![(0, EMBLOCKSIZE), (EMBLOCKSIZE, EMBLOCKSIZE * 2)];
+        tracker
+            .write()
+            .await
+            .publish_in_flight_requests(0, all.clone());
+
+        let (blocks, _, _) = compute_part_blocks_ms(&tracker, 0, 1).await;
+        assert_eq!(
+            blocks, all,
+            "with nothing fresh left, a piling-on worker still gets every block"
+        );
+
+        // A worker that died without withdrawing its ranges must not keep
+        // steering anyone: its guard clears them on every exit path.
+        tracker.write().await.clear_in_flight_requests(0);
+        let (after, _, _) = compute_part_blocks_ms(&tracker, 0, 1).await;
+        assert_eq!(after, all);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
     #[tokio::test]
     async fn drop_release_channel_frees_in_progress_claim() {
         let (tracker, path) = test_tracker("drop-channel", PARTSIZE);
         let cs = Arc::new(RwLock::new(ChunkSelector::new(1)));
         let tx = spawn_drop_release_worker(tracker.clone(), cs);
         {
-            let mut g = InProgressGuard::with_release_tx(tracker.clone(), tx.clone());
+            let mut g = InProgressGuard::with_release_tx(tracker.clone(), 0, tx.clone());
             g.claim(0).await;
             assert!(tracker.read().await.is_in_progress(0));
             drop(g);
@@ -10649,7 +10970,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
         {
-            let mut g = InProgressGuard::with_release_tx(tracker.clone(), tx);
+            let mut g = InProgressGuard::with_release_tx(tracker.clone(), 0, tx);
             g.claim(0).await;
             assert!(tracker.read().await.is_in_progress(0));
             drop(g);
@@ -10937,37 +11258,88 @@ mod tests {
         );
     }
 
-    /// Cold-start (speed == 0) must issue at least 2 concurrent
-    /// OP_REQUESTPARTS packets when there's enough gap material in the
-    /// file to fill them. Regressing this to 1 would recreate the
-    /// multi-second cold-pipe-stall on high-bandwidth peers.
+    /// Cold-start (speed == 0) must keep enough blocks pending to fill more
+    /// than one request packet when there's enough gap material in the file.
+    /// Regressing this to a single packet would recreate the multi-second
+    /// cold-pipe-stall on high-bandwidth peers.
     #[test]
     fn outstanding_requests_cold_start_uses_mid_tier_pipeline() {
         // Normal file: plenty of remaining parts, plenty of gap bytes.
-        let packets = outstanding_requests_for_speed_ms(
+        let blocks = outstanding_blocks_for_speed_ms(
             0,
             100,                // remaining_parts > 4
             1024 * 1024 * 1024, // plenty of gap to pull from
         );
         assert!(
-            packets >= 2,
-            "cold-start packet count should be at least 2, got {packets}",
+            blocks > MAX_BLOCKS_PER_REQUEST,
+            "cold-start budget should span more than one packet, got {blocks}",
         );
     }
 
     /// ...but small-file / endgame cases (remaining_parts <= 4) must stay
     /// conservative — the inner clamp at the bottom of the function
-    /// caps to 3 packets when remaining_parts <= 2, and to 6 when
+    /// caps to 3 blocks when remaining_parts <= 2, and to 6 when
     /// <= 4, so the unknown-speed branch shouldn't leak the larger
     /// `blocks = 6` default in there and start over-requesting the tail
     /// of a small file.
     #[test]
     fn outstanding_requests_cold_start_respects_small_file_clamp() {
-        let packets = outstanding_requests_for_speed_ms(0, 2, 1024);
+        let blocks = outstanding_blocks_for_speed_ms(0, 2, 1024);
         assert_eq!(
-            packets, 1,
-            "endgame with tiny gap should stay at a single outstanding request, got {packets}",
+            blocks, 1,
+            "endgame with tiny gap should keep a single block pending, got {blocks}",
         );
+    }
+
+    /// The budget is a *block* count, and on a trickle slot it has to actually
+    /// hold the packet down to that many blocks.
+    ///
+    /// eMule drops to 1 or 2 blocks below 9 KB/s specifically so a fast uploader
+    /// does not time out waiting for a slow downloader to drain the data
+    /// (`DownloadClient.cpp:795-806`). Ember previously turned the budget into a
+    /// packet count and then filled every packet with 3 blocks, so the slowest
+    /// peers asked for 540 KB — the exact thing the tier exists to prevent.
+    #[test]
+    fn trickle_tiers_request_fewer_than_three_blocks_per_packet() {
+        let plenty = 1024 * 1024 * 1024;
+
+        // Below 4 KB/s: one block, one block per packet.
+        let blocks = outstanding_blocks_for_speed_ms(2 * 1024, 100, plenty);
+        assert_eq!(blocks, 1);
+        assert_eq!(blocks.min(MAX_BLOCKS_PER_REQUEST), 1);
+        assert_eq!(blocks.div_ceil(blocks.min(MAX_BLOCKS_PER_REQUEST)), 1);
+
+        // 4..9 KB/s: two blocks in a single packet, not three.
+        let blocks = outstanding_blocks_for_speed_ms(6 * 1024, 100, plenty);
+        assert_eq!(blocks, 2);
+        assert_eq!(blocks.min(MAX_BLOCKS_PER_REQUEST), 2);
+        assert_eq!(blocks.div_ceil(blocks.min(MAX_BLOCKS_PER_REQUEST)), 1);
+    }
+
+    /// Every tier at or above 3 is a multiple of 3, so switching the budget from
+    /// packets to blocks must leave the fast tiers byte-for-byte identical. This
+    /// is what bounds the blast radius of that change to the trickle tiers.
+    #[test]
+    fn fast_tiers_keep_their_previous_packet_geometry() {
+        let plenty = 1024 * 1024 * 1024;
+        for speed in [
+            20 * 1024,
+            100 * 1024,
+            200 * 1024,
+            500 * 1024,
+            4 * 1024 * 1024,
+        ] {
+            let blocks = outstanding_blocks_for_speed_ms(speed, 100, plenty);
+            assert_eq!(
+                blocks % MAX_BLOCKS_PER_REQUEST,
+                0,
+                "tier at {speed} B/s should be a whole number of full packets, got {blocks}",
+            );
+            let per_packet = blocks.min(MAX_BLOCKS_PER_REQUEST);
+            assert_eq!(per_packet, MAX_BLOCKS_PER_REQUEST);
+            // The old packet count was `((blocks + 2) / 3).max(1)`.
+            assert_eq!(blocks.div_ceil(per_packet), ((blocks + 2) / 3).max(1));
+        }
     }
 }
 

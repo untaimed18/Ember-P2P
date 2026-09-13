@@ -558,6 +558,10 @@ struct UploadSlotGuard {
     slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
     /// The identity this guard admitted, so Drop can release it.
     held: Option<QueueIdentity>,
+    /// Standard-order registry, so the slot this guard admits knows its
+    /// seniority when it apportions the uplink.
+    slot_order: Arc<SlotOrder>,
+    slot_seq: Option<u64>,
     armed: bool,
 }
 
@@ -596,12 +600,15 @@ impl UploadSlotGuard {
         active_count: Arc<std::sync::atomic::AtomicUsize>,
         slot_notify: Arc<tokio::sync::Notify>,
         slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
+        slot_order: Arc<SlotOrder>,
     ) -> Self {
         Self {
             active_count,
             slot_notify,
             slot_holders,
             held: None,
+            slot_order,
+            slot_seq: None,
             armed: false,
         }
     }
@@ -637,6 +644,7 @@ impl UploadSlotGuard {
                 Ok(_) => {
                     holders.insert(identity.clone());
                     self.held = Some(identity.clone());
+                    self.slot_seq = Some(self.slot_order.register());
                     self.armed = true;
                     return true;
                 }
@@ -650,6 +658,14 @@ impl UploadSlotGuard {
         if let Some(id) = self.held.take() {
             self.slot_holders.lock().remove(&id);
         }
+        if let Some(seq) = self.slot_seq.take() {
+            self.slot_order.release(seq);
+        }
+    }
+
+    /// This slot's standard-order sequence, or `None` before it is granted.
+    fn slot_seq(&self) -> Option<u64> {
+        self.slot_seq
     }
 
     fn is_active(&self) -> bool {
@@ -1010,8 +1026,23 @@ const MAX_TOTAL_CONNECTIONS: usize = 100;
 /// sessions from that IP that only fit because of this reserve are rejected in
 /// [`allow_long_lived_session_under_admission`].
 const RESERVED_PORT_TEST_CONNECTIONS: usize = 4;
-/// Maximum number of peers waiting in the upload queue
-const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
+/// Maximum number of peers waiting in the upload queue — eMule's
+/// `thePrefs.GetQueueSize()`, whose default is `QueueSizePref` 50 × 100
+/// (`Preferences.cpp:2173-2174`).
+///
+/// This was 500, a tenth of eMule's, while [`HARD_UPLOAD_QUEUE_SIZE`] below
+/// reproduced eMule's derivation faithfully — so a node sharing anything popular
+/// began refusing peers at 500 waiters where eMule accepts 5000, and the
+/// soft→hard scoring gate that exists to ration those last places was doing its
+/// work an order of magnitude too early.
+///
+/// The cost of the larger list is the O(n) rank computation
+/// ([`compute_queue_rank`], and the per-session snapshot that scores every
+/// connected waiter): about a millisecond per pass at this size rather than a
+/// tenth of one. eMule pays the same shape in `GetWaitingPosition` and
+/// `CUploadQueue::Process`, and the per-IP cap plus the soft-zone gate still
+/// bound who gets in.
+const MAX_UPLOAD_QUEUE_SIZE: usize = 5000;
 /// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
@@ -1065,6 +1096,36 @@ const MAX_UP_CLIENTS_ALLOWED: usize = 100;
 /// target grows by 1 KiB/s per slot up to this cap, which limits how many extra
 /// slots the dynamic calculation opens. Matches CUploadQueue::GetTargetClientDataRate.
 const UPLOAD_CLIENT_MAXDATARATE: u64 = 25 * 1024;
+
+/// eMule's `minFragSize`, the smallest amount the throttler hands a slot when
+/// it is that slot's turn (`UploadBandwidthThrottler.cpp:437-443`). Below
+/// [`UPLOAD_SLOW_RATE_THRESHOLD`] eMule drops to one 536-byte packet at a time
+/// for a smoother stream; above it, two 1300-byte fragments are sent together
+/// so the pair can share one ACK.
+const UPLOAD_MIN_FRAG_SIZE: u64 = 1300;
+const UPLOAD_MIN_FRAG_SIZE_SLOW: u64 = 536;
+const UPLOAD_SLOW_RATE_THRESHOLD: u64 = 6 * 1024;
+
+/// A slot that has had nothing on the wire for this long becomes eligible for
+/// the trickle pass (`UploadBandwidthThrottler.cpp:542`).
+const TRICKLE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Deadline the in-progress block is paced against when deciding how few bytes
+/// will keep the peer from timing out (`EMSocket.cpp:872`). The peer's own read
+/// timeout for a client it is downloading from is `CONNECTION_TIMEOUT` plus
+/// `4 * CONNECTION_TIMEOUT` (`Opcodes.h:63`, `ListenSocket.cpp:136-142`) — 200 s
+/// — so a block delivered inside this window never trips it.
+const TRICKLE_BLOCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Absolute keepalive floor: once this long has passed since any byte went out,
+/// one byte is owed even when the block is comfortably ahead of schedule, so the
+/// socket itself cannot time out (`EMSocket.cpp:884-887`).
+const TRICKLE_KEEPALIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a slot over its share sleeps before re-testing the trickle and
+/// leftover escapes. Half the limiter's refill interval, so unclaimed budget is
+/// noticed within a tick of appearing.
+const SLOT_PACING_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 /// m7: Hard queue limit = soft + max(soft, 800) / 4.  Between soft and hard,
 /// only clients with above-average score are admitted; above hard, all rejected.
 const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
@@ -1084,7 +1145,13 @@ const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
 /// must not drift. A 60 s download-side reask floor against this 590 s ban
 /// threshold is what got Ember banned by its own peers.
 const MIN_REQUESTTIME_SECS: u64 = super::dead_sources::MIN_REQUESTTIME_SECS as u64;
-const BADCLIENTBAN: u32 = 2;
+/// eMule `BADCLIENTBAN` (`Opcodes.h:115`): strikes inside
+/// [`MIN_REQUESTTIME_SECS`] before a peer is banned.
+///
+/// This was 2, so Ember banned on half the evidence eMule requires — and the
+/// resulting ban is per-IP and durable, where eMule's lapses in two hours and
+/// is not persisted. Two mistimed re-asks an hour apart were enough.
+const BADCLIENTBAN: u32 = 4;
 
 struct FileRequestTracker {
     /// Maps (peer_identity, file_hash) -> (last_request_time, bad_request_count)
@@ -1122,12 +1189,30 @@ impl FileRequestTracker {
     /// seeding reached the threshold, and the result is a seven-day persisted
     /// IP ban — so an unattended node progressively banned its own swarm, at a
     /// rate any peer sitting in the queue could accelerate.
-    fn record_request(&mut self, identity: QueueIdentity, file_hash: [u8; 16]) -> bool {
+    ///
+    /// `is_friend_slot` and `downloading_from_peer` reproduce the two exemptions
+    /// in eMule's `AddRequestCount` (`UploadClient.cpp:604-605`): a friend
+    /// holding a friend slot is never struck at all, and a peer we are currently
+    /// downloading *from* does not accrue a strike even inside the window,
+    /// because it is helping us. Ember had neither, so a peer feeding us a file
+    /// could be banned for asking about one of ours.
+    fn record_request(
+        &mut self,
+        identity: QueueIdentity,
+        file_hash: [u8; 16],
+        is_friend_slot: bool,
+        downloading_from_peer: bool,
+    ) -> bool {
         let now = std::time::Instant::now();
         let key = (identity, file_hash);
         if let Some((last_time, bad_count)) = self.entries.get_mut(&key) {
-            if last_time.elapsed().as_secs() < MIN_REQUESTTIME_SECS {
-                *bad_count += 1;
+            if last_time.elapsed().as_secs() < MIN_REQUESTTIME_SECS && !is_friend_slot {
+                // eMule adds `(GetDownloadState() != DS_DOWNLOADING)`, i.e. zero
+                // while the peer is uploading to us, which still refreshes the
+                // timestamp below without moving the counter.
+                if !downloading_from_peer {
+                    *bad_count += 1;
+                }
                 *last_time = now;
                 return *bad_count >= BADCLIENTBAN;
             }
@@ -1271,6 +1356,76 @@ fn keep_queue_row_after_slot_grant(
 /// queue rank for their peers instead of a placeholder 0.
 pub(crate) type UploadQueueRef = Arc<tokio::sync::Mutex<Vec<QueueEntry>>>;
 
+/// Unbinds a session's queue row and slot-rate entry however the session ends.
+///
+/// `serve_peer` does this inline on its normal exits, but that is ordinary
+/// imperative code and a panic inside the serve loop unwinds straight past it.
+/// The accept site catches the unwind, so the task survives while the row keeps
+/// `current_addr` pointing at a socket nobody is reading. Such a row still counts
+/// as a *connected* waiter in `try_add_up_next_client`, where it inflates
+/// `best_connected_score` and can stop a genuinely dialable HighID from being
+/// dialed — while never being promotable itself, because there is no session
+/// listening. `UploadSlotGuard` already covers the slot; this covers the two
+/// pieces of bookkeeping beside it.
+///
+/// eMule needs no equivalent: `CUploadQueue::Process` sweeps every ~100 ms and
+/// evicts clients whose socket has gone (`UploadQueue.cpp:300-303`), so no
+/// per-client cleanup path is load-bearing there.
+struct SessionRowGuard {
+    upload_queue: UploadQueueRef,
+    slot_rates: SlotRateRegistry,
+    identity: QueueIdentity,
+    peer_addr: SocketAddr,
+    armed: bool,
+}
+
+impl SessionRowGuard {
+    fn new(
+        upload_queue: UploadQueueRef,
+        slot_rates: SlotRateRegistry,
+        identity: QueueIdentity,
+        peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            upload_queue,
+            slot_rates,
+            identity,
+            peer_addr,
+            armed: true,
+        }
+    }
+
+    /// The normal teardown ran, so there is nothing left to do.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionRowGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.slot_rates.lock().remove(&self.peer_addr);
+        // The queue is behind an async mutex, so the unbind has to happen on a
+        // detached task. It is idempotent — only a row still bound to *this*
+        // address is touched — and the row itself is deliberately kept, exactly
+        // as the normal path keeps it, so seniority and the `add_next_connect`
+        // fast path survive a panic.
+        let queue = self.upload_queue.clone();
+        let identity = self.identity.clone();
+        let peer_addr = self.peer_addr;
+        tokio::spawn(async move {
+            let mut queue = queue.lock().await;
+            for entry in queue.iter_mut() {
+                if entry.identity == identity && entry.current_addr == Some(peer_addr) {
+                    entry.current_addr = None;
+                }
+            }
+        });
+    }
+}
+
 /// eMule-style upload parts tracking. Records how many bytes of each
 /// ED2K part (`PARTSIZE`, 9.28 MB) we have actually delivered to the
 /// peer during the current session, so the UI can paint a per-chunk
@@ -1405,7 +1560,25 @@ pub(crate) struct QueueEntry {
     pub(crate) is_high_id: bool,
     pub(crate) user_hash: [u8; 16],
     pub(crate) file_hash: [u8; 16],
+    /// When this peer's wait began — its seniority, and the input to
+    /// `score_queue_entry`. Only reset when a seniority claim is refused.
     pub(crate) join_time: std::time::Instant,
+    /// When this peer last asked us for the file, i.e. eMule's
+    /// `m_dwLastUpRequest` (`UpdownClient.h:550`).
+    ///
+    /// Deliberately separate from `join_time`, because eMule purges the waiting
+    /// list on this clock (`UploadQueue.cpp:119`) while accruing wait time on the
+    /// other. Both used to be `join_time` here, so `MAX_PURGEQUEUETIME_SECS`
+    /// evicted every waiter one hour after it arrived no matter how faithfully it
+    /// re-asked — and a peer re-asks every `FILEREASKTIME` (~29 min) precisely to
+    /// hold its place. The queue was therefore a rolling one-hour window in which
+    /// no accrued wait or credit standing could ever mature into a turn, and a
+    /// peer behind a long queue was guaranteed to be dropped before reaching the
+    /// front. eMule refreshes this from all three re-ask paths: TCP
+    /// `AddClientToQueue` (`UploadQueue.cpp:526`), UDP `OP_REASKFILEPING`
+    /// (`ClientUDPSocket.cpp:255`) and `OP_REASKCALLBACKTCP`
+    /// (`ListenSocket.cpp:1428`).
+    pub(crate) last_request: std::time::Instant,
     /// eMule m_bAddNextConnect: Low-ID client that scored highest while
     /// disconnected; gets priority slot on reconnect.
     pub(crate) add_next_connect: bool,
@@ -1472,6 +1645,7 @@ fn queue_entry_from_hello(
         user_hash: peer_user_hash,
         file_hash,
         join_time,
+        last_request: std::time::Instant::now(),
         add_next_connect: false,
         emule_version: hello_caps.emule_version_min,
         is_friend_slot,
@@ -1885,8 +2059,9 @@ pub enum UploadEventKind {
         reason: String,
         /// When set, the IP is also recorded against this peer's DB record
         /// so a later manual `unban_peer` clears it (ban/unban symmetry).
-        /// `None` for anonymous abuse auto-bans (AddRequestCount etc.),
-        /// whose 7-day TTL self-heals and which have no manual unban path.
+        /// `None` for anonymous abuse auto-bans (AddRequestCount etc.), which
+        /// have no manual unban path and instead self-heal on eMule's
+        /// `CLIENTBANTIME` — see `AUTO_BAN_TTL_BEHAVIOUR_SECS`.
         user_hash: Option<[u8; 16]>,
     },
 }
@@ -2040,12 +2215,14 @@ struct UploadHandler {
     push_grant_dials: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-slot smoothed upload rates for dynamic slot decisions.
     slot_rates: SlotRateRegistry,
+    /// Standard-order slot list backing the per-slot uplink apportionment.
+    slot_order: Arc<SlotOrder>,
     /// Active Ember friend sessions: ember_hash -> outbound packet sender
     ember_sessions: EmberSessionMap,
     /// Set to true when the network is disconnected; upload handlers check
     /// this to reject new file requests and terminate active sessions (eMule
     /// behavior: all upload activity stops on disconnect).
-    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free counter the per-connection upload tasks bump on every
     /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES`
     /// packet. Ember `OP_EMBER_SOURCEEXCHANGE` is counted on
@@ -2190,6 +2367,225 @@ impl AichCache {
     }
 }
 
+/// eMule `CUploadQueue::GetTargetClientDataRate` (`UploadQueue.cpp:397-409`):
+/// the per-slot rate the uplink is assumed to be able to feed. Three slots or
+/// fewer are budgeted 3 KiB/s each; past that it grows 1 KiB/s per slot up to
+/// [`UPLOAD_CLIENT_MAXDATARATE`]. `min_datarate` selects eMule's three-quarter
+/// variant, which is what its slot-count and apportionment arithmetic divides by.
+fn target_client_data_rate(open_slots: usize, min_datarate: bool) -> u64 {
+    let full = if open_slots <= 3 {
+        3 * 1024
+    } else {
+        (open_slots as u64 * 1024).min(UPLOAD_CLIENT_MAXDATARATE)
+    };
+    if min_datarate {
+        full * 3 / 4
+    } else {
+        full
+    }
+}
+
+/// eMule's `(minFragSize, doubleSendSize)` pair for a given uplink rate
+/// (`UploadBandwidthThrottler.cpp:437-443`). `allowed_rate` must be a real rate;
+/// callers handle "unlimited" before they get here.
+fn upload_frag_sizes(allowed_rate: u64) -> (u64, u64) {
+    if allowed_rate < UPLOAD_SLOW_RATE_THRESHOLD {
+        (UPLOAD_MIN_FRAG_SIZE_SLOW, UPLOAD_MIN_FRAG_SIZE_SLOW)
+    } else {
+        (UPLOAD_MIN_FRAG_SIZE, UPLOAD_MIN_FRAG_SIZE * 2)
+    }
+}
+
+/// eMule's `maxSlot` (`UploadBandwidthThrottler.cpp:561-562`): how many slots
+/// the uplink can carry at the target per-slot rate, and therefore how many get
+/// a share of it in the equal-share pass.
+///
+/// This is where eMule answers "what if the rate divided by the slot count falls
+/// below the per-slot minimum" — it does not thin every slot's share, it feeds
+/// fewer slots. The remainder stay open on the trickle and whatever the fed
+/// slots leave behind.
+fn fully_fed_slot_count(allowed_rate: u64, open_slots: usize) -> usize {
+    let target = target_client_data_rate(open_slots, true).max(1);
+    open_slots.min((allowed_rate / target) as usize)
+}
+
+/// The share of the uplink owed to the slot at `slot_index` in standard order,
+/// in bytes per second, or `None` for a slot outside the equal-share pass.
+///
+/// Index 0 is the oldest slot: eMule appends new slots to the end of
+/// `m_StandardOrder_list` (`UploadQueue.cpp:168`) and both the equal-share and
+/// leftover passes walk it from the front, so seniority — not fairness — decides
+/// who is fed when the uplink cannot cover everyone.
+///
+/// The shares sum to `allowed_rate`, which is what makes the pacing safe to
+/// enforce: nothing is reserved for a slot that does not exist.
+fn slot_share_per_sec(allowed_rate: u64, open_slots: usize, slot_index: usize) -> Option<u64> {
+    let max_slot = fully_fed_slot_count(allowed_rate, open_slots);
+    if slot_index >= max_slot {
+        return None;
+    }
+    Some((allowed_rate / max_slot as u64).max(1))
+}
+
+/// eMule `CEMSocket::GetNeededBytes` (`EMSocket.cpp:852-895`): the fewest bytes
+/// this slot must put on the wire now to keep its peer from timing out.
+///
+/// The schedule is per *packet*, not per block — `sizetotal` is the size of the
+/// packet currently being written to the socket (`sendblen`, set from
+/// `GetRealPacketSize` at `EMSocket.cpp:592`), and the clock restarts each time
+/// one finishes (`EMSocket.cpp:677`). So this delivers one packet inside
+/// [`TRICKLE_BLOCK_DEADLINE`], and a starved slot's whole allowance is that
+/// packet size divided by the deadline.
+///
+/// Zero means the packet is ahead of schedule and the slot can be left alone —
+/// which is what stops the trickle from becoming a second bandwidth allocator
+/// running alongside the equal-share pass.
+///
+/// eMule's 45-second accelerated deadline applies when a control packet is
+/// queued behind the block. Ember's session loop answers control packets between
+/// blocks rather than queueing them alongside, so there is never one waiting and
+/// the deadline is always the full 90 seconds.
+fn trickle_needed_bytes(
+    bytes_left: u64,
+    bytes_total: u64,
+    since_packet_start: std::time::Duration,
+    since_last_send: std::time::Duration,
+) -> u64 {
+    if bytes_left == 0 || bytes_total == 0 {
+        return 0;
+    }
+    let total_ms = TRICKLE_BLOCK_DEADLINE.as_millis();
+    let elapsed_ms = since_packet_start.as_millis();
+    if elapsed_ms >= total_ms {
+        return bytes_left;
+    }
+    let left_ms = total_ms - elapsed_ms;
+    if left_ms * u128::from(bytes_total) >= total_ms * u128::from(bytes_left) {
+        return u64::from(since_last_send >= TRICKLE_KEEPALIVE_AFTER);
+    }
+    let decval = (left_ms * u128::from(bytes_total) / total_ms) as u64;
+    if decval == 0 {
+        return bytes_left;
+    }
+    if decval < bytes_left {
+        // Round up, as eMule does.
+        bytes_left - decval + 1
+    } else {
+        1
+    }
+}
+
+/// Standard-order registry of the slots currently serving file data.
+///
+/// eMule's throttler owns one such list and walks it from a single thread;
+/// Ember's slots are independent tasks, so the list is shared and each task
+/// looks up its own position to work out what it is owed. Registration happens
+/// at slot grant and release at slot drop, both inside [`UploadSlotGuard`], so
+/// the order tracks `active_count` exactly.
+#[derive(Default)]
+struct SlotOrder {
+    inner: parking_lot::Mutex<SlotOrderState>,
+}
+
+#[derive(Default)]
+struct SlotOrderState {
+    /// Slot sequence numbers, oldest first.
+    order: Vec<u64>,
+    next_seq: u64,
+}
+
+impl SlotOrder {
+    fn register(&self) -> u64 {
+        let mut state = self.inner.lock();
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.order.push(seq);
+        seq
+    }
+
+    fn release(&self, seq: u64) {
+        let mut state = self.inner.lock();
+        if let Some(pos) = state.order.iter().position(|&s| s == seq) {
+            state.order.remove(pos);
+        }
+    }
+
+    /// This slot's `(index, slot count)` under one lock, so the share it
+    /// computes cannot be derived from two different snapshots. `None` once the
+    /// slot has been released.
+    fn position(&self, seq: u64) -> Option<(usize, usize)> {
+        let state = self.inner.lock();
+        let index = state.order.iter().position(|&s| s == seq)?;
+        Some((index, state.order.len()))
+    }
+}
+
+/// Per-slot pacing state: this slot's end of the shared uplink.
+///
+/// Held by the session task and consulted by
+/// [`UploadHandler::acquire_slot_bandwidth`] before every data packet. There is
+/// no partially-sent-packet state to carry, because `write_packet_async` puts a
+/// chunk on the wire whole or not at all — where eMule's socket can be left
+/// mid-packet, which is what its `sendblen`/`sent` pair tracks.
+struct SlotBandwidth {
+    /// Virtual clock: the earliest instant this slot may put its next byte on
+    /// the wire, advanced by `bytes / share` on every grant.
+    send_by: std::time::Instant,
+    last_send: std::time::Instant,
+}
+
+impl SlotBandwidth {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            send_by: now,
+            last_send: now,
+        }
+    }
+
+    /// Whether the trickle pass owes this slot the `bytes`-sized packet it is
+    /// holding.
+    ///
+    /// eMule dribbles out the prefix `GetNeededBytes` asks for and leaves the
+    /// rest of the packet in the socket buffer. An ed2k packet is atomic on
+    /// Ember's wire, so the slot instead waits until the whole packet is what it
+    /// is owed. That would put a starved slot at one packet per
+    /// [`TRICKLE_BLOCK_DEADLINE`], long enough for a peer past its first
+    /// `4 * CONNECTION_TIMEOUT` of downloading to hit the plain 40 s socket
+    /// timeout it falls back to (`ListenSocket.cpp:136-147`) — so
+    /// [`TRICKLE_KEEPALIVE_AFTER`], the point at which eMule will spend a byte
+    /// purely to keep a socket alive, is the backstop.
+    fn wants_trickle(&self, now: std::time::Instant, bytes: u64) -> bool {
+        let since_last_send = now.duration_since(self.last_send);
+        if since_last_send < TRICKLE_AFTER {
+            return false;
+        }
+        if since_last_send >= TRICKLE_KEEPALIVE_AFTER {
+            return true;
+        }
+        trickle_needed_bytes(bytes, bytes, since_last_send, since_last_send) >= bytes
+    }
+
+    /// Book `bytes` against this slot's share.
+    ///
+    /// `send_by` is floored at `now` so an idle slot banks no credit — eMule's
+    /// budget is global and likewise carries nothing forward per slot. A slot
+    /// with no share is held to the trickle's own rate, one packet per
+    /// [`TRICKLE_BLOCK_DEADLINE`], which is all `GetNeededBytes` ever grants it.
+    fn charge(&mut self, bytes: u64, share: Option<u64>) {
+        let now = std::time::Instant::now();
+        self.last_send = now;
+        let owed = match share {
+            Some(share) => std::time::Duration::from_nanos(
+                (u128::from(bytes) * 1_000_000_000 / u128::from(share.max(1)))
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            None => TRICKLE_BLOCK_DEADLINE,
+        };
+        self.send_by = self.send_by.max(now) + owed;
+    }
+}
+
 /// EWMA-based per-session upload rate tracker.
 /// α = 0.3 gives roughly a 3-sample half-life, balancing responsiveness
 /// and smoothness for the dynamic slot opener.
@@ -2247,15 +2643,17 @@ struct AbuseEntry {
     banned_until: Option<std::time::Instant>,
 }
 
-/// eMule: BAN_TIMEOUT = 2 hours
-const BAN_DURATION_SECS: u64 = 7200;
+/// eMule: BAN_TIMEOUT = 2 hours. Shared with the persisted mirror
+/// (`AUTO_BAN_TTL_BEHAVIOUR_SECS`) so a peer this tracker has forgiven is not
+/// still blocked by the database.
+pub(crate) const BAN_DURATION_SECS: u64 = 7200;
 /// Max requests per 5-minute window before auto-ban, per address.
 ///
 /// eMule has no connection-rate ban at all, so this is ours and it must err
 /// heavily toward false negatives: the cost of missing a flood is small (the
 /// concurrency caps already bound it) while the cost of a false positive is a
-/// two-hour ban plus a persisted `PeerAutoBanned` entry for *every* client
-/// behind the address. `AbuseTracker` keys on the IP with no identity
+/// two-hour ban for *every* client behind the address — in memory here and, at
+/// the same lifetime, in the database via `PeerAutoBanned`. `AbuseTracker` keys on the IP with no identity
 /// component, and [`MAX_CONNECTIONS_PER_IP`] / [`MAX_QUEUE_ENTRIES_PER_IP`]
 /// both deliberately allow several distinct clients per address — so a CGNAT,
 /// campus or VPN egress hosting a handful of eD2K clients could trip a flat 40
@@ -2602,6 +3000,44 @@ pub(crate) fn compute_queue_rank(
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
 pub(crate) const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
 
+/// Wait time to score an *uploading* peer with, when deciding whether a waiter
+/// should preempt it.
+///
+/// eMule scores a client that already holds a slot with `GetScore(true, true)`,
+/// whose base is its accrued wait plus a flat bonus: 30 minutes while it is
+/// inside the first 15 minutes of the upload, 15 minutes after that
+/// (`UploadClient.cpp:212-220`). The comment there gives the reason in one line —
+/// *"the first 15 min download time counts as 15 min waiting time and you get a
+/// 15 min bonus while you are in the first 15 min :) (to avoid 20 sec
+/// downloads)"*.
+///
+/// Without it, Ember compared a *frozen* wait-at-grant against live waiters, and
+/// that value is zero on the two commonest grants: a HighID push-grant sets it to
+/// zero outright, and an empty-queue direct add has nothing accrued. Zero times
+/// the preempt factor is still zero, so the first peer to arrive on an idle node
+/// was thrown off roughly ten seconds after a second peer queued, having
+/// transferred almost nothing — then the same thing happened to its replacement.
+///
+/// Note also that eMule only score-preempts at all when `TransferFullChunks` is
+/// off, and it defaults to on (`Preferences.cpp:2147`), in which case sessions end
+/// on `SESSIONMAXTRANS` instead. So this bonus is the *lenient* reading of
+/// eMule's behaviour, not the strict one.
+fn uploading_score_wait_secs(
+    wait_at_grant_secs: u64,
+    session_elapsed: Option<std::time::Duration>,
+) -> u64 {
+    const FIRST_PHASE: u64 = 15 * 60;
+    const EARLY_BONUS: u64 = 30 * 60;
+    const LATER_BONUS: u64 = 15 * 60;
+    let elapsed = session_elapsed.map(|d| d.as_secs()).unwrap_or(0);
+    let bonus = if elapsed < FIRST_PHASE {
+        EARLY_BONUS
+    } else {
+        LATER_BONUS
+    };
+    wait_at_grant_secs.saturating_add(elapsed).saturating_add(bonus)
+}
+
 /// Pure decision core of `UploadHandler::purge_unshared_queue_entries`, split
 /// out so the eviction rule can be unit-tested without constructing a full
 /// `UploadHandler` (which needs channels, sockets, a GeoIP reader, etc.).
@@ -2729,6 +3165,23 @@ pub(crate) async fn udp_queue_rank_for_peer(
         let guard = upload_queue.lock().await;
         guard.clone()
     };
+    // A UDP re-ask is the peer holding its place, so it has to refresh the purge
+    // clock exactly as the TCP path does — eMule stamps `SetLastUpRequest` here
+    // too (`ClientUDPSocket.cpp:255`). Done as a separate short critical section
+    // rather than while scoring, to keep the "queue lock is never held across an
+    // await" rule above intact.
+    {
+        let mut guard = upload_queue.lock().await;
+        let now = std::time::Instant::now();
+        for entry in guard.iter_mut() {
+            if entry.file_hash == *file_hash
+                && (matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
+                    || entry.current_addr.map(|a| a.ip() == from_ip).unwrap_or(false))
+            {
+                entry.last_request = now;
+            }
+        }
+    }
     let cm = credit_manager.read().await;
     let idx = local_index.read().await;
     let mut best: Option<&QueueEntry> = None;
@@ -2844,7 +3297,7 @@ pub async fn start_upload_server(
     ember_hash: [u8; 16],
     ed25519_public_key: [u8; 32],
     ed25519_secret_key: [u8; 32],
-    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     // Queue handle created by the caller so other subsystems (UDP REASKACK
     // rank, diagnostics) can read the same shared queue state.
     upload_queue: UploadQueueRef,
@@ -2894,6 +3347,7 @@ pub async fn start_upload_server(
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let slot_notify = Arc::new(tokio::sync::Notify::new());
     let slot_rates: SlotRateRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let slot_order: Arc<SlotOrder> = Arc::new(SlotOrder::default());
 
     let server = Arc::new(UploadHandler {
         local_index,
@@ -2957,8 +3411,9 @@ pub async fn start_upload_server(
         push_grant_backoff: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         push_grant_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         slot_rates,
+        slot_order,
         ember_sessions,
-        network_disconnected,
+        halted_for_shutdown,
         sx_overhead,
         epx_overhead,
     });
@@ -3101,12 +3556,18 @@ pub async fn start_upload_server(
                             }
                         }
 
-                        // eMule: reject new upload connections while network is disconnected.
-                        // Firewall probes and the eD2K server's HighID port-test still pass.
-                        if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed)
+                        // Refuse new connections once shutdown has begun, so no
+                        // session is started against state the save sequence is
+                        // about to tear down. Firewall probes and the eD2K
+                        // server's HighID port-test still pass.
+                        //
+                        // Not raised by going offline: eMule's Disconnect leaves
+                        // its listen socket alone, and Ember matches that — see
+                        // `NetworkState::uploads_halted_for_shutdown`.
+                        if server.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed)
                             && !is_server_port_test_ip
                         {
-                            debug!("Rejecting connection from {peer_addr}: network disconnected");
+                            debug!("Rejecting connection from {peer_addr}: shutting down");
                             drop(stream);
                             continue;
                         }
@@ -3372,11 +3833,11 @@ pub async fn start_upload_server(
                 let peer_addr = req.peer_addr;
                 let peer_ip = peer_addr.ip();
 
-                // Same gate as inbound TCP accept: reject new upload sessions
-                // while the network is disconnected (eMule behavior).
-                if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                // Same gate as inbound TCP accept: no new upload sessions once
+                // shutdown has begun.
+                if server.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     debug!(
-                        "Rejecting punch/relay-adopted stream from {peer_addr}: network disconnected"
+                        "Rejecting punch/relay-adopted stream from {peer_addr}: shutting down"
                     );
                     continue;
                 }
@@ -4047,13 +4508,38 @@ impl UploadHandler {
             return ADMISSION_FLOOR_SLOTS.min(max_configured);
         }
 
-        let target_per_slot = if active <= 3 {
-            3u64 * 1024
-        } else {
-            (3u64 * 1024 + (active as u64 - 3) * 1024).min(UPLOAD_CLIENT_MAXDATARATE)
-        };
+        let target_per_slot = target_client_data_rate(active, false);
 
-        let computed = (effective_rate / target_per_slot).max(ADMISSION_FLOOR_SLOTS as u64);
+        // eMule bounds the slot count by two terms and refuses at whichever binds
+        // first (`AcceptNewClient`, `UploadQueue.cpp:388`):
+        //
+        //   observed throughput / GetTargetClientDataRate(true)   [target * 3/4]
+        //   configured cap      / GetTargetClientDataRate(false)  [target]
+        //
+        // The first divisor is three quarters of the target
+        // (`UploadQueue.cpp:408`). Dividing the observed term by the *full*
+        // target made every ceiling about 25% lower than eMule's for identical
+        // measurements, and slot count is the main lever on total upload
+        // throughput because individual eD2K peers are slow. It is also
+        // self-reinforcing: fewer slots means less observed throughput, which
+        // computes fewer slots again.
+        //
+        // Ignoring the configured term whenever a slot was active was the other
+        // half of the problem — a limited uplink serving slow peers could never
+        // open enough slots to reach the cap the user actually set.
+        let min_target = target_client_data_rate(active, true).max(1);
+        let from_observed = effective_rate / min_target;
+        let configured_rate = self.bandwidth_limiter.effective_upload_rate();
+        let from_configured = if configured_rate > 0 {
+            configured_rate / target_per_slot
+        } else {
+            // Unlimited: eMule likewise stops applying this bound
+            // (`UploadQueue.cpp:391`, `MaxSpeed != UNLIMITED`).
+            u64::MAX
+        };
+        let computed = from_observed
+            .min(from_configured)
+            .max(ADMISSION_FLOOR_SLOTS as u64);
         let computed = (computed as usize)
             .min(MAX_UP_CLIENTS_ALLOWED)
             .min(max_configured);
@@ -4281,7 +4767,7 @@ impl UploadHandler {
             let mut best_dial: Option<(QueueEntry, f64)> = None;
 
             for e in queue.iter() {
-                if e.join_time.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
+                if e.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
                     continue;
                 }
                 let score = score_queue_entry(
@@ -6016,11 +6502,10 @@ impl UploadHandler {
                  client software {ul_client_software:?} mod {:?} matched pattern {:?}",
                 hello_caps.mod_version, m.pattern,
             );
-            // Best-effort soft-close: send OP_QUEUEFULL so well-behaved
-            // peers stop trying immediately rather than retrying with a
-            // backoff. Ignore any write error — we're disconnecting
-            // either way.
-            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await;
+            // Dropped in silence. eMule refuses a queue admission by simply
+            // returning, and a TCP reply here would be read as
+            // `OP_MULTIPACKETANSWER` and cost us the source — see the
+            // `OP_QUEUEFULL` note in `messages.rs`.
             return Ok(());
         }
 
@@ -6329,13 +6814,24 @@ impl UploadHandler {
             self.active_count.clone(),
             self.slot_notify.clone(),
             self.slot_holders.clone(),
+            self.slot_order.clone(),
         );
         let mut session_start: Option<std::time::Instant> = None;
         let mut rate_tracker = SessionRateTracker::new();
+        // This slot's end of the shared uplink; see `acquire_slot_bandwidth`.
+        let mut slot_bw = SlotBandwidth::new();
         // (SecureIdent state `pending_secident_challenge` / `pending_peer_challenge`
         // declared above the EmuleInfo exchange block so the proactive
         // challenge there can populate `pending_secident_challenge`.)
         let queue_identity = QueueIdentity::from_peer(peer_user_hash, peer_addr);
+        // Backstop for the teardown at the end of this function; see
+        // `SessionRowGuard`. Disarmed there once it has run.
+        let mut session_row_guard = SessionRowGuard::new(
+            self.upload_queue.clone(),
+            self.slot_rates.clone(),
+            queue_identity.clone(),
+            peer_addr,
+        );
         let mut queued_identity: Option<QueueIdentity> = None;
         let mut queue_join_time: std::time::Instant = std::time::Instant::now();
         let mut queue_wait_at_grant: u64 = 0;
@@ -6611,7 +7107,7 @@ impl UploadHandler {
                 }
             }
             // eMule: terminate upload sessions when the network is disconnected.
-            if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 debug!("Terminating upload session with {peer_addr}: network disconnected");
                 break;
             }
@@ -6862,13 +7358,6 @@ impl UploadHandler {
                             };
                             if !still_ours {
                                 queued_identity = None;
-                                let _ = write_packet_async(
-                                    &mut writer,
-                                    OP_EMULEPROT,
-                                    OP_QUEUEFULL,
-                                    &[],
-                                )
-                                .await;
                                 break;
                             }
                             let current_active = self
@@ -6885,7 +7374,7 @@ impl UploadHandler {
                                 let queue_snapshot: Vec<_> = {
                                     let mut queue = self.upload_queue.lock().await;
                                     queue.retain(|e| {
-                                        e.join_time.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS
+                                        e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS
                                     });
                                     queue.iter().enumerate().map(|(i, e)| {
                                         (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash, e.user_hash, e.emule_version, e.is_friend_slot, e.ember_pubkey, e.ember_verified)
@@ -6958,13 +7447,6 @@ impl UploadHandler {
                                                 drop(queue);
                                                 slot_guard.deactivate();
                                                 queued_identity = None;
-                                                let _ = write_packet_async(
-                                                    &mut writer,
-                                                    OP_EMULEPROT,
-                                                    OP_QUEUEFULL,
-                                                    &[],
-                                                )
-                                                .await;
                                                 break;
                                             }
                                         }
@@ -7452,7 +7934,13 @@ impl UploadHandler {
                                 let mut a4af = self.a4af_manager.write().await;
                                 for &dl_hash in download_hashes.iter() {
                                     if dl_hash != hash {
-                                        a4af.add_a4af_source(dl_hash, peer_addr, hash);
+                                        // A peer asking us for `hash` says nothing
+                                        // about whether it still has parts we need
+                                        // of it, so claim nothing: `true` leaves
+                                        // the swap decision to priority and source
+                                        // counts instead of firing the
+                                        // "has run dry" fast path.
+                                        a4af.add_a4af_source(dl_hash, peer_addr, hash, true);
                                     }
                                 }
                             }
@@ -7562,8 +8050,6 @@ impl UploadHandler {
                                 "Refusing queue admission for friends-only file {} from {peer_addr}",
                                 hex::encode(h)
                             );
-                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
-                                .await?;
                             break;
                         }
                     }
@@ -7608,12 +8094,30 @@ impl UploadHandler {
                             std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                         };
                         if let Some(peer_v4) = peer_v4 {
+                            // eMule exempts a friend holding a friend slot, and a
+                            // peer that is currently uploading to us. Friend
+                            // status is re-evaluated here, as at every other
+                            // friend-priority site, because proof-of-possession
+                            // can land mid-session.
+                            let is_friend_slot = live_secure_friend_member(
+                                &self.friend_hashes,
+                                peer_ember_hash,
+                                secure_v2_authenticated,
+                            )
+                            .await;
+                            let downloading_from_peer = self
+                                .transfer_manager
+                                .read()
+                                .await
+                                .is_downloading_from_ip(peer_addr.ip());
                             let should_ban = {
                                 let mut tracker = self.file_request_tracker.lock().await;
                                 tracker.cleanup_stale();
                                 tracker.record_request(
                                     QueueIdentity::from_peer(peer_user_hash, peer_addr),
                                     h,
+                                    is_friend_slot,
+                                    downloading_from_peer,
                                 )
                             };
                             if should_ban {
@@ -7637,7 +8141,6 @@ impl UploadHandler {
                                         user_hash: None,
                                     },
                                 }).await;
-                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                                 break;
                             }
                         }
@@ -7655,7 +8158,7 @@ impl UploadHandler {
                         // Snapshot queue, purging stale entries first, then release lock
                         let (queue_empty, queue_snapshot) = {
                             let mut queue = self.upload_queue.lock().await;
-                            queue.retain(|e| e.join_time.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
+                            queue.retain(|e| e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
                             let empty = queue.is_empty();
                             let snap: Vec<_> = queue
                                 .iter()
@@ -7895,8 +8398,6 @@ impl UploadHandler {
                                 drop(queue);
                                 drop(idx_snap);
                                 drop(cm);
-                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
-                                    .await?;
                                 break;
                             }
                             let same_session = bound_addr == Some(peer_addr);
@@ -7916,6 +8417,11 @@ impl UploadHandler {
                                 );
                                 queue[pos].join_time = std::time::Instant::now();
                             }
+                            // The peer just asked, which is what keeps it on the
+                            // list — eMule stamps this in `AddClientToQueue`
+                            // (`UploadQueue.cpp:526`) on every request, including
+                            // one from a client already queued.
+                            queue[pos].last_request = std::time::Instant::now();
                             queue[pos].current_addr = Some(peer_addr);
                             queue[pos].last_ip = Some(peer_addr.ip());
                             queue[pos].udp_port = hello_caps.udp_port;
@@ -7983,20 +8489,18 @@ impl UploadHandler {
                             drop(queue);
                             drop(idx_snap);
                             drop(cm);
-                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                             break;
                         } else if queue.len() >= HARD_UPLOAD_QUEUE_SIZE {
-                            debug!("Upload queue at hard limit ({HARD_UPLOAD_QUEUE_SIZE}), sending OP_QUEUEFULL to {peer_addr}");
+                            debug!("Upload queue at hard limit ({HARD_UPLOAD_QUEUE_SIZE}), refusing {peer_addr}");
                             drop(queue);
                             drop(idx_snap);
                             drop(cm);
-                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                             break;
                         } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
                             // eMule soft→hard zone: admit when CombinedFilePrioAndCredit
                             // is at/above the queue average (wait-independent), or the
                             // peer holds a verified friend slot. Scoring newcomers with
-                            // wait=0 made almost everyone get OP_QUEUEFULL.
+                            // wait=0 got almost everyone refused.
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = secure_v2_authenticated;
                             let peer_ip = peer_ip_u32(Some(peer_addr));
@@ -8086,8 +8590,6 @@ impl UploadHandler {
                                 drop(queue);
                                 drop(idx_snap);
                                 drop(cm);
-                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
-                                    .await?;
                                 break;
                             }
                         } else {
@@ -8689,7 +9191,7 @@ impl UploadHandler {
                         // Breaking returns to the outer loop, whose own
                         // network-disconnected check ends the session and runs
                         // the normal cleanup.
-                        if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                        if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                             info!("Upload to {peer_addr} ending: network disconnected mid-batch");
                             break;
                         }
@@ -8862,7 +9364,12 @@ impl UploadHandler {
                                 part_payload.extend_from_slice(&newsize.to_le_bytes());
                                 part_payload.extend_from_slice(chunk);
 
-                                self.acquire_upload_bandwidth(chunk_len as u64).await?;
+                                self.acquire_slot_bandwidth(
+                                    &mut slot_bw,
+                                    slot_guard.slot_seq(),
+                                    chunk_len as u64,
+                                )
+                                .await?;
                                 let write_start = std::time::Instant::now();
                                 write_packet_async(
                                     &mut writer,
@@ -8996,7 +9503,12 @@ impl UploadHandler {
                             }
                             part_payload.extend_from_slice(chunk);
 
-                            self.acquire_upload_bandwidth(chunk_len as u64).await?;
+                            self.acquire_slot_bandwidth(
+                                &mut slot_bw,
+                                slot_guard.slot_seq(),
+                                chunk_len as u64,
+                            )
+                            .await?;
                             let write_start = std::time::Instant::now();
                             write_packet_async(&mut writer, proto, op, &part_payload).await?;
                             let write_elapsed = write_start.elapsed();
@@ -9242,7 +9754,11 @@ impl UploadHandler {
                             let ember_verified = secure_v2_authenticated;
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, my_fh,
-                                queue_wait_at_grant, Some(peer_addr),
+                                uploading_score_wait_secs(
+                                    queue_wait_at_grant,
+                                    session_start.map(|t| t.elapsed()),
+                                ),
+                                Some(peer_addr),
                                 hello_caps.emule_version_min, is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
@@ -9408,7 +9924,7 @@ impl UploadHandler {
                                 // `user_hash` may have inserted a fresh
                                 // row. Do not hijack a waiter's row bound
                                 // to a different IP or advertised port;
-                                // refuse and let the caller send OP_QUEUEFULL.
+                                // refuse and let the caller drop the session.
                                 // Same IP + Hello-advertised port takes
                                 // the row over. Preserve seniority only
                                 // when `current_addr` is `None` (reconnect).
@@ -9535,10 +10051,8 @@ impl UploadHandler {
                             queued_identity = Some(queue_identity.clone());
                         } else {
                             debug!(
-                                "Upload queue full on session-rotation re-admit, sending OP_QUEUEFULL to {peer_addr}"
+                                "Upload queue full on session-rotation re-admit, dropping {peer_addr}"
                             );
-                            write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
-                                .await?;
                             break;
                         }
                     }
@@ -10447,13 +10961,7 @@ impl UploadHandler {
                             hello_caps.mod_version,
                             m.pattern,
                         );
-                        let _ = write_packet_async(
-                            &mut writer,
-                            OP_EMULEPROT,
-                            OP_QUEUEFULL,
-                            &[],
-                        )
-                        .await;
+                        // Refused in silence, as above.
                         {
                             let mut queue = self.upload_queue.lock().await;
                             queue.retain(|e| {
@@ -11394,6 +11902,7 @@ impl UploadHandler {
         }
 
         self.slot_rates.lock().remove(&peer_addr);
+        session_row_guard.disarm();
 
         // slot_guard Drop handles upload slot release automatically
 
@@ -11499,12 +12008,91 @@ impl UploadHandler {
         session_result
     }
 
+    /// Put `bytes` of file data on the wire for one upload slot, waiting until
+    /// the slot's share of the uplink covers them.
+    ///
+    /// eMule apportions the uplink from a single thread that walks its slot list
+    /// three times per loop (`UploadBandwidthThrottler.cpp:537-602`): a trickle
+    /// pass, an equal-share pass over the first `maxSlot` slots, and a leftover
+    /// pass that spends whatever the first two did not. Ember's slots are
+    /// independent tasks with no such loop, so each one paces itself against the
+    /// same three rules, in the same order:
+    ///
+    /// * Under its share, it goes straight through — the equal-share pass.
+    /// * Over its share, it is still let through when the block has fallen behind
+    ///   the delivery schedule its peer times out on — the trickle pass, and the
+    ///   only thing feeding a slot that `maxSlot` has excluded entirely.
+    /// * Otherwise it is let through when the shared bucket is holding unclaimed
+    ///   budget, rather than leave the uplink idle — the leftover pass.
+    ///
+    /// Only file data is paced. Control packets keep using
+    /// [`Self::acquire_upload_bandwidth`] directly, matching eMule's throttler,
+    /// which drains its control queues before any of the three passes runs
+    /// (`UploadBandwidthThrottler.cpp:516-535`).
+    ///
+    /// Where eMule must overshoot its budget to trickle — its loop is synchronous
+    /// and cannot wait, so it borrows against later loops up to
+    /// `(slots + 1) * minFragSize` (`UploadBandwidthThrottler.cpp:607-609`) — a
+    /// trickling task here simply waits for tokens like any other. Pacing the
+    /// slots that do have a share is what makes those tokens available.
+    async fn acquire_slot_bandwidth(
+        &self,
+        slot: &mut SlotBandwidth,
+        slot_seq: Option<u64>,
+        bytes: u64,
+    ) -> anyhow::Result<()> {
+        let allowed = self.bandwidth_limiter.effective_upload_rate();
+        // Unlimited (0 here, `_UI32_MAX` in eMule) leaves nothing to divide, and
+        // eMule's own `maxSlot` degenerates to the whole slot list. A session
+        // still without a standard-order entry is not holding a slot to pace.
+        let Some((index, open_slots)) = slot_seq
+            .filter(|_| allowed > 0)
+            .and_then(|seq| self.slot_order.position(seq))
+        else {
+            return self.acquire_upload_bandwidth(bytes).await;
+        };
+
+        let share = slot_share_per_sec(allowed, open_slots, index);
+        // eMule's leftover pass will spend down to its last fragment rather than
+        // let the uplink idle (`max(bytesToSpend - spentBytes, doubleSendSize)`,
+        // `UploadBandwidthThrottler.cpp:593`), so surplus counts from one
+        // fragment up — not from a whole packet, which at rates under about
+        // 5 KiB/s exceeds everything the bucket can even hold.
+        let (_, double_send) = upload_frag_sizes(allowed);
+        let surplus = bytes.min(double_send);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= slot.send_by {
+                break;
+            }
+            if slot.wants_trickle(now, bytes) {
+                break;
+            }
+            if self.bandwidth_limiter.available_upload_tokens() >= surplus {
+                break;
+            }
+            tokio::time::sleep(slot.send_by.duration_since(now).min(SLOT_PACING_TICK)).await;
+            if self
+                .halted_for_shutdown
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                anyhow::bail!("network disconnected");
+            }
+        }
+
+        let result = self.acquire_upload_bandwidth(bytes).await;
+        if result.is_ok() {
+            slot.charge(bytes, share);
+        }
+        result
+    }
+
     /// Acquire upload tokens, aborting promptly if the network disconnects
     /// while parked in the token bucket (tight limits can otherwise stall
     /// teardown for many seconds after Disconnect).
     async fn acquire_upload_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
         if self
-            .network_disconnected
+            .halted_for_shutdown
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             anyhow::bail!("network disconnected");
@@ -11519,7 +12107,7 @@ impl UploadHandler {
             }
             _ = async {
                 loop {
-                    if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                    if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -12969,6 +13557,363 @@ mod abuse_and_seniority_tests {
     //! missing a bound or punishing honest peers.
     use super::*;
 
+    /// The purge clock has to be the last *request*, not the join time, or a peer
+    /// that re-asks exactly as the protocol tells it to is still evicted an hour
+    /// after it arrived — and a peer behind a long queue can then never reach the
+    /// front, because the list turns over faster than its wait matures.
+    #[test]
+    fn a_re_asking_peer_survives_the_purge_while_a_silent_one_does_not() {
+        let hour = std::time::Duration::from_secs(MAX_PURGEQUEUETIME_SECS + 60);
+        let long_ago = std::time::Instant::now() - hour;
+
+        // Both joined over an hour ago. One has just re-asked.
+        let mut faithful = queue_entry(None, None);
+        faithful.join_time = long_ago;
+        faithful.last_request = std::time::Instant::now();
+
+        let mut silent = queue_entry(None, None);
+        silent.join_time = long_ago;
+        silent.last_request = long_ago;
+
+        let purged = |e: &QueueEntry| e.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS;
+        assert!(
+            !purged(&faithful),
+            "a peer that re-asked keeps its place, and keeps its accrued seniority"
+        );
+        assert!(purged(&silent), "one that has gone quiet is dropped");
+
+        // Seniority is still the join time, so re-asking must not reset the wait
+        // that decides the peer's rank.
+        assert!(faithful.join_time.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS);
+    }
+
+    /// eMule hands an uploading client a flat bonus so a waiter cannot displace
+    /// it seconds after it started — "to avoid 20 sec downloads"
+    /// (`UploadClient.cpp:212-220`). Ember scored the holder on a frozen
+    /// wait-at-grant that is zero for a push-grant and for the common
+    /// empty-queue add, so any waiter with a positive score won immediately.
+    #[test]
+    fn a_freshly_granted_slot_is_not_immediately_outscored() {
+        use std::time::Duration;
+
+        // The case that thrashed: nothing accrued before the grant, ten seconds in.
+        let fresh = uploading_score_wait_secs(0, Some(Duration::from_secs(10)));
+        assert!(
+            fresh >= 30 * 60,
+            "a brand-new upload must not score as a zero-wait peer, got {fresh}s"
+        );
+
+        // The bonus steps down once past the first 15 minutes, and the score
+        // still only ever grows with time held.
+        let early = uploading_score_wait_secs(0, Some(Duration::from_secs(14 * 60)));
+        let later = uploading_score_wait_secs(0, Some(Duration::from_secs(16 * 60)));
+        assert_eq!(early, 14 * 60 + 30 * 60);
+        assert_eq!(later, 16 * 60 + 15 * 60);
+        assert!(later > 15 * 60);
+
+        // Wait accrued before the grant still counts, and a missing session
+        // start cannot panic or read as an enormous wait.
+        assert_eq!(
+            uploading_score_wait_secs(120, Some(Duration::from_secs(60))),
+            120 + 60 + 30 * 60
+        );
+        assert_eq!(uploading_score_wait_secs(0, None), 30 * 60);
+    }
+
+    /// `GetTargetClientDataRate` (`UploadQueue.cpp:397-409`) is the divisor the
+    /// whole apportionment rests on, and both the slot-count formula and the
+    /// per-slot share read it — so its table has to be exact.
+    #[test]
+    fn the_per_slot_target_rate_matches_emules_table() {
+        // Three slots or fewer are flat at 3 KiB/s.
+        for open in 0..=3 {
+            assert_eq!(target_client_data_rate(open, false), 3 * 1024);
+            assert_eq!(target_client_data_rate(open, true), 2304);
+        }
+        // Past that, 1 KiB/s per slot...
+        assert_eq!(target_client_data_rate(4, false), 4 * 1024);
+        assert_eq!(target_client_data_rate(10, false), 10 * 1024);
+        // ...capped at UPLOAD_CLIENT_MAXDATARATE.
+        assert_eq!(target_client_data_rate(25, false), UPLOAD_CLIENT_MAXDATARATE);
+        assert_eq!(target_client_data_rate(40, false), UPLOAD_CLIENT_MAXDATARATE);
+        // The `true` variant is three quarters of it (`UploadQueue.cpp:408`).
+        assert_eq!(target_client_data_rate(10, true), 10 * 1024 * 3 / 4);
+    }
+
+    /// eMule drops to one 536-byte packet at a time below 6 KiB/s for a smoother
+    /// stream, and above it pairs two 1300-byte fragments so they share an ACK
+    /// (`UploadBandwidthThrottler.cpp:437-443`).
+    #[test]
+    fn fragment_sizes_shrink_on_a_slow_uplink() {
+        assert_eq!(upload_frag_sizes(1024), (536, 536));
+        assert_eq!(upload_frag_sizes(6 * 1024 - 1), (536, 536));
+        assert_eq!(upload_frag_sizes(6 * 1024), (1300, 2600));
+        assert_eq!(upload_frag_sizes(1024 * 1024), (1300, 2600));
+    }
+
+    /// The shares handed to the fed slots must sum to the whole uplink: less
+    /// wastes it, more oversubscribes it and the pacing stops meaning anything.
+    #[test]
+    fn the_slot_shares_add_up_to_the_whole_uplink() {
+        for &(rate, open) in &[
+            (1024u64 * 1024, 4usize),
+            (20 * 1024, 6),
+            (64 * 1024, 12),
+            (256 * 1024, 30),
+        ] {
+            let fed = fully_fed_slot_count(rate, open);
+            let total: u64 = (0..open)
+                .filter_map(|i| slot_share_per_sec(rate, open, i))
+                .sum();
+            assert_eq!(
+                total,
+                rate / fed as u64 * fed as u64,
+                "rate {rate} across {open} slots ({fed} fed) must apportion the whole uplink"
+            );
+            assert!(total <= rate, "shares must not oversubscribe {rate}");
+        }
+    }
+
+    /// eMule's answer to "the rate divided by the slot count is below the
+    /// per-slot minimum" is to feed *fewer slots*, not to thin every share:
+    /// `maxSlot = min(listSize, allowedDataRate / targetDataRate)`
+    /// (`UploadBandwidthThrottler.cpp:561-562`). The slots it leaves out stay
+    /// open on the trickle.
+    #[test]
+    fn a_tight_uplink_feeds_fewer_slots_rather_than_thinning_every_share() {
+        // 20 KiB/s over six slots: the minimum target at six slots is 4608 B/s,
+        // so only four of them can be fed.
+        assert_eq!(target_client_data_rate(6, true), 4608);
+        assert_eq!(fully_fed_slot_count(20 * 1024, 6), 4);
+        for index in 0..4 {
+            assert_eq!(
+                slot_share_per_sec(20 * 1024, 6, index),
+                Some(5120),
+                "slot {index} is inside maxSlot and owed an equal share"
+            );
+        }
+        for index in 4..6 {
+            assert_eq!(
+                slot_share_per_sec(20 * 1024, 6, index),
+                None,
+                "slot {index} is past maxSlot and lives on the trickle"
+            );
+        }
+
+        // A comfortable uplink feeds everyone.
+        assert_eq!(fully_fed_slot_count(1024 * 1024, 4), 4);
+        // One too thin to cover even a single slot at target feeds nobody an
+        // equal share — eMule's equal-share loop simply does not execute.
+        assert_eq!(fully_fed_slot_count(2000, 4), 0);
+        assert_eq!(slot_share_per_sec(2000, 4, 0), None);
+    }
+
+    /// eMule appends each new slot to the end of `m_StandardOrder_list`
+    /// (`UploadQueue.cpp:168`) and feeds it from index 0, so seniority — not
+    /// fairness — decides who goes without when the uplink cannot cover
+    /// everyone. The newest slot is the one that starves.
+    #[test]
+    fn slot_seniority_decides_who_goes_hungry() {
+        let order = SlotOrder::default();
+        let oldest = order.register();
+        let middle = order.register();
+        let newest = order.register();
+
+        assert_eq!(order.position(oldest), Some((0, 3)));
+        assert_eq!(order.position(middle), Some((1, 3)));
+        assert_eq!(order.position(newest), Some((2, 3)));
+
+        // 8 KiB/s over three slots: minimum target is 2304 B/s, so three slots
+        // fit and all three are fed.
+        assert_eq!(fully_fed_slot_count(8 * 1024, 3), 3);
+        // Halve the uplink and the newest slot is the one dropped.
+        assert_eq!(fully_fed_slot_count(4 * 1024, 3), 1);
+        assert!(slot_share_per_sec(4 * 1024, 3, 0).is_some());
+        assert!(slot_share_per_sec(4 * 1024, 3, 2).is_none());
+
+        // Ranks close up when an older slot goes, promoting the survivors.
+        order.release(oldest);
+        assert_eq!(order.position(middle), Some((0, 2)));
+        assert_eq!(order.position(newest), Some((1, 2)));
+        assert_eq!(order.position(oldest), None);
+    }
+
+    /// `GetNeededBytes` (`EMSocket.cpp:852-895`) paces the block against a
+    /// 90-second delivery deadline. A block that is keeping up needs nothing —
+    /// which is what stops the trickle from becoming a second bandwidth
+    /// allocator running alongside the equal-share pass.
+    #[test]
+    fn a_block_ahead_of_schedule_is_not_trickled() {
+        use std::time::Duration;
+        let block = 184_320;
+        assert_eq!(
+            trickle_needed_bytes(block, block, Duration::ZERO, Duration::ZERO),
+            0,
+            "a block that has only just started owes nothing"
+        );
+        assert_eq!(
+            trickle_needed_bytes(
+                block / 2,
+                block,
+                Duration::from_secs(10),
+                Duration::from_secs(2)
+            ),
+            0,
+            "half delivered in a ninth of the window is well ahead"
+        );
+    }
+
+    /// The trickle threshold: a slot with nothing on the wire for a second
+    /// (`UploadBandwidthThrottler.cpp:542`) is owed exactly enough to get back
+    /// on the delivery schedule, rounded up.
+    #[test]
+    fn a_block_that_has_fallen_behind_is_trickled_enough_to_catch_up() {
+        use std::time::Duration;
+        // Nothing sent, halfway through the 90 s window: the schedule allows
+        // 45 000 of the 90 000 bytes to still be outstanding, so it owes the
+        // difference plus eMule's round-up.
+        assert_eq!(
+            trickle_needed_bytes(
+                90_000,
+                90_000,
+                Duration::from_secs(45),
+                Duration::from_secs(2)
+            ),
+            45_001
+        );
+        // Past the deadline, everything left is owed at once.
+        assert_eq!(
+            trickle_needed_bytes(
+                90_000,
+                90_000,
+                TRICKLE_BLOCK_DEADLINE + Duration::from_secs(1),
+                Duration::from_secs(2)
+            ),
+            90_000
+        );
+        // A finished or absent block is never trickled.
+        assert_eq!(
+            trickle_needed_bytes(0, 90_000, Duration::from_secs(60), Duration::from_secs(30)),
+            0
+        );
+        assert_eq!(
+            trickle_needed_bytes(0, 0, Duration::from_secs(60), Duration::from_secs(30)),
+            0
+        );
+    }
+
+    /// eMule owes an on-schedule slot a single byte once 20 seconds have passed
+    /// since any send, so the socket itself cannot time out while it waits
+    /// (`EMSocket.cpp:884-887`). Ember's peers apply `CONNECTION_TIMEOUT` — 40 s
+    /// (`Opcodes.h:63`) — so the keepalive has to land well inside it.
+    #[test]
+    fn a_silent_slot_is_owed_one_byte_after_twenty_seconds() {
+        use std::time::Duration;
+        let block = 184_320;
+        // On schedule, so the only reason to send is the socket itself.
+        assert_eq!(
+            trickle_needed_bytes(
+                block,
+                block,
+                Duration::ZERO,
+                TRICKLE_KEEPALIVE_AFTER - Duration::from_secs(1)
+            ),
+            0
+        );
+        assert_eq!(
+            trickle_needed_bytes(block, block, Duration::ZERO, TRICKLE_KEEPALIVE_AFTER),
+            1
+        );
+        assert!(TRICKLE_KEEPALIVE_AFTER < Duration::from_secs(40));
+    }
+
+    /// A slot only escapes its pacing on the trickle once it has been quiet for
+    /// [`TRICKLE_AFTER`] *and* the packet it is holding is what eMule would now
+    /// push out. Being over its share is not on its own a reason to send —
+    /// otherwise the trickle would quietly become a second allocator handing
+    /// every paced slot a full packet a second.
+    #[test]
+    fn a_slow_slot_still_receives_its_minimum_share() {
+        use std::time::Duration;
+        let slot = SlotBandwidth::new();
+        let start = slot.last_send;
+        let chunk = 10_240;
+
+        assert!(
+            !slot.wants_trickle(start, chunk),
+            "a slot that just sent is not trickled"
+        );
+        assert!(
+            !slot.wants_trickle(start + Duration::from_secs(2), chunk),
+            "quiet two seconds: eMule would spend a couple of hundred bytes here, \
+             far short of a whole packet"
+        );
+        assert!(
+            !slot.wants_trickle(
+                start + TRICKLE_KEEPALIVE_AFTER - Duration::from_secs(1),
+                chunk
+            ),
+            "still inside the keepalive window"
+        );
+        assert!(
+            slot.wants_trickle(start + TRICKLE_KEEPALIVE_AFTER, chunk),
+            "a starved slot must be fed before its peer's socket timeout"
+        );
+        assert!(
+            slot.wants_trickle(start + TRICKLE_BLOCK_DEADLINE, chunk),
+            "past the packet deadline everything owed is owed at once"
+        );
+    }
+
+    /// Pacing charges each grant against the slot's share, and a slot with no
+    /// share at all (past `maxSlot`) is held to the trickle's own rate — one
+    /// packet per delivery deadline, which is all `GetNeededBytes` grants it. An
+    /// idle slot must bank no credit: eMule's budget is global and carries
+    /// nothing forward per slot.
+    #[test]
+    fn a_slot_over_its_share_waits_in_proportion_to_what_it_sent() {
+        use std::time::Duration;
+        let mut slot = SlotBandwidth::new();
+
+        // 10 240 bytes at 5 120 B/s is two seconds of debt.
+        let before = std::time::Instant::now();
+        slot.charge(10_240, Some(5_120));
+        let owed = slot.send_by.duration_since(before);
+        assert!(
+            owed >= Duration::from_secs(2) && owed < Duration::from_millis(2_100),
+            "expected ~2s of pacing debt, got {owed:?}"
+        );
+
+        // A share-less slot is held to the trickle rate instead.
+        let mut outside = SlotBandwidth::new();
+        let before = std::time::Instant::now();
+        outside.charge(10_240, None);
+        assert!(outside.send_by.duration_since(before) >= TRICKLE_BLOCK_DEADLINE);
+
+        // Debt is floored at the present, so sitting idle earns nothing.
+        let mut idle = SlotBandwidth::new();
+        idle.send_by = std::time::Instant::now() - Duration::from_secs(30);
+        let before = std::time::Instant::now();
+        idle.charge(1_024, Some(1_024));
+        let owed = idle.send_by.duration_since(before);
+        assert!(
+            owed >= Duration::from_secs(1) && owed < Duration::from_millis(1_100),
+            "an idle slot must not bank credit, got {owed:?}"
+        );
+    }
+
+    /// The hard limit is derived from the soft one, so the pair has to stay in
+    /// eMule's relationship: `soft + max(soft, 800) / 4` (`UploadQueue.cpp:621`).
+    #[test]
+    fn queue_limits_match_emules_defaults() {
+        assert_eq!(MAX_UPLOAD_QUEUE_SIZE, 5000, "eMule QueueSizePref 50 * 100");
+        assert_eq!(HARD_UPLOAD_QUEUE_SIZE, 6250);
+        assert_eq!(
+            HARD_UPLOAD_QUEUE_SIZE,
+            MAX_UPLOAD_QUEUE_SIZE + MAX_UPLOAD_QUEUE_SIZE.max(800) / 4
+        );
+    }
+
     fn queue_entry(last_ip: Option<IpAddr>, ember_pubkey: Option<[u8; 32]>) -> QueueEntry {
         QueueEntry {
             identity: QueueIdentity::UserHash([7u8; 16]),
@@ -12981,6 +13926,7 @@ mod abuse_and_seniority_tests {
             user_hash: [7u8; 16],
             file_hash: [1u8; 16],
             join_time: std::time::Instant::now(),
+            last_request: std::time::Instant::now(),
             add_next_connect: false,
             emule_version: 0,
             is_friend_slot: false,
@@ -13021,13 +13967,13 @@ mod abuse_and_seniority_tests {
 
         // Both clients ask, then each re-asks immediately. Per-identity that
         // is one strike each, nowhere near BADCLIENTBAN.
-        assert!(!tracker.record_request(a.clone(), hash));
-        assert!(!tracker.record_request(b.clone(), hash));
+        assert!(!tracker.record_request(a.clone(), hash, false, false));
+        assert!(!tracker.record_request(b.clone(), hash, false, false));
         backdate(&mut tracker, &a, hash, 1);
         backdate(&mut tracker, &b, hash, 1);
-        assert!(!tracker.record_request(a.clone(), hash));
+        assert!(!tracker.record_request(a.clone(), hash, false, false));
         assert!(
-            !tracker.record_request(b.clone(), hash),
+            !tracker.record_request(b.clone(), hash, false, false),
             "one client's re-ask must not push another client toward a ban"
         );
         assert_eq!(tracker.entries[&(a, hash)].1, 1);
@@ -13052,9 +13998,25 @@ mod abuse_and_seniority_tests {
         let peer = QueueIdentity::UserHash([0xA1; 16]);
         let other = QueueIdentity::UserHash([0xB2; 16]);
 
-        let mut first = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
-        let mut second = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
-        let mut third = UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone());
+        let order = Arc::new(SlotOrder::default());
+        let mut first = UploadSlotGuard::new(
+            active.clone(),
+            notify.clone(),
+            holders.clone(),
+            order.clone(),
+        );
+        let mut second = UploadSlotGuard::new(
+            active.clone(),
+            notify.clone(),
+            holders.clone(),
+            order.clone(),
+        );
+        let mut third = UploadSlotGuard::new(
+            active.clone(),
+            notify.clone(),
+            holders.clone(),
+            order.clone(),
+        );
 
         assert!(first.try_activate(4, &peer));
         assert!(
@@ -13083,13 +14045,13 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.9");
         let hash = [3u8; 16];
 
-        tracker.record_request(id.clone(), hash);
+        tracker.record_request(id.clone(), hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash));
+        assert!(!tracker.record_request(id.clone(), hash, false, false));
         assert_eq!(tracker.entries[&(id.clone(), hash)].1, 1);
 
         backdate(&mut tracker, &id, hash, MIN_REQUESTTIME_SECS + 1);
-        assert!(!tracker.record_request(id.clone(), hash));
+        assert!(!tracker.record_request(id.clone(), hash, false, false));
         assert_eq!(
             tracker.entries[&(id, hash)].1,
             0,
@@ -13106,14 +14068,14 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.10");
         let hash = [4u8; 16];
 
-        tracker.record_request(id.clone(), hash);
+        tracker.record_request(id.clone(), hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash));
+        assert!(!tracker.record_request(id.clone(), hash, false, false));
 
         tracker.forgive_requeue(id.clone(), hash);
         backdate(&mut tracker, &id, hash, 1);
         assert!(
-            !tracker.record_request(id, hash),
+            !tracker.record_request(id, hash, false, false),
             "a forgiven rotation must not leave the peer one request from a ban"
         );
     }
@@ -13124,13 +14086,42 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.11");
         let hash = [5u8; 16];
 
-        tracker.record_request(id.clone(), hash);
+        tracker.record_request(id.clone(), hash, false, false);
         let mut banned = false;
-        for _ in 0..4 {
+        for _ in 0..BADCLIENTBAN {
             backdate(&mut tracker, &id, hash, 1);
-            banned |= tracker.record_request(id.clone(), hash);
+            banned |= tracker.record_request(id.clone(), hash, false, false);
         }
         assert!(banned, "the ban must stay reachable for a genuinely abusive peer");
+    }
+
+    /// eMule never strikes a friend holding a friend slot, and adds nothing while
+    /// the peer is uploading to us (`UploadClient.cpp:604-605`). Ember had
+    /// neither exemption, so a peer feeding us a file could be banned — for a
+    /// week, per IP — for asking about one of ours.
+    #[test]
+    fn a_friend_or_a_peer_feeding_us_is_never_struck() {
+        let hash = [6u8; 16];
+
+        for (label, is_friend, downloading) in [
+            ("a friend with a friend slot", true, false),
+            ("a peer currently uploading to us", false, true),
+        ] {
+            let mut tracker = FileRequestTracker::new();
+            let id = ident("203.0.113.12");
+            tracker.record_request(id.clone(), hash, is_friend, downloading);
+            for _ in 0..(BADCLIENTBAN * 3) {
+                backdate(&mut tracker, &id, hash, 1);
+                assert!(
+                    !tracker.record_request(id.clone(), hash, is_friend, downloading),
+                    "{label} must never be banned by the request-frequency counter"
+                );
+            }
+            assert_eq!(
+                tracker.entries[&(id, hash)].1, 0,
+                "{label} must not even accrue a strike"
+            );
+        }
     }
 
     #[test]

@@ -2087,6 +2087,9 @@ impl Default for AppSettings {
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferProgressPayload<'a> {
     pub id: &'a str,
+    /// Download-direction wire bytes — cumulative, and may exceed
+    /// [`total`](Self::total) once a corrupt part has been re-fetched. Symmetric
+    /// with [`uploaded`](Self::uploaded) on the upload side.
     pub downloaded: u64,
     pub total: u64,
     pub progress: f64,
@@ -2096,10 +2099,15 @@ pub struct TransferProgressPayload<'a> {
     /// Session wire bytes; may exceed [`total`](Self::total) on uploads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<u64>,
-    /// Upload-direction only: unique per-part coverage this session.
-    /// Drives the small-file progress fill (files with too few ED2K parts
-    /// for the chunked bar). The chunked bar's overlay is served-parts /
-    /// part-count, not this figure.
+    /// The coverage figure for either direction: unique per-part coverage this
+    /// session for uploads, gap-derived bytes on disk for downloads. This — never
+    /// the wire counters above — is what [`progress`](Self::progress) and the
+    /// remaining byte count are derived from, because only this one is bounded by
+    /// the file size.
+    ///
+    /// For uploads it also drives the small-file progress fill (files with too few
+    /// ED2K parts for the chunked bar); the chunked bar's overlay is
+    /// served-parts / part-count, not this figure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_size: Option<u64>,
     /// `"upload"` for upload progress events; omitted for downloads.

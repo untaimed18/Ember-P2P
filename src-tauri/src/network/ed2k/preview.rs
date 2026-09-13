@@ -260,6 +260,23 @@ pub fn cleanup_previews() {
 mod tests {
     use super::*;
 
+    /// A preview is copied and then handed to the shell, so everything
+    /// [`can_preview`] accepts has to be on the one-click launch allowlist as
+    /// well. It was not: `.flv`, `.ts`, `.vob`, `.3gp`, `.divx`, `.ogm`,
+    /// `.ogv`, `.rm`, `.rmvb`, `.wma` and `.ape` all reported `preview_ready`,
+    /// so the button enabled itself, the verified prefix was copied, and
+    /// `launch_preview` then refused at the last step.
+    #[test]
+    fn every_previewable_extension_can_actually_be_launched() {
+        for ext in VIDEO_EXTENSIONS.iter().chain(AUDIO_EXTENSIONS) {
+            let name = format!("clip.{ext}");
+            assert!(
+                crate::security::filesystem::passive_type_agrees(&name, Path::new(&name)),
+                "{ext} is previewable but not launchable"
+            );
+        }
+    }
+
     #[test]
     fn preview_copies_only_supplied_verified_ranges() {
         let part = std::env::temp_dir().join(format!(

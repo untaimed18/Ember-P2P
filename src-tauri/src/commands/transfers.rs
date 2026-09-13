@@ -32,7 +32,11 @@ pub(crate) fn pending_download_usage(
         .chain(manager.queue.iter())
         .filter(|transfer| transfer.direction == TransferDirection::Download)
         .fold((0usize, 0u64), |(count, bytes), transfer| {
-            let completed = transfer.completed_size.max(transfer.transferred);
+            // `completed_size` only. `transferred` is now cumulative wire bytes and
+            // can exceed the file size after a re-fetch, so folding it in with
+            // `max` would report a download as further along than it is and shrink
+            // the disk space this budget is reserving for it.
+            let completed = transfer.completed_size;
             (
                 count.saturating_add(1),
                 bytes.saturating_add(transfer.total_size.saturating_sub(completed)),

@@ -60,11 +60,23 @@ impl A4AFManager {
         }
     }
 
+    /// Record `peer_addr` as a candidate for `file_hash` while it is currently
+    /// working on `assigned_file_hash`.
+    ///
+    /// `has_needed_parts_on_assigned` is the peer's usefulness to the file it is
+    /// already on, and it is the input [`evaluate_swap`] leans on hardest: a
+    /// source that has nothing left to give its current file is the one eMule
+    /// retasks first (`CPartFile::Process` hands every `DS_NONEEDEDPARTS` source
+    /// to `SwapToAnotherFile`, `PartFile.cpp:2320-2324`). It is a parameter
+    /// rather than a default because only the caller knows — the NNP sweep adds
+    /// sources precisely *because* they have run dry, while a peer that merely
+    /// asked us for a different file has not.
     pub fn add_a4af_source(
         &mut self,
         file_hash: [u8; 16],
         peer_addr: SocketAddr,
         assigned_file_hash: [u8; 16],
+        has_needed_parts_on_assigned: bool,
     ) {
         let entries = self.a4af_sources.entry(file_hash).or_default();
 
@@ -82,28 +94,55 @@ impl A4AFManager {
             added_time: chrono::Utc::now().timestamp(),
             last_swap_time: 0,
             queue_rank: 0,
-            has_needed_parts: true,
+            has_needed_parts: has_needed_parts_on_assigned,
             credit_ratio: 1.0,
         });
     }
 
-    /// Update queue rank and NNP state for a peer (called from download loop).
+    /// Update queue rank and NNP state for a peer on one specific file.
+    ///
+    /// `assigned_file_hash` scopes the update, because every field here is about
+    /// the peer's relationship to *that* file: `queue_rank` is its position in
+    /// that file's queue and `has_needed_parts` is whether it still has bytes
+    /// that file wants. This used to walk every entry for the peer regardless of
+    /// file, so a peer queued on one download overwrote its own record for a
+    /// different download — including the "has run dry" flag that decides
+    /// whether it gets retasked at all.
     pub fn update_source_state(
         &mut self,
         peer_addr: SocketAddr,
+        assigned_file_hash: [u8; 16],
         queue_rank: u16,
         has_needed_parts: bool,
         credit_ratio: f64,
     ) {
         for entries in self.a4af_sources.values_mut() {
             for entry in entries.iter_mut() {
-                if entry.peer_addr == peer_addr {
+                if entry.peer_addr == peer_addr
+                    && entry.assigned_file_hash == assigned_file_hash
+                {
                     entry.queue_rank = queue_rank;
                     entry.has_needed_parts = has_needed_parts;
                     entry.credit_ratio = credit_ratio;
                 }
             }
         }
+    }
+
+    /// Sources registered as candidates for `file_hash` while working on another
+    /// file — eMule's `GetSrcA4AFCount()`, the `+aa` term of the Sources column
+    /// (`DownloadListCtrl.cpp:2005-2006`). It tells the user a file has reachable
+    /// peers that a priority decision is currently spending elsewhere.
+    pub fn a4af_count(&self, file_hash: &[u8; 16]) -> usize {
+        self.a4af_sources
+            .get(file_hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.assigned_file_hash != *file_hash)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     pub fn remove_source(&mut self, peer_addr: SocketAddr) {
@@ -248,4 +287,105 @@ fn evaluate_swap(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const FILE_A: [u8; 16] = [0xAA; 16];
+    const FILE_B: [u8; 16] = [0xBB; 16];
+
+    fn peer(last_octet: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)), 4662)
+    }
+
+    fn downloading(priority: u32, active_sources: usize) -> FileSwapInfo {
+        FileSwapInfo {
+            priority,
+            active_source_count: active_sources,
+            has_needed_parts: true,
+        }
+    }
+
+    /// The engine's whole job. A source that has run dry on file B, while file A
+    /// still wants bytes, is the case eMule retasks on every `Process()` pass.
+    ///
+    /// This used to produce nothing at all, because the caller's file map was
+    /// built only from *pending* downloads while candidates are harvested from
+    /// *active* ones — `process_swaps` needs both the target and the assigned
+    /// file present, and neither was. A map missing either side still silently
+    /// yields no swaps, which is what the second half of this test pins.
+    #[test]
+    fn a_source_that_has_run_dry_is_retasked_to_a_file_that_still_wants_bytes() {
+        let mut a4af = A4AFManager::new();
+        a4af.add_a4af_source(FILE_A, peer(1), FILE_B, false);
+
+        let mut files = HashMap::new();
+        files.insert(FILE_A, downloading(7, 0));
+        files.insert(FILE_B, downloading(7, 4));
+
+        let swaps = a4af.process_swaps(&files);
+        assert_eq!(swaps.len(), 1, "the dry source must be offered to file A");
+        assert_eq!(swaps[0].peer_addr, peer(1));
+        assert_eq!(swaps[0].from_file, FILE_B);
+        assert_eq!(swaps[0].to_file, FILE_A);
+
+        // Either side missing from the map disables the swap entirely — the
+        // shape of the original bug.
+        let only_target: HashMap<_, _> = [(FILE_A, downloading(7, 0))].into_iter().collect();
+        assert!(a4af.process_swaps(&only_target).is_empty());
+        let only_assigned: HashMap<_, _> = [(FILE_B, downloading(7, 4))].into_iter().collect();
+        assert!(a4af.process_swaps(&only_assigned).is_empty());
+    }
+
+    /// A peer is usually a source for several of our files at once — that is why
+    /// A4AF exists. Its queue position and "has run dry" flag are per file, so an
+    /// update about one download must not rewrite its record for another.
+    #[test]
+    fn a_status_update_only_touches_the_file_it_describes() {
+        let mut a4af = A4AFManager::new();
+        // The same peer is a candidate for A while dry on B, and a candidate for
+        // B while working on A.
+        a4af.add_a4af_source(FILE_A, peer(1), FILE_B, false);
+        a4af.add_a4af_source(FILE_B, peer(1), FILE_A, true);
+
+        // News about file A: still useful there, good queue position.
+        a4af.update_source_state(peer(1), FILE_A, 10, true, 1.0);
+
+        let entry_b = a4af.a4af_sources[&FILE_A]
+            .iter()
+            .find(|e| e.assigned_file_hash == FILE_B)
+            .expect("the B-assigned entry survives");
+        assert!(
+            !entry_b.has_needed_parts,
+            "an update about file A must not claim the peer still has parts for B"
+        );
+        assert_eq!(entry_b.queue_rank, 0, "nor overwrite B's queue position");
+
+        let entry_a = a4af.a4af_sources[&FILE_B]
+            .iter()
+            .find(|e| e.assigned_file_hash == FILE_A)
+            .expect("the A-assigned entry is the one updated");
+        assert_eq!(entry_a.queue_rank, 10);
+    }
+
+    /// `+aa` in the Sources column: peers held for this file while working on
+    /// another. Every construction site set the transfer field to zero and
+    /// nothing wrote it, so the segment never appeared.
+    #[test]
+    fn a4af_count_reports_candidates_held_for_a_file() {
+        let mut a4af = A4AFManager::new();
+        assert_eq!(a4af.a4af_count(&FILE_A), 0);
+
+        a4af.add_a4af_source(FILE_A, peer(1), FILE_B, false);
+        a4af.add_a4af_source(FILE_A, peer(2), FILE_B, false);
+        assert_eq!(a4af.a4af_count(&FILE_A), 2);
+        assert_eq!(a4af.a4af_count(&FILE_B), 0);
+
+        // A duplicate peer is one candidate, not two.
+        a4af.add_a4af_source(FILE_A, peer(1), FILE_B, false);
+        assert_eq!(a4af.a4af_count(&FILE_A), 2);
+    }
 }

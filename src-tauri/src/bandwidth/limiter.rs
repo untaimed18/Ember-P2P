@@ -152,7 +152,7 @@ impl BandwidthLimiter {
     /// To avoid a runaway loop if the refill task dies or the limit is set
     /// impossibly low, we log a single warning once the wait exceeds 60s
     /// but keep waiting — shutdown is the caller's responsibility (upload
-    /// sessions already poll `network_disconnected`).
+    /// sessions already poll `halted_for_shutdown`).
     ///
     /// `max_rate` is the live rate atomic (not a snapshot) so we can observe
     /// a runtime switch to "unlimited" (0) mid-drain. Without re-checking it,
@@ -424,6 +424,16 @@ impl BandwidthLimiter {
 
     pub fn effective_upload_rate(&self) -> u64 {
         self.max_upload_rate.load(Ordering::Relaxed)
+    }
+
+    /// Upload tokens sitting unclaimed in the bucket right now.
+    ///
+    /// eMule's throttler reads the same quantity — `bytesToSpend - spentBytes`,
+    /// what the slots collectively left unspent — to decide whether a slot may
+    /// send past its equal share (`UploadBandwidthThrottler.cpp:586`). The ed2k
+    /// per-slot pacer uses it for exactly that.
+    pub fn available_upload_tokens(&self) -> u64 {
+        self.upload_tokens.load(Ordering::Relaxed)
     }
 
     pub fn total_uploaded(&self) -> u64 {

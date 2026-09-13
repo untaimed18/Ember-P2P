@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use flate2::read::{DeflateDecoder, ZlibDecoder};
+use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -73,19 +74,94 @@ pub(crate) fn epx_result_to_entries(
 
 const MAX_DECOMPRESSED_COMPRESSED_PART: usize = 10 * 1024 * 1024;
 const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
-const MAX_PENDING_COMPRESSED_BYTES: usize = 4 * 1024 * 1024;
+/// Output buffer per inflate round. Bounds allocation churn on a block that
+/// arrives in many small fragments without capping how much a fragment may
+/// inflate to — the loop simply runs again.
+const INFLATE_ROUND_BYTES: usize = 64 * 1024;
 
+/// How much inflated data to accumulate before handing it back to be written.
+///
+/// eMule compresses a whole requested block in one `compress2` and then splits
+/// the result into 10240-byte packets (`UploadDiskIOThread.cpp:238-239`, `:444`),
+/// so a 180 KB block usually arrives as ~15 packets of one zlib stream. Writing
+/// each packet as it inflated turned one reserve/write/commit cycle per block
+/// into fifteen — and each cycle takes the tracker write lock twice and makes an
+/// mpsc round-trip to the per-file writer, whose queue also carries other
+/// workers' `sync_data()` and 9.28 MB part hashes. That is a lot of contention to
+/// add to the receive path, and it shrank disk writes to 10 KB each.
+///
+/// Batching is a direct trade against how much of an abandoned block survives:
+/// whatever is still staged when a peer stops is lost. At 64 KiB a full block
+/// costs three cycles instead of fifteen, writes stay comfortably large, and a
+/// block abandoned near its end still leaves ~128 KB on disk rather than nothing.
+const INFLATE_FLUSH_BYTES: usize = 64 * 1024;
+
+/// Inflate state for one compressed block being received.
 struct PendingCompressedBlock {
     declared_total: usize,
-    bytes: Vec<u8>,
+    /// Compressed bytes seen, against `declared_total`.
+    packed_seen: usize,
+    /// Total bytes zlib has produced for this block. Bounds the output allowance,
+    /// which is what stops a stream inflating past its requested range.
+    inflated: usize,
+    /// Bytes already handed to the caller. Also the offset of the next handover
+    /// within the block, which is how eMule places each packet's output:
+    /// `StartOffset + totalUnzipped - lenUnzipped` (`DownloadClient.cpp:1057`).
+    flushed: usize,
+    /// Inflated bytes not yet handed over; they belong at `start + flushed`.
+    /// Held back so several packets become one disk write — see
+    /// [`INFLATE_FLUSH_BYTES`].
+    staged: Vec<u8>,
+    /// Inflated size the block must reach, from the requested range.
+    expected_len: usize,
+    inflate: InflateState,
 }
 
-/// Shared bounded reassembly used by both download paths. Declared lengths
-/// never drive allocation; only bytes actually received do.
+/// A compressed block is a single zlib stream spread over several packets, so
+/// the inflate state has to live as long as the block. eMule keeps one
+/// `z_stream` per pending block and calls `unzip` on each packet
+/// (`DownloadClient.cpp:1050`).
+enum InflateState {
+    /// Fewer than two bytes seen, so zlib and raw deflate are still
+    /// indistinguishable. Holds at most one byte.
+    Probing(Vec<u8>),
+    Running(Box<Decompress>),
+}
+
+/// One packet's worth of inflated data, positioned absolutely.
+#[derive(Debug)]
+pub(super) struct InflatedFragment {
+    /// Where in the file these bytes belong. Not the block start except for the
+    /// first fragment.
+    pub(super) offset: u64,
+    pub(super) data: Vec<u8>,
+}
+
+/// Whether a two-byte prefix opens a zlib stream (RFC 1950): the low nibble of
+/// CMF names the deflate method, and the two bytes together are a multiple of 31.
+///
+/// Sniffing the header replaces the old "inflate as zlib, and on failure inflate
+/// the whole buffer again as raw deflate" fallback, which a streaming decoder
+/// cannot do — by the time a mid-block fragment failed, the earlier fragments
+/// would already have been written and discarded.
+fn looks_like_zlib(header: &[u8]) -> bool {
+    header.len() >= 2
+        && header[0] & 0x0F == 8
+        && ((u16::from(header[0]) << 8) | u16::from(header[1])) % 31 == 0
+}
+
+/// Shared bounded reassembly used by both download paths.
+///
+/// Each fragment is inflated as it arrives and its output returned for writing,
+/// rather than the block's compressed bytes being buffered until the last
+/// fragment lands. That is what eMule does, and it means a peer that dies
+/// part-way through a block still leaves its earlier bytes on disk instead of
+/// costing the whole block. It also drops the compressed-byte backlog to nothing:
+/// what remains per block is the inflate window, so `MAX_PENDING_COMPRESSED_BLOCKS`
+/// is now the only budget worth keeping.
 #[derive(Default)]
 pub(super) struct CompressedPartAccumulator {
     pending: HashMap<u64, PendingCompressedBlock>,
-    pending_bytes: usize,
 }
 
 impl CompressedPartAccumulator {
@@ -106,13 +182,7 @@ impl CompressedPartAccumulator {
     /// path does not need this — it scopes its accumulator per part.
     pub(super) fn retain_outstanding(&mut self, retained: impl Fn(u64) -> bool) {
         let before = self.pending.len();
-        self.pending.retain(|start, block| {
-            let keep = retained(*start);
-            if !keep {
-                self.pending_bytes = self.pending_bytes.saturating_sub(block.bytes.len());
-            }
-            keep
-        });
+        self.pending.retain(|start, _| retained(*start));
         if before != self.pending.len() {
             debug!(
                 "Dropped {} abandoned compressed block(s) from reassembly",
@@ -127,7 +197,7 @@ impl CompressedPartAccumulator {
         requested_end: Option<u64>,
         declared_total: u32,
         chunk: &[u8],
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<Option<InflatedFragment>> {
         let requested_end =
             requested_end.ok_or_else(|| anyhow::anyhow!("unsolicited compressed part start"))?;
         let expected_len = requested_end
@@ -153,26 +223,23 @@ impl CompressedPartAccumulator {
         {
             anyhow::bail!("too many concurrent compressed parts");
         }
-        let existing_len = self
+        let existing = self
             .pending
             .get(&start)
             .map(|entry| {
-                if entry.declared_total != declared_total {
+                if entry.declared_total != declared_total || entry.expected_len != expected_len {
                     Err(anyhow::anyhow!(
                         "compressed part changed declared packed size"
                     ))
                 } else {
-                    Ok(entry.bytes.len())
+                    Ok(entry.packed_seen)
                 }
             })
             .transpose()?
             .unwrap_or(0);
-        if chunk.len() > declared_total.saturating_sub(existing_len) {
+        if chunk.len() > declared_total.saturating_sub(existing) {
             self.remove(start);
             anyhow::bail!("compressed part fragments exceed declared packed size");
-        }
-        if self.pending_bytes.saturating_add(chunk.len()) > MAX_PENDING_COMPRESSED_BYTES {
-            anyhow::bail!("aggregate compressed-part reassembly budget exhausted");
         }
 
         let entry = self
@@ -180,35 +247,118 @@ impl CompressedPartAccumulator {
             .entry(start)
             .or_insert_with(|| PendingCompressedBlock {
                 declared_total,
-                bytes: Vec::new(),
+                packed_seen: 0,
+                inflated: 0,
+                flushed: 0,
+                staged: Vec::new(),
+                expected_len,
+                inflate: InflateState::Probing(Vec::new()),
             });
+        entry.packed_seen += chunk.len();
+        let packed_complete = entry.packed_seen >= declared_total;
+
+        // Hold the opening byte back until the format is decidable. `declared_total`
+        // is validated non-zero, so a one-byte block resolves on this same call.
+        let mut owned_chunk: Option<Vec<u8>> = None;
+        let chunk: &[u8] = match &mut entry.inflate {
+            InflateState::Probing(head) => {
+                let mut combined = std::mem::take(head);
+                combined
+                    .try_reserve(chunk.len())
+                    .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
+                combined.extend_from_slice(chunk);
+                if combined.len() < 2 && combined.len() < declared_total {
+                    *head = combined;
+                    return Ok(None);
+                }
+                entry.inflate =
+                    InflateState::Running(Box::new(Decompress::new(looks_like_zlib(&combined))));
+                owned_chunk.insert(combined).as_slice()
+            }
+            InflateState::Running(_) => chunk,
+        };
+        let InflateState::Running(inflate) = &mut entry.inflate else {
+            unreachable!("inflate state was just set to Running");
+        };
+
+        let mut produced: Vec<u8> = Vec::new();
+        let mut consumed = 0usize;
+        let mut stream_end = false;
+        while consumed < chunk.len() && !stream_end {
+            // The remaining output allowance is the anti-bomb bound: a stream that
+            // wants to inflate past the range we asked for cannot, because the
+            // buffer it writes into never has room for more.
+            let allowance = entry
+                .expected_len
+                .saturating_sub(entry.inflated + produced.len());
+            if allowance == 0 {
+                break;
+            }
+            let mut buf: Vec<u8> = Vec::new();
+            buf.try_reserve_exact(allowance.min(INFLATE_ROUND_BYTES))
+                .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
+            let before_in = inflate.total_in();
+            let status = inflate
+                .decompress_vec(&chunk[consumed..], &mut buf, FlushDecompress::None)
+                .map_err(|e| anyhow::anyhow!("compressed part failed to inflate: {e}"))?;
+            consumed += (inflate.total_in() - before_in) as usize;
+            produced
+                .try_reserve(buf.len())
+                .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
+            produced.extend_from_slice(&buf);
+            if matches!(status, Status::StreamEnd) {
+                stream_end = true;
+            }
+        }
+
+        // Every fragment must be fully consumed, because none of it is retained.
+        // Bytes left over mean either the output allowance ran out (the stream
+        // inflates past its requested range) or the stream ended with trailing
+        // data — both are a broken or hostile block.
+        if consumed < chunk.len() {
+            self.remove(start);
+            anyhow::bail!("decompressed part exceeds requested range");
+        }
+
+        let entry = self
+            .pending
+            .get_mut(&start)
+            .expect("pending compressed block removed while borrowed");
+        entry.inflated += produced.len();
         entry
-            .bytes
-            .try_reserve(chunk.len())
+            .staged
+            .try_reserve(produced.len())
             .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
-        entry.bytes.extend_from_slice(chunk);
-        self.pending_bytes += chunk.len();
-        if entry.bytes.len() < declared_total {
+        entry.staged.extend_from_slice(&produced);
+
+        let block_done = entry.inflated == entry.expected_len;
+        // The stream finished, or every declared compressed byte arrived, yet the
+        // output is short of the requested range. Hand over whatever is staged and
+        // drop the block, so the shortfall stays a gap and is re-requested.
+        let closing_short = !block_done && (stream_end || packed_complete);
+
+        if !block_done && !closing_short && entry.staged.len() < INFLATE_FLUSH_BYTES {
             return Ok(None);
         }
 
-        let packed = self
-            .pending
-            .remove(&start)
-            .expect("completed compressed block remains present")
-            .bytes;
-        self.pending_bytes = self.pending_bytes.saturating_sub(packed.len());
-        let decompressed = decompress_compressed_part_bounded(&packed, expected_len)?;
-        if decompressed.len() != expected_len {
-            anyhow::bail!("decompressed part is outside its requested range");
+        let offset = start + entry.flushed as u64;
+        let data = std::mem::take(&mut entry.staged);
+        entry.flushed += data.len();
+
+        if block_done || closing_short {
+            self.pending.remove(&start);
         }
-        Ok(Some(decompressed))
+        if data.is_empty() {
+            if closing_short {
+                anyhow::bail!("decompressed part is outside its requested range");
+            }
+            return Ok(None);
+        }
+        Ok(Some(InflatedFragment { offset, data }))
     }
 
     fn remove(&mut self, start: u64) {
-        if let Some(entry) = self.pending.remove(&start) {
-            self.pending_bytes = self.pending_bytes.saturating_sub(entry.bytes.len());
-        }
+        self.pending.remove(&start);
     }
 }
 
@@ -309,27 +459,6 @@ pub(super) fn take_completed_outstanding_range(
     }
 }
 
-fn decompress_compressed_part_bounded(compressed: &[u8], limit: usize) -> anyhow::Result<Vec<u8>> {
-    fn decode<R: std::io::Read>(mut decoder: R, limit: usize) -> anyhow::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 8192];
-        loop {
-            let read = decoder.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            if output.len().saturating_add(read) > limit {
-                anyhow::bail!("decompressed part exceeds requested range");
-            }
-            output.extend_from_slice(&buffer[..read]);
-        }
-        Ok(output)
-    }
-
-    decode(ZlibDecoder::new(compressed), limit)
-        .or_else(|_| decode(DeflateDecoder::new(compressed), limit))
-}
-
 #[cfg(test)]
 mod compressed_part_bounds_tests {
     use super::*;
@@ -342,34 +471,184 @@ mod compressed_part_bounds_tests {
         encoder.finish().unwrap()
     }
 
-    #[test]
-    fn fragmented_emule_compressed_part_round_trips() {
-        let plain = vec![0x5a; 180 * 1024];
-        let packed = packed(&plain);
-        let split = packed.len() / 2;
+    /// Feed `packed` in `fragments` even slices and return the inflated pieces
+    /// with their absolute offsets, as the receive loop would write them.
+    fn stream(
+        start: u64,
+        plain_len: usize,
+        packed: &[u8],
+        fragments: usize,
+    ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
         let mut accumulator = CompressedPartAccumulator::default();
-        assert!(accumulator
-            .append(
-                100,
-                Some(100 + plain.len() as u64),
+        let chunk = packed.len().div_ceil(fragments);
+        let mut out = Vec::new();
+        for piece in packed.chunks(chunk) {
+            if let Some(f) = accumulator.append(
+                start,
+                Some(start + plain_len as u64),
                 packed.len() as u32,
-                &packed[..split],
+                piece,
+            )? {
+                out.push((f.offset, f.data));
+            }
+        }
+        Ok(out)
+    }
+
+    /// However a block is split across packets, the bytes written have to be the
+    /// same bytes at the same offsets. This is the property that makes streaming
+    /// safe to put on the receive path at all.
+    #[test]
+    fn fragmentation_does_not_change_what_reaches_disk() {
+        // Compressible, but not so uniform that a single inflate round covers it.
+        let plain: Vec<u8> = (0..180 * 1024).map(|i| (i / 977) as u8).collect();
+        let packed = packed(&plain);
+
+        for fragments in [1usize, 2, 3, 7, 64] {
+            let pieces = stream(100, plain.len(), &packed, fragments).unwrap();
+            let mut rebuilt = vec![0u8; plain.len()];
+            let mut covered = 0usize;
+            for (offset, data) in &pieces {
+                let at = (*offset - 100) as usize;
+                assert_eq!(at, covered, "fragments must tile the block in order");
+                rebuilt[at..at + data.len()].copy_from_slice(data);
+                covered += data.len();
+            }
+            assert_eq!(covered, plain.len(), "split into {fragments} fragments");
+            assert_eq!(rebuilt, plain, "split into {fragments} fragments");
+        }
+        // And the whole point: output arrives before the last packet does.
+        assert!(
+            stream(100, plain.len(), &packed, 7).unwrap().len() > 1,
+            "a fragmented block should yield data as it arrives, not all at the end"
+        );
+    }
+
+    /// Inflated output is batched before it is handed back, because every handover
+    /// becomes a reserve/write/commit cycle taking the tracker write lock twice
+    /// and an mpsc round-trip to the per-file writer.
+    ///
+    /// eMule splits a compressed block into 10240-byte packets
+    /// (`UploadDiskIOThread.cpp:444`), so a 180 KB block arrives as ~15 of them.
+    /// Writing each one as it inflated put fifteen of those cycles on the receive
+    /// path where there had been one.
+    #[test]
+    fn many_small_packets_still_produce_few_disk_writes() {
+        // Barely compressible, which is the case that actually fragments — eMule's
+        // own note puts the gain at ~4% for .exe and .avi.
+        let plain: Vec<u8> = {
+            let mut lcg: u32 = 0x1234_5678;
+            (0..180 * 1024)
+                .map(|_| {
+                    lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (lcg >> 16) as u8
+                })
+                .collect()
+        };
+        let packed = packed(&plain);
+
+        // Fragmented the way eMule fragments: 10240 bytes of compressed data each.
+        let fragments = packed.len().div_ceil(10240);
+        assert!(fragments >= 8, "test needs a genuinely fragmented block");
+        let pieces = stream(0, plain.len(), &packed, fragments).unwrap();
+
+        assert!(
+            pieces.len() <= plain.len().div_ceil(INFLATE_FLUSH_BYTES) + 1,
+            "{fragments} packets should batch into a handful of writes, got {}",
+            pieces.len(),
+        );
+        assert!(
+            pieces.len() * 4 <= fragments,
+            "batching must be a large reduction, not a token one: {} writes for {fragments} packets",
+            pieces.len(),
+        );
+
+        // Batching must not change the bytes or their placement.
+        let mut rebuilt = vec![0u8; plain.len()];
+        let mut covered = 0usize;
+        for (offset, data) in &pieces {
+            assert_eq!(*offset as usize, covered);
+            rebuilt[covered..covered + data.len()].copy_from_slice(data);
+            covered += data.len();
+        }
+        assert_eq!(covered, plain.len());
+        assert_eq!(rebuilt, plain);
+    }
+
+    /// A peer that stops mid-block used to cost us every byte of it. The bytes
+    /// that did arrive are now already written, and only the shortfall is left as
+    /// a gap to re-request.
+    #[test]
+    fn an_abandoned_block_keeps_the_bytes_that_arrived() {
+        let plain: Vec<u8> = (0..180 * 1024).map(|i| (i / 613) as u8).collect();
+        let packed = packed(&plain);
+        let mut accumulator = CompressedPartAccumulator::default();
+
+        // Half the compressed stream, then silence.
+        let fragment = accumulator
+            .append(
+                0,
+                Some(plain.len() as u64),
+                packed.len() as u32,
+                &packed[..packed.len() / 2],
             )
             .unwrap()
-            .is_none());
-        assert_eq!(
-            accumulator
-                .append(
-                    100,
-                    Some(100 + plain.len() as u64),
-                    packed.len() as u32,
-                    &packed[split..],
-                )
-                .unwrap()
-                .unwrap(),
-            plain
+            .expect("half a stream still inflates a usable prefix");
+        assert_eq!(fragment.offset, 0);
+        assert!(!fragment.data.is_empty());
+        assert!(fragment.data.len() < plain.len());
+        assert_eq!(plain[..fragment.data.len()], fragment.data[..]);
+    }
+
+    /// Raw deflate with no zlib header is still accepted. The old code inflated
+    /// the buffered block as zlib and retried the whole thing as raw deflate on
+    /// failure; a streaming decoder cannot retry, so the format is decided from
+    /// the header instead.
+    #[test]
+    fn raw_deflate_without_a_zlib_header_still_inflates() {
+        use flate2::write::DeflateEncoder;
+        let plain = vec![0x31u8; 8192];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&plain).unwrap();
+        let raw = encoder.finish().unwrap();
+        assert!(!looks_like_zlib(&raw), "test needs a header-less stream");
+
+        let pieces = stream(0, plain.len(), &raw, 3).unwrap();
+        let rebuilt: Vec<u8> = pieces.into_iter().flat_map(|(_, d)| d).collect();
+        assert_eq!(rebuilt, plain);
+    }
+
+    #[test]
+    fn zlib_header_detection_matches_real_streams() {
+        assert!(looks_like_zlib(&packed(b"hello world, compress me")));
+        assert!(!looks_like_zlib(&[]));
+        assert!(!looks_like_zlib(&[0x78]));
+        // Right method nibble, wrong checksum.
+        assert!(!looks_like_zlib(&[0x78, 0x00]));
+        // Valid mod-31 pair but not the deflate method.
+        assert!(!looks_like_zlib(&[0x79, 0x9b]));
+    }
+
+    /// A stream that inflates past the range we asked for is refused rather than
+    /// written. The output allowance is the bound, so a decompression bomb runs
+    /// out of buffer instead of memory.
+    #[test]
+    fn refuses_a_stream_that_inflates_past_its_requested_range() {
+        let plain = vec![0u8; 512 * 1024];
+        let packed = packed(&plain);
+        let mut accumulator = CompressedPartAccumulator::default();
+        // Claim a 4 KiB range for a stream holding 512 KiB.
+        let err = accumulator
+            .append(0, Some(4096), packed.len() as u32, &packed)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds requested range"),
+            "unexpected error: {err}"
         );
-        assert_eq!(accumulator.pending_bytes, 0);
+        assert!(
+            accumulator.pending.is_empty(),
+            "a refused block must not stay in reassembly"
+        );
     }
 
     #[test]
@@ -377,17 +656,44 @@ mod compressed_part_bounds_tests {
         let mut accumulator = CompressedPartAccumulator::default();
         assert!(accumulator.append(10, None, 10, b"abc").is_err());
         assert!(accumulator.append(10, Some(20), 2, b"abc").is_err());
-        assert_eq!(accumulator.pending_bytes, 0);
+        assert!(accumulator.pending.is_empty());
     }
 
+    /// Declared lengths still never drive allocation: nothing is sized from the
+    /// peer's claimed packed size, and with streaming there is no compressed
+    /// backlog at all — only the inflate window.
     #[test]
     fn declared_total_does_not_preallocate() {
         let mut accumulator = CompressedPartAccumulator::default();
         accumulator
             .append(0, Some(1024 * 1024), 1024 * 1024, b"x")
             .unwrap();
-        assert!(accumulator.pending[&0].bytes.capacity() < 4096);
-        assert_eq!(accumulator.pending_bytes, 1);
+        assert_eq!(accumulator.pending.len(), 1);
+        assert_eq!(accumulator.pending[&0].packed_seen, 1);
+        assert_eq!(accumulator.pending[&0].inflated, 0);
+    }
+
+    /// Reassembly state is dropped for blocks that are no longer outstanding, so
+    /// a session-scoped accumulator cannot fill up with stranded entries.
+    #[test]
+    fn retain_outstanding_drops_abandoned_blocks() {
+        let plain = vec![7u8; 4096];
+        let packed = packed(&plain);
+        let mut accumulator = CompressedPartAccumulator::default();
+        for start in [0u64, 8192] {
+            accumulator
+                .append(
+                    start,
+                    Some(start + plain.len() as u64),
+                    packed.len() as u32,
+                    &packed[..1],
+                )
+                .unwrap();
+        }
+        assert_eq!(accumulator.pending.len(), 2);
+        accumulator.retain_outstanding(|start| start == 0);
+        assert_eq!(accumulator.pending.len(), 1);
+        assert!(accumulator.pending.contains_key(&0));
     }
 }
 
@@ -484,7 +790,19 @@ pub enum SourceFailureKind {
 pub enum DownloadEvent {
     Progress {
         transfer_id: String,
+        /// Bytes present on disk, from the gap list — eMule's `m_completedsize`
+        /// and its Completed column. Progress % and the remaining byte count
+        /// derive from this (`DownloadListCtrl.cpp:1698`, `:1731`).
         downloaded: u64,
+        /// Cumulative bytes peers have sent for this file — eMule's
+        /// `m_uTransferred` and its Transferred column
+        /// (`DownloadListCtrl.cpp:1984`). Counts duplicates, re-fetches after a
+        /// failed part hash, and compressed payload, so it can exceed `total`.
+        ///
+        /// `None` from the terminal and zero-length paths, which have no tracker
+        /// to read it from; the consumer then falls back to `downloaded` rather
+        /// than reporting a byte count it does not have.
+        transferred: Option<u64>,
         total: u64,
     },
     SourcesUpdate {
@@ -1667,6 +1985,7 @@ impl Ed2kDownload {
         let _ = event_tx.try_send(DownloadEvent::Progress {
             transfer_id: self.transfer_id.clone(),
             downloaded: 0,
+            transferred: None,
             total: 0,
         });
         Ok(final_path)
@@ -4585,6 +4904,10 @@ impl Ed2kDownload {
                             consecutive_bad_blocks = 0;
                             let piece_len = end - start;
                             self.acquire_download_bandwidth(piece_len).await?;
+                            // Every byte the peer sent, counted before the gap
+                            // check below decides which were needed — eMule's
+                            // `m_uTransferred += transize` (`PartFile.cpp:3957`).
+                            tracker.add_transferred(piece_len);
 
                             // Never overwrite bytes we already have. Write ONLY the
                             // gap sub-ranges of this block, not the whole block: a
@@ -4685,6 +5008,7 @@ impl Ed2kDownload {
                                 let _ = event_tx.try_send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
                                     downloaded: progress,
+                                    transferred: Some(tracker.transferred()),
                                     total: self.file_size,
                                 });
                                 last_progress_emit = std::time::Instant::now();
@@ -4716,6 +5040,11 @@ impl Ed2kDownload {
                                     hex::encode(hash)
                                 );
                             }
+                            // Compressed length, counted per packet — eMule hands
+                            // `WriteToBuffer` the same wire size for packed blocks
+                            // as for plain ones (`DownloadClient.cpp:1066`), and
+                            // counts each packet rather than each inflated block.
+                            tracker.add_transferred(compressed.len() as u64);
 
                             let requested_end = batches.iter().take(sent_idx).flatten().find_map(
                                 |(requested_start, requested_end)| {
@@ -4732,7 +5061,7 @@ impl Ed2kDownload {
                                 );
                                 continue;
                             };
-                            let Some(decompressed) = pending_compressed.append(
+                            let Some(fragment) = pending_compressed.append(
                                 start,
                                 Some(requested_end),
                                 compressed_total_size,
@@ -4743,6 +5072,11 @@ impl Ed2kDownload {
                                 continue;
                             };
 
+                            // This packet's inflated bytes and where they belong —
+                            // the block start only for the first packet. See the
+                            // matching branch in `multi_source.rs`.
+                            let decompressed = fragment.data;
+                            let start = fragment.offset;
                             let piece_len = decompressed.len() as u64;
                             if start.saturating_add(piece_len) > self.file_size {
                                 consecutive_bad_blocks += 1;
@@ -4841,6 +5175,7 @@ impl Ed2kDownload {
                                 let _ = event_tx.try_send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
                                     downloaded: progress,
+                                    transferred: Some(tracker.transferred()),
                                     total: self.file_size,
                                 });
                                 last_progress_emit = std::time::Instant::now();
@@ -5472,6 +5807,7 @@ impl Ed2kDownload {
                                         let _ = event_tx.try_send(DownloadEvent::Progress {
                                             transfer_id: self.transfer_id.clone(),
                                             downloaded: progress,
+                                            transferred: Some(tracker.transferred()),
                                             total: self.file_size,
                                         });
                                         info!(
@@ -5602,6 +5938,7 @@ impl Ed2kDownload {
                 let _ = event_tx.try_send(DownloadEvent::Progress {
                     transfer_id: self.transfer_id.clone(),
                     downloaded: progress,
+                    transferred: Some(tracker.transferred()),
                     total: self.file_size,
                 });
                 last_progress_emit = std::time::Instant::now();

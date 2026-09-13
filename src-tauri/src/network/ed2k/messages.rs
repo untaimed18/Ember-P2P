@@ -72,10 +72,31 @@ pub const OP_ANSWERSOURCES2: u8 = 0x84;
 pub const SOURCEEXCHANGE2_VERSION: u8 = 4;
 
 // Queue opcodes (OP_EMULEPROT)
-// NOTE: OP_QUEUEFULL on TCP is 0x93 (same value as OP_MULTIPACKETANSWER).
-// Disambiguation is by context: 0x93 on a peer TCP connection where we sent a
-// file request and are awaiting a queue response is OP_QUEUEFULL; 0x93 in
-// response to OP_MULTIPACKET is OP_MULTIPACKETANSWER.
+//
+// `OP_QUEUEFULL` is 0x93, which on TCP is `OP_MULTIPACKETANSWER`. eMule
+// declares it only in its UDP section (`Opcodes.h:293`, under "extended prot
+// client <-> extended prot client UDP") and never writes it to a TCP stream:
+// the one send site that is reached from a TCP packet, the `OP_REASKCALLBACKTCP`
+// handler at `ListenSocket.cpp:1469`, answers over `theApp.clientudp`.
+//
+// So we only ever *receive* this on TCP, never send it — see
+// `UploadServer::serve_peer`. Sending it was actively harmful: eMule dispatches
+// on the opcode alone (`ListenSocket.cpp:1030`), reads a file hash out of the
+// empty body (`:1059`), throws, and lands in the invalid-packet handler at
+// `:1806-1808`, which sets `DS_ERROR`. `CUpDownClient::Disconnected` then treats
+// `DS_ERROR` as a dead source (`BaseClient.cpp:1188-1194`): it calls
+// `RemoveSource` *and* `AddDeadSource`, so the peer deletes us as a source for
+// that file and refuses to dial us for 15 minutes (30 if we are LowID). That
+// fired on ordinary refusals — including the re-admit right after a successful
+// session rotation — so a busy node shed the peers it had just served.
+//
+// eMule's own queue refusal is silence: every rejection path in
+// `CUploadQueue::AddClientToQueue` (`UploadQueue.cpp:523, 530, 564, 590, 632`)
+// simply returns, and the waiting downloader assumes "remote queue full" until
+// it hears otherwise.
+//
+// Parsing it inbound stays, because other clients do send it over UDP and
+// older Ember builds still send it over TCP.
 pub const OP_QUEUEFULL: u8 = 0x93;
 
 // UDP reask opcodes (OP_EMULEPROT, peer-to-peer UDP)

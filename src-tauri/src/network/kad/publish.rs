@@ -13,12 +13,19 @@ const MAX_FILES_PER_KEYWORD_PACKET: usize = 50;
 
 /// Byte budget for one `PublishKeyReq` body.
 ///
-/// `encode_packet` compresses any payload over 1419 bytes and hard-fails when
-/// the compressed form still exceeds 1418. Staying under the compression
-/// threshold means a keyword packet always encodes, whatever its filenames
-/// look like. The remaining headroom covers the 16-byte target, the entry
-/// count, and the protocol/opcode bytes.
-const MAX_KEYWORD_PACKET_BODY_BYTES: usize = 1300;
+/// Sized against `UDP_KAD_MAX_PUBLISH_FRAGMENT`, the ceiling eMule actually
+/// enforces on a publish request, rather than the 1420-byte fragment limit it
+/// only applies to responses. At 1300 this was the binding constraint
+/// instead of [`MAX_FILES_PER_KEYWORD_PACKET`], so a keyword backing 150 files
+/// went out as 17-25 datagrams where eMule sends three — and a storing eMule
+/// accepts only four before dropping the rest and eventually banning us. See
+/// `UDP_KAD_MAX_PUBLISH_FRAGMENT` for that accounting.
+///
+/// This is measured on the *uncompressed* body while the ceiling applies to the
+/// compressed form, so the slack between the two only ever works in our favour;
+/// filename-heavy bodies compress well, and `encode_packet` still validates the
+/// real wire size.
+const MAX_KEYWORD_PACKET_BODY_BYTES: usize = 7000;
 
 /// Conservative encoded size of one keyword entry.
 ///
@@ -40,14 +47,14 @@ fn keyword_entry_wire_size(entry: &PublishEntry) -> usize {
 
 /// Split keyword entries into packets small enough to actually encode.
 ///
-/// A keyword entry is mostly incompressible — a 16-byte MD4 plus a filename —
-/// so chunking purely by count produced roughly 6 KB bodies for a popular
-/// keyword, which zlib could not squeeze under the fragment ceiling.
-/// `encode_packet` returned an error that both send sites discarded with
-/// `if let Ok(packet)`, so the publish silently vanished: the keyword was
+/// Count is normally what binds, matching eMule's 50 entries per packet
+/// (`Search.cpp:723`). The byte budget is the secondary guard for pathological
+/// filenames: a keyword entry is mostly incompressible — a 16-byte MD4 plus a
+/// filename — so a body that overruns the wire ceiling would make
+/// `encode_packet` fail, and both send sites discard that error with
+/// `if let Ok(packet)`. The publish then vanished silently: the keyword was
 /// never marked published, `next_keyword_candidate` re-offered it on every
-/// tick, and a fresh DHT search was started each time. Any keyword appearing
-/// in more than roughly fifteen filenames never reached the network at all.
+/// tick, and a fresh DHT search was started each time.
 ///
 /// A single entry larger than the budget still gets its own packet — better
 /// to attempt an oversized one than to drop the file silently.
@@ -769,7 +776,9 @@ impl PublishManager {
 /// 32-bit word in little-endian on the wire. This effectively reverses
 /// the byte order within each 4-byte word of the raw MD4 digest.
 pub fn keyword_to_kad_id(keyword: &str) -> KadId {
-    let lower = keyword.to_lowercase();
+    // Same 1:1 mapping the tokenizer applies, so a keyword hashed directly here
+    // lands on the key its tokenised form would — see `kad_keyword_lowercase`.
+    let lower = kad_keyword_lowercase(keyword);
     let hash = Md4::digest(lower.as_bytes());
     md4_bytes_to_kad_id(&hash)
 }
@@ -838,7 +847,8 @@ pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
 /// Matches eMule SearchManager::GetWords:
 /// - Split on INV_KAD_KEYWORD_CHARS: ` ()[]{}<>,._-!?:;\\/"`
 /// - Keep words where UTF-8 byte length >= 3
-/// - Deduplicate (case-insensitive), keeping order of first occurrence
+/// - Lowercase 1:1 (see [`kad_keyword_lowercase`])
+/// - Deduplicate, moving a repeat to the end of the list
 /// - Remove last word if it's exactly 3 chars and 3 bytes (strips file extensions)
 pub fn extract_keywords(filename: &str) -> Vec<String> {
     tokenize_keywords(filename, true)
@@ -861,50 +871,74 @@ pub fn extract_query_keywords(query: &str) -> Vec<String> {
     tokenize_keywords(query, false)
 }
 
-fn tokenize_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
-    let separator_chars = |c: char| -> bool {
-        matches!(
-            c,
-            '(' | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '<'
-                | '>'
-                | ','
-                | '.'
-                | '_'
-                | '-'
-                | '!'
-                | '?'
-                | ':'
-                | ';'
-                | '\\'
-                | '/'
-                | '"'
-        ) || c.is_whitespace()
-    };
+/// eMule `INV_KAD_KEYWORD_CHARS` (`SearchManager.h:35`), exactly.
+///
+/// The space is the only whitespace in it. Ember used to add
+/// `char::is_whitespace`, which also matches tab, newline and — the one that
+/// bites in practice — `U+00A0` no-break space: a filename containing one was
+/// then tokenised differently by us and by every eMule, so it was published
+/// under keys nobody searches and our searches missed theirs.
+const INV_KAD_KEYWORD_CHARS: &[char] = &[
+    ' ', '(', ')', '[', ']', '{', '}', '<', '>', ',', '.', '_', '-', '!', '?', ':', ';', '\\', '/',
+    '"',
+];
 
-    let mut seen = std::collections::HashSet::new();
+fn is_kad_keyword_separator(c: char) -> bool {
+    INV_KAD_KEYWORD_CHARS.contains(&c)
+}
+
+/// Length-preserving lowercase, matching what eMule hashes.
+///
+/// `KadTagStrMakeLower` (`DataIO.cpp:483-514`) walks a fixed 1:1 UTF-16 map
+/// precomputed from `LCMapString(LANG_ENGLISH_US, LCMAP_LOWERCASE)`, and the
+/// comment above it states the requirement: *"All clients in the network have to
+/// use the same character mapping."*
+///
+/// `str::to_lowercase` is not that mapping. It implements full Unicode
+/// lowercasing, so `U+0130 İ` expands to two code points and a word-final `Σ`
+/// becomes `ς` rather than `σ` — either of which yields a different MD4 and so a
+/// different key. Mapping char by char and keeping any char whose lowercase is
+/// not a single char gives a 1:1 result and, incidentally, drops the final-sigma
+/// context rule, because that rule lives in `str::to_lowercase` alone.
+fn kad_keyword_lowercase(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(single), None) => single,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+fn tokenize_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
+    // Assigned for *every* token scanned, including ones too short to keep —
+    // eMule sets `uChars`/`uBytes` before its length test (`SearchManager.cpp:237`,
+    // `:246`), so the extension check below sees the genuinely last token. Ember
+    // only updated them for accepted words, so a name ending in a separator or a
+    // short token could strip the wrong keyword.
     let mut last_chars = 0usize;
     let mut last_bytes = 0usize;
 
-    for word in text.split(separator_chars) {
-        let bytes = word.len();
-        if bytes < 3 {
+    for word in text.split(is_kad_keyword_separator) {
+        last_chars = word.chars().count();
+        last_bytes = word.len();
+        if last_bytes < 3 {
             continue;
         }
-        let lower = word.to_lowercase();
-        if seen.insert(lower.clone()) {
-            last_chars = word.chars().count();
-            last_bytes = bytes;
-            result.push(lower);
-        }
+        let lower = kad_keyword_lowercase(word);
+        // A repeat moves to the end rather than keeping its first position:
+        // eMule does `rlistWords.remove(sWord); rlistWords.push_back(sWord);`
+        // (`SearchManager.cpp:249-250`). It decides which word a repeated query
+        // targets, and which one the extension strip below can remove.
+        result.retain(|w| w != &lower);
+        result.push(lower);
     }
 
-    // eMule: if last word is 3 chars and 3 bytes and there are >1 words, pop it (extension)
+    // eMule: if the last token scanned is 3 chars and 3 bytes and more than one
+    // word survived, drop it — almost always a file extension.
     if strip_trailing_extension && result.len() > 1 && last_chars == 3 && last_bytes == 3 {
         result.pop();
     }
@@ -937,6 +971,120 @@ mod tests {
         // emission of every other tag too).
         p.direct_udp_callback = true;
         p
+    }
+
+    fn keyword_entry(name: &str) -> PublishEntry {
+        PublishManager::build_keyword_entry(&PublishableFile {
+            file_hash: KadId([0x42; 16]),
+            file_name: name.to_string(),
+            file_size: 1024,
+            file_type: "Video".to_string(),
+            complete_sources: 3,
+            keyword_publishable: true,
+            last_source_publish: 0,
+        })
+    }
+
+    /// A keyword publish has to leave as about as many datagrams as eMule's
+    /// would, because a storing eMule accepts only four
+    /// `KADEMLIA2_PUBLISH_KEY_REQ` in a row before it drops the rest and starts
+    /// building toward a ban. With the old 1300-byte body budget, the packet
+    /// count was set by bytes rather than by eMule's 50-entry rule, and an
+    /// ordinary release name yielded ~9 entries per packet — 17 packets for a
+    /// full batch, of which the network kept four.
+    #[test]
+    fn a_full_keyword_batch_packs_like_emule_not_into_fragments() {
+        let entries: Vec<PublishEntry> = (0..MAX_FILES_PER_KEYWORD_PUBLISH)
+            .map(|i| keyword_entry(&format!("Some.Movie.Title.{i}.1080p.BluRay.x264-GROUP.mkv")))
+            .collect();
+
+        let chunks = chunk_keyword_entries(entries);
+
+        // eMule: 150 files at 50 per packet = 3 packets. Anything up to four
+        // stays inside the receiver's burst allowance.
+        assert!(
+            chunks.len() <= 4,
+            "{} packets for one keyword; a storing eMule keeps only the first four",
+            chunks.len()
+        );
+        assert!(chunks.iter().all(|c| c.len() <= MAX_FILES_PER_KEYWORD_PACKET));
+
+        // And every chunk must still survive `encode_packet`, which is where an
+        // over-budget body used to be dropped on the floor.
+        for chunk in chunks {
+            let packet = super::super::messages::encode_packet(&KadMessage::PublishKeyReq {
+                target: KadId([0x11; 16]),
+                entries: chunk,
+            })
+            .expect("a chunk must always encode");
+            assert!(
+                packet.len() <= UDP_KAD_MAX_PUBLISH_FRAGMENT,
+                "packet of {} bytes exceeds the publish ceiling",
+                packet.len()
+            );
+            // eMule's client UDP socket reads into 8192 bytes; longer is truncated.
+            assert!(packet.len() <= 8192);
+        }
+    }
+
+    /// An index only works while every client agrees on what a word is, so each
+    /// of these rules is a compatibility requirement rather than a preference.
+    #[test]
+    fn tokenizer_matches_emules_word_rules() {
+        // Only the space separates; other whitespace is an ordinary character.
+        // A no-break space is the realistic case, and splitting on it published
+        // to keys no eMule would ever search.
+        assert_eq!(
+            extract_keywords("alpha\u{00A0}beta.mkv"),
+            vec!["alpha\u{00A0}beta"],
+            "U+00A0 is not a separator for eMule, so it must not be one here"
+        );
+        assert_eq!(extract_keywords("alpha beta.mkv"), vec!["alpha", "beta"]);
+
+        // A repeat moves to the end (`remove` then `push_back`).
+        assert_eq!(
+            extract_keywords("alpha beta alpha gamma"),
+            vec!["beta", "alpha", "gamma"]
+        );
+
+        // The extension strip looks at the last token *scanned*, so a trailing
+        // separator does not shift it onto a real keyword.
+        assert_eq!(
+            extract_keywords("some movie title.mkv"),
+            vec!["some", "movie", "title"],
+            "a 3-char 3-byte extension is dropped"
+        );
+        assert_eq!(
+            extract_keywords("some movie title.mkv."),
+            vec!["some", "movie", "title", "mkv"],
+            "the last token scanned is the empty one after the dot, so nothing is stripped"
+        );
+
+        // Four-letter extensions are keywords, by the same rule eMule applies.
+        assert_eq!(
+            extract_keywords("some movie title.flac"),
+            vec!["some", "movie", "title", "flac"]
+        );
+
+        // A query keeps its final short word — that strip is filename-only.
+        assert_eq!(extract_query_keywords("the big cat"), vec!["the", "big", "cat"]);
+    }
+
+    /// The lowercase step feeds MD4 directly, so it has to be 1:1 like eMule's
+    /// map. Full Unicode lowercasing changes the byte length, and a different
+    /// byte string is a different key.
+    #[test]
+    fn keyword_lowercase_is_length_preserving() {
+        assert_eq!(kad_keyword_lowercase("ABC"), "abc");
+        // Greek final sigma: `str::to_lowercase` would produce `ς` here, which
+        // hashes differently from the `σ` every other client derives.
+        assert_eq!(kad_keyword_lowercase("ΟΔΟΣ"), "οδοσ");
+        // `İ` lowercases to two code points in full Unicode; a 1:1 map cannot,
+        // so the character is left as-is rather than silently changing length.
+        let dotted = kad_keyword_lowercase("İ");
+        assert_eq!(dotted.chars().count(), 1);
+        // And the mapping the hash actually uses is the same one.
+        assert_eq!(keyword_to_kad_id("UBUNTU"), keyword_to_kad_id("ubuntu"));
     }
 
     /// Every Ember build has to derive the same rendezvous key or nodes

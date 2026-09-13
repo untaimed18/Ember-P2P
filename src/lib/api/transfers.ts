@@ -75,16 +75,25 @@ export async function takePendingDownloadOverflowNotice(): Promise<number> {
   return invoke('take_pending_download_overflow_notice');
 }
 
+// The three row actions the transfers footer latches `selectedActionBusy` on
+// while they run: without a deadline a wedged command leaves Pause / Resume /
+// Stop disabled for the rest of the session. Each takes the transfer-manager
+// write lock, persists a status, then hands the network task a command through
+// `bounded_send` — which is itself capped at 10 s, so the deadline here has to
+// clear that for the backend's own coded error to win when the channel is the
+// thing that's blocked. `withTimeout`'s 20 s default does. The command is not
+// cancelled by the rejection, so a late success still shows up in the next
+// 3 s transfer poll.
 export async function pauseTransfer(transferId: string): Promise<void> {
-  return invoke('pause_transfer', { transferId });
+  return withTimeout(invoke<void>('pause_transfer', { transferId }), 'pause_transfer');
 }
 
 export async function stopTransfer(transferId: string): Promise<void> {
-  return invoke('stop_transfer', { transferId });
+  return withTimeout(invoke<void>('stop_transfer', { transferId }), 'stop_transfer');
 }
 
 export async function resumeTransfer(transferId: string): Promise<void> {
-  return invoke('resume_transfer', { transferId });
+  return withTimeout(invoke<void>('resume_transfer', { transferId }), 'resume_transfer');
 }
 
 export async function cancelTransfer(transferId: string): Promise<void> {
@@ -158,7 +167,14 @@ export async function resumeAllTransfers(): Promise<void> {
 }
 
 export async function getTransferSources(transferId: string): Promise<SourceInfo[]> {
-  return invoke('get_transfer_sources', { transferId });
+  // Gates the source drawer's spinner, so a hang here is a spinner that never
+  // clears. Clones an in-memory row list behind the transfer-manager read
+  // lock; 8 s as for `get_upload_queue`.
+  return withTimeout(
+    invoke<SourceInfo[]>('get_transfer_sources', { transferId }),
+    'get_transfer_sources',
+    8_000,
+  );
 }
 
 export async function openFile(transferId: string): Promise<void> {

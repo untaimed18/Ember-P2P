@@ -10,9 +10,14 @@ import * as m from '$lib/paraglide/messages';
 
 interface ProgressPayload {
   id: string;
+  /** Download-direction cumulative wire bytes; may exceed `total` after a
+   *  re-fetch. Symmetric with `uploaded`. */
   downloaded: number;
   uploaded?: number;
-  /** Upload-direction only: unique per-part coverage this session. */
+  /** The coverage figure for either direction: unique per-part coverage this
+   *  session for uploads, bytes on disk for downloads. Bounded by the file size,
+   *  which is why the progress bar and remaining bytes come from this and not
+   *  from the wire counters. */
   completed_size?: number;
   total: number;
   progress: number;
@@ -497,9 +502,15 @@ function flushProgress() {
       // Uploads: `completed_size` is unique coverage, not session wire bytes.
       // Merging it with `transferred` pinned the bar at 100% whenever
       // re-requests reached file size while the parts bitmap was still sparse.
+      // Never derived from `transferred` for either direction. `transferred` is
+      // cumulative wire bytes and counts anything downloaded or sent twice, so on
+      // a download that re-fetched a corrupt part it exceeds the file size —
+      // seeding Completed from it drove the bar and the remaining byte count past
+      // 100%. Uploads had the same bug and were fixed the same way; downloads only
+      // became exposed once they started reporting real wire bytes.
       const completedSize = isUpload
         ? (p.completed_size != null ? p.completed_size : existing.completed_size || 0)
-        : Math.max(transferred, existing.completed_size || 0);
+        : Math.max(p.completed_size ?? 0, existing.completed_size || 0);
       const bytesMoved = transferred > (existing.transferred || 0);
       const clearStaleHealth = bytesMoved || existing.health === 'stalled';
       list[idx] = {
@@ -721,7 +732,12 @@ export async function initTransferStore() {
             status: 'completed' as const,
             speed: 0,
             progress: 100,
-            transferred: t.total_size,
+            // A floor for Transferred rather than an assignment, matching
+            // `TransferManager::complete`: a download that re-fetched a corrupt
+            // part legitimately ends with more bytes off the wire than the file
+            // holds, and that overage is the only thing distinguishing the two
+            // columns on a finished row.
+            transferred: Math.max(t.transferred || 0, t.total_size),
             completed_size: t.total_size,
             ember_verified: ember_verified === true || t.ember_verified,
           };
@@ -1067,7 +1083,8 @@ function snapCompletedDownload(t: Transfer): Transfer {
     return {
       ...t,
       progress: 100,
-      transferred: t.total_size,
+      // Floored, not assigned — see the `transfer-complete` handler above.
+      transferred: Math.max(t.transferred || 0, t.total_size),
       completed_size: t.total_size,
       speed: 0,
     };

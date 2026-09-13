@@ -18,11 +18,19 @@ const MIN_TCP_RECONNECT_SECS: i64 = 1200;
 
 /// Whether a stored source may be forwarded in an OP_ANSWERSOURCES(2) reply.
 ///
-/// Matches eMule's `CreateSrcInfoPacket`: HighID sources are gated on a valid,
-/// non-filtered IP that isn't the requester; LowID (firewalled) sources are
-/// forwarded too — eMule includes them so the receiver can reach them via a
-/// server callback — but only when they carry a usable server reference (their
-/// own IP is unknown, so the IP-based filters don't apply to them).
+/// Matches eMule's `CreateSrcInfoPacket`, whose very first test is
+/// `if (cur_src->HasLowID() || !cur_src->IsValidSource()) continue;`
+/// (`PartFile.cpp:3696`) — and `CKnownFile::CreateSrcInfoPacket` opens the same
+/// way (`KnownFile.cpp:1060`). LowID sources are skipped unconditionally by both.
+///
+/// Ember used to forward them, on the stated belief that eMule includes them so
+/// the receiver can call back through a server. It does not, and the belief does
+/// not survive contact with how callbacks work: a LowID peer is reachable only
+/// through the *same* server it is logged into, so most of what we handed out was
+/// dead weight that still consumed the recipient's per-file source allowance and
+/// inflated its Sources column. Forwarding rows we had never contacted also made
+/// us an amplifier — fabricated sources pushed into us over SX were re-advertised
+/// to every peer that asked.
 pub(crate) fn sx_answer_source_eligible(e: &SourceEntry, exclude_ip: Ipv4Addr, now: i64) -> bool {
     if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
         return false;
@@ -33,10 +41,9 @@ pub(crate) fn sx_answer_source_eligible(e: &SourceEntry, exclude_ip: Ipv4Addr, n
         return false;
     }
     if e.client_id != 0 {
-        e.server_ip != 0 && e.server_port != 0
-    } else {
-        e.ip != exclude_ip && !is_filtered_source_ip(&e.ip)
+        return false;
     }
+    e.ip != exclude_ip && !is_filtered_source_ip(&e.ip)
 }
 
 /// The eMule "hybrid" (host-order) source ID to advertise for a source: the
@@ -953,6 +960,37 @@ impl PerFileSourceList {
         self.find(ip, port, user_hash)
             .map(|s| s.kad_callback_reask_due())
             .unwrap_or(false)
+    }
+
+    /// Whether the source at `ip:port` is a firewalled (LowID) peer, judged from
+    /// the state its row is parked in.
+    ///
+    /// Selects the longer dead-source block time, which eMule keys on the
+    /// *source's* `HasLowID()` (`DeadSourceList.cpp:121`). Every state here is one
+    /// a peer only reaches because it cannot accept an inbound connection: it is
+    /// waiting to call us back, or the two of us are both firewalled.
+    pub fn source_is_firewalled(
+        &self,
+        ip: Ipv4Addr,
+        port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) -> bool {
+        self.find(ip, port, user_hash).is_some_and(|s| {
+            matches!(
+                s.state,
+                DownloadSourceState::WaitCallbackKad
+                    | DownloadSourceState::LowToLowIp
+                    | DownloadSourceState::EmberRelay
+            ) || s.callback_buddy_ip.is_some()
+        })
+    }
+
+    /// Callback requests already sent for this row, so the caller can vary
+    /// which candidate buddy port the next one targets.
+    pub fn callback_attempts(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> u32 {
+        self.find(ip, port, user_hash)
+            .map(|s| s.callback_reasks_sent)
+            .unwrap_or(0)
     }
 
     /// Bump the reask timer after a successful `CallbackReq` send.
@@ -3997,6 +4035,42 @@ mod tests {
             .unwrap();
         assert_eq!(listening.udp_port, 4672);
         assert!(!listening.not_for_reconnect);
+    }
+
+    /// eMule skips a LowID source outright when building a source-exchange
+    /// answer, and both of its builders open with that test. Handing them out
+    /// spends the recipient's per-file source allowance on peers it can only
+    /// reach through the one server they happen to be logged into.
+    #[test]
+    fn sx_answer_skips_lowid_sources() {
+        let hash = [0x5C; 16];
+        let peer = [0x6D; 16];
+        // Deliberately outside the special-use ranges `is_filtered_source_ip`
+        // rejects, matching the sibling test above.
+        let highid_ip = Ipv4Addr::new(9, 8, 7, 6);
+        let server_ip = u32::from(Ipv4Addr::new(9, 8, 7, 1));
+        let mut sm = SourceManager::new();
+
+        // A LowID source carrying a perfectly usable server reference, which is
+        // the case the old code deliberately forwarded.
+        sm.register_lowid_source(hash, 16_777_000, 4662, server_ip, 4661, peer, 0);
+        sm.register_source_full_opts(hash, highid_ip, 4662, 0, [0x7E; 16], 0);
+
+        let now = chrono::Utc::now().timestamp();
+        let other = Ipv4Addr::new(1, 1, 1, 1);
+        let entries = sm.sources.get(&hash).unwrap();
+
+        let lowid = entries.iter().find(|e| e.client_id != 0).unwrap();
+        assert!(
+            !sx_answer_source_eligible(lowid, other, now),
+            "a LowID source must not be forwarded even with a usable server reference"
+        );
+
+        let highid = entries.iter().find(|e| e.ip == highid_ip).unwrap();
+        assert!(
+            sx_answer_source_eligible(highid, other, now),
+            "HighID sources on the same list are still offered"
+        );
     }
 
     #[test]

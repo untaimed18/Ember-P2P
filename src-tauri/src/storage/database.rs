@@ -2727,7 +2727,14 @@ impl Database {
                 transfer.progress,
                 i64::try_from(transfer.speed).unwrap_or(i64::MAX),
                 i64::try_from(transfer.total_size).unwrap_or(i64::MAX),
-                i64::try_from(transfer.transferred).unwrap_or(i64::MAX),
+                // The `transferred` column stores resume progress, so it takes the
+                // on-disk figure — the same thing `update_transfer_progress` writes
+                // and `load_transfers` reads back into `completed_size`. The
+                // cumulative wire total is kept in `.part.met`'s `FT_TRANSFERRED`,
+                // as eMule keeps it, and must not land here: the queue-overflow
+                // query computes `total_size - transferred`, which would underflow
+                // to zero for any download that re-fetched a part.
+                i64::try_from(transfer.completed_size).unwrap_or(i64::MAX),
                 transfer.started_at,
                 transfer.priority,
                 transfer.category,
@@ -2845,6 +2852,12 @@ impl Database {
                         progress: row.get(7)?,
                         speed: row.get::<_, i64>(8)?.max(0) as u64,
                         total_size: row.get::<_, i64>(9)?.max(0) as u64,
+                        // The persisted column is the on-disk figure, so it restores
+                        // `completed_size` directly. `transferred` starts from it as
+                        // a floor: the real cumulative wire total lives in
+                        // `.part.met`'s `FT_TRANSFERRED` (as it does for eMule) and
+                        // replaces this the first time the resumed download reports
+                        // progress.
                         transferred: transferred_val,
                         completed_size: transferred_val,
                         started_at: row.get(11)?,

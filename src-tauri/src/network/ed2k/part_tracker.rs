@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
 };
+use std::time::{Duration, Instant};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -28,6 +29,25 @@ const FT_STATUS: u8 = 0x14;
 /// extension. Encoded as a BLOB: first byte = byte count, then the raw
 /// bitmap bytes (LSB-first per byte).
 const FT_EMBER_VERIFIED_BITMAP: u8 = 0xEB;
+
+/// Ember-private tag: which convention [`FT_GAPEND`] follows in this file.
+///
+/// Needed because Ember used to write the *inclusive* last missing byte where
+/// eMule writes the *exclusive* one (`PartFile.cpp:1384` writes `gap.end + 1`;
+/// its loader undoes that at `:972`). Files written by those builds are still on
+/// disk, and their gap ends have to keep their old meaning or every gap loses a
+/// byte on resume — which fails the covering part's MD4 and re-downloads it.
+///
+/// Absent is therefore the legacy reading (inclusive). That is also what an
+/// eMule-written file looks like, and there the mistake is harmless in the safe
+/// direction: its exclusive end read as inclusive extends the gap by one byte we
+/// already hold, so we re-fetch a byte instead of skipping one.
+const FT_EMBER_GAP_FORMAT: u8 = 0xEC;
+
+/// Value of [`FT_EMBER_GAP_FORMAT`] meaning "`FT_GAPEND` is eMule's exclusive
+/// end". Versioned rather than a bare flag so a later convention change can be
+/// told apart from this one.
+const GAP_FORMAT_EXCLUSIVE_END: u32 = 1;
 
 /// eMule tag types
 const TAGTYPE_UINT32: u8 = 0x03;
@@ -173,6 +193,21 @@ pub struct PartTracker {
     /// `multi_source::WriteReservation` for why the tracker guard can no
     /// longer be held across `PartFileWriter::write`.
     write_reservations: Vec<(u64, u64)>,
+    /// Byte ranges each source worker has asked its peer for and not yet
+    /// received, keyed by worker index.
+    ///
+    /// eMule's `CPartFile::requestedblocks_list` (appended at
+    /// `PartFile.cpp:4654`, dropped by `RemoveBlockFromList` at `:2656`), which
+    /// `IsAlreadyRequested` (`:1672`) consults so no two clients are asked for
+    /// the same bytes. Ember de-duplicated only at part granularity via
+    /// `in_progress_claims`, which is enough while sources sit on different
+    /// parts but not once two share one: the endgame fallback deliberately lets
+    /// a second worker pile onto a part already in flight, and both then cut
+    /// their block list from the same gap list and requested the same leading
+    /// blocks.
+    ///
+    /// Advisory, not authoritative — see [`Self::requested_by_others`].
+    in_flight_requests: HashMap<usize, (Vec<(u64, u64)>, Instant)>,
     met_path: PathBuf,
     file_hash: [u8; 16],
     file_name: String,
@@ -186,6 +221,33 @@ pub struct PartTracker {
     /// resume after restart does not re-mark bytes as safe-to-upload until
     /// the download verifies them again. `len() == part_count`.
     part_verified: Vec<bool>,
+    /// Cumulative bytes peers have sent us for this file, across every session.
+    ///
+    /// eMule's `CPartFile::m_uTransferred`, and the number behind its
+    /// Transferred column (`DownloadListCtrl.cpp:1984`). It counts what came off
+    /// the wire — `WriteToBuffer` adds the packet's `transize` before it looks at
+    /// which of those bytes are still missing (`PartFile.cpp:3951-3957`), and the
+    /// comment above it notes the figure "includes compressed packets" — so
+    /// duplicates and re-fetches after a failed part hash are all counted. It
+    /// therefore can and does exceed the file size, and is deliberately not
+    /// capped.
+    ///
+    /// Distinct from [`Self::completed_bytes`], which is what actually landed on
+    /// disk and is eMule's Completed column (`:1987`). Progress and the remaining
+    /// byte count derive from *that* one, never from this
+    /// (`DownloadListCtrl.cpp:1698`, `:1731`).
+    ///
+    /// Persisted through `FT_TRANSFERRED` and restored on load, exactly as eMule
+    /// does (`PartFile.cpp:798`, `:1223`), so it survives a restart.
+    ///
+    /// Shared and atomic so the receive paths can count bytes without taking the
+    /// tracker's write lock. Every packet arrival bumps this, and that lock is the
+    /// one the write-reservation comments warn about — it serialises every tracker
+    /// reader including the main network event loop, so a per-packet acquisition
+    /// just to add an integer is contention the download path should not pay.
+    /// Hand the counter out once with [`Self::transferred_counter`] and increment
+    /// it off-lock.
+    transferred: Arc<AtomicU64>,
     /// Set when the final full-file ed2k hash passed; implies every part is
     /// verified even when `part_hashes` is empty (single-part files).
     /// Saved in `.part.met` only transiently — completion normally deletes
@@ -267,11 +329,13 @@ impl PartTracker {
             },
             in_progress_claims: vec![0; part_count],
             write_reservations: Vec::new(),
+            in_flight_requests: HashMap::new(),
             met_path,
             file_hash: expected_file_hash,
             file_name: String::new(),
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
+            transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
         };
@@ -305,11 +369,13 @@ impl PartTracker {
             },
             in_progress_claims: vec![0; part_count],
             write_reservations: Vec::new(),
+            in_flight_requests: HashMap::new(),
             met_path,
             file_hash: [0u8; 16],
             file_name: String::new(),
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
+            transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -652,6 +718,29 @@ impl PartTracker {
         (start, end)
     }
 
+    /// Count bytes a peer just sent us, whether or not they were needed.
+    ///
+    /// Mirrors eMule's `m_uTransferred += transize` (`PartFile.cpp:3957`), which
+    /// runs before the gap check and so includes duplicate ranges and the
+    /// compressed payload. Uncapped: eMule's figure routinely passes the file
+    /// size on a download that re-fetched a corrupt part.
+    ///
+    /// Takes `&self`, so a caller holding only a read guard can count. Prefer
+    /// [`Self::transferred_counter`] on a hot path and skip the lock entirely.
+    pub fn add_transferred(&self, wire_bytes: u64) {
+        self.transferred.fetch_add(wire_bytes, Ordering::Relaxed);
+    }
+
+    /// The wire-byte counter itself, for incrementing without the tracker lock.
+    pub fn transferred_counter(&self) -> Arc<AtomicU64> {
+        self.transferred.clone()
+    }
+
+    /// Cumulative wire bytes received for this file — eMule's Transferred column.
+    pub fn transferred(&self) -> u64 {
+        self.transferred.load(Ordering::Relaxed)
+    }
+
     /// Total completed bytes.
     pub fn completed_bytes(&self) -> u64 {
         let gap_bytes: u64 = self.gaps.iter().map(|(s, e)| e - s).sum();
@@ -796,6 +885,7 @@ impl PartTracker {
             part_hashes: self.part_hashes.clone(),
             gaps: self.gaps.clone(),
             part_verified: self.part_verified.clone(),
+            transferred: self.transferred(),
             save_generation: self.save_generation.clone(),
             generation,
         }
@@ -851,7 +941,14 @@ impl PartTracker {
             }
             tag_count += 1;
 
-            let transferred = self.completed_bytes();
+            // Cumulative wire bytes, which is what this eMule tag means
+            // (`PartFile.cpp:1223` writes `m_uTransferred`). Ember used to put
+            // `completed_bytes()` here, so an eMule opening one of our `.part.met`
+            // files read our Completed figure as its Transferred column — and
+            // Ember itself discarded the tag on load, restarting the counter at
+            // zero every launch. `u32` truncation on the small-file path matches
+            // eMule, which only widens the tag for large files.
+            let transferred = self.transferred();
             if use_large {
                 write_uint64_tag(&mut cur, FT_TRANSFERRED, transferred)?;
             } else {
@@ -859,13 +956,29 @@ impl PartTracker {
             }
             tag_count += 1;
 
-            // Gap list: eMule uses inclusive end (last missing byte), our gaps
-            // use exclusive end (byte past last missing), so subtract 1 for wire format.
+            // `FT_GAPEND` is the *exclusive* end on disk — eMule's "first
+            // non-missing byte", which it produces as `gap.end + 1` from its own
+            // inclusive representation (`PartFile.cpp:1381-1384`) and converts
+            // back with `- 1` on load (`:972`). Our gaps already hold an
+            // exclusive end, so the value goes out unmodified.
+            //
+            // This used to subtract 1, publishing eMule's *inclusive* end. An
+            // eMule resuming one of our part files then subtracted a second byte
+            // and concluded the last byte of every gap was already present: it
+            // never requested those bytes, so the covering part's MD4 could never
+            // match and the part was re-fetched in full, or at the file tail the
+            // whole-file hash failed. It round-tripped inside Ember only because
+            // the loader added the same byte straight back, which is exactly what
+            // a round-trip test cannot see.
             for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
                 write_gap_tag(&mut cur, FT_GAPSTART, i, gap_start, use_large)?;
-                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end.saturating_sub(1), use_large)?;
+                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end, use_large)?;
                 tag_count += 2;
             }
+            // Declares the convention above, so a file written by an older build
+            // (inclusive ends) is still read the way it was written.
+            write_uint32_tag(&mut cur, FT_EMBER_GAP_FORMAT, GAP_FORMAT_EXCLUSIVE_END)?;
+            tag_count += 1;
 
             // Ember-private: per-part verified bitmap. eMule-family clients
             // skip unknown tag IDs, so this extends the format without
@@ -914,6 +1027,7 @@ impl PartTracker {
         }
         self.in_progress_claims = vec![0; self.part_count];
         self.write_reservations.clear();
+        self.in_flight_requests.clear();
         self.sync_to_on_disk_part_length();
     }
 
@@ -1085,6 +1199,9 @@ impl PartTracker {
         let mut gap_starts: std::collections::HashMap<usize, u64> =
             std::collections::HashMap::new();
         let mut gap_ends: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        // Absent marker means the legacy Ember convention (inclusive end), which
+        // is also how an eMule-written file is read — see `FT_EMBER_GAP_FORMAT`.
+        let mut gap_end_is_exclusive = false;
         let mut file_size_from_tags: Option<u64> = None;
         let mut verified_bitmap_bytes: Option<Vec<u8>> = None;
         let mut tags_parsed: u32 = 0;
@@ -1115,6 +1232,12 @@ impl PartTracker {
                         }
                         MetTag::VerifiedBitmap(bytes) => {
                             verified_bitmap_bytes = Some(bytes);
+                        }
+                        MetTag::GapFormat(v) => {
+                            gap_end_is_exclusive = v >= GAP_FORMAT_EXCLUSIVE_END as u64;
+                        }
+                        MetTag::Transferred(v) => {
+                            self.transferred.store(v, Ordering::Relaxed);
                         }
                         MetTag::Unknown => {}
                     }
@@ -1203,14 +1326,24 @@ impl PartTracker {
         // Build byte-level gap list from paired start/end tags
         self.gaps = Vec::new();
         for (&idx, &start) in &gap_starts {
-            // eMule writes inclusive end; convert to our exclusive end by adding 1
-            let inclusive_end = gap_ends.get(&idx).copied().unwrap_or_else(|| {
-                tracing::warn!(
-                    "Orphaned gap start at index {idx} (offset {start}), extending to file_size"
-                );
-                self.file_size.saturating_sub(1)
-            });
-            let end = inclusive_end.saturating_add(1).min(self.file_size);
+            let end = match gap_ends.get(&idx).copied() {
+                // Written by this build, or any client that follows eMule: the
+                // tag already is the exclusive end we keep internally.
+                Some(raw) if gap_end_is_exclusive => raw,
+                // No marker. Either an older Ember build, whose inclusive end
+                // needs the byte added back, or an eMule file, where treating its
+                // exclusive end as inclusive only stretches the gap over one byte
+                // we already hold — a redundant re-fetch rather than a skipped
+                // byte, which is the direction to err in.
+                Some(raw) => raw.saturating_add(1),
+                None => {
+                    tracing::warn!(
+                        "Orphaned gap start at index {idx} (offset {start}), extending to file_size"
+                    );
+                    self.file_size
+                }
+            }
+            .min(self.file_size);
             if start < end && end <= self.file_size {
                 self.gaps.push((start, end));
             }
@@ -1395,6 +1528,63 @@ impl PartTracker {
         self.write_reservations.len()
     }
 
+    /// Record the ranges `worker` currently has requested and unreceived,
+    /// replacing whatever it published before.
+    ///
+    /// Whole-set replacement rather than incremental add/remove: a worker's
+    /// outstanding list is already maintained exactly for its own timeout
+    /// accounting, so publishing a snapshot of it cannot drift out of step the
+    /// way a pair of add and remove hooks could.
+    pub fn publish_in_flight_requests(&mut self, worker: usize, ranges: Vec<(u64, u64)>) {
+        if ranges.is_empty() {
+            self.in_flight_requests.remove(&worker);
+            return;
+        }
+        // Bounded by the largest speed tier's block budget in practice. The cap
+        // is defence-in-depth against a worker that somehow accumulates ranges:
+        // dropping the excess only costs de-duplication quality, never
+        // correctness, because this map never gates what may be requested.
+        const MAX_IN_FLIGHT_PER_WORKER: usize = 64;
+        let mut ranges = ranges;
+        ranges.truncate(MAX_IN_FLIGHT_PER_WORKER);
+        self.in_flight_requests
+            .insert(worker, (ranges, Instant::now()));
+    }
+
+    /// Drop `worker`'s published ranges, on the way out of a part or the task.
+    pub fn clear_in_flight_requests(&mut self, worker: usize) {
+        self.in_flight_requests.remove(&worker);
+    }
+
+    /// Ranges *other* workers currently have in flight, for ordering a fresh
+    /// block list away from them.
+    ///
+    /// Deliberately advisory. The caller uses this to sort duplicate work to the
+    /// back of its own block list, never to remove anything from it, and this is
+    /// the property that makes the whole mechanism safe: a stale or leaked entry
+    /// can only cost a worker some ordering quality, where an authoritative
+    /// exclusion set would leave bytes that no worker is willing to ask for and
+    /// strand the download short of complete. It also keeps the endgame
+    /// pile-on that `in_progress_claims` documents — when duplicate work is all
+    /// that is left, it still gets requested, just last.
+    ///
+    /// A `TTL` bounds the damage from a worker that dies between publishing and
+    /// its guard running.
+    pub fn requested_by_others(&self, worker: usize) -> Vec<(u64, u64)> {
+        const TTL: Duration = Duration::from_secs(180);
+        let now = Instant::now();
+        let mut out: Vec<(u64, u64)> = self
+            .in_flight_requests
+            .iter()
+            .filter(|(&w, (_, at))| {
+                w != worker && now.saturating_duration_since(*at) < TTL
+            })
+            .flat_map(|(_, (ranges, _))| ranges.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     pub fn delete_met(&self, allowed_roots: &[String]) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
         suppressed_met_saves().lock().insert(&self.met_path);
@@ -1420,6 +1610,10 @@ pub struct SaveSnapshot {
     part_hashes: Vec<[u8; 16]>,
     gaps: Vec<(u64, u64)>,
     part_verified: Vec<bool>,
+    /// Cumulative wire bytes, carried so the snapshot writes the same
+    /// `FT_TRANSFERRED` value `save_emule_format` does — it cannot be recomputed
+    /// from `gaps`, which is what the previous code tried to do.
+    transferred: u64,
     save_generation: Arc<AtomicU64>,
     generation: u64,
 }
@@ -1477,22 +1671,22 @@ impl SaveSnapshot {
             }
             tag_count += 1;
 
-            // Mirror PartTracker::completed_bytes() inline to keep this
-            // snapshot self-contained.
-            let gap_bytes: u64 = self.gaps.iter().map(|(s, e)| e - s).sum();
-            let transferred = self.file_size.saturating_sub(gap_bytes);
             if use_large {
-                write_uint64_tag(&mut cur, FT_TRANSFERRED, transferred)?;
+                write_uint64_tag(&mut cur, FT_TRANSFERRED, self.transferred)?;
             } else {
-                write_uint32_tag(&mut cur, FT_TRANSFERRED, transferred as u32)?;
+                write_uint32_tag(&mut cur, FT_TRANSFERRED, self.transferred as u32)?;
             }
             tag_count += 1;
 
+            // Exclusive end plus the format marker, exactly as in
+            // `save_emule_format` above — see the comment there.
             for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
                 write_gap_tag(&mut cur, FT_GAPSTART, i, gap_start, use_large)?;
-                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end.saturating_sub(1), use_large)?;
+                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end, use_large)?;
                 tag_count += 2;
             }
+            write_uint32_tag(&mut cur, FT_EMBER_GAP_FORMAT, GAP_FORMAT_EXCLUSIVE_END)?;
+            tag_count += 1;
 
             if self.part_verified.iter().any(|&v| v) {
                 let byte_count = (self.part_verified.len() + 7) / 8;
@@ -1546,6 +1740,10 @@ enum MetTag {
     GapEnd(usize, u64),
     /// Ember-private per-part verified bitmap (LSB-first per byte).
     VerifiedBitmap(Vec<u8>),
+    /// Ember-private [`FT_EMBER_GAP_FORMAT`] version.
+    GapFormat(u64),
+    /// Cumulative wire bytes — eMule's `m_uTransferred`.
+    Transferred(u64),
     Unknown,
 }
 
@@ -1655,7 +1853,9 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
     if name_len == 1 {
         match name_buf[0] {
             FT_FILESIZE => return Ok(MetTag::FileSize(value)),
-            FT_STATUS | FT_TRANSFERRED => return Ok(MetTag::Unknown),
+            FT_EMBER_GAP_FORMAT => return Ok(MetTag::GapFormat(value)),
+            FT_TRANSFERRED => return Ok(MetTag::Transferred(value)),
+            FT_STATUS => return Ok(MetTag::Unknown),
             _ => {}
         }
     }
@@ -1781,6 +1981,55 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
+    /// eMule's two byte counters are genuinely different numbers, and the
+    /// distinction only shows up on a file that had to re-fetch something: what
+    /// came off the wire versus what is on disk. Transferred also has to survive
+    /// a restart, because eMule persists it and reads it back
+    /// (`PartFile.cpp:798`, `:1223`).
+    #[test]
+    fn transferred_counts_wire_bytes_and_survives_a_reload() {
+        let part_path = temp_part_path("transferred");
+        let met_path = part_path.with_extension("part.met");
+        let _ = std::fs::remove_file(&met_path);
+
+        let mut tracker = PartTracker::new(100, &part_path);
+        assert_eq!(tracker.transferred(), 0);
+
+        // 40 bytes land, then the same 40 arrive again from a second source.
+        tracker.add_transferred(40);
+        tracker.fill_range(0, 40);
+        tracker.add_transferred(40);
+
+        assert_eq!(
+            tracker.transferred(),
+            80,
+            "duplicate bytes still crossed the wire, so they still count"
+        );
+        assert_eq!(
+            tracker.completed_bytes(),
+            40,
+            "only the bytes on disk count as completed"
+        );
+
+        // Re-fetching the whole file pushes Transferred past the file size, which
+        // eMule allows and the UI must not cap.
+        tracker.add_transferred(100);
+        assert!(tracker.transferred() > tracker.file_size);
+
+        let expected = tracker.transferred();
+        tracker.save();
+
+        let reloaded = PartTracker::new(100, &part_path);
+        assert_eq!(
+            reloaded.transferred(),
+            expected,
+            "FT_TRANSFERRED must round-trip, or the counter resets every launch"
+        );
+        assert_eq!(reloaded.completed_bytes(), 40);
+
+        let _ = std::fs::remove_file(&met_path);
+    }
+
     #[test]
     fn fill_range_tracks_completed_bytes() {
         let part_path = temp_part_path("fill");
@@ -1888,6 +2137,117 @@ mod tests {
         assert_eq!(reloaded.gap_list(), &[(25, 75)]);
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// Byte offset of a uint32 tag's value, located by its raw name bytes.
+    ///
+    /// Deliberately works on the file rather than on a reloaded tracker: the
+    /// whole point is that our writer and reader shared a compensating error, so
+    /// only the bytes on disk can show it.
+    fn met_uint32_value_at(met_bytes: &[u8], name: &[u8]) -> Option<usize> {
+        let mut pattern = vec![TAGTYPE_UINT32];
+        pattern.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        pattern.extend_from_slice(name);
+        met_bytes
+            .windows(pattern.len() + 4)
+            .position(|w| w[..pattern.len()] == pattern[..])
+            .map(|at| at + pattern.len())
+    }
+
+    fn met_uint32_tag(met_bytes: &[u8], name: &[u8]) -> Option<u32> {
+        met_uint32_value_at(met_bytes, name).map(|at| {
+            u32::from_le_bytes([
+                met_bytes[at],
+                met_bytes[at + 1],
+                met_bytes[at + 2],
+                met_bytes[at + 3],
+            ])
+        })
+    }
+
+    /// `FT_GAPEND` on disk is eMule's *exclusive* end — the first non-missing
+    /// byte. eMule writes `gap.end + 1` from its inclusive representation
+    /// (`PartFile.cpp:1384`) and subtracts it again on load (`:972`), so a value
+    /// one too low makes eMule believe the last byte of every gap is already
+    /// present. It never asks for those bytes, the covering part's MD4 can never
+    /// match, and the part is re-fetched in full on every attempt.
+    ///
+    /// `save_and_reload_preserves_gap_state` cannot catch that, because our
+    /// reader used to add the same byte back.
+    #[test]
+    fn gap_end_on_disk_is_emules_exclusive_end() {
+        let part_path = temp_part_path("gap-end-wire");
+        let met_path = part_path.with_extension("part.met");
+
+        let mut tracker = PartTracker::new(100, &part_path);
+        tracker.set_file_hash([0x44; 16]);
+        tracker.set_part_hashes(vec![[0x55; 16]]);
+        // Missing bytes are 25..=74, so eMule's inclusive end is 74 and the
+        // value that belongs on the wire is 75.
+        tracker.fill_range(0, 25);
+        tracker.fill_range(75, 100);
+        tracker.save();
+        assert_eq!(tracker.gap_list(), &[(25, 75)]);
+
+        let bytes = std::fs::read(&met_path).unwrap();
+        assert_eq!(
+            met_uint32_tag(&bytes, &[FT_GAPSTART, b'0']),
+            Some(25),
+            "gap start is the first missing byte"
+        );
+        assert_eq!(
+            met_uint32_tag(&bytes, &[FT_GAPEND, b'0']),
+            Some(75),
+            "gap end must be the first non-missing byte, not the last missing one"
+        );
+        // And the marker has to be there, or our own loader will read these as
+        // legacy inclusive ends and stretch every gap by a byte.
+        assert_eq!(
+            met_uint32_tag(&bytes, &[FT_EMBER_GAP_FORMAT]),
+            Some(GAP_FORMAT_EXCLUSIVE_END)
+        );
+
+        let _ = std::fs::remove_file(&met_path);
+    }
+
+    /// A `.part.met` from a build that wrote inclusive gap ends carries no format
+    /// marker, so its gaps must keep their original meaning. Reading them as
+    /// exclusive would drop the last byte of each gap, and every affected part
+    /// would then fail its hash and be downloaded again — on a part file that may
+    /// already be many GB in.
+    #[test]
+    fn a_legacy_part_met_without_the_marker_keeps_its_inclusive_gap_ends() {
+        let part_path = temp_part_path("gap-end-legacy");
+        let met_path = part_path.with_extension("part.met");
+
+        let mut tracker = PartTracker::new(100, &part_path);
+        tracker.set_file_hash([0x44; 16]);
+        tracker.set_part_hashes(vec![[0x55; 16]]);
+        tracker.fill_range(0, 25);
+        tracker.fill_range(75, 100);
+        tracker.save();
+
+        // Rewrite the file the way an older build would have: inclusive end, and
+        // no format marker. Retagging in place keeps every other field intact.
+        let mut bytes = std::fs::read(&met_path).unwrap();
+        let end_at = met_uint32_value_at(&bytes, &[FT_GAPEND, b'0']).expect("gap end tag present");
+        bytes[end_at..end_at + 4].copy_from_slice(&74u32.to_le_bytes());
+        let marker_at =
+            met_uint32_value_at(&bytes, &[FT_EMBER_GAP_FORMAT]).expect("marker present");
+        // Neutralise the marker by renaming its tag rather than removing it, so
+        // the declared tag count still matches and the truncation guard, which
+        // would otherwise discard all resume data, stays quiet.
+        bytes[marker_at - 1] = 0xEE;
+        std::fs::write(&met_path, &bytes).unwrap();
+
+        let reloaded = PartTracker::new(100, &part_path);
+        assert_eq!(
+            reloaded.gap_list(),
+            &[(25, 75)],
+            "an inclusive end of 74 still means bytes 25..75 are missing"
+        );
+
+        let _ = std::fs::remove_file(&met_path);
     }
 
     /// A crash inside `atomic_write`'s Windows replace-fallback leaves nothing
