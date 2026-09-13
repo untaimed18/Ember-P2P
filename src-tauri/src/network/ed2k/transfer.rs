@@ -79,16 +79,39 @@ const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
 /// inflate to — the loop simply runs again.
 const INFLATE_ROUND_BYTES: usize = 64 * 1024;
 
+/// How much inflated data to accumulate before handing it back to be written.
+///
+/// eMule compresses a whole requested block in one `compress2` and then splits
+/// the result into 10240-byte packets (`UploadDiskIOThread.cpp:238-239`, `:444`),
+/// so a 180 KB block usually arrives as ~15 packets of one zlib stream. Writing
+/// each packet as it inflated turned one reserve/write/commit cycle per block
+/// into fifteen — and each cycle takes the tracker write lock twice and makes an
+/// mpsc round-trip to the per-file writer, whose queue also carries other
+/// workers' `sync_data()` and 9.28 MB part hashes. That is a lot of contention to
+/// add to the receive path, and it shrank disk writes to 10 KB each.
+///
+/// Batching is a direct trade against how much of an abandoned block survives:
+/// whatever is still staged when a peer stops is lost. At 64 KiB a full block
+/// costs three cycles instead of fifteen, writes stay comfortably large, and a
+/// block abandoned near its end still leaves ~128 KB on disk rather than nothing.
+const INFLATE_FLUSH_BYTES: usize = 64 * 1024;
+
 /// Inflate state for one compressed block being received.
 struct PendingCompressedBlock {
     declared_total: usize,
     /// Compressed bytes seen, against `declared_total`.
     packed_seen: usize,
-    /// Inflated bytes handed to the caller so far. Doubles as the offset of the
-    /// next fragment's output within the block, which is how eMule places each
-    /// packet's output: `StartOffset + totalUnzipped - lenUnzipped`
-    /// (`DownloadClient.cpp:1057`).
-    unzipped: usize,
+    /// Total bytes zlib has produced for this block. Bounds the output allowance,
+    /// which is what stops a stream inflating past its requested range.
+    inflated: usize,
+    /// Bytes already handed to the caller. Also the offset of the next handover
+    /// within the block, which is how eMule places each packet's output:
+    /// `StartOffset + totalUnzipped - lenUnzipped` (`DownloadClient.cpp:1057`).
+    flushed: usize,
+    /// Inflated bytes not yet handed over; they belong at `start + flushed`.
+    /// Held back so several packets become one disk write — see
+    /// [`INFLATE_FLUSH_BYTES`].
+    staged: Vec<u8>,
     /// Inflated size the block must reach, from the requested range.
     expected_len: usize,
     inflate: InflateState,
@@ -225,7 +248,9 @@ impl CompressedPartAccumulator {
             .or_insert_with(|| PendingCompressedBlock {
                 declared_total,
                 packed_seen: 0,
-                unzipped: 0,
+                inflated: 0,
+                flushed: 0,
+                staged: Vec::new(),
                 expected_len,
                 inflate: InflateState::Probing(Vec::new()),
             });
@@ -265,7 +290,7 @@ impl CompressedPartAccumulator {
             // buffer it writes into never has room for more.
             let allowance = entry
                 .expected_len
-                .saturating_sub(entry.unzipped + produced.len());
+                .saturating_sub(entry.inflated + produced.len());
             if allowance == 0 {
                 break;
             }
@@ -299,34 +324,37 @@ impl CompressedPartAccumulator {
             .pending
             .get_mut(&start)
             .expect("pending compressed block removed while borrowed");
-        let offset = start + entry.unzipped as u64;
-        entry.unzipped += produced.len();
-        let block_done = entry.unzipped == entry.expected_len;
+        entry.inflated += produced.len();
+        entry
+            .staged
+            .try_reserve(produced.len())
+            .map_err(|_| anyhow::anyhow!("compressed-part allocation failed"))?;
+        entry.staged.extend_from_slice(&produced);
 
-        if block_done {
-            self.pending.remove(&start);
-        } else if stream_end || packed_complete {
-            // The stream finished, or every declared compressed byte arrived, yet
-            // the output is short of the requested range. Earlier fragments were
-            // already written; drop the block so the shortfall stays a gap and is
-            // re-requested.
-            self.pending.remove(&start);
-            if produced.is_empty() {
-                anyhow::bail!("decompressed part is outside its requested range");
-            }
-            return Ok(Some(InflatedFragment {
-                offset,
-                data: produced,
-            }));
-        }
+        let block_done = entry.inflated == entry.expected_len;
+        // The stream finished, or every declared compressed byte arrived, yet the
+        // output is short of the requested range. Hand over whatever is staged and
+        // drop the block, so the shortfall stays a gap and is re-requested.
+        let closing_short = !block_done && (stream_end || packed_complete);
 
-        if produced.is_empty() {
+        if !block_done && !closing_short && entry.staged.len() < INFLATE_FLUSH_BYTES {
             return Ok(None);
         }
-        Ok(Some(InflatedFragment {
-            offset,
-            data: produced,
-        }))
+
+        let offset = start + entry.flushed as u64;
+        let data = std::mem::take(&mut entry.staged);
+        entry.flushed += data.len();
+
+        if block_done || closing_short {
+            self.pending.remove(&start);
+        }
+        if data.is_empty() {
+            if closing_short {
+                anyhow::bail!("decompressed part is outside its requested range");
+            }
+            return Ok(None);
+        }
+        Ok(Some(InflatedFragment { offset, data }))
     }
 
     fn remove(&mut self, start: u64) {
@@ -496,6 +524,57 @@ mod compressed_part_bounds_tests {
         );
     }
 
+    /// Inflated output is batched before it is handed back, because every handover
+    /// becomes a reserve/write/commit cycle taking the tracker write lock twice
+    /// and an mpsc round-trip to the per-file writer.
+    ///
+    /// eMule splits a compressed block into 10240-byte packets
+    /// (`UploadDiskIOThread.cpp:444`), so a 180 KB block arrives as ~15 of them.
+    /// Writing each one as it inflated put fifteen of those cycles on the receive
+    /// path where there had been one.
+    #[test]
+    fn many_small_packets_still_produce_few_disk_writes() {
+        // Barely compressible, which is the case that actually fragments — eMule's
+        // own note puts the gain at ~4% for .exe and .avi.
+        let plain: Vec<u8> = {
+            let mut lcg: u32 = 0x1234_5678;
+            (0..180 * 1024)
+                .map(|_| {
+                    lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (lcg >> 16) as u8
+                })
+                .collect()
+        };
+        let packed = packed(&plain);
+
+        // Fragmented the way eMule fragments: 10240 bytes of compressed data each.
+        let fragments = packed.len().div_ceil(10240);
+        assert!(fragments >= 8, "test needs a genuinely fragmented block");
+        let pieces = stream(0, plain.len(), &packed, fragments).unwrap();
+
+        assert!(
+            pieces.len() <= plain.len().div_ceil(INFLATE_FLUSH_BYTES) + 1,
+            "{fragments} packets should batch into a handful of writes, got {}",
+            pieces.len(),
+        );
+        assert!(
+            pieces.len() * 4 <= fragments,
+            "batching must be a large reduction, not a token one: {} writes for {fragments} packets",
+            pieces.len(),
+        );
+
+        // Batching must not change the bytes or their placement.
+        let mut rebuilt = vec![0u8; plain.len()];
+        let mut covered = 0usize;
+        for (offset, data) in &pieces {
+            assert_eq!(*offset as usize, covered);
+            rebuilt[covered..covered + data.len()].copy_from_slice(data);
+            covered += data.len();
+        }
+        assert_eq!(covered, plain.len());
+        assert_eq!(rebuilt, plain);
+    }
+
     /// A peer that stops mid-block used to cost us every byte of it. The bytes
     /// that did arrive are now already written, and only the shortfall is left as
     /// a gap to re-request.
@@ -591,7 +670,7 @@ mod compressed_part_bounds_tests {
             .unwrap();
         assert_eq!(accumulator.pending.len(), 1);
         assert_eq!(accumulator.pending[&0].packed_seen, 1);
-        assert_eq!(accumulator.pending[&0].unzipped, 0);
+        assert_eq!(accumulator.pending[&0].inflated, 0);
     }
 
     /// Reassembly state is dropped for blocks that are no longer outstanding, so

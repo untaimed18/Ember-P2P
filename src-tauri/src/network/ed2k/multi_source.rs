@@ -7372,6 +7372,9 @@ async fn download_parts_from_source(
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
     let mut pending_compressed = CompressedPartAccumulator::default();
+    // Taken once, outside the receive loop: the wire-byte counter is incremented
+    // on every packet and must not cost a tracker lock each time.
+    let wire_bytes_counter = tracker.read().await.transferred_counter();
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -8217,7 +8220,11 @@ async fn download_parts_from_source(
                         // failed part hash therefore count, which is why the figure
                         // can exceed the file size. This is the Transferred column;
                         // the gap map behind it is the Completed column.
-                        tracker.write().await.add_transferred(piece_len);
+                        //
+                        // Lock-free: this fires on every packet, and the tracker's
+                        // write lock serialises every reader including the network
+                        // event loop.
+                        wire_bytes_counter.fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
 
                         // D21: never overwrite bytes we already have. With several
                         // sources in flight (and cross-part pipelining), source B
@@ -8376,17 +8383,14 @@ async fn download_parts_from_source(
                             );
                         }
                         // The *compressed* length, and counted here at the packet
-                        // rather than below at the completed block: eMule passes the
-                        // same `uTransferredFileDataSize` for packed and unpacked
-                        // blocks (`DownloadClient.cpp:1035`, `:1066`) — hence its
-                        // note that the counter "includes compressed packets" — and
-                        // it counts every packet, whereas Ember only reaches the
-                        // write once enough fragments have arrived to inflate a
-                        // whole block.
-                        tracker
-                            .write()
-                            .await
-                            .add_transferred(compressed.len() as u64);
+                        // rather than below at the write: eMule passes the same
+                        // `uTransferredFileDataSize` for packed and unpacked blocks
+                        // (`DownloadClient.cpp:1035`, `:1066`) — hence its note that
+                        // the counter "includes compressed packets" — and it counts
+                        // every packet, whereas Ember reaches the write only once
+                        // enough has inflated to be worth one.
+                        wire_bytes_counter
+                            .fetch_add(compressed.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
                         let requested_end = outstanding_ranges
                             .iter()

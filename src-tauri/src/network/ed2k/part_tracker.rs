@@ -239,7 +239,15 @@ pub struct PartTracker {
     ///
     /// Persisted through `FT_TRANSFERRED` and restored on load, exactly as eMule
     /// does (`PartFile.cpp:798`, `:1223`), so it survives a restart.
-    transferred: u64,
+    ///
+    /// Shared and atomic so the receive paths can count bytes without taking the
+    /// tracker's write lock. Every packet arrival bumps this, and that lock is the
+    /// one the write-reservation comments warn about — it serialises every tracker
+    /// reader including the main network event loop, so a per-packet acquisition
+    /// just to add an integer is contention the download path should not pay.
+    /// Hand the counter out once with [`Self::transferred_counter`] and increment
+    /// it off-lock.
+    transferred: Arc<AtomicU64>,
     /// Set when the final full-file ed2k hash passed; implies every part is
     /// verified even when `part_hashes` is empty (single-part files).
     /// Saved in `.part.met` only transiently — completion normally deletes
@@ -327,7 +335,7 @@ impl PartTracker {
             file_name: String::new(),
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
-            transferred: 0,
+            transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
         };
@@ -367,7 +375,7 @@ impl PartTracker {
             file_name: String::new(),
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
-            transferred: 0,
+            transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -716,13 +724,21 @@ impl PartTracker {
     /// runs before the gap check and so includes duplicate ranges and the
     /// compressed payload. Uncapped: eMule's figure routinely passes the file
     /// size on a download that re-fetched a corrupt part.
-    pub fn add_transferred(&mut self, wire_bytes: u64) {
-        self.transferred = self.transferred.saturating_add(wire_bytes);
+    ///
+    /// Takes `&self`, so a caller holding only a read guard can count. Prefer
+    /// [`Self::transferred_counter`] on a hot path and skip the lock entirely.
+    pub fn add_transferred(&self, wire_bytes: u64) {
+        self.transferred.fetch_add(wire_bytes, Ordering::Relaxed);
+    }
+
+    /// The wire-byte counter itself, for incrementing without the tracker lock.
+    pub fn transferred_counter(&self) -> Arc<AtomicU64> {
+        self.transferred.clone()
     }
 
     /// Cumulative wire bytes received for this file — eMule's Transferred column.
     pub fn transferred(&self) -> u64 {
-        self.transferred
+        self.transferred.load(Ordering::Relaxed)
     }
 
     /// Total completed bytes.
@@ -869,7 +885,7 @@ impl PartTracker {
             part_hashes: self.part_hashes.clone(),
             gaps: self.gaps.clone(),
             part_verified: self.part_verified.clone(),
-            transferred: self.transferred,
+            transferred: self.transferred(),
             save_generation: self.save_generation.clone(),
             generation,
         }
@@ -932,10 +948,11 @@ impl PartTracker {
             // Ember itself discarded the tag on load, restarting the counter at
             // zero every launch. `u32` truncation on the small-file path matches
             // eMule, which only widens the tag for large files.
+            let transferred = self.transferred();
             if use_large {
-                write_uint64_tag(&mut cur, FT_TRANSFERRED, self.transferred)?;
+                write_uint64_tag(&mut cur, FT_TRANSFERRED, transferred)?;
             } else {
-                write_uint32_tag(&mut cur, FT_TRANSFERRED, self.transferred as u32)?;
+                write_uint32_tag(&mut cur, FT_TRANSFERRED, transferred as u32)?;
             }
             tag_count += 1;
 
@@ -1220,7 +1237,7 @@ impl PartTracker {
                             gap_end_is_exclusive = v >= GAP_FORMAT_EXCLUSIVE_END as u64;
                         }
                         MetTag::Transferred(v) => {
-                            self.transferred = v;
+                            self.transferred.store(v, Ordering::Relaxed);
                         }
                         MetTag::Unknown => {}
                     }
