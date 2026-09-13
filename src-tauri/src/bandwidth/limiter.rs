@@ -152,7 +152,7 @@ impl BandwidthLimiter {
     /// To avoid a runaway loop if the refill task dies or the limit is set
     /// impossibly low, we log a single warning once the wait exceeds 60s
     /// but keep waiting — shutdown is the caller's responsibility (upload
-    /// sessions already poll `network_disconnected`).
+    /// sessions already poll `halted_for_shutdown`).
     ///
     /// `max_rate` is the live rate atomic (not a snapshot) so we can observe
     /// a runtime switch to "unlimited" (0) mid-drain. Without re-checking it,

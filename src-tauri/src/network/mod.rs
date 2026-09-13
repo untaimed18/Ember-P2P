@@ -7185,29 +7185,6 @@ mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
 
-    /// Uploads must not depend on KAD. eMule treats KAD and eD2K as independent
-    /// subsystems — running with KAD off is an ordinary configuration that seeds
-    /// normally — but `KadDisconnect` raised the upload gate unconditionally, so
-    /// a user who turned KAD off while logged in to a server stopped serving
-    /// every peer while their downloads carried on. The gate now asks whether
-    /// any transport is left, and a live-or-pending server session is one.
-    #[test]
-    fn a_live_server_session_keeps_uploads_enabled_when_kad_goes_down() {
-        // Logged in, socket held, or a login still in flight: any of the three
-        // means we are still reachable for eD2K and must keep serving.
-        assert!(ed2k_server_session_live(true, true, false));
-        assert!(ed2k_server_session_live(false, true, false));
-        assert!(ed2k_server_session_live(
-            false, false,
-            /* pending login */ true
-        ));
-        assert!(ed2k_server_session_live(true, false, false));
-
-        // KAD was the last transport standing, so the node really is offline
-        // and the upload listener should come down with it.
-        assert!(!ed2k_server_session_live(false, false, false));
-    }
-
     /// Firsthand session contacts sit beside the routing table and are exempt
     /// from everything that disciplines a resident: no liveness ping reaches
     /// them, so they never accrue a failed query, and the table's staleness
@@ -14233,27 +14210,29 @@ struct NetworkState {
     recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
-    /// Shared flag: set to true when the user is offline so the upload listener
-    /// rejects new connections and terminates active sessions. The upload TCP
-    /// listener binds and starts accepting connections as soon as
-    /// `start_network` runs, independent of KAD/server connection state, so a
-    /// node the user has taken offline must not still be serving uploads to
-    /// peers who remember our IP:port from a prior session.
+    /// Shared flag: set while the app is shutting down, so the upload listener
+    /// stops accepting new connections and terminates active sessions before the
+    /// multi-second save sequence tears their state down.
     ///
-    /// Explicitly *not* tied to `stats.status`, which only ever reports KAD:
-    /// serving an upload needs the shared file, the TCP listener and — for
-    /// LowID — a server for callbacks, none of which involve KAD, and eD2K is
-    /// opt-in independently of it. Raised by an explicit Disconnect and by the
-    /// shutdown save sequence; cleared by every path back online, including a
-    /// successful server login.
-    upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// Shutdown is the *only* thing that raises this, and the name says so on
+    /// purpose. Going offline must not: eMule's global Disconnect stops the
+    /// server connection and KAD and never touches its listen socket
+    /// (`CemuleDlg::CloseConnection`; `CListenSocket::StopListening` is only
+    /// called by `OnAccept` shedding load), so a disconnected eMule keeps serving
+    /// the peers that already hold a queue slot or know its address. Two earlier
+    /// rules tried to raise this on disconnect and both stopped uploads that
+    /// should have kept running — see `NetworkCommand::KadDisconnect` and
+    /// `handle_server_disconnect`.
+    ///
+    /// Nothing clears it, because there is no path back from shutdown.
+    uploads_halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// The user asked activity to stop: set by an explicit `KadDisconnect`,
     /// cleared by every path back off `Disconnected`.
     ///
-    /// Deliberately not `upload_disconnected`, which answers a different
-    /// question — "are we accepting inbound connections?" — and is *also*
-    /// raised by the shutdown save sequence, which is not the user asking to go
-    /// offline. This one is only ever set by an explicit Disconnect, so it can
+    /// Deliberately not `uploads_halted_for_shutdown`, which answers a different
+    /// question — "are we still accepting inbound connections?" — and is raised
+    /// only by shutdown, which is not the user asking to go offline. This one is
+    /// only ever set by an explicit Disconnect, so it can
     /// gate the outbound side: starting download workers, dialling friends, and
     /// UDP server search, plus whether eD2K auto-reconnect may fire at all.
     ///
@@ -23686,46 +23665,25 @@ async fn handle_server_disconnect(
         "server-status-changed",
         serde_json::json!({ "status": "disconnected" }),
     );
-    // Re-arm the upload gate only if the user actually asked to go offline.
+    // Losing the server does not stop uploads, whether the user asked for it or
+    // not. Serving needs the shared file and the TCP listener; a server only
+    // relays callbacks for LowID peers, so a HighID node needs it for nothing at
+    // all and a LowID one simply stops receiving callbacks.
     //
-    // This used to key off `stats.status == Disconnected`, which is KAD's
-    // status and nothing else (see the `stats.status` comment in the KAD
-    // bootstrap arm). Serving an upload needs the shared file, the TCP
-    // listener and — for LowID — a server to relay callbacks; KAD has no part
-    // in it, and eD2K is deliberately opt-in independently of KAD. So on a
-    // server-only session the first transient server drop (the 120s activity
-    // watchdog, a server-side disconnect, a failed reconnect attempt) silently
-    // stopped every upload, and auto-reconnect never cleared the flag again
-    // because only `initiate_server_connect` and `KadConnect` do. Uploads
-    // stayed dead for the rest of the session with the UI showing a healthy
-    // server.
+    // Two rules have been tried here and both stopped uploads that should have
+    // kept running. Keying off `stats.status == Disconnected` meant KAD's status
+    // decided the fate of eD2K uploads, so a server-only session lost every
+    // upload on the first transient drop — the 120 s activity watchdog, a
+    // server-side disconnect, a failed reconnect — and nothing cleared it again,
+    // because only `initiate_server_connect` and `KadConnect` do. Keying off
+    // `user_offline` then quietly undid the KAD-disconnect exemption instead:
+    // `KadDisconnect` sets that flag and then calls this function to drop the
+    // server itself, so the gate came straight back up and uploads stopped
+    // anyway.
     //
-    // `user_offline` is set by an explicit Disconnect and cleared by every
-    // path back online, which is exactly the question being asked here.
-    if state
-        .user_offline
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        state
-            .upload_disconnected
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Whether an eD2K server session is live, or an in-flight login is about to
-/// produce one.
-///
-/// All three inputs are consulted because they are set at different points in
-/// the connect/disconnect sequence: `server_connected` is the logged-in flag,
-/// `server_connection` holds the live socket, and `pending_server_connect` is a
-/// login still in progress. Checking only the first would read a session that
-/// is mid-login as absent.
-pub(super) fn ed2k_server_session_live(
-    server_connected: bool,
-    has_connection: bool,
-    has_pending_connect: bool,
-) -> bool {
-    server_connected || has_connection || has_pending_connect
+    // eMule raises no such gate on any disconnect — see the note in
+    // `NetworkCommand::KadDisconnect`. The upload listener now comes down for
+    // shutdown alone.
 }
 
 /// Tear down an already-up eD2K session whose IP is now blocked.
@@ -23881,15 +23839,11 @@ async fn initiate_server_connect(
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
     state.preferred_ed2k_server = Some((ip.clone(), port));
-    // Connecting to an eD2K server counts as being online for the upload
-    // listener: allow peer uploads and (critically) the server's HighID
-    // TCP port-test. Without this, joining a server after disconnecting KAD
-    // always rejected the port-test and got stuck on LowID.
-    state
-        .upload_disconnected
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    // Joining a server is a deliberate "come back online" too, so it lifts the
-    // outbound stop the same way `KadConnect` does.
+    // Joining a server is a deliberate "come back online", so it lifts the
+    // outbound stop the same way `KadConnect` does. The upload listener needs
+    // nothing here — it was never taken down. It used to be, which is what made
+    // joining a server after disconnecting KAD reject the server's own HighID
+    // TCP port-test and stick the node on LowID.
     state
         .user_offline
         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -26472,7 +26426,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // always bootstraps there is no such session: startup is always a
         // connect. `KadDisconnect` sets the flag, and `KadConnect` /
         // `initiate_server_connect` clear it again.
-        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        uploads_halted_for_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Starts false on purpose — see the field comment. "Has not connected
         // yet" is not "was asked to go offline".
         user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27141,7 +27095,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_ember_gen = ember_payload_generation.clone();
         let ul_geoip = geoip.clone();
         let ul_ember_sessions = state.ember_sessions.clone();
-        let ul_disconnected = state.upload_disconnected.clone();
+        let ul_disconnected = state.uploads_halted_for_shutdown.clone();
         let ul_queue = upload_queue_handle.clone();
         let ul_sx_overhead = stats_manager.sx_counters.clone();
         let ul_epx_overhead = stats_manager.epx_counters.clone();
@@ -27868,7 +27822,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Stop the upload listener from accepting new connections (and let it
             // terminate active sessions) during the multi-second shutdown save
             // sequence, so it can't spawn work against state being torn down.
-            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+            state.uploads_halted_for_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
         }
 
@@ -29037,14 +28991,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         info!("Network shutting down");
                         // See the try_recv drain above: stop the upload listener
                         // before the shutdown save sequence runs.
-                        state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        state.uploads_halted_for_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     None => {
                         info!("Network shutting down");
                         // See the try_recv drain above: stop the upload listener
                         // before the shutdown save sequence runs.
-                        state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        state.uploads_halted_for_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     // `UpdateSettings` mutates the loop-owned `settings` variable
@@ -41367,7 +41321,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // and `server_auto_reconnect` both survive going offline, so without this
                 // guard the disconnect the user just asked for was undone ~2s later by
                 // the drop-recovery path: the server came back on its own while
-                // `upload_disconnected` stayed raised, leaving a session that reads
+                // `uploads_halted_for_shutdown` stayed raised, leaving a session that reads
                 // "server connected" in the UI and refuses every upload.
                 if state.server_auto_reconnect
                     && !state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
@@ -42197,18 +42151,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed2k::server::set_server_flags_mirror(session.server_flags);
                         state.server_reconnect_failures = 0;
                         state.preferred_ed2k_server = Some((ip.clone(), port));
-                        // Being logged in to a server means we are reachable and
-                        // expected to serve, whatever KAD is doing. Only the
-                        // Servers-page path went through `initiate_server_connect`
-                        // and cleared this; auto-reconnect after a drop landed
-                        // here instead and left the gate shut, so uploads stayed
-                        // dead for the rest of the session. The guard keeps an
-                        // explicit Disconnect authoritative.
-                        if !state.user_offline.load(std::sync::atomic::Ordering::Relaxed) {
-                            state
-                                .upload_disconnected
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
-                        }
                         {
                             let last = ed2k::server_list::LastEd2kServer {
                                 ip: ip.clone(),
@@ -50920,14 +50862,17 @@ async fn maybe_publish_ember_sources(
     // over — and it outlives the decision by a full source TTL, which is DHT
     // pollution rather than a local UX quirk.
     //
-    // `upload_disconnected` is the right signal and `ember_tcp_firewalled` is
-    // not: `KadDisconnect` clears LowID and rebuilds the firewall checker, so
-    // the TCP verdict reads `Unknown` immediately afterwards and the node
-    // publishes itself as a *reachable* HighID source while rejecting every
-    // connect. The same flag also covers shutdown, where the listener is
-    // closed before the save sequence runs.
+    // `uploads_halted_for_shutdown` is the right signal and `ember_tcp_firewalled`
+    // is not: the firewall verdict reads `Unknown` after any event that rebuilds
+    // the checker, and a node would then publish itself as a *reachable* HighID
+    // source while refusing every connect. This flag names the one state in which
+    // the listener really is refusing everything.
+    //
+    // Note that going offline is not that state — it leaves the listener up, so a
+    // record placed before a disconnect stays honest and is deliberately left to
+    // lapse on its own TTL.
     if state
-        .upload_disconnected
+        .uploads_halted_for_shutdown
         .load(std::sync::atomic::Ordering::Relaxed)
     {
         return;

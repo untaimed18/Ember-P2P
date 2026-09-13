@@ -2222,7 +2222,7 @@ struct UploadHandler {
     /// Set to true when the network is disconnected; upload handlers check
     /// this to reject new file requests and terminate active sessions (eMule
     /// behavior: all upload activity stops on disconnect).
-    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free counter the per-connection upload tasks bump on every
     /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES`
     /// packet. Ember `OP_EMBER_SOURCEEXCHANGE` is counted on
@@ -3297,7 +3297,7 @@ pub async fn start_upload_server(
     ember_hash: [u8; 16],
     ed25519_public_key: [u8; 32],
     ed25519_secret_key: [u8; 32],
-    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     // Queue handle created by the caller so other subsystems (UDP REASKACK
     // rank, diagnostics) can read the same shared queue state.
     upload_queue: UploadQueueRef,
@@ -3413,7 +3413,7 @@ pub async fn start_upload_server(
         slot_rates,
         slot_order,
         ember_sessions,
-        network_disconnected,
+        halted_for_shutdown,
         sx_overhead,
         epx_overhead,
     });
@@ -3556,12 +3556,18 @@ pub async fn start_upload_server(
                             }
                         }
 
-                        // eMule: reject new upload connections while network is disconnected.
-                        // Firewall probes and the eD2K server's HighID port-test still pass.
-                        if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed)
+                        // Refuse new connections once shutdown has begun, so no
+                        // session is started against state the save sequence is
+                        // about to tear down. Firewall probes and the eD2K
+                        // server's HighID port-test still pass.
+                        //
+                        // Not raised by going offline: eMule's Disconnect leaves
+                        // its listen socket alone, and Ember matches that — see
+                        // `NetworkState::uploads_halted_for_shutdown`.
+                        if server.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed)
                             && !is_server_port_test_ip
                         {
-                            debug!("Rejecting connection from {peer_addr}: network disconnected");
+                            debug!("Rejecting connection from {peer_addr}: shutting down");
                             drop(stream);
                             continue;
                         }
@@ -3827,11 +3833,11 @@ pub async fn start_upload_server(
                 let peer_addr = req.peer_addr;
                 let peer_ip = peer_addr.ip();
 
-                // Same gate as inbound TCP accept: reject new upload sessions
-                // while the network is disconnected (eMule behavior).
-                if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                // Same gate as inbound TCP accept: no new upload sessions once
+                // shutdown has begun.
+                if server.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     debug!(
-                        "Rejecting punch/relay-adopted stream from {peer_addr}: network disconnected"
+                        "Rejecting punch/relay-adopted stream from {peer_addr}: shutting down"
                     );
                     continue;
                 }
@@ -7101,7 +7107,7 @@ impl UploadHandler {
                 }
             }
             // eMule: terminate upload sessions when the network is disconnected.
-            if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 debug!("Terminating upload session with {peer_addr}: network disconnected");
                 break;
             }
@@ -9185,7 +9191,7 @@ impl UploadHandler {
                         // Breaking returns to the outer loop, whose own
                         // network-disconnected check ends the session and runs
                         // the normal cleanup.
-                        if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                        if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                             info!("Upload to {peer_addr} ending: network disconnected mid-batch");
                             break;
                         }
@@ -12067,7 +12073,7 @@ impl UploadHandler {
             }
             tokio::time::sleep(slot.send_by.duration_since(now).min(SLOT_PACING_TICK)).await;
             if self
-                .network_disconnected
+                .halted_for_shutdown
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 anyhow::bail!("network disconnected");
@@ -12086,7 +12092,7 @@ impl UploadHandler {
     /// teardown for many seconds after Disconnect).
     async fn acquire_upload_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
         if self
-            .network_disconnected
+            .halted_for_shutdown
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             anyhow::bail!("network disconnected");
@@ -12101,7 +12107,7 @@ impl UploadHandler {
             }
             _ = async {
                 loop {
-                    if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                    if self.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
