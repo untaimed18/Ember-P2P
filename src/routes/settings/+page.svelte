@@ -8,6 +8,7 @@
     getLogFolderPath,
     openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
+    pickPreviewPlayer as pickPreviewPlayerDialog,
     importWebServicesFile,
     getExampleWebService,
     type UpdateSettingsResult,
@@ -1391,6 +1392,21 @@
     }
   }
 
+  async function pickPreviewPlayer() {
+    if (!settings) return;
+    try {
+      // Backend picker, so the path is authorized where it is chosen — saving
+      // a player the renderer named on its own is refused.
+      const selected = await pickPreviewPlayerDialog();
+      if (selected) {
+        settings.preview_player = selected;
+      }
+    } catch (e) {
+      const msg = translateError(e, m.settings_preview_player_pick_failed());
+      showSaveMsg(msg, true, 5000);
+    }
+  }
+
   async function pickDownloadFolder() {
     if (!settings) return;
     try {
@@ -2502,6 +2518,20 @@
               <span class="hint">{m.settings_preview_priority_all_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.preview_priority_all} ariaLabel={m.settings_preview_priority_all()} />
+          </div>
+          <div class="field">
+            <label for="preview-player">{m.settings_preview_player_label()}</label>
+            <div class="folder-input">
+              <!-- Read-only for the same reason the download folder is: the
+                   value has to come from the backend picker, and a typed path
+                   would be refused on save anyway. -->
+              <input id="preview-player" value={settings.preview_player} readonly placeholder={m.settings_preview_player_placeholder()} />
+              <button class="folder-btn" onclick={pickPreviewPlayer}>{m.settings_browse()}</button>
+              {#if settings.preview_player}
+                <button class="folder-btn" onclick={() => (settings && (settings.preview_player = ''))}>{m.common_clear()}</button>
+              {/if}
+            </div>
+            <span class="field-hint">{m.settings_preview_player_hint()}</span>
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">

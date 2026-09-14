@@ -1388,6 +1388,18 @@ pub struct AppSettings {
     /// per-file flag. Off by default (rarest-first is best for swarm health).
     #[serde(default)]
     pub preview_priority_all: bool,
+    /// Absolute path to an external media player for Preview, or empty to
+    /// hand the file to the system's default handler (eMule's "Video Player"
+    /// preference).
+    ///
+    /// Write-gated on provenance, not on shape: this names a program Ember
+    /// will execute, so a path the renderer invented is local code execution
+    /// over IPC. `update_settings` refuses a *change* to this field unless
+    /// `pick_preview_player` produced that exact path this session — the same
+    /// rule `download_folder` is under, for a stronger reason. Clearing it
+    /// back to empty is always allowed, because that is the safe default.
+    #[serde(default)]
+    pub preview_player: String,
     /// Skip compressing video files during upload (eMule: dontcompressavi)
     #[serde(default)]
     pub skip_compress_video: bool,
@@ -2069,6 +2081,7 @@ impl Default for AppSettings {
             add_downloads_paused: false,
             remove_finished_downloads: false,
             preview_priority_all: false,
+            preview_player: String::new(),
             skip_compress_video: false,
             antileech_enabled: false,
             uss_enabled: false,

@@ -197,6 +197,42 @@ fn download_root_was_picked(path: &std::path::Path) -> bool {
         .contains(&key)
 }
 
+/// Media players the OS picker handed us this session.
+///
+/// The same provenance rule as the download folder, for a stronger reason:
+/// that one names a directory Ember will write to, this one names a program
+/// Ember will *execute*. A renderer that could set it freely could run any
+/// binary on the machine with our environment, which is the whole reason the
+/// path has to come from a dialog the renderer can neither draw nor dismiss.
+fn picked_preview_players() -> &'static std::sync::Mutex<Vec<Vec<String>>> {
+    static PICKED: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    PICKED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn remember_picked_preview_player(path: &std::path::Path) {
+    const MAX_REMEMBERED: usize = 8;
+    let key = normalized_path_components(path);
+    let mut picked = picked_preview_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if picked.contains(&key) {
+        return;
+    }
+    if picked.len() >= MAX_REMEMBERED {
+        picked.remove(0);
+    }
+    picked.push(key);
+}
+
+fn preview_player_was_picked(path: &std::path::Path) -> bool {
+    let key = normalized_path_components(path);
+    picked_preview_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
 /// Decide whether an incoming `reapprove_download_root` flag may be honored.
 ///
 /// Re-approval re-captures the identity of whatever object currently sits at
@@ -344,6 +380,76 @@ pub async fn pick_download_folder(
         return Ok(None);
     };
     remember_picked_download_root(&path);
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Open a trusted native file picker for the external media player.
+///
+/// Answers the half of the Preview report that the AppImage fix did not: there
+/// was no way to say which player to use, only the system's handler for the
+/// file type.
+///
+/// Mirrors [`pick_download_folder`] — the renderer never names the path that
+/// gets authorized, and the selection is returned only so the Settings form
+/// can show it before the user saves. Restricted to the main window for the
+/// same reason.
+#[tauri::command]
+pub async fn pick_preview_player(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Option<String>, String> {
+    if window.label() != "main" {
+        return Err(coded(
+            "settings_preview_player_picker_failed",
+            "The media player can only be chosen from the main window",
+        ));
+    }
+    let picker_app = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        let dialog = picker_app
+            .dialog()
+            .file()
+            .set_title("Choose a media player for Preview");
+        // Filtered on Windows only. There an executable *is* its extension, so
+        // the filter is a real help; on Linux and macOS the thing to pick has
+        // no extension at all (`/usr/bin/mpv`) or is a bundle directory, and a
+        // filter would hide every valid answer.
+        #[cfg(target_os = "windows")]
+        let dialog = dialog.add_filter("Programs", &["exe", "com", "bat", "cmd"]);
+        dialog
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path().map_err(|error| {
+                    coded_ctx(
+                        "settings_preview_player_picker_failed",
+                        "Invalid selected player",
+                        error,
+                    )
+                })
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| {
+        coded_ctx(
+            "settings_preview_player_picker_failed",
+            "Player picker failed",
+            error,
+        )
+    })??;
+
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    // A directory would spawn nothing; catching it here means the Settings
+    // form never shows a path that Preview would then quietly ignore.
+    if !path.is_file() {
+        return Err(coded(
+            "settings_preview_player_not_a_file",
+            "That is not a program",
+        ));
+    }
+    remember_picked_preview_player(&path);
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
@@ -1314,6 +1420,20 @@ pub async fn update_settings(
                 ));
             }
             explicit_additions.push(settings.download_folder.clone());
+        }
+        // Same provenance rule for the media player, and the same narrowness:
+        // only a *change* is gated, so the background callers that persist
+        // through here with no user present re-save the existing value
+        // untouched. Clearing it is exempt — an empty player is the default,
+        // and refusing to let someone turn the feature off would be perverse.
+        if settings.preview_player != old_settings.preview_player
+            && !settings.preview_player.is_empty()
+            && !preview_player_was_picked(std::path::Path::new(&settings.preview_player))
+        {
+            return Err(coded(
+                "settings_preview_player_not_picked",
+                "Choose the media player with Browse before saving",
+            ));
         }
         let registry = state.approved_roots.clone();
         // A root revoked for an identity mismatch stays unusable until it is

@@ -834,6 +834,9 @@ export interface AppSettings {
   remove_finished_downloads: boolean;
   /** Globally prioritize first/last part of every download for faster preview. */
   preview_priority_all: boolean;
+  /** External media player for Preview; empty uses the system default handler.
+   *  Only settable via `pickPreviewPlayer()` — see that function. */
+  preview_player: string;
   skip_compress_video: boolean;
   /** When on, peers whose advertised client-software string matches any
    *  pattern in `<data_dir>/antileech.dat` are rejected at handshake

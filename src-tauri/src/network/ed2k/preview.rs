@@ -224,8 +224,31 @@ pub fn create_preview_file(
     Ok(preview_path)
 }
 
-/// Launch the system default media player for the file.
-pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
+/// The external player to use, if the configured one is usable.
+///
+/// `None` means "hand it to the system's default handler", which covers both
+/// the unconfigured case and a configured player that is no longer there.
+///
+/// A missing player falls back rather than failing. The setting is opt-in and
+/// the complaint it answers was that Preview did nothing at all, so a player
+/// that has since been uninstalled or moved must not put it back in that
+/// state — the caller logs the mismatch instead.
+fn resolve_player(configured: &str) -> Option<PathBuf> {
+    if configured.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(configured);
+    // Deliberately only "is it still a file". The path's authority came from
+    // the native picker at the moment it was set (see
+    // `pick_preview_player`), not from anything checkable here.
+    path.is_file().then_some(path)
+}
+
+/// Launch the user's media player for the file, or the system default.
+///
+/// `configured_player` is `AppSettings::preview_player`, empty when the user
+/// has not chosen one.
+pub fn launch_preview(file_path: &Path, configured_player: &str) -> anyhow::Result<()> {
     // Basename only — avoid logging the full local path (PII) at info level.
     info!(
         "Launching preview: {}",
@@ -239,10 +262,26 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("preview path has no usable name"))?;
+    // Still enforced when an explicit player is configured. The allowlist is
+    // about what these bytes are, not about who opens them: the copy came off
+    // the wire, and `can_preview` gating on the extension is only worth
+    // anything if the extension is checked against the content here too.
     if !crate::security::filesystem::passive_type_agrees(declared, file_path) {
         anyhow::bail!("preview type is not on the passive launch allowlist");
     }
-    crate::security::filesystem::open_with_default_app(file_path)?;
+    match resolve_player(configured_player) {
+        Some(player) => {
+            crate::security::filesystem::launch_with_player(&player, file_path)?;
+        }
+        None => {
+            if !configured_player.is_empty() {
+                tracing::warn!(
+                    "The configured media player is no longer there; using the default handler"
+                );
+            }
+            crate::security::filesystem::open_with_default_app(file_path)?;
+        }
+    }
     Ok(())
 }
 
@@ -275,6 +314,44 @@ mod tests {
                 "{ext} is previewable but not launchable"
             );
         }
+    }
+
+    /// The setting exists because Preview had no way to say which player to
+    /// use. It must not become a new way for Preview to do nothing: a player
+    /// that has been uninstalled or moved since it was chosen falls back to
+    /// the system handler rather than failing the launch.
+    #[test]
+    fn a_missing_player_falls_back_to_the_default_handler() {
+        assert_eq!(resolve_player(""), None, "unconfigured");
+        let absent = std::env::temp_dir().join(format!(
+            "ember-player-that-is-not-there-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        assert_eq!(
+            resolve_player(&absent.to_string_lossy()),
+            None,
+            "configured but gone"
+        );
+        // A directory would spawn nothing, so it is not a player either.
+        assert_eq!(
+            resolve_player(&std::env::temp_dir().to_string_lossy()),
+            None,
+            "a directory is not a program"
+        );
+
+        let player = std::env::temp_dir().join(format!(
+            "ember-player-{}-{}.exe",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&player, b"not really a program").unwrap();
+        assert_eq!(
+            resolve_player(&player.to_string_lossy()),
+            Some(player.clone()),
+            "a configured player that is still there is used"
+        );
+        let _ = std::fs::remove_file(&player);
     }
 
     #[test]

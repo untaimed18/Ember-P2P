@@ -2059,6 +2059,32 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     opener::open(path).map_err(|e| io::Error::other(e.to_string()))
 }
 
+/// Hand `file` to `player`, the external media player the user chose.
+///
+/// Spawned directly, never through a shell and never through `opener`: the
+/// program is named by configuration and the file by us, so there is no
+/// command line for either to be re-parsed out of. Nothing is waited on, for
+/// the same reason [`spawn_linux_host_open`] waits on nothing — a player runs
+/// until the user closes it.
+///
+/// On Linux the AppImage runtime is subtracted first. This is the same trap
+/// `open_with_default_app` documents: a player started with the bundle's
+/// `LD_LIBRARY_PATH` and GStreamer paths in place dies immediately, which is
+/// what made Preview look like it did nothing at all. Choosing the player
+/// explicitly does not change that — it only changes who picks the binary.
+pub fn launch_with_player(player: &Path, file: &Path) -> io::Result<()> {
+    use std::process::Stdio;
+    let mut cmd = std::process::Command::new(player);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    apply_host_desktop_env(&mut cmd);
+    cmd.arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 /// Launch an already-validated URL with the user's default handler.
 ///
 /// Same AppImage problem as [`open_with_default_app`], and worse in one

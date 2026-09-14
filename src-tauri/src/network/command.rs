@@ -5737,6 +5737,7 @@ async fn handle_command_inner(
             single_flight,
         } => {
             let download_folder = settings.download_folder.clone();
+            let preview_player = settings.preview_player.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
                 // Dropped when this task ends, which is what makes the claim
@@ -5845,7 +5846,7 @@ async fn handle_command_inner(
                         )
                         .map_err(|e| format!("Failed to create preview file: {e}"))?;
 
-                        ed2k::preview::launch_preview(&preview_path)
+                        ed2k::preview::launch_preview(&preview_path, &preview_player)
                             .map_err(|e| format!("Failed to launch preview: {e}"))?;
 
                         // The full path is PII (username, folder layout) and the
