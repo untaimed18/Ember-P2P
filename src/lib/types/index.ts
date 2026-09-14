@@ -716,10 +716,14 @@ export interface ServerInfo {
   soft_files: number;
   hard_files: number;
   is_static: boolean;
+  priority: ServerPriority;
   fail_count: number;
   client_id: number;
   is_low_id: boolean;
 }
+
+/** Matches `ServerPriority` in `network/ed2k/server_list.rs`. */
+export type ServerPriority = 'low' | 'normal' | 'high';
 
 /** Row in the upload-pane "Queued" tab. Mirrors `crate::types::UploadQueueClient`
  *  in the Rust backend; populated by `invoke('get_upload_queue')`. */
@@ -730,7 +734,11 @@ export interface UploadQueueClient {
   file_hash: string;
   file_name: string;
   wait_seconds: number;
-  queue_rank: number | null;
+  queue_rank: number;
+  /** Whether the peer currently holds a connection; waiting peers usually don't. */
+  connected: boolean;
+  peer_name: string;
+  client_software: string;
   credit_ratio: number;
   uploaded: number;
   downloaded: number;
@@ -746,6 +754,9 @@ export interface UploadQueueClient {
  *  are shown only on the Ember tab. */
 export interface KnownClient {
   user_hash: string;
+  /** The eD2K client's own Hello nickname; `nickname` below is an Ember friend name. */
+  peer_name: string;
+  client_software: string;
   downloaded: number;
   uploaded: number;
   credit_ratio: number;

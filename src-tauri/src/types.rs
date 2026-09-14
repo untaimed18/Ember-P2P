@@ -1708,11 +1708,22 @@ pub struct ServerInfo {
     pub soft_files: u32,
     pub hard_files: u32,
     pub is_static: bool,
+    /// Connection priority, as `"low"` / `"normal"` / `"high"`.
+    ///
+    /// Tracked and persisted (`server.met` tag `0x0E`) since the list was
+    /// first written, but withheld from this struct — so the Servers tab
+    /// could neither show it nor offer eMule's High/Normal/Low choice.
+    #[serde(default = "default_server_priority")]
+    pub priority: String,
     pub fail_count: u32,
     #[serde(default)]
     pub client_id: u32,
     #[serde(default)]
     pub is_low_id: bool,
+}
+
+fn default_server_priority() -> String {
+    "normal".to_string()
 }
 
 /// Snapshot of the AntiLeech filter for the Settings UI. Carries the
@@ -1755,10 +1766,23 @@ pub struct UploadQueueClient {
     pub file_name: String,
     pub wait_seconds: u64,
     /// 1-based queue rank computed via the eMule scoring rules
-    /// (`compute_queue_rank` in the upload module). `None` when the
-    /// peer is currently disconnected and only `m_bAddNextConnect` is
-    /// keeping their slot warm.
-    pub queue_rank: Option<u32>,
+    /// (`compute_queue_rank` in the upload module).
+    ///
+    /// Always known: it is derived from the whole queue, not from the peer.
+    /// This was `Option<u32>`, withheld whenever the peer had no live socket
+    /// — which is the normal state of a waiting peer — so the column showed
+    /// `?` for every row.
+    pub queue_rank: u32,
+    /// Whether the peer currently holds a connection to us.
+    ///
+    /// A waiting peer is usually disconnected between re-asks, which is not a
+    /// problem; it is still worth showing, and it is what the old `None` rank
+    /// was trying (and failing) to convey.
+    pub connected: bool,
+    /// Peer's Hello nickname, empty when it advertised none.
+    pub peer_name: String,
+    /// Client software and version, e.g. `eMule 0.60a`.
+    pub client_software: String,
     /// SecIdent credit ratio (1.0–10.0). 1.0 for first-time peers.
     pub credit_ratio: f64,
     /// Lifetime bytes we have uploaded TO this peer across all sessions.
@@ -1783,6 +1807,14 @@ pub struct UploadQueueClient {
 pub struct KnownClient {
     /// 32-char hex ed2k user hash.
     pub user_hash: String,
+    /// Peer's Hello nickname, empty until it has told us one.
+    ///
+    /// Distinct from `nickname` below, which is an Ember *friend* name out of
+    /// the friends database. This is what the eD2K client itself advertises,
+    /// and it is what the eD2K tab could not show at all.
+    pub peer_name: String,
+    /// Client software and version, e.g. `eMule 0.60a`.
+    pub client_software: String,
     /// Bytes WE downloaded from them across all sessions (eMule's
     /// `m_nDownloaded`). This is the value that buys us upload-queue
     /// priority on their side.

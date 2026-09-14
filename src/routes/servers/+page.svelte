@@ -7,9 +7,11 @@
     disconnectServer,
     addServer,
     removeServer,
+    setServerStatic,
+    setServerPriority,
     downloadServerMet,
   } from '$lib/api/server';
-  import type { ServerInfo } from '$lib/types';
+  import type { ServerInfo, ServerPriority } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
@@ -57,6 +59,7 @@
   // can't break the table.
   const VALID_SORT_COLS = new Set([
     'name', 'ip', 'description', 'users', 'maxusers', 'files', 'maxfiles', 'failed', 'static',
+    'priority',
   ]);
   let sortCol: string = $state('name');
   let sortAsc = $state(true);
@@ -408,6 +411,68 @@
     }
   }
 
+  /** Sort key for the Priority column: Low < Normal < High. */
+  function priorityRank(priority: ServerPriority): number {
+    return priority === 'high' ? 2 : priority === 'low' ? 0 : 1;
+  }
+
+  function priorityLabel(priority: ServerPriority): string {
+    return priority === 'high'
+      ? m.servers_priority_high()
+      : priority === 'low'
+        ? m.servers_priority_low()
+        : m.servers_priority_normal();
+  }
+
+  /**
+   * Mark a server static, or let it become prunable again.
+   *
+   * Applies to the whole selection when there is one, like Remove does — the
+   * reason to reach for this is usually a batch just imported from a
+   * downloaded server.met.
+   */
+  async function applyStatic(target: ServerInfo, isStatic: boolean) {
+    const targets = contextTargets(target);
+    error = null;
+    try {
+      for (const server of targets) {
+        await setServerStatic(server.ip, server.port, isStatic);
+      }
+      flash(isStatic ? m.servers_marked_static() : m.servers_unmarked_static());
+      await refresh();
+    } catch (e: unknown) {
+      error = toErrorMsg(e);
+    }
+  }
+
+  async function applyPriority(target: ServerInfo, priority: ServerPriority) {
+    const targets = contextTargets(target);
+    error = null;
+    try {
+      for (const server of targets) {
+        await setServerPriority(server.ip, server.port, priority);
+      }
+      flash(m.servers_priority_set({ priority: priorityLabel(priority) }));
+      await refresh();
+    } catch (e: unknown) {
+      error = toErrorMsg(e);
+    }
+  }
+
+  /**
+   * The rows a context-menu action applies to: the whole selection, or just
+   * the right-clicked row when it stands alone.
+   *
+   * `target` is passed in rather than read back off `ctxMenu`, because these
+   * actions run after `closeContextMenu()` has already cleared it.
+   * `handleContextMenu` guarantees the right-clicked row is part of the
+   * selection, so a multi-row selection always includes it.
+   */
+  function contextTargets(target: ServerInfo): ServerInfo[] {
+    const selected = servers.filter((s) => selectedServers.has(serverKey(s)));
+    return selected.length > 1 ? selected : [target];
+  }
+
   function handleRemoveAll() {
     confirmRemoveAll = true;
   }
@@ -553,6 +618,16 @@
       await copyOrWarn(`${target.ip}:${target.port}`, m.servers_copied_clipboard());
     } else if (action === 'copy_ed2k' && target) {
       await copyOrWarn(`ed2k://|server|${target.ip}|${target.port}|/`, m.servers_copied_ed2k());
+    } else if (action === 'make_static' && target) {
+      await applyStatic(target, true);
+    } else if (action === 'clear_static' && target) {
+      await applyStatic(target, false);
+    } else if (action === 'priority_high' && target) {
+      await applyPriority(target, 'high');
+    } else if (action === 'priority_normal' && target) {
+      await applyPriority(target, 'normal');
+    } else if (action === 'priority_low' && target) {
+      await applyPriority(target, 'low');
     }
   }
 
@@ -663,6 +738,9 @@
         case 'maxfiles': cmp = compareLimit(perUserFileLimit(a), perUserFileLimit(b)); break;
         case 'failed': cmp = a.fail_count - b.fail_count; break;
         case 'static': cmp = Number(a.is_static) - Number(b.is_static); break;
+        // By what the priority *means* — Low, Normal, High — not by the
+        // name, which would sort High before Low alphabetically.
+        case 'priority': cmp = priorityRank(a.priority) - priorityRank(b.priority); break;
       }
       return sortAsc ? cmp : -cmp;
     });
@@ -909,7 +987,10 @@
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('failed')} onclick={() => toggleSort('failed')} onkeydown={(e) => sortOnKey(e, () => toggleSort('failed'))}>
                   {m.servers_col_failed()}{sortIndicator('failed')}
                 </th>
-                <th class="sortable" tabindex="0" role="columnheader" aria-sort={ariaSortValue('static')} onclick={() => toggleSort('static')} onkeydown={(e) => sortOnKey(e, () => toggleSort('static'))}>
+                <th class="sortable" tabindex="0" role="columnheader" title={m.servers_col_priority_hint()} aria-sort={ariaSortValue('priority')} onclick={() => toggleSort('priority')} onkeydown={(e) => sortOnKey(e, () => toggleSort('priority'))}>
+                  {m.servers_col_priority()}{sortIndicator('priority')}
+                </th>
+                <th class="sortable" tabindex="0" role="columnheader" title={m.servers_col_static_hint()} aria-sort={ariaSortValue('static')} onclick={() => toggleSort('static')} onkeydown={(e) => sortOnKey(e, () => toggleSort('static'))}>
                   {m.servers_col_static()}{sortIndicator('static')}
                 </th>
                 <th>{m.servers_col_actions()}</th>
@@ -942,7 +1023,16 @@
                   <td class="num" class:fail-warn={server.fail_count > 0}>
                     {server.fail_count > 0 ? server.fail_count : '—'}
                   </td>
-                  <td>{server.is_static ? m.common_yes() : '—'}</td>
+                  <td class="priority-cell" class:priority-high={server.priority === 'high'} class:priority-low={server.priority === 'low'}>
+                    {priorityLabel(server.priority)}
+                  </td>
+                  <!-- Yes *and* No. This was an em-dash for every
+                       non-static server, which reads as "not applicable"
+                       rather than "no" — and since a server only becomes
+                       static by being added by hand, a list imported from a
+                       server.met showed a column of dashes and nothing
+                       else. -->
+                  <td>{server.is_static ? m.common_yes() : m.common_no()}</td>
                   <td>
                     <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
                   </td>
@@ -1129,6 +1219,23 @@
     {:else}
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('disconnect')}>{m.servers_disconnect()}</button>
     {/if}
+    <div class="ctx-sep" role="separator"></div>
+    {#if ctxMenu.server.is_static}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_static')}>{m.servers_ctx_clear_static()}</button>
+    {:else}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('make_static')}>{m.servers_ctx_make_static()}</button>
+    {/if}
+    <div class="ctx-sep" role="separator"></div>
+    <div class="ctx-header" role="presentation">{m.servers_col_priority()}</div>
+    <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'high'} onclick={() => ctxAction('priority_high')}>
+      {ctxMenu.server.priority === 'high' ? '\u2713 ' : ''}{m.servers_priority_high()}
+    </button>
+    <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'normal'} onclick={() => ctxAction('priority_normal')}>
+      {ctxMenu.server.priority === 'normal' ? '\u2713 ' : ''}{m.servers_priority_normal()}
+    </button>
+    <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'low'} onclick={() => ctxAction('priority_low')}>
+      {ctxMenu.server.priority === 'low' ? '\u2713 ' : ''}{m.servers_priority_low()}
+    </button>
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ed2k')}>{m.servers_copy_ed2k_link()}</button>
@@ -1431,6 +1538,21 @@
   .near-capacity {
     color: var(--warning);
     font-weight: 600;
+  }
+
+  /* Normal is the default and stays unstyled, so the column only draws
+     attention to the servers the user has actually moved. */
+  .priority-cell {
+    color: var(--text-secondary);
+  }
+
+  .priority-cell.priority-high {
+    color: var(--success);
+    font-weight: 600;
+  }
+
+  .priority-cell.priority-low {
+    opacity: 0.7;
   }
 
   /* Side panel */

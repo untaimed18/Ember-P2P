@@ -4090,7 +4090,12 @@ pub async fn open_shared_folder(
         // different code than the containment failure.
         let canonical = crate::security::filesystem::verify_existing_path(folder, &allowed_dirs)
             .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-        crate::security::filesystem::reveal_in_file_manager(&canonical)
+        // Opened, not revealed. `reveal_in_file_manager` selects its argument
+        // *inside the argument's own parent*, so handing it the containing
+        // folder opened the grandparent with the folder merely highlighted —
+        // on Windows via `explorer /select,`, and on Linux via
+        // `ShowItems`. This action names the folder it is meant to show.
+        crate::security::filesystem::open_with_default_app(&canonical)
             .map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))?;
         Ok(())
     })

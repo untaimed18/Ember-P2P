@@ -4772,6 +4772,54 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
+        NetworkCommand::SetServerStatic {
+            ip,
+            port,
+            is_static,
+            tx,
+        } => {
+            let result = if state.server_list.set_static(&ip, port, is_static) {
+                let met_path = state.data_dir.join("server.met");
+                spawn_save_server_met(
+                    &state.server_list,
+                    met_path,
+                    &state.server_met_save_generation,
+                    &state.server_met_save_lock,
+                );
+                Ok(format!("Updated static flag for server {ip}:{port}"))
+            } else {
+                Err(format!("Server {ip}:{port} not found in the list"))
+            };
+            let _ = tx.send(result);
+        }
+
+        NetworkCommand::SetServerPriority {
+            ip,
+            port,
+            priority,
+            tx,
+        } => {
+            use crate::network::ed2k::server_list::ServerPriority;
+            let result = match ServerPriority::parse_name(&priority) {
+                None => Err(format!("Unknown server priority {priority}")),
+                Some(priority) => {
+                    if state.server_list.set_priority(&ip, port, priority) {
+                        let met_path = state.data_dir.join("server.met");
+                        spawn_save_server_met(
+                            &state.server_list,
+                            met_path,
+                            &state.server_met_save_generation,
+                            &state.server_met_save_lock,
+                        );
+                        Ok(format!("Set server {ip}:{port} priority"))
+                    } else {
+                        Err(format!("Server {ip}:{port} not found in the list"))
+                    }
+                }
+            };
+            let _ = tx.send(result);
+        }
+
         NetworkCommand::GetServerListSnapshot { tx } => {
             let _ = tx.send(
                 state

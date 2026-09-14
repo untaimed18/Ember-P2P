@@ -3487,7 +3487,13 @@
           <th class="sortable col-origin" role="columnheader" aria-sort={sortField === 'origin' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('origin')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('origin'))}>
             {m.search_col_source()}{sortIndicator('origin')}
           </th>
-          <th class="sortable col-sources" role="columnheader" aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
+          <!-- The header says what the number is, because the number is
+               reliably lower than what the Transfers pane shows once the
+               download starts, and that difference reads as a bug. A search
+               carries whatever estimate the answering node happened to hold;
+               starting the download asks every network for sources directly.
+               eMule's search list is the same, and for the same reason. -->
+          <th class="sortable col-sources" role="columnheader" title={m.search_col_sources_hint()} aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
             {m.search_col_sources()}{sortIndicator('sources')}
           </th>
           {#if columnVis.complete}

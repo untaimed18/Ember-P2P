@@ -277,6 +277,68 @@ pub async fn remove_server(
     await_reply(rx, "server_remove_failed", "Failed to remove server").await?
 }
 
+/// Mark a server static, or let it become prunable again.
+///
+/// eMule's "Add to static server list". Needs no consent prompt of its own:
+/// `confirm_server_addition` gates *introducing* a server, and this only
+/// changes the standing of one already in the list — it cannot name a new
+/// destination, because [`crate::network::ed2k::server_list::ServerList::set_static`]
+/// fails on an address that is not there.
+#[tauri::command]
+pub async fn set_server_static(
+    state: tauri::State<'_, AppState>,
+    ip: String,
+    port: u16,
+    is_static: bool,
+) -> Result<String, String> {
+    if ip.is_empty() {
+        return Err(coded("server_ip_required", "Server IP is required"));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SetServerStatic {
+            ip,
+            port,
+            is_static,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "server_set_static_failed", "Failed to update server").await?
+}
+
+/// Set a server's connection priority to `"low"`, `"normal"` or `"high"`.
+///
+/// The name is validated in the network task rather than here, so the one
+/// accepted set lives next to the enum it maps onto.
+#[tauri::command]
+pub async fn set_server_priority(
+    state: tauri::State<'_, AppState>,
+    ip: String,
+    port: u16,
+    priority: String,
+) -> Result<String, String> {
+    if ip.is_empty() {
+        return Err(coded("server_ip_required", "Server IP is required"));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SetServerPriority {
+            ip,
+            port,
+            priority,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(
+        rx,
+        "server_set_priority_failed",
+        "Failed to set server priority",
+    )
+    .await?
+}
+
 #[tauri::command]
 pub async fn get_server_list(state: tauri::State<'_, AppState>) -> Result<Vec<ServerInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();

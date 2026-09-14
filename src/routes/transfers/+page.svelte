@@ -134,7 +134,13 @@
   // new column set.
   const QUEUE_COLUMNS: TransferColumn[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
+    // Nickname and Software sit beside the User ID here for the same reason
+    // they do on the Uploading tab: the hash identifies the row, the name is
+    // what the person reading it recognises. The queue snapshot carries both
+    // now — before, this tab could only offer the truncated hash.
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-nick' },
     { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client' },
+    { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 110, minWidth: 80, className: 'col-q-sw' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file' },
     { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait' },
     { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank' },
@@ -153,6 +159,17 @@
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
     { key: 'user_hash', get label() { return showingEmberKnown ? m.transfers_col_user_name() : m.transfers_col_user_hash(); }, width: 248, minWidth: 168, className: 'col-k-hash', sortField: 'user_hash' },
+    // The ledger stores what each peer called itself and what it runs, so the
+    // eD2K tab no longer has only 32 hex characters to identify a row by.
+    //
+    // The header has to change on the Ember tab: there the first column is
+    // itself labelled "User Name" (it shows the friend nickname), so calling
+    // this one that too would put two identical headers side by side. The
+    // eD2K Hello name is still worth showing for an Ember peer — it is just a
+    // different name from the friend one — so it is relabelled rather than
+    // dropped.
+    { key: 'peer_name', get label() { return showingEmberKnown ? m.transfers_col_ed2k_name() : m.transfers_col_user_name(); }, width: 150, minWidth: 110, className: 'col-k-nick', sortField: 'peer_name' },
+    { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 120, minWidth: 96, className: 'col-k-soft', sortField: 'client_software' },
     { key: 'last_known_ip', get label() { return m.transfers_col_last_ip(); }, width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip', defaultHidden: true },
     { key: 'uploaded', get label() { return m.transfers_col_uploaded_to(); }, width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
     { key: 'downloaded', get label() { return m.transfers_col_downloaded_from(); }, width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
@@ -204,8 +221,12 @@
   const COLUMN_ORDER_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-column-order-DownloadListCtrl',
     uploads: 'transfers-column-order-UploadListCtrl',
-    queue: 'transfers-column-order-QueueListCtrlV2',
-    known: 'transfers-column-order-KnownClientsCtrl',
+    // V3: bumped when Nickname and Software were added, so the two land where
+    // the schema puts them instead of being appended after Identification.
+    queue: 'transfers-column-order-QueueListCtrlV3',
+    // V2: bumped when Nickname and Client Software were added, so the two
+    // land beside the hash they identify instead of after Last Seen.
+    known: 'transfers-column-order-KnownClientsCtrlV2',
     clients: 'transfers-column-order-DownloadClientsCtrl',
   };
 
@@ -1329,6 +1350,12 @@
           raw = cmpStr(nameOf(a), nameOf(b));
           break;
         }
+        case 'peer_name':
+          raw = cmpStr(a.peer_name, b.peer_name);
+          break;
+        case 'client_software':
+          raw = cmpStr(a.client_software, b.client_software);
+          break;
         case 'last_known_ip':
           raw = cmpIp(a.last_known_ip, b.last_known_ip);
           break;
@@ -1362,13 +1389,13 @@
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
   type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
-  type KnSortField = 'user_hash' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
+  type KnSortField = 'user_hash' | 'peer_name' | 'client_software' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
   // No `file_name`: that column shows the parent download's name, which is the
   // same string on every row here, so sorting by it would do nothing.
   type ClSortField = 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
   const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
-  const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
+  const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'peer_name', 'client_software', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
   const CL_SORT_FIELDS: ClSortField[] = ['peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
   // localStorage can throw in private mode / on quota-exceeded, and
   // `loadStoredColumnWidths` runs during mount — an escaped throw there
@@ -1418,7 +1445,12 @@
       // string columns default to ascending (A-Z first). Matches the
       // sorting UX in eMule and most file managers.
       knSortField = field;
-      knSortAsc = field === 'user_hash' || field === 'last_known_ip' || field === 'ident_state';
+      knSortAsc =
+        field === 'user_hash' ||
+        field === 'peer_name' ||
+        field === 'client_software' ||
+        field === 'last_known_ip' ||
+        field === 'ident_state';
     }
     safeSetItem('transfers-kn-sort-field', knSortField);
     safeSetItem('transfers-kn-sort-asc', String(knSortAsc));
@@ -4370,15 +4402,23 @@
                 {#each visibleQueueColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={q.country_code ?? ''}>{#if countryFlagSrc(q.country_code ?? undefined)}<img src={countryFlagSrc(q.country_code ?? undefined)} alt={q.country_code ?? ''} class="flag-img" />{/if}</td>
+                  {:else if column.key === 'peer_name'}
+                    <td class="client-cell" title={q.peer_name}>{q.is_friend ? '\u2605 ' : ''}<bdi dir="auto">{q.peer_name || '\u2014'}</bdi></td>
                   {:else if column.key === 'user_name'}
                     {@const label = q.user_hash ? q.user_hash.slice(0, 8) + '\u2026' : (q.peer_ip || '\u2014')}
-                    <td class="client-cell" title={q.user_hash || q.peer_ip}>{q.is_friend ? '\u2605 ' : ''}{label}</td>
+                    <td class="client-cell" title={q.user_hash || q.peer_ip}>{label}</td>
+                  {:else if column.key === 'client_software'}
+                    <td class="client-cell" title={q.client_software}>{q.client_software || '\u2014'}</td>
                   {:else if column.key === 'file_name'}
                     <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
                   {:else if column.key === 'queue_rank'}
-                    <td class="num-cell" title={q.queue_rank == null ? m.transfers_queue_disconnected_title() : ''}>{q.queue_rank == null ? '?' : q.queue_rank}</td>
+                    <!-- Always a number. The rank is computed from the whole
+                         queue, so it is known whether or not the peer happens
+                         to be connected right now; "disconnected" is said by
+                         dimming the row's position, not by replacing it. -->
+                    <td class="num-cell" class:rank-idle={!q.connected} title={q.connected ? '' : m.transfers_queue_disconnected_title()}>{q.queue_rank}</td>
                   {:else if column.key === 'credit_ratio'}
                     <td class="num-cell" title={m.transfers_queue_credit_title()}>{q.credit_ratio.toFixed(2)}</td>
                   {:else if column.key === 'transfer_history'}
@@ -4569,6 +4609,10 @@
                         {/if}
                       </button>
                     </td>
+                  {:else if column.key === 'peer_name'}
+                    <td class="client-cell" title={kc.peer_name}><bdi dir="auto">{kc.peer_name || '\u2014'}</bdi></td>
+                  {:else if column.key === 'client_software'}
+                    <td class="client-cell" title={kc.client_software}>{kc.client_software || '\u2014'}</td>
                   {:else if column.key === 'last_known_ip'}
                     <td class="client-cell" title={kc.last_known_ip ?? m.transfers_known_never_identified()}>{kc.last_known_ip ?? '\u2014'}</td>
                   {:else if column.key === 'uploaded'}
@@ -5687,6 +5731,11 @@
     text-align: right;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
+  }
+  /* A queued peer with no live connection still has a position, so the rank
+     is shown either way and only dimmed — the tooltip says why. */
+  .num-cell.rank-idle {
+    opacity: 0.55;
   }
   /* Numeric columns render their values right-aligned (.num-cell), but the
      default header is flush-left, so the label drifted to the opposite edge

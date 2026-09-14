@@ -9698,6 +9698,33 @@ async fn download_parts_from_source(
                             if let Some(cm) = &credit_mgr {
                                 let mut cm = cm.write().await;
                                 cm.add_downloaded(peer_user_hash, verified_bytes);
+                                // Name the row these bytes just created.
+                                //
+                                // The download side learns the peer's Hello
+                                // name and client software across seven
+                                // different connect paths (plain, obfuscated,
+                                // callback, Ember-Hello, …), all of which have
+                                // converged into `src_peer_name` /
+                                // `src_client_software` by the time bytes
+                                // verify. Recording it here rather than at
+                                // each of those sites covers them all, under
+                                // a lock this path already holds — and it
+                                // names exactly the peers that end up with a
+                                // durable ledger row, since `downloaded > 0`
+                                // is what keeps a record past the
+                                // `clients.met` filter.
+                                //
+                                // Without this, a peer we only ever download
+                                // from stayed a bare 32-character hash in
+                                // Known eD2K Peers: the upload handler was
+                                // the only thing recording identity, and it
+                                // never sees a peer that does not ask us for
+                                // anything.
+                                cm.note_client_identity(
+                                    peer_user_hash,
+                                    &src_peer_name,
+                                    &src_client_software,
+                                );
                                 // Ember credit mirror: record how much
                                 // PoP-verified peers have uploaded to
                                 // us, so their `downloaded` column (from

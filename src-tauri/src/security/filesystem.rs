@@ -2207,7 +2207,7 @@ fn apply_host_desktop_env(cmd: &mut std::process::Command) {
 /// Nothing is waited on, matching what `opener` does here: `xdg-open` may
 /// `exec` the player it picked, so waiting would block Open and Preview until
 /// the user quit VLC.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn spawn_linux_host_open(target: &std::ffi::OsStr) -> io::Result<()> {
     use std::process::Stdio;
     let attempts: [(&str, &[&str]); 4] = [
@@ -2244,22 +2244,187 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
-    for command in ["nautilus", "dolphin", "nemo"] {
-        let mut cmd = std::process::Command::new(command);
+/// How one file manager wants to be told "show this file in its folder".
+///
+/// `--select` is not a shared convention, which is what broke this. Nautilus
+/// and Dolphin document the option; Nemo does not have it at all, and GLib's
+/// option parser *rejects the whole command line* when it sees an unknown
+/// long option, so `nemo --select …` exited without opening a window. Because
+/// the process nonetheless spawned, the old loop read that as success and
+/// never tried anything else — so "Open file location" and the Library's
+/// "Open folder containing the file" did nothing whatsoever on Cinnamon,
+/// which is Linux Mint's default desktop.
+///
+/// Nemo does select a file when handed the path on its own. Thunar, Caja and
+/// PCManFM have no selection support in any form — handed a *file* they
+/// behave like `xdg-open` and would launch it in a media player instead of
+/// showing the folder, so they are given the parent directory instead.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealStyle {
+    /// `fm --select <file>`
+    SelectFlag,
+    /// `fm <file>` — opens the parent with the file highlighted.
+    BarePath,
+    /// `fm <parent>` — no highlight available, so just show the folder.
+    ParentOnly,
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+const LINUX_REVEAL_COMMANDS: &[(&str, RevealStyle)] = &[
+    ("nautilus", RevealStyle::SelectFlag),
+    ("dolphin", RevealStyle::SelectFlag),
+    ("nemo", RevealStyle::BarePath),
+    ("caja", RevealStyle::ParentOnly),
+    ("thunar", RevealStyle::ParentOnly),
+    ("pcmanfm", RevealStyle::ParentOnly),
+];
+
+/// Percent-encode `path` into a `file://` URI for the D-Bus call.
+///
+/// Everything outside the RFC 3986 unreserved set is escaped, `/` excepted.
+/// That is stricter than it needs to be for a URI, and deliberately so: it
+/// also guarantees the result cannot contain a quote or a bracket, which is
+/// what lets [`show_item_over_dbus`] paste it into `gdbus`'s `['…']` array
+/// literal without the path being able to break out of it.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn file_uri(path: &Path) -> io::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+    let mut uri = String::from("file://");
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(byte as char);
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    Ok(uri)
+}
+
+/// Ask the session's file manager to show `path` selected in its parent.
+///
+/// This is the freedesktop interface for exactly this action, and it is the
+/// only approach that reaches the file manager the user actually chose rather
+/// than the first one we happen to find on `PATH`. Nautilus, Dolphin, Nemo,
+/// Caja and Thunar (1.8.3+) all export it, and the name is D-Bus activatable,
+/// so it works whether or not a window is already open.
+///
+/// It also sidesteps the AppImage problem outright: the file manager is
+/// started by the bus daemon, not by us, so it never inherits the bundle's
+/// `LD_LIBRARY_PATH` in the first place.
+///
+/// Unlike the spawn-and-hope fallbacks, the exit status *is* checked — these
+/// are one-shot RPC clients that return as soon as the call is answered, so
+/// there is nothing to wait on beyond the reply. Both are capped well below
+/// their multi-second default reply timeouts so a desktop with no such
+/// service falls through quickly instead of hanging the menu action.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn show_item_over_dbus(path: &Path) -> io::Result<()> {
+    use std::process::Stdio;
+    const DEST: &str = "org.freedesktop.FileManager1";
+    const OBJECT: &str = "/org/freedesktop/FileManager1";
+    let uri = file_uri(path)?;
+
+    let gdbus_array = format!("['{uri}']");
+    let mut attempts: Vec<(&str, Vec<String>)> = Vec::new();
+    for program in ["/usr/bin/gdbus", "gdbus"] {
+        attempts.push((
+            program,
+            vec![
+                "call".into(),
+                "--session".into(),
+                "--timeout".into(),
+                "3".into(),
+                "--dest".into(),
+                DEST.into(),
+                "--object-path".into(),
+                OBJECT.into(),
+                "--method".into(),
+                format!("{DEST}.ShowItems"),
+                gdbus_array.clone(),
+                String::new(),
+            ],
+        ));
+    }
+    // `dbus-send` for hosts that ship dbus' own tools but not GLib's.
+    for program in ["/usr/bin/dbus-send", "dbus-send"] {
+        attempts.push((
+            program,
+            vec![
+                "--session".into(),
+                "--print-reply".into(),
+                "--reply-timeout=3000".into(),
+                format!("--dest={DEST}"),
+                OBJECT.into(),
+                format!("{DEST}.ShowItems"),
+                format!("array:string:{uri}"),
+                "string:".into(),
+            ],
+        ));
+    }
+
+    for (program, args) in attempts {
+        let mut cmd = std::process::Command::new(program);
         apply_host_desktop_env(&mut cmd);
-        if cmd.arg("--select").arg(path).spawn().is_ok() {
+        let status = cmd
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
             return Ok(());
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no org.freedesktop.FileManager1 service answered",
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
+    use std::process::Stdio;
+
+    if show_item_over_dbus(path).is_ok() {
+        return Ok(());
+    }
+
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target has no parent directory"))?;
-    let mut cmd = std::process::Command::new("xdg-open");
-    apply_host_desktop_env(&mut cmd);
-    cmd.arg(parent).spawn()?;
-    Ok(())
+
+    for (program, style) in LINUX_REVEAL_COMMANDS {
+        let mut cmd = std::process::Command::new(program);
+        apply_host_desktop_env(&mut cmd);
+        match style {
+            RevealStyle::SelectFlag => {
+                cmd.arg("--select").arg(path);
+            }
+            RevealStyle::BarePath => {
+                cmd.arg(path);
+            }
+            RevealStyle::ParentOnly => {
+                cmd.arg(parent);
+            }
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
+    }
+
+    // No file manager we know by name, so fall back to whatever handles a
+    // directory. Through `spawn_linux_host_open` rather than a bare
+    // `xdg-open` so this last resort gets the same AppImage-stripped
+    // environment, the absolute-path-first lookup and the `gio open` and
+    // `opener` backstops that Open and Preview already rely on.
+    spawn_linux_host_open(parent.as_os_str())
 }
 
 #[cfg(windows)]
@@ -2434,6 +2599,55 @@ mod tests {
     fn the_host_open_path_type_checks_off_linux() {
         let launcher: fn(&std::ffi::OsStr) -> io::Result<()> = spawn_linux_host_open;
         let _ = launcher;
+        let reveal: fn(&Path) -> io::Result<()> = show_item_over_dbus;
+        let _ = reveal;
+    }
+
+    /// The bug this table exists to prevent. Nemo has no `--select`, and
+    /// GLib rejects an unknown long option by refusing the whole command
+    /// line, so it exited without a window while still reporting a
+    /// successful spawn — which is why "Open file location" was silent on
+    /// Cinnamon. Nothing may hand `--select` to a file manager that does not
+    /// document it, and the three with no selection support at all must get
+    /// the parent directory, never the file: handed a file they act like
+    /// `xdg-open` and would play it instead of showing where it lives.
+    #[test]
+    fn only_file_managers_that_document_select_are_given_it() {
+        let style = |name: &str| {
+            LINUX_REVEAL_COMMANDS
+                .iter()
+                .find(|(program, _)| *program == name)
+                .map(|(_, style)| *style)
+        };
+        assert_eq!(style("nautilus"), Some(RevealStyle::SelectFlag));
+        assert_eq!(style("dolphin"), Some(RevealStyle::SelectFlag));
+        assert_eq!(style("nemo"), Some(RevealStyle::BarePath));
+        assert_eq!(style("caja"), Some(RevealStyle::ParentOnly));
+        assert_eq!(style("thunar"), Some(RevealStyle::ParentOnly));
+        assert_eq!(style("pcmanfm"), Some(RevealStyle::ParentOnly));
+    }
+
+    /// The encoding is what keeps a filename from breaking out of the
+    /// `['…']` array literal `gdbus` is handed, so the quote, the bracket
+    /// and the backslash matter as much as the space.
+    #[test]
+    fn file_uri_escapes_everything_a_gdbus_array_literal_would_read() {
+        assert_eq!(
+            file_uri(Path::new("/home/u/Videos/clip.mp4")).unwrap(),
+            "file:///home/u/Videos/clip.mp4"
+        );
+        assert_eq!(
+            file_uri(Path::new("/home/u/a b.mp4")).unwrap(),
+            "file:///home/u/a%20b.mp4"
+        );
+        let hostile = file_uri(Path::new("/home/u/'] , ['file:///etc/passwd")).unwrap();
+        assert!(!hostile.contains('\''), "{hostile}");
+        assert!(!hostile.contains('['), "{hostile}");
+        assert!(!hostile.contains(']'), "{hostile}");
+        assert_eq!(
+            file_uri(Path::new("/home/u/naïve #1.mp4")).unwrap(),
+            "file:///home/u/na%C3%AFve%20%231.mp4"
+        );
     }
 
     /// Both orderings are asserted because the predicate is symmetric as

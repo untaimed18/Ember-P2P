@@ -123,13 +123,19 @@ const CLIENTS_MET_MAGIC: u32 = 0xE3B2_0001;
 /// in-memory (see `reseed_friend_endpoint` in `network/mod.rs`). Readers
 /// stay backward compatible with v1 files (no trailer to read).
 ///
-/// v3 (current): appends the crypto-anchor section (see
+/// v3: appends the crypto-anchor section (see
 /// [`CLIENTS_MET_ANCHOR_MAGIC`]) *after* the record array. The per-record
 /// layout is byte-identical to v2 on purpose: a v2 reader consumes exactly
 /// `count` records and stops, so it ignores the section instead of
 /// mis-framing the record after it, and a v2 file simply has no section for
 /// us to find.
-const CLIENTS_MET_VERSION: u8 = 3;
+///
+/// v4 (current): appends the identity section (see
+/// [`CLIENTS_MET_IDENTITY_MAGIC`]) after the crypto-anchor section, carrying
+/// each record's Hello nickname and client-software string. Same containment
+/// trick as v3 — the per-record layout is untouched, so a v2/v3 reader
+/// consumes `count` records and never looks further.
+const CLIENTS_MET_VERSION: u8 = 4;
 
 /// Introduces the v3 crypto-anchor section: `magic | u32 count | count ×
 /// 16-byte user_hash`, naming the records whose credits are already anchored
@@ -145,9 +151,40 @@ const CLIENTS_MET_VERSION: u8 = 3;
 /// peer's totals would be reset to 1 the next time it re-proved itself.
 const CLIENTS_MET_ANCHOR_MAGIC: u32 = 0xE3B2_0003;
 
+/// Introduces the v4 identity section: `magic | u32 count | count × (16-byte
+/// user_hash | u8 name_len | name | u8 software_len | software)`.
+///
+/// Separate from the record array rather than added to it, for the reason the
+/// anchor section is: the per-record layout stays byte-identical, so a build
+/// that stops after `count` records still reads this file correctly.
+///
+/// Length-prefixed with a single byte because [`MAX_IDENTITY_LEN`] bounds
+/// both strings well under 255.
+const CLIENTS_MET_IDENTITY_MAGIC: u32 = 0xE3B2_0004;
+
 pub const CRYPT_CIP_REMOTECLIENT: u8 = 10;
 pub const CRYPT_CIP_LOCALCLIENT: u8 = 20;
 pub const CRYPT_CIP_NONECLIENT: u8 = 30;
+
+/// Cap on a stored nickname or client-software string.
+///
+/// Both come off the wire and are persisted, so an unbounded value would let
+/// one peer grow `clients.met` and the `credits` table without limit. The
+/// eD2K Hello tag is already bounded by the frame, but the record outlives
+/// the frame. Well above any real nickname.
+const MAX_IDENTITY_LEN: usize = 64;
+
+/// Bound a peer-supplied identity string without splitting a UTF-8 character.
+fn truncate_identity(value: &str) -> String {
+    if value.len() <= MAX_IDENTITY_LEN {
+        return value.to_string();
+    }
+    let mut end = MAX_IDENTITY_LEN;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct CreditRecord {
@@ -184,6 +221,20 @@ pub struct CreditRecord {
     /// empty), so the anchor has to be carried in that table's row as well
     /// or the reset stays reachable across every restart.
     pub crypto_verified_once: bool,
+    /// Peer's Hello nickname (`CT_NAME`) the last time it told us one.
+    ///
+    /// Identity, not accounting, but it lives here because this record is the
+    /// only thing the Known eD2K Peers tab has to build a row from — and that
+    /// tab is a lifetime ledger, so almost none of its rows have a live
+    /// session to ask. Persisted in the SQLite `credits` table (v47) and in
+    /// the v4 `clients.met` identity section.
+    ///
+    /// Only ever overwritten by a *non-empty* value (see
+    /// [`CreditManager::note_client_identity`]), so a later handshake that
+    /// omits the tag does not erase a name we already had.
+    pub peer_name: String,
+    /// Client software and version, as `client_software_from_caps` renders it.
+    pub client_software: String,
 }
 
 /// Enhanced credit record for verified Ember peers.
@@ -310,6 +361,8 @@ impl CreditRecord {
             ident_ip: 0,
             ember_hash: None,
             crypto_verified_once: false,
+            peer_name: String::new(),
+            client_software: String::new(),
         }
     }
 }
@@ -646,6 +699,43 @@ impl CreditManager {
             .or_insert_with(|| CreditRecord::new(user_hash));
         record.last_seen = now;
         record
+    }
+
+    /// Remember what a peer calls itself and what it runs.
+    ///
+    /// Both strings come from `PeerCapabilities`, which is the only place
+    /// either exists. Neither is trusted for anything — they are peer-supplied
+    /// display text, and the Known eD2K Peers tab renders them as such — so
+    /// this deliberately records them without validation beyond a length
+    /// bound.
+    ///
+    /// Called from both directions, but not symmetrically. The upload handler
+    /// calls it *at* the handshake, because a peer that only ever asks us for
+    /// files may never transfer a byte and still deserves a name. The download
+    /// side calls it when a part verifies, alongside `add_downloaded`: its
+    /// seven connect paths have all converged on one pair of variables by
+    /// then, and the lock is already held.
+    ///
+    /// An empty argument leaves the stored value alone. A client that sends
+    /// `CT_NAME` on its first handshake and omits it on a later one is
+    /// common, and treating the omission as "my name is now blank" would lose
+    /// the name for exactly the peers we talk to most.
+    pub fn note_client_identity(
+        &mut self,
+        user_hash: [u8; 16],
+        peer_name: &str,
+        client_software: &str,
+    ) {
+        if user_hash == [0u8; 16] || (peer_name.is_empty() && client_software.is_empty()) {
+            return;
+        }
+        let record = self.get_or_create(user_hash);
+        if !peer_name.is_empty() {
+            record.peer_name = truncate_identity(peer_name);
+        }
+        if !client_software.is_empty() {
+            record.client_software = truncate_identity(client_software);
+        }
     }
 
     /// Accumulate upload credit, unless the peer's identity state forbids it —
@@ -1345,6 +1435,34 @@ impl CreditManager {
         for user_hash in anchored {
             buf.extend_from_slice(user_hash);
         }
+        // v4 identity section. Only records that have told us something are
+        // listed, so a ledger full of hash-only peers costs 8 bytes.
+        //
+        // Drawn from `records`, which is already filtered above — so a peer we
+        // have merely been introduced to, with no bytes and no Ember binding,
+        // has no row here to hang a name on. That is deliberate: this file is
+        // only the fallback cache for when the SQLite `credits` table comes up
+        // empty, and that table keeps every row unfiltered. Losing a name for
+        // a peer we never traded with, in the rare case the database is lost,
+        // is not worth caching a row the filter exists to omit.
+        let named: Vec<&&CreditRecord> = records
+            .iter()
+            .filter(|r| !r.peer_name.is_empty() || !r.client_software.is_empty())
+            .collect();
+        buf.extend_from_slice(&CLIENTS_MET_IDENTITY_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(named.len() as u32).to_le_bytes());
+        for r in named {
+            // `truncate_identity` bounds both on the way in, so the casts
+            // below cannot wrap. Re-applied here rather than assumed, because
+            // this is the byte that frames the field on disk.
+            let name = truncate_identity(&r.peer_name);
+            let software = truncate_identity(&r.client_software);
+            buf.extend_from_slice(&r.user_hash);
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(software.len() as u8);
+            buf.extend_from_slice(software.as_bytes());
+        }
         buf
     }
 
@@ -1374,6 +1492,8 @@ impl CreditManager {
         // Same idea for the v3 crypto-anchor section, which follows the whole
         // record array rather than sitting inside a record.
         let has_anchor_section = versioned && data.len() > 4 && data[4] >= 3;
+        // And for the v4 identity section, which follows the anchor section.
+        let has_identity_section = versioned && data.len() > 4 && data[4] >= 4;
         let (count, mut offset) = if versioned {
             if data.len() < 9 {
                 return Ok(0);
@@ -1488,6 +1608,10 @@ impl CreditManager {
                 // exactly the state a stranger can knock back to `Failed`,
                 // which is why v3 stores the anchor instead.
                 crypto_verified_once: ident_state == IdentState::Verified,
+                // Filled from the v4 section below, which is keyed by
+                // user_hash and may name only some of these records.
+                peer_name: String::new(),
+                client_software: String::new(),
             };
             self.credits.insert(user_hash, record);
             loaded_hashes.push(user_hash);
@@ -1512,6 +1636,22 @@ impl CreditManager {
                     }
                     if let Some(record) = self.credits.get_mut(user_hash) {
                         record.crypto_verified_once = true;
+                    }
+                }
+            }
+            // The identity section sits after the anchor section, so it can
+            // only be located once that one's length is known. Same
+            // all-or-nothing rule: a section we cannot frame is skipped, and
+            // a missing name is simply a row we have never been introduced to.
+            if has_identity_section {
+                if let Some(after_anchors) = anchor_section_end(&data, offset) {
+                    for (user_hash, peer_name, client_software) in
+                        read_identity_section(&data, after_anchors)
+                    {
+                        if let Some(record) = self.credits.get_mut(&user_hash) {
+                            record.peer_name = peer_name;
+                            record.client_software = client_software;
+                        }
                     }
                 }
             }
@@ -1547,6 +1687,79 @@ fn read_anchor_section(data: &[u8], offset: usize) -> Option<HashSet<[u8; 16]>> 
             })
             .collect(),
     )
+}
+
+/// Offset just past the v3 crypto-anchor section that starts at `offset`.
+///
+/// `None` when there is no framable section there, which is the same
+/// condition [`read_anchor_section`] returns `None` for — the v4 section that
+/// follows cannot be located either way.
+///
+/// Deliberately re-derives the anchor section's length rather than having
+/// [`read_anchor_section`] return it, so that function's signature stays as
+/// it was. The two must therefore agree on the header layout: change one and
+/// change this.
+fn anchor_section_end(data: &[u8], offset: usize) -> Option<usize> {
+    let header = data.get(offset..offset + 8)?;
+    if u32::from_le_bytes(header[0..4].try_into().ok()?) != CLIENTS_MET_ANCHOR_MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let end = count.checked_mul(16)?.checked_add(offset + 8)?;
+    // Must actually be present, not merely arithmetically implied, or the
+    // identity read would start past the end of a truncated file.
+    if end > data.len() {
+        return None;
+    }
+    Some(end)
+}
+
+/// Read the v4 identity section sitting at `offset`.
+///
+/// Returns what it could frame and stops at the first malformed entry rather
+/// than failing the whole load: these are display strings, so a truncated
+/// tail costs a few names and nothing else. An empty result covers "no
+/// section here", which is what a v3 file looks like.
+#[allow(clippy::type_complexity)]
+fn read_identity_section(data: &[u8], offset: usize) -> Vec<([u8; 16], String, String)> {
+    let mut out = Vec::new();
+    let Some(header) = data.get(offset..offset + 8) else {
+        return out;
+    };
+    if u32::from_le_bytes(header[0..4].try_into().unwrap_or_default()) != CLIENTS_MET_IDENTITY_MAGIC
+    {
+        return out;
+    }
+    let count = u32::from_le_bytes(header[4..8].try_into().unwrap_or_default()) as usize;
+    let mut cursor = offset + 8;
+    // Bounded by the record cap, so a bogus count cannot make us spin or
+    // reserve.
+    for _ in 0..count.min(MAX_CREDIT_RECORDS) {
+        let Some(hash_bytes) = data.get(cursor..cursor + 16) else {
+            break;
+        };
+        let mut user_hash = [0u8; 16];
+        user_hash.copy_from_slice(hash_bytes);
+        cursor += 16;
+
+        let read_string = |cursor: &mut usize| -> Option<String> {
+            let len = *data.get(*cursor)? as usize;
+            *cursor += 1;
+            let bytes = data.get(*cursor..*cursor + len)?;
+            *cursor += len;
+            // Lossy rather than a hard failure: the name came off the wire
+            // and was only ever display text.
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        };
+        let Some(peer_name) = read_string(&mut cursor) else {
+            break;
+        };
+        let Some(client_software) = read_string(&mut cursor) else {
+            break;
+        };
+        out.push((user_hash, peer_name, client_software));
+    }
+    out
 }
 
 fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
@@ -2030,10 +2243,126 @@ mod tests {
         expected.extend_from_slice(&CLIENTS_MET_ANCHOR_MAGIC.to_le_bytes());
         expected.extend_from_slice(&1u32.to_le_bytes());
         expected.extend_from_slice(&hash);
+        // --- v4 identity section, empty: this peer never named itself ---
+        expected.extend_from_slice(&CLIENTS_MET_IDENTITY_MAGIC.to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
 
         // The version byte stays >= 2, so an older reader still expects the
         // per-record Ember trailer that v3 keeps writing.
         assert_eq!(cm.serialize(), expected);
+    }
+
+    /// The nickname and client-software columns behind the Known eD2K Peers
+    /// tab have to survive a restart, because that tab is a lifetime ledger:
+    /// nearly every row it draws belongs to a peer with no open session, so
+    /// there is nothing to ask at render time.
+    #[test]
+    fn a_peers_name_and_client_survive_the_clients_met_round_trip() {
+        let mut cm = CreditManager::new();
+        let named = [0x41u8; 16];
+        let anonymous = [0x42u8; 16];
+        {
+            let r = cm.get_or_create(named);
+            r.uploaded = 4096;
+            r.peer_name = "Pöttinger".to_string();
+            r.client_software = "eMule 0.60a".to_string();
+        }
+        {
+            let r = cm.get_or_create(anonymous);
+            r.uploaded = 1024;
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_identity_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, cm.serialize()).expect("write v4 clients.met");
+        let mut restored = CreditManager::new();
+        let n = restored.load_from_file(&path).expect("load v4 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 2);
+        let back = restored.get_record(&named).expect("named record");
+        assert_eq!(back.peer_name, "Pöttinger");
+        assert_eq!(back.client_software, "eMule 0.60a");
+        let blank = restored.get_record(&anonymous).expect("anonymous record");
+        assert_eq!(blank.peer_name, "");
+        assert_eq!(blank.client_software, "");
+    }
+
+    /// A v3 file has no identity section, and reading one must not be
+    /// mistaken for finding an empty one — nor may it disturb the anchor
+    /// section that does sit at that offset.
+    #[test]
+    fn a_pre_v4_file_loads_without_an_identity_section() {
+        let peer = [0x43u8; 16];
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
+        v3.push(3);
+        v3.extend_from_slice(&1u32.to_le_bytes());
+        v3.extend_from_slice(&peer);
+        v3.extend_from_slice(&4096u64.to_le_bytes());
+        v3.extend_from_slice(&8192u64.to_le_bytes());
+        v3.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        v3.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        v3.push(IdentState::Verified.to_u8());
+        v3.extend_from_slice(&0u16.to_le_bytes());
+        v3.push(0);
+        v3.extend_from_slice(&CLIENTS_MET_ANCHOR_MAGIC.to_le_bytes());
+        v3.extend_from_slice(&1u32.to_le_bytes());
+        v3.extend_from_slice(&peer);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_v3_no_identity_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &v3).expect("write v3 clients.met");
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).expect("load v3 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 1);
+        let record = cm.get_record(&peer).expect("record");
+        assert_eq!(record.peer_name, "");
+        assert!(
+            record.crypto_verified_once,
+            "the anchor section still had to be read",
+        );
+    }
+
+    /// A peer that sent `CT_NAME` once and omits it on the next handshake
+    /// still has a name. Treating the omission as a new, empty value would
+    /// blank the name for exactly the peers reconnected to most often.
+    #[test]
+    fn a_later_handshake_without_a_name_does_not_erase_the_stored_one() {
+        let mut cm = CreditManager::new();
+        let peer = [0x44u8; 16];
+        cm.note_client_identity(peer, "Aoife", "eMule 0.60a");
+        cm.note_client_identity(peer, "", "eMule 0.60b");
+        let record = cm.get_record(&peer).expect("record");
+        assert_eq!(record.peer_name, "Aoife");
+        assert_eq!(
+            record.client_software, "eMule 0.60b",
+            "a value that *was* sent still updates",
+        );
+    }
+
+    /// Both strings are peer-supplied and persisted, so an unbounded one
+    /// would let a single peer grow the ledger without limit. The cut must
+    /// not split a character, or the stored name is invalid UTF-8 away from
+    /// being a panic.
+    #[test]
+    fn a_hostile_identity_is_bounded_without_splitting_a_character() {
+        let mut cm = CreditManager::new();
+        let peer = [0x45u8; 16];
+        // 3 bytes each, so the cap lands mid-character if taken naively.
+        let long = "☃".repeat(100);
+        cm.note_client_identity(peer, &long, "");
+        let stored = &cm.get_record(&peer).expect("record").peer_name;
+        assert!(stored.len() <= MAX_IDENTITY_LEN, "{}", stored.len());
+        assert!(stored.chars().all(|c| c == '☃'), "{stored}");
     }
 
     /// Monotonic-ish suffix for temp filenames so concurrent test runs don't

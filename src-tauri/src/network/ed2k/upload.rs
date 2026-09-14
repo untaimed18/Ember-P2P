@@ -1600,6 +1600,18 @@ pub(crate) struct QueueEntry {
     /// insertion/update time — re-evaluated each time the peer
     /// re-enters the queue (session-expired, queue-full rotation).
     pub(crate) ember_verified: bool,
+    /// Peer's self-reported nickname from Hello (`CT_NAME`), empty when it
+    /// advertised none.
+    ///
+    /// Snapshotted here for the same reason `emule_version` is: the Queue tab
+    /// is built from these rows alone, and the session that carried the Hello
+    /// is usually long gone by the time anyone looks — a queued peer hangs up
+    /// and re-asks. Without it the tab could only show a truncated user hash,
+    /// while the Uploading tab beside it showed the name.
+    pub(crate) peer_name: String,
+    /// Client software and version, as `client_software_from_caps` renders it
+    /// for the Uploading tab (`eMule 0.60a`, `Ember`, …).
+    pub(crate) client_software: String,
 }
 
 /// Classify a peer as HighID for upload-queue dialability (`AddUpNextClient`).
@@ -1651,6 +1663,8 @@ fn queue_entry_from_hello(
         is_friend_slot,
         ember_pubkey: hello_caps.ember_pubkey,
         ember_verified,
+        peer_name: hello_caps.peer_name.clone(),
+        client_software: client_software_from_caps(hello_caps),
     }
 }
 
@@ -5922,6 +5936,19 @@ impl UploadHandler {
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
 
+        // Remember who this is for the Known eD2K Peers ledger, which is
+        // built from credit records alone and so has no session to ask later.
+        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
+        // back to the peer's address for display, and an `IP:port` is not a
+        // nickname worth persisting.
+        if peer_user_hash != [0u8; 16] {
+            self.credit_manager.write().await.note_client_identity(
+                peer_user_hash,
+                &hello_caps.peer_name,
+                &ul_client_software,
+            );
+        }
+
         if peer_user_hash != [0u8; 16] {
             if let Ok(set) = self.banned_hashes.read() {
                 if set.contains(&peer_user_hash) {
@@ -6423,6 +6450,15 @@ impl UploadHandler {
                 ul_client_software = client_software_from_caps(&hello_caps);
                 if !hello_caps.peer_name.is_empty() {
                     ul_peer_name = hello_caps.peer_name.clone();
+                }
+                // OP_EMULEINFO is where the version details arrive, so the
+                // software string is only now complete — re-record it.
+                if peer_user_hash != [0u8; 16] {
+                    self.credit_manager.write().await.note_client_identity(
+                        peer_user_hash,
+                        &hello_caps.peer_name,
+                        &ul_client_software,
+                    );
                 }
                 let emule_payload = build_emule_info(
                     self.advertised_udp_port(),
@@ -8431,6 +8467,11 @@ impl UploadHandler {
                                 peer_is_high_id_for_queue(&hello_caps, peer_addr);
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                            // Refreshed with the rest of the Hello-derived
+                            // fields, so a peer that only sent its name on a
+                            // later handshake still names itself in the tab.
+                            queue[pos].peer_name = hello_caps.peer_name.clone();
+                            queue[pos].client_software = client_software_from_caps(&hello_caps);
                             // If the peer has since completed PoP, upgrade
                             // an existing queue entry's friend-slot flag
                             // (it may have been added while auth was still
@@ -9951,6 +9992,8 @@ impl UploadHandler {
                                     peer_is_high_id_for_queue(&hello_caps, peer_addr);
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                                entry.peer_name = hello_caps.peer_name.clone();
+                                entry.client_software = client_software_from_caps(&hello_caps);
                                 if is_verified_friend {
                                     entry.is_friend_slot = true;
                                 }
@@ -11047,6 +11090,13 @@ impl UploadHandler {
                             }
                         }
                         ul_client_software = client_software_from_caps(&hello_caps);
+                        if peer_user_hash != [0u8; 16] {
+                            self.credit_manager.write().await.note_client_identity(
+                                peer_user_hash,
+                                &hello_caps.peer_name,
+                                &ul_client_software,
+                            );
+                        }
                         info!(
                             "Peer {peer_addr} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
                             ident.mod_version, ident.nickname,
@@ -13932,6 +13982,8 @@ mod abuse_and_seniority_tests {
             is_friend_slot: false,
             ember_pubkey,
             ember_verified: ember_pubkey.is_some(),
+            peer_name: String::new(),
+            client_software: String::new(),
         }
     }
 

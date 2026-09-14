@@ -1985,6 +1985,8 @@ pub fn run() {
             commands::server::disconnect_server,
             commands::server::add_server,
             commands::server::remove_server,
+            commands::server::set_server_static,
+            commands::server::set_server_priority,
             commands::server::get_server_list,
             commands::server::get_connected_server,
             commands::server::download_server_met,

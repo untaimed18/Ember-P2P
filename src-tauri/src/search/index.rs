@@ -1328,10 +1328,21 @@ mod local_index_tests {
         ]);
 
         // Second batch: one path already indexed (with a new hash), one new.
-        // Casing differs on the known path, which must still match it rather
-        // than push a duplicate.
+        //
+        // The known path is re-stated in a different casing on Windows only.
+        // `normalize_path_key` folds case there and nowhere else, because that
+        // is where the filesystem does — on Linux `a/ONE.bin` and `A/one.bin`
+        // are two different files, and matching them would be the bug. Asking
+        // for the fold unconditionally is what made this test fail on Linux:
+        // it counted 4 rows, which was the correct answer to the wrong
+        // question.
+        let known_path = if cfg!(windows) {
+            "a/ONE.bin"
+        } else {
+            "A/one.bin"
+        };
         index.add_files(vec![
-            file("a/ONE.bin", &"c".repeat(32), true, "high"),
+            file(known_path, &"c".repeat(32), true, "high"),
             file("A/three.bin", &"d".repeat(32), true, "normal"),
         ]);
 
@@ -1339,7 +1350,7 @@ mod local_index_tests {
         // Replaced in place, and reachable under its new hash but not its old.
         assert_eq!(
             index.get_by_hash(&"c".repeat(32)).map(|f| f.path.clone()),
-            Some("a/ONE.bin".to_string())
+            Some(known_path.to_string())
         );
         assert!(index.get_by_hash(&"a".repeat(32)).is_none());
         assert!(index.get_by_hash(&"d".repeat(32)).is_some());

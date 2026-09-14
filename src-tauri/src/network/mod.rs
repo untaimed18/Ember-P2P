@@ -12172,6 +12172,18 @@ pub enum NetworkCommand {
         port: u16,
         tx: oneshot::Sender<Result<String, String>>,
     },
+    SetServerStatic {
+        ip: String,
+        port: u16,
+        is_static: bool,
+        tx: oneshot::Sender<Result<String, String>>,
+    },
+    SetServerPriority {
+        ip: String,
+        port: u16,
+        priority: String,
+        tx: oneshot::Sender<Result<String, String>>,
+    },
     GetServerListSnapshot {
         tx: oneshot::Sender<Vec<ServerInfo>>,
     },
@@ -23991,6 +24003,8 @@ async fn flush_credit_state(
                     r.ident_state.to_u8(),
                     r.ember_hash,
                     r.crypto_verified_once,
+                    r.peer_name.clone(),
+                    r.client_software.clone(),
                 )
             })
             .collect();
@@ -24028,8 +24042,20 @@ async fn flush_credit_state(
         let _ownership = ownership;
         let refs: Vec<crate::storage::database::CreditRowRef<'_>> = owned
             .iter()
-            .map(|(h, u, d, l, p, ip, st, eh, cv)| {
-                (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref(), *cv)
+            .map(|(h, u, d, l, p, ip, st, eh, cv, name, software)| {
+                (
+                    h,
+                    *u,
+                    *d,
+                    *l,
+                    p.as_slice(),
+                    *ip,
+                    *st,
+                    eh.as_ref(),
+                    *cv,
+                    name.as_str(),
+                    software.as_str(),
+                )
             })
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
@@ -24262,6 +24288,7 @@ fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
         soft_files: server.soft_files,
         hard_files: server.hard_files,
         is_static: server.is_static,
+        priority: server.priority.as_str().to_string(),
         fail_count: server.fail_count,
         client_id: 0,
         is_low_id: false,
@@ -24290,6 +24317,11 @@ fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
         soft_files: limits.map(|s| s.soft_files).unwrap_or(0),
         hard_files: limits.map(|s| s.hard_files).unwrap_or(0),
         is_static: limits.is_some_and(|s| s.is_static),
+        priority: limits
+            .map(|s| s.priority)
+            .unwrap_or(crate::network::ed2k::server_list::ServerPriority::Normal)
+            .as_str()
+            .to_string(),
         fail_count: 0,
         client_id: state.server_client_id,
         is_low_id: state.low_id,
@@ -25090,14 +25122,22 @@ async fn upload_queue_snapshot(
             score,
             entry.join_time,
         );
-        // Treat "no current connection" as no rank — matches eMule's UI
-        // where a queued LowID waiting for callback shows '?' instead of
-        // a number until they reconnect.
-        let queue_rank: Option<u32> = if entry.current_addr.is_some() {
-            Some(rank as u32)
-        } else {
-            None
-        };
+        // Every waiting peer has a rank, so every row gets one.
+        //
+        // This used to be withheld whenever `current_addr` was `None`, on the
+        // theory that it matched eMule showing `?` for a queued LowID waiting
+        // for a callback. It does not: eMule's `?` is for *our* position in a
+        // *remote* peer's queue, which we genuinely do not know until they
+        // send `OP_QUEUERANKING`. Our own queue is the one place the number is
+        // never in doubt — `compute_queue_rank` above scores the whole queue
+        // and does not care whether a socket happens to be open.
+        //
+        // And `current_addr` is `None` for almost every row: a peer that has
+        // been told it is queued hangs up and re-asks later, which clears the
+        // binding while the entry keeps its seniority. So the Position column
+        // showed `?` and nothing else, for the entire queue. The connection
+        // state it was standing in for now travels as its own field.
+        let queue_rank = rank as u32;
 
         let (peer_ip_str, peer_port, peer_ip_v4) = match entry.current_addr {
             Some(addr) => {
@@ -25164,6 +25204,9 @@ async fn upload_queue_snapshot(
             file_name,
             wait_seconds: wait_secs,
             queue_rank,
+            connected: entry.current_addr.is_some(),
+            peer_name: entry.peer_name.clone(),
+            client_software: entry.client_software.clone(),
             credit_ratio,
             uploaded,
             downloaded,
@@ -25302,6 +25345,8 @@ async fn known_clients_snapshot(
 
             crate::types::KnownClient {
                 user_hash: hex::encode(record.user_hash),
+                peer_name: record.peer_name.clone(),
+                client_software: record.client_software.clone(),
                 downloaded: record.downloaded,
                 uploaded: record.uploaded,
                 credit_ratio,
@@ -26881,6 +26926,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ident_state,
                 ember_hash,
                 crypto_verified_once,
+                peer_name,
+                client_software,
             ) in records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
@@ -26908,6 +26955,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // unanchored and the anti-theft reset wipes each peer's totals
                 // on their first verification after a restart.
                 record.crypto_verified_once = crypto_verified_once;
+                record.peer_name = peer_name;
+                record.client_software = client_software;
             }
             info!(
                 "Loaded {} credit records from database",
@@ -46526,41 +46575,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 let stats_snapshot = state.stats.clone();
 
-                let cached_srv: Vec<ServerInfo> = state.server_list.servers().iter().map(|s| ServerInfo {
-                    ip: s.ip.clone(),
-                    port: s.port,
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    user_count: s.user_count,
-                    file_count: s.file_count,
-                    max_users: s.max_users,
-                    soft_files: s.soft_files,
-                    hard_files: s.hard_files,
-                    is_static: s.is_static,
-                    fail_count: s.fail_count,
-                    client_id: 0,
-                    is_low_id: false,
-                }).collect();
+                // Both of these were hand-copied transcriptions too, and the
+                // connected-server one had drifted in the same way the Kad
+                // copy above had: it zeroed `description`, `max_users`,
+                // `soft_files`, `hard_files` and `is_static`, so the row for
+                // the server the user was actually on lost the very fields
+                // `connected_server_info` exists to borrow from the list
+                // entry — depending on whether the poll or this cache
+                // answered first. Call the one implementation instead.
+                let cached_srv: Vec<ServerInfo> =
+                    state.server_list.servers().iter().map(server_entry_to_info).collect();
 
-                let cached_conn_srv: Option<ServerInfo> = state.server_connection.as_ref().and_then(|conn| {
-                    let session = conn.session.as_ref()?;
-                    let addr = state.server_addr?;
-                    Some(ServerInfo {
-                        ip: addr.ip().to_string(),
-                        port: addr.port(),
-                        name: session.server_name.clone(),
-                        description: String::new(),
-                        user_count: session.user_count,
-                        file_count: session.file_count,
-                        max_users: 0,
-                        soft_files: 0,
-                        hard_files: 0,
-                        is_static: false,
-                        fail_count: 0,
-                        client_id: state.server_client_id,
-                        is_low_id: state.low_id,
-                    })
-                });
+                let cached_conn_srv: Option<ServerInfo> = connected_server_info(&state);
 
                 let cached_tstats = stats_manager.get_stats();
 
