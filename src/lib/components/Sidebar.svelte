@@ -16,6 +16,7 @@
     navIndexFromShortcutEvent,
     navShortcutDigit,
     visibleNavItems,
+    type NavGroup,
     type NavItem,
   } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
@@ -28,6 +29,31 @@
   // Shared with the keyboard cheat-sheet so Alt+N is numbered against the
   // list the user can actually see.
   let visibleNav = $derived(visibleNavItems($appSettings?.ember_native_enabled));
+
+  /**
+   * The nav split into its titled runs, each entry keeping the index it has in
+   * the flat list.
+   *
+   * The index has to travel with the item because Alt+N is numbered against
+   * the flat order — `navShortcutDigit` takes a position in `visibleNav`, not
+   * a position within a group.
+   *
+   * Grouping in the markup rather than by watching for a change of group
+   * between successive rows, which is how this started: that produced captions
+   * that were siblings of the links rather than headings for them, so the only
+   * way to keep a screen reader from reading them as twelfth and thirteenth
+   * list items was `aria-hidden`, which hid the grouping from exactly the
+   * users who cannot see the layout expressing it.
+   */
+  let navRuns = $derived.by(() => {
+    const runs: { group: NavGroup; entries: { item: NavItem; index: number }[] }[] = [];
+    visibleNav.forEach((item, index) => {
+      const open = runs[runs.length - 1];
+      if (open && open.group === item.group) open.entries.push({ item, index });
+      else runs.push({ group: item.group, entries: [{ item, index }] });
+    });
+    return runs;
+  });
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -296,20 +322,23 @@
     </a>
   </div>
 
-  <ul class="nav-list">
-    {#each visibleNav as item, i}
-      {@const digit = navShortcutDigit(i)}
-      <!-- A caption opens each run. Driven off "the group changed since the
-           previous entry" rather than a nested loop, so the flat list the
-           Alt+N shortcuts are numbered against stays exactly one list. -->
-      {#if i === 0 || visibleNav[i - 1].group !== item.group}
-        <li class="nav-group" aria-hidden="true">
-          <span class="nav-group-label">{navGroupLabel(item.group)}</span>
+  <!-- `.scroll-shadows` is the app's own cue for a pane with more in it than
+       fits; the list only scrolls in a short window, and without it the run it
+       cuts off just ends mid-row with nothing to say so. -->
+  <div class="nav-list scroll-shadows">
+    {#each navRuns as run (run.group)}
+      <!-- A real group with a real heading, so the structure the captions draw
+           is also the structure a screen reader announces. -->
+      <div class="nav-run" role="group" aria-labelledby={`nav-group-${run.group}`}>
+        <p class="nav-group" id={`nav-group-${run.group}`}>
+          <span class="nav-group-label">{navGroupLabel(run.group)}</span>
           <!-- Stands in for the caption on the collapsed rail, where there is
                no room for words but the grouping is still worth keeping. -->
-          <span class="nav-group-rule"></span>
-        </li>
-      {/if}
+          <span class="nav-group-rule" aria-hidden="true"></span>
+        </p>
+        <ul class="nav-items">
+    {#each run.entries as { item, index } (item.id)}
+      {@const digit = navShortcutDigit(index)}
       <li>
         <a
           href={item.href}
@@ -432,7 +461,10 @@
         </a>
       </li>
     {/each}
-  </ul>
+        </ul>
+      </div>
+    {/each}
+  </div>
 
   <div class="sidebar-footer">
     <button
@@ -634,11 +666,20 @@
   }
 
   .nav-list {
-    list-style: none;
     padding: 4px 0 8px;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* The scroll-shadow utility paints its cover colour from this, and the
+       sidebar is a panel rather than the page. Without the override the cover
+       would be the page grey and read as a band across the top of the list. */
+    --scroll-cover: var(--bg-secondary);
+  }
+
+  .nav-items {
+    list-style: none;
+    margin: 0;
+    padding: 0;
   }
 
   /* The caption over each run of related destinations. Same micro-type the
@@ -649,10 +690,12 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    /* `<p>` for the heading, so the margin it arrives with has to go. */
+    margin: 0;
     padding: 14px 16px 4px;
   }
 
-  .nav-group:first-child {
+  .nav-run:first-child .nav-group {
     padding-top: 6px;
   }
 
@@ -677,7 +720,7 @@
     padding: 10px 14px 6px;
   }
 
-  .sidebar.collapsed .nav-group:first-child {
+  .sidebar.collapsed .nav-run:first-child .nav-group {
     padding-top: 4px;
   }
 
@@ -710,7 +753,9 @@
        icon-to-label rhythm continue across the divide. */
     gap: 12px;
     width: 100%;
-    padding: 9px 16px;
+    /* Same row box as `.nav-list li a`, not a pixel off it: the two sit in one
+       column and any difference just reads as imprecision. */
+    padding: 10px 16px;
     border: none;
     border-radius: 0;
     background: transparent;
