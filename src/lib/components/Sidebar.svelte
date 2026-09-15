@@ -499,6 +499,7 @@
       </span>
       <span>{m.sidebar_share_ember()}</span>
     </button>
+    <div class="footer-sep" aria-hidden="true"></div>
     <button
       type="button"
       class="about-btn collapse-btn"
@@ -626,40 +627,86 @@
 
   /* A solid brand block across the bottom of the sidebar. The band is the
      separator, so the hairline that used to do that job would only read as a
-     seam against the fill. */
+     seam against the fill.
+     No horizontal padding, which is what aligns these rows with the nav list
+     above: `.nav-list` has none either, so its rows' own 16px is the sidebar's
+     text inset. Padding here was stacking on top of the buttons' 16px and
+     pushing every label and icon in this block 12px further right than the
+     ones above — barely noticeable in quiet grey, obvious once the block is
+     filled. */
   .sidebar-footer {
-    background: var(--sidebar-footer-bg);
-    padding: 8px 12px 12px;
+    /* Two stops, eight percent apart. Enough to keep a block this large from
+       reading as a flat swatch, not enough to be seen as a gradient. */
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--sidebar-footer-bg) 92%, #ffffff) 0%,
+      var(--sidebar-footer-bg) 100%
+    );
+    /* The hairline lands *inside* the fill as a lit top edge, and the shadow
+       above it lets the band sit over the nav list rather than beside it —
+       which matters because that list scrolls underneath. */
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, #ffffff 16%, transparent),
+      0 -6px 16px -8px rgba(0, 0, 0, 0.38);
+    padding: 8px 0 10px;
     flex-shrink: 0;
   }
 
   .about-btn {
     display: flex;
     align-items: center;
-    gap: 10px;
+    /* 12px, matching `.nav-list li a`, so the icon-to-label rhythm is the same
+       on both sides of the divide. */
+    gap: 12px;
     width: 100%;
     padding: 10px 16px;
     border: none;
-    border-radius: var(--radius-md);
+    /* Square, like the nav rows: these are full-bleed now, and a rounded
+       corner on a row that reaches both edges only clips the highlight. */
+    border-radius: 0;
     background: transparent;
     /* Every state in here is derived from the footer's own foreground rather
        than from the app's text ramp: those tokens are tuned against the page
        background, and on a saturated blue `--text-muted` turns to mud. */
     color: var(--sidebar-footer-fg);
     font-size: 13px;
-    font-weight: 700;
+    /* 600, not 700. White on a saturated fill gains apparent weight, so the
+       heavier step read as chunky at this size while 600 still lands as bold. */
+    font-weight: 600;
     font-family: inherit;
     cursor: pointer;
     text-align: left;
-    transition: background-color var(--transition-normal), color var(--transition-normal);
+    transition: background-color var(--transition-normal), color var(--transition-normal),
+      opacity var(--transition-normal);
   }
 
   /* Tinted with the foreground, not with a surface colour — a white wash is
      the only hover that works on a fill this saturated without either
      vanishing or turning muddy. */
   .about-btn:hover {
-    background: color-mix(in srgb, var(--sidebar-footer-fg) 16%, transparent);
+    background: color-mix(in srgb, var(--sidebar-footer-fg) 18%, transparent);
     color: var(--sidebar-footer-fg);
+  }
+
+  /* Collapse is chrome, not one of the four things you came here to open, and
+     five identically loud rows gave that away nowhere. It is set back a step
+     and comes forward on hover. */
+  .collapse-btn {
+    opacity: 0.78;
+  }
+
+  .about-btn.collapse-btn:hover {
+    opacity: 1;
+  }
+
+  /* Divides the four features from the one window control. White-alpha rather
+     than `--border`, which is mixed for the page background and disappears
+     here. Inset to the text column so it stops under the labels instead of
+     cutting the whole band in half. */
+  .footer-sep {
+    height: 1px;
+    margin: 6px 16px;
+    background: color-mix(in srgb, var(--sidebar-footer-fg) 20%, transparent);
   }
 
   /* `--accent` here would be the one colour guaranteed to disappear, being
@@ -779,8 +826,15 @@
     justify-content: center;
   }
 
+  /* Horizontal padding stays off so the centred icons sit on the rail's own
+     axis; the buttons go full width and centre themselves. */
   .sidebar.collapsed .sidebar-footer {
-    padding: 8px 4px 12px;
+    padding: 8px 0 10px;
+  }
+
+  /* Pulled in to the icon column, since there are no labels to run under. */
+  .sidebar.collapsed .footer-sep {
+    margin: 6px 14px;
   }
 
   /*
