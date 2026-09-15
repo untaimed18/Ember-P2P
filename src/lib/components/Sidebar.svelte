@@ -523,6 +523,13 @@
     </button>
   </div>
 
+  <!-- Takes the leftover height so the block above docks under the nav list
+       instead of being pushed to the window's bottom edge. The nav list used
+       to claim this space itself, which left the footer stranded at the bottom
+       with a tall empty gap above it — fine while it was quiet grey, but once
+       it became a saturated band that gap read as a detached slab. -->
+  <div class="sidebar-filler" aria-hidden="true"></div>
+
   <AboutDialog bind:open={aboutOpen} />
   <ShareEmberDialog bind:open={shareOpen} />
   <KeyboardShortcutsDialog bind:open={shortcutsOpen} />
@@ -617,17 +624,27 @@
     margin-top: 1px;
   }
 
+  /* Sized to its contents, not to the sidebar. `flex: 1` here was what pinned
+     the footer to the bottom; the filler after the footer holds that space
+     now. Still shrinks and scrolls when the window is too short to fit the
+     list — `0 1 auto` keeps the shrink, drops only the grow — so the block
+     below stays on screen at any height. */
   .nav-list {
     list-style: none;
     padding: 4px 0 8px;
-    flex: 1;
+    flex: 0 1 auto;
     min-height: 0;
     overflow-y: auto;
   }
 
-  /* A solid brand block across the bottom of the sidebar. The band is the
-     separator, so the hairline that used to do that job would only read as a
-     seam against the fill.
+  .sidebar-filler {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* A solid brand band closing out the nav list. The band is the separator, so
+     the hairline that used to do that job would only read as a seam against
+     the fill.
      No horizontal padding, which is what aligns these rows with the nav list
      above: `.nav-list` has none either, so its rows' own 16px is the sidebar's
      text inset. Padding here was stacking on top of the buttons' 16px and
@@ -642,13 +659,18 @@
       color-mix(in srgb, var(--sidebar-footer-bg) 92%, #ffffff) 0%,
       var(--sidebar-footer-bg) 100%
     );
-    /* The hairline lands *inside* the fill as a lit top edge, and the shadow
-       above it lets the band sit over the nav list rather than beside it —
-       which matters because that list scrolls underneath. */
+    /* The hairline lands *inside* the fill as a lit top edge. The two shadows
+       are cast both ways now that the band has sidebar on both sides of it
+       rather than the window edge below — one edge lit and one edge shadowed
+       would have read as a slab sliding out of the panel. The upward one also
+       still does its original job, since the nav list scrolls under it. */
     box-shadow:
       inset 0 1px 0 color-mix(in srgb, #ffffff 16%, transparent),
-      0 -6px 16px -8px rgba(0, 0, 0, 0.38);
-    padding: 8px 0 10px;
+      0 -6px 16px -8px rgba(0, 0, 0, 0.38),
+      0 6px 16px -8px rgba(0, 0, 0, 0.28);
+    /* Symmetric, for the same reason: it is a band between two surfaces, not
+       a base resting on the bottom of the window. */
+    padding: 8px 0;
     flex-shrink: 0;
   }
 
@@ -829,7 +851,7 @@
   /* Horizontal padding stays off so the centred icons sit on the rail's own
      axis; the buttons go full width and centre themselves. */
   .sidebar.collapsed .sidebar-footer {
-    padding: 8px 0 10px;
+    padding: 8px 0;
   }
 
   /* Pulled in to the icon column, since there are no labels to run under. */
