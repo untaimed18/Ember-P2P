@@ -12,6 +12,7 @@
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import {
     navItems,
+    navGroupLabel,
     navIndexFromShortcutEvent,
     navShortcutDigit,
     visibleNavItems,
@@ -298,6 +299,17 @@
   <ul class="nav-list">
     {#each visibleNav as item, i}
       {@const digit = navShortcutDigit(i)}
+      <!-- A caption opens each run. Driven off "the group changed since the
+           previous entry" rather than a nested loop, so the flat list the
+           Alt+N shortcuts are numbered against stays exactly one list. -->
+      {#if i === 0 || visibleNav[i - 1].group !== item.group}
+        <li class="nav-group" aria-hidden="true">
+          <span class="nav-group-label">{navGroupLabel(item.group)}</span>
+          <!-- Stands in for the caption on the collapsed rail, where there is
+               no room for words but the grouping is still worth keeping. -->
+          <span class="nav-group-rule"></span>
+        </li>
+      {/if}
       <li>
         <a
           href={item.href}
@@ -523,13 +535,6 @@
     </button>
   </div>
 
-  <!-- Takes the leftover height so the block above docks under the nav list
-       instead of being pushed to the window's bottom edge. The nav list used
-       to claim this space itself, which left the footer stranded at the bottom
-       with a tall empty gap above it — fine while it was quiet grey, but once
-       it became a saturated band that gap read as a detached slab. -->
-  <div class="sidebar-filler" aria-hidden="true"></div>
-
   <AboutDialog bind:open={aboutOpen} />
   <ShareEmberDialog bind:open={shareOpen} />
   <KeyboardShortcutsDialog bind:open={shortcutsOpen} />
@@ -551,10 +556,14 @@
     width: 64px;
   }
 
+  /* Hairline under the wordmark, matching the one over the footer, so the
+     panel reads as header / destinations / utilities rather than one
+     undivided column. */
   .sidebar-header {
     display: flex;
     align-items: center;
     flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
   }
 
   .logo {
@@ -624,118 +633,112 @@
     margin-top: 1px;
   }
 
-  /* Sized to its contents, not to the sidebar. `flex: 1` here was what pinned
-     the footer to the bottom; the filler after the footer holds that space
-     now. Still shrinks and scrolls when the window is too short to fit the
-     list — `0 1 auto` keeps the shrink, drops only the grow — so the block
-     below stays on screen at any height. */
   .nav-list {
     list-style: none;
     padding: 4px 0 8px;
-    flex: 0 1 auto;
+    flex: 1;
     min-height: 0;
     overflow-y: auto;
   }
 
-  .sidebar-filler {
-    flex: 1;
-    min-height: 0;
+  /* The caption over each run of related destinations. Same micro-type the
+     rest of the app uses for the labels above a value — small, spaced,
+     uppercase, muted — so the sidebar reads as part of the same family
+     rather than as chrome with its own rules. */
+  .nav-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 16px 4px;
   }
 
-  /* A solid brand band closing out the nav list. The band is the separator, so
-     the hairline that used to do that job would only read as a seam against
-     the fill.
-     No horizontal padding, which is what aligns these rows with the nav list
-     above: `.nav-list` has none either, so its rows' own 16px is the sidebar's
-     text inset. Padding here was stacking on top of the buttons' 16px and
-     pushing every label and icon in this block 12px further right than the
-     ones above — barely noticeable in quiet grey, obvious once the block is
-     filled. */
+  .nav-group:first-child {
+    padding-top: 6px;
+  }
+
+  .nav-group-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  /* Only ever seen on the collapsed rail — see the rules below. */
+  .nav-group-rule {
+    display: none;
+  }
+
+  /* Collapsed, the captions are unreadable at 64px, so each becomes the
+     hairline it was standing in for. The grouping is the point; the words
+     were only ever how it was expressed when there was room. */
+  .sidebar.collapsed .nav-group {
+    padding: 10px 14px 6px;
+  }
+
+  .sidebar.collapsed .nav-group:first-child {
+    padding-top: 4px;
+  }
+
+  .sidebar.collapsed .nav-group-label {
+    display: none;
+  }
+
+  .sidebar.collapsed .nav-group-rule {
+    display: block;
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* The utilities, closed off from the destinations above by the same hairline
+     the rest of the app divides things with. Deliberately the quietest part of
+     the panel: opening a dialog is not navigation, and a saturated block here
+     put the five least important rows above both the nav and the current-page
+     cue. */
   .sidebar-footer {
-    /* Two stops, eight percent apart. Enough to keep a block this large from
-       reading as a flat swatch, not enough to be seen as a gradient. */
-    background: linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--sidebar-footer-bg) 92%, #ffffff) 0%,
-      var(--sidebar-footer-bg) 100%
-    );
-    /* The hairline lands *inside* the fill as a lit top edge. The two shadows
-       are cast both ways now that the band has sidebar on both sides of it
-       rather than the window edge below — one edge lit and one edge shadowed
-       would have read as a slab sliding out of the panel. The upward one also
-       still does its original job, since the nav list scrolls under it. */
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #ffffff 16%, transparent),
-      0 -6px 16px -8px rgba(0, 0, 0, 0.38),
-      0 6px 16px -8px rgba(0, 0, 0, 0.28);
-    /* Symmetric, for the same reason: it is a band between two surfaces, not
-       a base resting on the bottom of the window. */
-    padding: 8px 0;
+    border-top: 1px solid var(--border);
+    padding: 6px 0 8px;
     flex-shrink: 0;
   }
 
   .about-btn {
     display: flex;
     align-items: center;
-    /* 12px, matching `.nav-list li a`, so the icon-to-label rhythm is the same
-       on both sides of the divide. */
+    /* Matches `.nav-list li a` on both counts, so the icon column and the
+       icon-to-label rhythm continue across the divide. */
     gap: 12px;
     width: 100%;
-    padding: 10px 16px;
+    padding: 9px 16px;
     border: none;
-    /* Square, like the nav rows: these are full-bleed now, and a rounded
-       corner on a row that reaches both edges only clips the highlight. */
     border-radius: 0;
     background: transparent;
-    /* Every state in here is derived from the footer's own foreground rather
-       than from the app's text ramp: those tokens are tuned against the page
-       background, and on a saturated blue `--text-muted` turns to mud. */
-    color: var(--sidebar-footer-fg);
+    color: var(--text-muted);
     font-size: 13px;
-    /* 600, not 700. White on a saturated fill gains apparent weight, so the
-       heavier step read as chunky at this size while 600 still lands as bold. */
-    font-weight: 600;
     font-family: inherit;
     cursor: pointer;
     text-align: left;
-    transition: background-color var(--transition-normal), color var(--transition-normal),
-      opacity var(--transition-normal);
+    transition: background-color var(--transition-normal), color var(--transition-normal);
   }
 
-  /* Tinted with the foreground, not with a surface colour — a white wash is
-     the only hover that works on a fill this saturated without either
-     vanishing or turning muddy. */
   .about-btn:hover {
-    background: color-mix(in srgb, var(--sidebar-footer-fg) 18%, transparent);
-    color: var(--sidebar-footer-fg);
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
-  /* Collapse is chrome, not one of the four things you came here to open, and
-     five identically loud rows gave that away nowhere. It is set back a step
-     and comes forward on hover. */
-  .collapse-btn {
-    opacity: 0.78;
+  .about-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--bg-hover);
   }
 
-  .about-btn.collapse-btn:hover {
-    opacity: 1;
-  }
-
-  /* Divides the four features from the one window control. White-alpha rather
-     than `--border`, which is mixed for the page background and disappears
-     here. Inset to the text column so it stops under the labels instead of
-     cutting the whole band in half. */
+  /* Collapse is a window control rather than one of the four things you open
+     from here, so it sits under its own hairline. */
   .footer-sep {
     height: 1px;
     margin: 6px 16px;
-    background: color-mix(in srgb, var(--sidebar-footer-fg) 20%, transparent);
-  }
-
-  /* `--accent` here would be the one colour guaranteed to disappear, being
-     the blue this block is already filled with. */
-  .about-btn:focus-visible {
-    outline: 2px solid var(--sidebar-footer-fg);
-    outline-offset: -2px;
+    background: var(--border);
   }
 
   /*
@@ -745,25 +748,23 @@
    * the bg + text).
    */
   .chats-btn.active {
-    background: color-mix(in srgb, var(--sidebar-footer-fg) 26%, transparent);
-    color: var(--sidebar-footer-fg);
+    background: var(--accent-fill);
+    color: var(--accent);
   }
 
   .chats-btn {
     position: relative;
   }
 
-  /* Unread chats are a presence cue, not a work queue: a single plain dot
+  /* Unread chats are a presence cue, not a work queue: a single accent dot
      rather than a warning-hued count, which read as "something is wrong".
-     The exact count stays available via the tooltip / aria-label.
-     It takes the footer's foreground now — it used to be `--accent`, which is
-     the colour the block behind it is filled with. */
+     The exact count stays available via the tooltip / aria-label. */
   .chats-dot {
     margin-left: auto;
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--sidebar-footer-fg);
+    background: var(--accent);
     flex-shrink: 0;
   }
 
@@ -851,7 +852,7 @@
   /* Horizontal padding stays off so the centred icons sit on the rail's own
      axis; the buttons go full width and centre themselves. */
   .sidebar.collapsed .sidebar-footer {
-    padding: 8px 0;
+    padding: 6px 0 8px;
   }
 
   /* Pulled in to the icon column, since there are no labels to run under. */
@@ -890,15 +891,21 @@
     background: var(--bg-hover);
   }
 
+  /* `--accent-fill` rather than `--bg-tertiary`. The token exists for exactly
+     this — "selected rows, active chips, checked filters" — and it is what
+     every selected row elsewhere in the app uses, so the current page now
+     reads as selected in the same language. The neutral grey it replaces put
+     accent text on a colourless plate, which said "disabled" as readily as
+     "current". */
   .nav-list li a.active {
-    background: var(--bg-tertiary);
+    background: var(--accent-fill);
     color: var(--accent);
+    font-weight: 600;
   }
 
   .nav-list li a.active::before {
     opacity: 1;
     transform: scaleY(1);
-    box-shadow: 0 0 10px 0 var(--accent-halo);
   }
 
   .nav-icon {

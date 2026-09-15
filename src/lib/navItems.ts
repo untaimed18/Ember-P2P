@@ -15,7 +15,38 @@ export type NavItem = {
    *  sidebar doesn't flicker between "no item active" and "KAD
    *  active" on the brief detour through the redirect stub. */
   aliases?: string[];
+  /** Which titled run of the sidebar this entry belongs to. */
+  group: NavGroup;
 };
+
+/**
+ * The sidebar's titled runs, in display order.
+ *
+ * Eleven flat rows gave the eye nothing to land on, and the app already labels
+ * runs of related things this way everywhere else — the small uppercase
+ * captions over `EXTERNAL IP` / `TCP` / `UDP` on the Ember page are the same
+ * device.
+ *
+ * The grouping is a pure read of the existing order, not a reshuffle: the
+ * boundaries fall between entries that were already adjacent. That matters
+ * because Alt+N is positional — see `navShortcutDigit` — so reordering to
+ * suit the groups would silently reassign every shortcut after the first
+ * move.
+ */
+export type NavGroup = 'networks' | 'files' | 'community' | 'system';
+
+export function navGroupLabel(group: NavGroup): string {
+  switch (group) {
+    case 'networks':
+      return m.nav_group_networks();
+    case 'files':
+      return m.nav_group_files();
+    case 'community':
+      return m.nav_group_community();
+    case 'system':
+      return m.nav_group_system();
+  }
+}
 
 /**
  * Primary sidebar navigation, in display order.
@@ -30,21 +61,21 @@ export const navItems: NavItem[] = [
   // `/` is the app's entry route and redirects here, so it counts as Ember for
   // highlighting purposes — otherwise launch shows a sidebar with nothing
   // active until the redirect lands.
-  { href: '/ember', label: () => m.nav_ember_network(), id: 'ember', aliases: ['/'] },
+  { href: '/ember', label: () => m.nav_ember_network(), id: 'ember', aliases: ['/'], group: 'networks' },
   // KAD moved off `/` when Ember became the entry route. `/kad-network`, the
   // URL before that, still redirects here and is kept as an alias so a
   // bookmark highlights this row instead of flickering through "no item
   // active" on the way through the stub.
-  { href: '/kad', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'] },
-  { href: '/servers', label: () => m.nav_ed2k_servers(), id: 'servers' },
-  { href: '/search', label: () => m.nav_search(), id: 'search' },
-  { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
-  { href: '/library', label: () => m.nav_library(), id: 'library' },
-  { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
-  { href: '/channels', label: () => m.nav_channels(), id: 'channels' },
-  { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
-  { href: '/security', label: () => m.nav_security(), id: 'security' },
-  { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
+  { href: '/kad', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'], group: 'networks' },
+  { href: '/servers', label: () => m.nav_ed2k_servers(), id: 'servers', group: 'networks' },
+  { href: '/search', label: () => m.nav_search(), id: 'search', group: 'files' },
+  { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers', group: 'files' },
+  { href: '/library', label: () => m.nav_library(), id: 'library', group: 'files' },
+  { href: '/friends', label: () => m.nav_friends(), id: 'friends', group: 'community' },
+  { href: '/channels', label: () => m.nav_channels(), id: 'channels', group: 'community' },
+  { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics', group: 'system' },
+  { href: '/security', label: () => m.nav_security(), id: 'security', group: 'system' },
+  { href: '/settings', label: () => m.nav_settings(), id: 'settings', group: 'system' },
 ];
 
 /**
