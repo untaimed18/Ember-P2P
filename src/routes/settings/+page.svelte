@@ -2773,45 +2773,45 @@
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_history()}</h4>
             <div class="field">
-            <span class="toggle-title">{m.settings_download_history()}</span>
-            <span class="field-hint">
-              {m.settings_download_history_hint()}
-            </span>
-            <div class="history-grid">
-              <div class="history-card">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
-                  </strong>
+              <span class="toggle-title">{m.settings_download_history()}</span>
+              <span class="field-hint">
+                {m.settings_download_history_hint()}
+              </span>
+              <div class="history-grid">
+                <div class="history-card">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
                 </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
-              </div>
-              <div class="history-card">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
-                  </strong>
+                <div class="history-card">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
                 </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
-              </div>
-              <div class="history-card history-card-total">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_total()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
-                  </strong>
+                <div class="history-card history-card-total">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_total()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
                 </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
               </div>
-            </div>
-            {#if historyStatsError}
-              <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
-            {/if}
-            {#if historyClearMsg}
-              <span class="hint">{historyClearMsg}</span>
-            {/if}
+              {#if historyStatsError}
+                <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
+              {/if}
+              {#if historyClearMsg}
+                <span class="hint">{historyClearMsg}</span>
+              {/if}
             </div>
           </div>
         </div>
@@ -4462,10 +4462,21 @@
     margin: 0 8px;
   }
 
-  /* Names the group a run of fields belongs to. The rules that used to
-     separate them said nothing about what they separated. */
+  /* A group has to lay its own children out, not just contain them. `.card-body`
+     is a flex column with an 18px gap and `.field` carries no margin of its
+     own, so once these wrappers became the flex children the gap applied
+     between *groups* and the fields inside each one collapsed against each
+     other — which is why this section alone looked wrong. Same axis, same gap,
+     so a field sits exactly where it does in every other section. */
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* Names the run of fields under it. */
   .subsection-title {
-    margin: 18px 0 2px;
+    margin: 0;
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.06em;
@@ -4473,10 +4484,32 @@
     color: var(--text-secondary);
   }
 
-  /* The first group heading in a card sits directly under the header, which
-     already provides the space. */
-  .settings-group:first-child .subsection-title {
+  /* A heading belongs to the controls beneath it, so it sits nearer them than
+     they sit to one another. Pulling it in against the group's own gap keeps
+     one number in charge of the rhythm. */
+  .settings-group > .subsection-title {
+    margin-bottom: -7px;
+  }
+
+  /* Naming the groups replaced the rules that used to separate them, which
+     left this the only section on the page with no hairlines in it. They come
+     back, with the heading now saying what each one introduces. The first
+     group needs none — the card header is already that boundary. */
+  .card-body > .settings-group + .settings-group {
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    margin-top: 2px;
+    padding-top: 20px;
+  }
+
+  /* `+` cannot see past a hidden sibling, so a filter that drops the first
+     group would leave the next one's rule stranded directly under the card
+     header, reading as a stray line. The groups on screen while filtering are
+     a subset anyway, so a rule claiming to divide them says nothing true —
+     the card-body gap is separation enough. */
+  .cards-grid.filtering .card-body > .settings-group + .settings-group {
+    border-top: none;
     margin-top: 0;
+    padding-top: 0;
   }
 
   .settings-no-results {
