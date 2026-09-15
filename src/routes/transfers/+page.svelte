@@ -1571,6 +1571,18 @@
     return 0;
   }
 
+  /** True when every byte is on disk, including the 1-byte hold
+   *  `progress_bytes` uses until part MD4 / whole-file hash. That hold is
+   *  what made a finished-looking bar sit next to "Downloading (Idle)".
+   *  A 1-byte file's hold is 0, so "one byte remaining" is only treated as
+   *  complete on files larger than that. */
+  function downloadCoverageComplete(t: Transfer): boolean {
+    const completed = t.completed_size ?? 0;
+    if (t.total_size <= 0) return false;
+    if (completed >= t.total_size) return true;
+    return t.total_size > 1 && completed + 1 >= t.total_size;
+  }
+
   /** D23: pick the progress-bar fill colour for a download row. Respects
    *  both status (paused/stopped/verifying/completing/failed) and health
    *  (stalled / degraded) so an active row with bad health doesn't still
@@ -1582,6 +1594,7 @@
       return 'var(--success)';
     }
     if (t.status === 'active') {
+      if (downloadCoverageComplete(t)) return 'var(--accent)';
       if (t.health === 'stalled') return 'var(--danger)';
       if (t.health === 'degraded') return 'var(--warning)';
     }
@@ -1881,6 +1894,7 @@
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
+        if (downloadCoverageComplete(t)) return m.transfers_dl_status_finishing();
         if (t.health === 'stalled') return m.transfers_dl_status_stalled();
         if (t.health === 'degraded') return m.transfers_dl_status_downloading_idle();
         return m.transfers_dl_status_downloading();
@@ -3298,6 +3312,7 @@
         // D6: mirror dlStatusLabel's health-sensitive branches so the
         // tooltip never contradicts the label (e.g. label "Stalled" +
         // tooltip "Actively downloading").
+        if (downloadCoverageComplete(t)) return m.transfers_dl_tooltip_finishing();
         const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
         if (t.health === 'stalled') {
           return health
@@ -3796,7 +3811,7 @@
                     eMule computes remaining the same way, from Completed
                     (DownloadListCtrl.cpp:1731).
                   -->
-                  <td class="num-cell">{formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
+                  <td class="num-cell">{downloadCoverageComplete(t) ? '\u2014' : formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
                 {:else if column.key === 'last_seen_complete'}
                   <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                 {:else if column.key === 'last_received'}

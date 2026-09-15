@@ -37,13 +37,17 @@
   let resolvedColor = $derived(color || STATUS_COLORS[status] || 'var(--accent)');
   let raw = $derived(max > 0 ? (value / max) * 100 : 0);
   let percentage = $derived(Math.min(100, Math.max(0, Number.isFinite(raw) ? raw : 0)));
+  // `toFixed(1)` rounds 99.95+ up to "100.0". Download progress holds at
+  // `size - 1` until parts verify, which would otherwise print 100% while
+  // the row is still Active.
+  let displayPercentage = $derived(percentage >= 100 ? 100 : Math.min(percentage, 99.9));
 </script>
 
 <div
   class="progress-bar"
   role="progressbar"
   aria-label={label || undefined}
-  aria-valuenow={Math.round(percentage)}
+  aria-valuenow={Math.floor(displayPercentage)}
   aria-valuemin={0}
   aria-valuemax={100}
 >
@@ -52,11 +56,11 @@
     style="width: {percentage}%; background: {resolvedColor};"
   ></div>
   {#if showPercent}
-    <span class="progress-text progress-text-track">{percentage.toFixed(1)}%</span>
+    <span class="progress-text progress-text-track">{displayPercentage.toFixed(1)}%</span>
     <span
       class="progress-text progress-text-fill"
       style="clip-path: inset(0 calc(100% - {percentage}%) 0 0);"
-    >{percentage.toFixed(1)}%</span>
+    >{displayPercentage.toFixed(1)}%</span>
   {/if}
 </div>
 
