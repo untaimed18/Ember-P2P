@@ -624,8 +624,11 @@
     overflow-y: auto;
   }
 
+  /* A solid brand block across the bottom of the sidebar. The band is the
+     separator, so the hairline that used to do that job would only read as a
+     seam against the fill. */
   .sidebar-footer {
-    border-top: 1px solid var(--border);
+    background: var(--sidebar-footer-bg);
     padding: 8px 12px 12px;
     flex-shrink: 0;
   }
@@ -639,21 +642,30 @@
     border: none;
     border-radius: var(--radius-md);
     background: transparent;
-    color: var(--text-muted);
+    /* Every state in here is derived from the footer's own foreground rather
+       than from the app's text ramp: those tokens are tuned against the page
+       background, and on a saturated blue `--text-muted` turns to mud. */
+    color: var(--sidebar-footer-fg);
     font-size: 13px;
+    font-weight: 700;
     font-family: inherit;
     cursor: pointer;
     text-align: left;
     transition: background-color var(--transition-normal), color var(--transition-normal);
   }
 
+  /* Tinted with the foreground, not with a surface colour — a white wash is
+     the only hover that works on a fill this saturated without either
+     vanishing or turning muddy. */
   .about-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+    background: color-mix(in srgb, var(--sidebar-footer-fg) 16%, transparent);
+    color: var(--sidebar-footer-fg);
   }
 
+  /* `--accent` here would be the one colour guaranteed to disappear, being
+     the blue this block is already filled with. */
   .about-btn:focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--sidebar-footer-fg);
     outline-offset: -2px;
   }
 
@@ -664,23 +676,25 @@
    * the bg + text).
    */
   .chats-btn.active {
-    background: var(--bg-tertiary);
-    color: var(--accent);
+    background: color-mix(in srgb, var(--sidebar-footer-fg) 26%, transparent);
+    color: var(--sidebar-footer-fg);
   }
 
   .chats-btn {
     position: relative;
   }
 
-  /* Unread chats are a presence cue, not a work queue: a single accent dot
+  /* Unread chats are a presence cue, not a work queue: a single plain dot
      rather than a warning-hued count, which read as "something is wrong".
-     The exact count stays available via the tooltip / aria-label. */
+     The exact count stays available via the tooltip / aria-label.
+     It takes the footer's foreground now — it used to be `--accent`, which is
+     the colour the block behind it is filled with. */
   .chats-dot {
     margin-left: auto;
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--accent);
+    background: var(--sidebar-footer-fg);
     flex-shrink: 0;
   }
 
