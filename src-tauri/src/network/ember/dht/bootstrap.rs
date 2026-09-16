@@ -588,6 +588,30 @@ pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedReco
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::PathBuf;
+
+    /// A directory no other run will be holding, in the manner of
+    /// `part_tracker`'s `temp_part_path`.
+    ///
+    /// These tests used a fixed name each, and cleaned up with a
+    /// `remove_dir_all` at the end of the body — which a failing or panicking
+    /// test never reaches. So one bad run left a directory behind for the next
+    /// one to inherit, and two of these went red intermittently on a tree where
+    /// nothing near them had changed. The comments in `save_nodes` name the
+    /// other half of it: on Windows a read or write here can lose a race with
+    /// antivirus, the indexer or backup software, and a path shared with a
+    /// previous run is one more thing that can be holding the file.
+    fn temp_nodes_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "ember-nodes-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
 
     fn make_contact(id: u8) -> CachedContact {
         // `load_nodes` re-derives the node id from the Ed25519 key and drops
@@ -610,7 +634,7 @@ mod tests {
 
     #[test]
     fn save_load_round_trip() {
-        let dir = std::env::temp_dir().join("ember_test_nodes");
+        let dir = temp_nodes_dir("roundtrip");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -647,7 +671,7 @@ mod tests {
     /// peers under whatever one session happened to find.
     #[test]
     fn a_session_that_could_not_read_the_file_must_not_overwrite_it() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_unread");
+        let dir = temp_nodes_dir("unread");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -678,7 +702,7 @@ mod tests {
     /// which is the ratchet the whole bootstrap cache exists to break.
     #[test]
     fn a_truncated_load_is_not_licence_to_shrink_the_file() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_truncated");
+        let dir = temp_nodes_dir("truncated");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -723,7 +747,7 @@ mod tests {
     /// no file to protect there is nothing to lose.
     #[test]
     fn a_missing_file_is_still_written_even_if_nothing_was_loaded() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_fresh");
+        let dir = temp_nodes_dir("fresh");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
         let _ = std::fs::remove_file(&path);
@@ -741,7 +765,7 @@ mod tests {
     /// `a_future_dated_entry_cannot_fake_having_been_reached` test.
     #[test]
     fn the_loader_reports_the_timestamp_the_file_carries() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_future");
+        let dir = temp_nodes_dir("future");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -761,7 +785,7 @@ mod tests {
     /// starting even rather than being refused or misparsed.
     #[test]
     fn a_v1_file_loads_with_a_clean_slate() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_v1");
+        let dir = temp_nodes_dir("v1");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -800,7 +824,7 @@ mod tests {
     /// decompressions and `add_contact` calls.
     #[test]
     fn a_file_declaring_more_contacts_than_we_write_is_capped() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_overlong");
+        let dir = temp_nodes_dir("overlong");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember.dat");
 
@@ -837,7 +861,7 @@ mod tests {
 
     #[test]
     fn save_load_with_ipv6() {
-        let dir = std::env::temp_dir().join("ember_test_nodes_v6");
+        let dir = temp_nodes_dir("v6");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember_v6.dat");
 
