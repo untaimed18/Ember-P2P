@@ -80,6 +80,26 @@ struct RegistryFile {
     username_activity: HashMap<String, i64>,
 }
 
+/// Borrowed mirror of [`RegistryFile`] used for writing.
+///
+/// `persist` runs on every claim, nomination, delete and reap, and building an
+/// owned `RegistryFile` copied all four maps each time — including `deleted`,
+/// which is a permanent tombstone set that only ever grows, so the cost of a
+/// save climbed with the server's whole deletion history. Serde emits an
+/// identical document either way.
+///
+/// The tombstones themselves are deliberately kept forever: only an owner can
+/// destroy a room, and `owner_delete_keeps_the_name_retired` pins that such a
+/// name must never become claimable again. Expiring them would be a policy
+/// change, not a leak fix.
+#[derive(Serialize)]
+struct RegistryFileRef<'a> {
+    usernames: &'a HashMap<String, String>,
+    names: &'a HashMap<String, ChannelNameRecord>,
+    deleted: &'a HashSet<String>,
+    username_activity: &'a HashMap<String, i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChannelRegistry {
     path: Option<PathBuf>,
@@ -113,6 +133,10 @@ impl ChannelRegistry {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // A previous run may have been interrupted between moving the old
+        // registry aside and renaming the new one into place. Reading that as
+        // a first run would silently release every claim on record.
+        recover_interrupted_write(&path);
         let parsed = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RegistryFile>(&bytes).ok())
@@ -139,11 +163,11 @@ impl ChannelRegistry {
         let Some(path) = &self.path else {
             return;
         };
-        let file = RegistryFile {
-            usernames: self.usernames.clone(),
-            names: self.names.clone(),
-            deleted: self.deleted.clone(),
-            username_activity: self.username_activity.clone(),
+        let file = RegistryFileRef {
+            usernames: &self.usernames,
+            names: &self.names,
+            deleted: &self.deleted,
+            username_activity: &self.username_activity,
         };
         let Ok(json) = serde_json::to_vec_pretty(&file) else {
             return;
@@ -242,6 +266,20 @@ impl ChannelRegistry {
                 return Err(RegistryError::Taken);
             }
             break;
+        }
+        // Reject a name that merely *looks* like one already on record. Scoped
+        // to other rooms, so an owner refreshing or re-casing its own claim
+        // still passes, and skipped when the exact key already exists because
+        // the block below handles that case with the owner check it needs.
+        if !self.names.contains_key(&normalized) {
+            let candidate = confusable_key(&normalized);
+            if self.names.iter().any(|(existing_name, rec)| {
+                !rec.deleted
+                    && !rec.channel_id.eq_ignore_ascii_case(&id)
+                    && confusable_key(existing_name) == candidate
+            }) {
+                return Err(RegistryError::Taken);
+            }
         }
         if let Some(existing) = self.names.get_mut(&normalized) {
             if existing.deleted {
@@ -530,21 +568,90 @@ impl ChannelRegistry {
     }
 }
 
+/// Where [`atomic_write`] parks the previous copy while it swaps in a new one.
+fn backup_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    dest.with_file_name(name)
+}
+
+/// Restore a registry left behind by an interrupted [`atomic_write`].
+///
+/// Only ever fires on Windows, and only for the narrow window in which the
+/// destination has been moved aside but the replacement has not landed. A
+/// backup sitting next to a destination that already exists is ordinary
+/// leftover and is cleaned up rather than restored.
+pub(crate) fn recover_interrupted_write(dest: &Path) {
+    let backup = backup_path(dest);
+    if !backup.exists() {
+        return;
+    }
+    if dest.exists() {
+        let _ = fs::remove_file(&backup);
+        return;
+    }
+    if fs::rename(&backup, dest).is_ok() {
+        tracing::warn!(
+            path = %dest.display(),
+            "restored the channels registry from its backup after an interrupted write"
+        );
+    }
+}
+
 fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         let mut file = fs::File::create(tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    // Windows cannot rename over an existing file. On Unix, rename replaces
-    // atomically — deleting first opens a window where a crash loses the
-    // registry.
-    #[cfg(windows)]
-    if dest.exists() {
-        fs::remove_file(dest)?;
+
+    // On Unix, `rename` replaces atomically and there is nothing to arrange.
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, dest)?;
+        Ok(())
     }
-    fs::rename(tmp, dest)?;
-    Ok(())
+
+    // Windows cannot rename over an existing file. Deleting the destination
+    // first is the obvious workaround and the dangerous one: if the rename
+    // then fails — a scanner or backup agent holding a handle, a transient
+    // sharing violation, the process dying inside the window — the
+    // destination is already gone and the new content is still parked under
+    // the temp name. The server comes back with no registry at all, which
+    // releases every username and channel-name claim for anyone to re-take.
+    //
+    // So move the old copy aside instead of destroying it: at every point
+    // between here and the end of the function, the previous registry exists
+    // under either `dest` or `backup`, and `recover_interrupted_write` picks
+    // it up on the next load.
+    #[cfg(windows)]
+    {
+        let backup = backup_path(dest);
+        let parked = if dest.exists() {
+            let _ = fs::remove_file(&backup);
+            fs::rename(dest, &backup)?;
+            true
+        } else {
+            false
+        };
+        match fs::rename(tmp, dest) {
+            Ok(()) => {
+                if parked {
+                    let _ = fs::remove_file(&backup);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Put the original back rather than leaving nothing at `dest`.
+                // If even this fails the backup stays put, which is exactly
+                // what the recovery path on next load looks for.
+                if parked {
+                    let _ = fs::rename(&backup, dest);
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 pub fn normalize_username(raw: &str) -> Option<String> {
@@ -572,6 +679,30 @@ pub fn normalize_channel_name(raw: &str) -> Option<String> {
     Some(cleaned.to_lowercase())
 }
 
+/// Fold a channel name to its Unicode confusable skeleton (UTS #39), for
+/// deciding whether two names would look the same to a user.
+///
+/// [`normalize_channel_name`] case-folds and nothing else, so `"Lobby"` and
+/// `"Lοbby"` — the second with a Greek omicron — are distinct keys and both
+/// claimable. Since creating a room is unprivileged, anyone could register a
+/// name visually identical to an established one, have it served to every
+/// client's Discover directory, and (because the directory sorts by name) land
+/// it directly beside the room it mimics. Usernames were never exposed to
+/// this: `normalize_username` requires `is_ascii_alphanumeric`, which removes
+/// the homoglyph primitive outright.
+///
+/// This is deliberately kept *separate* from the map key rather than replacing
+/// it. Re-keying would strand every name already on record under its old key —
+/// making each one look unclaimed and therefore re-claimable, which is a far
+/// worse version of the problem being fixed — and the skeleton is a matching
+/// form, not a display form: it maps `l`, `1` and `I` onto one representative,
+/// so a legacy record with no stored `display` would render as mojibake in the
+/// directory's fallback path.
+fn confusable_key(name: &str) -> String {
+    use unicode_security::confusable_detection::skeleton;
+    skeleton(&name.to_lowercase()).collect()
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +710,7 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn strip_invisible(raw: &str) -> String {
+pub(crate) fn strip_invisible(raw: &str) -> String {
     raw.chars()
         .filter(|c| !c.is_control() && *c != '\0' && !is_bidi_or_zero_width(*c))
         .collect::<String>()
@@ -651,6 +782,47 @@ mod tests {
         assert_eq!(
             reg.claim_channel_name(&other, &other_pk, "lobby", false),
             Err(RegistryError::Taken)
+        );
+    }
+
+    /// A name that merely looks like one already taken must be refused, or
+    /// anyone can stand up a visually identical room beside an established one
+    /// in Discover.
+    #[test]
+    fn a_confusable_channel_name_cannot_be_claimed() {
+        let mut reg = ChannelRegistry::in_memory();
+        assert!(reg
+            .claim_channel_name(&"11".repeat(16), &"22".repeat(32), "Lobby", false)
+            .is_ok());
+
+        // Greek omicron (U+03BF) for the Latin "o".
+        assert_eq!(
+            reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), "L\u{03BF}bby", false),
+            Err(RegistryError::Taken),
+            "a homoglyph of a taken name must not be claimable"
+        );
+        // Cyrillic small "о" (U+043E).
+        assert_eq!(
+            reg.claim_channel_name(&"55".repeat(16), &"66".repeat(32), "L\u{043E}bby", false),
+            Err(RegistryError::Taken)
+        );
+        // A genuinely different name is unaffected.
+        assert!(reg
+            .claim_channel_name(&"77".repeat(16), &"88".repeat(32), "Lounge", false)
+            .is_ok());
+    }
+
+    /// The confusable check is scoped to *other* rooms, so an owner refreshing
+    /// or re-casing its own claim still succeeds.
+    #[test]
+    fn an_owner_can_still_refresh_its_own_name() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(
+            reg.claim_channel_name(&id, &pk, "LOBBY", false).is_ok(),
+            "re-casing is a refresh of the same normalised key"
         );
     }
 

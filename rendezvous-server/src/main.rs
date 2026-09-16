@@ -165,6 +165,9 @@ const OP_CHANNEL_NAME_V4: u8 = 0x27;
 const OP_CHANNEL_DELETE_V4: u8 = 0x28;
 const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
 const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
+/// Channel-name claim that also commits to the published display string.
+/// See [`build_channel_name_display_v4_msg`].
+const OP_CHANNEL_NAME_DISPLAY_V4: u8 = 0x2b;
 
 /// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
 const SIGNED_IP_V4: u8 = 4;
@@ -640,6 +643,44 @@ fn build_channel_name_v4_msg(
     message
 }
 
+/// Signed form of a channel-name claim that also commits to the *display*
+/// string the directory will publish.
+///
+/// [`build_channel_name_v4_msg`] covers only the normalised key, so the bytes
+/// actually served to every client were never signed by anyone. Case folding
+/// is not injective — U+212A KELVIN SIGN folds to ASCII `k`, U+0130 to `i`
+/// plus a combining dot — so the published string can contain scalars absent
+/// from the signed one, and the replay key (computed over the signed message)
+/// collided for two requests differing only in their display bytes.
+///
+/// Both strings are length-prefixed, so no pair of (normalised, display)
+/// values can encode the same as a different pair, and the opcode differs from
+/// [`OP_CHANNEL_NAME_V4`] so a legacy signature can never be reinterpreted as
+/// one of these.
+fn build_channel_name_display_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    normalized: &str,
+    display: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 4 + normalized.len() + 4 + display.len() + 1 + 8,
+    );
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NAME_DISPLAY_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
+    message.extend_from_slice(normalized.as_bytes());
+    message.extend_from_slice(&(display.len() as u32).to_le_bytes());
+    message.extend_from_slice(display.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
 fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
     let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
     message.extend_from_slice(RDV_V4_DOMAIN);
@@ -995,6 +1036,23 @@ struct RateEntry {
     count: u64,
     window_start: Instant,
 }
+
+/// Shortest gap between two runs of the inline purge in
+/// [`check_rate_limit_bucket_in`]. The periodic sweeper is the primary reaper;
+/// this only has to keep a map full of old churn from 429-ing every
+/// first-time caller in between sweeps.
+const RATE_PURGE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One rate-limit bucket: the per-IP windows, plus the clock that paces the
+/// inline purge.
+#[derive(Default)]
+struct RateBucket {
+    entries: HashMap<IpAddr, RateEntry>,
+    /// When the inline purge last ran, or `None` if it never has.
+    last_purge: Option<Instant>,
+}
+
+type RateLimitBucket = Arc<RwLock<RateBucket>>;
 
 /// A hole-punch coordination request waiting for the other peer to poll.
 #[derive(Clone)]
@@ -1634,26 +1692,26 @@ struct AppState {
     /// punch registrations no longer steals the budget from unrelated
     /// endpoints — earlier this map was shared, and a single LowID
     /// peer's punch retries could 429 lookup/register for the same IP.
-    rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    rate_limits: RateLimitBucket,
     /// Temporary unauthenticated v3 identity oracle budget. It must not share
     /// counters with authenticated registration/lookup traffic: otherwise a
     /// normal rollout registration burst can consume the tighter legacy cap
     /// before an old client performs its first identity lookup.
-    legacy_identity_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    legacy_identity_rate_limits: RateLimitBucket,
     /// Separate per-IP budget for authenticated relay ticket poll/status
     /// reads. This prevents normal fallback traffic from consuming punch or
     /// general API capacity.
-    ticket_read_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    ticket_read_rate_limits: RateLimitBucket,
     /// Per-IP rate-limit window for hole-punch register traffic.
     /// Counted separately from `rate_limits` so the documented
     /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
     /// punch attempts.
-    punch_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    punch_rate_limits: RateLimitBucket,
     /// Per-IP, per-*hour* budget for first-time channel name claims. Separate
     /// map because it is the only bucket measured over an hour rather than a
     /// minute; sharing one would either let a minute's worth of room creation
     /// through unchecked or throttle ordinary traffic to a creation rate.
-    channel_create_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    channel_create_rate_limits: RateLimitBucket,
     /// Pending hole-punch registrations, keyed by `(target_id, from_id)`.
     /// Keying by both IDs (rather than just `target_id`) prevents an
     /// unauthenticated attacker from overwriting a legit registrant's
@@ -1967,25 +2025,41 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
 }
 
 async fn check_rate_limit_bucket_in(
-    limits: &Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    limits: &RateLimitBucket,
     ip: IpAddr,
     max_requests: u64,
     window: Duration,
 ) -> bool {
     let mut limits = limits.write().await;
     let now = Instant::now();
-    if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
+    if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
         // Same rationale as the store cap in `register`: purge
         // entries that are stale by the sweep's own definition before
         // failing closed on a brand-new IP, so a map that's merely
         // full of old churn doesn't 429 every first-time caller until
         // the next sweep cycle happens to run.
-        limits.retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
-        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
+        //
+        // Paced, because the condition that gets us here is a flood from many
+        // distinct addresses — exactly what the map exists to mitigate. In
+        // that state every entry is fresh, so the retain frees nothing and
+        // without the pacing it ran for *every* request from an unseen IP: a
+        // 200,000-element scan holding the exclusive lock that gates every
+        // rate-limited endpoint, bought with a single HTTP request. That turns
+        // the mitigation into the amplifier.
+        let due = limits
+            .last_purge
+            .is_none_or(|at| now.duration_since(at) >= RATE_PURGE_MIN_INTERVAL);
+        if due {
+            limits.last_purge = Some(now);
+            limits
+                .entries
+                .retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
+        }
+        if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
             return false;
         }
     }
-    let entry = limits.entry(ip).or_insert(RateEntry {
+    let entry = limits.entries.entry(ip).or_insert(RateEntry {
         count: 0,
         window_start: now,
     });
@@ -2000,7 +2074,7 @@ async fn check_rate_limit_bucket_in(
 }
 
 async fn check_rate_limit_bucket(
-    limits: &Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    limits: &RateLimitBucket,
     ip: IpAddr,
     max_requests: u64,
 ) -> bool {
@@ -2803,10 +2877,31 @@ async fn claim_channel_name_v4(
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
     }
-    let signed = build_channel_name_v4_msg(&channel_id, &pubkey, &normalized, body.private, body.ts);
-    if !ed25519_verify(&pubkey, &signed, &sig) {
-        return StatusCode::FORBIDDEN;
-    }
+    // Prefer the form that commits to the display string the directory will
+    // publish. A client predating it still authenticates through the legacy
+    // message, but that message covers only the normalised key — so rather
+    // than serving bytes nobody signed, the legacy path publishes the
+    // normalised name and the room simply shows lowercase until the client
+    // upgrades.
+    let display = registry::strip_invisible(&body.name);
+    let signed_display = build_channel_name_display_v4_msg(
+        &channel_id,
+        &pubkey,
+        &normalized,
+        &display,
+        body.private,
+        body.ts,
+    );
+    let (signed, publish_name) = if ed25519_verify(&pubkey, &signed_display, &sig) {
+        (signed_display, body.name.clone())
+    } else {
+        let legacy =
+            build_channel_name_v4_msg(&channel_id, &pubkey, &normalized, body.private, body.ts);
+        if !ed25519_verify(&pubkey, &legacy, &sig) {
+            return StatusCode::FORBIDDEN;
+        }
+        (legacy, normalized.clone())
+    };
     if let Err(status) =
         replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
     {
@@ -2821,7 +2916,7 @@ async fn claim_channel_name_v4(
         return StatusCode::TOO_MANY_REQUESTS;
     }
     let mut registry = state.channels_registry.write().await;
-    match registry.claim_channel_name(&channel_hex, &hex::encode(pubkey), &body.name, body.private)
+    match registry.claim_channel_name(&channel_hex, &hex::encode(pubkey), &publish_name, body.private)
     {
         Ok(()) => StatusCode::OK,
         Err(err) => registry_error_status(err),
@@ -4806,15 +4901,15 @@ async fn sweep_expired(state: AppState) {
         // with the sweep.
         {
             let mut limits = state.rate_limits.write().await;
-            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
         {
             let mut limits = state.legacy_identity_rate_limits.write().await;
-            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
         {
             let mut limits = state.ticket_read_rate_limits.write().await;
-            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
         // Sweep the punch-specific rate-limit map on the same cadence
@@ -4822,7 +4917,7 @@ async fn sweep_expired(state: AppState) {
         // a punch burst goes quiet.
         {
             let mut limits = state.punch_rate_limits.write().await;
-            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
         // Swept against its own hour-long window. Using the general one here
@@ -4831,7 +4926,7 @@ async fn sweep_expired(state: AppState) {
         {
             let mut limits = state.channel_create_rate_limits.write().await;
             limits
-                .retain(|_, entry| now.duration_since(entry.window_start) < CHANNEL_CREATE_WINDOW);
+                .entries.retain(|_, entry| now.duration_since(entry.window_start) < CHANNEL_CREATE_WINDOW);
         }
 
         {
@@ -4932,11 +5027,11 @@ async fn main() {
     let state = AppState {
         store: Arc::new(RwLock::new(HashMap::new())),
         capability_store: Arc::new(RwLock::new(HashMap::new())),
-        rate_limits: Arc::new(RwLock::new(HashMap::new())),
-        legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-        ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-        punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-        channel_create_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+        rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -5171,11 +5266,11 @@ mod relay_ticket_tests {
         AppState {
             store: Arc::new(RwLock::new(HashMap::new())),
             capability_store: Arc::new(RwLock::new(HashMap::new())),
-            rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            channel_create_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -5936,6 +6031,7 @@ mod relay_ticket_tests {
         assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
         assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
         assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
+        assert_eq!(OP_CHANNEL_NAME_DISPLAY_V4, 0x2b);
     }
 
     #[test]
@@ -6024,6 +6120,7 @@ mod relay_ticket_tests {
                 .rate_limits
                 .read()
                 .await
+                .entries
                 .get(&addr.ip())
                 .unwrap()
                 .count,
@@ -6094,6 +6191,7 @@ mod relay_ticket_tests {
                 .rate_limits
                 .read()
                 .await
+                .entries
                 .get(&addr.ip())
                 .unwrap()
                 .count,
@@ -6139,6 +6237,7 @@ mod relay_ticket_tests {
                 .rate_limits
                 .read()
                 .await
+                .entries
                 .get(&addr.ip())
                 .unwrap()
                 .count,
@@ -7188,7 +7287,10 @@ mod relay_ticket_tests {
         let ts = now_unix_secs();
         let addr = "8.8.8.8:1000".parse().unwrap();
 
-        let claim = build_channel_name_v4_msg(&old_id, &owner_pk, "lobby", false, ts);
+        // Signed the way a current client does — over the display string as
+        // well as the key — so the room keeps its casing in the directory.
+        let claim =
+            build_channel_name_display_v4_msg(&old_id, &owner_pk, "lobby", "Lobby", false, ts);
         assert_eq!(
             claim_channel_name_v4(
                 State(state.clone()),
@@ -7278,6 +7380,66 @@ mod relay_ticket_tests {
         assert_eq!(
             channels[0]["name"], "Lobby",
             "the successor inherits the display name"
+        );
+    }
+
+    /// A client that predates the display-committing message still
+    /// authenticates, but the directory must not serve bytes its signature
+    /// never covered — so the legacy path publishes the normalised name.
+    #[tokio::test]
+    async fn a_legacy_name_claim_publishes_only_what_it_signed() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let channel_id = test_channel_id(&owner_pk);
+        let ts = now_unix_secs();
+        let addr: SocketAddr = "8.8.8.8:1000".parse().unwrap();
+
+        let legacy = build_channel_name_v4_msg(&channel_id, &owner_pk, "lobby", false, ts);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "LoBBy".to_string(),
+                    private: false,
+                    ts,
+                    sig: hex::encode(owner.sign(&legacy).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK,
+            "a legacy signature is still accepted"
+        );
+
+        let dir = channel_directory_v4(State(state), ConnectInfo(addr), HeaderMap::new())
+            .await
+            .expect("directory");
+        assert_eq!(
+            dir.0["channels"].as_array().unwrap()[0]["name"], "lobby",
+            "casing the legacy signature did not cover must not be published"
+        );
+    }
+
+    /// The two signed forms must not be interchangeable, or the new opcode
+    /// buys nothing.
+    #[test]
+    fn channel_name_signed_forms_are_unambiguous() {
+        let channel_id = [7u8; 16];
+        let pubkey = [9u8; 32];
+        let ts = 1_700_000_000;
+        assert_ne!(
+            build_channel_name_v4_msg(&channel_id, &pubkey, "lobby", false, ts),
+            build_channel_name_display_v4_msg(&channel_id, &pubkey, "lobby", "lobby", false, ts)
+        );
+        // Length prefixes, so a shifted split between the two strings cannot
+        // produce the same bytes.
+        assert_ne!(
+            build_channel_name_display_v4_msg(&channel_id, &pubkey, "ab", "cd", false, ts),
+            build_channel_name_display_v4_msg(&channel_id, &pubkey, "abc", "d", false, ts)
         );
     }
 

@@ -20,6 +20,7 @@ futures-util = "0.3"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
+unicode-security = "0.1.2"
 
 [profile.release]
 strip = true
