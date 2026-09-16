@@ -43,6 +43,29 @@ impl ChunkSelector {
         self.total_sources = counted.min(u16::MAX as usize) as u16;
     }
 
+    /// Add a source's contribution to the frequency table — the exact inverse
+    /// of [`Self::remove_source`].
+    ///
+    /// Every dial that will `remove_source` on exit has to pair with one of
+    /// these on entry. [`Self::update_frequencies`] covers only the sources
+    /// present when the selector is built, and only for their *first* dial: a
+    /// retry round re-dials a source whose previous task already removed its
+    /// contribution, and an injected or adopted source was never counted at
+    /// all. Unpaired, the table drains monotonically toward zero — at which
+    /// point `select_part` scores every part in the "very rare" zone and
+    /// rarest-first stops discriminating between parts entirely.
+    pub fn add_source(&mut self, available_parts: &[bool]) {
+        if available_parts.is_empty() {
+            return;
+        }
+        for (i, &has) in available_parts.iter().enumerate() {
+            if i < self.part_frequency.len() && has {
+                self.part_frequency[i] = self.part_frequency[i].saturating_add(1);
+            }
+        }
+        self.total_sources = self.total_sources.saturating_add(1);
+    }
+
     /// Remove a source's contribution from the frequency table.
     /// Called when a source disconnects or completes so that rarity data stays
     /// accurate for subsequent `select_part` calls.
@@ -254,6 +277,65 @@ mod tests {
             "a source whose only part is claimed must still be given it, or a swarm \
              where every peer holds the same part can never start"
         );
+    }
+
+    /// Every dial removes its source's contribution when the task exits, so
+    /// every dial has to add it back on entry. Without the pairing the table
+    /// only ever drains: by the retry rounds `total_sources` is 0, every part
+    /// lands in the "very rare" zone, and rarest-first stops discriminating.
+    #[test]
+    fn add_source_is_the_exact_inverse_of_remove_source() {
+        let source = |available_parts: Vec<bool>| DownloadSource {
+            peer_ip: "10.0.0.1".to_string(),
+            peer_port: 4662,
+            available_parts,
+            peer_user_hash: None,
+            peer_connect_options: None,
+        };
+        let sources = [
+            source(vec![true, false, true]),
+            source(vec![true, true, false]),
+        ];
+
+        let mut selector = ChunkSelector::new(3);
+        selector.update_frequencies(&sources);
+        let seeded = (selector.part_frequency.clone(), selector.total_sources);
+        assert_eq!(seeded.1, 2);
+
+        // A source's task exits, then a retry round re-dials it.
+        selector.remove_source(&sources[0].available_parts);
+        assert_ne!(
+            (selector.part_frequency.clone(), selector.total_sources),
+            seeded,
+            "the removal has to actually change the table"
+        );
+        selector.add_source(&sources[0].available_parts);
+        assert_eq!(
+            (selector.part_frequency.clone(), selector.total_sources),
+            seeded,
+            "a re-dial must restore exactly what the previous exit removed"
+        );
+
+        // Repeated rounds must not drift the table either way.
+        for _ in 0..8 {
+            selector.remove_source(&sources[1].available_parts);
+            selector.add_source(&sources[1].available_parts);
+        }
+        assert_eq!(
+            (selector.part_frequency, selector.total_sources),
+            seeded,
+            "rarest-first must survive an arbitrary number of retry rounds"
+        );
+    }
+
+    /// An empty availability map means "this source has not answered yet", and
+    /// `update_frequencies` does not count it — so neither side of the pair may.
+    #[test]
+    fn an_empty_availability_map_is_not_counted() {
+        let mut selector = ChunkSelector::new(3);
+        selector.add_source(&[]);
+        assert_eq!(selector.total_sources, 0);
+        assert_eq!(selector.part_frequency, vec![0, 0, 0]);
     }
 
     #[test]

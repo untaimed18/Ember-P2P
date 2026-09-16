@@ -17,6 +17,53 @@ use tokio::sync::RwLock;
 /// session with only a log line to say why.
 const IN_FLIGHT_HASH_LEASE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Paces the `file-hash-progress` stream that drives the library scan's
+/// progress UI.
+///
+/// The emit sits in a per-file loop whose body, for small files, finishes in
+/// about a millisecond — so on an SSD it produced thousands of events per
+/// second, each serialised to JSON, pushed across the Tauri IPC bridge, and
+/// assigned into a Svelte `$state` that re-renders on every write. The window
+/// got *less* responsive the faster the disk was. The `shared-files-changed`
+/// emit in the same loop was already rate-limited; this is the same treatment.
+///
+/// Only the in-loop updates are paced. Both callers emit an unthrottled
+/// terminal `done` event after the loop, so the bar always lands on full.
+struct HashProgressEmitter {
+    last_emit: Option<std::time::Instant>,
+}
+
+impl HashProgressEmitter {
+    /// Fast enough to read as continuous, slow enough that the webview keeps
+    /// up with a disk hashing thousands of small files a second.
+    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+    fn new() -> Self {
+        Self { last_emit: None }
+    }
+
+    fn emit(&mut self, app: &tauri::AppHandle, current: usize, total: usize, file_name: &str) {
+        let now = std::time::Instant::now();
+        // The first update always goes out, so the bar appears immediately
+        // rather than after the first interval.
+        if self
+            .last_emit
+            .is_some_and(|at| now.duration_since(at) < Self::MIN_INTERVAL)
+        {
+            return;
+        }
+        self.last_emit = Some(now);
+        let _ = app.emit(
+            "file-hash-progress",
+            serde_json::json!({
+                "current": current,
+                "total": total,
+                "file_name": file_name,
+            }),
+        );
+    }
+}
+
 /// Paths whose `hash_file_cancellable` is still running after the 5-minute
 /// scan timeout. The scan continues, but a later pass must not start a second
 /// blocking hash of the same file until the first drain completes or its lease
@@ -1676,6 +1723,7 @@ pub async fn add_shared_folder(
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
+        let mut hash_progress = HashProgressEmitter::new();
         let mut was_cancelled = false;
         let mut page_complete = true;
 
@@ -1706,14 +1754,7 @@ pub async fn add_shared_folder(
                 file.name
             );
 
-            let _ = app.emit(
-                "file-hash-progress",
-                serde_json::json!({
-                    "current": hashed_count + 1,
-                    "total": total_to_hash,
-                    "file_name": file.name,
-                }),
-            );
+            hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
             let mut hash_task = tokio::task::spawn_blocking(move || {
                 FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
@@ -3249,6 +3290,7 @@ async fn reload_shared_files_page(
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
+        let mut hash_progress = HashProgressEmitter::new();
         let mut was_cancelled = false;
         let mut page_complete = true;
 
@@ -3279,14 +3321,7 @@ async fn reload_shared_files_page(
                 file.name
             );
 
-            let _ = app.emit(
-                "file-hash-progress",
-                serde_json::json!({
-                    "current": hashed_count + 1,
-                    "total": total_to_hash,
-                    "file_name": file.name,
-                }),
-            );
+            hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
             let mut hash_task = tokio::task::spawn_blocking(move || {
                 FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)

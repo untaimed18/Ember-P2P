@@ -2921,10 +2921,43 @@ pub(crate) fn score_queue_entry(
     ember_pubkey: Option<&[u8; 32]>,
     ember_verified: bool,
 ) -> f64 {
-    let file_prio = idx
-        .get_by_hash(&hex::encode(file_hash))
+    score_queue_entry_with_prio(
+        cm,
+        file_priority_weight(idx, file_hash),
+        user_hash,
+        wait_secs,
+        current_addr,
+        emule_version,
+        is_friend_slot,
+        ember_pubkey,
+        ember_verified,
+    )
+}
+
+/// The file-priority term of [`score_queue_entry`], resolved on its own.
+///
+/// Queue rows cluster on a handful of files, so [`compute_queue_rank`] — which
+/// scores every row — resolves each distinct hash once and reuses the weight
+/// rather than paying a `hex::encode` allocation and an index lookup per row.
+pub(crate) fn file_priority_weight(idx: &LocalIndex, file_hash: [u8; 16]) -> f64 {
+    idx.get_by_hash(&hex::encode(file_hash))
         .map(|f| priority_weight(&f.priority))
-        .unwrap_or(0.7);
+        .unwrap_or(0.7)
+}
+
+/// [`score_queue_entry`] with the file-priority lookup already done. See
+/// [`file_priority_weight`] for why the split exists.
+pub(crate) fn score_queue_entry_with_prio(
+    cm: &CreditManager,
+    file_prio: f64,
+    user_hash: &[u8; 16],
+    wait_secs: u64,
+    current_addr: Option<SocketAddr>,
+    emule_version: u8,
+    is_friend_slot: bool,
+    ember_pubkey: Option<&[u8; 32]>,
+    ember_verified: bool,
+) -> f64 {
     // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) so queue scoring and
     // BadGuy IP checks work for peers connecting over dual-stack sockets.
     // Previously these peers got peer_ip=0, which defeated the credit
@@ -2988,15 +3021,22 @@ pub(crate) fn compute_queue_rank(
     my_join_time: std::time::Instant,
 ) -> u16 {
     let mut rank: u16 = 1;
+    // One index lookup per distinct file rather than per row. At
+    // `HARD_UPLOAD_QUEUE_SIZE` rows the per-row form was thousands of
+    // `hex::encode` allocations for a single rank query, and a UDP re-ask
+    // triggers one of those per datagram.
+    let mut prio_cache: HashMap<[u8; 16], f64> = HashMap::new();
     for entry in queue.iter() {
         if entry.identity == *my_identity {
             continue;
         }
-        let es = score_queue_entry(
+        let file_prio = *prio_cache
+            .entry(entry.file_hash)
+            .or_insert_with(|| file_priority_weight(idx, entry.file_hash));
+        let es = score_queue_entry_with_prio(
             cm,
-            idx,
+            file_prio,
             &entry.user_hash,
-            entry.file_hash,
             entry.join_time.elapsed().as_secs(),
             entry.current_addr,
             entry.emule_version,
@@ -3170,47 +3210,46 @@ pub(crate) async fn udp_queue_rank_for_peer(
     from_udp_port: u16,
     file_hash: &[u8; 16],
 ) -> Option<u16> {
-    // Snapshot the queue and release its lock BEFORE acquiring the credit /
-    // index read locks, so `upload_queue` is never held across an `.await`
-    // (and no two of these locks are ever held simultaneously — this sidesteps
-    // both contention and any lock-ordering hazard). The reported rank is
-    // advisory, so scoring a snapshot taken microseconds earlier is fine.
-    let queue: Vec<QueueEntry> = {
-        let guard = upload_queue.lock().await;
-        guard.clone()
-    };
-    // A UDP re-ask is the peer holding its place, so it has to refresh the purge
-    // clock exactly as the TCP path does — eMule stamps `SetLastUpRequest` here
-    // too (`ClientUDPSocket.cpp:255`). Done as a separate short critical section
-    // rather than while scoring, to keep the "queue lock is never held across an
-    // await" rule above intact.
-    {
-        let mut guard = upload_queue.lock().await;
-        let now = std::time::Instant::now();
-        for entry in guard.iter_mut() {
-            if entry.file_hash == *file_hash
-                && (matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-                    || entry.current_addr.map(|a| a.ip() == from_ip).unwrap_or(false))
-            {
-                entry.last_request = now;
-            }
-        }
-    }
+    // Lock order is credit manager → index → queue, matching every other
+    // ranking site in this file (see the `OP_QUEUERANKING` resend and the
+    // Hello re-ask path in `serve_peer`, both of which hold all three).
+    //
+    // Taking them in that order up front is what lets this scan in place. The
+    // previous shape cloned the whole queue so the queue lock would not be
+    // held across the two `.await`s below it — but `QueueEntry` owns two
+    // `String`s, so at `HARD_UPLOAD_QUEUE_SIZE` rows that was thousands of
+    // allocations per inbound re-ask datagram, on the network event loop, and
+    // the UDP arm drains a burst of them per pass. Nothing after this point
+    // awaits, so the queue lock is still never held across a suspension point.
     let cm = credit_manager.read().await;
     let idx = local_index.read().await;
-    let mut best: Option<&QueueEntry> = None;
-    for entry in queue.iter() {
+    let mut queue = upload_queue.lock().await;
+
+    // A UDP re-ask is the peer holding its place, so it has to refresh the
+    // purge clock exactly as the TCP path does — eMule stamps
+    // `SetLastUpRequest` here too (`ClientUDPSocket.cpp:255`). Folded into the
+    // match scan rather than run as a second pass, but note the two conditions
+    // differ: the refresh is deliberately not gated on the UDP port.
+    let now = std::time::Instant::now();
+    let mut best: Option<usize> = None;
+    let mut best_join: Option<std::time::Instant> = None;
+    for i in 0..queue.len() {
+        let entry = &mut queue[i];
         if entry.file_hash != *file_hash {
             continue;
+        }
+        let ip_matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
+            || entry
+                .current_addr
+                .map(|a| a.ip() == from_ip)
+                .unwrap_or(false);
+        if ip_matches {
+            entry.last_request = now;
         }
         if entry.udp_port != 0 && entry.udp_port != from_udp_port {
             continue;
         }
-        let matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-            || entry
-                .current_addr
-                .map(|a| a.ip() == from_ip)
-                .unwrap_or(false)
+        let matches = ip_matches
             // Port-only fallback for entries with no known address yet.
             // Requires a real (non-zero) stored UDP port so multiple
             // queued peers that both still have `udp_port == 0` can't
@@ -3221,13 +3260,17 @@ pub(crate) async fn udp_queue_rank_for_peer(
                 && entry.udp_port != 0
                 && entry.udp_port == from_udp_port);
         if matches {
-            match best {
-                Some(prev) if prev.join_time <= entry.join_time => {}
-                _ => best = Some(entry),
+            // Earliest join wins, so the reported rank is stable and
+            // non-inflationary when several peers NAT to one address.
+            let join = entry.join_time;
+            if best_join.is_none_or(|bj| join < bj) {
+                best = Some(i);
+                best_join = Some(join);
             }
         }
     }
-    let target = best?;
+
+    let target = &queue[best?];
     let my_score = score_queue_entry(
         &cm,
         &idx,

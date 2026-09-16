@@ -900,6 +900,14 @@ impl SourceAbortSet {
 
     fn track<T>(&self, handle: &tokio::task::JoinHandle<T>) {
         if let Ok(mut v) = self.handles.lock() {
+            // Drop handles whose task has already finished before appending.
+            // Five spawn sites feed this set and nothing else drains it until
+            // the worker is dropped, so a long download that cycles through
+            // sources across retry rounds otherwise retains one handle — and
+            // the task allocation it keeps alive — per attempt ever made.
+            // Aborting a finished task is a no-op, so the only thing these
+            // rows cost is memory.
+            v.retain(|h| !h.is_finished());
             v.push(handle.abort_handle());
         }
     }
@@ -2789,6 +2797,14 @@ impl MultiSourceDownload {
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
                                 let freq_avail = avail.clone();
+                                // An injected source was not present when
+                                // `update_frequencies` seeded the table, so the
+                                // `remove_source` below has to pair with an add
+                                // here — otherwise it decrements a contribution
+                                // that was never made.
+                                if !freq_avail.is_empty() {
+                                    cs.write().await.add_source(&freq_avail);
+                                }
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -3047,6 +3063,14 @@ impl MultiSourceDownload {
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
                                 let freq_avail = avail.clone();
+                                // An injected source was not present when
+                                // `update_frequencies` seeded the table, so the
+                                // `remove_source` below has to pair with an add
+                                // here — otherwise it decrements a contribution
+                                // that was never made.
+                                if !freq_avail.is_empty() {
+                                    cs.write().await.add_source(&freq_avail);
+                                }
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -3558,6 +3582,12 @@ impl MultiSourceDownload {
                         Err(_) => return,
                     };
                     let freq_avail = avail.clone();
+                    // An adopted callback source was not present when
+                    // `update_frequencies` seeded the table, so the
+                    // `remove_source` below has to pair with an add here.
+                    if !freq_avail.is_empty() {
+                        cs.write().await.add_source(&freq_avail);
+                    }
                     let cancel_ctrl = ctrl.clone();
                     let result = tokio::select! {
                         res = download_parts_from_source(
@@ -3975,6 +4005,10 @@ impl MultiSourceDownload {
                 let rcmt = self.comment_manager.clone();
 
                 let rcs = chunk_selector.clone();
+                // Second handle on the selector: `rcs` is moved into
+                // `download_parts_from_source`, and this round has to restore
+                // the source's frequency contribution around that call.
+                let rcs_freq = chunk_selector.clone();
                 let ravail = all_sources[src_idx].available_parts.clone();
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
@@ -4022,6 +4056,18 @@ impl MultiSourceDownload {
                         Ok(p) => p,
                         Err(_) => return,
                     };
+                    // Restore this source's frequency contribution for the
+                    // duration of the re-dial. `update_frequencies` counted it
+                    // once at construction and the source's previous task
+                    // removed it on exit, so without this the retry rounds run
+                    // against a table that only ever drains — by the second
+                    // round `total_sources` is 0, every part lands in the
+                    // "very rare" zone, and both rarest-first and the endgame
+                    // availability tie-break stop discriminating.
+                    let freq_avail = ravail.clone();
+                    if !freq_avail.is_empty() {
+                        rcs_freq.write().await.add_source(&freq_avail);
+                    }
                     let cancel_ctrl = rctrl.clone();
                     let result = tokio::select! {
                         res = download_parts_from_source(
@@ -4051,6 +4097,9 @@ impl MultiSourceDownload {
                         ) => res,
                         _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                     };
+                    if !freq_avail.is_empty() {
+                        rcs_freq.write().await.remove_source(&freq_avail);
+                    }
                     if let Err(e) = result {
                         let err_str = e.to_string();
                         note_disk_full(&r_disk_full, &e);

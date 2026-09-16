@@ -14812,6 +14812,12 @@ struct NetworkState {
     rendezvous_url: String,
     /// Member Ed25519 → Noise static key from presence extra (no IP).
     ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// When `channel_member_touches` was last written through to SQLite. See
+    /// [`flush_channel_member_touches`].
+    channel_member_touch_flushed_at: Option<std::time::Instant>,
+    /// Channel roster as last read from SQLite, and when. See
+    /// [`channels_lite_cached`].
+    channel_roster_cache: Option<(Arc<Vec<crate::storage::database::StoredChannel>>, std::time::Instant)>,
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
@@ -14851,8 +14857,8 @@ struct NetworkState {
     /// gets its completion frame instead of being timed out by the sender.
     xfer_finish_in_flight: usize,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
-    /// holding the newest timestamp seen. Drained once a second by
-    /// [`flush_channel_member_touches`].
+    /// holding the newest timestamp seen. Drained by
+    /// [`flush_channel_member_touches`] on its own interval.
     channel_member_touches: HashMap<([u8; 16], [u8; 32]), i64>,
     /// Offers waiting on the user to accept or decline.
     xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
@@ -15568,8 +15574,10 @@ fn channel_member_pubkeys(
 
 /// Ceiling on [`NetworkState::channel_member_touches`] between flushes.
 ///
-/// Rooms joined times the roster cap, rounded to something a burst cannot
-/// meaningfully exceed in the one second a buffer lives for.
+/// Rooms joined times the roster cap. The buffer is keyed by
+/// `(room, member)` and keeps only the newest timestamp per key, so its size
+/// tracks how many distinct members have been heard from rather than how many
+/// datagrams arrived — which is why the flush interval does not enter into it.
 const MAX_CHANNEL_MEMBER_TOUCHES: usize = 4096;
 
 /// Queue a roster row for the next presence emit.
@@ -15604,7 +15612,7 @@ fn mark_channel_presence_dirty(
 /// roster is a separate question that public and private rooms answer
 /// differently — see [`ember::channel::chat_author_joins_gossip_roster`] — and
 /// answering it here would quietly route around it.
-/// Buffered rather than written, and flushed once per second by
+/// Buffered rather than written, and flushed on an interval by
 /// [`flush_channel_member_touches`]. This is called for *every* channel
 /// datagram that authenticates, and the write it used to do was a synchronous
 /// autocommitted `UPDATE` on the network task — one transaction, and under
@@ -15645,15 +15653,33 @@ fn note_channel_member_alive(
     *slot = (*slot).max(at);
 }
 
-/// Write the second's worth of buffered `last_seen` touches as one transaction,
-/// and queue a presence delta for each row that actually moved.
+/// Write the buffered `last_seen` touches as one transaction, and queue a
+/// presence delta for each row that actually moved.
 ///
-/// Runs immediately before [`emit_channel_presence_deltas`], so a member heard
-/// from during this tick is still reported on this tick.
+/// Runs immediately before [`emit_channel_presence_deltas`], so a member whose
+/// row moved on this flush is reported on this tick rather than the next.
+/// Presence therefore resolves at [`CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL`]
+/// granularity, not the caller's 1 Hz — which is the point, and is well inside
+/// what a "last seen" column conveys.
 fn flush_channel_member_touches(state: &mut NetworkState, db: &Database) {
     if state.channel_member_touches.is_empty() {
         return;
     }
+    // Paced, because the write commits a transaction and the database is
+    // opened `PRAGMA synchronous=FULL` — so each flush forces an fsync, on the
+    // Tokio worker running the network `select!`. At the caller's 1 Hz that is
+    // 86,400 fsyncs a day, each stalling all UDP/TCP servicing for as long as
+    // the disk takes (tens of milliseconds on a spinning or encrypted volume).
+    // `last_seen` is soft state that the member's next datagram re-establishes,
+    // and the buffer coalesces in the meantime, so batching costs only a little
+    // resolution on a presence timestamp.
+    if state
+        .channel_member_touch_flushed_at
+        .is_some_and(|at| at.elapsed() < CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL)
+    {
+        return;
+    }
+    state.channel_member_touch_flushed_at = Some(std::time::Instant::now());
     let pending: Vec<(([u8; 16], [u8; 32]), i64)> =
         state.channel_member_touches.drain().collect();
     let rows: Vec<(String, String, i64)> = pending
@@ -15833,11 +15859,11 @@ async fn maybe_beat_channel_presence(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut beaten = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if beaten >= CHANNEL_BEACON_BEAT_PER_TICK {
             break;
         }
@@ -15863,7 +15889,7 @@ async fn maybe_beat_channel_presence(
         // has to back off like any other, or every tick re-reads its key and
         // its whole member list to reach the same conclusion a second later.
         state.channel_beacon_beat_at.insert(channel_id, now);
-        let Some(key) = channel_content_key(db, &ch) else {
+        let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
         let neighbors = ember::channel::gossip_neighbors(
@@ -16141,12 +16167,15 @@ async fn apply_channel_presence_beacons(
     }
 }
 
+/// `roster` comes from [`channels_lite_cached`] so this shares the caller's
+/// read rather than running its own `channels` scan on the event loop.
 fn collect_channel_neighbor_caps(
     db: &Database,
+    roster: &[crate::storage::database::StoredChannel],
     our_pubkey: &[u8; 32],
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
     let mut members_by_channel = Vec::new();
-    for ch in db.list_channels_lite()? {
+    for ch in roster {
         // `rendezvous_neighbor_targets` keeps the first
         // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
         // the rest, so stopping here is what that cap already means — and it
@@ -16186,11 +16215,57 @@ async fn load_rendezvous_register_targets(
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
         let friends = db.get_friend_public_keys().unwrap_or_default();
-        let neighbors = collect_channel_neighbor_caps(&db, &our_pubkey).unwrap_or_default();
+        // Already off the reactor, so this reads its own roster rather than
+        // taking a turn on the shared cache.
+        let roster = db.list_channels_lite().unwrap_or_default();
+        let neighbors =
+            collect_channel_neighbor_caps(&db, &roster, &our_pubkey).unwrap_or_default();
         (friends, neighbors)
     })
     .await
     .unwrap_or_default()
+}
+
+/// How long the channel roster is reused before it is re-read from SQLite.
+///
+/// The 1 Hz maintenance pass consults the roster from several helpers, each of
+/// which ran `list_channels_lite` itself: four full `channels` table scans a
+/// second (with `ORDER BY`), as blocking `rusqlite` calls behind one
+/// `Mutex<Connection>`, executed directly on the Tokio worker running the
+/// network `select!`. Each contends with every `spawn_blocking` DB writer —
+/// `wal_checkpoint(TRUNCATE)` and `VACUUM` included — and stalls all
+/// networking for as long as it waits. Worse, the per-room due-time gates that
+/// decide whether any work actually happens are evaluated *after* the query,
+/// so the cost was paid whether or not anything was due.
+///
+/// Deliberately shorter than every per-room gate this roster feeds (the
+/// shortest, the presence beat, is tens of seconds), so nothing observable is
+/// scheduled later than it would have been. That is also why there is no
+/// explicit invalidation: five seconds is already well inside the resolution
+/// any of these decisions have.
+const CHANNEL_ROSTER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortest gap between two durable writes of channel member `last_seen`.
+/// See [`flush_channel_member_touches`].
+const CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// The channel roster, re-read from SQLite at most once per
+/// [`CHANNEL_ROSTER_TTL`]. Returned behind an `Arc` so callers can hold it
+/// while mutating `state`, and so sharing it between helpers on one tick costs
+/// nothing.
+fn channels_lite_cached(
+    state: &mut NetworkState,
+    db: &Database,
+) -> Option<Arc<Vec<crate::storage::database::StoredChannel>>> {
+    if let Some((roster, read_at)) = &state.channel_roster_cache {
+        if read_at.elapsed() < CHANNEL_ROSTER_TTL {
+            return Some(roster.clone());
+        }
+    }
+    let roster = Arc::new(db.list_channels_lite().ok()?);
+    state.channel_roster_cache = Some((roster.clone(), std::time::Instant::now()));
+    Some(roster)
 }
 
 const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
@@ -16301,11 +16376,11 @@ async fn maybe_refresh_channel_members(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16340,7 +16415,7 @@ async fn maybe_refresh_channel_members(
         if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh, focused)) {
             continue;
         }
-        if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
+        if start_channel_presence_fetch(socket, state, db, ch, channel_id, now).await {
             started += 1;
         }
     }
@@ -16361,11 +16436,11 @@ async fn maybe_refresh_channel_moderation(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16484,11 +16559,11 @@ async fn maybe_publish_owned_channel_records(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if ch.deleted {
             continue;
         }
@@ -16531,14 +16606,16 @@ async fn maybe_publish_owned_channel_records(
         // pass is what hands it to each of them — the three have to travel
         // together, exactly as `rotate_and_commit` keeps them together for the
         // owner's own bans.
-        let mut ch = ch;
+        // Borrowed from the shared roster until a rotation forces a re-read,
+        // so the common path does not copy the row.
+        let mut ch = std::borrow::Cow::Borrowed(ch);
         let rotated = if private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false) {
             let minted = rotate_owned_channel_key(db, &ch.channel_id, ch.key_epoch);
             if minted.is_some() {
                 // Re-read: the snapshot's tail and the re-seal both take the
                 // epoch from this row.
                 if let Ok(Some(fresh)) = db.get_channel(&ch.channel_id) {
-                    ch = fresh;
+                    ch = std::borrow::Cow::Owned(fresh);
                 }
             }
             minted
@@ -16850,12 +16927,12 @@ async fn maybe_refresh_channel_key_epoch(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let our_pk = identity.ed25519_public_key;
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16997,11 +17074,11 @@ async fn maybe_refresh_channel_handoff(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -17445,7 +17522,10 @@ async fn maybe_dial_channel_neighbors(
     if settings.rendezvous_url.is_empty() {
         return;
     }
-    let Ok(neighbors) = collect_channel_neighbor_caps(db, &our_pubkey) else {
+    let Some(roster) = channels_lite_cached(state, db) else {
+        return;
+    };
+    let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey) else {
         return;
     };
     let now = std::time::Instant::now();
@@ -20372,14 +20452,14 @@ async fn maybe_sync_channel_history(
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
     }
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let now = std::time::Instant::now();
     let interval = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_SYNC_SECS);
     let our_pk = state.local_ed25519_pubkey;
     let mut sent = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -20426,7 +20506,7 @@ async fn maybe_sync_channel_history(
         if due.is_empty() {
             continue;
         }
-        let Some(key) = channel_content_key(db, &ch) else {
+        let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
         let wall = chrono::Utc::now().timestamp();
@@ -25330,6 +25410,7 @@ async fn download_file_details(
     };
 
     let part_count = guard.part_count;
+    let file_size = guard.file_size;
     details.tracked = true;
     details.part_count = part_count as u32;
     details.local_part_status = pack_part_bitmap(&guard.completed_parts());
@@ -25350,9 +25431,16 @@ async fn download_file_details(
     // ones that have not. The table stays here and only its minimum travels.
     let mut frequency = vec![0u16; part_count];
     let mut swarm = vec![false; part_count];
+    // Peers advertise the eD2K *wire* part count, `floor(size / PARTSIZE) + 1`,
+    // which is one more than the tracker's `ceil(size / PARTSIZE)` exactly when
+    // the size is a whole multiple of `PARTSIZE`. Requiring strict equality
+    // therefore rejected every bitmap for such a file, and the window claimed
+    // nobody in the swarm held any part at all.
+    let wire_part_count = ed2k::messages::ed2k_wire_part_count(file_size);
     if let Some(list) = state.per_file_sources.get(transfer_id) {
         for source in &list.sources {
-            if source.available_parts.len() != part_count {
+            let len = source.available_parts.len();
+            if len != part_count && len != wire_part_count {
                 // A bitmap for a different part count describes a different
                 // file, or a source that has not answered yet. Either way it
                 // cannot be folded in.
@@ -25360,7 +25448,10 @@ async fn download_file_details(
             }
             details.sources_with_bitmaps = details.sources_with_bitmaps.saturating_add(1);
             for (i, &has) in source.available_parts.iter().enumerate() {
-                if has {
+                // Bound as `ChunkSelector::update_frequencies` does, so the
+                // wire count's trailing pseudo-part is ignored rather than
+                // overflowing the table.
+                if has && i < part_count {
                     frequency[i] = frequency[i].saturating_add(1);
                     swarm[i] = true;
                 }
@@ -25849,6 +25940,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_moderation_publish_at.clear();
     state.channel_username_refresh_at = 0;
     state.ember_channel_noise_keys.clear();
+    state.channel_roster_cache = None;
+    state.channel_member_touch_flushed_at = None;
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
     state.channel_relay_outboxes.clear();
@@ -26894,6 +26987,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
+        channel_member_touch_flushed_at: None,
+        channel_roster_cache: None,
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
         channel_relay_outboxes: HashMap::new(),
@@ -27848,6 +27943,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut reputation_save_started_at: Option<tokio::time::Instant> = None;
     let mut known2_save_in_flight = false;
     let mut known2_save_started_at: Option<tokio::time::Instant> = None;
+    // Length of `aich_hash_sets` as of the last durable `known2_64.met` write,
+    // or `None` if this session has not written one yet. `aich_hash_sets` is
+    // append-only — nothing removes an entry and the cap refuses new sets
+    // rather than evicting — so its length identifies its contents, which
+    // makes this a sufficient dirty check.
+    let mut known2_saved_len: Option<usize> = None;
+    let mut known2_in_flight_len: usize = 0;
     let mut nodes_save_in_flight = false;
     let mut nodes_save_started_at: Option<tokio::time::Instant> = None;
     let mut spam_save_in_flight = false;
@@ -28322,6 +28424,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &mut state.ember_published_sources,
                         );
                         state.aich_hash_sets = loads.aich_hash_sets;
+                        // The deferred load replaces the in-memory set wholesale,
+                        // so any length this session already wrote no longer
+                        // describes what is in memory.
+                        known2_saved_len = None;
                         for (k, v) in loads.aich_root_map {
                             if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
                                 break;
@@ -37028,6 +37134,36 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .retain(|_, attempt| mgr.get_transfer(&attempt.transfer_id).is_some());
                 }
 
+                // Forget neighbour-lookup throttle stamps once they can no
+                // longer suppress a lookup. Keyed by remote member pubkey, so
+                // this map grows with other people's room churn rather than
+                // with anything the user does, and its sibling
+                // `channel_neighbor_lookup_inflight` is already cleared on
+                // completion. A stamp past its interval also keeps suppressing
+                // nothing, so holding it only costs memory.
+                {
+                    let now = std::time::Instant::now();
+                    state.channel_neighbor_lookup_at.retain(|_, at| {
+                        now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL
+                    });
+                }
+
+                // Drop publish-ack counters for files no longer being
+                // published. The field documents itself as reset at the start
+                // of each source-publish cycle, but nothing ever removed an
+                // entry, so a session that rotates shares accumulated one row
+                // per file ever published — and the 60s source-count sync
+                // probes this map once per shared file.
+                // The Ember rendezvous advert is deliberately absent from the
+                // publish record set, so it is kept by key.
+                {
+                    let rendezvous_key = kad::publish::ember_rendezvous_key();
+                    let publish = &state.publish_manager;
+                    state
+                        .source_publish_acks
+                        .retain(|id, _| *id == rendezvous_key || publish.has_record(id));
+                }
+
                 // Forget inbound rate-limit stamps once they can no longer
                 // reject anything.
                 {
@@ -40384,33 +40520,34 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Feed NNP sources from persistent per-file lists into A4AF.
                 // A source with NNP on file X should be offered to all OTHER
                 // active downloads, not back to file X itself.
+                //
+                // Both sides are collected before the lock is taken, and the
+                // dry list is de-duplicated by address. A peer that has run
+                // dry on several files is still one candidate per target, so
+                // feeding the raw per-file lists in walked every target once
+                // per file the peer appeared on, for no added coverage.
                 {
                     let all_file_hashes: Vec<[u8; 16]> = state.per_file_sources
                         .values()
                         .map(|pfs| pfs.file_hash)
                         .collect();
-                    let mut a4af = a4af_shared.write().await;
+                    let mut seen_dry: HashSet<SocketAddr> = HashSet::new();
+                    let mut dry_sources: Vec<(SocketAddr, [u8; 16])> = Vec::new();
                     for pfs in state.per_file_sources.values() {
                         for src in &pfs.sources {
                             if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
                                 let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
-                                for &other_hash in &all_file_hashes {
-                                    if other_hash != pfs.file_hash {
-                                        a4af.add_a4af_source(
-                                            other_hash,
-                                            addr,
-                                            pfs.file_hash,
-                                            // This sweep selects on
-                                            // `NoneNeededParts`, so by
-                                            // construction the peer has nothing
-                                            // left for the file it is on — which
-                                            // is the whole reason to retask it.
-                                            false,
-                                        );
-                                    }
+                                if seen_dry.insert(addr) {
+                                    dry_sources.push((addr, pfs.file_hash));
                                 }
                             }
                         }
+                    }
+                    if !dry_sources.is_empty() {
+                        a4af_shared
+                            .write()
+                            .await
+                            .offer_dry_sources(&all_file_hashes, &dry_sources);
                     }
                 }
 
@@ -44655,6 +44792,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     PeriodicSaveJob::Known2 => {
                         known2_save_in_flight = false;
                         known2_save_started_at = None;
+                        if result.result.is_ok() {
+                            // Only a durable write lets the next tick skip; a
+                            // failed one leaves the file behind the set.
+                            known2_saved_len = Some(known2_in_flight_len);
+                        }
                         "known2_64.met"
                     }
                     PeriodicSaveJob::Nodes => {
@@ -44874,9 +45016,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                     state.aich_hash_sets.push(hs);
                 }
-                if !state.aich_hash_sets.is_empty() && !known2_save_in_flight {
+                // Gated on the set having actually grown, the way the
+                // `known.met` save above is gated on `is_dirty()`. Unconditional,
+                // this deep-cloned the whole recovery corpus on the event loop,
+                // re-serialised it in the blocking task and rewrote the file
+                // every 120s for the life of the session — at the loader's
+                // 64 MiB ceiling, tens of GiB of writes a day to persist bytes
+                // already on disk.
+                if !state.aich_hash_sets.is_empty()
+                    && known2_saved_len != Some(state.aich_hash_sets.len())
+                    && !known2_save_in_flight
+                {
                     let known2_path = state.data_dir.join("known2_64.met");
                     let hash_sets = state.aich_hash_sets.clone();
+                    known2_in_flight_len = hash_sets.len();
                     let tx = periodic_save_result_tx.clone();
                     known2_save_in_flight = true;
                     known2_save_started_at = Some(tokio::time::Instant::now());
@@ -46308,7 +46461,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // and/or KAD peers that ACK'd our source publish. Do NOT use
                 // SourceManager::source_count — that counts every known peer
                 // including incomplete ones and inflated the column.
-                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::new();
+                // `per_file_sources` is keyed by transfer id, so answering
+                // "how many complete sources for this hash" from it is a
+                // linear scan. Done once per shared file that was
+                // O(shared files × tracked files) every 60s on the event loop
+                // — tens of millions of comparisons for a large library.
+                // Invert it once instead, then probe.
+                let complete_by_hash: HashMap<[u8; 16], u32> = {
+                    let mut m: HashMap<[u8; 16], u32> =
+                        HashMap::with_capacity(state.per_file_sources.len());
+                    for pfs in state.per_file_sources.values() {
+                        let count = u32::from(pfs.complete_source_count());
+                        m.entry(pfs.file_hash)
+                            .and_modify(|c| *c = (*c).max(count))
+                            .or_insert(count);
+                    }
+                    m
+                };
+                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::with_capacity(hashes.len());
                 for hash_hex in &hashes {
                     let hash_bytes: [u8; 16] = match hex::decode(hash_hex) {
                         Ok(b) if b.len() == 16 => {
@@ -46318,13 +46488,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                         _ => continue,
                     };
-                    let mut count = 0u32;
-                    for pfs in state.per_file_sources.values() {
-                        if pfs.file_hash == hash_bytes {
-                            count = count.max(u32::from(pfs.complete_source_count()));
-                            break;
-                        }
-                    }
+                    let mut count = complete_by_hash.get(&hash_bytes).copied().unwrap_or(0);
                     // Purely-shared files (never searched/downloaded) have no
                     // PFS entry; fall back to KAD publish ACKs — peers that
                     // stored our source record. Local copy is not counted.
@@ -46958,10 +47122,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // cached_shared_files -- never nest these two locks.
                     let file_snap = {
                         let mut index = li_ref.write().await;
-                        for (file_hash, reqs, accepted, transferred) in &known_stats {
-                            let hash_hex = hex::encode(file_hash);
-                            index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
-                        }
+                        index.update_alltime_stats_bulk(&known_stats);
                         let mut snap = index.all_files().to_vec();
                         apply_publish_badges(
                             &mut snap,

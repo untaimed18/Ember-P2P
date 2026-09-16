@@ -5690,7 +5690,11 @@ impl Ed2kDownload {
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_part = super::aich::compute_aich_part(&part_data);
+                        let aich_part = super::aich::compute_aich_part(
+                            &part_data,
+                            part_idx,
+                            tracker.part_count,
+                        );
                         let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
                             / super::aich::AICH_BLOCK_SIZE;
                         warn!(

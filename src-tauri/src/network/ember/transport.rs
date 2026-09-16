@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -722,6 +722,20 @@ pub struct EmberTransport {
     /// "replayed init re-runs the handshake, re-emits its embedded payload, and
     /// resets the live session" vector. Pruned in [`Self::cleanup`].
     recent_handshakes: HashMap<[u8; 32], RecentHandshake>,
+    /// Insertion order for `recent_handshakes`, so eviction at
+    /// [`MAX_REPLAY_DIGESTS`] pops the oldest in O(1).
+    ///
+    /// Scanning the map for the minimum `seen_at` instead meant an 8192-entry
+    /// pass per *fresh* handshake — and every fresh digest is unique by
+    /// construction, so there was no short-circuit: one unproven remote
+    /// datagram bought ~8192 comparisons on the network event loop.
+    ///
+    /// Rows may name a digest the map no longer holds ([`Self::forget_handshake`],
+    /// the TTL sweep in [`Self::cleanup`], [`Self::cleanup_all`]), and the same
+    /// digest can appear twice if it is re-inserted after its TTL lapsed. Both
+    /// are resolved at pop time by matching `seen_at`, so a stale row can never
+    /// evict a fresher entry.
+    recent_handshake_order: VecDeque<([u8; 32], Instant)>,
     /// Payloads carried inside an inbound IK initiation, held until the
     /// source address proves it can receive. See [`Self::handle_ik_init`].
     /// Pruned in [`Self::cleanup`].
@@ -739,6 +753,12 @@ pub struct EmberTransport {
     /// opened ourselves. Keyed on address only: a peer's source port rotates, and
     /// the mapping question is about the host.
     dialled: HashMap<IpAddr, Instant>,
+    /// Insertion order for `dialled`, for the same reason as
+    /// `recent_handshake_order`: capped eviction without an O(n) scan of the
+    /// map. Pushed only when an address is newly inserted — refreshing an
+    /// existing dial updates the map in place — so the queue holds each
+    /// resident address at most once and cannot outgrow it.
+    dialled_order: VecDeque<IpAddr>,
     /// Secret keying the XX retry cookie, and the one it replaced. Two, not
     /// one, so a cookie minted a moment before a rotation is still honoured
     /// a moment after it. This is the *only* state an unvalidated XX msg1
@@ -825,9 +845,11 @@ impl EmberTransport {
             staged_sessions: HashMap::new(),
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
+            recent_handshake_order: VecDeque::new(),
             deferred_ik: HashMap::new(),
             trim_salt: fresh_cookie_secret(),
             dialled: HashMap::new(),
+            dialled_order: VecDeque::new(),
             cookie_secret: fresh_cookie_secret(),
             prev_cookie_secret: fresh_cookie_secret(),
             cookie_rotated_at: Instant::now(),
@@ -987,14 +1009,20 @@ impl EmberTransport {
                 };
             }
         }
-        if self.recent_handshakes.len() >= MAX_REPLAY_DIGESTS {
-            if let Some(oldest) = self
+        while self.recent_handshakes.len() >= MAX_REPLAY_DIGESTS {
+            // Rows that no longer match a live entry are skipped, not counted
+            // as an eviction — each is popped at most once, so the loop stays
+            // amortised O(1). The queue is pushed in lockstep with every
+            // insert below, so it cannot run dry while the map is at its cap.
+            let Some((key, queued_at)) = self.recent_handshake_order.pop_front() else {
+                break;
+            };
+            if self
                 .recent_handshakes
-                .iter()
-                .min_by_key(|(_, e)| e.seen_at)
-                .map(|(k, _)| *k)
+                .get(&key)
+                .is_some_and(|e| e.seen_at == queued_at)
             {
-                self.recent_handshakes.remove(&oldest);
+                self.recent_handshakes.remove(&key);
             }
         }
         self.recent_handshakes.insert(
@@ -1005,6 +1033,7 @@ impl EmberTransport {
                 response: None,
             },
         );
+        self.recent_handshake_order.push_back((digest, now));
         HandshakeReplay::Fresh { digest }
     }
 
@@ -1096,17 +1125,23 @@ impl EmberTransport {
         // match, and nothing about that failure would be visible.
         let ip = ip.to_canonical();
         let now = Instant::now();
-        if self.dialled.len() >= MAX_DIALLED_ADDRS && !self.dialled.contains_key(&ip) {
-            if let Some(oldest) = self
-                .dialled
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(ip, _)| *ip)
-            {
-                self.dialled.remove(&oldest);
+        if let Some(at) = self.dialled.get_mut(&ip) {
+            // Already resident: refresh in place and leave its position in the
+            // order queue alone, so re-dialling a known address neither grows
+            // the queue nor costs an eviction.
+            *at = now;
+            return;
+        }
+        while self.dialled.len() >= MAX_DIALLED_ADDRS {
+            let Some(oldest) = self.dialled_order.pop_front() else {
+                break;
+            };
+            if self.dialled.remove(&oldest).is_some() {
+                break;
             }
         }
         self.dialled.insert(ip, now);
+        self.dialled_order.push_back(ip);
     }
 
     /// Whether we have sent anything to this address recently enough that a NAT
@@ -1558,6 +1593,15 @@ impl EmberTransport {
             .retain(|_, d| now.duration_since(d.stored) < DEFERRED_IK_PAYLOAD_TTL);
         self.dialled
             .retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
+        // Both order queues are swept alongside the maps they index. Stale rows
+        // are harmless at pop time but would otherwise accumulate for the life
+        // of the process, since eviction is the only other thing that drains
+        // them and it only runs at the cap.
+        let live_handshakes = &self.recent_handshakes;
+        self.recent_handshake_order
+            .retain(|(k, at)| live_handshakes.get(k).is_some_and(|e| e.seen_at == *at));
+        let live_dialled = &self.dialled;
+        self.dialled_order.retain(|ip| live_dialled.contains_key(ip));
     }
 
     /// Drop the session, staged re-handshake and deferred payload held for one
@@ -1603,6 +1647,7 @@ impl EmberTransport {
         self.staged_sessions.clear();
         self.pending.clear();
         self.recent_handshakes.clear();
+        self.recent_handshake_order.clear();
         self.deferred_ik.clear();
         // `dialled` deliberately survives. Clearing it alongside the session state
         // looked tidy and was wrong: the caller does reset its reachability

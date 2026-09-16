@@ -587,19 +587,33 @@ impl LocalIndex {
         Some(removed)
     }
 
-    pub fn update_alltime_stats(
-        &mut self,
-        hash: &str,
-        alltime_requests: u32,
-        alltime_accepted: u32,
-        alltime_transferred: u64,
-    ) {
-        if let Some(indices) = self.hash_map.get(hash).cloned() {
-            for idx in indices {
-                if let Some(file) = self.files.get_mut(idx) {
-                    file.alltime_requests = alltime_requests;
-                    file.alltime_accepted = alltime_accepted;
-                    file.alltime_transferred = alltime_transferred;
+    /// Merge all-time upload counters for many files in one pass.
+    ///
+    /// The periodic cache refresh applies these for every known file while
+    /// holding the index write lock, which blocks every IPC reader of the
+    /// library. Calling [`Self::update_alltime_stats`] per file paid a fresh
+    /// `hex::encode` allocation for the key plus a `Vec<usize>` clone of the
+    /// hash's index list on each one — hundreds of thousands of allocations
+    /// inside that critical section for a large share. This reuses one key
+    /// buffer and borrows the index list in place.
+    pub fn update_alltime_stats_bulk(&mut self, stats: &[([u8; 16], u32, u32, u64)]) {
+        use std::fmt::Write as _;
+        let files = &mut self.files;
+        let hash_map = &self.hash_map;
+        let mut key = String::with_capacity(32);
+        for (file_hash, requests, accepted, transferred) in stats {
+            key.clear();
+            for byte in file_hash {
+                let _ = write!(key, "{byte:02x}");
+            }
+            let Some(indices) = hash_map.get(&key) else {
+                continue;
+            };
+            for &idx in indices {
+                if let Some(file) = files.get_mut(idx) {
+                    file.alltime_requests = *requests;
+                    file.alltime_accepted = *accepted;
+                    file.alltime_transferred = *transferred;
                 }
             }
         }

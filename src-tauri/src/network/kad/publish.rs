@@ -492,6 +492,15 @@ impl PublishManager {
     }
 
     /// Mark a file's source as published.
+    /// Whether a publish record exists for `file_hash`.
+    ///
+    /// Used by the periodic cleanup to prune `source_publish_acks`, which is
+    /// keyed the same way and otherwise never shed a row for a file that has
+    /// since been unshared.
+    pub fn has_record(&self, file_hash: &KadId) -> bool {
+        self.records.contains_key(file_hash)
+    }
+
     pub fn mark_source_published(&mut self, file_hash: &KadId) {
         if let Some(record) = self.records.get_mut(file_hash) {
             record.last_source_publish = chrono::Utc::now().timestamp();
