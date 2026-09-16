@@ -277,6 +277,28 @@ pub struct PartTracker {
 /// under `ED2K_MAX_FILE_SIZE_BYTES`). The tracker constructors, the
 /// restore-from-disk path and `commands::transfers::verify_recovery_ranges`
 /// are all reachable without ever passing that gate.
+/// Pack a per-part bitmap for the UI, in the encoding `PartsBar.svelte` reads:
+/// byte index = `part / 8`, bit index = `part % 8`, LSB-first within each byte,
+/// rendered as lowercase hex pairs.
+///
+/// The same encoding the upload direction already ships (`build_up_part_status`
+/// in `upload.rs`), so the download chunk map can reuse the component that
+/// draws the upload one.
+pub fn pack_part_bitmap(bits: &[bool]) -> String {
+    let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            bytes[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 fn tracked_part_count(file_size: u64, part_file: &Path) -> Option<usize> {
     if file_size == 0 {
         return Some(0);
@@ -1968,6 +1990,33 @@ fn write_gap_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunk map in the File Details window is drawn by the same component
+    /// that draws the upload parts bar, so this has to pack bits the way that
+    /// component unpacks them: byte = `part / 8`, bit = `part % 8`, LSB-first.
+    /// Getting the bit order backwards would draw a plausible-looking map of
+    /// the wrong parts.
+    #[test]
+    fn part_bitmaps_pack_lsb_first_within_each_byte() {
+        assert_eq!(pack_part_bitmap(&[]), "");
+        assert_eq!(pack_part_bitmap(&[true]), "01");
+        assert_eq!(pack_part_bitmap(&[false]), "00");
+        // Part 7 is the high bit of the first byte; part 8 opens the second.
+        assert_eq!(
+            pack_part_bitmap(&[false, false, false, false, false, false, false, true]),
+            "80"
+        );
+        assert_eq!(pack_part_bitmap(&[true, false, true]), "05");
+
+        // Round-trip against the reader's own bit test, so the two cannot drift
+        // apart without this failing.
+        let bits: Vec<bool> = (0..20).map(|i| i % 3 == 0).collect();
+        let hex = pack_part_bitmap(&bits);
+        for (i, &want) in bits.iter().enumerate() {
+            let byte = u8::from_str_radix(&hex[(i / 8) * 2..(i / 8) * 2 + 2], 16).unwrap();
+            assert_eq!(byte & (1 << (i % 8)) != 0, want, "part {i}");
+        }
+    }
 
     fn temp_part_path(name: &str) -> PathBuf {
         let unique = format!(

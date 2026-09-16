@@ -847,14 +847,68 @@ fn apply_tcp_mapping_keepalive(
     confirmed
 }
 
-/// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
-/// then falling back to plain text (for LowID).
+/// One recorded line of eD2K server activity.
 ///
-/// Many servers use the same port for both plain and obfuscated connections (the server
-/// detects the mode from the first byte). If no dedicated obfuscation port is known,
-/// we try DH on the regular port first.
+/// `seq` is assigned here rather than in the frontend so a replayed line and
+/// the live event announcing it can be recognised as the same line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerLogLine {
+    pub seq: u64,
+    /// Epoch milliseconds at the moment the line was recorded. Carried through
+    /// so replayed lines keep the time they happened rather than the time they
+    /// were read back.
+    pub at: i64,
+    pub message: String,
+}
+
+/// Lines kept for replay. Matches `MAX_ENTRIES` in `stores/serverLog.ts`;
+/// there is no point holding more here than the view will show.
+const SERVER_LOG_HISTORY: usize = 200;
+
+/// Replay buffer behind [`get_server_log`](crate::commands::server::get_server_log).
+///
+/// `emit_server_log` used to only emit. That was survivable while the sole
+/// consumer was a frontend store that outlived tab switches, but the store
+/// does not outlive a reload of the webview — and the uploads pane was
+/// offering the webview's own Reload as its context menu — so the log came
+/// back empty with the connection still up and no way to get the history
+/// back. Keeping the last lines here means the frontend can ask.
+///
+/// Process-global because `emit_server_log` is called from all over the
+/// network task with nothing but an `AppHandle` to hand.
+static SERVER_LOG: std::sync::LazyLock<parking_lot::Mutex<VecDeque<ServerLogLine>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
+
+/// Record a line in the replay buffer and return it, ready to emit.
+fn record_server_log(message: &str) -> ServerLogLine {
+    static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let line = ServerLogLine {
+        seq: NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        at: chrono::Utc::now().timestamp_millis(),
+        message: message.to_string(),
+    };
+    let mut log = SERVER_LOG.lock();
+    if log.len() >= SERVER_LOG_HISTORY {
+        log.pop_front();
+    }
+    log.push_back(line.clone());
+    line
+}
+
 fn emit_server_log(app: &tauri::AppHandle, message: &str) {
-    let _ = app.emit("server-log", serde_json::json!({ "message": message }));
+    let _ = app.emit("server-log", record_server_log(message));
+}
+
+/// The retained log, oldest first.
+pub fn server_log_history() -> Vec<ServerLogLine> {
+    SERVER_LOG.lock().iter().cloned().collect()
+}
+
+/// Discard the retained log. `seq` deliberately keeps counting, so a line
+/// recorded after a clear can still never collide with one the frontend is
+/// already holding.
+pub fn clear_server_log_history() {
+    SERVER_LOG.lock().clear();
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
@@ -2973,6 +3027,21 @@ fn note_ed2k_search_results(
         active
             .ed2k_noted_availability
             .insert(r.file.hash.clone(), new_avail);
+
+        // Complete sources ride along on the same rule, and deliberately do not
+        // feed `ed2k_found_sources`: the result cap counts sources, and a
+        // complete source has already been counted as one.
+        let new_complete = match active.ed2k_noted_complete_sources.get(&r.file.hash) {
+            Some(&p) => crate::search::merge::clamp_source_count(if sum_incoming {
+                p.saturating_add(r.file.complete_sources)
+            } else {
+                p.max(r.file.complete_sources)
+            }),
+            None => crate::search::merge::clamp_source_count(r.file.complete_sources),
+        };
+        active
+            .ed2k_noted_complete_sources
+            .insert(r.file.hash.clone(), new_complete);
     }
     active.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
 }
@@ -3093,6 +3162,9 @@ fn note_ed2k_resight_availability(
             let _ = note_ed2k_search_results(active, std::slice::from_ref(r), skip_hashes);
             if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
                 r.availability = total;
+            }
+            if let Some(&total) = active.ed2k_noted_complete_sources.get(&r.file.hash) {
+                r.file.complete_sources = total;
             }
         }
     }
@@ -6428,6 +6500,12 @@ fn inject_source_into_active_transfers(
     stats
 }
 
+/// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
+/// then falling back to plain text (for LowID).
+///
+/// Many servers use the same port for both plain and obfuscated connections (the server
+/// detects the mode from the first byte). If no dedicated obfuscation port is known,
+/// we try DH on the regular port first.
 async fn try_connect_server(
     ip: &str,
     port: u16,
@@ -7184,6 +7262,63 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// The server log is held here so the frontend can ask for it back. It has
+    /// to survive a reload of the webview, which wipes the store that used to
+    /// be the only copy — and the uploads pane was offering the webview's own
+    /// Reload as its context menu, so users were hitting exactly that.
+    ///
+    /// One test rather than several: the buffer is process-global, and nothing
+    /// else in the suite writes to it, so this owns it for the duration.
+    #[test]
+    fn the_server_log_replays_its_last_lines_and_forgets_them_when_cleared() {
+        clear_server_log_history();
+        assert!(server_log_history().is_empty());
+
+        let first = record_server_log("connecting");
+        let second = record_server_log("connected");
+        assert!(
+            second.seq > first.seq,
+            "sequence numbers order the replay and identify a line the \
+             frontend is already holding, so they have to keep rising"
+        );
+
+        let history = server_log_history();
+        assert_eq!(
+            history.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(),
+            ["connecting", "connected"],
+            "replayed oldest first, the order the view reads in"
+        );
+        assert_eq!(history[0].seq, first.seq);
+        assert_eq!(history[0].at, first.at);
+
+        // Past the cap the oldest go, so a long-running session cannot grow
+        // this without bound.
+        for i in 0..SERVER_LOG_HISTORY {
+            record_server_log(&format!("line {i}"));
+        }
+        let history = server_log_history();
+        assert_eq!(history.len(), SERVER_LOG_HISTORY);
+        assert_eq!(
+            history.last().map(|l| l.message.as_str()),
+            Some(format!("line {}", SERVER_LOG_HISTORY - 1).as_str()),
+        );
+        assert!(
+            !history.iter().any(|l| l.message == "connecting"),
+            "the first line should have been pushed out by now"
+        );
+
+        // Clearing the view clears this too, or the next reload would hand the
+        // cleared lines straight back.
+        clear_server_log_history();
+        assert!(server_log_history().is_empty());
+        assert!(
+            record_server_log("after clear").seq > second.seq,
+            "sequence numbers keep counting across a clear, so a line recorded \
+             after one cannot collide with a line the frontend still holds"
+        );
+        clear_server_log_history();
+    }
 
     /// Firsthand session contacts sit beside the routing table and are exempt
     /// from everything that disciplines a resident: no liveness ping reaches
@@ -8076,6 +8211,7 @@ mod tests {
             udp_search_sent_ips: HashSet::new(),
             ed2k_found_sources: 0,
             ed2k_noted_availability: HashMap::new(),
+            ed2k_noted_complete_sources: HashMap::new(),
             dht_noted_availability: HashMap::new(),
             file_type_filter: None,
             min_size: None,
@@ -8294,6 +8430,57 @@ mod tests {
         }];
         note_ed2k_resight_availability(&mut active, &mut resights, &none);
         assert_eq!(resights[0].availability, 29);
+    }
+
+    /// Complete sources accumulate across servers exactly as availability does,
+    /// because eMule's `AddCompleteSources` is `AddSources` with a different
+    /// tag. This lives here rather than only in `search::merge` because a
+    /// streamed re-sight carries one server's slice: the frontend merges
+    /// batches by max, so a row emitted with anything but the absolute total
+    /// would settle on whichever single server answered with the most.
+    #[test]
+    fn a_resight_is_emitted_with_every_servers_complete_sources_summed() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let ed2k_row = |origin: &str, avail: u32, complete: u32| {
+            let mut r = SearchResult {
+                result_origin: origin.to_string(),
+                availability: avail,
+                ..sample_search_result("hash1")
+            };
+            r.file.complete_sources = complete;
+            r
+        };
+
+        note_ed2k_search_results(
+            &mut active,
+            &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 3)],
+            &none,
+        );
+        assert_eq!(
+            active.ed2k_noted_complete_sources.get("hash1"),
+            Some(&3),
+            "the first server's count stands on its own"
+        );
+
+        // A TCP "More results" re-list repeats the same server's figure, so it
+        // replaces rather than accumulates.
+        note_ed2k_search_results(
+            &mut active,
+            &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 4)],
+            &none,
+        );
+        assert_eq!(active.ed2k_noted_complete_sources.get("hash1"), Some(&4));
+
+        // A UDP reply is a different server, so it adds.
+        let mut resights = vec![ed2k_row(crate::search::merge::ORIGIN_SERVER_UDP, 4, 5)];
+        note_ed2k_resight_availability(&mut active, &mut resights, &none);
+        assert_eq!(resights[0].availability, 29);
+        assert_eq!(resights[0].file.complete_sources, 9);
+        assert!(
+            resights[0].file.complete_sources <= resights[0].availability,
+            "summing both keeps the pair readable as a ratio"
+        );
     }
 
     /// The client-side "Min sources" filter drops rows, and a re-sight is not a
@@ -11729,8 +11916,11 @@ mod tests {
         assert!(results[0].media.is_none());
     }
 
+    /// Both Kad counts are estimates of one swarm, so neither accumulates with
+    /// the number of nodes that answered. eMule branches on `m_bKademlia` in
+    /// `AddSources` and `AddCompleteSources` alike and keeps the larger value.
     #[test]
-    fn kad_complete_sources_takes_max_across_publishers() {
+    fn kad_source_counts_take_max_across_publishers() {
         use crate::network::kad::types::{TAG_COMPLETE_SOURCES, TAG_FILESIZE, TAG_SOURCES};
         let file_id = KadId([0x66; 16]);
         let entry = |complete: u32, sources: u32| SearchResultEntry {
@@ -11756,8 +11946,20 @@ mod tests {
         };
         let results = convert_search_results(&[entry(50, 10), entry(80, 10)], |_| true);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file.complete_sources, 80, "swarm estimates must not sum");
-        assert_eq!(results[0].availability, 20, "TAG_SOURCES still sums");
+        assert_eq!(
+            results[0].file.complete_sources, 80,
+            "swarm estimates must not sum"
+        );
+        assert_eq!(
+            results[0].availability, 10,
+            "two nodes describing the same ten sources are still ten sources"
+        );
+        assert!(
+            results[0].availability >= results[0].file.complete_sources
+                || !crate::search::merge::complete_sources_known(&results[0].result_origin),
+            "a Kad row may report more complete sources than sources, which is \
+             exactly why its complete count is not shown as a known figure"
+        );
     }
 
     #[test]
@@ -12103,6 +12305,16 @@ pub enum NetworkCommand {
     /// resolved so the UI doesn't need to invoke any further commands.
     GetUploadQueueSnapshot {
         tx: oneshot::Sender<Vec<crate::types::UploadQueueClient>>,
+    },
+    /// Chunk map and part-level counters for one download, backing the
+    /// "File Details" window. Lives here rather than on the transfer row
+    /// because the part tracker and the sources' part bitmaps belong to the
+    /// network task, and because it is read on demand — a per-part bitmap on
+    /// every transfers poll would be paid for by every user who never opens
+    /// the window.
+    GetDownloadFileDetails {
+        transfer_id: String,
+        tx: oneshot::Sender<crate::types::DownloadFileDetails>,
     },
     /// Snapshot of every persistent SecIdent credit record. Backs the
     /// "Known Clients" tab — this is the lifetime view from clients.met,
@@ -13186,6 +13398,16 @@ struct ActiveSearchRequest {
     /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
     /// delta after summing, matching eMule `UpdateResultCount`).
     ed2k_noted_availability: HashMap<String, u32>,
+    /// Per-hash running total of `FT_COMPLETE_SOURCES`, accumulated by the same
+    /// rule as `ed2k_noted_availability` because eMule accumulates it by the
+    /// same rule: `AddCompleteSources` is `AddSources` with a different tag.
+    ///
+    /// Needed separately from the merge in `search::merge` because a streamed
+    /// re-sight carries one server's slice and the row has to be emitted with
+    /// the file's absolute total — the frontend merges batches by max, so
+    /// without this the Complete column kept whichever single server answered
+    /// with the most instead of the sum across them.
+    ed2k_noted_complete_sources: HashMap<String, u32>,
     /// The same running per-file total for the DHT legs; see
     /// [`DhtNotedAvailability`] for why theirs is kept apart from the ed2k one.
     dht_noted_availability: HashMap<String, DhtNotedAvailability>,
@@ -25064,6 +25286,92 @@ fn ident_state_label(state: ed2k::credits::IdentState) -> &'static str {
     }
 }
 
+/// Build the chunk map and part counters behind the "File Details" window.
+///
+/// Two sources, because no one place holds both halves: the part tracker knows
+/// what we have, and the persistent per-file source list knows what the swarm
+/// has. The live per-source bitmaps belong to the download task and are not
+/// reachable from here, so the swarm half is whatever the stored list last
+/// learned from a TCP file status or a UDP reask — fresh enough for a window
+/// the user opened deliberately, and the alternative is nothing at all.
+async fn download_file_details(
+    state: &NetworkState,
+    transfer_id: &str,
+) -> crate::types::DownloadFileDetails {
+    use crate::network::ed2k::part_tracker::pack_part_bitmap;
+
+    /// Same budget the reask bitmap read uses: long enough that an uncontended
+    /// read always wins, short enough that a busy tracker answers the window
+    /// with "not available" instead of stalling the network task.
+    const TRACKER_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut details = crate::types::DownloadFileDetails {
+        part_count: 0,
+        local_part_status: String::new(),
+        swarm_part_status: String::new(),
+        verified_parts: 0,
+        in_progress_parts: 0,
+        rarest_part_sources: 0,
+        sources_with_bitmaps: 0,
+        completed_bytes: 0,
+        verified_bytes: 0,
+        remaining_bytes: 0,
+        transferred: 0,
+        tracked: false,
+    };
+
+    let tracker = state.tracker_registry.lock().get(transfer_id).cloned();
+    let Some(tracker) = tracker else {
+        return details;
+    };
+    let Ok(guard) = tokio::time::timeout(TRACKER_READ_BUDGET, tracker.read()).await else {
+        debug!("Tracker busy for {transfer_id}; File Details has nothing to draw this time");
+        return details;
+    };
+
+    let part_count = guard.part_count;
+    details.tracked = true;
+    details.part_count = part_count as u32;
+    details.local_part_status = pack_part_bitmap(&guard.completed_parts());
+    details.verified_parts = guard.verified_parts().iter().filter(|&&v| v).count() as u32;
+    details.in_progress_parts = guard.in_progress_part_count() as u32;
+    details.completed_bytes = guard.completed_bytes();
+    details.verified_bytes = guard.verified_bytes();
+    details.remaining_bytes = guard.remaining_gap_bytes();
+    details.transferred = guard.transferred();
+    drop(guard);
+
+    if part_count == 0 {
+        return details;
+    }
+
+    // Per-part source counts, built the way `ChunkSelector::update_frequencies`
+    // builds its own: one pass per source that has sent a bitmap, ignoring the
+    // ones that have not. The table stays here and only its minimum travels.
+    let mut frequency = vec![0u16; part_count];
+    let mut swarm = vec![false; part_count];
+    if let Some(list) = state.per_file_sources.get(transfer_id) {
+        for source in &list.sources {
+            if source.available_parts.len() != part_count {
+                // A bitmap for a different part count describes a different
+                // file, or a source that has not answered yet. Either way it
+                // cannot be folded in.
+                continue;
+            }
+            details.sources_with_bitmaps = details.sources_with_bitmaps.saturating_add(1);
+            for (i, &has) in source.available_parts.iter().enumerate() {
+                if has {
+                    frequency[i] = frequency[i].saturating_add(1);
+                    swarm[i] = true;
+                }
+            }
+        }
+    }
+    details.swarm_part_status = pack_part_bitmap(&swarm);
+    details.rarest_part_sources = frequency.iter().copied().min().unwrap_or(0);
+    details
+}
+
 /// Build the on-demand snapshot for the upload-pane "Queued" tab.
 /// Walks the upload queue once with a single read lock on each shared
 /// resource (`upload_queue`, `credit_manager`, `local_index`,
@@ -25139,28 +25447,53 @@ async fn upload_queue_snapshot(
         // state it was standing in for now travels as its own field.
         let queue_rank = rank as u32;
 
-        let (peer_ip_str, peer_port, peer_ip_v4) = match entry.current_addr {
-            Some(addr) => {
-                let v4 = match addr.ip() {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-                };
-                (addr.ip().to_string(), addr.port(), v4)
-            }
+        // The address the credit lookups below are allowed to see: the live
+        // socket, or the identity when the identity *is* an address. Kept
+        // deliberately narrow, and specifically without the `last_ip` fallback
+        // used for display: `CreditManager` reads a zero IP as "we do not know
+        // where this peer is right now" and declines to call a verified peer a
+        // BadGuy on that basis. Handing it a stale address would re-flag every
+        // peer on a dynamic IP the moment they re-asked from a new one.
+        let credit_ip_v4 = match entry.current_addr {
+            Some(addr) => match addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            },
             None => match &entry.identity {
-                ed2k::upload::QueueIdentity::Ip(ip) => {
-                    let v4 = match ip {
-                        std::net::IpAddr::V4(v4) => Some(*v4),
-                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-                    };
-                    (ip.to_string(), 0u16, v4)
-                }
-                ed2k::upload::QueueIdentity::UserHash(_) => (String::new(), 0u16, None),
+                ed2k::upload::QueueIdentity::Ip(ip) => match ip {
+                    std::net::IpAddr::V4(v4) => Some(*v4),
+                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                },
+                ed2k::upload::QueueIdentity::UserHash(_) => None,
             },
         };
-        let peer_ip_u32 = peer_ip_v4
+        let peer_ip_u32 = credit_ip_v4
             .map(|v4| u32::from_be_bytes(v4.octets()))
             .unwrap_or(0);
+
+        // The address the row shows, and the one the flag is resolved from.
+        // `last_ip` is the fallback that matters: it outlives the socket (it is
+        // what the per-IP queue cap counts), and a queued peer is disconnected
+        // between re-asks, so `current_addr` is `None` for nearly every row.
+        // Without it a `UserHash` entry reported no address at all and the
+        // Country column came out blank for the whole queue.
+        let display_ip = entry
+            .current_addr
+            .map(|addr| addr.ip())
+            .or(match &entry.identity {
+                ed2k::upload::QueueIdentity::Ip(ip) => Some(*ip),
+                ed2k::upload::QueueIdentity::UserHash(_) => None,
+            })
+            .or(entry.last_ip);
+        let peer_ip_str = display_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        // Their advertised listen port, never the ephemeral source port of a
+        // connection they happen to hold. Nothing displays this; the UI keys
+        // its rows on it, so it has to name the peer the same way across a
+        // re-ask, and the advertised port is the one the rest of the queue
+        // identifies a peer by (`queue_row_owned_by_session`, matching eMule's
+        // `AttachToAlreadyKnown`). Reporting the source port meant a row was
+        // torn down and rebuilt every time the peer connected or hung up.
+        let peer_port = entry.tcp_port;
         let credit_ratio = cm.get_score_ratio(&entry.user_hash, peer_ip_u32);
         let ident_state =
             ident_state_label(cm.get_current_ident_state(&entry.user_hash, peer_ip_u32))
@@ -25176,9 +25509,9 @@ async fn upload_queue_snapshot(
             .map(|f| f.name.clone())
             .unwrap_or_else(|| String::from("(unknown file)"));
 
-        let country_code = peer_ip_v4
-            .map(std::net::IpAddr::V4)
-            .and_then(|ip| crate::geoip::lookup_country(geoip, ip));
+        // Resolved from the full address, not a v4-mapped copy of it, so a
+        // v6-only peer gets a flag too.
+        let country_code = display_ip.and_then(|ip| crate::geoip::lookup_country(geoip, ip));
 
         let user_hash_hex = if entry.user_hash == [0u8; 16] {
             String::new()
@@ -57745,15 +58078,21 @@ fn convert_search_results(
             {
                 existing.source_addresses.push(p.source_addr);
             }
+            // Max, not sum. Both of these are one publisher's estimate of the
+            // same swarm, so adding them counts that swarm twice: eMule's
+            // `AddSources` and `AddCompleteSources` both branch on
+            // `m_bKademlia` and keep the larger value, and its parent rollup in
+            // `CSearchList::AddToList` maxes across children too.
+            //
+            // This summed `TAG_SOURCES`, citing `CSearch::ProcessResult`. That
+            // is the wrong function: it is the Kad search layer handing results
+            // to `AddToList`, which is where the merge — and the max — happens.
+            // The effect was an availability that climbed with the number of
+            // nodes that answered rather than with the size of the swarm.
             let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
-            *acc = acc
-                .saturating_add(effective_sources)
-                .min(MAX_KAD_AVAILABILITY);
+            *acc = (*acc).max(effective_sources).min(MAX_KAD_AVAILABILITY);
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
-            // TAG_COMPLETE_SOURCES is a swarm estimate from each publisher,
-            // not a partial count. Summing 50+50 inflates Complete / ranking;
-            // take max (same as cross-origin merge.rs). TAG_SOURCES still sums.
             let cs = complete_accum.entry(p.hash.clone()).or_insert(0);
             *cs = (*cs).max(p.complete_sources_tag).min(MAX_KAD_AVAILABILITY);
             existing.file.complete_sources = *cs;

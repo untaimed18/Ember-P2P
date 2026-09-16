@@ -1772,7 +1772,13 @@ pub struct UploadQueueClient {
     /// 32-char hex ed2k user hash, or empty when the peer didn't
     /// advertise one (queue identity falls back to IP in that case).
     pub user_hash: String,
+    /// Best known address: the live socket, the identity when that is an
+    /// address, or the last one seen. A queued peer is normally disconnected
+    /// between re-asks, so the last-seen fallback is what makes this — and the
+    /// country flag derived from it — present at all for most rows.
     pub peer_ip: String,
+    /// The peer's advertised listen port, not the source port of any
+    /// connection. Row identity for the UI rather than something it displays.
     pub peer_port: u16,
     pub file_hash: String,
     pub file_name: String,
@@ -1809,6 +1815,59 @@ pub struct UploadQueueClient {
     /// Raw eMule version byte (Hello CT_EMULE_VERSION). Surfaces in the UI
     /// as a tooltip / column for diagnosing legacy-client penalties.
     pub emule_version: u8,
+}
+
+/// Backs the downloads "File Details" window: eMule's chunk map, plus the
+/// per-file counters that live on the part tracker rather than on the transfer
+/// row.
+///
+/// Every bitmap uses the encoding `PartsBar.svelte` reads and the upload
+/// direction already ships — byte index = `part / 8`, bit = `part % 8`,
+/// LSB-first, lowercase hex — so the chunk map reuses the component that draws
+/// the upload bar. All four are `part_count` bits wide.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadFileDetails {
+    /// `ceil(total_size / PARTSIZE)`. Zero when no tracker could be read, which
+    /// is how the window knows to say so rather than draw an empty map.
+    pub part_count: u32,
+    /// Parts fully on disk.
+    pub local_part_status: String,
+    /// Parts at least one known source holds. Drawn behind `local_part_status`,
+    /// so together they read as "what exists out there, and how much of it we
+    /// have" — the question eMule's map answers.
+    pub swarm_part_status: String,
+    /// Parts whose MD4 has been checked, as a count rather than a bitmap: the
+    /// map is drawn from the two above, and shipping a third and fourth bitmap
+    /// that nothing draws would be paid for on every refresh.
+    pub verified_parts: u32,
+    /// Parts a source worker is fetching right now.
+    pub in_progress_parts: u32,
+    /// Holders of the scarcest part, across the sources that have sent a
+    /// bitmap. Zero means some part is held by none of them, which is the one
+    /// thing worth saying out loud: the download cannot finish from what we
+    /// know of right now.
+    ///
+    /// A single number rather than the whole per-part frequency table. The
+    /// table is `part_count` wide — tens of thousands of entries for a large
+    /// file — and nothing draws it, so shipping it on every refresh of the
+    /// window would be paid for in vain.
+    pub rarest_part_sources: u16,
+    /// Sources the frequency figures are drawn from. Lower than the transfer's
+    /// source count, because a source that has not sent its bitmap yet cannot
+    /// contribute to it.
+    pub sources_with_bitmaps: u32,
+    /// Unique bytes on disk.
+    pub completed_bytes: u64,
+    /// Bytes inside MD4-verified parts.
+    pub verified_bytes: u64,
+    /// Bytes still missing.
+    pub remaining_bytes: u64,
+    /// Wire bytes, which can exceed the file size once retries are counted.
+    pub transferred: u64,
+    /// False when the download has no registered part tracker — the
+    /// single-source and callback paths do not register one — so the window can
+    /// explain the absence instead of implying the file has no parts.
+    pub tracked: bool,
 }
 
 /// One row in the upload-pane "Known Clients" tab — a SecIdent credit

@@ -725,11 +725,26 @@ export interface ServerInfo {
 /** Matches `ServerPriority` in `network/ed2k/server_list.rs`. */
 export type ServerPriority = 'low' | 'normal' | 'high';
 
+/** One line of the backend's server log. Mirrors `network::ServerLogLine`, and
+ *  arrives both as the `server-log` event payload and in the replay returned by
+ *  `invoke('get_server_log')`. */
+export interface ServerLogLine {
+  /** Assigned by the backend, so a replayed line and the live event announcing
+   *  it can be told apart from two genuinely repeated messages. */
+  seq: number;
+  /** Epoch milliseconds the backend recorded the line. */
+  at: number;
+  message: string;
+}
+
 /** Row in the upload-pane "Queued" tab. Mirrors `crate::types::UploadQueueClient`
  *  in the Rust backend; populated by `invoke('get_upload_queue')`. */
 export interface UploadQueueClient {
   user_hash: string;
+  /** Best known address: the live socket, or the last one seen. Waiting peers
+   *  are usually disconnected, so it is mostly the latter. */
   peer_ip: string;
+  /** The peer's advertised listen port. Part of the row key, not displayed. */
   peer_port: number;
   file_hash: string;
   file_name: string;
@@ -746,6 +761,41 @@ export interface UploadQueueClient {
   country_code: string | null;
   is_friend: boolean;
   emule_version: number;
+}
+
+/** Chunk map and part counters behind the downloads "File Details" window.
+ *  Mirrors `crate::types::DownloadFileDetails`; populated by
+ *  `invoke('get_download_file_details')`.
+ *
+ *  Every bitmap is `part_count` bits in the encoding `PartsBar` reads — byte
+ *  index = part / 8, bit = part % 8, LSB-first, lowercase hex. */
+export interface DownloadFileDetails {
+  /** Zero when nothing could be read; see `tracked`. */
+  part_count: number;
+  /** Parts fully on disk. */
+  local_part_status: string;
+  /** Parts at least one known source holds. */
+  swarm_part_status: string;
+  /** Parts whose MD4 has been checked. A count, not a bitmap: only the two
+   *  bitmaps above are drawn. */
+  verified_parts: number;
+  /** Parts being fetched right now. */
+  in_progress_parts: number;
+  /** Holders of the scarcest part, across the sources that have sent a bitmap.
+   *  Zero means some part is held by none of them, so the download cannot
+   *  finish from what we currently know of. */
+  rarest_part_sources: number;
+  /** Sources the frequency figures are drawn from, which is fewer than the
+   *  transfer's source count while some have yet to send a bitmap. */
+  sources_with_bitmaps: number;
+  completed_bytes: number;
+  verified_bytes: number;
+  remaining_bytes: number;
+  /** Wire bytes, which can exceed the file size once retries are counted. */
+  transferred: number;
+  /** False when the download has no registered part tracker, so the window can
+   *  explain the absence rather than imply the file has no parts. */
+  tracked: boolean;
 }
 
 /** Row in the upload-pane "Known ED2K Peers" / "Known Ember Peers"

@@ -222,29 +222,38 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
             existing.source_addresses.push(addr);
         }
     }
-    // eMule SearchList: ed2k (server/UDP) hits for the same hash *sum*
-    // availability; Kad uses max. Mixed Kad+ed2k keeps max. Both inputs are
-    // peer-supplied, so the result is held to `MAX_PLAUSIBLE_SOURCES` — an
-    // uncapped `saturating_add` let a padded claim keep growing across merges.
+    // eMule `CSearchFile::AddSources` / `AddCompleteSources`: ed2k (server/UDP)
+    // hits for the same hash *sum*; Kad takes the max. Mixed Kad+ed2k keeps
+    // max. Both inputs are peer-supplied, so the result is held to
+    // `MAX_PLAUSIBLE_SOURCES` — an uncapped `saturating_add` let a padded claim
+    // keep growing across merges.
+    let both_ed2k =
+        is_ed2k_network_origin(&prev_origin) && is_ed2k_network_origin(&incoming.result_origin);
     existing.availability = clamp_source_count(
-        if is_ed2k_network_origin(&prev_origin) && is_ed2k_network_origin(&incoming.result_origin) {
-            existing
-                .availability
-                .saturating_add(incoming.availability)
-                .max(existing.source_addresses.len() as u32)
+        if both_ed2k {
+            existing.availability.saturating_add(incoming.availability)
         } else {
-            existing
-                .availability
-                .max(incoming.availability)
-                .max(existing.source_addresses.len() as u32)
-        },
+            existing.availability.max(incoming.availability)
+        }
+        .max(existing.source_addresses.len() as u32),
     );
-    existing.file.complete_sources = clamp_source_count(
+    // The same rule, because eMule applies the same rule: `AddCompleteSources`
+    // is `AddSources` with a different tag, summing on ed2k and maxing on Kad.
+    // This used to max unconditionally, which undercounted every multi-server
+    // result — two servers reporting three and five complete sources gave five
+    // rather than eight — and, paired with a summed availability, put the two
+    // columns on scales that could not be read against each other.
+    existing.file.complete_sources = clamp_source_count(if both_ed2k {
         existing
             .file
             .complete_sources
-            .max(incoming.file.complete_sources),
-    );
+            .saturating_add(incoming.file.complete_sources)
+    } else {
+        existing
+            .file
+            .complete_sources
+            .max(incoming.file.complete_sources)
+    });
     if existing.file_type.is_empty() && !incoming.file_type.is_empty() {
         existing.file_type = incoming.file_type;
     }
@@ -336,6 +345,28 @@ pub fn is_ed2k_network_origin(origin: &str) -> bool {
     saw
 }
 
+/// Whether a row's Complete Sources figure means anything, or whether the only
+/// honest answer is "unknown".
+///
+/// eMule decides this in `CSearchFile::IsComplete`, which returns unknown for
+/// every Kademlia result, and leaves the Kad rollup of `FT_COMPLETE_SOURCES`
+/// commented out in `CSearchList::AddToList` as "not yet supported". The reason
+/// is in the shape of the number: a Kad publisher's `TAG_COMPLETE_SOURCES` is
+/// its claim about a swarm it cannot see, whereas a server counts from its own
+/// source table and an Ember row counts distinct signatures. So a Kad-only row
+/// has a figure that should not be shown as if it were one of those.
+///
+/// `ORIGIN_NOTES` is not enough on its own either — a Kad note carries no
+/// source accounting at all.
+pub fn complete_sources_known(origin: &str) -> bool {
+    origin.split('·').any(|part| {
+        matches!(
+            part.trim(),
+            ORIGIN_SERVER_TCP | ORIGIN_SERVER_UDP | ORIGIN_EMBER | ORIGIN_LOCAL
+        )
+    })
+}
+
 /// Merge two result lists; rows with the same hash are combined. Output is sorted for display.
 pub fn merge_search_vecs(
     primary: Vec<SearchResult>,
@@ -368,12 +399,23 @@ pub fn merge_search_vecs(
 }
 
 pub fn sort_search_results(v: &mut [SearchResult]) {
+    // Rows whose complete count is unknown rank as zero on that key, so they
+    // are not ordered by a figure the UI refuses to show them with. eMule ends
+    // up in the same place: the Kad rollup of `FT_COMPLETE_SOURCES` is left at
+    // zero, so its Kad rows sort at the bottom of that column too.
+    let ranked_complete = |r: &SearchResult| {
+        if complete_sources_known(&r.result_origin) {
+            clamp_source_count(r.file.complete_sources)
+        } else {
+            0
+        }
+    };
     v.sort_by(|a, b| {
         // Rank on clamped counts: both fields are remote-controlled, so a row
         // that has never been merged (and therefore never passed through the
         // cap in `merge_into`) must not buy the top slot with a padded number.
-        clamp_source_count(b.file.complete_sources)
-            .cmp(&clamp_source_count(a.file.complete_sources))
+        ranked_complete(b)
+            .cmp(&ranked_complete(a))
             .then_with(|| {
                 clamp_source_count(b.availability).cmp(&clamp_source_count(a.availability))
             })
@@ -478,6 +520,89 @@ mod tests {
             vec![sample("bb", 7, ORIGIN_SERVER_TCP)],
         );
         assert_eq!(merged[0].availability, 10);
+    }
+
+    /// `AddCompleteSources` is `AddSources` with a different tag: eMule sums
+    /// both across ed2k replies and maxes both on Kad. Maxing the complete
+    /// count while summing availability left the two columns on scales that
+    /// could not be compared — a five-server result reporting three complete
+    /// sources each showed fifteen sources and three complete.
+    #[test]
+    fn complete_sources_follow_the_same_rule_as_availability() {
+        let with_complete = |hash: &str, avail: u32, complete: u32, origin: &str| {
+            let mut r = sample(hash, avail, origin);
+            r.file.complete_sources = complete;
+            r
+        };
+
+        let merged = merge_search_vecs(
+            vec![with_complete("aa", 10, 3, ORIGIN_SERVER_TCP)],
+            vec![with_complete("aa", 7, 5, ORIGIN_SERVER_UDP)],
+        );
+        assert_eq!(merged[0].availability, 17);
+        assert_eq!(merged[0].file.complete_sources, 8, "ed2k replies sum");
+
+        let merged = merge_search_vecs(
+            vec![with_complete("bb", 10, 3, ORIGIN_KAD)],
+            vec![with_complete("bb", 7, 5, ORIGIN_SERVER_TCP)],
+        );
+        assert_eq!(merged[0].availability, 10);
+        assert_eq!(
+            merged[0].file.complete_sources, 5,
+            "a Kad estimate and a server count describe overlapping swarms, so \
+             the larger stands rather than their sum"
+        );
+    }
+
+    /// Summing each responder's complete count cannot exceed the summed
+    /// availability, so long as no single responder claims more complete
+    /// sources than it has sources. That is the invariant the old max-against-
+    /// sum pairing broke, and the reason eMule's two columns can be read as a
+    /// ratio.
+    #[test]
+    fn summed_complete_sources_stay_within_summed_availability() {
+        let with_complete = |avail: u32, complete: u32, origin: &str| {
+            let mut r = sample("cc", avail, origin);
+            r.file.complete_sources = complete;
+            r
+        };
+        let merged = merge_search_vecs(
+            vec![with_complete(10, 10, ORIGIN_SERVER_TCP)],
+            vec![with_complete(15, 15, ORIGIN_SERVER_UDP)],
+        );
+        assert_eq!(merged[0].availability, 25);
+        assert_eq!(merged[0].file.complete_sources, 25);
+        assert!(merged[0].file.complete_sources <= merged[0].availability);
+    }
+
+    /// eMule shows no Complete Sources figure for a Kad result at all
+    /// (`CSearchFile::IsComplete` returns unknown, and the Kad rollup of
+    /// `FT_COMPLETE_SOURCES` is commented out as "not yet supported").
+    #[test]
+    fn complete_sources_are_known_only_where_something_counted_them() {
+        assert!(complete_sources_known(ORIGIN_SERVER_TCP));
+        assert!(complete_sources_known(ORIGIN_SERVER_UDP));
+        assert!(complete_sources_known(ORIGIN_EMBER));
+        assert!(complete_sources_known(ORIGIN_LOCAL));
+
+        assert!(!complete_sources_known(ORIGIN_KAD));
+        assert!(!complete_sources_known(ORIGIN_NOTES));
+        assert!(!complete_sources_known(""));
+        assert!(!complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_NOTES
+        )));
+
+        // One trustworthy counter is enough: the row carries a real count plus
+        // a Kad sighting, not a Kad guess.
+        assert!(complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_SERVER_TCP
+        )));
+        assert!(complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_EMBER
+        )));
     }
 
     #[test]
@@ -605,10 +730,13 @@ mod tests {
     /// side moved.
     ///
     /// Only genuinely shared rules are in the fixture. The deliberate
-    /// divergences stay out of it: the frontend takes `max` where `merge_into`
-    /// sums ed2k availability (the backend has already summed within a network),
-    /// it keeps the first name where `merge_search_vecs` elects one by vote, and
-    /// both sides cap `source_addresses` at `MAX_SOURCE_ADDRS`.
+    /// divergences stay out of it: the frontend takes `max` for both source
+    /// counts where `merge_into` sums them across ed2k replies — the backend
+    /// has already summed within a network, and emits the absolute running
+    /// total (`ed2k_noted_availability` / `ed2k_noted_complete_sources`), so a
+    /// second sum over the batches would double it — it keeps the first name
+    /// where `merge_search_vecs` elects one by vote, and both sides cap
+    /// `source_addresses` at `MAX_SOURCE_ADDRS`.
     fn merge_contract_fixture() -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/fixtures/merge-contract.json");

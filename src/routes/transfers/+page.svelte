@@ -9,7 +9,7 @@
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
-    getUploadQueue, getKnownClients,
+    getUploadQueue, getKnownClients, getDownloadFileDetails,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
@@ -25,7 +25,12 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
+  import type {
+    Transfer, SourceInfo, UploadQueueClient, KnownClient, DownloadFileDetails,
+  } from '$lib/types';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
@@ -308,18 +313,17 @@
     compactMq.addEventListener('change', onCompactMq);
     viewportCompactCleanup = () => compactMq.removeEventListener('change', onCompactMq);
 
-    // One-shot fetch of the upload-queue and known-clients snapshots so
-    // the bottom-tab labels show their counts immediately on page load,
-    // not just after the user has clicked each tab. The per-tab
-    // `$effect`s below still own the ongoing polling while a tab is
-    // visible — this only primes the counts for tabs the user hasn't
-    // opened yet. Without it, "Queued (N)" / "Known ED2K Peers (N)"
-    // rendered as bare "Queued" / "Known ED2K Peers" until first click,
-    // and the numbers vanished again every time the user navigated
-    // away from /transfers and back.
-    refreshUploadQueue();
-    // Priming the tab counts only needs the list, not a badge sweep — this
-    // runs on every visit to /transfers whether or not the tab is opened.
+    // One-shot fetch of the known-clients snapshot so the bottom-tab label
+    // shows its count immediately on page load, not just after the user has
+    // clicked the tab. That poll is still owned by the per-tab `$effect`
+    // below and runs only while the tab is visible, so without this
+    // "Known ED2K Peers (N)" rendered as a bare "Known ED2K Peers" until
+    // first click, and the number vanished again on every visit.
+    //
+    // The upload queue needs no equivalent: its poll runs on whichever tab
+    // is showing, so it primes its own count.
+    //
+    // Priming the tab count only needs the list, not a badge sweep.
     refreshKnownClients(false);
     void refreshFriendHashes();
     listen<{
@@ -948,6 +952,11 @@
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
+  // Cadence while some other bottom tab is showing. The Queued tab's label
+  // carries the queue count, so the poll cannot stop when the tab is hidden —
+  // it just slows down to what a count badge is worth.
+  const QUEUE_BADGE_POLL_INTERVAL_MS = 15000;
+  let queueTabActive = $derived(bottomView === 'queued');
   const KNOWN_POLL_INTERVAL_MS = 8000;
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
@@ -1193,34 +1202,44 @@
   });
 
   $effect(() => {
-    // Poll the upload queue only while its tab is visible. Refresh
-    // immediately on activation so the table is populated before the
-    // next interval tick fires.
-    if (bottomView === 'queued') {
-      refreshUploadQueue();
-      if (queuePollHandle === null) {
-        queuePollHandle = setInterval(() => {
-          // Same gate as the known-clients poll below and every poll in the
-          // stores: a minimized client has nobody to show a queue rank to.
-          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-            return;
-          }
-          refreshUploadQueue();
-        }, QUEUE_POLL_INTERVAL_MS);
-      }
-      // Skipping ticks while hidden means the first thing the user sees on
-      // restoring the window is up to a full interval out of date, so pump
-      // once on the way back.
-      if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
-        queueVisibilityHandler = () => {
-          if (document.visibilityState !== 'visible' || bottomView !== 'queued') return;
-          refreshUploadQueue();
-        };
-        document.addEventListener('visibilitychange', queueVisibilityHandler);
-      }
-    } else if (queuePollHandle !== null) {
-      clearInterval(queuePollHandle);
-      queuePollHandle = null;
+    // Poll the upload queue for as long as this page is mounted, fast while
+    // its own tab is showing and slowly otherwise.
+    //
+    // This used to stop entirely unless `bottomView === 'queued'`. The Queued
+    // tab is not the default one, so on arriving at Transfers the queue was
+    // read exactly once — by the mount-time fetch — and then left alone: the
+    // count in the tab label went stale, and peers who joined the queue after
+    // that never showed up. Reported as the queue not populating, with a
+    // right-click "Reload" as the only thing that helped. That Reload is the
+    // webview's own, and what it does is remount the page, which re-runs that
+    // single fetch; hence also having to repeat it.
+    //
+    // Read through a `$derived` so that moving between two tabs that are both
+    // "not the queue" doesn't tear down and rebuild the interval.
+    const fast = queueTabActive;
+    refreshUploadQueue();
+    // Rebuilt rather than reused when the cadence changes, so switching to the
+    // tab starts polling at the tab's rate instead of keeping the badge's.
+    queuePollHandle = setInterval(
+      () => {
+        // Same gate as the known-clients poll below and every poll in the
+        // stores: a minimized client has nobody to show a queue rank to.
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+          return;
+        }
+        refreshUploadQueue();
+      },
+      fast ? QUEUE_POLL_INTERVAL_MS : QUEUE_BADGE_POLL_INTERVAL_MS,
+    );
+    // Skipping ticks while hidden means the first thing the user sees on
+    // restoring the window is up to a full interval out of date, so pump
+    // once on the way back.
+    if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
+      queueVisibilityHandler = () => {
+        if (document.visibilityState !== 'visible') return;
+        refreshUploadQueue();
+      };
+      document.addEventListener('visibilitychange', queueVisibilityHandler);
     }
     return () => {
       if (queuePollHandle !== null) {
@@ -2109,6 +2128,7 @@
     closeColumnMenu();
     closeKnownCtx();
     closePaneCtx();
+    closeUploadsPaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
     ctxWebSub = false;
@@ -2121,6 +2141,7 @@
     closeCtx();
     closeColumnMenu();
     closePaneCtx();
+    closeUploadsPaneCtx();
     knownCtxMenu = { x: e.clientX, y: e.clientY, client };
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
@@ -2129,29 +2150,217 @@
   /// need no row, and are most wanted when the list is empty.
   let paneCtxMenu: { x: number; y: number } | null = $state(null);
 
-  function onDownloadsPaneCtx(e: MouseEvent) {
-    // The header and the rows already own their right-click, and neither
-    // stops propagation, so this has to bow out for both rather than opening a
-    // second menu on top of theirs.
+  /// Whether a right-click inside a pane has already been answered, or landed
+  /// somewhere that should keep the platform's own menu.
+  ///
+  /// Anything that owns a right-click — a row menu, a column menu — calls
+  /// `preventDefault` before a pane handler sees the event, so asking that is
+  /// both simpler and more accurate than guessing at ancestors. The guess this
+  /// replaces bowed out for every `tbody tr`, and two kinds of row have no menu
+  /// of their own: each table's empty state, and the upload queue's rows. Both
+  /// fell through to the webview's Back/Forward/Stop/Reload — the empty state
+  /// being exactly where someone with nothing in the list would right-click,
+  /// and Reload there throws away the page.
+  ///
+  /// Text fields keep their own menu, because that is where paste lives.
+  function paneCtxHandledElsewhere(e: MouseEvent): boolean {
+    if (e.defaultPrevented) return true;
     const target = e.target as HTMLElement | null;
-    if (target?.closest('thead') || target?.closest('tbody tr')) return;
+    return !!target?.closest('input, textarea, select, [contenteditable="true"]');
+  }
+
+  function onDownloadsPaneCtx(e: MouseEvent) {
+    if (paneCtxHandledElsewhere(e)) return;
     e.preventDefault();
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
+    closeUploadsPaneCtx();
     paneCtxMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  /// Background menu for the uploads pane. Mostly it exists so that the pane
+  /// answers its own right-click: with no handler here the webview offered
+  /// Back/Forward/Stop/Reload instead, and Reload — a genuine reload of the
+  /// whole page — was being used as a refresh button, which also took the
+  /// server log with it.
+  let uploadsPaneCtxMenu: { x: number; y: number } | null = $state(null);
+
+  function onUploadsPaneCtx(e: MouseEvent) {
+    if (paneCtxHandledElsewhere(e)) return;
+    e.preventDefault();
+    closeCtx();
+    closeKnownCtx();
+    closeColumnMenu();
+    closePaneCtx();
+    uploadsPaneCtxMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  /**
+   * eMule's File Details, for a download.
+   *
+   * A modal rather than another pane: it is about one file, it is opened
+   * deliberately, and the chunk map wants the width. The map itself reuses
+   * `PartsBar` — the component that already draws the upload direction's parts
+   * bar — because the backend hands this window bitmaps in the same encoding.
+   */
+  let fileDetailsId: string | null = $state(null);
+  let fileDetails: DownloadFileDetails | null = $state(null);
+  let fileDetailsLoading = $state(false);
+  let fileDetailsError: string | null = $state(null);
+  let fileDetailsOverlayEl: HTMLDivElement | undefined = $state();
+  let fileDetailsModalEl: HTMLDivElement | undefined = $state();
+  let fileDetailsCloseBtn: HTMLButtonElement | undefined = $state();
+  let fileDetailsReturnFocusEl: HTMLElement | null = null;
+  let fileDetailsGen = 0;
+  /// Slower than the transfers poll: a chunk map that redraws every second is
+  /// harder to read than one that settles, and parts complete in minutes.
+  const FILE_DETAILS_POLL_MS = 4000;
+
+  /// The live row for the open window, so its stats track the download rather
+  /// than freezing at whatever they were when it opened.
+  let fileDetailsTransfer = $derived(
+    fileDetailsId ? ($transfers.find((t) => t.id === fileDetailsId) ?? null) : null,
+  );
+
+  async function refreshFileDetails(transferId: string) {
+    const gen = ++fileDetailsGen;
+    try {
+      const data = await getDownloadFileDetails(transferId);
+      if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
+      fileDetails = data;
+      fileDetailsError = null;
+    } catch (e) {
+      if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
+      // Keep the last good map rather than blanking it: a busy network task is
+      // a reason to show stale parts, not no parts.
+      if (!fileDetails) fileDetailsError = translateError(e, m.transfers_file_details_failed());
+    } finally {
+      if (mounted && gen === fileDetailsGen && fileDetailsId === transferId) {
+        fileDetailsLoading = false;
+      }
+    }
+  }
+
+  function openFileDetails(t: Transfer) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    fileDetailsReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    fileDetailsId = t.id;
+    fileDetails = null;
+    fileDetailsError = null;
+    fileDetailsLoading = true;
+    void refreshFileDetails(t.id);
+  }
+
+  function closeFileDetails() {
+    fileDetailsId = null;
+    fileDetails = null;
+    fileDetailsError = null;
+    fileDetailsLoading = false;
+    fileDetailsGen += 1;
+  }
+
+  $effect(() => {
+    if (!fileDetailsOverlayEl) return;
+    return inertBackground(fileDetailsOverlayEl);
+  });
+
+  // Focus the dialog on open and hand focus back to the row that opened it.
+  $effect(() => {
+    if (!fileDetailsId) return;
+    const raf = requestAnimationFrame(() => fileDetailsCloseBtn?.focus());
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = fileDetailsReturnFocusEl;
+      fileDetailsReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  // Close the window if its download goes away — cancelled from another row,
+  // cleared, removed. The markup already stops rendering without a row behind
+  // it, so without this the dialog would vanish while its poll kept asking
+  // about an id nothing answers for.
+  $effect(() => {
+    if (fileDetailsId && !fileDetailsTransfer) closeFileDetails();
+  });
+
+  $effect(() => {
+    const id = fileDetailsId;
+    if (!id) return;
+    const handle = setInterval(() => {
+      // Same gate as every other poll here: nothing to redraw for a window
+      // nobody can see.
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void refreshFileDetails(id);
+    }, FILE_DETAILS_POLL_MS);
+    return () => clearInterval(handle);
+  });
+
+  function handleFileDetailsKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      // Handled here so the page-level Escape does not also fire; that one
+      // stays as the fallback for when focus is somehow outside.
+      e.preventDefault();
+      e.stopPropagation();
+      closeFileDetails();
+      return;
+    }
+    trapTabKey(e, fileDetailsModalEl);
+  }
+
+  /// Count set bits in one of the window's part bitmaps, in the same packing
+  /// `PartsBar` decodes.
+  function countBits(hex: string, parts: number): number {
+    let total = 0;
+    for (let i = 0; i < parts; i++) {
+      const off = (i >> 3) * 2;
+      const byte = Number.parseInt(hex.slice(off, off + 2), 16);
+      if (!Number.isNaN(byte) && (byte & (1 << (i & 7))) !== 0) total += 1;
+    }
+    return total;
+  }
+
+  /// Counted once per snapshot rather than per render: a large file runs to
+  /// tens of thousands of parts. The other two counts arrive ready-made,
+  /// because their bitmaps are not drawn and so are not sent.
+  let fileDetailsHaveParts = $derived.by(() => {
+    const d = fileDetails;
+    return d ? countBits(d.local_part_status, d.part_count) : 0;
+  });
+
+  /// Re-read the things this page fetches for itself: the upload queue, the
+  /// credit ledger, and the expanded download's source list (which is what the
+  /// Download Clients tab shows). The Uploading tab is fed by the transfers
+  /// store, which runs its own poll, so there is nothing here to refresh on its
+  /// behalf. Polling keeps all of this current regardless; the menu item is for
+  /// the user who wants to be sure.
+  function refreshBottomPane() {
+    refreshUploadQueue();
+    if (isKnownLedgerView(bottomView)) {
+      refreshKnownClients();
+      void refreshFriendHashes();
+    }
+    if (expandedTransferId) {
+      void refreshExpandedSourceDetails(expandedTransferId);
+    }
   }
 
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
+  function closeUploadsPaneCtx() { uploadsPaneCtxMenu = null; }
 
   function onDocClick() {
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
     closePaneCtx();
+    closeUploadsPaneCtx();
     // Match ctx/column menus: native <details> stays open on outside click.
     document
       .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
@@ -3073,6 +3282,7 @@
     event.stopPropagation();
     closeCtx();
     closePaneCtx();
+    closeUploadsPaneCtx();
     columnMenu = { table, x: event.clientX, y: event.clientY };
   }
 
@@ -3551,8 +3761,13 @@
 
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
+    // The dialog handles its own Escape and stops it there; this is the
+    // fallback for when focus has somehow ended up outside it, and it comes
+    // first because the dialog sits above everything else.
+    if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
+    else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); e.stopPropagation(); }
     else {
@@ -4201,10 +4416,16 @@
         >{m.transfers_tab_download_clients()}</button>
       </div>
     </div>
+    <!-- `tabindex`: answering the pane's own right-click makes this element
+         interactive as far as the a11y check is concerned, which then wants it
+         focusable. -1 keeps it out of the tab order, leaving the tables and
+         buttons inside it as what keyboard users actually move through. -->
     <div
       class="pane-content scroll-shadows"
       id="bottom-pane-content"
+      oncontextmenu={onUploadsPaneCtx}
       role="tabpanel"
+      tabindex={-1}
       aria-label={
         bottomView === 'uploading' ? m.transfers_tab_uploading_label()
         : bottomView === 'queued' ? m.transfers_tab_queued()
@@ -4945,6 +5166,15 @@
   </div>
 {/if}
 
+{#if uploadsPaneCtxMenu}
+  <!-- Uploads pane background menu. Short on purpose: the pane's tables act on
+       rows, and what this needs to do is answer the right-click at all. -->
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: uploadsPaneCtxMenu.x, y: uploadsPaneCtxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <button class="ctx-item" role="menuitem" onclick={() => { closeUploadsPaneCtx(); refreshBottomPane(); }}>{m.common_refresh()}</button>
+  </div>
+{/if}
+
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
@@ -4961,6 +5191,8 @@
       {#if canResume(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button
@@ -5064,6 +5296,8 @@
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button
@@ -5275,7 +5509,317 @@
   }}
 />
 
+{#if fileDetailsId && fileDetailsTransfer}
+  {@const t = fileDetailsTransfer}
+  {@const d = fileDetails}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={fileDetailsOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-file-details-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
+    onkeydown={handleFileDetailsKeydown}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+  >
+    <div
+      class="modal-content dl-details-modal"
+      bind:this={fileDetailsModalEl}
+      transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+    >
+      <div class="modal-header">
+        <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
+        <button
+          type="button"
+          class="modal-close"
+          bind:this={fileDetailsCloseBtn}
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          onclick={closeFileDetails}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="dl-details-hero">
+          <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+        </div>
+
+        {#if fileDetailsLoading && !d}
+          <p class="dl-details-note">{m.common_loading()}</p>
+        {:else if fileDetailsError}
+          <p class="dl-details-note error-msg">{fileDetailsError}</p>
+        {:else if d}
+          {@const hasMap = d.tracked && d.part_count > 0}
+          {#if !hasMap}
+            <!-- Said plainly rather than drawn as an empty map. A finished
+                 download has had its part map released, and the single-source
+                 path never registers one; either way the file has parts, we
+                 just cannot see them from here. The figures below do not all
+                 depend on the map, so the dialog is not a dead end. -->
+            <p class="dl-details-note">{m.transfers_file_details_untracked()}</p>
+          {:else}
+          <div class="dl-chunk-block">
+            <span class="dl-chunk-label">{m.transfers_file_details_chunk_map()}</span>
+            <PartsBar
+              partStatus={d.local_part_status}
+              peerPartStatus={d.swarm_part_status}
+              partCount={d.part_count}
+              transferred={d.completed_bytes}
+              total={t.total_size}
+              title={m.transfers_file_details_chunk_map_title()}
+            />
+            <span class="dl-chunk-legend">
+              {m.transfers_file_details_legend({
+                have: fileDetailsHaveParts,
+                parts: d.part_count,
+              })}
+            </span>
+          </div>
+          {/if}
+
+          <dl class="dl-details-grid">
+            {#if hasMap}
+              <dt>{m.transfers_file_details_verified()}</dt>
+              <dd>{m.transfers_file_details_parts_of({
+                n: d.verified_parts,
+                parts: d.part_count,
+              })}</dd>
+
+              <dt>{m.transfers_file_details_in_progress()}</dt>
+              <dd>{d.in_progress_parts}</dd>
+            {/if}
+
+            <!-- The tracker's figures where there is one, the transfer row's
+                 otherwise: both are gap-derived, and a dialog that shows
+                 nothing at all once a download finishes is worse than one that
+                 shows the row it already had. -->
+            <dt>{m.transfers_file_details_on_disk()}</dt>
+            <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
+
+            <dt>{m.transfers_file_details_remaining()}</dt>
+            <dd>{formatSize(hasMap
+              ? d.remaining_bytes
+              : Math.max(0, t.total_size - t.completed_size))}</dd>
+
+            <!-- Wire bytes, which exceed the file once a corrupt part has been
+                 re-fetched. Worth showing next to the on-disk figure, because
+                 the gap between them is what a bad source costs. -->
+            <dt>{m.transfers_file_details_transferred()}</dt>
+            <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
+
+            {#if hasMap}
+              <dt>{m.transfers_file_details_availability()}</dt>
+              <dd>
+                {#if d.sources_with_bitmaps === 0}
+                  {m.common_unknown()}
+                {:else}
+                  {m.transfers_file_details_rarest({
+                    n: d.rarest_part_sources,
+                    sources: d.sources_with_bitmaps,
+                  })}
+                {/if}
+              </dd>
+            {/if}
+
+            <dt>{m.transfers_col_last_seen_complete()}</dt>
+            <dd>
+              <!-- Relative here, where the question is "is this file still
+                   out there"; the column gives the absolute date. Both take
+                   unix *seconds* — `formatRelativeTime` compares against
+                   `Date.now() / 1000`, so passing milliseconds would read as
+                   "now" for every value. -->
+              {t.last_seen_complete
+                ? formatRelativeTime(t.last_seen_complete)
+                : m.common_unknown()}
+            </dd>
+
+            <dt>{m.transfers_col_sources()}</dt>
+            <dd>{sourcesLabel(t)}</dd>
+          </dl>
+        {/if}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
+  /* --- File Details dialog ---
+     Same shell as the Search page's details modal, so the two read as the same
+     kind of window. Scoped styles, so it is repeated rather than shared; the
+     alternative is a component extraction that neither page needs yet. */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--overlay-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .modal-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .dl-details-modal {
+    width: min(560px, 100%);
+    max-height: min(640px, calc(100vh - 48px));
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .modal-title {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .modal-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+
+  .modal-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .modal-body {
+    padding: 16px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  /* The filename leads: it is what the reader opened the dialog to check, and
+     release names need the full width. */
+  .dl-details-hero {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .dl-details-name {
+    font-weight: 600;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .dl-details-sub,
+  .dl-chunk-legend {
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .dl-chunk-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+
+  .dl-chunk-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-grid {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+    gap: 6px 16px;
+    margin: 0;
+    font-size: 12px;
+  }
+
+  .dl-details-grid dt {
+    color: var(--text-secondary);
+  }
+
+  .dl-details-grid dd {
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+
+  @media (max-width: 560px) {
+    .modal-overlay {
+      padding: 0;
+      align-items: stretch;
+    }
+
+    .dl-details-modal {
+      width: 100%;
+      max-height: 100vh;
+      border: none;
+      border-radius: 0;
+    }
+
+    .dl-details-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0;
+    }
+
+    .dl-details-grid dt {
+      margin-top: 6px;
+    }
+  }
+
   /* --- Layout --- */
   .transfers-split {
     flex: 1;

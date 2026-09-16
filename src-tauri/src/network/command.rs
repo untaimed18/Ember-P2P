@@ -186,6 +186,7 @@ async fn handle_command_inner(
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
                 ed2k_noted_availability: HashMap::new(),
+                ed2k_noted_complete_sources: HashMap::new(),
                 dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
@@ -3436,6 +3437,10 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(result));
         }
 
+        NetworkCommand::GetDownloadFileDetails { transfer_id, tx } => {
+            let details = download_file_details(state, &transfer_id).await;
+            let _ = tx.send(details);
+        }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
             let snap = upload_queue_snapshot(
                 upload_queue,

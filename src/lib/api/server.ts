@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ServerInfo, ServerPriority } from '$lib/types';
+import type { ServerInfo, ServerLogLine, ServerPriority } from '$lib/types';
 
 export async function connectToServer(ip: string, port: number): Promise<string> {
   return invoke('connect_to_server', { ip, port });
@@ -36,6 +36,19 @@ export async function getServerList(): Promise<ServerInfo[]> {
 
 export async function getConnectedServer(): Promise<ServerInfo | null> {
   return invoke('get_connected_server');
+}
+
+/** The backend's retained server log, oldest line first. Used to restore the
+ *  history after a reload of the webview, which the frontend store cannot
+ *  survive on its own. */
+export async function getServerLog(): Promise<ServerLogLine[]> {
+  return invoke('get_server_log');
+}
+
+/** Discard the backend's retained log, so clearing the view is permanent
+ *  rather than undone by the next reload. */
+export async function clearServerLogHistory(): Promise<void> {
+  return invoke('clear_server_log');
 }
 
 export async function downloadServerMet(url: string): Promise<string> {

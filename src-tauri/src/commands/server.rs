@@ -377,6 +377,23 @@ pub async fn get_connected_server(
     .await
 }
 
+/// The retained eD2K server log, oldest line first.
+///
+/// Read straight out of the replay buffer rather than through the network
+/// task: it is an in-memory list behind a short lock, and the caller is a
+/// page that has just loaded and wants its history back.
+#[tauri::command]
+pub fn get_server_log() -> Vec<crate::network::ServerLogLine> {
+    crate::network::server_log_history()
+}
+
+/// Discard the retained log, so that clearing the view clears it for good
+/// rather than until the next reload replays it back into place.
+#[tauri::command]
+pub fn clear_server_log() {
+    crate::network::clear_server_log_history();
+}
+
 #[tauri::command]
 pub async fn download_server_met(
     app: tauri::AppHandle,

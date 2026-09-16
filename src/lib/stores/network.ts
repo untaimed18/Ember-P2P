@@ -1,14 +1,15 @@
 import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { DegradedReason, NetworkStats } from '$lib/types';
+import type { DegradedReason, NetworkStats, ServerLogLine } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
+import { getServerLog } from '$lib/api/server';
 import { relatedSearchSupported as apiRelatedSearchSupported } from '$lib/api/search';
 import { withTimeout } from '$lib/utils';
 import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
-import { appendServerLog } from '$lib/stores/serverLog';
+import { appendServerLog, hydrateServerLog } from '$lib/stores/serverLog';
 import * as m from '$lib/paraglide/messages';
 import { translateError } from '$lib/i18n';
 
@@ -404,11 +405,10 @@ export async function initNetworkStore() {
     // leaving the Servers tab: the page component is destroyed on every
     // navigation, and while it owned this listener the server's greeting was
     // both forgotten and, for anything that arrived while the user was
-    // elsewhere, never recorded. Nothing replays it — the backend emits and
-    // forgets — so the listener has to outlive the view.
-    registered.push(await listen<{ message: string }>('server-log', (event) => {
-      const message = event.payload?.message;
-      if (typeof message === 'string') appendServerLog(message);
+    // elsewhere, never recorded. So the listener has to outlive the view.
+    registered.push(await listen<ServerLogLine>('server-log', (event) => {
+      const line = event.payload;
+      if (typeof line?.message === 'string') appendServerLog(line.message, line);
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       const status = narrowServerStatus(event.payload?.status);
@@ -442,6 +442,20 @@ export async function initNetworkStore() {
     return;
   }
   unlisteners.push(...registered);
+
+  try {
+    // Ask for the log the backend kept. Deliberately after the listener above
+    // is live, so a line emitted while this is in flight is caught rather than
+    // falling between the two; `hydrateServerLog` reconciles the overlap.
+    //
+    // Restores the history after a reload of the webview, which wipes the
+    // store even though the backend and its server connection are untouched.
+    const history = await getServerLog();
+    if (myEpoch !== storeEpoch) return;
+    hydrateServerLog(history);
+  } catch {
+    // The log is a courtesy; a page with no history is still a working page.
+  }
 
   try {
     const stats = await getNetworkStats();

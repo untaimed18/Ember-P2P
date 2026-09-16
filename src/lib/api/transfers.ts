@@ -7,6 +7,7 @@ import type {
   StartDownloadResponse,
   UploadQueueClient,
   KnownClient,
+  DownloadFileDetails,
 } from '$lib/types';
 
 /** Normalize a trusted AICH pin while rejecting malformed non-empty values. */
@@ -115,6 +116,22 @@ export async function getUploadQueue(): Promise<UploadQueueClient[]> {
   // backend leaves the caller's in-flight guard latched forever. Reads an
   // in-memory queue snapshot; 8 s is generous.
   return withTimeout(invoke<UploadQueueClient[]>('get_upload_queue'), 'get_upload_queue', 8_000);
+}
+
+/** Chunk map and part counters for one download, for the File Details window.
+ *  Read when the window opens and while it stays open, never on the transfers
+ *  poll — a per-part bitmap on every tick would be paid for by every user who
+ *  never opens it. */
+export async function getDownloadFileDetails(
+  transferId: string,
+): Promise<DownloadFileDetails> {
+  // Bounded for the same reason the queue snapshot is: the window refreshes on
+  // a timer, so a wedged backend must not latch the caller's in-flight guard.
+  return withTimeout(
+    invoke<DownloadFileDetails>('get_download_file_details', { transferId }),
+    'get_download_file_details',
+    8_000,
+  );
 }
 
 /** Snapshot of every persistent SecIdent credit record (transfers bottom

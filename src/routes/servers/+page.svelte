@@ -10,6 +10,7 @@
     setServerStatic,
     setServerPriority,
     downloadServerMet,
+    clearServerLogHistory,
   } from '$lib/api/server';
   import type { ServerInfo, ServerPriority } from '$lib/types';
   import { onMount, untrack } from 'svelte';
@@ -141,6 +142,15 @@
       if (logArea) logArea.scrollTop = logArea.scrollHeight;
     });
   });
+
+  /// Clears the view and the backend's replay buffer. Without the second half,
+  /// the next reload would hand the cleared lines straight back.
+  function clearLog() {
+    clearServerLog();
+    void clearServerLogHistory().catch(() => {
+      // The visible log is already clear, which is what was asked for.
+    });
+  }
 
   onMount(() => {
     mounted = true;
@@ -1191,7 +1201,7 @@
   <div class="server-lower">
     <div class="log-toolbar">
       <span class="toolbar-label">{m.servers_log_title()}</span>
-      <button class="ghost btn-sm" onclick={clearServerLog}>{m.common_clear()}</button>
+      <button class="ghost btn-sm" onclick={clearLog}>{m.common_clear()}</button>
     </div>
     <div class="log-area" bind:this={logArea}>
       {#if $serverLog.length === 0}

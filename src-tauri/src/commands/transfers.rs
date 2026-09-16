@@ -1849,6 +1849,28 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
 /// "Queued" tab in the transfers/uploads pane. Each row already carries
 /// resolved file name + credit info so the frontend doesn't need any
 /// follow-up commands per row.
+/// Chunk map and part counters for one download, for the "File Details"
+/// window. Read on demand rather than carried on every transfers poll, because
+/// a per-part bitmap on every tick would be paid for by every user who never
+/// opens the window.
+#[tauri::command]
+pub async fn get_download_file_details(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<crate::types::DownloadFileDetails, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetDownloadFileDetails { transfer_id, tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(
+        rx,
+        "transfers_file_details_failed",
+        "Failed to read file details",
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn get_upload_queue(
     state: tauri::State<'_, AppState>,

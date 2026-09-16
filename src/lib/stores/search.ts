@@ -5,6 +5,12 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
 import { shedWeakestRows } from '$lib/searchOverflow';
+import {
+  PERSIST_RETRY_LIMITS,
+  SEARCH_STORAGE_KEY,
+  buildPersistPayload,
+  parsePersistedSearch,
+} from '$lib/searchPersistence';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
 
@@ -44,8 +50,52 @@ export type SearchTab = {
   error: string | null;
 };
 
-export const searchTabs = writable<SearchTab[]>([]);
-export const activeSearchTabId = writable<string | null>(null);
+/**
+ * Restore the tabs a reload would otherwise have thrown away. The rules live in
+ * `searchPersistence.ts`; what is left here is the storage itself.
+ *
+ * Written at `pagehide` rather than on every change: results arrive in batches
+ * and a tab can hold thousands of rows, so serialising on each update would
+ * cost far more than the one write that actually matters.
+ */
+function persistSearch() {
+  if (typeof sessionStorage === 'undefined') return;
+  const tabs = get(searchTabs);
+  if (tabs.length === 0) {
+    try {
+      sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+    } catch {
+      /* nothing to lose */
+    }
+    return;
+  }
+  const activeId = get(activeSearchTabId);
+  for (const limit of PERSIST_RETRY_LIMITS) {
+    try {
+      const payload = buildPersistPayload(tabs, activeId, limit);
+      sessionStorage.setItem(SEARCH_STORAGE_KEY, JSON.stringify(payload));
+      return;
+    } catch {
+      // Quota, or a value that would not serialise. Try a smaller payload.
+    }
+  }
+}
+
+const persistedSearch = parsePersistedSearch(
+  typeof sessionStorage === 'undefined' ? null : sessionStorage.getItem(SEARCH_STORAGE_KEY),
+);
+
+export const searchTabs = writable<SearchTab[]>(persistedSearch.tabs);
+export const activeSearchTabId = writable<string | null>(persistedSearch.activeId);
+
+if (typeof window !== 'undefined') {
+  // `pagehide` covers the reload and the window going away; the hidden branch
+  // of `visibilitychange` is the backstop for paths that do not fire it.
+  window.addEventListener('pagehide', persistSearch);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') persistSearch();
+  });
+}
 /** Bumped when learned spam data is wiped so the search page can drop
  *  tooltip caches that would otherwise outlive empty `spam_reasons`. */
 export const spamFilterEpoch = writable(0);
