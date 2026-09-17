@@ -12322,6 +12322,19 @@ pub enum NetworkCommand {
     GetKnownClientsSnapshot {
         tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
     },
+    /// Just the two row counts [`GetKnownClientsSnapshot`] would produce.
+    ///
+    /// The tab labels carry those counts, so they have to keep moving while
+    /// some other tab is showing — but the full snapshot is far too expensive
+    /// to poll for two integers: it joins a `spawn_blocking` SQLite read for
+    /// friend metadata, resolves an ident state, credit ratio and GeoIP
+    /// country per record, and allocates six owned strings per row, for up to
+    /// `MAX_CREDIT_RECORDS` rows. None of that changes which tab a record
+    /// lands on, which is decided solely by whether it has a bound Ember
+    /// identity, so counting needs no allocation, no database and no GeoIP.
+    GetKnownClientCounts {
+        tx: oneshot::Sender<crate::types::KnownClientCounts>,
+    },
     /// Anti-leech client filter — read the current pattern list + flag
     /// for the Settings UI.
     GetAntiLeechSnapshot {
@@ -25654,6 +25667,41 @@ async fn upload_queue_snapshot(
 /// (reseed / Hello binding) with zero transfer bytes and `ident_ip == 0`.
 /// Their usable address and last-seen live in the friends SQLite table,
 /// so we join that metadata in here before handing rows to the UI.
+/// Count what [`known_clients_snapshot`] would return, without building it.
+///
+/// Kept immediately beside that function because the two have to agree: a tab
+/// label that disagrees with the table it opens is worse than a stale one. The
+/// only thing that decides which tab a record lands on is whether it resolves
+/// an Ember identity — from the persisted `ember_hash`, or from a live queue
+/// row that verified one this session before the credit flush landed — so this
+/// reproduces exactly that rule and nothing else. No friends lookup, no ident
+/// state, no credit ratio, no GeoIP, and no per-row allocation.
+async fn known_client_counts(
+    credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
+) -> crate::types::KnownClientCounts {
+    let live_ember: std::collections::HashSet<[u8; 16]> = {
+        let q = upload_queue.lock().await;
+        q.iter()
+            .filter(|entry| {
+                entry.user_hash != [0u8; 16] && entry.ember_verified && entry.ember_pubkey.is_some()
+            })
+            .map(|entry| entry.user_hash)
+            .collect()
+    };
+
+    let cm = credit_manager.read().await;
+    let mut counts = crate::types::KnownClientCounts::default();
+    for record in cm.all_records().iter() {
+        if record.ember_hash.is_some() || live_ember.contains(&record.user_hash) {
+            counts.ember = counts.ember.saturating_add(1);
+        } else {
+            counts.ed2k = counts.ed2k.saturating_add(1);
+        }
+    }
+    counts
+}
+
 async fn known_clients_snapshot(
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
     friend_hashes: &crate::app_state::SharedFriendHashes,

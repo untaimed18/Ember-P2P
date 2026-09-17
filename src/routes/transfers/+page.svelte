@@ -9,7 +9,7 @@
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
-    getUploadQueue, getKnownClients, getDownloadFileDetails,
+    getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
@@ -26,7 +26,7 @@
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type {
-    Transfer, SourceInfo, UploadQueueClient, KnownClient, DownloadFileDetails,
+    Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { scale } from 'svelte/transition';
@@ -313,18 +313,15 @@
     compactMq.addEventListener('change', onCompactMq);
     viewportCompactCleanup = () => compactMq.removeEventListener('change', onCompactMq);
 
-    // One-shot fetch of the known-clients snapshot so the bottom-tab label
-    // shows its count immediately on page load, not just after the user has
-    // clicked the tab. That poll is still owned by the per-tab `$effect`
-    // below and runs only while the tab is visible, so without this
-    // "Known ED2K Peers (N)" rendered as a bare "Known ED2K Peers" until
-    // first click, and the number vanished again on every visit.
+    // Prime the known-peer tab labels so they carry a count on first paint
+    // rather than after the first poll interval. The `$effect` below now keeps
+    // them current on any tab — via the counts-only command when its own tab is
+    // hidden — so this is purely about the gap before its first tick, and it
+    // uses the same cheap command rather than pulling the whole ledger.
     //
     // The upload queue needs no equivalent: its poll runs on whichever tab
     // is showing, so it primes its own count.
-    //
-    // Priming the tab count only needs the list, not a badge sweep.
-    refreshKnownClients(false);
+    void refreshKnownCounts();
     void refreshFriendHashes();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
@@ -937,6 +934,15 @@
   //     visibility so background tabs don't keep the network task busy.
   let uploadQueueClients: UploadQueueClient[] = $state([]);
   let knownClients: KnownClient[] = $state([]);
+  /** Counts behind the two known-peer tab labels.
+   *
+   *  Deliberately separate from `knownClients`, and the only thing the labels
+   *  read. The full ledger is fetched only while one of those tabs is showing,
+   *  so deriving the labels from it left them frozen at whatever the last visit
+   *  saw — a peer count that never moved until clicked. This is fed by the
+   *  cheap counts command off-tab and by the full snapshot on it, so there is
+   *  one source of truth and it is always the freshest answer received. */
+  let knownCounts = $state<KnownClientCounts | null>(null);
   let uploadQueueLoaded = $state(false);
   let knownClientsLoaded = $state(false);
 
@@ -958,11 +964,22 @@
   const QUEUE_BADGE_POLL_INTERVAL_MS = 15000;
   let queueTabActive = $derived(bottomView === 'queued');
   const KNOWN_POLL_INTERVAL_MS = 8000;
+  // Cadence for the counts-only poll that runs on every other bottom tab.
+  // Slower than the queue's badge poll because credit records accrue far more
+  // slowly than queue rank changes, and this is a number in a label.
+  const KNOWN_BADGE_POLL_INTERVAL_MS = 30000;
+  let knownLedgerActive = $derived(isKnownLedgerView(bottomView));
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
   let uploadQueueGen = 0;
   let knownClientsGen = 0;
+  // Guards `knownCounts` alone, and is claimed by both writers — the cheap
+  // counts poll and the full snapshot — so whichever *started* last wins
+  // regardless of which resolves first. Without a shared counter a slow
+  // counts request begun before a tab switch could land on top of the fresher
+  // figures the snapshot had already published.
+  let knownCountsGen = 0;
   // Consecutive-failure counters for the *first* load only (reset on any
   // success). If the very first snapshot keeps failing — e.g. the tab is
   // opened right after launch, before the network task's command loop is
@@ -1008,12 +1025,35 @@
       }
     }
   }
+  /** Refresh just the tab-label counts. Cheap enough to run on any tab. */
+  async function refreshKnownCounts() {
+    const gen = ++knownCountsGen;
+    try {
+      const counts = await getKnownClientCounts();
+      if (!mounted || gen !== knownCountsGen) return;
+      knownCounts = counts;
+    } catch (e) {
+      // Leave the last good figures up rather than blanking the labels; the
+      // next tick retries.
+      console.warn('Failed to refresh known client counts:', e);
+    }
+  }
+
   async function refreshKnownClients(refreshBadges = true) {
     const gen = ++knownClientsGen;
+    const countGen = ++knownCountsGen;
     try {
       const data = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
       knownClients = data;
+      // The ledger we just fetched is a stricter answer than the counts poll
+      // can give, so publish the labels from it. Split exactly as `knownSplit`
+      // does, or the label and the table it opens would disagree.
+      if (countGen === knownCountsGen) {
+        let ember = 0;
+        for (const kc of data) if (kc.ember_hash) ember++;
+        knownCounts = { ed2k: data.length - ember, ember };
+      }
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
@@ -1254,42 +1294,66 @@
   });
 
   $effect(() => {
-    // Same pattern as the queue poll; longer interval because credit
-    // records change far less often than queue rank. Friend hashes are
-    // refreshed on the same cadence so add/remove from the Friends page
-    // updates markers while this tab stays open.
-    if (isKnownLedgerView(bottomView)) {
-      refreshKnownClients();
-      void refreshFriendHashes();
-      if (knownPollHandle === null) {
-        knownPollHandle = setInterval(() => {
-          // Every other poll in the app skips work while the window is
-          // hidden; this one did not, so a minimized client kept sweeping
-          // reputations forever.
-          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-            return;
-          }
+    // Same pattern as the queue poll, and for the same reason: both known-peer
+    // tab labels carry a count, so the poll cannot stop when the tab is hidden.
+    // It used to, which left "Known ED2K Peers (1678)" frozen at whatever the
+    // last visit happened to see — or at the mount-time prime — for the rest of
+    // the session.
+    //
+    // What changes off-tab is *what* is fetched, not just how often. The full
+    // ledger joins a `spawn_blocking` database read and resolves an ident
+    // state, credit ratio and GeoIP country for every one of up to
+    // `MAX_CREDIT_RECORDS` rows; running that to keep two integers current
+    // would cost more than the tabs are worth. `get_known_client_counts`
+    // answers the same question without the database, the lookups or the
+    // per-row allocation, so that is what runs on every other tab.
+    //
+    // Read through a `$derived` so moving between two tabs that are both "not
+    // a known-peer tab" doesn't tear down and rebuild the interval.
+    const onTab = knownLedgerActive;
+    const pump = () => {
+      if (onTab) {
+        refreshKnownClients();
+        // Friend hashes ride the ledger poll so add/remove from the Friends
+        // page updates the markers while the tab stays open. The labels carry
+        // no friend state, so the counts-only path does not need them.
+        void refreshFriendHashes();
+      } else {
+        void refreshKnownCounts();
+      }
+    };
+    pump();
+    // Rebuilt rather than reused when the cadence changes, so arriving on the
+    // tab starts polling at the ledger's rate instead of keeping the label's.
+    knownPollHandle = setInterval(
+      () => {
+        // Every other poll in the app skips work while the window is
+        // hidden; this one did not, so a minimized client kept sweeping
+        // reputations forever.
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+          return;
+        }
+        pump();
+      },
+      onTab ? KNOWN_POLL_INTERVAL_MS : KNOWN_BADGE_POLL_INTERVAL_MS,
+    );
+    // Skipping ticks while hidden means the first thing the user sees on
+    // restoring the window is up to a full interval out of date, so pump
+    // once on the way back — the same catch-up the network and transfer
+    // stores do around their own visibility gates. Reads `bottomView` live
+    // rather than closing over `onTab`, because this handler outlives the
+    // effect run that registered it.
+    if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
+      knownVisibilityHandler = () => {
+        if (document.visibilityState !== 'visible') return;
+        if (isKnownLedgerView(bottomView)) {
           refreshKnownClients();
           void refreshFriendHashes();
-        }, KNOWN_POLL_INTERVAL_MS);
-      }
-      // Skipping ticks while hidden means the first thing the user sees on
-      // restoring the window is up to a full interval out of date, so pump
-      // once on the way back — the same catch-up the network and transfer
-      // stores do around their own visibility gates.
-      if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
-        knownVisibilityHandler = () => {
-          if (document.visibilityState !== 'visible' || !isKnownLedgerView(bottomView)) {
-            return;
-          }
-          refreshKnownClients();
-          void refreshFriendHashes();
-        };
-        document.addEventListener('visibilitychange', knownVisibilityHandler);
-      }
-    } else if (knownPollHandle !== null) {
-      clearInterval(knownPollHandle);
-      knownPollHandle = null;
+        } else {
+          void refreshKnownCounts();
+        }
+      };
+      document.addEventListener('visibilitychange', knownVisibilityHandler);
     }
     return () => {
       if (knownPollHandle !== null) {
@@ -2343,6 +2407,9 @@
     if (isKnownLedgerView(bottomView)) {
       refreshKnownClients();
       void refreshFriendHashes();
+    } else {
+      // Not on a known-peer tab, but their labels are still on screen.
+      void refreshKnownCounts();
     }
     if (expandedTransferId) {
       void refreshExpandedSourceDetails(expandedTransferId);
@@ -4394,7 +4461,7 @@
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title={m.transfers_tab_known_title()}
-        >{knownClientsLoaded ? m.transfers_tab_known_count({ count: knownSplit.ed2k.length }) : m.transfers_tab_known()}</button>
+        >{knownCounts ? m.transfers_tab_known_count({ count: knownCounts.ed2k }) : m.transfers_tab_known()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_ember'}
@@ -4404,7 +4471,7 @@
           tabindex={bottomView === 'known_ember' ? 0 : -1}
           onclick={() => bottomView = 'known_ember'}
           title={m.transfers_tab_known_ember_title()}
-        >{knownClientsLoaded ? m.transfers_tab_known_ember_count({ count: knownSplit.ember.length }) : m.transfers_tab_known_ember()}</button>
+        >{knownCounts ? m.transfers_tab_known_ember_count({ count: knownCounts.ember }) : m.transfers_tab_known_ember()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}

@@ -1908,6 +1908,28 @@ pub async fn get_known_clients(
     .await
 }
 
+/// Row counts for the two known-peer tabs.
+///
+/// The tab labels carry these, so they are polled on whichever tab is showing;
+/// `get_known_clients` is far too expensive to run for two integers. See
+/// `NetworkCommand::GetKnownClientCounts`.
+#[tauri::command]
+pub async fn get_known_client_counts(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types::KnownClientCounts, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetKnownClientCounts { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(
+        rx,
+        "transfers_known_client_counts_failed",
+        "Failed to get known client counts",
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn set_transfer_priority(
     state: tauri::State<'_, AppState>,

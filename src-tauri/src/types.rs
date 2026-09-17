@@ -1870,6 +1870,18 @@ pub struct DownloadFileDetails {
     pub tracked: bool,
 }
 
+/// Row counts for the two known-peer tabs, split the same way
+/// [`KnownClient`] rows are split: a record with a bound Ember identity is an
+/// Ember peer, everything else is an eD2K peer.
+///
+/// Exists so the tab labels can stay current without polling the full
+/// snapshot — see `NetworkCommand::GetKnownClientCounts`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct KnownClientCounts {
+    pub ed2k: u32,
+    pub ember: u32,
+}
+
 /// One row in the upload-pane "Known Clients" tab — a SecIdent credit
 /// record. These are persistent across sessions (clients.met) so the
 /// list is the lifetime view of every peer we've ever traded credit

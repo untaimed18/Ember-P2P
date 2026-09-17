@@ -7,6 +7,7 @@ import type {
   StartDownloadResponse,
   UploadQueueClient,
   KnownClient,
+  KnownClientCounts,
   DownloadFileDetails,
 } from '$lib/types';
 
@@ -141,6 +142,20 @@ export async function getKnownClients(): Promise<KnownClient[]> {
   // Also polled (8 s). Reads the persistent credit store, so allow more room
   // than the queue snapshot above.
   return withTimeout(invoke<KnownClient[]>('get_known_clients'), 'get_known_clients', 15_000);
+}
+
+/** Just the two row counts the tab labels carry.
+ *
+ *  Polled on whichever bottom tab is showing, so that the counts keep moving
+ *  without the user visiting the tab. `getKnownClients` cannot be used for
+ *  that: it joins a database read and resolves an ident state, credit ratio
+ *  and country per record, none of which the labels need. */
+export async function getKnownClientCounts(): Promise<KnownClientCounts> {
+  return withTimeout(
+    invoke<KnownClientCounts>('get_known_client_counts'),
+    'get_known_client_counts',
+    8_000,
+  );
 }
 
 export async function clearCompleted(): Promise<number> {

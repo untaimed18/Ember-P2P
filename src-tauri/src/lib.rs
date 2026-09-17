@@ -1822,6 +1822,7 @@ pub fn run() {
             commands::transfers::get_upload_queue,
             commands::transfers::get_download_file_details,
             commands::transfers::get_known_clients,
+            commands::transfers::get_known_client_counts,
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,

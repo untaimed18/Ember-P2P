@@ -822,6 +822,15 @@ export interface KnownClient {
   nickname?: string;
 }
 
+/** Row counts for the two known-peer tabs, split the same way `KnownClient`
+ *  rows are: a record with a bound Ember identity is an Ember peer, everything
+ *  else is an eD2K peer. Mirrors `crate::types::KnownClientCounts`.
+ *  Populated by `invoke('get_known_client_counts')`. */
+export interface KnownClientCounts {
+  ed2k: number;
+  ember: number;
+}
+
 /** Snapshot of the anti-leech client filter — the eMule-style
  *  AntiLeech.dat equivalent. Populated by `invoke('get_antileech_patterns')`. */
 export interface AntiLeechSnapshot {

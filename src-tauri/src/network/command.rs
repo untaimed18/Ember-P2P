@@ -3479,6 +3479,20 @@ async fn handle_command_inner(
             });
         }
 
+        NetworkCommand::GetKnownClientCounts { tx } => {
+            // Off the network task for the same reason as the snapshot above:
+            // the record walk is bounded by `MAX_CREDIT_RECORDS`. It is far
+            // cheaper per record — an integer test, no allocation — but this
+            // is the poll that runs whichever tab is showing, so it is the one
+            // that must never be the thing holding up UDP receive.
+            let credit_manager = credit_manager.clone();
+            let upload_queue = upload_queue.clone();
+            tokio::spawn(async move {
+                let counts = known_client_counts(&credit_manager, &upload_queue).await;
+                let _ = tx.send(counts);
+            });
+        }
+
         NetworkCommand::GetAntiLeechSnapshot { tx } => {
             let _ = tx.send(antileech_snapshot(state));
         }
