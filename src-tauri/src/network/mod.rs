@@ -15693,9 +15693,20 @@ fn flush_channel_member_touches(state: &mut NetworkState, db: &Database) {
     // `last_seen` is soft state that the member's next datagram re-establishes,
     // and the buffer coalesces in the meantime, so batching costs only a little
     // resolution on a presence timestamp.
-    if state
-        .channel_member_touch_flushed_at
-        .is_some_and(|at| at.elapsed() < CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL)
+    //
+    // The pacing yields to the buffer's own ceiling. `note_channel_member_alive`
+    // refuses a *new* key once the map is full, so a window long enough to
+    // reach `MAX_CHANNEL_MEMBER_TOUCHES` distinct `(room, member)` pairs starts
+    // silently dropping members' presence instead of merely delaying it — and
+    // the cap is roughly sixteen full rosters, which a user in that many busy
+    // rooms can reach in ten seconds where they could not in one. Draining at
+    // the halfway mark keeps the cap from ever being the thing that loses a
+    // touch, while leaving the common case on the slow cadence.
+    let near_capacity = state.channel_member_touches.len() >= MAX_CHANNEL_MEMBER_TOUCHES / 2;
+    if !near_capacity
+        && state
+            .channel_member_touch_flushed_at
+            .is_some_and(|at| at.elapsed() < CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL)
     {
         return;
     }

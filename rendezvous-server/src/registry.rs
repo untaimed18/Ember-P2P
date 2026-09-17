@@ -817,6 +817,101 @@ mod tests {
             .is_ok());
     }
 
+    /// `persist` writes through a borrowed mirror of `RegistryFile` to avoid
+    /// cloning four maps — one of them the permanent tombstone set — on every
+    /// claim, nomination, delete and reap. The two must serialise identically
+    /// or the next load reads a different file than the one that was written.
+    #[test]
+    fn the_borrowed_write_form_serialises_exactly_like_the_owned_one() {
+        let mut reg = ChannelRegistry::in_memory();
+        assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg
+            .set_channel_nominee(&id, &pk, &"bb".repeat(32), 7)
+            .is_ok());
+        let gone = "33".repeat(16);
+        let gone_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&gone, &gone_pk, "Gone", false).is_ok());
+        assert!(reg.delete_channel(&gone, &gone_pk).is_ok());
+
+        let borrowed = serde_json::to_vec_pretty(&RegistryFileRef {
+            usernames: &reg.usernames,
+            names: &reg.names,
+            deleted: &reg.deleted,
+            username_activity: &reg.username_activity,
+        })
+        .expect("borrowed form serialises");
+        let owned = serde_json::to_vec_pretty(&RegistryFile {
+            usernames: reg.usernames.clone(),
+            names: reg.names.clone(),
+            deleted: reg.deleted.clone(),
+            username_activity: reg.username_activity.clone(),
+        })
+        .expect("owned form serialises");
+
+        assert_eq!(
+            String::from_utf8(borrowed).unwrap(),
+            String::from_utf8(owned).unwrap()
+        );
+    }
+
+    /// A handoff moves the name's record rather than re-claiming it, so it
+    /// must not be exposed to the confusable scan — the successor is taking
+    /// the *same* name, which necessarily collides with itself. Pinned because
+    /// the scan and the handover live in different functions and nothing else
+    /// would notice if handover started routing through the claim path.
+    #[test]
+    fn a_handover_keeps_the_name_and_is_not_blocked_by_the_confusable_scan() {
+        let mut reg = ChannelRegistry::in_memory();
+        let old_id = "11".repeat(16);
+        let old_pk = "22".repeat(32);
+        let new_id = "33".repeat(16);
+        let new_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&old_id, &old_pk, "Lobby", false).is_ok());
+
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &old_pk, unix_now())
+            .is_ok());
+
+        let listing = reg.public_directory();
+        assert_eq!(listing.len(), 1, "the name moved rather than duplicating");
+        assert_eq!(listing[0].channel_id, new_id);
+        assert_eq!(listing[0].name, "Lobby");
+
+        // And the successor, now the holder, can still refresh its own claim —
+        // the scan skips same-channel rows, so its own name is not a lookalike
+        // of itself.
+        assert!(reg
+            .claim_channel_name(&new_id, &new_pk, "Lobby", false)
+            .is_ok());
+    }
+
+    /// The predecessor's record is gone after a handoff, so a successor that
+    /// wants a *different* name is judged against every other room and not
+    /// against the room it replaced.
+    #[test]
+    fn a_successor_can_take_a_different_name_after_a_handover() {
+        let mut reg = ChannelRegistry::in_memory();
+        let old_id = "11".repeat(16);
+        let old_pk = "22".repeat(32);
+        let new_id = "33".repeat(16);
+        let new_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&old_id, &old_pk, "Lobby", false).is_ok());
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &old_pk, unix_now())
+            .is_ok());
+
+        // One name per room, so the successor must release "Lobby" first; that
+        // is the pre-existing rule, not something the confusable scan added.
+        assert_eq!(
+            reg.claim_channel_name(&new_id, &new_pk, "Lounge", false),
+            Err(RegistryError::Taken)
+        );
+        assert!(reg.delete_channel(&new_id, &new_pk).is_ok());
+    }
+
     /// An owner-deleted name never comes back, so a lookalike of one must not
     /// either — otherwise the retirement just moves the name one homoglyph
     /// away, to a room whose owner is gone and cannot object.

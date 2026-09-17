@@ -1299,6 +1299,51 @@ mod local_index_tests {
     use crate::types::FileInfo;
     use std::collections::HashSet;
 
+    /// The bulk merge builds its lookup key by hand into a reused buffer
+    /// instead of calling `hex::encode` per row. If that spelling ever drifts
+    /// from what `hash_map` is keyed on, nothing breaks loudly — every lookup
+    /// simply misses and the all-time columns quietly stop advancing, on a
+    /// path that only runs on a 5s timer.
+    #[test]
+    fn bulk_alltime_merge_finds_rows_by_the_same_key_hex_encode_produces() {
+        let raw: [u8; 16] = [
+            0x00, 0x0f, 0x10, 0xa0, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe,
+            0x0a, 0xb0,
+        ];
+        let hash = hex::encode(raw);
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file("A/one.bin", &hash, true, "normal")]);
+
+        index.update_alltime_stats_bulk(&[(raw, 7, 3, 4096)]);
+
+        let row = index.get_by_hash(&hash).expect("row resolves by hex key");
+        assert_eq!(row.alltime_requests, 7);
+        assert_eq!(row.alltime_accepted, 3);
+        assert_eq!(row.alltime_transferred, 4096);
+    }
+
+    /// The key buffer is reused across rows, so a short-lived bug in the
+    /// clear-then-rebuild would leave one row's key prefixed onto the next.
+    #[test]
+    fn bulk_alltime_merge_does_not_bleed_keys_between_rows() {
+        let a: [u8; 16] = [0xaa; 16];
+        let b: [u8; 16] = [0xbb; 16];
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/a.bin", &hex::encode(a), true, "normal"),
+            file("A/b.bin", &hex::encode(b), true, "normal"),
+        ]);
+
+        index.update_alltime_stats_bulk(&[(a, 1, 1, 10), (b, 2, 2, 20)]);
+
+        assert_eq!(index.get_by_hash(&hex::encode(a)).unwrap().alltime_requests, 1);
+        assert_eq!(index.get_by_hash(&hex::encode(b)).unwrap().alltime_requests, 2);
+        // A hash nobody shares is skipped rather than mis-applied.
+        index.update_alltime_stats_bulk(&[([0xcc; 16], 9, 9, 9)]);
+        assert_eq!(index.get_by_hash(&hex::encode(a)).unwrap().alltime_requests, 1);
+        assert_eq!(index.get_by_hash(&hex::encode(b)).unwrap().alltime_requests, 2);
+    }
+
     fn file(path: &str, hash: &str, shared: bool, priority: &str) -> FileInfo {
         FileInfo {
             id: hash.to_string(),
