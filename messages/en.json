@@ -1809,6 +1809,7 @@
   "transfers_unknown_client": "Unknown Client",
   "transfers_parts": "{have}/{total} parts",
   "transfers_parts_peer": "{peer} already on peer",
+  "transfers_parts_swarm": "{peer} held by sources",
   "transfers_parts_title": "Parts available from this source",
   "transfers_failed_sources_hidden_one": "1 failed source hidden",
   "transfers_failed_sources_hidden_other": "{count} failed sources hidden",

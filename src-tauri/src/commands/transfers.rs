@@ -1845,10 +1845,6 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
     Ok(manager.get_all())
 }
 
-/// Snapshot of peers currently waiting in our upload queue. Backs the
-/// "Queued" tab in the transfers/uploads pane. Each row already carries
-/// resolved file name + credit info so the frontend doesn't need any
-/// follow-up commands per row.
 /// Chunk map and part counters for one download, for the "File Details"
 /// window. Read on demand rather than carried on every transfers poll, because
 /// a per-part bitmap on every tick would be paid for by every user who never
@@ -1871,6 +1867,10 @@ pub async fn get_download_file_details(
     .await
 }
 
+/// Snapshot of peers currently waiting in our upload queue. Backs the
+/// "Queued" tab in the transfers/uploads pane. Each row already carries
+/// resolved file name + credit info so the frontend doesn't need any
+/// follow-up commands per row.
 #[tauri::command]
 pub async fn get_upload_queue(
     state: tauri::State<'_, AppState>,

@@ -5634,6 +5634,7 @@
             <PartsBar
               partStatus={d.local_part_status}
               peerPartStatus={d.swarm_part_status}
+              peerSense="swarm"
               partCount={d.part_count}
               transferred={d.completed_bytes}
               total={t.total_size}

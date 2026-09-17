@@ -328,6 +328,33 @@ mod tests {
         );
     }
 
+    /// Adding twice and removing once leaves the table permanently inflated,
+    /// which skews `select_part`'s rarity zones exactly as far the other way as
+    /// an unpaired remove does. Each dial site must add once and remove once.
+    #[test]
+    fn a_doubled_add_is_not_undone_by_a_single_remove() {
+        let avail = vec![true, false, true];
+        let mut selector = ChunkSelector::new(3);
+
+        selector.add_source(&avail);
+        let balanced = (selector.part_frequency.clone(), selector.total_sources);
+
+        selector.add_source(&avail);
+        selector.remove_source(&avail);
+        assert_eq!(
+            (selector.part_frequency.clone(), selector.total_sources),
+            balanced,
+            "two adds against one remove must be visible as drift, not absorbed"
+        );
+
+        // And the drift is upward, not a wash.
+        selector.add_source(&avail);
+        assert_ne!(
+            (selector.part_frequency, selector.total_sources),
+            balanced
+        );
+    }
+
     /// An empty availability map means "this source has not answered yet", and
     /// `update_frequencies` does not count it — so neither side of the pair may.
     #[test]

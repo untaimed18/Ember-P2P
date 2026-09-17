@@ -1809,6 +1809,7 @@
   "transfers_unknown_client": "未知客户端",
   "transfers_parts": "{have}/{total} 分块",
   "transfers_parts_peer": "{peer} 已拥有",
+  "transfers_parts_swarm": "{peer} 个由源持有",
   "transfers_parts_title": "该来源可用的分块",
   "transfers_failed_sources_hidden_one": "已隐藏 1 个失败来源",
   "transfers_failed_sources_hidden_other": "已隐藏 {count} 个失败来源",

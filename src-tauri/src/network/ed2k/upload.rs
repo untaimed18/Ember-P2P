@@ -7041,6 +7041,8 @@ impl UploadHandler {
         // [`QUEUED_SOCKET_IDLE_SECS`], which is the only thing that lets go of
         // a waiting peer's connection slot.
         let mut last_inbound: std::time::Instant = std::time::Instant::now();
+        // Separate from `last_inbound`, which stays purely a receive clock.
+        let mut last_friend_keepalive: std::time::Instant = std::time::Instant::now();
 
         // Session-local caches populated lazily on OP_REQUESTPARTS and reused
         // across batches / blocks so we don't re-open the serve file, re-read
@@ -7094,7 +7096,7 @@ impl UploadHandler {
         // tens of seconds inside an `OP_REQUESTPARTS` batch (`WRITE_PACKET_TIMEOUT`
         // is 60 s), so a peer that stops reading our writes could park several
         // maximum-size frames per connection — heap it chooses and we never
-        // look at, multiplied by `MAX_TOTAL_CONNECTIONS`. One in flight plus one
+        // look at, multiplied by `AppSettings::max_connections`. One in flight plus one
         // buffered is all the decoupling this needs: the reason the task exists
         // is frame-state isolation from `select!` cancellation, not throughput.
         let (pkt_tx, mut pkt_rx) =
@@ -7672,6 +7674,32 @@ impl UploadHandler {
                                         &mut writer, OP_EMULEPROT, OP_QUEUERANKING, &qr_payload,
                                     ).await;
                                 }
+                            }
+                            // A peer can hold an Ember friend session *and* a
+                            // queue place at once, and this branch runs first,
+                            // so the `owns_ember_slot` keepalive below is
+                            // unreachable for it. Such a session is not idle in
+                            // the sense the check below means — it carries chat
+                            // and browse, and dropping it would take the peer's
+                            // `ember_sessions` routing entry with it every 40s.
+                            // eMule extends its own timeout for exactly this
+                            // case, a client whose chat state is live
+                            // (`ListenSocket.cpp:143`). Paced off its own clock
+                            // so this is one packet per idle window rather than
+                            // one per 1s queued poll.
+                            if owns_ember_slot {
+                                if last_friend_keepalive.elapsed().as_secs()
+                                    >= QUEUED_SOCKET_IDLE_SECS
+                                {
+                                    last_friend_keepalive = std::time::Instant::now();
+                                    if write_packet_async(
+                                        &mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[],
+                                    ).await.is_err() {
+                                        debug!("Friend keepalive failed, closing session");
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
                             // Promotion has had its chance on this tick; if the
                             // peer is still only waiting and has been silent for

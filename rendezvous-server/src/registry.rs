@@ -273,9 +273,14 @@ impl ChannelRegistry {
         // the block below handles that case with the owner check it needs.
         if !self.names.contains_key(&normalized) {
             let candidate = confusable_key(&normalized);
+            // Tombstones count. The exact-key path below refuses a
+            // owner-deleted name permanently, so exempting those rows here
+            // would have left a homoglyph of a retired name claimable while
+            // the name itself never comes back — the impersonation this check
+            // exists to stop, aimed at a room that no longer has an owner to
+            // notice.
             if self.names.iter().any(|(existing_name, rec)| {
-                !rec.deleted
-                    && !rec.channel_id.eq_ignore_ascii_case(&id)
+                !rec.channel_id.eq_ignore_ascii_case(&id)
                     && confusable_key(existing_name) == candidate
             }) {
                 return Err(RegistryError::Taken);
@@ -810,6 +815,29 @@ mod tests {
         assert!(reg
             .claim_channel_name(&"77".repeat(16), &"88".repeat(32), "Lounge", false)
             .is_ok());
+    }
+
+    /// An owner-deleted name never comes back, so a lookalike of one must not
+    /// either — otherwise the retirement just moves the name one homoglyph
+    /// away, to a room whose owner is gone and cannot object.
+    #[test]
+    fn a_confusable_of_a_retired_name_is_also_refused() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg.delete_channel(&id, &pk).is_ok());
+
+        assert_eq!(
+            reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), "Lobby", false),
+            Err(RegistryError::Taken),
+            "the exact retired name stays retired"
+        );
+        assert_eq!(
+            reg.claim_channel_name(&"55".repeat(16), &"66".repeat(32), "L\u{03BF}bby", false),
+            Err(RegistryError::Taken),
+            "and so does a homoglyph of it"
+        );
     }
 
     /// The confusable check is scoped to *other* rooms, so an owner refreshing

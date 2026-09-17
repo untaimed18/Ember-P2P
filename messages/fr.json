@@ -1809,6 +1809,7 @@
   "transfers_unknown_client": "Client inconnu",
   "transfers_parts": "{have}/{total} parties",
   "transfers_parts_peer": "{peer} déjà chez le pair",
+  "transfers_parts_swarm": "{peer} détenues par des sources",
   "transfers_parts_title": "Parties disponibles depuis cette source",
   "transfers_failed_sources_hidden_one": "1 source échouée masquée",
   "transfers_failed_sources_hidden_other": "{count} sources échouées masquées",

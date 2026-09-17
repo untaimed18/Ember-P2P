@@ -3367,6 +3367,14 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::DropChannelTransfers { channel_id, member } => {
+            // `delete_owned_channel` tombstones the row and then sends this, so
+            // it is the point at which the network task learns a room it may be
+            // publishing for is gone. The cached roster still holds the
+            // pre-tombstone row, and the owner-publish pass skips only rows
+            // whose `deleted` flag it can see — so without this, a destroyed
+            // room could be re-STOREd once more, with a 24 h record TTL, inside
+            // the cache's TTL. Dropping the snapshot costs one re-read.
+            state.channel_roster_cache = None;
             drop_channel_transfers_for(
                 state,
                 app_handle,

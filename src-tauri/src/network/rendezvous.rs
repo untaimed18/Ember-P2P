@@ -2336,6 +2336,10 @@ fn is_not_bidi_or_zero_width(c: char) -> bool {
             | '\u{2069}'
             | '\u{FEFF}'
             | '\u{061C}'
+            // Zl / Zp. Not `char::is_control()`, so nothing else removes them,
+            // and a name pasted out of a PDF or word processor carries them.
+            | '\u{2028}'
+            | '\u{2029}'
     )
 }
 
@@ -2738,6 +2742,32 @@ pub(crate) async fn fetch_deleted_channel_ids(
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
+
+    /// This mirrors the rendezvous server's `strip_invisible`, and a
+    /// divergence is silent and total: the client signs over a string the
+    /// server never derives, so the claim 403s on the new message, 403s again
+    /// on the legacy fallback, and the user sees no reason why. U+2028/U+2029
+    /// are the easy ones to miss — they are `Zl`/`Zp`, not `is_control()`, so
+    /// only the explicit list removes them, and they ride in on text pasted
+    /// from a PDF or word processor.
+    #[test]
+    fn the_invisible_char_filter_matches_the_rendezvous_server() {
+        for c in [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{FEFF}', '\u{061C}', '\u{2028}', '\u{2029}',
+        ] {
+            assert_eq!(
+                strip_invisible(&format!("Lo{c}bby")),
+                "Lobby",
+                "U+{:04X} must be stripped exactly as the server strips it",
+                c as u32
+            );
+        }
+        // Ordinary text, including non-Latin, is untouched.
+        assert_eq!(strip_invisible("  Lobby  "), "Lobby");
+        assert_eq!(strip_invisible("ロビー"), "ロビー");
+    }
 
     #[test]
     fn current_privacy_operation_codes_are_stable() {

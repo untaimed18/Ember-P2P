@@ -1809,6 +1809,7 @@
   "transfers_unknown_client": "Client sconosciuto",
   "transfers_parts": "{have}/{total} parti",
   "transfers_parts_peer": "{peer} già sul peer",
+  "transfers_parts_swarm": "{peer} presenti nelle fonti",
   "transfers_parts_title": "Parti disponibili da questa fonte",
   "transfers_failed_sources_hidden_one": "1 fonte non riuscita nascosta",
   "transfers_failed_sources_hidden_other": "{count} fonti non riuscite nascoste",

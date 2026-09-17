@@ -343,6 +343,15 @@ fn listener_reserve(max: usize) -> usize {
     (max / 4).min(max.saturating_sub(1))
 }
 
+/// How long a download waits for capacity outside [`listener_reserve`] before
+/// it is allowed to draw on the reserve itself. See the loop in
+/// [`acquire_global_dl_conn`] for why the floor is not permanent.
+const MAX_LISTENER_FLOOR_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest a parked download sleeps before re-testing the floor. Only reached
+/// when no connection was released in the meantime.
+const LISTENER_FLOOR_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One connection held by the upload listener against the shared budget.
 /// Releases on drop, exactly as [`GlobalConnPermit`] does for a download.
 pub struct ListenerConnPermit {
@@ -480,7 +489,7 @@ pub fn set_global_conn_limit(max: usize) {
 //
 // Lightweight machine-wide counters so a real run can confirm the queued-source
 // model is behaving and the constants are tuned right. Read by the network
-// loop's periodic summary (`pathb_event_counts` / `global_dl_conn_stats`).
+// loop's periodic summary (`pathb_event_counts` / `global_conn_stats`).
 // Monotonic since process start; cheap relaxed atomics on hot-ish paths.
 static QUEUE_DETACH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PUSH_GRANT_DIVERSION_COUNT: std::sync::atomic::AtomicU64 =
@@ -516,10 +525,15 @@ pub fn pathb_event_counts() -> (u64, u64, u64) {
     )
 }
 
-/// Snapshot of the global download-connection cap for telemetry:
-/// `(in_use, max, total_acquires, contended_acquires)`. `None` before the
-/// limiter is installed (pre-network-start).
-pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
+/// Snapshot of the machine-wide connection budget for telemetry:
+/// `(in_use, max, total_acquires, contended_acquires)`.
+///
+/// `in_use` and `max` cover both directions since the budget was shared; the
+/// two acquire counters remain download-only, which is what they have always
+/// measured. `None` before the limiter is installed, unlike
+/// [`shared_conn_snapshot`], which force-installs it — telemetry should report
+/// "not started yet" rather than bring the budget into being as a side effect.
+pub fn global_conn_stats() -> Option<(usize, usize, u64, u64)> {
     use std::sync::atomic::Ordering;
     let l = GLOBAL_CONN_LIMITER.get()?;
     let max = l.desired_max.load(Ordering::SeqCst);
@@ -592,14 +606,16 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     // downloads. The soft wait below can time out and proceed into a priority
     // reserve, but never into this one — `listener_floor` in the loop is what
     // makes it hard.
-    let priority_reserve = match priority_ord {
+    // Priority only. The listener's share is enforced as a floor in the loop
+    // below, not here: folding it in made `reserve` non-zero for every tier,
+    // so `high`/`release` — the tiers that are supposed to wait for nothing —
+    // sat out the full `MAX_RESERVE_WAIT` before reaching a check that would
+    // have blocked them at the same threshold anyway.
+    let reserve = match priority_ord {
         4 | 5 => 0,                                    // high / release
         2 | 3 => (max / 5).min(max.saturating_sub(1)), // normal / auto (~20%)
         _ => (max * 2 / 5).min(max.saturating_sub(1)), // low / verylow (~40%)
     };
-    let reserve = priority_reserve
-        .saturating_add(listener_reserve(max))
-        .min(max.saturating_sub(1));
     if reserve > 0 {
         const MAX_RESERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
@@ -616,6 +632,10 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     } else if l.in_use.load(Ordering::Acquire) >= max {
         GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+    // How long a download defers to the listener's reserve before taking from
+    // it. Matches `MAX_RESERVE_WAIT` above, which is the same trade for the
+    // per-priority reserve.
+    let listener_floor_deadline = std::time::Instant::now() + MAX_LISTENER_FLOOR_WAIT;
     loop {
         // Register the waiter before the capacity check below. `Notified`
         // only enrolls when it is first polled, and every release site uses
@@ -629,12 +649,23 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
         notified.as_mut().enable();
 
         let desired = l.desired_max.load(Ordering::Acquire);
-        // Downloads stop short of the configured ceiling so the upload
-        // listener always has somewhere to put an arriving peer. See
-        // `listener_reserve`.
-        let listener_floor = desired.saturating_sub(listener_reserve(desired));
+        // Downloads stop short of the configured ceiling so the upload listener
+        // always has somewhere to put an arriving peer (see `listener_reserve`)
+        // — but only for a bounded time. The listener has no reciprocal cap: it
+        // may take the whole budget, so an enforced-forever floor would let a
+        // node with a busy upload queue park every source dial indefinitely,
+        // which is worse than briefly lending the listener's share back. eMule
+        // does not park at all here — `TryToConnect` simply fails when
+        // `TooManySockets()` and the source is retried later
+        // (`DownloadClient.cpp:209`) — so yielding after a wait is already more
+        // patient than the client we follow.
+        let floor = if std::time::Instant::now() < listener_floor_deadline {
+            desired.saturating_sub(listener_reserve(desired))
+        } else {
+            desired
+        };
         let active = l.in_use.load(Ordering::Acquire);
-        if active < listener_floor {
+        if active < floor {
             if l.in_use
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -660,7 +691,10 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
             }
             continue;
         }
-        notified.await;
+        // Bounded, so the listener-floor deadline above can actually come due.
+        // A release always notifies, so this timeout only fires when nothing
+        // has moved — exactly the case where the floor needs re-evaluating.
+        let _ = tokio::time::timeout(LISTENER_FLOOR_RECHECK, notified).await;
     }
 }
 
@@ -2824,15 +2858,14 @@ impl MultiSourceDownload {
                                     queued: queued_count.load(Ordering::Relaxed),
                                 })
                                 .await;
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
+                            // Spelled as `add_source` rather than open-coded, so
+                            // that grepping the add/remove pair finds it. The
+                            // matching `remove_source` is at the bottom of the
+                            // task spawned just below.
+                            chunk_selector
+                                .write()
+                                .await
+                                .add_source(&source.available_parts);
                             info!("Injecting new source {}:{} (idx {src_idx}) into active download", source.peer_ip, source.peer_port);
                             remember_injected_source(&mut injected_sources, source.clone());
                             let src = source.clone();
@@ -2895,15 +2928,9 @@ impl MultiSourceDownload {
                                     Ok(p) => p,
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
+                                // Paired with the `add_source` at the injection
+                                // site above, before this task was spawned.
                                 let freq_avail = avail.clone();
-                                // An injected source was not present when
-                                // `update_frequencies` seeded the table, so the
-                                // `remove_source` below has to pair with an add
-                                // here — otherwise it decrements a contribution
-                                // that was never made.
-                                if !freq_avail.is_empty() {
-                                    cs.write().await.add_source(&freq_avail);
-                                }
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -3087,15 +3114,14 @@ impl MultiSourceDownload {
                                     queued: queued_count.load(Ordering::Relaxed),
                                 })
                                 .await;
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
+                            // Spelled as `add_source` rather than open-coded, so
+                            // that grepping the add/remove pair finds it. The
+                            // matching `remove_source` is at the bottom of the
+                            // task spawned just below.
+                            chunk_selector
+                                .write()
+                                .await
+                                .add_source(&source.available_parts);
                             info!(
                                 "Injecting pre-established source {}:{} (idx {src_idx}) into active download",
                                 source.peer_ip, source.peer_port,
@@ -3161,15 +3187,9 @@ impl MultiSourceDownload {
                                     Ok(p) => p,
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
+                                // Paired with the `add_source` at the injection
+                                // site above, before this task was spawned.
                                 let freq_avail = avail.clone();
-                                // An injected source was not present when
-                                // `update_frequencies` seeded the table, so the
-                                // `remove_source` below has to pair with an add
-                                // here — otherwise it decrements a contribution
-                                // that was never made.
-                                if !freq_avail.is_empty() {
-                                    cs.write().await.add_source(&freq_avail);
-                                }
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -3607,15 +3627,13 @@ impl MultiSourceDownload {
                         queued: queued_count.load(Ordering::Relaxed),
                     })
                     .await;
-                if !source.available_parts.is_empty() {
-                    let mut cs = chunk_selector.write().await;
-                    for (i, &has) in source.available_parts.iter().enumerate() {
-                        if i < cs.part_frequency.len() && has {
-                            cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                        }
-                    }
-                    cs.total_sources = cs.total_sources.saturating_add(1);
-                }
+                // Spelled as `add_source` rather than open-coded, so that
+                // grepping the add/remove pair finds it. The matching
+                // `remove_source` is at the bottom of the task spawned below.
+                chunk_selector
+                    .write()
+                    .await
+                    .add_source(&source.available_parts);
                 info!(
                     "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
                     retry_round + 1,
@@ -3680,13 +3698,9 @@ impl MultiSourceDownload {
                         Ok(p) => p,
                         Err(_) => return,
                     };
+                    // Paired with the `add_source` at the adoption site above,
+                    // before this task was spawned.
                     let freq_avail = avail.clone();
-                    // An adopted callback source was not present when
-                    // `update_frequencies` seeded the table, so the
-                    // `remove_source` below has to pair with an add here.
-                    if !freq_avail.is_empty() {
-                        cs.write().await.add_source(&freq_avail);
-                    }
                     let cancel_ctrl = ctrl.clone();
                     let result = tokio::select! {
                         res = download_parts_from_source(
@@ -7821,7 +7835,14 @@ async fn download_parts_from_source(
             // network (eMule mods) do not implement the I64 handler and
             // silently drop the request, causing "accepted but no data"
             // timeouts.
-            while sent_idx < batches.len() && sent_idx < max_outstanding {
+            // Bounded on blocks actually in flight, not on how far the index
+            // has walked — the same bound both refill loops below use. Keyed
+            // on `sent_idx`, a batch dropped here as already-filled still
+            // consumed a pipeline slot, so a part whose first `max_outstanding`
+            // batches had all been landed by another worker left this loop
+            // having sent nothing at all. Nothing recovers from that: the stall
+            // tick only refills when a request has expired, and there are none.
+            while sent_idx < batches.len() && outstanding_ranges.len() < max_outstanding_blocks {
                 let batch = drop_filled_blocks(&tracker, &batches[sent_idx]).await;
                 if batch.is_empty() {
                     sent_idx += 1;
@@ -11156,7 +11177,9 @@ mod tests {
     /// queue with us — which is the failure the single pool would otherwise
     /// reintroduce.
     #[test]
-    fn the_listener_reserve_is_a_minority_of_the_budget_but_never_zero() {
+    fn the_listener_reserve_is_a_minority_of_the_budget_above_the_degenerate_range() {
+        // From 4 up. `a_single_connection_budget_still_leaves_downloads_a_slot`
+        // covers 0..=3, where there is nothing to divide.
         for max in [4usize, 20, 100, 500, 2000] {
             let reserve = listener_reserve(max);
             assert!(reserve > 0, "max={max} must hold something back");

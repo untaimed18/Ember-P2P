@@ -1809,6 +1809,7 @@
   "transfers_unknown_client": "未知客戶端",
   "transfers_parts": "{have}/{total} 分塊",
   "transfers_parts_peer": "{peer} 已擁有",
+  "transfers_parts_swarm": "{peer} 個由來源持有",
   "transfers_parts_title": "該來源可用的分塊",
   "transfers_failed_sources_hidden_one": "已隱藏 1 個失敗來源",
   "transfers_failed_sources_hidden_other": "已隱藏 {count} 個失敗來源",

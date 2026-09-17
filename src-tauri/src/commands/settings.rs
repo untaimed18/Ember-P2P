@@ -411,9 +411,15 @@ pub async fn pick_preview_player(
             .file()
             .set_title("Choose a media player for Preview");
         // Filtered on Windows only. There an executable *is* its extension, so
-        // the filter is a real help; on Linux and macOS the thing to pick has
-        // no extension at all (`/usr/bin/mpv`) or is a bundle directory, and a
-        // filter would hide every valid answer.
+        // the filter is a real help; on Linux the thing to pick has no
+        // extension at all (`/usr/bin/mpv`) and a filter would hide every valid
+        // answer.
+        //
+        // Note the check below requires a regular file, so a macOS `.app`
+        // bundle is refused rather than accepted. That is deliberate while
+        // macOS is not a bundle target: `launch_with_player` spawns the path
+        // directly, and a bundle needs `open -a`. Supporting bundles means
+        // teaching both ends, not just loosening this guard.
         #[cfg(target_os = "windows")]
         let dialog = dialog.add_filter("Programs", &["exe", "com", "bat", "cmd"]);
         dialog

@@ -668,13 +668,16 @@
     'general',
     'notifications',
     'downloads',
+    // Declared between Transfers and Search in the markup below, so it sits
+    // there here too. While filtering, every matching card is on screen in DOM
+    // order, and this array is what the tablist and the arrow keys walk.
+    'webservices',
     'search',
     'bandwidth',
     'network',
     'security',
     'friends',
     'channels',
-    'webservices',
     'backup',
     'about',
   ];
@@ -746,9 +749,11 @@
     if (!query) {
       for (const card of cards) {
         card.removeAttribute('data-filtered');
-        for (const el of card.querySelectorAll<HTMLElement>(
-          '.field, .field-row, .settings-group',
-        )) {
+        // Clear by attribute rather than by selector list. The marking pass
+        // below reaches more kinds of element than the three it used to, and
+        // a cleanup that names them individually is one edit away from
+        // stranding something permanently hidden.
+        for (const el of card.querySelectorAll<HTMLElement>('[data-filtered]')) {
           el.removeAttribute('data-filtered');
         }
       }
@@ -783,6 +788,34 @@
       for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group')) {
         if (box.querySelector('.field:not([data-filtered])')) box.removeAttribute('data-filtered');
         else box.setAttribute('data-filtered', 'out');
+      }
+      // Everything else the body holds. Plenty of a card is not a `.field`:
+      // About's identity block and updater panel, Backup's action rows,
+      // Bandwidth's active-schedule banner. Judging the card on fields alone
+      // made all of that both unfindable — a query matching only such text
+      // scored zero and hid the whole card, putting eight controls out of
+      // reach, among them "Open log folder", "Choose Backup File…" and the
+      // updater's Install button — and unhideable, since nothing ever marked
+      // it, so it leaked into every card that survived on some other match.
+      const body = card.querySelector<HTMLElement>('.card-body');
+      for (const block of body ? (Array.from(body.children) as HTMLElement[]) : []) {
+        if (block.matches('.field, .field-row, .settings-group')) continue;
+        if (block.querySelector('.field')) {
+          // Holds fields the loops above already ruled on; follow them.
+          if (block.querySelector('.field:not([data-filtered])')) {
+            block.removeAttribute('data-filtered');
+          } else {
+            block.setAttribute('data-filtered', 'out');
+          }
+          continue;
+        }
+        const hit = wholeCard || (block.textContent?.toLowerCase().includes(query) ?? false);
+        if (hit) {
+          block.removeAttribute('data-filtered');
+          cardMatches += 1;
+        } else {
+          block.setAttribute('data-filtered', 'out');
+        }
       }
       if (cardMatches > 0) card.removeAttribute('data-filtered');
       else card.setAttribute('data-filtered', 'out');
@@ -4455,10 +4488,7 @@
      these three rules as unused and the filter hid nothing at all. The
      `.cards-grid` prefix stays scoped, which keeps the escape hatch confined
      to this page. */
-  .cards-grid :global(.card[data-filtered='out']),
-  .cards-grid :global(.field[data-filtered='out']),
-  .cards-grid :global(.field-row[data-filtered='out']),
-  .cards-grid :global(.settings-group[data-filtered='out']) {
+  .cards-grid :global([data-filtered='out']) {
     display: none;
   }
 

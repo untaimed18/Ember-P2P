@@ -25508,7 +25508,16 @@ async fn upload_queue_snapshot(
     // could otherwise deadlock against `start_uploading_to_peer`).
     let queue_snapshot: Vec<ed2k::upload::QueueEntry> = {
         let mut q = queue.lock().await;
-        q.retain(|e| e.join_time.elapsed().as_secs() < ed2k::upload::MAX_PURGEQUEUETIME_SECS);
+        // `last_request`, not `join_time`. eMule's waiting-list purge keys on
+        // `GetLastUpRequest` (`UploadQueue.cpp:119`) and `QueueEntry` splits
+        // the two fields precisely so seniority can accrue on one clock while
+        // the purge runs on the other. Keying this site on `join_time` evicted
+        // every waiter an hour after it arrived however faithfully it had been
+        // re-asking — and because this runs from `get_upload_queue`, which the
+        // transfers page polls every 15s on any tab, it bounded the whole
+        // waiting list by arrivals-per-hour. Every other purge site already
+        // uses `last_request`; this one was missed.
+        q.retain(|e| e.last_request.elapsed().as_secs() < ed2k::upload::MAX_PURGEQUEUETIME_SECS);
         q.clone()
     };
     if queue_snapshot.is_empty() {
@@ -25674,6 +25683,11 @@ async fn upload_queue_snapshot(
 /// (reseed / Hello binding) with zero transfer bytes and `ident_ip == 0`.
 /// Their usable address and last-seen live in the friends SQLite table,
 /// so we join that metadata in here before handing rows to the UI.
+/// Most rows [`known_clients_snapshot`] will let cross IPC. Shared with
+/// [`known_client_counts`] so the tab label cannot describe a different set
+/// than the table it opens.
+const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
+
 /// Count what [`known_clients_snapshot`] would return, without building it.
 ///
 /// Kept immediately beside that function because the two have to agree: a tab
@@ -25698,9 +25712,34 @@ async fn known_client_counts(
     };
 
     let cm = credit_manager.read().await;
+    // The snapshot sorts most-recently-seen first and trims to
+    // `MAX_KNOWN_CLIENT_ROWS`, so counting the whole ledger would make the
+    // label jump every time the user entered or left the tab once the ledger
+    // passed the cap. Reproduce the trim on the same key.
+    //
+    // The snapshot's key is `max(record.last_seen, friend last_seen)`; this
+    // uses the record's alone, because reading the friends table is exactly
+    // the cost this command exists to avoid. The two can only disagree about
+    // rows sitting on the cap boundary, and only for friends whose DB row is
+    // fresher than their credit row.
+    let mut rows: Vec<(i64, bool)> = cm
+        .all_records()
+        .iter()
+        .map(|record| {
+            (
+                record.last_seen,
+                record.ember_hash.is_some() || live_ember.contains(&record.user_hash),
+            )
+        })
+        .collect();
+    if rows.len() > MAX_KNOWN_CLIENT_ROWS {
+        rows.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
+        rows.truncate(MAX_KNOWN_CLIENT_ROWS);
+    }
+
     let mut counts = crate::types::KnownClientCounts::default();
-    for record in cm.all_records().iter() {
-        if record.ember_hash.is_some() || live_ember.contains(&record.user_hash) {
+    for (_, is_ember) in rows {
+        if is_ember {
             counts.ember = counts.ember.saturating_add(1);
         } else {
             counts.ed2k = counts.ed2k.saturating_add(1);
@@ -25850,7 +25889,6 @@ async fn known_clients_snapshot(
     // the *oldest* entries is the right end to lose: they are the peers a
     // lifetime-view is least likely to be asked about, and the sort above has
     // already put everything recent first.
-    const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
     if out.len() > MAX_KNOWN_CLIENT_ROWS {
         debug!(
             "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
@@ -38529,7 +38567,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             _ = pathb_stats_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some((in_use, max, acquires, contended)) =
-                    ed2k::multi_source::global_dl_conn_stats()
+                    ed2k::multi_source::global_conn_stats()
                 {
                     let (detaches, diversions, rotations) =
                         ed2k::multi_source::pathb_event_counts();
@@ -47478,7 +47516,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     info!("Shutting down network");
     // Final Path B tally so even a short test run (under the 60 s periodic
     // cadence) always captures the queued-source-model counters.
-    if let Some((in_use, max, acquires, contended)) = ed2k::multi_source::global_dl_conn_stats() {
+    if let Some((in_use, max, acquires, contended)) = ed2k::multi_source::global_conn_stats() {
         let (detaches, diversions, rotations) = ed2k::multi_source::pathb_event_counts();
         info!(
             "Path B final stats: dl-conns {in_use}/{max} in use at shutdown, {acquires} acquires \
