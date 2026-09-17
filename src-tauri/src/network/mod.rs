@@ -14158,11 +14158,12 @@ struct NetworkState {
     aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
     /// Shared max upload slots (updated on settings change, read by upload handler)
     upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections`, read by the upload listener's accept
-    /// path. Shared rather than captured by value so the setting takes effect
-    /// without a restart, like `upload_max_slots` beside it.
-    upload_max_connections: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections_per_five_secs`, same arrangement.
+    /// `AppSettings::max_connections_per_five_secs`, read by the upload
+    /// listener's accept path. Shared rather than captured by value so the
+    /// setting takes effect without a restart, like `upload_max_slots` beside
+    /// it. The connection *ceiling* needs no equivalent here: it lives in the
+    /// machine-wide budget both directions draw on
+    /// (`ed2k::multi_source::set_global_conn_limit`).
     upload_max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     /// Shared obfuscation flag mirroring `state.obfuscation_enabled`. The
     /// upload listener captures this `Arc` at spawn time and reads it on
@@ -26144,15 +26145,11 @@ fn apply_network_settings(
         new_settings.max_concurrent_uploads as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
-    state.upload_max_connections.store(
-        new_settings.max_connections as usize,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     state.upload_max_conn_per_five.store(
         new_settings.max_connections_per_five_secs as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
-    ed2k::multi_source::set_global_download_conn_limit(new_settings.max_connections as usize);
+    ed2k::multi_source::set_global_conn_limit(new_settings.max_connections as usize);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
     if !new_settings.uss_enabled {
         if let Some((addr, _)) = state.uss_host.take() {
@@ -26881,9 +26878,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(
             settings.max_concurrent_uploads as usize,
         )),
-        upload_max_connections: Arc::new(std::sync::atomic::AtomicUsize::new(
-            settings.max_connections as usize,
-        )),
         upload_max_conn_per_five: Arc::new(std::sync::atomic::AtomicUsize::new(
             settings.max_connections_per_five_secs as usize,
         )),
@@ -27366,7 +27360,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Install the machine-wide download-connection cap (eMule `maxconnections`)
     // before any download tasks can spawn, so the raised per-file source
     // budget stays globally bounded.
-    ed2k::multi_source::set_global_download_conn_limit(settings.max_connections as usize);
+    ed2k::multi_source::set_global_conn_limit(settings.max_connections as usize);
 
     // Install the global "preview priority for all downloads" preference so the
     // chunk selector front-loads first/last parts from the very first task.
@@ -27607,7 +27601,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_nickname = shared_nickname.clone();
         let ul_app = app_handle.clone();
         let ul_max = state.upload_max_slots.clone();
-        let ul_max_conns = state.upload_max_connections.clone();
         let ul_max_conn_per_five = state.upload_max_conn_per_five.clone();
         let ul_sm = source_manager.clone();
         let ul_comments = state.comment_manager.clone();
@@ -27664,7 +27657,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_bw,
                 ul_tx,
                 ul_max,
-                ul_max_conns,
                 ul_max_conn_per_five,
                 ul_sm,
                 ul_comments,

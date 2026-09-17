@@ -297,18 +297,104 @@ async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'s
 /// how a popular file ends up *queued* on far more peers than it holds open
 /// sockets to, mirroring eMule (which keeps a large per-file source pool but
 /// only a bounded number of live connections). The machine-wide ceiling is
-/// `GLOBAL_DL_CONN_LIMITER` (eMule `maxconnections`).
+/// `GLOBAL_CONN_LIMITER` (eMule `maxconnections`).
 const MAX_CONCURRENT_SOURCES: usize = 50;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
 
-/// Global cap on simultaneously held outbound download-source connections
-/// across *all* active downloads, wired from `AppSettings::max_connections`
-/// (eMule's machine-wide `maxconnections`). Installed at network start and
-/// resized on settings change. A held connection takes one permit for its
-/// lifetime; detaching to `OnQueue` releases it. This is the safety bound
-/// that keeps the raised per-file budget from exhausting the OS connection
-/// table when many downloads run concurrently.
-static GLOBAL_DL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::sync::OnceLock::new();
+/// The machine-wide cap on client TCP connections, wired from
+/// `AppSettings::max_connections` (eMule's `maxconnections`). Installed at
+/// network start and resized on settings change.
+///
+/// Both directions draw on it, which is what makes the setting mean what it
+/// says. eMule counts every `CClientReqSocket` in one list regardless of who
+/// dialled whom — the constructor registers it at `ListenSocket.cpp:62`, and
+/// `GetOpenSockets()` is that list's length — so `TooManySockets()` gates
+/// inbound accepts and outbound connects against a single number. Ember used
+/// to apply the same setting to each direction separately, which let a user
+/// who asked for 500 end up holding closer to 1000.
+///
+/// A held connection takes one unit for its lifetime; for downloads, detaching
+/// to `OnQueue` releases it. See [`listener_reserve`] for how the two
+/// directions are arbitrated.
+static GLOBAL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::sync::OnceLock::new();
+
+/// Fallback ceiling if a caller reaches the budget before `start_network` has
+/// installed the configured one. Matches `AppSettings::max_connections`'s own
+/// default so the behaviour is the same either way.
+const FALLBACK_CONN_LIMIT: usize = 500;
+
+fn conn_limiter() -> &'static GlobalConnLimiter {
+    GLOBAL_CONN_LIMITER.get_or_init(|| GlobalConnLimiter::new(FALLBACK_CONN_LIMIT))
+}
+
+/// Capacity kept available to the upload listener however many download
+/// sources are running.
+///
+/// eMule has no equivalent, and arbitrates the other way round: inbound accepts
+/// and outbound download connects compete first-come-first-served, and only
+/// upload *promotion* is exempt from the cap — `CUploadQueue::AddUpNextClient`
+/// dials a waiter with `TryToConnect(true)` (`UploadQueue.cpp:208`) where the
+/// download path passes `false` (`DownloadClient.cpp:209`). Holding a slice
+/// back is strictly friendlier than that exemption: it gives the same
+/// guarantee — peers that want to download *from* us are never crowded out by
+/// our own downloads — without letting the total exceed the number the user
+/// configured, which is the whole point of sharing one budget.
+fn listener_reserve(max: usize) -> usize {
+    (max / 4).min(max.saturating_sub(1))
+}
+
+/// One connection held by the upload listener against the shared budget.
+/// Releases on drop, exactly as [`GlobalConnPermit`] does for a download.
+pub struct ListenerConnPermit {
+    limiter: &'static GlobalConnLimiter,
+}
+
+impl Drop for ListenerConnPermit {
+    fn drop(&mut self) {
+        self.limiter
+            .in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.limiter.notify.notify_waiters();
+    }
+}
+
+/// Take one connection from the shared budget for the upload listener.
+///
+/// Non-blocking, because the accept loop's only choices are to admit now or
+/// drop the peer; it cannot park. `headroom` is extra capacity *above* the
+/// configured ceiling, used solely by the eD2K server's HighID port-test so a
+/// saturated pool can never cost us a HighID.
+pub fn try_acquire_listener_conn(headroom: usize) -> Option<ListenerConnPermit> {
+    use std::sync::atomic::Ordering;
+    let l = conn_limiter();
+    let ceiling = l
+        .desired_max
+        .load(Ordering::Acquire)
+        .saturating_add(headroom);
+    let mut cur = l.in_use.load(Ordering::Acquire);
+    loop {
+        if cur >= ceiling {
+            return None;
+        }
+        match l
+            .in_use
+            .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return Some(ListenerConnPermit { limiter: l }),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// `(in_use, configured_max)` for the shared budget.
+pub fn shared_conn_snapshot() -> (usize, usize) {
+    use std::sync::atomic::Ordering;
+    let l = conn_limiter();
+    (
+        l.in_use.load(Ordering::Acquire),
+        l.desired_max.load(Ordering::Acquire),
+    )
+}
 
 struct GlobalConnLimiter {
     sem: Arc<tokio::sync::Semaphore>,
@@ -379,13 +465,13 @@ impl GlobalConnLimiter {
     }
 }
 
-/// Install or resize the global download-connection cap. Idempotent; safe to
-/// call from the network-start path and the settings-update arm.
-pub fn set_global_download_conn_limit(max: usize) {
-    match GLOBAL_DL_CONN_LIMITER.get() {
+/// Install or resize the machine-wide connection cap. Idempotent; safe to call
+/// from the network-start path and the settings-update arm.
+pub fn set_global_conn_limit(max: usize) {
+    match GLOBAL_CONN_LIMITER.get() {
         Some(l) => l.set_max(max),
         None => {
-            let _ = GLOBAL_DL_CONN_LIMITER.set(GlobalConnLimiter::new(max));
+            let _ = GLOBAL_CONN_LIMITER.set(GlobalConnLimiter::new(max));
         }
     }
 }
@@ -435,7 +521,7 @@ pub fn pathb_event_counts() -> (u64, u64, u64) {
 /// limiter is installed (pre-network-start).
 pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
     use std::sync::atomic::Ordering;
-    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    let l = GLOBAL_CONN_LIMITER.get()?;
     let max = l.desired_max.load(Ordering::SeqCst);
     let in_use = l.in_use.load(Ordering::SeqCst);
     Some((
@@ -450,7 +536,7 @@ pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
 /// connection slot is in use). Used by trickle-source rotation to confirm the
 /// slot it would free is actually contended before dropping a slow source.
 fn global_dl_conn_contended() -> bool {
-    GLOBAL_DL_CONN_LIMITER.get().is_some_and(|l| {
+    GLOBAL_CONN_LIMITER.get().is_some_and(|l| {
         l.in_use.load(std::sync::atomic::Ordering::Acquire)
             >= l.desired_max.load(std::sync::atomic::Ordering::Acquire)
     })
@@ -496,15 +582,24 @@ impl InUseAcquireGuard {
 
 async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     use std::sync::atomic::Ordering;
-    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    let l = GLOBAL_CONN_LIMITER.get()?;
     GLOBAL_DL_ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let max = l.desired_max.load(Ordering::SeqCst);
-    let reserve = match priority_ord {
+    // The listener's share is not negotiable and is added to every tier,
+    // including the ones that reserve nothing for their own siblings: it is a
+    // floor against the *other direction*, not a priority ordering among our
+    // downloads. The soft wait below can time out and proceed into a priority
+    // reserve, but never into this one — `listener_floor` in the loop is what
+    // makes it hard.
+    let priority_reserve = match priority_ord {
         4 | 5 => 0,                                    // high / release
         2 | 3 => (max / 5).min(max.saturating_sub(1)), // normal / auto (~20%)
         _ => (max * 2 / 5).min(max.saturating_sub(1)), // low / verylow (~40%)
     };
+    let reserve = priority_reserve
+        .saturating_add(listener_reserve(max))
+        .min(max.saturating_sub(1));
     if reserve > 0 {
         const MAX_RESERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
@@ -534,8 +629,12 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
         notified.as_mut().enable();
 
         let desired = l.desired_max.load(Ordering::Acquire);
+        // Downloads stop short of the configured ceiling so the upload
+        // listener always has somewhere to put an arriving peer. See
+        // `listener_reserve`.
+        let listener_floor = desired.saturating_sub(listener_reserve(desired));
         let active = l.in_use.load(Ordering::Acquire);
-        if active < desired {
+        if active < listener_floor {
             if l.in_use
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -11050,6 +11149,34 @@ mod tests {
     use super::*;
 
     use super::super::messages::PARTSIZE;
+
+    /// The listener's share of the shared budget has to be real capacity and
+    /// has to leave downloads a usable majority. It is the thing standing
+    /// between "one pool" and downloads crowding out every peer that wants to
+    /// queue with us — which is the failure the single pool would otherwise
+    /// reintroduce.
+    #[test]
+    fn the_listener_reserve_is_a_minority_of_the_budget_but_never_zero() {
+        for max in [4usize, 20, 100, 500, 2000] {
+            let reserve = listener_reserve(max);
+            assert!(reserve > 0, "max={max} must hold something back");
+            assert!(
+                reserve < max,
+                "max={max} must leave downloads somewhere to go"
+            );
+            assert!(
+                max - reserve > reserve,
+                "max={max}: downloads should still get the larger share"
+            );
+        }
+    }
+
+    /// Degenerate limits must not underflow or deadlock the download path.
+    #[test]
+    fn a_single_connection_budget_still_leaves_downloads_a_slot() {
+        assert_eq!(listener_reserve(1), 0);
+        assert_eq!(listener_reserve(0), 0);
+    }
 
     /// `yy` in the Sources column is the size of the source list, so committing
     /// a peer that is already in it must not raise the total. Re-committing is

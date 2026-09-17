@@ -566,26 +566,32 @@ struct UploadSlotGuard {
     armed: bool,
 }
 
+/// Holds one connection's admission for as long as the session lives: its unit
+/// of the machine-wide budget and its entry in the per-IP count. Both are
+/// released together on drop, whichever way the session ends.
 struct ConnectionAdmissionGuard {
-    total: Arc<std::sync::atomic::AtomicUsize>,
+    /// Dropped with the guard, returning the unit to the shared budget.
+    _conn: super::multi_source::ListenerConnPermit,
     per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
 }
 
 impl ConnectionAdmissionGuard {
     fn new(
-        total: Arc<std::sync::atomic::AtomicUsize>,
+        conn: super::multi_source::ListenerConnPermit,
         per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
         ip: IpAddr,
     ) -> Self {
-        Self { total, per_ip, ip }
+        Self {
+            _conn: conn,
+            per_ip,
+            ip,
+        }
     }
 }
 
 impl Drop for ConnectionAdmissionGuard {
     fn drop(&mut self) {
-        self.total
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let mut counts = self.per_ip.lock();
         if let Some(count) = counts.get_mut(&self.ip) {
             *count = count.saturating_sub(1);
@@ -1046,20 +1052,12 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// still-queued entries (via [`QueueEntry::last_ip`]), so a peer cannot
 /// churn connections with rotating user-hashes to dilute the queue.
 const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
-/// Fallback ceiling on concurrent TCP connections to the upload listener, used
-/// only if the configured value is somehow zero.
-///
-/// This was the *hardcoded* limit, and at 100 it was a fifth of eMule's
-/// `maxconnections` default of 500 (`CPreferences::GetRecommendedMaxConnections`,
-/// `Preferences.cpp:1473-1485`, gating accepts through
-/// `CListenSocket::TooManySockets`, `ListenSocket.cpp:2181`). Ember already had
-/// the matching setting — `AppSettings::max_connections`, documented as
-/// "eMule: maxconnections, default 500" — but it only ever reached the outbound
-/// download limiter, so the listener ignored it. Combined with a queued peer
-/// never releasing its socket, that capped the waiting list at roughly this
-/// number (issue #111). The listener now reads the setting; see
-/// [`QUEUED_SOCKET_IDLE_SECS`] for the other half of that fix.
-const MAX_TOTAL_CONNECTIONS_FALLBACK: usize = 500;
+// The listener's connection ceiling is not a constant here. It is
+// `AppSettings::max_connections` — eMule's `maxconnections`, gating accepts
+// through `CListenSocket::TooManySockets` (`ListenSocket.cpp:2181`) — and it is
+// shared with the download side, because eMule counts every client socket in
+// one list whoever dialled it. See `multi_source::GLOBAL_CONN_LIMITER` and
+// `multi_source::try_acquire_listener_conn`.
 /// Extra accept slots reserved so the configured eD2K server can still complete
 /// its short HighID port-test while ordinary capacity is saturated.  Long-lived
 /// sessions from that IP that only fit because of this reserve are rejected in
@@ -2146,9 +2144,6 @@ struct UploadHandler {
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections`, live-updated. See
-    /// [`MAX_TOTAL_CONNECTIONS_FALLBACK`].
-    max_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// `AppSettings::max_connections_per_five_secs`, live-updated. See
     /// [`UploadHandler::accept_budget_allows`].
     max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
@@ -2159,7 +2154,6 @@ struct UploadHandler {
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
         Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
-    total_connections: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -3356,7 +3350,6 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    max_connections: Arc<std::sync::atomic::AtomicUsize>,
     max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
@@ -3471,13 +3464,11 @@ pub async fn start_upload_server(
         advertise_udp_port,
         active_count,
         max_concurrent_uploads,
-        max_connections,
         max_conn_per_five,
         accept_window: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-        total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         source_manager,
         comment_manager,
         credit_manager,
@@ -3697,46 +3688,25 @@ pub async fn start_upload_server(
                             continue;
                         }
 
-                        // Enforce global connection limit. Reserve the slot with
-                        // an atomic compare-exchange rather than a separate
-                        // load-check-then-`fetch_add`: under a burst of
-                        // simultaneous accepts the old check-then-act let
-                        // multiple handlers each observe `< MAX` and increment
-                        // past the limit.
-                        let reserved = {
-                            let limit = server.connection_limit();
-                            let connection_limit = if is_server_port_test_ip {
-                                limit + RESERVED_PORT_TEST_CONNECTIONS
-                            } else {
-                                limit
-                            };
-                            let mut cur = server
-                                .total_connections
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                if cur >= connection_limit {
-                                    break false;
-                                }
-                                match server.total_connections.compare_exchange_weak(
-                                    cur,
-                                    cur + 1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break true,
-                                    Err(actual) => cur = actual,
-                                }
-                            }
+                        // Take one unit of the machine-wide budget, which the
+                        // download side draws on too. The port-test headroom
+                        // is the one thing allowed above the configured
+                        // ceiling; see `RESERVED_PORT_TEST_CONNECTIONS`.
+                        let headroom = if is_server_port_test_ip {
+                            RESERVED_PORT_TEST_CONNECTIONS
+                        } else {
+                            0
                         };
-                        if !reserved {
+                        let Some(conn_permit) =
+                            super::multi_source::try_acquire_listener_conn(headroom)
+                        else {
                             debug!("Rejecting connection from {peer_addr}: global connection limit reached");
                             drop(stream);
                             continue;
-                        }
+                        };
 
-                        // Enforce per-IP connection limit. If we reject here,
-                        // release the global slot reserved just above so the
-                        // reservation isn't leaked.
+                        // Enforce per-IP connection limit. Dropping
+                        // `conn_permit` on the reject path returns the unit.
                         {
                             let mut counts = server.ip_connection_counts.lock();
                             let count = counts.entry(peer_addr.ip()).or_insert(0);
@@ -3748,16 +3718,14 @@ pub async fn start_upload_server(
                             if *count >= per_ip_limit {
                                 debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
                                 drop(counts);
-                                server
-                                    .total_connections
-                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                drop(conn_permit);
                                 drop(stream);
                                 continue;
                             }
                             *count += 1;
                         }
                         let admission_guard = ConnectionAdmissionGuard::new(
-                            server.total_connections.clone(),
+                            conn_permit,
                             server.ip_connection_counts.clone(),
                             peer_addr.ip(),
                         );
@@ -3861,36 +3829,16 @@ pub async fn start_upload_server(
                 };
                 let peer_ip = req.peer_addr.ip();
 
-                // Reserve a global slot with the same cap + atomic CAS the
-                // inbound accept path uses, so outbound callback serves can't
-                // push the process past the configured connection limit.
-                let reserved = {
-                    let limit = server.connection_limit();
-                    let mut cur = server
-                        .total_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    loop {
-                        if cur >= limit {
-                            break false;
-                        }
-                        match server.total_connections.compare_exchange_weak(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break true,
-                            Err(actual) => cur = actual,
-                        }
-                    }
-                };
-                if !reserved {
+                // Draw on the same machine-wide budget the inbound accept path
+                // uses, so outbound callback serves can't push the process
+                // past the configured connection limit.
+                let Some(conn_permit) = super::multi_source::try_acquire_listener_conn(0) else {
                     debug!(
                         "Dropping callback-serve to {}: global connection limit reached",
                         req.peer_addr
                     );
                     continue;
-                }
+                };
                 {
                     let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
@@ -3900,15 +3848,13 @@ pub async fn start_upload_server(
                             req.peer_addr
                         );
                         drop(counts);
-                        server
-                            .total_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        drop(conn_permit);
                         continue;
                     }
                     *count += 1;
                 }
                 let admission_guard = ConnectionAdmissionGuard::new(
-                    server.total_connections.clone(),
+                    conn_permit,
                     server.ip_connection_counts.clone(),
                     peer_ip,
                 );
@@ -4026,32 +3972,12 @@ pub async fn start_upload_server(
                     }
                 }
 
-                let reserved = {
-                    let limit = server.connection_limit();
-                    let mut cur = server
-                        .total_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    loop {
-                        if cur >= limit {
-                            break false;
-                        }
-                        match server.total_connections.compare_exchange_weak(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break true,
-                            Err(actual) => cur = actual,
-                        }
-                    }
-                };
-                if !reserved {
+                let Some(conn_permit) = super::multi_source::try_acquire_listener_conn(0) else {
                     debug!(
                         "Dropping punch/relay-adopted stream from {peer_addr}: global connection limit reached"
                     );
                     continue;
-                }
+                };
                 {
                     let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
@@ -4060,15 +3986,13 @@ pub async fn start_upload_server(
                             "Dropping punch/relay-adopted stream from {peer_addr}: per-IP limit reached"
                         );
                         drop(counts);
-                        server
-                            .total_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        drop(conn_permit);
                         continue;
                     }
                     *count += 1;
                 }
                 let admission_guard = ConnectionAdmissionGuard::new(
-                    server.total_connections.clone(),
+                    conn_permit,
                     server.ip_connection_counts.clone(),
                     peer_ip,
                 );
@@ -4619,16 +4543,6 @@ impl UploadHandler {
     /// per-slot rate is compared against the target: if existing slots are
     /// already starved (median < target * 0.5), we avoid opening more even
     /// if the formula would allow it.
-    /// Configured ceiling on concurrent connections held by this listener.
-    fn connection_limit(&self) -> usize {
-        let configured = self.max_connections.load(std::sync::atomic::Ordering::Relaxed);
-        if configured == 0 {
-            MAX_TOTAL_CONNECTIONS_FALLBACK
-        } else {
-            configured
-        }
-    }
-
     /// eMule's `MaxConperFive` gate: at most N newly accepted connections in
     /// any five-second window (`CListenSocket::TooManySockets`,
     /// `ListenSocket.cpp:2182`, default `MAXCONPER5SEC` = 20).
@@ -5045,33 +4959,21 @@ impl UploadHandler {
             hex::encode(entry.file_hash)
         );
 
-        // Reserve global + per-IP connection slots like the callback-serve arm.
-        let reserved = {
-            let limit = self.connection_limit();
-            let mut cur = self
-                .total_connections
-                .load(std::sync::atomic::Ordering::Relaxed);
-            loop {
-                if cur >= limit {
-                    break false;
-                }
-                match self.total_connections.compare_exchange_weak(
-                    cur,
-                    cur + 1,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                ) {
-                    Ok(_) => break true,
-                    Err(c) => cur = c,
-                }
-            }
-        };
-        if !reserved {
+        // Granting a queued peer its slot is the one connection eMule refuses
+        // to let the cap block: `CUploadQueue::AddUpNextClient` dials with
+        // `TryToConnect(true)` (`UploadQueue.cpp:208`) where the download path
+        // passes `false` (`DownloadClient.cpp:209`). Same intent here, but
+        // bounded rather than unlimited — `MAX_PUSH_GRANT_DIALS` already caps
+        // how many of these can be in flight, so that is exactly the headroom
+        // this needs and no more.
+        let Some(conn_permit) =
+            super::multi_source::try_acquire_listener_conn(MAX_PUSH_GRANT_DIALS)
+        else {
             self.push_grant_dials
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             return;
-        }
+        };
         let per_ip_reserved = {
             let mut counts = self.ip_connection_counts.lock();
             let count = counts.entry(ip).or_insert(0);
@@ -5083,19 +4985,15 @@ impl UploadHandler {
             }
         };
         if !per_ip_reserved {
-            self.total_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            drop(conn_permit);
             self.push_grant_dials
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
             return;
         }
-        let _admission_guard = ConnectionAdmissionGuard::new(
-            self.total_connections.clone(),
-            self.ip_connection_counts.clone(),
-            ip,
-        );
+        let _admission_guard =
+            ConnectionAdmissionGuard::new(conn_permit, self.ip_connection_counts.clone(), ip);
 
         let result = self.connect_and_serve(req).await;
         self.push_grant_dials
@@ -6069,10 +5967,7 @@ impl UploadHandler {
                     .map(|a| a.ip() == peer_addr.ip())
                     .unwrap_or(false)
             };
-            let total = self
-                .total_connections
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let ordinary_max = self.connection_limit();
+            let (total, ordinary_max) = super::multi_source::shared_conn_snapshot();
             if !allow_long_lived_session_under_admission(
                 from_configured_server_ip,
                 total,
@@ -13713,25 +13608,36 @@ mod ember_session_handle_tests {
         assert!(*shutdown_b.borrow());
     }
 
+    /// The guard owns both halves of an admission — the unit of the
+    /// machine-wide budget and the per-IP count — and must release them
+    /// together however the session ends.
     #[test]
     fn connection_admission_guard_releases_all_counters() {
-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let per_ip = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let ip: IpAddr = "203.0.113.20".parse().unwrap();
         per_ip.lock().insert(ip, 1);
+        let before = super::super::multi_source::shared_conn_snapshot().0;
         {
-            let _guard = ConnectionAdmissionGuard::new(total.clone(), per_ip.clone(), ip);
-            assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let permit = super::super::multi_source::try_acquire_listener_conn(0)
+                .expect("budget has room in a test process");
+            assert_eq!(
+                super::super::multi_source::shared_conn_snapshot().0,
+                before + 1
+            );
+            let _guard = ConnectionAdmissionGuard::new(permit, per_ip.clone(), ip);
         }
-        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            super::super::multi_source::shared_conn_snapshot().0,
+            before,
+            "the budget unit must go back when the session ends"
+        );
         assert!(!per_ip.lock().contains_key(&ip));
     }
 
     #[test]
     fn port_test_reserve_does_not_expand_ordinary_capacity() {
-        // The listener's ceiling is `AppSettings::max_connections` now; only
-        // the reserve on top of it is fixed.
-        assert_eq!(MAX_TOTAL_CONNECTIONS_FALLBACK, 500);
+        // The listener's ceiling is `AppSettings::max_connections`, shared with
+        // the download side; only the reserve on top of it is fixed here.
         const _: () = assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
         const _: () = assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
     }

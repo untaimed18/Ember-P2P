@@ -1374,12 +1374,12 @@ pub struct AppSettings {
     pub max_sources_per_file: u32,
     /// Maximum total TCP connections (eMule: maxconnections, default 500).
     ///
-    /// Applied to the upload listener and to the outbound download-source
-    /// limiter. eMule keeps one pool for both directions
-    /// (`CListenSocket::TooManySockets`); Ember applies the ceiling to each
-    /// independently, because a download burst drawing from a shared pool
-    /// would starve the listener of accept capacity — which is the failure
-    /// this setting exists to prevent.
+    /// One machine-wide budget shared by the upload listener and the outbound
+    /// download sources, as in eMule — every `CClientReqSocket` joins one list
+    /// whoever dialled it, and `TooManySockets` gates both directions against
+    /// its length. Downloads leave a reserve free so a burst of them can never
+    /// cost us the ability to accept a peer that wants to queue with us; see
+    /// `ed2k::multi_source::listener_reserve`.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     /// Most new TCP connections the upload listener will accept in any
