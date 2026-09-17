@@ -733,6 +733,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     changed |= clamp_assign(&mut settings.download_queue_wait_secs, 60, 14400);
     changed |= clamp_assign(&mut settings.max_sources_per_file, 1, 2000);
     changed |= clamp_assign(&mut settings.max_connections, 1, 2000);
+    // 0 is meaningful here — it turns the burst gate off — so it is clamped
+    // from above only.
+    if settings.max_connections_per_five_secs > 500 {
+        settings.max_connections_per_five_secs = 500;
+        changed = true;
+    }
     changed |= clamp_assign(&mut settings.multisource_retry_rounds, 1, 20);
     changed |= clamp_assign(&mut settings.download_part_retry_rounds, 1, 20);
     changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 593);
@@ -976,6 +982,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_max_connections_invalid",
             "Max connections must be between 1 and 2000",
+        ));
+    }
+    if settings.max_connections_per_five_secs > 500 {
+        return Err(coded(
+            "settings_max_connections_per_five_secs_invalid",
+            "Max connections per 5 seconds must be between 0 and 500",
         ));
     }
     if !(1..=20).contains(&settings.multisource_retry_rounds) {

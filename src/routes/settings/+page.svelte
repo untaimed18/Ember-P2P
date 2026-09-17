@@ -1071,7 +1071,8 @@
     const numericFields = [
       'tcp_port', 'udp_port', 'max_upload_speed', 'max_download_speed',
       'max_concurrent_downloads', 'max_concurrent_uploads', 'max_sources_per_file',
-      'max_connections', 'download_queue_wait_secs', 'multisource_retry_rounds',
+      'max_connections', 'max_connections_per_five_secs',
+      'download_queue_wait_secs', 'multisource_retry_rounds',
       'download_part_retry_rounds', 'max_download_file_size_gib',
       'search_timeout_secs', 'max_friends',
     ] as const;
@@ -1110,6 +1111,9 @@
     s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
     s.max_sources_per_file = ci(s.max_sources_per_file, 1, 2000, 1000);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
+    // Lower bound 0: that is the documented "no burst gate" value, not an
+    // empty box — `numericFields` above already rejects those.
+    s.max_connections_per_five_secs = ci(s.max_connections_per_five_secs, 0, 500, 20);
     s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
@@ -2706,6 +2710,24 @@
               </div>
             </div>
 
+            <!-- eMule's Connection page keeps `maxconnections` and
+                 `MaxConnectionsPerFiveSeconds` beside the transfer limits, and
+                 the first of the two decides how many peers can be waiting in
+                 your upload queue at all — so it belongs in front of the user
+                 rather than in config.json. -->
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-connections">{m.settings_max_connections()}</label>
+                <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
+                <span class="hint">{m.settings_max_connections_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-conn-per-five">{m.settings_max_conn_per_five()}</label>
+                <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} />
+                <span class="hint">{m.settings_max_conn_per_five_hint()}</span>
+              </div>
+            </div>
+
             <div class="field">
               <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
               <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
@@ -2713,9 +2735,12 @@
             </div>
           </div>
 
-          <!-- Protocol budget / retry knobs (max_sources, max_connections,
+          <!-- The remaining protocol budget / retry knobs (max_sources,
                queue wait, retry rounds) stay in AppSettings for config.json
-               and backend clamps, but are intentionally not exposed here. -->
+               and backend clamps, but are intentionally not exposed here.
+               `max_connections` used to be in that list; it is above now,
+               because it governs upload-queue capacity and eMule has always
+               exposed it. -->
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_behavior()}</h4>

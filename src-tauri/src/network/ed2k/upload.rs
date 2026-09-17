@@ -313,8 +313,9 @@ async fn mutual_friend_access(
 fn allow_long_lived_session_under_admission(
     from_configured_server_ip: bool,
     total_connections: usize,
+    ordinary_limit: usize,
 ) -> bool {
-    !from_configured_server_ip || total_connections <= MAX_TOTAL_CONNECTIONS
+    !from_configured_server_ip || total_connections <= ordinary_limit
 }
 
 /// Remove `hash`'s entry from `sessions` if present but stale (see
@@ -944,6 +945,32 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+
+/// How long a peer that is only *waiting* in the queue may hold its TCP session
+/// open without saying anything.
+///
+/// eMule drops such a socket after `CONNECTION_TIMEOUT` (40 s) in
+/// `CClientReqSocket::CheckTimeOut` (`ListenSocket.cpp:136-153`). The
+/// extensions there are for a client that is downloading, chatting or acting as
+/// a KAD buddy; a plain waiter gets none of them.
+///
+/// The queue *row* is unaffected by the disconnect, in eMule and here alike:
+/// eMule's waiting-list purge (`UploadQueue.cpp:119`) keys on
+/// `GetLastUpRequest` and `MAX_PURGEQUEUETIME` (1 h) and never looks at the
+/// socket, and the peer keeps its place by re-asking over UDP
+/// `OP_REASKFILEPING`. Ember already matches both halves of that — the row
+/// survives with `current_addr` cleared, `udp_queue_rank_for_peer` answers the
+/// re-ask, and `AddUpNextClient` dials a HighID waiter back when a slot opens.
+///
+/// What Ember did *not* match is letting go of the socket. The queued branch
+/// polled once a second and never closed, so every waiter pinned one of the
+/// listener's connection slots for as long as it cared to stay connected. Once
+/// those were full the accept loop dropped new peers before they could send
+/// `OP_STARTUPLOADREQ`, which bounded the waiting list by the connection limit
+/// rather than by `MAX_UPLOAD_QUEUE_SIZE` — reported as Ember plateauing around
+/// 150 queued peers where aMule reached ~400 on the same share and server
+/// (issue #111).
+const QUEUED_SOCKET_IDLE_SECS: u64 = 40;
 /// One wall-clock budget covers transport discrimination, optional
 /// obfuscation/secure-stream negotiation, and receipt of the first complete
 /// eD2K frame.
@@ -1019,8 +1046,20 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// still-queued entries (via [`QueueEntry::last_ip`]), so a peer cannot
 /// churn connections with rotating user-hashes to dilute the queue.
 const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
-/// Maximum total concurrent TCP connections to the upload server
-const MAX_TOTAL_CONNECTIONS: usize = 100;
+/// Fallback ceiling on concurrent TCP connections to the upload listener, used
+/// only if the configured value is somehow zero.
+///
+/// This was the *hardcoded* limit, and at 100 it was a fifth of eMule's
+/// `maxconnections` default of 500 (`CPreferences::GetRecommendedMaxConnections`,
+/// `Preferences.cpp:1473-1485`, gating accepts through
+/// `CListenSocket::TooManySockets`, `ListenSocket.cpp:2181`). Ember already had
+/// the matching setting — `AppSettings::max_connections`, documented as
+/// "eMule: maxconnections, default 500" — but it only ever reached the outbound
+/// download limiter, so the listener ignored it. Combined with a queued peer
+/// never releasing its socket, that capped the waiting list at roughly this
+/// number (issue #111). The listener now reads the setting; see
+/// [`QUEUED_SOCKET_IDLE_SECS`] for the other half of that fix.
+const MAX_TOTAL_CONNECTIONS_FALLBACK: usize = 500;
 /// Extra accept slots reserved so the configured eD2K server can still complete
 /// its short HighID port-test while ordinary capacity is saturated.  Long-lived
 /// sessions from that IP that only fit because of this reserve are rejected in
@@ -2107,6 +2146,15 @@ struct UploadHandler {
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
+    /// `AppSettings::max_connections`, live-updated. See
+    /// [`MAX_TOTAL_CONNECTIONS_FALLBACK`].
+    max_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// `AppSettings::max_connections_per_five_secs`, live-updated. See
+    /// [`UploadHandler::accept_budget_allows`].
+    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rolling accept-rate window: when it started, and how many connections
+    /// have been accepted inside it.
+    accept_window: parking_lot::Mutex<(std::time::Instant, usize)>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
@@ -3308,6 +3356,8 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
+    max_connections: Arc<std::sync::atomic::AtomicUsize>,
+    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -3421,6 +3471,9 @@ pub async fn start_upload_server(
         advertise_udp_port,
         active_count,
         max_concurrent_uploads,
+        max_connections,
+        max_conn_per_five,
+        accept_window: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -3629,17 +3682,33 @@ pub async fn start_upload_server(
                             continue;
                         }
 
+                        // Accept-rate gate, ahead of the capacity check because
+                        // it is about how fast we open sockets rather than how
+                        // many we hold. The configured server is exempt: its
+                        // HighID port-test must never lose to a burst from
+                        // ordinary peers, which is the same carve-out eMule
+                        // makes for `serverconnect->IsConnecting()`
+                        // (`ListenSocket.cpp:2013`).
+                        if !is_server_port_test_ip && !server.accept_budget_allows() {
+                            debug!(
+                                "Rejecting connection from {peer_addr}: accept rate budget spent for this window"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+
                         // Enforce global connection limit. Reserve the slot with
                         // an atomic compare-exchange rather than a separate
                         // load-check-then-`fetch_add`: under a burst of
                         // simultaneous accepts the old check-then-act let
                         // multiple handlers each observe `< MAX` and increment
-                        // past MAX_TOTAL_CONNECTIONS.
+                        // past the limit.
                         let reserved = {
+                            let limit = server.connection_limit();
                             let connection_limit = if is_server_port_test_ip {
-                                MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
+                                limit + RESERVED_PORT_TEST_CONNECTIONS
                             } else {
-                                MAX_TOTAL_CONNECTIONS
+                                limit
                             };
                             let mut cur = server
                                 .total_connections
@@ -3794,13 +3863,14 @@ pub async fn start_upload_server(
 
                 // Reserve a global slot with the same cap + atomic CAS the
                 // inbound accept path uses, so outbound callback serves can't
-                // push the process past MAX_TOTAL_CONNECTIONS.
+                // push the process past the configured connection limit.
                 let reserved = {
+                    let limit = server.connection_limit();
                     let mut cur = server
                         .total_connections
                         .load(std::sync::atomic::Ordering::Relaxed);
                     loop {
-                        if cur >= MAX_TOTAL_CONNECTIONS {
+                        if cur >= limit {
                             break false;
                         }
                         match server.total_connections.compare_exchange_weak(
@@ -3957,11 +4027,12 @@ pub async fn start_upload_server(
                 }
 
                 let reserved = {
+                    let limit = server.connection_limit();
                     let mut cur = server
                         .total_connections
                         .load(std::sync::atomic::Ordering::Relaxed);
                     loop {
-                        if cur >= MAX_TOTAL_CONNECTIONS {
+                        if cur >= limit {
                             break false;
                         }
                         match server.total_connections.compare_exchange_weak(
@@ -4548,6 +4619,48 @@ impl UploadHandler {
     /// per-slot rate is compared against the target: if existing slots are
     /// already starved (median < target * 0.5), we avoid opening more even
     /// if the formula would allow it.
+    /// Configured ceiling on concurrent connections held by this listener.
+    fn connection_limit(&self) -> usize {
+        let configured = self.max_connections.load(std::sync::atomic::Ordering::Relaxed);
+        if configured == 0 {
+            MAX_TOTAL_CONNECTIONS_FALLBACK
+        } else {
+            configured
+        }
+    }
+
+    /// eMule's `MaxConperFive` gate: at most N newly accepted connections in
+    /// any five-second window (`CListenSocket::TooManySockets`,
+    /// `ListenSocket.cpp:2182`, default `MAXCONPER5SEC` = 20).
+    ///
+    /// This bounds the rate at which we open sockets, not how many we hold —
+    /// the point is to stay friendly to NAT tables and to routers that choke on
+    /// connection bursts, which is why eMule ships it as a user-visible
+    /// preference. Returns false when the budget for the current window is
+    /// spent; the caller drops the connection and the peer retries, which is
+    /// the same outcome as eMule's `StopListening`.
+    ///
+    /// `0` disables the gate, for a user who would rather not have one.
+    fn accept_budget_allows(&self) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        let budget = self
+            .max_conn_per_five
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if budget == 0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut window = self.accept_window.lock();
+        if now.duration_since(window.0) >= WINDOW {
+            *window = (now, 0);
+        }
+        if window.1 >= budget {
+            return false;
+        }
+        window.1 += 1;
+        true
+    }
+
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let max_configured = self
@@ -4934,11 +5047,12 @@ impl UploadHandler {
 
         // Reserve global + per-IP connection slots like the callback-serve arm.
         let reserved = {
+            let limit = self.connection_limit();
             let mut cur = self
                 .total_connections
                 .load(std::sync::atomic::Ordering::Relaxed);
             loop {
-                if cur >= MAX_TOTAL_CONNECTIONS {
+                if cur >= limit {
                     break false;
                 }
                 match self.total_connections.compare_exchange_weak(
@@ -5958,11 +6072,16 @@ impl UploadHandler {
             let total = self
                 .total_connections
                 .load(std::sync::atomic::Ordering::Relaxed);
-            if !allow_long_lived_session_under_admission(from_configured_server_ip, total) {
+            let ordinary_max = self.connection_limit();
+            if !allow_long_lived_session_under_admission(
+                from_configured_server_ip,
+                total,
+                ordinary_max,
+            ) {
                 info!(
                     "Rejecting long-lived connection from configured server IP {peer_addr}: \
                      reserved capacity is only for the short HighID port-test protocol \
-                     (connections={total}, ordinary_max={MAX_TOTAL_CONNECTIONS})"
+                     (connections={total}, ordinary_max={ordinary_max})"
                 );
                 return Ok(());
             }
@@ -7022,6 +7141,11 @@ impl UploadHandler {
         let mut last_heartbeat_log: Option<std::time::Instant> = None;
         let mut outer_loop_iterations: u64 = 0;
         let session_open_at: std::time::Instant = std::time::Instant::now();
+        // Last frame received from the peer, i.e. eMule's `timeout_timer` and
+        // its `ResetTimeOutTimer()` on receive. Drives
+        // [`QUEUED_SOCKET_IDLE_SECS`], which is the only thing that lets go of
+        // a waiting peer's connection slot.
+        let mut last_inbound: std::time::Instant = std::time::Instant::now();
 
         // Session-local caches populated lazily on OP_REQUESTPARTS and reused
         // across batches / blocks so we don't re-open the serve file, re-read
@@ -7398,7 +7522,10 @@ impl UploadHandler {
                 };
 
                 match read_result {
-                    Ok(Some(Ok(p))) => p,
+                    Ok(Some(Ok(p))) => {
+                        last_inbound = std::time::Instant::now();
+                        p
+                    }
                     Ok(Some(Err(e))) => {
                         info!(
                             target: "ember::upload_diag",
@@ -7650,6 +7777,21 @@ impl UploadHandler {
                                         &mut writer, OP_EMULEPROT, OP_QUEUERANKING, &qr_payload,
                                     ).await;
                                 }
+                            }
+                            // Promotion has had its chance on this tick; if the
+                            // peer is still only waiting and has been silent for
+                            // longer than eMule would hold the socket, hand the
+                            // connection slot back. The row stays — see
+                            // `QUEUED_SOCKET_IDLE_SECS`.
+                            if last_inbound.elapsed().as_secs() >= QUEUED_SOCKET_IDLE_SECS {
+                                debug!(
+                                    target: "ember::upload_diag",
+                                    "session_end {peer_addr} reason=queued_socket_idle \
+                                     idle={}s session_age={}s — queue row retained",
+                                    last_inbound.elapsed().as_secs(),
+                                    session_open_at.elapsed().as_secs(),
+                                );
+                                break;
                             }
                             continue;
                         }
@@ -13540,17 +13682,17 @@ mod ember_session_handle_tests {
 
     #[test]
     fn reserved_port_test_admission_rejects_long_lived_over_capacity() {
+        const LIMIT: usize = 500;
         assert!(allow_long_lived_session_under_admission(
             false,
-            MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
+            LIMIT + RESERVED_PORT_TEST_CONNECTIONS,
+            LIMIT
         ));
-        assert!(allow_long_lived_session_under_admission(
-            true,
-            MAX_TOTAL_CONNECTIONS
-        ));
+        assert!(allow_long_lived_session_under_admission(true, LIMIT, LIMIT));
         assert!(!allow_long_lived_session_under_admission(
             true,
-            MAX_TOTAL_CONNECTIONS + 1
+            LIMIT + 1,
+            LIMIT
         ));
     }
 
@@ -13587,9 +13729,24 @@ mod ember_session_handle_tests {
 
     #[test]
     fn port_test_reserve_does_not_expand_ordinary_capacity() {
-        assert_eq!(MAX_TOTAL_CONNECTIONS, 100);
+        // The listener's ceiling is `AppSettings::max_connections` now; only
+        // the reserve on top of it is fixed.
+        assert_eq!(MAX_TOTAL_CONNECTIONS_FALLBACK, 500);
         const _: () = assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
         const _: () = assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
+    }
+
+    /// A waiting peer must not be able to hold a connection slot forever; that
+    /// is what bounded the queue by the connection limit instead of by
+    /// `MAX_UPLOAD_QUEUE_SIZE`. eMule drops the socket after
+    /// `CONNECTION_TIMEOUT` and keeps the row for `MAX_PURGEQUEUETIME`.
+    #[test]
+    fn a_queued_socket_is_released_long_before_its_queue_row_expires() {
+        // Releasing the socket must not also drop the peer's place in the queue.
+        const _: () = assert!(QUEUED_SOCKET_IDLE_SECS < MAX_PURGEQUEUETIME_SECS);
+        // eMule's CONNECTION_TIMEOUT (Opcodes.h:63) is 40s, and a plain waiter
+        // gets none of the extensions in CClientReqSocket::CheckTimeOut.
+        assert_eq!(QUEUED_SOCKET_IDLE_SECS, 40);
     }
 
     #[tokio::test]

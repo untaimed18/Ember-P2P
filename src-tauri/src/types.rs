@@ -1372,9 +1372,24 @@ pub struct AppSettings {
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
     #[serde(default = "default_max_sources_per_file")]
     pub max_sources_per_file: u32,
-    /// Maximum total TCP connections (eMule: maxconnections, default 500)
+    /// Maximum total TCP connections (eMule: maxconnections, default 500).
+    ///
+    /// Applied to the upload listener and to the outbound download-source
+    /// limiter. eMule keeps one pool for both directions
+    /// (`CListenSocket::TooManySockets`); Ember applies the ceiling to each
+    /// independently, because a download burst drawing from a shared pool
+    /// would starve the listener of accept capacity — which is the failure
+    /// this setting exists to prevent.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Most new TCP connections the upload listener will accept in any
+    /// five-second window (eMule: `MaxConnectionsPerFiveSeconds`, default 20
+    /// via `MAXCONPER5SEC`). `0` disables the gate.
+    ///
+    /// Bounds the *rate* of socket creation rather than the count, which is
+    /// what keeps consumer routers and NAT tables from choking on a burst.
+    #[serde(default = "default_max_connections_per_five_secs")]
+    pub max_connections_per_five_secs: u32,
     /// Add new downloads in paused state (eMule: addnewfilespaused)
     #[serde(default)]
     pub add_downloads_paused: bool,
@@ -1945,6 +1960,10 @@ fn default_max_connections() -> u32 {
     500
 }
 
+fn default_max_connections_per_five_secs() -> u32 {
+    20
+}
+
 fn default_download_queue_wait_secs() -> u64 {
     1800
 }
@@ -2149,6 +2168,7 @@ impl Default for AppSettings {
             auto_connect_server: false,
             max_sources_per_file: 400,
             max_connections: 500,
+            max_connections_per_five_secs: 20,
             add_downloads_paused: false,
             remove_finished_downloads: false,
             preview_priority_all: false,

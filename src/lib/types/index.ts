@@ -888,7 +888,12 @@ export interface AppSettings {
   /** eD2K only. KAD always bootstraps on startup and has no setting. */
   auto_connect_server: boolean;
   max_sources_per_file: number;
+  /** eMule `maxconnections`. Bounds the upload listener's concurrent
+   *  connections and the outbound download-source limiter. */
   max_connections: number;
+  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast the upload listener
+   *  opens new sockets; 0 disables the gate. */
+  max_connections_per_five_secs: number;
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
   /** Globally prioritize first/last part of every download for faster preview. */
