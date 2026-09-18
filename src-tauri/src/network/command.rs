@@ -4468,27 +4468,22 @@ async fn handle_command_inner(
             // can still finish its download. That is why a queue survives a
             // reconnect.
             //
-            // An earlier attempt kept uploads alive only while an eD2K server
-            // session was still live, which read as a reasonable "no transport
-            // left" rule but could never work from here: this handler sets
-            // `user_offline` immediately below and then tears the server session
-            // down itself a few lines later, and `handle_server_disconnect` used
-            // to re-raise the gate whenever the server went away while
-            // `user_offline` was set. The exemption was undone by its own handler
-            // before any upload could benefit from it, so uploads still stopped.
+            // Stop the outbound half — no new download workers, no friend
+            // dials, no server search — but only when leaving KAD actually
+            // leaves the node with no eD2K transport at all.
             //
-            // The old justification also sat badly with what this command
-            // deliberately keeps running: the Ember overlay, its DHT, channel
-            // transfers and the publish cycle all carry on (see the note further
-            // down). A node still publishing to one DHT is not a node that has
-            // gone offline, so refusing to serve the peers who already know it
-            // was never coherent.
-            //
-            // Stop the outbound half only: no new download workers, no friend
-            // dials, no server search until the user comes back online.
+            // KAD off with a server still connected is a normal eMule mode, not
+            // an offline node, and this is the command's only caller: the
+            // Disconnect button in the KAD Network page header. Raising the
+            // outbound gate unconditionally is what made leaving one network
+            // read as going offline, and it is why the upload exemption keyed on
+            // a live server session could never fire — this handler used to
+            // tear that session down itself a few lines later.
+            let server_session_survives =
+                state.server_connected || state.server_connection.is_some();
             state
                 .user_offline
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(!server_session_survives, std::sync::atomic::Ordering::Relaxed);
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -4498,34 +4493,24 @@ async fn handle_command_inner(
             state.stats.stores_acknowledged = 0;
             let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
 
-            // Tear down the eD2K server too. Not because eD2K depends on KAD —
-            // it does not, and treating the two as coupled is what used to stop
-            // uploads on a session that only ever had a server (see
-            // `handle_server_disconnect`) — but because this command is the
-            // app's single Disconnect: the user asked to go offline, not to
-            // leave one network.
-            if let Some(handle) = state.pending_server_connect.take() {
-                handle.abort();
-            }
-            if state.server_connected || state.server_connection.is_some() {
-                if let Some(conn) = state.server_connection.take() {
-                    conn.disconnect().await;
-                }
-                handle_server_disconnect(
-                    state,
-                    shared_server_addr,
-                    app_handle,
-                    "KAD disconnected",
-                )
-                .await;
-            }
+            // The eD2K server session is deliberately left alone, including a
+            // connect still in flight. KAD and the server are independent
+            // networks in eMule and in the protocol, and using one without the
+            // other is ordinary: server-only with KAD disabled, or KAD-only
+            // with no server. The server's own Disconnect is
+            // `NetworkCommand::DisconnectServer`, reached from the Servers
+            // page, and it is equally careful not to touch KAD.
 
             // Deliberately not "all activity stopped": the Ember overlay has no
             // off switch and keeps its DHT, channel transfers and publishing
-            // republish cycle running by design. What this tears down is KAD,
-            // the eD2K server session, uploads, friend sessions and the active
-            // download workers.
-            info!("KAD disconnected — KAD, eD2K server, uploads and friend sessions stopped");
+            // republish cycle running by design, and uploads keep serving (see
+            // the note above). What this tears down is KAD itself, friend
+            // sessions and the active download workers.
+            if server_session_survives {
+                info!("KAD disconnected — eD2K server session left connected");
+            } else {
+                info!("KAD disconnected — no eD2K transport left, outbound work stopped");
+            }
         }
 
         NetworkCommand::KadBootstrapIp { ip, port, tx } => {

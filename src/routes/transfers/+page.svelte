@@ -115,7 +115,7 @@
     .filter((column) => !DOWNLOAD_COMPACT_COLUMN_KEYS.has(column.key))
     .map((column) => column.key);
   const UPLOAD_COLUMNS: TransferColumn<UlSortField>[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-ul-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-ul-flag', sortField: 'country' },
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-ul-client', sortField: 'peer_name' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
     { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
@@ -137,8 +137,8 @@
   // user with persisted column widths from the old "On Queue" placeholder
   // tab gets defaults instead of a stale layout that doesn't match the
   // new column set.
-  const QUEUE_COLUMNS: TransferColumn[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
+  const QUEUE_COLUMNS: TransferColumn<QuSortField>[] = [
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-q-flag', sortField: 'country' },
     // Nickname and Software sit beside the User ID here for the same reason
     // they do on the Uploading tab: the hash identifies the row, the name is
     // what the person reading it recognises. The queue snapshot carries both
@@ -158,11 +158,12 @@
   // and Ember-only tabs; the first data column's header switches to
   // "User Name" on the Ember tab. Independent of which peers are
   // connected, so this view is the "credit ledger" view of the network.
-  // Every non-flag column is sortable; the user's last-used sort is persisted
-  // via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
+  // Every column is sortable, the flag included — it orders by the ISO code,
+  // which is all the GeoIP lookup returns. The user's last-used sort is
+  // persisted via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
   // `KnSortField` type and `toggleKnSort` below).
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-k-flag', sortField: 'country' },
     { key: 'user_hash', get label() { return showingEmberKnown ? m.transfers_col_user_name() : m.transfers_col_user_hash(); }, width: 248, minWidth: 168, className: 'col-k-hash', sortField: 'user_hash' },
     // The ledger stores what each peer called itself and what it runs, so the
     // eD2K tab no longer has only 32 hex characters to identify a row by.
@@ -190,7 +191,7 @@
   // choice made the rows keep their activity-priority default.
   const CLIENT_COLUMNS: TransferColumn<ClSortField>[] = [
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client', sortField: 'peer_name' },
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-c-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-c-flag', sortField: 'country' },
     { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft', sortField: 'client_software' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
     { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed', sortField: 'speed' },
@@ -758,6 +759,9 @@
     return [...sources].sort((a, b) => {
       let cmp = 0;
       switch (field) {
+        case 'country':
+          cmp = sortCollator.compare(a.country_code || '', b.country_code || '');
+          break;
         case 'peer_name':
           cmp = sortCollator.compare(a.peer_name || a.ip, b.peer_name || b.ip);
           break;
@@ -1436,6 +1440,9 @@
         case 'peer_name':
           raw = cmpStr(a.peer_name, b.peer_name);
           break;
+        case 'country':
+          raw = cmpStr(a.country_code, b.country_code);
+          break;
         case 'client_software':
           raw = cmpStr(a.client_software, b.client_software);
           break;
@@ -1469,17 +1476,71 @@
     return sorted;
   });
 
+  /** Sorted view of the upload queue snapshot, driven by the column-header
+   *  click state. Empty country / name / software values go to the end on an
+   *  ascending sort, as they do on the Known Peers table, and every comparison
+   *  falls back to the row's own key so equal values resolve the same way on
+   *  every re-poll instead of showing the backend's arrival order as movement. */
+  let sortedUploadQueueClients = $derived.by(() => {
+    if (uploadQueueClients.length === 0) return uploadQueueClients;
+    const sorted = [...uploadQueueClients];
+    const dir = quSortAsc ? 1 : -1;
+    const cmpStr = (a: string | null | undefined, b: string | null | undefined) => {
+      const ax = (a ?? '').toLowerCase();
+      const bx = (b ?? '').toLowerCase();
+      if (ax === bx) return 0;
+      // +1 for empty so the outer `raw * dir` puts it last ascending; see the
+      // matching note on `sortedKnownClients`.
+      if (!ax) return 1;
+      if (!bx) return -1;
+      return ax < bx ? -1 : 1;
+    };
+    const cmpNum = (a: number, b: number) => (a === b ? 0 : a < b ? -1 : 1);
+    sorted.sort((a, b) => {
+      let raw = 0;
+      switch (quSortField) {
+        case 'country': raw = cmpStr(a.country_code, b.country_code); break;
+        case 'peer_name': raw = cmpStr(a.peer_name, b.peer_name); break;
+        case 'user_name': raw = cmpStr(a.user_hash || a.peer_ip, b.user_hash || b.peer_ip); break;
+        case 'client_software': raw = cmpStr(a.client_software, b.client_software); break;
+        case 'file_name': raw = cmpStr(a.file_name, b.file_name); break;
+        case 'wait_time': raw = cmpNum(a.wait_seconds, b.wait_seconds); break;
+        case 'queue_rank': raw = cmpNum(a.queue_rank, b.queue_rank); break;
+        case 'credit_ratio': raw = cmpNum(a.credit_ratio, b.credit_ratio); break;
+        case 'transfer_history': raw = cmpNum(a.uploaded, b.uploaded); break;
+        // Same trust ordering the Known Peers table sorts by, not the raw
+        // code: the cell shows a translated label, so an alphabetical sort on
+        // the wire string would match the displayed order in no locale.
+        case 'ident_state':
+          raw = cmpNum(
+            KNOWN_IDENT_ORDER[a.ident_state] ?? 99,
+            KNOWN_IDENT_ORDER[b.ident_state] ?? 99,
+          );
+          break;
+      }
+      if (raw === 0) return cmpNum(a.queue_rank, b.queue_rank);
+      return raw * dir;
+    });
+    return sorted;
+  });
+
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
-  type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
-  type KnSortField = 'user_hash' | 'peer_name' | 'client_software' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
+  type UlSortField = 'country' | 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
+  // Every queue column says something per-row, so all of them sort. `user_name`
+  // orders by the user hash the column actually shows (falling back to the
+  // address, as the cell does), and `transfer_history` by what we sent them —
+  // the first of the two figures in the cell.
+  type QuSortField = 'country' | 'peer_name' | 'user_name' | 'client_software' | 'file_name' | 'wait_time' | 'queue_rank' | 'credit_ratio' | 'transfer_history' | 'ident_state';
+  type KnSortField = 'country' | 'user_hash' | 'peer_name' | 'client_software' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
   // No `file_name`: that column shows the parent download's name, which is the
   // same string on every row here, so sorting by it would do nothing.
-  type ClSortField = 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
+  type ClSortField = 'country' | 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
-  const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
-  const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'peer_name', 'client_software', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
-  const CL_SORT_FIELDS: ClSortField[] = ['peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
+  const UL_SORT_FIELDS: UlSortField[] = ['country', 'peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
+  const QU_SORT_FIELDS: QuSortField[] = ['country', 'peer_name', 'user_name', 'client_software', 'file_name', 'wait_time', 'queue_rank', 'credit_ratio', 'transfer_history', 'ident_state'];
+  const KN_SORT_FIELDS: KnSortField[] = ['country', 'user_hash', 'peer_name', 'client_software', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
+  const CL_SORT_FIELDS: ClSortField[] = ['country', 'peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
   // localStorage can throw in private mode / on quota-exceeded, and
   // `loadStoredColumnWidths` runs during mount — an escaped throw there
   // aborted page initialization. The sort and column-setup persistence below
@@ -1492,6 +1553,11 @@
   let dlSortAsc = $state(safeGetItem('transfers-dl-sort-asc') !== 'false');
   let ulSortField: UlSortField = $state(UL_SORT_FIELDS.includes(safeGetItem('transfers-ul-sort-field') as UlSortField) ? safeGetItem('transfers-ul-sort-field') as UlSortField : 'file_name');
   let ulSortAsc = $state(safeGetItem('transfers-ul-sort-asc') !== 'false');
+  // Default queue sort: rank ascending, which is the order the backend
+  // snapshot already arrives in and the order eMule shows a queue in, so the
+  // first paint is unchanged for anyone who never clicks a header.
+  let quSortField: QuSortField = $state(QU_SORT_FIELDS.includes(safeGetItem('transfers-qu-sort-field') as QuSortField) ? safeGetItem('transfers-qu-sort-field') as QuSortField : 'queue_rank');
+  let quSortAsc = $state(safeGetItem('transfers-qu-sort-asc') !== 'false');
   // Default Known Clients sort: most-recently-seen first. Matches the
   // backend snapshot's default ordering so the first paint is stable
   // even before the user picks a column. `dlSortAsc` semantics: true =
@@ -1519,6 +1585,27 @@
     safeSetItem('transfers-ul-sort-field', ulSortField);
     safeSetItem('transfers-ul-sort-asc', String(ulSortAsc));
   }
+  function toggleQuSort(field: QuSortField) {
+    if (quSortField === field) {
+      quSortAsc = !quSortAsc;
+    } else {
+      // Same "natural direction" rule as the Known Peers table: text reads
+      // best A-Z, numbers largest-first. Rank is the exception among the
+      // numbers — rank 1 is the front of the queue, so ascending is what
+      // someone clicking it wants to see.
+      quSortField = field;
+      quSortAsc =
+        field === 'country' ||
+        field === 'peer_name' ||
+        field === 'user_name' ||
+        field === 'client_software' ||
+        field === 'file_name' ||
+        field === 'ident_state' ||
+        field === 'queue_rank';
+    }
+    safeSetItem('transfers-qu-sort-field', quSortField);
+    safeSetItem('transfers-qu-sort-asc', String(quSortAsc));
+  }
   function toggleKnSort(field: KnSortField) {
     if (knSortField === field) {
       knSortAsc = !knSortAsc;
@@ -1529,6 +1616,7 @@
       // sorting UX in eMule and most file managers.
       knSortField = field;
       knSortAsc =
+        field === 'country' ||
         field === 'user_hash' ||
         field === 'peer_name' ||
         field === 'client_software' ||
@@ -1547,7 +1635,7 @@
       clSortField = field;
       // Text columns read best A-Z; numbers and status read best largest- /
       // most-active-first, matching the Known Clients table.
-      clSortAsc = field === 'peer_name' || field === 'client_software';
+      clSortAsc = field === 'country' || field === 'peer_name' || field === 'client_software';
     } else if (clSortAsc) {
       clSortAsc = false;
     } else {
@@ -1932,6 +2020,7 @@
     sorted.sort((a, b) => {
       let cmp = 0;
       switch (ulSortField) {
+        case 'country': cmp = (a.country_code || '').localeCompare(b.country_code || ''); break;
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
         case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
@@ -3086,6 +3175,18 @@
     sortOnKey(event, () => toggleUlSort(sortField));
   }
 
+  function onQueueHeaderClick(column: TransferColumn<QuSortField>) {
+    if (Date.now() < suppressHeaderClickUntil) return;
+    if (!column.sortField) return;
+    toggleQuSort(column.sortField);
+  }
+
+  function onQueueHeaderKeydown(event: KeyboardEvent, column: TransferColumn<QuSortField>) {
+    const sortField = column.sortField;
+    if (!sortField) return;
+    sortOnKey(event, () => toggleQuSort(sortField));
+  }
+
   function onKnownHeaderClick(column: TransferColumn<KnSortField>) {
     if (Date.now() < suppressHeaderClickUntil) return;
     if (!column.sortField) return;
@@ -3154,7 +3255,7 @@
 
   let visibleDownloadColumns = $derived.by(() => getVisibleColumns('downloads') as TransferColumn<DlSortField>[]);
   let visibleUploadColumns = $derived.by(() => getVisibleColumns('uploads') as TransferColumn<UlSortField>[]);
-  let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue'));
+  let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue') as TransferColumn<QuSortField>[]);
   let visibleKnownColumns = $derived.by(() => getVisibleColumns('known') as TransferColumn<KnSortField>[]);
   let visibleClientColumns = $derived.by(() => getVisibleColumns('clients') as TransferColumn<ClSortField>[]);
 
@@ -4674,18 +4775,25 @@
               {#each visibleQueueColumns as column (column.key)}
                 <th
                   class={column.className}
+                  class:sortable={Boolean(column.sortField)}
                   class:resizing={isResizingColumn('queue', column.key)}
                   class:drag-enabled={canDragColumn('queue', column.key)}
                   class:drop-before={isDropBefore('queue', column.key)}
                   class:drop-after={isDropAfter('queue', column.key)}
                   role="columnheader"
+                  tabindex={column.sortField ? 0 : undefined}
+                  aria-sort={column.sortField ? ariaSortValue(quSortField, column.sortField, quSortAsc) : undefined}
                   draggable={canDragColumn('queue', column.key)}
+                  onclick={() => onQueueHeaderClick(column)}
+                  onkeydown={(e) => onQueueHeaderKeydown(e, column)}
                   ondragstart={(e) => handleColumnDragStart(e, 'queue', column.key)}
                   ondragover={(e) => handleColumnDragOver(e, 'queue', column.key)}
                   ondrop={(e) => handleColumnDrop(e, 'queue', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">{column.label}</span>
+                  <span class="header-content" title={column.title}>
+                    {column.label}{column.sortField ? sortArrow(quSortField, column.sortField, quSortAsc) : ''}
+                  </span>
                   <button
                     type="button"
                     class="col-resize-handle"
@@ -4700,7 +4808,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each uploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
+            {#each sortedUploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
               <tr class="ul-row">
                 {#each visibleQueueColumns as column (column.key)}
                   {#if column.key === 'country'}

@@ -9,6 +9,8 @@ use crate::types::*;
 /// eMule-style rolling window speed measurement.
 /// Stores (cumulative_bytes, timestamp) pairs over a sliding window.
 const SPEED_WINDOW_MS: u128 = 10_000;
+/// Shortest span a displayed rate may be divided by. See `update_progress`.
+const MIN_SPEED_WINDOW_MS: u128 = 1_000;
 const MAX_SPEED_SAMPLES: usize = 500;
 const ACTIVE_DEGRADED_SECS: i64 = 20;
 const ACTIVE_STALLED_SECS: i64 = 60;
@@ -634,9 +636,30 @@ impl TransferManager {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
                 let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
                 let bytes_delta = transferred.saturating_sub(*oldest_bytes);
-                (bytes_delta as u128 * 1000)
-                    .checked_div(elapsed_ms)
-                    .map_or(transfer.speed, |bytes_per_sec| bytes_per_sec as u64)
+                // Divide by at least one second. A window is short whenever it
+                // has just been created — a new transfer, a new upload slot
+                // after a rotation, or a history dropped by the idle decay in
+                // `refresh_health` — and dividing by the 200 ms between the
+                // first two progress events reported several times the real
+                // rate. The upload token bucket holds up to 2x the cap, so a
+                // slot starting with a full bucket really does move that many
+                // bytes; it just did not move them in 200 ms. That is what put
+                // individual upload slots above the configured limit, and it
+                // showed up around slot changes because that is when a fresh
+                // window is most likely.
+                //
+                // One second is also the basis the status-bar total is computed
+                // on (`BandwidthLimiter::update_speeds` samples once a second),
+                // so a row and the total are no longer measured over windows
+                // two orders of magnitude apart.
+                //
+                // Flooring the divisor rather than reporting nothing until the
+                // window fills lets a starting slot ramp up instead of sitting
+                // at zero for a second. It also means the divisor is never 0,
+                // which is what the old `checked_div` guarded — its fallback
+                // carried the previous speed forward instead.
+                let divisor = elapsed_ms.max(MIN_SPEED_WINDOW_MS);
+                ((bytes_delta as u128 * 1000) / divisor) as u64
             } else {
                 0
             };
@@ -2209,6 +2232,38 @@ mod tests {
         assert_eq!(
             manager.queue.iter().find(|t| t.id == "c").unwrap().status,
             TransferStatus::Paused
+        );
+    }
+
+    /// A rate measured over a window that has only just opened used to be
+    /// divided by the 200 ms between the first two progress events, reporting
+    /// several times what actually moved. That is how a single upload slot
+    /// could show more than the whole configured upload limit, and why it
+    /// showed up around slot changes — a rotated slot is a new row with an
+    /// empty window.
+    ///
+    /// The sleep is what makes this meaningful: it puts a real, non-zero span
+    /// between the two samples that is still well under the one-second floor,
+    /// which is exactly the case that used to inflate. A slow machine that
+    /// overshoots the floor only makes the reported rate smaller, so the
+    /// assertion holds either way.
+    #[test]
+    fn a_fresh_speed_window_cannot_report_more_than_the_bytes_that_moved() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+
+        manager.update_progress("a", 0, Some(0));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        manager.update_progress("a", 400_000, Some(400_000));
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        assert!(
+            speed <= 400_000,
+            "400 kB moved in under a second reported as {speed} B/s"
+        );
+        assert!(
+            speed > 0,
+            "a slot that has started moving bytes must still ramp, not read zero"
         );
     }
 }

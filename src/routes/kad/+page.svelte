@@ -10,7 +10,8 @@
     getKadSearches,
     kadCancelSearch,
   } from '$lib/api/kad';
-  import { networkError, networkStats } from '$lib/stores/network';
+  import { goto } from '$app/navigation';
+  import { networkError, networkStats, serverStatus } from '$lib/stores/network';
   import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import type { KadContact, KadSearchEntry } from '$lib/types';
@@ -590,6 +591,24 @@
 
   let isConnected = $derived($networkStats.status === 'connected');
 
+  /** Sitting out KAD is a supported runtime choice, but with no eD2K server
+   *  either there is no network left that can answer "who has this file" —
+   *  `network_ready_for_sources` in the backend is KAD *or* server. Say so
+   *  here rather than letting it surface as searches that quietly return
+   *  nothing.
+   *
+   *  `last_update_at` gates the startup flash: both stores initialise to
+   *  'disconnected', so the condition is trivially true until the first
+   *  stats poll or event lands, and the field is only set once one has.
+   *  `connectPending` covers the moment between the click and the new status
+   *  arriving. Neither 'connecting' state warns — those are on their way. */
+  let noSourceNetwork = $derived(
+    ($networkStats.last_update_at ?? 0) > 0 &&
+      !connectPending &&
+      $networkStats.status === 'disconnected' &&
+      $serverStatus === 'disconnected',
+  );
+
   // V2 keeps the cross-page mirroring of the global `networkError` store
   // so a connect/listen failure raised elsewhere (e.g. by the network
   // initializer in onMount of +layout) still surfaces here. Main's KAD
@@ -645,6 +664,13 @@
   <div class="error-banner">
     <span>{kadError}</span>
     <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>{m.common_dismiss()}</button>
+  </div>
+{/if}
+
+{#if noSourceNetwork}
+  <div class="warning-banner" role="status">
+    <span>{m.kad_no_source_network()}</span>
+    <button class="ghost" onclick={() => goto('/servers')}>{m.nav_ed2k_servers()}</button>
   </div>
 {/if}
 
@@ -1159,10 +1185,12 @@
     align-items: center;
   }
 
-  .error-banner {
+  .error-banner,
+  .warning-banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding: 8px 20px;
     font-size: 13px;
   }
