@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "Detener descartará los archivos aún sin analizar en {folders}. Todo lo que ya está en tu biblioteca conserva sus recursos compartidos y estadísticas, y esos archivos se retomarán la próxima vez. ¿Continuar?",
   "library_stop_confirm_more_folders": "y {count} más",
   "library_stop_confirm_text": "Detener puede descartar archivos que aún no se han analizado. Todo lo que ya está en tu biblioteca conserva sus recursos compartidos y estadísticas. ¿Continuar?",
+  "library_digest_backfill": "Comprobaciones de archivos en segundo plano: {current} de {total}. Todo ya está compartido; esto solo añade una verificación de integridad extra para quienes descargan de ti.",
   "library_upgrading_index": "Actualizando el índice de la biblioteca (una sola vez): {current} de {total}. Tus archivos siguen compartidos mientras tanto.",
   "library_hashing_stopped": "El hasheo se detuvo.",
   "library_stopping_hashing": "Deteniendo el hasheo de forma segura…",

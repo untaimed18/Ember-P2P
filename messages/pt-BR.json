@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "Parar vai descartar arquivos ainda não escaneados em {folders}. Tudo o que já está na sua Biblioteca mantém compartilhamentos e estatísticas, e esses arquivos serão retomados da próxima vez. Continuar?",
   "library_stop_confirm_more_folders": "e mais {count}",
   "library_stop_confirm_text": "Parar pode descartar arquivos que ainda não foram escaneados. Tudo o que já está na sua Biblioteca mantém compartilhamentos e estatísticas. Continuar?",
+  "library_digest_backfill": "Verificações de arquivos em segundo plano: {current} de {total}. Tudo já está compartilhado — isto apenas adiciona uma verificação de integridade extra para quem baixa de você.",
   "library_upgrading_index": "Atualizando o índice da Biblioteca (uma única vez): {current} de {total}. Seus arquivos continuam compartilhados durante o processo.",
   "library_hashing_stopped": "A geração de hash foi interrompida.",
   "library_stopping_hashing": "Parando a geração de hash com segurança…",

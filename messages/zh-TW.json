@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "停止後將捨棄 {folders} 中尚未掃描的檔案。媒體櫃中已有的內容會保留其分享狀態與統計資料，這些檔案下次會繼續處理。是否繼續？",
   "library_stop_confirm_more_folders": "等另外 {count} 個",
   "library_stop_confirm_text": "停止後可能會捨棄尚未掃描的檔案。媒體櫃中已有的內容會保留其分享狀態與統計資料。是否繼續？",
+  "library_digest_backfill": "正在背景校驗檔案：{current} / {total}。所有檔案均已分享，這只是為下載者額外增加一層完整性校驗。",
   "library_upgrading_index": "正在升級媒體櫃索引（僅此一次）：{current} / {total}。期間你的檔案仍在分享中。",
   "library_hashing_stopped": "雜湊計算已停止。",
   "library_stopping_hashing": "正在安全停止雜湊計算…",

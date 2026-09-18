@@ -1086,6 +1086,7 @@
   "library_stop_confirm_more_folders": "and {count} more",
   "library_stop_confirm_safe": "Nothing in your Library will be lost — every file keeps its shares and stats, and work done so far is saved. Only files not yet scanned are skipped, and they are picked up next time. Continue?",
   "library_stop_confirm_text": "Stopping may drop files that have not been scanned yet. Everything already in your Library keeps its shares and stats. Continue?",
+  "library_digest_backfill": "Finishing background file checks: {current} of {total}. Everything is already shared — this only adds an extra integrity check for people downloading from you.",
   "library_upgrading_index": "Upgrading Library index (one-time): {current} of {total}. Your files stay shared while this runs.",
   "library_hashing_stopped": "Hashing was stopped.",
   "library_stopping_hashing": "Stopping hashing safely…",

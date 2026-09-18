@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "Beim Stoppen gehen noch nicht gescannte Dateien in {folders} verloren. Alles, was bereits in deiner Bibliothek ist, behält Freigaben und Statistiken, und diese Dateien werden beim nächsten Mal erfasst. Fortfahren?",
   "library_stop_confirm_more_folders": "und {count} weitere",
   "library_stop_confirm_text": "Beim Stoppen gehen möglicherweise noch nicht gescannte Dateien verloren. Alles, was bereits in deiner Bibliothek ist, behält Freigaben und Statistiken. Fortfahren?",
+  "library_digest_backfill": "Hintergrund-Dateiprüfung läuft: {current} von {total}. Alles ist bereits freigegeben — dies fügt nur eine zusätzliche Integritätsprüfung für deine Downloader hinzu.",
   "library_upgrading_index": "Bibliotheksindex wird aktualisiert (einmalig): {current} von {total}. Deine Dateien bleiben währenddessen freigegeben.",
   "library_hashing_stopped": "Hashing wurde gestoppt.",
   "library_stopping_hashing": "Hashing wird sicher gestoppt…",

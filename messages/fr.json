@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "L'arrêt abandonnera les fichiers pas encore analysés dans {folders}. Tout ce qui est déjà dans votre bibliothèque conserve ses partages et ses statistiques, et ces fichiers seront repris la prochaine fois. Continuer ?",
   "library_stop_confirm_more_folders": "et {count} de plus",
   "library_stop_confirm_text": "L'arrêt peut abandonner des fichiers pas encore analysés. Tout ce qui est déjà dans votre bibliothèque conserve ses partages et ses statistiques. Continuer ?",
+  "library_digest_backfill": "Vérifications de fichiers en arrière-plan : {current} sur {total}. Tout est déjà partagé — ceci ajoute seulement un contrôle d'intégrité supplémentaire pour ceux qui téléchargent chez vous.",
   "library_upgrading_index": "Mise à niveau de l'index de la bibliothèque (une seule fois) : {current} sur {total}. Vos fichiers restent partagés pendant l'opération.",
   "library_hashing_stopped": "Le calcul des hash a été arrêté.",
   "library_stopping_hashing": "Arrêt sécurisé du calcul des hash…",

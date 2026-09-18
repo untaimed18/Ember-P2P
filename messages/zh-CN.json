@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "停止后将丢弃 {folders} 中尚未扫描的文件。媒体库中已有的内容会保留其共享状态和统计数据，这些文件下次会继续处理。是否继续？",
   "library_stop_confirm_more_folders": "等另外 {count} 个",
   "library_stop_confirm_text": "停止后可能会丢弃尚未扫描的文件。媒体库中已有的内容会保留其共享状态和统计数据。是否继续？",
+  "library_digest_backfill": "正在后台校验文件：{current} / {total}。所有文件均已共享，这只是为下载者额外增加一层完整性校验。",
   "library_upgrading_index": "正在升级媒体库索引（仅此一次）：{current} / {total}。期间你的文件仍在共享。",
   "library_hashing_stopped": "哈希计算已停止。",
   "library_stopping_hashing": "正在安全停止哈希计算…",

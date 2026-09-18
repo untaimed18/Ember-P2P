@@ -1086,6 +1086,7 @@
   "library_stop_confirm_folders": "L'arresto scarterà i file non ancora analizzati in {folders}. Tutto ciò che è già nella Libreria conserva condivisioni e statistiche, e quei file verranno ripresi la prossima volta. Continuare?",
   "library_stop_confirm_more_folders": "e altre {count}",
   "library_stop_confirm_text": "L'arresto potrebbe scartare file non ancora analizzati. Tutto ciò che è già nella Libreria conserva condivisioni e statistiche. Continuare?",
+  "library_digest_backfill": "Verifiche dei file in background: {current} di {total}. Tutto è già condiviso: questo aggiunge solo un controllo di integrità extra per chi scarica da te.",
   "library_upgrading_index": "Aggiornamento dell'indice della Libreria (una tantum): {current} di {total}. I tuoi file restano condivisi durante l'operazione.",
   "library_hashing_stopped": "Calcolo hash arrestato.",
   "library_stopping_hashing": "Arresto sicuro del calcolo hash…",

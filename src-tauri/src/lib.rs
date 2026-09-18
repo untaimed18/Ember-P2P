@@ -1130,6 +1130,11 @@ pub fn run() {
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
+                // Already-servable rows wanting only the Ember digest. Kept
+                // out of `files_to_hash` so a cold start is not a full re-read
+                // of the library; handed to the background pass once the scan
+                // has finished with the drives.
+                let mut startup_digest_backfill: Vec<crate::types::FileInfo> = Vec::new();
                 // Paths with no known.met record at all — genuinely new to
                 // this library, as opposed to a previously-shared file that's
                 // merely being rediscovered. Only these should inherit a
@@ -1166,18 +1171,26 @@ pub fn run() {
                         // doesn't show 0 until the next 60s source-count sync.
                         file.complete_sources = record.complete_sources;
                         // A matched record short-circuits hashing unless we
-                        // still need a one-time repair pass:
-                        // - empty AICH on multi-part (v2 migration / missing root)
-                        // - empty ember_file_hash (slice 18 migration: pre-upgrade
-                        //   shares must get streaming BLAKE3 for DHT publish +
-                        //   download verify)
-                        // ed2k comes out identical; only the missing digests
-                        // are filled. Single-part empty AICH is left as-is
-                        // (roots never straddled a part boundary).
+                        // still need a one-time repair pass. The two repairs
+                        // are not equally urgent, and are scheduled apart:
+                        //
+                        // - empty AICH on multi-part (v2 migration / missing
+                        //   root) is eD2k protocol data. Without it a corrupt
+                        //   chunk cannot be identified or recovered, so it is
+                        //   worth making the scan wait. Single-part empty AICH
+                        //   is left as-is (roots never straddled a part
+                        //   boundary).
+                        // - empty ember_file_hash is an Ember-only extra that
+                        //   lets a downloader double-check the whole file. The
+                        //   row is fully servable without it, so it is filled
+                        //   in the background rather than holding up a scan
+                        //   that would otherwise take days on a large library.
+                        //
+                        // ed2k comes out identical either way; only the
+                        // missing digests are filled.
                         let needs_aich = file.aich_hash.is_empty()
                             && file.size > crate::network::ed2k::hash::PARTSIZE;
-                        let needs_ember = file.ember_file_hash.is_empty();
-                        if needs_aich || needs_ember {
+                        if needs_aich {
                             // Path-unique id while this copy is queued for
                             // re-hashing. `file.id` is the content hash,
                             // which every duplicate of the same content
@@ -1192,6 +1205,8 @@ pub fn run() {
                             // See [`crate::search::index::REHASH_ID_PREFIX`].
                             file.id = crate::search::index::rehash_id(&file.path);
                             files_to_hash.push(file.clone());
+                        } else if file.ember_file_hash.is_empty() {
+                            startup_digest_backfill.push(file.clone());
                         }
                     } else {
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
@@ -1630,6 +1645,14 @@ pub fn run() {
                     let app_state = startup_app.state::<AppState>();
                     commands::sharing::prune_pending_intents_for_hashed(&app_state).await;
                 }
+                if !was_cancelled {
+                    // Last, and only once the scan has let go of the drives.
+                    commands::sharing::queue_digest_backfill(
+                        startup_app.clone(),
+                        startup_digest_backfill,
+                    )
+                    .await;
+                }
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total_to_hash,
                     "total": total_to_hash,
@@ -1858,6 +1881,7 @@ pub fn run() {
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
             commands::sharing::preview_stop_hashing,
+            commands::sharing::digest_backfill_status,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
             commands::sharing::resolve_media_asset_path,

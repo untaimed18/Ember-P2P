@@ -10,6 +10,7 @@
     getLibraryScanTruncated,
     stopHashing,
     previewStopHashing,
+    digestBackfillStatus,
     resumeHashing,
     setFilePriority,
     unshareFile,
@@ -83,6 +84,11 @@
   let files: LibraryRow[] = $state.raw([]);
   let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
+  /** `[done, total]` while the background digest pass is running. Not part of
+   *  `scanning`: every file it touches is already shared and searchable, so the
+   *  Library is complete whether or not this is going. It is shown only so that
+   *  busy drives have a visible explanation. */
+  let digestBackfill = $state<[number, number] | null>(null);
   let scanTruncated = $state(false);
   let error: string | null = $state(null);
   // Tracks the message last shown by a failed `refresh()` so we can clear
@@ -2574,8 +2580,14 @@
       scanPumpOnNextVisible = false;
       scanPollBusy = true;
       try {
-        const isScanning = await getScanStatus();
+        // Same tick as the scan poll rather than a timer of its own: this
+        // moves slowly and nothing depends on it being fresh.
+        const [isScanning, backfill] = await Promise.all([
+          getScanStatus(),
+          digestBackfillStatus().catch(() => null),
+        ]);
         if (!mounted) return;
+        digestBackfill = backfill;
         scanPollFailures = 0;
         if (scanning && !isScanning) {
           scanning = false;
@@ -3368,6 +3380,14 @@
           <div class="hash-progress-fill" style="width:{Math.min(100, Math.round((hashProgress.current / hashProgress.total) * 100))}%"></div>
         </div>
       {/if}
+    {:else if digestBackfill}
+      <!-- Deliberately not the scan banner: no spinner, no Stop button, and it
+           does not claim the Library is incomplete. Every file counted here is
+           already shared, searchable and downloadable; what is being added is
+           an extra end-to-end check for whoever downloads it. -->
+      <div class="backfill-note">
+        {m.library_digest_backfill({ current: digestBackfill[0], total: digestBackfill[1] })}
+      </div>
     {/if}
     {#if stopConfirmVisible}
       <div class="confirm-banner">
@@ -4052,6 +4072,16 @@
     flex-shrink: 0;
   }
   .scan-text { flex: 1; }
+  /* Quieter than `.scan-banner` on purpose: this is an explanation for disk
+     activity, not a state the user is waiting on. */
+  .backfill-note {
+    padding: 5px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 11px;
+    flex-shrink: 0;
+  }
   .hash-progress-track {
     height: 3px;
     background: var(--border);
