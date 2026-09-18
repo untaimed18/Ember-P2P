@@ -4402,42 +4402,29 @@ impl MultiSourceDownload {
             });
             let job_cancel = verify_cancel.clone();
             let verified_result = match tokio::task::spawn_blocking(move || {
-                use std::io::{Read, Seek, SeekFrom};
                 let allowed = vec![verify_root.to_string_lossy().into_owned()];
+                // Tell the library scheduler this drive is in use; it rations
+                // reads per physical device and cannot see this one otherwise.
+                // Advisory only — the user is waiting on this file.
+                let _drive_busy = crate::sharing::disk::note_external_read(&verify_path);
                 let (_, mut file) = crate::security::filesystem::open_existing_approved(
                     &verify_path,
                     &allowed,
                     false,
                 )?;
                 let identity = crate::security::filesystem::opened_file_identity(&file)?;
-                let hash =
-                    super::hash::ed2k_hash_open_file_cancellable(&mut file, job_cancel.as_ref())?;
-                let aich = if expected_aich.is_some() {
-                    if job_cancel.load(Ordering::Relaxed) {
-                        anyhow::bail!("cancelled");
-                    }
-                    Some(
-                        super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?
-                            .root_hash,
-                    )
-                } else {
-                    None
-                };
-                if ember_expected != [0u8; 32] {
-                    file.seek(SeekFrom::Start(0))?;
-                    let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
-                    let mut buf = vec![0u8; 1024 * 1024];
-                    loop {
-                        if job_cancel.load(Ordering::Relaxed) {
-                            anyhow::bail!("cancelled");
-                        }
-                        let n = file.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buf[..n]);
-                    }
-                    let got = hasher.finalize();
+                // One pass for all three, as the single-source path does. Read
+                // one at a time, this walked a finished multi-gigabyte download
+                // from end to end once per digest.
+                let digests = super::hash::hash_open_file_digests_cancellable(
+                    &mut file,
+                    super::hash::WantedDigests {
+                        aich: expected_aich.is_some(),
+                        ember: ember_expected != [0u8; 32],
+                    },
+                    job_cancel.as_ref(),
+                )?;
+                if let Some(got) = digests.ember {
                     if got != ember_expected {
                         anyhow::bail!(
                             "ember blake3 mismatch: expected={} got={}",
@@ -4446,7 +4433,7 @@ impl MultiSourceDownload {
                         );
                     }
                 }
-                Ok::<_, anyhow::Error>((hash, identity, aich))
+                Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich))
             })
             .await
             {
