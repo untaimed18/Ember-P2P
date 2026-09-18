@@ -96,6 +96,15 @@ export async function stopHashing(): Promise<string[]> {
   return invoke('stop_hashing');
 }
 
+/**
+ * Which shared folders would actually lose files if hashing stopped now, without
+ * stopping it. Empty means stopping costs nothing — every file in the Library
+ * keeps its hash, its shares and its stats.
+ */
+export async function previewStopHashing(): Promise<string[]> {
+  return invoke('preview_stop_hashing');
+}
+
 export async function resumeHashing(): Promise<void> {
   return invoke('resume_hashing');
 }

@@ -13,6 +13,7 @@
  * pure — the storage reads and writes stay in the store.
  */
 import type { SearchTab } from '$lib/stores/search';
+import type { SearchResult } from '$lib/types';
 
 /** `sessionStorage`, not `localStorage`: a search is something you are in the
  *  middle of, not a preference. It should survive the accident that ends the
@@ -56,11 +57,27 @@ export type PersistedSearch = {
   activeId: string | null;
 };
 
+/**
+ * Whether a stored row can be used at all.
+ *
+ * `parsePersistedSearch` checked the tab's shape but never the rows inside it,
+ * and every consumer reaches straight through `result.file` — `resultKey` does,
+ * and it runs both in `mergeIntoTab`'s index rebuild and in the keyed `{#each}`
+ * that renders the table. So one row missing `file`, from hand-edited storage or
+ * a `SearchResult` shape change shipped without bumping `SEARCH_STORAGE_KEY`,
+ * threw a `TypeError` that took the whole search page down — instead of
+ * restoring nothing, which is what this module promises.
+ */
+function usableRow(row: unknown): row is SearchResult {
+  return !!row && typeof row === 'object' && typeof (row as SearchResult).file === 'object'
+    && !!(row as SearchResult).file;
+}
+
 /** Strip a tab to what is worth storing, and to what survives being stored. */
 export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchTab {
   return {
     ...tab,
-    results: tab.results.slice(0, limit),
+    results: (Array.isArray(tab.results) ? tab.results : []).filter(usableRow).slice(0, limit),
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
     resultIndex: undefined,

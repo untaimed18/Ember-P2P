@@ -383,6 +383,7 @@ const SPAM_REASON_CODES = new Map<string, (reason: SpamReason) => string>([
   // The whitelist verdict is the same sentence the Mark Not Spam action shows
   // optimistically, so the two share a key rather than drifting apart.
   ['not_spam_marked', () => m.search_spam_reason_manual_not_spam()],
+  ['owned_file', () => m.search_spam_reason_owned_file()],
   ['known_hash', (r) => m.search_spam_reason_known_hash({ weight: r.weight ?? 0 })],
   ['exact_filename', (r) => m.search_spam_reason_exact_filename({ weight: r.weight ?? 0 })],
   [

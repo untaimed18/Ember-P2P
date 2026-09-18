@@ -1,3 +1,4 @@
+pub mod disk;
 pub mod indexer;
 pub mod manager;
 pub mod watcher;

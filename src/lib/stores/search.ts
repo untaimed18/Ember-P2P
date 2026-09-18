@@ -180,6 +180,25 @@ function pickEmberDigest(existingDigest: string, existingOrigin: string, incomin
   return existingOrigin.includes('Local') ? existingDigest : incomingDigest;
 }
 
+/**
+ * Whether a merge adopts the incoming row's spam explanation or keeps the one
+ * it holds.
+ *
+ * `spam_rating` is merged with max and `is_spam` with OR, so the two lists have
+ * to follow the verdict that survived — otherwise a row shows a high score above
+ * a signal list that only justifies a low one, which is exactly what a user
+ * reads to decide whether to trust a file. Adopt only when the incoming row
+ * newly flags the file or outscores what we hold.
+ *
+ * Mirrors `takes_incoming_spam_signals` in `src-tauri/src/search/merge.rs`;
+ * pinned for both sides by `scripts/fixtures/merge-contract.json`. Keep it
+ * closed over nothing — `scripts/merge-contract.test.mjs` lifts this body out
+ * and runs it.
+ */
+function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: number, incomingIsSpam: boolean, incomingRating: number): boolean {
+  return (incomingIsSpam && !existingIsSpam) || incomingRating > existingRating;
+}
+
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
@@ -241,9 +260,19 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   // to travel together: prose from one scoring pass beside codes from another
   // would render two different explanations for one row. A user override
   // carries no codes — its text is already in the active locale.
+  //
+  // Which verdict's explanation to keep is `takesIncomingSpamSignals`, the same
+  // rule `merge_into` applies in merge.rs. This used to adopt the incoming pair
+  // whenever the incoming row was flagged at all, ignoring the score.
+  const takeIncomingSignals = takesIncomingSpamSignals(
+    !!existing.is_spam,
+    existing.spam_rating ?? 0,
+    !!incoming.is_spam,
+    incoming.spam_rating ?? 0,
+  );
   const spamSignals = override?.reasons
     ? { spam_reasons: override.reasons, spam_reason_details: undefined }
-    : incoming.is_spam && (incoming.spam_reasons?.length ?? 0) > 0
+    : takeIncomingSignals && (incoming.spam_reasons?.length ?? 0) > 0
       ? incoming
       : existing.spam_reasons?.length
         ? existing

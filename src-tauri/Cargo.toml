@@ -170,6 +170,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # `IOCTL_STORAGE_QUERY_PROPERTY` and the seek-penalty descriptor, used by
+    # `sharing::disk` to tell a solid-state library from a spinning one before
+    # deciding whether to hash several files at once.
+    "Win32_System_Ioctl",
     # `SetThreadExecutionState`, the sleep inhibitor held during transfers
     # (see `src/power.rs`).
     "Win32_System_Power",

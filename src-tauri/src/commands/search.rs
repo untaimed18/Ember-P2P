@@ -265,12 +265,18 @@ pub fn apply_search_enrichment_with_batch(
     }
 }
 
+/// `precomputed_batch` carries whatever cross-row context the caller already
+/// has. The streaming path passes the search-wide statistical context; the IPC
+/// paths pass one built by [`BatchSpamContext::for_owned_hashes`], which holds
+/// only the "already in your library" exemption and leaves every statistical
+/// signal off.
 pub async fn enrich_results_with_batch(
     results: &mut [SearchResult],
     state: &AppState,
     search_keywords: &[String],
     server_ip: Option<&str>,
     use_batch_context: bool,
+    precomputed_batch: Option<&BatchSpamContext>,
 ) {
     let (config, spam) = tokio::join!(state.config.read(), state.spam_filter.read(),);
     let spam_enabled = config.settings.spam_filter_enabled;
@@ -290,7 +296,7 @@ pub async fn enrich_results_with_batch(
         &cleanup_strings,
         &community,
         use_batch_context,
-        None,
+        precomputed_batch,
     );
 }
 
@@ -473,6 +479,26 @@ pub async fn search_files(
         .map(|expression| expression.positive_terms())
         .unwrap_or_default();
 
+    // A related search is planned against the server's advertised
+    // `SRV_TCPFLG_RELATEDSEARCH`, and when the server has it, the co-share
+    // request *is* the whole search — `related::plan` deliberately emits no
+    // keyword beside it, because a keyword turns the results into a search for
+    // the seed the user already has. The plan is then held until the server
+    // session is up, so the capability can be gone by the time it runs
+    // (`reset_ed2k_server_session` clears the flag mirror on every disconnect).
+    // With no keyword to fall back on the network arm would take the empty-query
+    // exit and report success: a tab that opens, fills with nothing, and says
+    // nothing. Refuse here instead, where there is still somewhere to say why.
+    if !related_hashes.is_empty()
+        && keywords.is_empty()
+        && !crate::network::ed2k::server::related_search_supported()
+    {
+        return Err(coded(
+            "search_related_server_gone",
+            "The server can no longer answer a related-files request",
+        ));
+    }
+
     let ui_file_type = file_type.clone();
     let client_min_size = min_size;
     let client_max_size = max_size;
@@ -527,7 +553,21 @@ pub async fn search_files(
                 client_min_availability,
             )
     });
-    enrich_results_with_batch(&mut streamed_local, &state, &keywords, None, false).await;
+    // Every row here came out of the library, so the whole batch is owned. The
+    // network task gets the same set on the command below, so a later sighting
+    // of one of these hashes from a server or a DHT is judged the same way.
+    let owned_ctx = BatchSpamContext::for_owned_hashes(
+        local_hits.iter().map(|r| r.file.hash.clone()),
+    );
+    enrich_results_with_batch(
+        &mut streamed_local,
+        &state,
+        &keywords,
+        None,
+        false,
+        Some(&owned_ctx),
+    )
+    .await;
     if !streamed_local.is_empty() {
         let _ = app.emit(
             "search-results",
@@ -548,6 +588,7 @@ pub async fn search_files(
             search_filters: filters,
             related_hashes,
             exclude_hashes: exclude_hashes.clone(),
+            owned_hashes: local_hits.iter().map(|r| r.file.hash.clone()).collect(),
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
@@ -556,9 +597,17 @@ pub async fn search_files(
             Ok(Ok(results)) => results,
             Ok(Err(e)) => return Err(coded_ctx("search_failed", "Search failed", e)),
             Err(_) => {
-                let _ = state
-                    .network_tx
-                    .try_send(NetworkCommand::CancelSearch { request_id });
+                // `bounded_send`, not `try_send`, for the reason `cancel_search`
+                // spells out: the channel is most likely full precisely when the
+                // event loop is busy, which is exactly when a dropped cancel
+                // costs the most — the KAD and Ember walks keep their
+                // routing-table and search-manager slots, and the UDP queue goes
+                // on draining, for a search this call has already given up on.
+                let _ = bounded_send(
+                    &state.network_tx,
+                    NetworkCommand::CancelSearch { request_id },
+                )
+                .await;
                 return Err(coded_ctx(
                     "search_timed_out",
                     format!("Search timed out after {timeout_secs}s"),
@@ -579,9 +628,19 @@ pub async fn search_files(
                 client_min_availability,
             )
     });
-    // No batch spam context: invoke often re-delivers hashes already shown via
-    // streamed events; batch heuristics can flip clean → spam.
-    enrich_results_with_batch(&mut results, &state, &keywords, None, false).await;
+    // No batch *statistics*: invoke often re-delivers hashes already shown via
+    // streamed events, and batch heuristics can flip clean → spam. The owned-file
+    // exemption still applies — this list has just been merged with `local_hits`,
+    // so it is where a network row and the user's own copy become one row.
+    enrich_results_with_batch(
+        &mut results,
+        &state,
+        &keywords,
+        None,
+        false,
+        Some(&owned_ctx),
+    )
+    .await;
     merge::sort_search_results(&mut results);
     Ok(results)
 }
@@ -631,10 +690,13 @@ pub async fn find_notes(
                 // Without this, the KAD search stayed alive (holding a
                 // routing-table in-use ref and a search-manager slot) until its
                 // own lifetime expired, well after this call had already
-                // returned an error to the caller.
-                let _ = state
-                    .network_tx
-                    .try_send(NetworkCommand::CancelSearch { request_id });
+                // returned an error to the caller. Bounded rather than
+                // best-effort for the same reason as the keyword search above.
+                let _ = bounded_send(
+                    &state.network_tx,
+                    NetworkCommand::CancelSearch { request_id },
+                )
+                .await;
                 return Err(coded_ctx(
                     "search_timed_out",
                     format!("Notes search timed out after {timeout_secs}s"),
@@ -662,7 +724,7 @@ pub async fn find_notes(
         }
     }
     // Notes are comments, not search hits: skip spam scoring and batch heuristics.
-    enrich_results_with_batch(&mut results, &state, &[], None, false).await;
+    enrich_results_with_batch(&mut results, &state, &[], None, false, None).await;
     for result in &mut results {
         result.spam_rating = 0;
         result.is_spam = false;
@@ -1175,15 +1237,15 @@ pub async fn mark_spam(
         spam_reasons: Vec::new(),
         spam_reason_details: Vec::new(),
     };
-    let save_data = {
+    let dirty = {
         let mut spam = state.spam_filter.write().await;
         spam.mark_spam(&result, &keywords, server_ip.as_deref());
-        spam.take_save_data()
+        spam.is_dirty()
     };
     // Persist off the IPC path so the UI isn't parked on disk I/O. In-memory
     // state is already updated; a crash before the write lands is recovered by
     // the next mark or the periodic spam flush in the network loop.
-    spawn_spam_filter_save(state.spam_filter.clone(), save_data);
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
     Ok(())
 }
 
@@ -1195,23 +1257,29 @@ pub async fn mark_not_spam(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
-    let save_data = {
+    let dirty = {
         let mut spam = state.spam_filter.write().await;
         spam.mark_not_spam(&file_hash);
-        spam.take_save_data()
+        spam.is_dirty()
     };
-    spawn_spam_filter_save(state.spam_filter.clone(), save_data);
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
     Ok(())
 }
 
 /// Persist off the IPC path so the UI isn't parked on disk I/O. Writers share
 /// [`SpamFilter::save_gate`] with the network-loop flush so concurrent marks
 /// cannot leave a stale snapshot on disk.
+///
+/// Takes a flag rather than a snapshot: `drain_saves` re-takes and re-serializes
+/// the database itself, so callers that passed `take_save_data()` here were
+/// pretty-printing the whole thing twice — once under `spam_filter.write()`, the
+/// one lock the network loop's result enrichment needs — and throwing the first
+/// copy away.
 fn spawn_spam_filter_save(
     spam_filter: std::sync::Arc<tokio::sync::RwLock<SpamFilter>>,
-    save_data: Option<(String, std::path::PathBuf, u64)>,
+    dirty: bool,
 ) {
-    if save_data.is_none() {
+    if !dirty {
         return;
     }
     tokio::spawn(async move {
@@ -1236,6 +1304,15 @@ pub struct SpamExplainResponse {
     pub profile: String,
     pub is_spam: bool,
     pub reasons: Vec<String>,
+    /// The same reasons carried as codes plus their numbers, which is what the
+    /// UI needs to render them in the active locale (`spamReasonTexts` falls
+    /// back to the English in `reasons` when this is absent).
+    ///
+    /// `SpamFilter::explain_result` has produced these all along; this struct
+    /// just did not pass them on, so the on-demand spam tooltip — the one path
+    /// that asks the backend instead of reading what the row already carries —
+    /// rendered English in all nine locales.
+    pub reason_details: Vec<crate::search::spam::SpamReason>,
 }
 
 #[tauri::command]
@@ -1389,6 +1466,7 @@ pub async fn explain_spam_result(
         profile: details.profile,
         is_spam: details.is_spam,
         reasons: details.reasons,
+        reason_details: details.reason_details,
     })
 }
 
@@ -1461,9 +1539,20 @@ pub async fn rescore_search_results(
     //
     // Safe to split only because `use_batch_context` is false here: nothing in
     // this pass looks across rows, so a chunk boundary changes no verdict.
+    // Resolved once, before the chunk loop, so a profile change cannot re-flag a
+    // file the library holds. Taken and released here rather than inside the
+    // loop: `enrich_results_with_batch` holds `spam_filter.read()` for its whole
+    // run, and nothing should hold the index across that.
+    let owned_ctx = {
+        let li = state.local_index.read().await;
+        BatchSpamContext::for_owned_hashes(results.iter().filter_map(|r| {
+            li.get_by_hash(&r.file.hash.to_ascii_lowercase())
+                .map(|_| r.file.hash.clone())
+        }))
+    };
     const RESCORE_CHUNK: usize = 256;
     for chunk in results.chunks_mut(RESCORE_CHUNK) {
-        enrich_results_with_batch(chunk, &state, &keywords, None, false).await;
+        enrich_results_with_batch(chunk, &state, &keywords, None, false, Some(&owned_ctx)).await;
         tokio::task::yield_now().await;
     }
     if !spam_enabled {

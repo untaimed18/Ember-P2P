@@ -2598,11 +2598,38 @@ const MAX_UDP_SEARCH_QUEUE: usize = 500;
 /// before the hard deadline steps in.
 const UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS: i64 = 90;
 
-/// eMule `MAX_RESULTS` — cancel the ed2k (TCP More / UDP global) sweep once
-/// the **summed** availability of accepted ed2k hits exceeds this. Counts are
-/// per-result FT_SOURCES, spam-capped at 5 (eMule `AddResultCount`).
-const MAX_ED2K_SEARCH_RESULTS: u32 = 100;
+/// Backstop on the UDP global sweep: stop querying further servers once the
+/// replies *from that sweep* have summed to this many sources. Counts are
+/// per-result FT_SOURCES, spam-capped at 5 (eMule `AddResultCount`), so this is
+/// roughly 200–1000 distinct files depending on how well-sourced they are.
+///
+/// Two things about this number are deliberate, because getting either wrong is
+/// what made a "Global" search stop being global.
+///
+/// It is a *backstop*, not the thing that normally ends the sweep. The sweep's
+/// real limits are the 750 ms send throttle, the post-drain grace period and
+/// `udp_search_deadline`; this only exists so a query that is pulling in
+/// thousands of sources does not keep working through a 500-entry server list
+/// for results nobody will scroll to. At 100 — where it used to sit — it was
+/// the *first* limit to fire rather than the last, and it ended the sweep after
+/// twenty-odd files.
+///
+/// And it counts only what the UDP leg itself brought back. It used to be one
+/// counter shared with the TCP leg, which is the same bug in a more damaging
+/// form: the connected server answers in a single ~200-row batch on a 2 s
+/// timer, while UDP leaves at one packet per 750 ms — so the first TCP reply
+/// spent the whole budget before three of the other servers had been asked, and
+/// `stop_ed2k_udp_search_if_capped` then cleared the rest of the queue. A global
+/// search reached two or three of a hundred servers. What the connected server
+/// indexes says nothing about what the others do; that is the entire reason the
+/// global leg exists.
+const MAX_UDP_SEARCH_SOURCES: u32 = 1_000;
 const ED2K_SEARCH_SOURCE_CAP: u32 = 5;
+
+/// `OP_QUERY_MORE_RESULT` pages we will ask the connected server for, on top of
+/// the first batch. Paired with the 1000-result ceiling in the same gate: a
+/// server answering 200 at a time is exhausted in five pages either way.
+const MAX_SERVER_MORE_REQUESTS: u8 = 5;
 
 /// Whether the UDP global-search leg should be force-completed this tick.
 /// True once the post-drain quiet-period grace expires (`server_udp_search_age`
@@ -2947,8 +2974,9 @@ mod search_legs_tests {
     }
 }
 
-/// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
-/// (eMule spam-caps each result at 5).
+/// Contribute one ed2k result's sources toward the running ed2k totals — the
+/// diagnostic `ed2k_found_sources` and, for a UDP reply, the sweep's own
+/// [`MAX_UDP_SEARCH_SOURCES`] backstop (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
     availability.clamp(1, ED2K_SEARCH_SOURCE_CAP)
 }
@@ -2992,18 +3020,24 @@ fn note_ed2k_search_results(
     skip_hashes: &HashSet<String>,
 ) -> bool {
     for r in results {
+        let from_udp = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
+            && r.result_origin
+                .split('·')
+                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
         if r.file.hash.is_empty() {
-            active.ed2k_found_sources = active
-                .ed2k_found_sources
-                .saturating_add(ed2k_result_source_contribution(r.availability));
+            let contribution = ed2k_result_source_contribution(r.availability);
+            active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(contribution);
+            if from_udp {
+                active.udp_found_sources = active.udp_found_sources.saturating_add(contribution);
+            }
             continue;
         }
         let skip_count = skip_hashes.contains(&r.file.hash);
         let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
-        let sum_incoming = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
-            && r.result_origin
-                .split('·')
-                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
+        // A UDP reply is a different server than the last one that reported this
+        // file, so its sources add; a TCP "More" re-list is the same server
+        // repeating itself, so its figure replaces.
+        let sum_incoming = from_udp;
         let (new_avail, old_contrib) = match prev {
             Some(p) => {
                 let merged = crate::search::merge::clamp_source_count(if sum_incoming {
@@ -3020,9 +3054,12 @@ fn note_ed2k_search_results(
         };
         let new_contrib = ed2k_result_source_contribution(new_avail);
         if !skip_count && new_contrib > old_contrib {
-            active.ed2k_found_sources = active
-                .ed2k_found_sources
-                .saturating_add(new_contrib - old_contrib);
+            let delta = new_contrib - old_contrib;
+            active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(delta);
+            // Only a UDP reply advances the sweep's own backstop.
+            if from_udp {
+                active.udp_found_sources = active.udp_found_sources.saturating_add(delta);
+            }
         }
         active
             .ed2k_noted_availability
@@ -3043,7 +3080,7 @@ fn note_ed2k_search_results(
             .ed2k_noted_complete_sources
             .insert(r.file.hash.clone(), new_complete);
     }
-    active.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
+    active.udp_found_sources > MAX_UDP_SEARCH_SOURCES
 }
 
 /// Mark hashes as streamed only after a row was actually accepted/emitted
@@ -3198,17 +3235,16 @@ fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::
     if !active.udp_pending {
         return;
     }
-    if active.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS {
+    if active.udp_found_sources <= MAX_UDP_SEARCH_SOURCES {
         return;
     }
     let request_id = active.request_id;
     active.udp_pending = false;
     state.server_udp_search_age = 0;
     state.udp_search_queue.clear();
-    state.server_search_more_needed = false;
     debug!(
-        "Stopping ed2k UDP search: summed sources {} > MAX_RESULTS ({})",
-        active.ed2k_found_sources, MAX_ED2K_SEARCH_RESULTS
+        "Stopping ed2k UDP global sweep: it has returned {} summed sources (backstop {})",
+        active.udp_found_sources, MAX_UDP_SEARCH_SOURCES
     );
     maybe_finish_active_search(state, app_handle, request_id);
 }
@@ -8210,6 +8246,7 @@ mod tests {
             udp_search_deadline: 0,
             udp_search_sent_ips: HashSet::new(),
             ed2k_found_sources: 0,
+            udp_found_sources: 0,
             ed2k_noted_availability: HashMap::new(),
             ed2k_noted_complete_sources: HashMap::new(),
             dht_noted_availability: HashMap::new(),
@@ -8349,6 +8386,105 @@ mod tests {
         assert!(second.is_empty());
         assert_eq!(resights.len(), 1);
         assert_eq!(resights[0].availability, 7);
+    }
+
+    /// The connected server answers in one ~200-row batch on a 2 s timer; the
+    /// UDP sweep leaves at one packet per 750 ms. Sharing a single 100-source
+    /// budget between them meant that first TCP reply spent the whole thing
+    /// before three of the other servers had been asked, and the sweep's queue
+    /// was then cleared — a "Global" search that reached two or three of a
+    /// hundred servers. What the connected server indexes says nothing about
+    /// what the rest do, which is the entire reason the global leg exists.
+    #[test]
+    fn a_tcp_batch_cannot_spend_the_udp_sweeps_budget() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+
+        // A generous first batch from the connected server: far more sources
+        // than the old shared cap of 100 allowed.
+        let tcp: Vec<SearchResult> = (0..300)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                availability: 5,
+                ..sample_search_result(&format!("tcp{i}"))
+            })
+            .collect();
+        assert!(
+            !note_ed2k_search_results(&mut active, &tcp, &none),
+            "the connected server's own reply must never stop the UDP sweep"
+        );
+        assert_eq!(active.ed2k_found_sources, 1_500);
+        assert_eq!(
+            active.udp_found_sources, 0,
+            "nothing the TCP leg found belongs to the sweep's budget"
+        );
+
+        // The sweep's own replies do advance it, and it does still have a
+        // backstop.
+        let udp: Vec<SearchResult> = (0..MAX_UDP_SEARCH_SOURCES / ED2K_SEARCH_SOURCE_CAP)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+                availability: ED2K_SEARCH_SOURCE_CAP,
+                ..sample_search_result(&format!("udp{i}"))
+            })
+            .collect();
+        assert!(
+            !note_ed2k_search_results(&mut active, &udp, &none),
+            "exactly at the backstop is still under it"
+        );
+        assert_eq!(active.udp_found_sources, MAX_UDP_SEARCH_SOURCES);
+
+        let one_more = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 1,
+            ..sample_search_result("udp-last")
+        };
+        assert!(
+            note_ed2k_search_results(&mut active, &[one_more], &none),
+            "past the backstop the sweep stops"
+        );
+    }
+
+    /// The backstop has to sit above the point where a server signals it has
+    /// more to give, or the "More results" gate — which requires a full 200-row
+    /// batch *and* room under the budget — can never open. Those were the two
+    /// halves of one `if`, and `note_ed2k_search_results` charges the batch
+    /// before the gate reads the counter, so page two was never asked for.
+    #[test]
+    fn the_more_results_gate_is_reachable() {
+        // The batch size that makes a server worth asking again.
+        const FULL_BATCH: u32 = 200;
+        assert!(
+            MAX_SERVER_MORE_REQUESTS >= 1,
+            "at least one follow-up page, or the loop is decorative"
+        );
+        assert!(
+            MAX_UDP_SEARCH_SOURCES >= FULL_BATCH * ED2K_SEARCH_SOURCE_CAP,
+            "the sweep's backstop has to outlast a whole well-sourced batch, or \
+             it stops being a backstop and starts being the limit"
+        );
+
+        // The gate no longer consults a source budget at all, so its two halves
+        // can no longer contradict each other: a batch large enough to ask about
+        // leaves the sweep's counter untouched.
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let batch: Vec<SearchResult> = (0..FULL_BATCH)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                availability: ED2K_SEARCH_SOURCE_CAP,
+                ..sample_search_result(&format!("row{i}"))
+            })
+            .collect();
+        note_ed2k_search_results(&mut active, &batch, &none);
+        assert_eq!(
+            active.ed2k_found_sources,
+            FULL_BATCH * ED2K_SEARCH_SOURCE_CAP
+        );
+        assert_eq!(
+            active.udp_found_sources, 0,
+            "the server's own pages must not spend the sweep's budget"
+        );
     }
 
     #[test]
@@ -12132,6 +12268,15 @@ pub enum NetworkCommand {
         /// Hashes to withhold from the UI for this request: the seed files of
         /// a related search, which are not related to themselves.
         exclude_hashes: Vec<String>,
+        /// Hashes of files this library already holds that matched the query,
+        /// resolved by the caller from the local index.
+        ///
+        /// A network sighting of one of these is the user's own file coming
+        /// back from a server or a DHT, and the spam scorer exempts it: we have
+        /// the bytes, so no claim about the result set it arrived in can make it
+        /// fake. Sent with the search because the network task has no business
+        /// taking the index lock once per inbound result packet to work it out.
+        owned_hashes: Vec<String>,
     },
     StartDownload {
         file_hash: String,
@@ -13404,9 +13549,15 @@ struct ActiveSearchRequest {
     /// request (eMule `SentUDPRequestNotification`). UDP search replies
     /// from any other IP are ignored as unsolicited / late.
     udp_search_sent_ips: HashSet<Ipv4Addr>,
-    /// Running sum of ed2k (TCP/UDP) result availability toward
-    /// [`MAX_ED2K_SEARCH_RESULTS`] (eMule `m_foundSourcesCount`).
+    /// Running sum of ed2k (TCP/UDP) result availability (eMule
+    /// `m_foundSourcesCount`). Diagnostic only — no leg stops on it. Kept
+    /// because it is the one number that says how much the ed2k side of a
+    /// search actually found.
     ed2k_found_sources: u32,
+    /// The part of `ed2k_found_sources` that the UDP global sweep brought in,
+    /// which is what that sweep's backstop ([`MAX_UDP_SEARCH_SOURCES`]) reads.
+    /// Held separately so the connected server's TCP reply cannot spend it.
+    udp_found_sources: u32,
     /// Per-hash summed availability already folded into `ed2k_found_sources`
     /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
     /// delta after summing, matching eMule `UpdateResultCount`).
@@ -13489,15 +13640,24 @@ const MAX_KAD_AVAILABILITY: u32 = 5_000;
 /// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
 
+/// Move the request's cross-packet spam context out for one enrichment pass,
+/// leaving an empty one in its place.
+///
+/// Moved rather than cloned. `BatchSpamContext` holds up to 4096 name keys and
+/// 4096 hash keys (each with up to 1024 members) plus 1024 row snapshots, and
+/// this runs on the network task once per inbound result packet — so the clone
+/// was O(context) per packet for the life of a search. Every call site is
+/// `take` → enrich → [`store_search_batch_spam`] with nothing in between that
+/// reads the field, so the empty stand-in is never observed.
 fn take_search_batch_spam(
-    state: &NetworkState,
+    state: &mut NetworkState,
     request_id: u64,
 ) -> crate::search::spam::BatchSpamContext {
     state
         .active_search_request
-        .as_ref()
+        .as_mut()
         .filter(|a| a.request_id == request_id)
-        .map(|a| a.batch_spam.clone())
+        .map(|a| std::mem::take(&mut a.batch_spam))
         .unwrap_or_default()
 }
 
@@ -13703,7 +13863,15 @@ struct NetworkState {
     server_udp_search_age: u32,
     /// Throttled UDP global search queue: packets to send one-at-a-time at
     /// 750ms intervals (eMule UDPSEARCHSPEED = SEC2MS(3)/4).
-    udp_search_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
+    ///
+    /// Each entry carries the `request_id` it was queued for. The queue drains
+    /// over minutes at that rate, so "the search this belongs to is whatever is
+    /// active when the packet finally goes out" is only true for as long as
+    /// every teardown path remembers to clear it — and a server's reply is
+    /// admitted on the strength of its IP being in `udp_search_sent_ips`, so
+    /// getting that wrong puts answers to the previous query into the current
+    /// tab. Carrying the id makes it a property of the packet instead.
+    udp_search_queue: VecDeque<(u64, Vec<u8>, std::net::SocketAddr)>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -23268,10 +23436,17 @@ fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
 /// trusts them.
 ///
 /// Acquires only a read lock on `spam_filter`, so it's safe to call
-/// Enrich, type/size/ext/avail-filter, and emit. Returns the rows actually
-/// emitted so ed2k callers can count toward `MAX_ED2K_SEARCH_RESULTS` only for
-/// accepted results. Hashes must be marked streamed by the caller via
-/// [`mark_streamed_hashes`] after this returns.
+/// Enrich, type/size/ext/avail-filter, and emit. Returns the rows this batch
+/// newly accepted — not everything the emit carried — so ed2k callers count
+/// only accepted results toward their running totals. Hashes must be marked
+/// streamed by the caller via [`mark_streamed_hashes`] after this returns.
+///
+/// The distinction matters because the emit also carries spam *upgrades*: rows
+/// an earlier packet already put on screen, re-sent because this packet pushed
+/// them over a batch-collision bar. They are not new sightings, and the callers
+/// treat what comes back as one — `note_dht_availability` adds a row's
+/// availability onto the leg's running total, so handing an upgrade back would
+/// count the same publishers a second time.
 #[allow(clippy::too_many_arguments)]
 async fn enrich_and_emit_search_results(
     app_handle: &tauri::AppHandle,
@@ -23308,30 +23483,37 @@ async fn enrich_and_emit_search_results(
 
     let mut upgrades = Vec::new();
     let analyzed_batch;
+    // Nothing downstream reads batch statistics with the filter off or under
+    // `relaxed`: `apply_search_enrichment_with_batch` ignores the context, and
+    // `colliding_hashes` walks every name and hash key — up to 4096 each — and
+    // clones a `String` per hash in every colliding bucket. `absorb` is the
+    // heavier half and used to run regardless, allocating a normalized name, a
+    // normalized hash and a snapshot per result, on the network task, for every
+    // inbound packet of a search whose results nobody was going to score.
+    //
+    // The cost of skipping it: a filter switched on *during* a search starts
+    // with whatever the context has absorbed since, not the whole search. The
+    // settings change already triggers `rescoreOpenTabs`, which re-scores
+    // without batch context at all, so this changes nothing a user sees.
+    let batch_stats_wanted =
+        spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed;
     let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
         if let Some(acc) = accumulated_batch {
-            // Only when something will read it. `colliding_hashes` walks every
-            // name and hash key in the batch — up to 4096 each — and clones a
-            // `String` per hash in every colliding bucket, and this runs on the
-            // network task for every inbound result packet. With the spam
-            // filter off or Relaxed the result was discarded, so a broad search
-            // paid that whole allocation on each of hundreds of packets for
-            // nothing.
-            let prev_colliding = (spam_enabled
-                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed)
-                .then(|| acc.colliding_hashes());
-            acc.absorb(&results);
-            if let Some(prev_colliding) = prev_colliding {
+            if batch_stats_wanted {
+                let prev_colliding = acc.colliding_hashes();
+                acc.absorb(&results);
                 let skip: std::collections::HashSet<String> = results
                     .iter()
                     .map(|r| r.file.hash.trim().to_ascii_lowercase())
                     .collect();
                 upgrades = acc.upgrade_rows(&prev_colliding, &skip);
             }
+            // Handed over even when the statistics are off, because this context
+            // also carries the owned-file exemption. With nothing absorbed it
+            // reports `enabled = false`, so not one of the collision signals can
+            // fire off the back of it.
             Some(&*acc)
-        } else if spam_enabled
-            && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
-        {
+        } else if batch_stats_wanted {
             analyzed_batch = crate::search::spam::BatchSpamContext::analyze(&results);
             Some(&analyzed_batch)
         } else {
@@ -23385,7 +23567,6 @@ async fn enrich_and_emit_search_results(
                 batch_for_score,
             );
             upgrades.retain(|r| r.is_spam);
-            results.append(&mut upgrades);
         }
     }
 
@@ -23415,7 +23596,18 @@ async fn enrich_and_emit_search_results(
             min_availability,
         )
     });
+    // Upgrades ride along in the emit but are deliberately not filtered: each
+    // one is a re-send of a row this search already showed, so it has passed
+    // these constraints once. Judging it again on the fields the rebuilt row
+    // carries is the wrong question, and asking it is how every upgrade in a
+    // search narrowed by type, extension or Min sources used to be discarded.
+    //
+    // Appended for the emit and then split off again, so the caller gets only
+    // this packet's own rows (see the note on the return value above).
+    let accepted = results.len();
+    results.append(&mut upgrades);
     emit_search_results_event(app_handle, request_id, &results);
+    results.truncate(accepted);
     results
 }
 
@@ -33062,14 +33254,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 pending_request_id,
                                 &mut batch,
                             );
-                            let filter_ctx = state.active_search_request.as_ref().map(|a| {
-                                (a.min_size, a.max_size, a.file_extension.clone(), a.min_availability)
-                            });
+                            // Matched on the id, like `dedup_streamed_batch` and
+                            // `take_search_batch_spam` beside it. Falling back to
+                            // `None` for a request that is no longer active meant
+                            // "apply no client-side filters" while still emitting
+                            // under this batch's own id — rows that ignore the
+                            // user's size, extension and Min-sources settings. An
+                            // empty batch is the honest answer: there is no tab
+                            // asking this question any more.
+                            let filter_ctx = state
+                                .active_search_request
+                                .as_ref()
+                                .filter(|a| a.request_id == pending_request_id)
+                                .map(|a| {
+                                    (a.min_size, a.max_size, a.file_extension.clone(), a.min_availability)
+                                });
+                            if filter_ctx.is_none() {
+                                batch.clear();
+                            }
                             let (min_size, max_size, file_extension, min_availability) =
                                 filter_ctx.unwrap_or((None, None, None, None));
                             if !batch.is_empty() {
                                 let mut batch_spam =
-                                    take_search_batch_spam(&state, pending_request_id);
+                                    take_search_batch_spam(&mut state, pending_request_id);
                                 let mut emitted = enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
@@ -37999,7 +38206,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Throttled UDP global search: send one packet per 750ms tick
             _ = udp_search_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if let Some((packet, addr)) = state.udp_search_queue.pop_front() {
+                if let Some((queued_request_id, packet, addr)) = state.udp_search_queue.pop_front() {
                     let sock = server_udp.socket_handle();
                     if let Err(e) = sock.send_to(&packet, addr).await {
                         // Most common failures are transient ICMP-unreachable
@@ -38014,7 +38221,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if let (Some(active), IpAddr::V4(ip)) =
                             (state.active_search_request.as_mut(), addr.ip())
                         {
-                            if active.udp_pending {
+                            // Only if this packet was queued for the search that
+                            // is running now; otherwise its reply would be
+                            // admitted into a tab that never asked the question.
+                            if active.udp_pending && active.request_id == queued_request_id {
                                 active.udp_search_sent_ips.insert(ip);
                             }
                         }
@@ -41053,14 +41263,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             local.extend(search_results);
                                             if count >= 200
                                                 && local.len() < 1000
-                                                && state.server_search_more_requests < 5
-                                                && state
-                                                    .active_search_request
-                                                    .as_ref()
-                                                    .map(|a| {
-                                                        a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS
-                                                    })
-                                                    .unwrap_or(true)
+                                                && state.server_search_more_requests
+                                                    < MAX_SERVER_MORE_REQUESTS
                                             {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -41078,35 +41282,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 finished_search_requests.push(request_id);
                                             }
                                         } else {
-                                            // Drop late More pages once the ed2k source cap
-                                            // has already stopped the UDP/More sweep.
-                                            let capped = state
-                                                .active_search_request
-                                                .as_ref()
-                                                .filter(|a| a.request_id == request_id)
-                                                .is_some_and(|a| {
-                                                    a.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
-                                                });
-                                            if capped {
-                                                // The cap has stopped this sweep, so a
-                                                // queued co-share follow-up would only
-                                                // restart what we just decided to end.
-                                                drop_queued_server_followup(
-                                                    &mut state,
-                                                    request_id,
-                                                );
-                                                if let Some(active) =
-                                                    state.active_search_request.as_mut()
-                                                {
-                                                    if active.request_id == request_id {
-                                                        active.server_pending = false;
-                                                    }
-                                                }
-                                                finished_search_requests.push(request_id);
-                                            } else {
+                                            // A page we asked for is a page we use.
+                                            // This whole branch used to be a
+                                            // discard: if the shared source cap
+                                            // had tripped between the request
+                                            // leaving and the answer arriving, up
+                                            // to 200 parsed rows were thrown away
+                                            // unemitted, and any queued co-share
+                                            // follow-up was dropped with them. The
+                                            // round trip had already been spent;
+                                            // refusing to read the reply bought
+                                            // none of it back.
+                                            {
+                                            // Matched on the id for the same
+                                            // reason as the KAD leg above: the
+                                            // `None` fallback meant "no
+                                            // client-side filters" on a batch
+                                            // still emitted under this id, so a
+                                            // search that had already moved on
+                                            // would deliver rows ignoring the
+                                            // user's filters.
                                             let filter_ctx = state
                                                 .active_search_request
                                                 .as_ref()
+                                                .filter(|a| a.request_id == request_id)
                                                 .map(|a| {
                                                     (
                                                         a.file_type_filter.clone(),
@@ -41117,10 +41316,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                         a.keywords.clone(),
                                                         a.server_ip.clone(),
                                                     )
-                                                })
-                                                .unwrap_or((
-                                                    None, None, None, None, None, Vec::new(), None,
-                                                ));
+                                                });
+                                            let ctx_matches = filter_ctx.is_some();
                                             let (
                                                 ft_filter,
                                                 min_size,
@@ -41129,15 +41326,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 min_availability,
                                                 kws,
                                                 srv_ip,
-                                            ) = filter_ctx;
+                                            ) = filter_ctx.unwrap_or((
+                                                None, None, None, None, None, Vec::new(), None,
+                                            ));
                                             let mut search_results = search_results;
+                                            if !ctx_matches {
+                                                search_results.clear();
+                                            }
                                             let resights = dedup_streamed_batch(
                                                 &mut state.active_search_request,
                                                 request_id,
                                                 &mut search_results,
                                             );
                                             let mut batch_spam =
-                                                take_search_batch_spam(&state, request_id);
+                                                take_search_batch_spam(&mut state, request_id);
                                             let emitted = enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
@@ -41192,14 +41394,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 .filter(|active| active.request_id == request_id)
                                                 .map(|active| active.server_result_count < 1000)
                                                 .unwrap_or(true);
+                                            // A full batch means the server has
+                                            // more to give, and the two limits
+                                            // that belong here are already
+                                            // stated: at most 1000 results and
+                                            // at most `MAX_SERVER_MORE_REQUESTS`
+                                            // pages.
+                                            //
+                                            // This used to carry a third term —
+                                            // `ed2k_found_sources <= 100` — which
+                                            // could never hold alongside the
+                                            // first. `note_ed2k_search_results`
+                                            // has already charged this batch, and
+                                            // every emitted row adds at least 1,
+                                            // so `count >= 200` guaranteed the
+                                            // counter was over 200. The five-page
+                                            // budget below was unreachable on any
+                                            // search a filter had not already
+                                            // gutted: page two was never asked
+                                            // for, on exactly the queries where
+                                            // the server said it had more.
                                             if count >= 200
                                                 && under_result_cap
-                                                && state.server_search_more_requests < 5
-                                                && state
-                                                    .active_search_request
-                                                    .as_ref()
-                                                    .map(|a| a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS)
-                                                    .unwrap_or(true)
+                                                && state.server_search_more_requests
+                                                    < MAX_SERVER_MORE_REQUESTS
                                             {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -41214,7 +41432,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     &mut finished_search_requests,
                                                 );
                                             }
-                                            } // end !capped
+                                            } // end of the page-processing block
                                         }
                                     }
                                 }
@@ -41789,7 +42007,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if server_disconnect_reason.is_none()
                             && state.server_search_more_needed
                             && state.pending_server_search.is_some()
-                            && state.server_search_more_requests < 5
+                            && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
                         {
                             state.server_search_more_needed = false;
                             state.server_search_more_requests += 1;
@@ -42654,7 +42872,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         request_id,
                                         &mut search_results,
                                     );
-                                    let mut batch_spam = take_search_batch_spam(&state, request_id);
+                                    let mut batch_spam = take_search_batch_spam(&mut state, request_id);
                                     let udp_server_ip = addr.ip().to_string();
                                     let emitted = enrich_and_emit_search_results(
                                         &app_handle,
@@ -46249,7 +46467,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             DhtBatchKind::Incremental
                         };
                         if !results.is_empty() {
-                            let mut batch_spam = take_search_batch_spam(&state, request_id);
+                            let mut batch_spam = take_search_batch_spam(&mut state, request_id);
                             let mut emitted = enrich_and_emit_search_results(
                                 &app_handle,
                                 &spam_filter,

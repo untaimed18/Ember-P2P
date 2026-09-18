@@ -1188,6 +1188,17 @@
   onMount(() => {
     loadPersistedPrefs();
     prefsRestored = true;
+
+    // Arriving on this page puts the caret in the query box. Typing is what
+    // someone came here to do, and it saves a click every single time.
+    //
+    // Deferred a frame rather than called here: `bind:this` is settled by the
+    // time `onMount` runs, but the tab strip and the readiness hint above the
+    // bar are still laying out, and focusing mid-layout can scroll the page to
+    // an element that is about to move. `focusInput` selects as well as
+    // focuses, so a query restored from a previous session is replaced by
+    // typing rather than appended to.
+    const focusFrame = requestAnimationFrame(() => searchBar?.focusInput());
     getSettings()
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
@@ -1274,6 +1285,7 @@
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
+      cancelAnimationFrame(focusFrame);
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);
       if (typeof document !== 'undefined') {
@@ -1684,6 +1696,30 @@
     return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
   }
 
+  /**
+   * Turn a size box's number and unit into a byte count the backend can accept.
+   *
+   * The boxes are `step="any"`, so `1.5` GB is a legitimate thing to type — but
+   * `search_files` declares `min_size` / `max_size` as `Option<u64>`, and serde
+   * rejects a JSON float outright ("invalid type: floating point `104857.6`,
+   * expected u64"). That error comes from argument deserialization, so it fires
+   * before the command body runs: typing `0.1` into Min Size made *every*
+   * search, on every network, fail with an unhelpful invalid-argument message
+   * and no results. And because the box is persisted to `localStorage` and
+   * restored behind nothing stricter than `Number.isFinite`, it stayed broken
+   * across restarts until someone thought to clear the field.
+   *
+   * Rounded, then held to `MAX_SAFE_INTEGER`: past that JS cannot represent the
+   * count exactly anyway, and `JSON.stringify` starts emitting an exponent,
+   * which serde reads as a float and rejects for the same reason.
+   */
+  function sizeToBytes(value: number | null, unit: number): number | undefined {
+    if (value === null) return undefined;
+    const bytes = Math.round(value * unit);
+    if (!Number.isFinite(bytes) || bytes < 0) return undefined;
+    return Math.min(bytes, Number.MAX_SAFE_INTEGER);
+  }
+
   /** Split a byte count back into the number and unit the size boxes hold. */
   function sizeToInput(
     bytes: number | undefined,
@@ -1898,17 +1934,18 @@
       filterType = searchFileType === 'Pro' ? '' : searchFileType;
     }
     const wireFileType = plan ? undefined : searchFileType || undefined;
-    const parsedMinSize = filterMinSize !== null ? filterMinSize * filterMinUnit : undefined;
-    const parsedMaxSize = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : undefined;
+    // `sizeToBytes` rounds and bounds; NaN, Infinity (e.g. "1e400") and
+    // negatives all come back as `undefined`, which is the same "no constraint"
+    // the boxes mean when empty.
+    const parsedMinSize = sizeToBytes(filterMinSize, filterMinUnit);
+    const parsedMaxSize = sizeToBytes(filterMaxSize, filterMaxUnit);
     const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
-    // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
-    // excludes both, unlike the previous `!isNaN` which let Infinity through.
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
       ? {}
       : {
           fileExtension: filterExtension.trim() || undefined,
-          minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
-          maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
+          minSize: parsedMinSize,
+          maxSize: parsedMaxSize,
           minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
         };
     // A related search whose seed filename yielded no searchable word is still
@@ -1982,6 +2019,10 @@
       searchInvokeSettled.add(t.requestId);
       clearSearchTimeoutForRequest(t.requestId);
       flushPendingSearchResults(t.requestId);
+      // `openSearchTab` is about to rotate this tab's id, so nothing will ever
+      // consult the entry again. Every other settle path prunes the set; this
+      // one grew it by an id per superseded search until the page unmounted.
+      forgetSettledRequest(t.requestId);
     }
     // `probes` is ordered most-specific-first, so the first one carrying a query
     // is the best one-line answer to "what is this tab looking for".
@@ -2211,6 +2252,21 @@
     spamExplainLoading = false;
     spamExplainError = null;
   }
+
+  // A tab that crosses `MAX_TAB_RESULTS` sheds its weakest rows by availability,
+  // and `shedWeakestRows` knows nothing about which row the user is reading — so
+  // an open details dialog can have its row evicted out from under it. The dialog
+  // itself is gated on `selectedResult` and unmounts on its own, but the key
+  // stayed set, and three things hang off that: the in-flight notes and
+  // spam-explain guards compare against `selectedResult`, so `loadingNotes` and
+  // `spamExplainLoading` were never cleared; the focus-restore effect stayed
+  // armed; and the document Escape handler kept a branch that swallowed the key
+  // with nothing on screen to close. Tear the rest down when the row goes.
+  $effect(() => {
+    if (selectedResultKey && selectedResult === null) {
+      closeFileDetails();
+    }
+  });
 
   $effect(() => {
     if (!detailsOverlayEl) return;
@@ -3679,7 +3735,19 @@
               <input
                 type="checkbox"
                 checked={checkedKeys.has(rKey)}
-                onclick={(e) => { e.stopPropagation(); toggleCheck(rKey, idx, e.shiftKey); }}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  toggleCheck(rKey, idx, e.shiftKey);
+                  // The native click has already flipped the DOM. Shift-clicking
+                  // a row that is *inside* the range extends the selection
+                  // without changing this row's membership, so the reactive
+                  // `checked` expression above lands on the value it already
+                  // had, Svelte sees no change and writes nothing back — leaving
+                  // an unticked box on a row that is still selected, still
+                  // highlighted, still counted, and still downloaded by the bulk
+                  // actions. Restore it from the state that just settled.
+                  e.currentTarget.checked = checkedKeys.has(rKey);
+                }}
                 aria-label={m.search_select_result({ name: displayName(result) })}
               />
             </td>

@@ -150,6 +150,7 @@ async fn handle_command_inner(
             search_filters,
             related_hashes,
             exclude_hashes,
+            owned_hashes,
         } => {
             // Cancel the prior request while it is still `active_search_request`
             // so cancel can clear the UDP queue and emit `search-complete`.
@@ -185,6 +186,7 @@ async fn handle_command_inner(
                 udp_search_deadline: 0,
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
+                udp_found_sources: 0,
                 ed2k_noted_availability: HashMap::new(),
                 ed2k_noted_complete_sources: HashMap::new(),
                 dht_noted_availability: HashMap::new(),
@@ -200,7 +202,10 @@ async fn handle_command_inner(
                 server_result_count: 0,
                 streamed_hashes: std::collections::HashSet::new(),
                 exclude_hashes: exclude_hashes.iter().cloned().collect(),
-                batch_spam: crate::search::spam::BatchSpamContext::default(),
+                // Seeded with the library hashes the caller resolved, so every
+                // streamed packet of this search scores them as files we hold
+                // rather than as rows in whatever result set they arrived in.
+                batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -417,7 +422,7 @@ async fn handle_command_inner(
                             dropped = dropped.saturating_add(1);
                             continue;
                         }
-                        state.udp_search_queue.push_back(pkt);
+                        state.udp_search_queue.push_back((request_id, pkt.0, pkt.1));
                     }
                 }
                 if dropped > 0 {
@@ -510,12 +515,16 @@ async fn handle_command_inner(
                 if let Some(search) = state.search_manager.get_mut(&sid) {
                     search.search_terms_data = kad_search_expr;
                 }
-                active_request.kad_pending = true;
-                active_request.kad_ran = true;
+                // Claim the oneshot before marking the leg pending. The other
+                // order left `kad_pending` set on a leg that never started, and
+                // nothing else clears it — so `maybe_finish_active_search` would
+                // wait on it forever and `search-complete` would never fire.
                 let Some(search_tx) = tx.take() else {
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
                 };
+                active_request.kad_pending = true;
+                active_request.kad_ran = true;
                 state.pending_keyword_searches.insert(
                     sid,
                     PendingKeywordSearch {
@@ -4167,7 +4176,26 @@ async fn handle_command_inner(
                 }
             });
 
-            // Stop all searches and cancel pending oneshot channels
+            // Stop all searches and cancel pending oneshot channels.
+            //
+            // The active keyword search goes through the real teardown first,
+            // because nulling `active_search_request` by hand — which is what
+            // this used to do, further down — skips everything cancelling a
+            // search actually means. No `search-complete` reaches the frontend,
+            // so the tab spins until its ten-minute ed2k grace period expires;
+            // `udp_search_queue` keeps its backlog and the UDP timer goes on
+            // sending up to `MAX_UDP_SEARCH_QUEUE` `OP_GLOBSEARCH` packets for
+            // a search the user cancelled by pressing Disconnect; and the Ember
+            // keyword walk keeps running against an id nothing will match
+            // again. The drains below still cover the searches this does not:
+            // `find_notes` carries its own request id.
+            if let Some(active_id) = state
+                .active_search_request
+                .as_ref()
+                .map(|active| active.request_id)
+            {
+                cancel_search_request(state, app_handle, active_id);
+            }
             state.search_manager = SearchManager::new();
             for (
                 _,
@@ -4181,7 +4209,10 @@ async fn handle_command_inner(
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Ok(Vec::new()));
             }
+            // `cancel_search_request` above already cleared it, along with the
+            // UDP queue and the `search-complete` the frontend waits on.
             state.active_search_request = None;
+            state.udp_search_queue.clear();
             state.download_source_searches.clear();
             state.store_keyword_searches.clear();
             // A disconnect drops the rendezvous advert along with everything

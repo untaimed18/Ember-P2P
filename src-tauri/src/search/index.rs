@@ -14,7 +14,6 @@ pub struct LocalIndex {
     /// completed row is keyed by its content hash, so two copies of the same
     /// file share one id exactly as they share one `hash_map` key.
     id_map: HashMap<String, Vec<usize>>,
-    name_tokens: HashMap<String, Vec<usize>>,
 }
 
 /// Temporary id for a row that has never been hashed, so the index has nothing
@@ -82,7 +81,6 @@ impl LocalIndex {
             path_map: HashMap::new(),
             hash_map: HashMap::new(),
             id_map: HashMap::new(),
-            name_tokens: HashMap::new(),
         }
     }
 
@@ -312,10 +310,19 @@ impl LocalIndex {
         best
     }
 
+    /// Look a row up by path.
+    ///
+    /// The stored index is re-checked against `files` for the same reason
+    /// [`Self::position_by_id`] and [`Self::remove_file_by_path`] re-check
+    /// theirs: `path_map` is patched incrementally, so a drifted entry must only
+    /// fail to find a row, never resolve onto an unrelated one. This was the
+    /// single reader that took the map's word for it — and it is the one the
+    /// upload path and the Library's own queries go through, where answering
+    /// with the wrong file is worse than answering with none.
     pub fn get_by_path(&self, path: &str) -> Option<&FileInfo> {
-        self.path_map
-            .get(&normalize_path_key(path))
-            .and_then(|&idx| self.files.get(idx))
+        let key = normalize_path_key(path);
+        let file = self.path_map.get(&key).and_then(|&idx| self.files.get(idx))?;
+        (normalize_path_key(&file.path) == key).then_some(file)
     }
 
     pub fn file_count(&self) -> usize {
@@ -523,7 +530,6 @@ impl LocalIndex {
                 self.files[last_idx].path.clone(),
                 self.files[last_idx].hash.clone(),
                 self.files[last_idx].id.clone(),
-                tokenize(&self.files[last_idx].name.to_lowercase()),
             ))
         } else {
             None
@@ -548,24 +554,15 @@ impl LocalIndex {
                 }
             }
         }
-        for token in tokenize(&removed.name.to_lowercase()) {
-            if let Some(v) = self.name_tokens.get_mut(&token) {
-                v.retain(|&i| i != pos && i != last_idx);
-                if v.is_empty() {
-                    self.name_tokens.remove(&token);
-                }
-            }
-        }
-
-        if let Some((moved_path, moved_hash, moved_id, moved_tokens)) = moved_key {
+        if let Some((moved_path, moved_hash, moved_id)) = moved_key {
             // The moved element previously lived at `last_idx`; repoint all of
             // its index entries to `pos`. The removed-file cleanup above only
-            // stripped the *removed* file's hash/tokens (which usually differ
-            // from the moved file's), so we must explicitly remove the stale
-            // `last_idx` from the moved file's own buckets before adding `pos`.
-            // Without this, `hash_map`/`name_tokens` accumulate dangling indices
-            // (out-of-bounds, or pointing at an unrelated file once the slot is
-            // reused) until the next full `rebuild()`.
+            // stripped the *removed* file's hash (which usually differs from the
+            // moved file's), so we must explicitly remove the stale `last_idx`
+            // from the moved file's own buckets before adding `pos`. Without
+            // this, `hash_map` accumulates dangling indices (out-of-bounds, or
+            // pointing at an unrelated file once the slot is reused) until the
+            // next full `rebuild()`.
             self.path_map.insert(normalize_path_key(&moved_path), pos);
             if !moved_hash.is_empty() {
                 let v = self.hash_map.entry(moved_hash).or_default();
@@ -574,11 +571,6 @@ impl LocalIndex {
             }
             if !moved_id.is_empty() {
                 let v = self.id_map.entry(moved_id).or_default();
-                v.retain(|&i| i != last_idx && i != pos);
-                v.push(pos);
-            }
-            for token in moved_tokens {
-                let v = self.name_tokens.entry(token).or_default();
                 v.retain(|&i| i != last_idx && i != pos);
                 v.push(pos);
             }
@@ -1074,26 +1066,17 @@ impl LocalIndex {
                 }
             }
         }
-        for token in tokenize(&file.name.to_lowercase()) {
-            if let Some(v) = self.name_tokens.get_mut(&token) {
-                v.retain(|&i| i != pos);
-                if v.is_empty() {
-                    self.name_tokens.remove(&token);
-                }
-            }
-        }
     }
 
     /// Add the map contributions for the file at `pos` (derived from
     /// `self.files[pos]`).
     fn add_index_entries(&mut self, pos: usize) {
-        let (path_key, hash, id, name_lower) = {
+        let (path_key, hash, id) = {
             let file = &self.files[pos];
             (
                 normalize_path_key(&file.path),
                 file.hash.clone(),
                 file.id.clone(),
-                file.name.to_lowercase(),
             )
         };
         self.path_map.insert(path_key, pos);
@@ -1103,16 +1086,12 @@ impl LocalIndex {
         if !id.is_empty() {
             self.id_map.entry(id).or_default().push(pos);
         }
-        for token in tokenize(&name_lower) {
-            self.name_tokens.entry(token).or_default().push(pos);
-        }
     }
 
     fn rebuild_indices(&mut self) {
         self.path_map.clear();
         self.hash_map.clear();
         self.id_map.clear();
-        self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {
             self.path_map.insert(normalize_path_key(&file.path), idx);
             if !file.hash.is_empty() {
@@ -1123,10 +1102,6 @@ impl LocalIndex {
             }
             if !file.id.is_empty() {
                 self.id_map.entry(file.id.clone()).or_default().push(idx);
-            }
-            let name_lower = file.name.to_lowercase();
-            for token in tokenize(&name_lower) {
-                self.name_tokens.entry(token).or_default().push(idx);
             }
         }
     }
@@ -1152,13 +1127,6 @@ fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
     // restriction reappears at the next restart, which makes the exposure
     // intermittent and near-invisible rather than obvious.
     file.friends_only = existing.friends_only;
-}
-
-fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .collect()
 }
 
 /// Categorize a file by its extension, matching eMule's g_aED2KFileTypes table

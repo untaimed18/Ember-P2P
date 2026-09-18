@@ -163,6 +163,14 @@ pub struct BatchSpamContext {
     /// Last-seen row fields for hashes already absorbed, so a later packet that
     /// newly crosses a collision bar can upgrade earlier streamed rows.
     snapshots: HashMap<String, StreamedSpamSnapshot>,
+    /// Hashes of files this library already holds, for the whole search.
+    ///
+    /// Carried here rather than passed alongside because this context is
+    /// already threaded to every scoring call — the network task moves it in
+    /// and out of `ActiveSearchRequest` per packet, and the IPC paths pass one
+    /// directly — so the exemption reaches the scorer without a `local_index`
+    /// read on the network loop or a new argument on four call chains.
+    owned_hashes: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +182,19 @@ struct StreamedSpamSnapshot {
     result_origin: String,
     origin_server_ip: Option<String>,
     rating: Option<u8>,
+    /// Carried so the rebuilt row still answers the search's own filters.
+    ///
+    /// An upgrade is a re-emit of a row the user is already looking at, and
+    /// `enrich_and_emit_search_results` runs every streamed row past
+    /// `result_matches_client_filters` on the way out. Leaving these at their
+    /// defaults meant the rebuilt row claimed no extension, no file type and a
+    /// single source — so a search narrowed to `Video`, to an extension, or to
+    /// two-plus sources dropped every upgrade it produced, and the poisoned
+    /// rows already on screen stayed unflagged. Silently, and exactly in the
+    /// searches where coordinated poisoning is worth catching.
+    extension: String,
+    file_type: String,
+    availability: u32,
 }
 
 impl BatchSpamContext {
@@ -182,6 +203,31 @@ impl BatchSpamContext {
         let mut ctx = Self::default();
         ctx.absorb(results);
         ctx
+    }
+
+    /// A context that carries nothing but the owned-file exemption.
+    ///
+    /// Every statistical signal stays off (`enabled` is false until
+    /// [`Self::absorb`] has seen `BATCH_MIN_RESULTS_FOR_STATS` rows), so this
+    /// behaves exactly like `default()` apart from the exemption — which is what
+    /// the IPC paths want: they deliberately score without batch heuristics.
+    pub fn for_owned_hashes(hashes: impl IntoIterator<Item = String>) -> Self {
+        let mut ctx = Self::default();
+        ctx.set_owned_hashes(hashes);
+        ctx
+    }
+
+    pub fn set_owned_hashes(&mut self, hashes: impl IntoIterator<Item = String>) {
+        self.owned_hashes = hashes
+            .into_iter()
+            .map(|h| normalize_hash(&h))
+            .filter(|h| !h.is_empty())
+            .collect();
+    }
+
+    /// Whether `hash` is a file this library already holds.
+    pub fn is_owned(&self, hash: &str) -> bool {
+        !self.owned_hashes.is_empty() && self.owned_hashes.contains(hash)
     }
 
     /// Fold another packet into this context so same-name/many-hashes can be
@@ -220,6 +266,9 @@ impl BatchSpamContext {
                             result_origin: r.result_origin.clone(),
                             origin_server_ip: r.origin_server_ip.clone(),
                             rating: r.rating,
+                            extension: r.file.extension.clone(),
+                            file_type: r.file_type.clone(),
+                            availability: r.availability,
                         },
                     );
                 }
@@ -351,7 +400,7 @@ impl StreamedSpamSnapshot {
                 hash: self.hash.clone(),
                 aich_hash: String::new(),
                 ember_file_hash: String::new(),
-                extension: String::new(),
+                extension: self.extension.clone(),
                 modified_at: 0,
                 priority: "normal".to_string(),
                 requests: 0,
@@ -370,8 +419,8 @@ impl StreamedSpamSnapshot {
             },
             peer_id: String::new(),
             peer_name: String::new(),
-            availability: 1,
-            file_type: String::new(),
+            availability: self.availability,
+            file_type: self.file_type.clone(),
             source_addresses: self.source_addresses.clone(),
             rating: self.rating,
             comment: None,
@@ -540,6 +589,7 @@ macro_rules! spam_reason_codes {
 
 spam_reason_codes! {
     NotSpamMarked => "not_spam_marked", "Manually marked as not spam";
+    OwnedFile => "owned_file", "Already in your library";
     KnownHash => "known_hash", "Known spam hash (+{weight})";
     ExactFilename => "exact_filename", "Exact spam filename match (+{weight})";
     VerySimilarName => "very_similar_name", "Very similar spam pattern ({percent}% match, +{weight})";
@@ -977,6 +1027,31 @@ impl SpamFilter {
                 threshold,
                 profile,
                 vec![SpamReason::new(SpamReasonCode::NotSpamMarked, &[])],
+            );
+        }
+
+        // A file this library already holds cannot be fake: the bytes are on
+        // disk and hash to exactly this id. The same argument `auto_mark_not_spam`
+        // makes for a completed download, applied to the library at large —
+        // without writing tens of thousands of hashes into a 10,000-entry
+        // learned set that exists to remember the user's own decisions.
+        //
+        // This is not cosmetic. The batch heuristics score a *result set*, not a
+        // file, so a flood advertising many hashes under a name that collides
+        // with something you share was enough to push your own copy over the
+        // threshold and hide it under "hide spam" — in your own search, for a
+        // file you are seeding. An attacker choosing the colliding name decides
+        // which of your files disappears.
+        //
+        // An explicit Mark spam still wins, exactly as it does over
+        // `auto_mark_not_spam`: if the user has judged this hash, that judgement
+        // is the answer.
+        if batch.is_owned(&hash) && !self.db.spam_hashes.contains(&hash) {
+            return Self::explanation(
+                0,
+                threshold,
+                profile,
+                vec![SpamReason::new(SpamReasonCode::OwnedFile, &[])],
             );
         }
 
@@ -2525,5 +2600,154 @@ mod tests {
         assert!(upgraded.contains(&"1".repeat(32)));
         assert!(upgraded.contains(&"2".repeat(32)));
         assert!(!upgraded.contains(&format!("{:032x}", 2)));
+    }
+
+    /// A file the library holds cannot be fake — the bytes are on disk and hash
+    /// to exactly this id. Without the exemption a flood advertising many hashes
+    /// under a name that collides with something you share pushed your own copy
+    /// over the threshold: your file, hidden from your own search, with the
+    /// attacker choosing which one by choosing the name.
+    #[test]
+    fn a_file_we_already_hold_is_never_batch_spam() {
+        let dir = temp_dir("owned-exempt");
+        let filter = SpamFilter::load(&dir);
+        // One advertised name carried by many hashes, with the URL such names
+        // usually carry, and one hash re-advertised under several names. Both
+        // collision bars plus the filename pattern — and one of those hashes is
+        // a file we are seeding.
+        let poison = "www.poison.to Movie Title 2026.mkv";
+        let mine = "1".repeat(32);
+
+        let mut rows = vec![
+            sized_result(&mine, poison, 1000, &[]),
+            sized_result(&mine, "www.poison.to Other Title 2026.mkv", 1000, &[]),
+            sized_result(&mine, "www.poison.to Third Title 2026.mkv", 1000, &[]),
+        ];
+        for i in 2..10 {
+            rows.push(sized_result(&format!("{i:032x}"), poison, 1000 + i as u64, &[]));
+        }
+
+        let plain = BatchSpamContext::analyze(&rows);
+        let convicted = filter.explain_result(
+            &rows[0],
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &plain,
+        );
+        assert!(
+            convicted.is_spam,
+            "the batch really does convict it (score {}); that is what the \
+             exemption has to override",
+            convicted.score
+        );
+
+        let mut owned = BatchSpamContext::analyze(&rows);
+        owned.set_owned_hashes([mine.clone()]);
+        let verdict = filter.explain_result(
+            &rows[0],
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &owned,
+        );
+        assert_eq!(verdict.score, 0);
+        assert!(!verdict.is_spam);
+        assert_eq!(verdict.reason_details[0].code, "owned_file");
+
+        // The flood around it is still judged on its own merits — the exemption
+        // is per hash, not a licence for the batch it arrived in.
+        let neighbour = filter.explain_result(
+            &rows[3],
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &owned,
+        );
+        assert!(neighbour.score > 0, "exempting our copy exempted the flood");
+        assert!(neighbour
+            .reason_details
+            .iter()
+            .all(|r| r.code != "owned_file"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The user's own verdict outranks "we have it", exactly as it outranks
+    /// `auto_mark_not_spam` on a completed download.
+    #[test]
+    fn an_explicit_mark_spam_still_wins_over_owning_the_file() {
+        let dir = temp_dir("owned-vs-mark");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "a".repeat(32);
+        let row = sample_result(&hash, "Something I Shared.bin");
+        filter.mark_spam(&row, &[], None);
+
+        let owned = BatchSpamContext::for_owned_hashes([hash.clone()]);
+        let verdict = filter.explain_result(
+            &row,
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &owned,
+        );
+        assert!(verdict.is_spam, "an explicit mark is the user's answer");
+        assert!(verdict.reason_details.iter().any(|r| r.code == "known_hash"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An upgrade is a re-emit of a row the user is already looking at, and
+    /// every streamed row is put past `result_matches_client_filters` on the way
+    /// out. So a rebuilt row has to answer that filter the same way the row it
+    /// replaces did — otherwise narrowing a search to `Video`, to an extension,
+    /// or to two-plus sources threw away every upgrade the batch produced, and
+    /// the poisoned rows on screen were never flagged.
+    #[test]
+    fn an_upgraded_row_still_answers_the_searchs_own_filters() {
+        let poison = "Poisoned Movie Title 2026.mkv";
+        let with_fields = |hash: &str, size: u64| {
+            let mut r = sized_result(hash, poison, size, &[]);
+            r.file.extension = "mkv".to_string();
+            r.file_type = "Video".to_string();
+            r.availability = 12;
+            r
+        };
+
+        let mut ctx = BatchSpamContext::default();
+        let first = vec![
+            with_fields(&"1".repeat(32), 1000),
+            with_fields(&"2".repeat(32), 1001),
+        ];
+        ctx.absorb(&first);
+        let prev = ctx.colliding_hashes();
+
+        let rest: Vec<SearchResult> = (2..8)
+            .map(|i| with_fields(&format!("{i:032x}"), 1000 + i as u64))
+            .collect();
+        ctx.absorb(&rest);
+        let skip: HashSet<String> = rest.iter().map(|r| r.file.hash.clone()).collect();
+
+        let upgrades = ctx.upgrade_rows(&prev, &skip);
+        assert!(!upgrades.is_empty(), "the collision bar was crossed");
+        for row in &upgrades {
+            assert_eq!(row.file.extension, "mkv");
+            assert_eq!(row.file_type, "Video");
+            assert_eq!(row.availability, 12);
+            assert!(
+                crate::search::merge::result_matches_client_filters(
+                    row,
+                    Some("Video"),
+                    None,
+                    None,
+                    Some("mkv"),
+                    Some(2),
+                ),
+                "upgrade for {} was dropped by the filter its own row passed",
+                row.file.hash
+            );
+        }
     }
 }

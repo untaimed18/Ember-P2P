@@ -149,6 +149,56 @@
       "chosen": ""
     }
   ],
+  "spam_signal_cases": [
+    {
+      "name": "a clean row adopts the first flagged verdict it meets",
+      "existing_is_spam": false,
+      "existing_rating": 0,
+      "incoming_is_spam": true,
+      "incoming_rating": 70,
+      "takes_incoming": true
+    },
+    {
+      "name": "a flagged row keeps its reasons when a weaker flagged batch arrives",
+      "existing_is_spam": true,
+      "existing_rating": 85,
+      "incoming_is_spam": true,
+      "incoming_rating": 40,
+      "takes_incoming": false
+    },
+    {
+      "name": "a higher score brings its own explanation",
+      "existing_is_spam": true,
+      "existing_rating": 60,
+      "incoming_is_spam": true,
+      "incoming_rating": 95,
+      "takes_incoming": true
+    },
+    {
+      "name": "an unflagged row cannot replace a flagged explanation",
+      "existing_is_spam": true,
+      "existing_rating": 70,
+      "incoming_is_spam": false,
+      "incoming_rating": 10,
+      "takes_incoming": false
+    },
+    {
+      "name": "an unflagged row with a higher score still explains the score that wins",
+      "existing_is_spam": false,
+      "existing_rating": 10,
+      "incoming_is_spam": false,
+      "incoming_rating": 30,
+      "takes_incoming": true
+    },
+    {
+      "name": "equal verdict and equal score keeps what is already shown",
+      "existing_is_spam": true,
+      "existing_rating": 60,
+      "incoming_is_spam": true,
+      "incoming_rating": 60,
+      "takes_incoming": false
+    }
+  ],
   "clamp_source_count_cases": [
     { "count": 0, "clamped": 0 },
     { "count": 1, "clamped": 1 },

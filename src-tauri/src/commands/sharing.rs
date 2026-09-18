@@ -31,6 +31,17 @@ const IN_FLIGHT_HASH_LEASE: std::time::Duration = std::time::Duration::from_secs
 /// terminal `done` event after the loop, so the bar always lands on full.
 struct HashProgressEmitter {
     last_emit: Option<std::time::Instant>,
+    /// How many files in this pass are a one-time digest top-up rather than
+    /// something newly discovered.
+    ///
+    /// Reported so the UI can say which it is. A library carried over from a
+    /// build that predates `ember_file_hash` has every record queued for a
+    /// top-up, and reading that many files takes as long as reading the library
+    /// — hours on a big share, days on a very big one. Shown as an ordinary
+    /// "scanning" bar it looks like Ember is re-hashing from scratch and has
+    /// hung, which is precisely what it was reported as. It is neither: the
+    /// files stay shared and servable throughout, and the pass never runs again.
+    upgrading: usize,
 }
 
 impl HashProgressEmitter {
@@ -38,8 +49,14 @@ impl HashProgressEmitter {
     /// up with a disk hashing thousands of small files a second.
     const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
-    fn new() -> Self {
-        Self { last_emit: None }
+    fn new(files_to_hash: &[FileInfo]) -> Self {
+        Self {
+            last_emit: None,
+            upgrading: files_to_hash
+                .iter()
+                .filter(|f| f.id.starts_with(crate::search::index::REHASH_ID_PREFIX))
+                .count(),
+        }
     }
 
     fn emit(&mut self, app: &tauri::AppHandle, current: usize, total: usize, file_name: &str) {
@@ -59,6 +76,7 @@ impl HashProgressEmitter {
                 "current": current,
                 "total": total,
                 "file_name": file_name,
+                "upgrading": self.upgrading,
             }),
         );
     }
@@ -105,6 +123,148 @@ fn release_in_flight_hash(path: &str, claim: u64) {
         .unwrap_or_else(|e| e.into_inner());
     if claims.get(path).is_some_and(|(current, _)| *current == claim) {
         claims.remove(path);
+    }
+}
+
+/// What a single queued file's hash pass produces.
+type HashPassResult = anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)>;
+
+/// The ed2k hash and AICH root to carry forward when a queued file needs only
+/// its Ember digest computed, or `None` when it needs the full pass.
+///
+/// Only a digest top-up qualifies, and only when `known.met` really did supply
+/// both of the other two — a record old enough to predate AICH as well has to be
+/// hashed in full.
+fn digest_only_inputs(file: &FileInfo) -> Option<(String, String)> {
+    if !file.id.starts_with(crate::search::index::REHASH_ID_PREFIX) {
+        return None;
+    }
+    if file.hash.is_empty() || file.aich_hash.is_empty() || !file.ember_file_hash.is_empty() {
+        return None;
+    }
+    Some((file.hash.clone(), file.aich_hash.clone()))
+}
+
+/// One file hash started ahead of the loop that will consume it.
+struct StartedHash {
+    index: usize,
+    claim: u64,
+    task: tokio::task::JoinHandle<HashPassResult>,
+}
+
+/// Keeps up to `concurrency` file hashes running ahead of the consumer, handing
+/// them back in queue order.
+///
+/// The scan loop used to spawn one hash, await it, do its bookkeeping, and only
+/// then start the next — so on a disk that can serve several reads at once the
+/// drive sat idle for every CPU-bound stretch and the CPU sat idle for every
+/// read. Nothing about the loop's bookkeeping wants to be concurrent, though:
+/// it writes the index, hands off part hashes and moves counters, all of which
+/// must stay ordered and serialized. So the overlap is confined to the part
+/// that benefits, and results still arrive one at a time and in queue order —
+/// the loop body downstream of this is unchanged.
+///
+/// `concurrency` comes from [`crate::sharing::disk::hash_concurrency`], which
+/// answers 1 for anything that might seek. That is the safeguard: this is a
+/// win on solid-state storage and a loss on a spinning disk, where concurrent
+/// reads turn into head travel.
+struct HashLookahead<'a> {
+    files: &'a [FileInfo],
+    next: usize,
+    concurrency: usize,
+    cancel: Arc<AtomicBool>,
+    inflight: std::collections::VecDeque<StartedHash>,
+    /// Files passed over because another pass still holds their claim. The
+    /// caller must treat a non-zero count as an incomplete page, or the resume
+    /// cursor advances past a file nothing hashed.
+    skipped: usize,
+}
+
+impl<'a> HashLookahead<'a> {
+    fn new(files: &'a [FileInfo], concurrency: usize, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            files,
+            next: 0,
+            concurrency: concurrency.max(1),
+            cancel,
+            inflight: std::collections::VecDeque::new(),
+            skipped: 0,
+        }
+    }
+
+    /// How many files this pass could not start. See [`Self::skipped`].
+    fn skipped(&self) -> usize {
+        self.skipped
+    }
+
+    /// The next started hash in queue order, or `None` when the queue is spent.
+    ///
+    /// Tops the window up *before* handing one out, never after. The one it
+    /// returns is still running as far as the disk is concerned — the caller
+    /// has yet to await it — so it is part of the window, and refilling
+    /// afterwards would leave `concurrency + 1` reads outstanding. At a
+    /// concurrency of 1 that is the difference between the strictly sequential
+    /// pass a spinning disk needs and two concurrent reads, which is the exact
+    /// thing `sharing::disk` exists to prevent.
+    fn next_started(&mut self) -> Option<StartedHash> {
+        self.fill();
+        self.inflight.pop_front()
+    }
+
+    fn fill(&mut self) {
+        while self.inflight.len() < self.concurrency && self.next < self.files.len() {
+            let index = self.next;
+            self.next += 1;
+            let file = &self.files[index];
+            let Some(claim) = try_claim_in_flight_hash(&file.path) else {
+                warn!(
+                    "Skipping hash of {} — a previous timed-out hash is still running",
+                    file.name
+                );
+                self.skipped += 1;
+                continue;
+            };
+            let path = file.path.clone();
+            let cancel = self.cancel.clone();
+            let digest_only = digest_only_inputs(file);
+            let task = tokio::task::spawn_blocking(move || {
+                let path = std::path::Path::new(&path);
+                match digest_only {
+                    Some((ed2k, aich)) => FileIndexer::hash_file_digest_only_cancellable(
+                        path, ed2k, aich, &cancel,
+                    ),
+                    None => FileIndexer::hash_file_cancellable(path, &cancel),
+                }
+            });
+            self.inflight.push_back(StartedHash { index, claim, task });
+        }
+    }
+
+    /// Let go of one started hash the consumer will not process, releasing its
+    /// claim only once the task has actually stopped.
+    ///
+    /// Every row this hands out is claimed, and the claim is the consumer's to
+    /// release — so any row that does not reach the consumer's `match` has to
+    /// come back through here. Dropping it instead would detach the task and
+    /// strand the claim until the 15-minute lease expired, and the next scan
+    /// would refuse to touch that file. Same drain the per-file timeout branch
+    /// performs, for the same reason.
+    fn drain_started(&self, started: StartedHash) {
+        let path = self.files[started.index].path.clone();
+        tokio::spawn(async move {
+            let _ = started.task.await;
+            release_in_flight_hash(&path, started.claim);
+        });
+    }
+
+    /// Let go of everything still queued. Cancelling breaks out of the consumer
+    /// loop with the look-ahead window still full, and every file in it is
+    /// claimed.
+    fn abandon(&mut self) {
+        let pending: Vec<StartedHash> = self.inflight.drain(..).collect();
+        for started in pending {
+            self.drain_started(started);
+        }
     }
 }
 
@@ -1723,29 +1883,33 @@ pub async fn add_shared_folder(
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
-        let mut hash_progress = HashProgressEmitter::new();
+        let mut hash_progress = HashProgressEmitter::new(&files_to_hash);
         let mut was_cancelled = false;
         let mut page_complete = true;
 
-        for file in &files_to_hash {
+        // One at a time unless this folder's storage has told us reads do not
+        // seek; see `sharing::disk`.
+        let hash_width = crate::sharing::disk::hash_concurrency(std::slice::from_ref(&canonical_str));
+        if hash_width > 1 {
+            info!("Hashing {total_to_hash} files {hash_width} at a time (no seek penalty reported)");
+        }
+        let mut pipeline = HashLookahead::new(&files_to_hash, hash_width, cancel_flag.clone());
+        while let Some(started) = pipeline.next_started() {
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Hashing cancelled for {path} at {hashed_count}/{total_to_hash}");
                 was_cancelled = true;
+                // This row is already claimed and running: it has to go back
+                // through the drain like the rest of the window, or its claim
+                // outlives the scan. The old loop checked cancellation before
+                // claiming, so there was nothing here to hand back.
+                pipeline.drain_started(started);
                 break;
             }
 
-            let file_path = file.path.clone();
+            let file = &files_to_hash[started.index];
             let file_temp_id = file.id.clone();
-            let cf = cancel_flag.clone();
-
-            let Some(hash_claim) = try_claim_in_flight_hash(&file.path) else {
-                warn!(
-                    "Skipping hash of {} — a previous timed-out hash is still running",
-                    file.name
-                );
-                page_complete = false;
-                continue;
-            };
+            let hash_claim = started.claim;
+            let mut hash_task = started.task;
 
             debug!(
                 "Hashing file {}/{}: {}",
@@ -1756,9 +1920,6 @@ pub async fn add_shared_folder(
 
             hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
-            let mut hash_task = tokio::task::spawn_blocking(move || {
-                FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-            });
             let hash_result =
                 tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
 
@@ -1889,6 +2050,14 @@ pub async fn add_shared_folder(
                     continue;
                 }
             }
+        }
+        // Cancelling leaves the look-ahead window full of claimed, still-running
+        // hashes; hand them off to drain rather than stranding their claims.
+        pipeline.abandon();
+        // A file another pass still held leaves this page unfinished, so the
+        // resume cursor must not move past it.
+        if pipeline.skipped() > 0 {
+            page_complete = false;
         }
 
         {
@@ -3290,29 +3459,31 @@ async fn reload_shared_files_page(
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
-        let mut hash_progress = HashProgressEmitter::new();
+        let mut hash_progress = HashProgressEmitter::new(&files_to_hash);
         let mut was_cancelled = false;
         let mut page_complete = true;
 
-        for file in &files_to_hash {
+        // One at a time unless the library is on storage that has told us reads
+        // do not seek; see `sharing::disk`.
+        let hash_width = crate::sharing::disk::hash_concurrency(&reloaded_folders);
+        if hash_width > 1 {
+            info!("Reload hashing {total_to_hash} files {hash_width} at a time (no seek penalty reported)");
+        }
+        let mut pipeline = HashLookahead::new(&files_to_hash, hash_width, cancel_flag.clone());
+        while let Some(started) = pipeline.next_started() {
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Reload hashing cancelled at {hashed_count}/{total_to_hash}");
                 was_cancelled = true;
+                // Already claimed and running — hand it back to the drain, or
+                // its claim outlives the scan. See the folder-add loop.
+                pipeline.drain_started(started);
                 break;
             }
 
-            let file_path = file.path.clone();
+            let file = &files_to_hash[started.index];
             let file_temp_id = file.id.clone();
-            let cf = cancel_flag.clone();
-
-            let Some(hash_claim) = try_claim_in_flight_hash(&file.path) else {
-                warn!(
-                    "Skipping reload hash of {} — a previous timed-out hash is still running",
-                    file.name
-                );
-                page_complete = false;
-                continue;
-            };
+            let hash_claim = started.claim;
+            let mut hash_task = started.task;
 
             debug!(
                 "Reload hashing {}/{}: {}",
@@ -3323,9 +3494,6 @@ async fn reload_shared_files_page(
 
             hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
-            let mut hash_task = tokio::task::spawn_blocking(move || {
-                FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-            });
             let hash_result =
                 tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
 
@@ -3454,6 +3622,14 @@ async fn reload_shared_files_page(
                 }
             }
         }
+        // Cancelling leaves the look-ahead window full of claimed, still-running
+        // hashes; hand them off to drain rather than stranding their claims.
+        pipeline.abandon();
+        // A file another pass still held leaves this page unfinished, so the
+        // resume cursor must not move past it.
+        if pipeline.skipped() > 0 {
+            page_complete = false;
+        }
 
         {
             let mut index = local_index.write().await;
@@ -3567,46 +3743,89 @@ pub fn get_library_scan_truncated(state: tauri::State<'_, AppState>) -> Result<b
     Ok(state.library_scan_truncated.load(Ordering::Relaxed))
 }
 
+/// Shared folders that would actually lose files if hashing stopped right now.
+///
+/// A folder qualifies only when it holds a row with **no hash yet** — something
+/// this scan discovered and has not finished hashing. The one-time digest
+/// top-up rows deliberately do not count: they already carry their ed2k hash,
+/// their share state and their counters, `abandon_hash_placeholder` keeps them
+/// on cancel, and the digests computed so far are already in `known.met`. So
+/// stopping a migration pass costs nothing and must not be described as if it
+/// did.
+///
+/// That distinction is the whole point of this function existing separately
+/// from [`stop_hashing`]. The confirmation dialog used to warn unconditionally,
+/// before anything had worked out whether there was anything to warn about — and
+/// the case where there is nothing is the common one, because upgrading a large
+/// library queues every file for a digest top-up and not one of them is at risk.
+/// A user with a 46,000-file library was told they would lose folders for
+/// stopping a pass that could not lose them anything, and so did not stop it.
+async fn folders_losing_files_on_stop(state: &AppState) -> Vec<String> {
+    let shared_folders = {
+        let config = state.config.read().await;
+        config.settings.shared_folders.clone()
+    };
+    // One pass over the index rather than a full clone of it. This now runs
+    // twice per stop — once for the dialog's preview and once for the stop
+    // itself — and `all_files().to_vec()` on a large library is tens of
+    // thousands of `FileInfo` clones each time. Most rows carry a hash and are
+    // rejected on the first test, so the folder loop only runs for the few that
+    // are actually still waiting.
+    let mut at_risk: HashSet<String> = HashSet::new();
+    {
+        let index = state.local_index.read().await;
+        for file in index.all_files() {
+            if !file.hash.is_empty() {
+                continue;
+            }
+            for folder in &shared_folders {
+                if crate::security::path_matches_dir(&file.path, folder) {
+                    at_risk.insert(folder.clone());
+                }
+            }
+        }
+    }
+
+    // A per-folder scan still in flight may be about to add unhashed rows, so
+    // its folder counts even if nothing unhashed is indexed yet. The special
+    // `__reload__` / `__startup__` keys are whole-library passes and are named
+    // by the rows above instead.
+    let flags = state.hash_cancel_flags.read().await;
+    for key in flags.keys() {
+        if !key.starts_with("__") {
+            at_risk.insert(key.clone());
+        }
+    }
+    drop(flags);
+
+    let mut result = at_risk.into_iter().collect::<Vec<_>>();
+    result.sort();
+    result
+}
+
+/// What [`stop_hashing`] would cost, without stopping anything.
+///
+/// Read-only, so the confirmation dialog can say what will actually happen
+/// rather than warning by default.
+#[tauri::command]
+pub async fn preview_stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(folders_losing_files_on_stop(&state).await)
+}
+
 #[tauri::command]
 pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     // Latch pause before signalling cancel so a concurrent FS-watcher tick
     // cannot start a new reload that races past the cancel flags.
     state.hashing_paused.store(true, Ordering::Relaxed);
 
-    let (shared_folders, index_snap) = tokio::join!(
-        async {
-            let config = state.config.read().await;
-            config.settings.shared_folders.clone()
-        },
-        async {
-            let index = state.local_index.read().await;
-            index.all_files().to_vec()
-        },
-    );
-    let pending_folders = shared_folders
-        .iter()
-        .filter(|folder| {
-            index_snap.iter().any(|file| {
-                crate::security::path_matches_dir(&file.path, folder) && file.hash.is_empty()
-            })
-        })
-        .cloned()
-        .collect::<HashSet<_>>();
+    let result = folders_losing_files_on_stop(&state).await;
 
     let flags = state.hash_cancel_flags.read().await;
     let count = flags.len();
-    let mut incomplete_folders = pending_folders;
-    for key in flags.keys() {
-        if !key.starts_with("__") {
-            incomplete_folders.insert(key.clone());
-        }
-    }
     for flag in flags.values() {
         flag.store(true, Ordering::Relaxed);
     }
     info!("Stop hashing requested, cancelled {count} active tasks");
-    let mut result = incomplete_folders.into_iter().collect::<Vec<_>>();
-    result.sort();
     Ok(result)
 }
 
@@ -4168,6 +4387,83 @@ mod tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    /// The look-ahead must never have more reads outstanding than it was told
+    /// to, because at a concurrency of 1 that bound *is* the spinning-disk
+    /// safeguard. The row handed to the caller counts: the caller has not
+    /// awaited it yet, so as far as the drive is concerned it is still running.
+    /// Refilling the window after handing one out rather than before left two
+    /// reads in flight on a disk that had asked for one.
+    #[tokio::test]
+    async fn the_look_ahead_never_exceeds_its_concurrency() {
+        for width in [1usize, 3] {
+            let files: Vec<FileInfo> = (0..6)
+                .map(|i| {
+                    indexed_file(
+                        &format!("C:/ember-lookahead-{}-{width}-{i}.bin", std::process::id()),
+                        &"ab".repeat(16),
+                    )
+                })
+                .collect();
+            // Pre-cancelled: every spawned hash bails at once, so this measures
+            // the window rather than waiting on real reads.
+            let cancel = Arc::new(AtomicBool::new(true));
+            let mut pipeline = HashLookahead::new(&files, width, cancel);
+
+            let mut handed_out = 0usize;
+            while let Some(started) = pipeline.next_started() {
+                handed_out += 1;
+                assert!(
+                    pipeline.inflight.len() + 1 <= width,
+                    "width {width}: {} queued plus the one just handed out exceeds it",
+                    pipeline.inflight.len()
+                );
+                release_in_flight_hash(&files[started.index].path, started.claim);
+            }
+            assert_eq!(handed_out, files.len(), "every file must be handed out once");
+            assert_eq!(pipeline.skipped(), 0);
+        }
+    }
+
+    /// Only a digest top-up may skip the ed2k and AICH passes, and only when
+    /// `known.met` really supplied both. Getting this wrong in the permissive
+    /// direction writes a made-up ed2k hash into the index; in the restrictive
+    /// direction it just costs the speed-up.
+    #[test]
+    fn only_a_complete_record_missing_its_digest_skips_the_full_pass() {
+        let hash = "ab".repeat(16);
+        let aich = "cd".repeat(20);
+
+        let mut migration = indexed_file("C:/A/file.bin", &hash);
+        migration.id = crate::search::index::rehash_id("C:/A/file.bin");
+        migration.aich_hash = aich.clone();
+        assert_eq!(
+            digest_only_inputs(&migration),
+            Some((hash.clone(), aich.clone())),
+            "an otherwise complete record needs only its BLAKE3"
+        );
+
+        // Old enough to predate AICH as well: nothing to carry forward.
+        let mut no_aich = migration.clone();
+        no_aich.aich_hash = String::new();
+        assert_eq!(digest_only_inputs(&no_aich), None);
+
+        // Already has a digest — should not have been queued at all, and
+        // certainly must not be short-cut.
+        let mut has_digest = migration.clone();
+        has_digest.ember_file_hash = "ef".repeat(32);
+        assert_eq!(digest_only_inputs(&has_digest), None);
+
+        // A genuinely new file has no hash to carry forward.
+        let mut fresh = indexed_file("C:/A/new.bin", "");
+        fresh.id = format!("{}C:/A/new.bin", crate::search::index::PENDING_ID_PREFIX);
+        fresh.aich_hash = aich;
+        assert_eq!(digest_only_inputs(&fresh), None);
+
+        // A completed row that is not a migration row is left alone.
+        let ordinary = indexed_file("C:/A/file.bin", &hash);
+        assert_eq!(digest_only_inputs(&ordinary), None);
     }
 
     #[test]

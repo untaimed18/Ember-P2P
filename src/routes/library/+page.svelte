@@ -9,6 +9,7 @@
     getScanStatus,
     getLibraryScanTruncated,
     stopHashing,
+    previewStopHashing,
     resumeHashing,
     setFilePriority,
     unshareFile,
@@ -115,7 +116,11 @@
   // the DOM yet because the table is virtualized).
   let libraryTableRef: { scrollRowIntoView: (i: number) => void; openColumnMenu: (e: MouseEvent) => void } | undefined = $state(undefined);
   let filterFolder: string | null = $state(null);
-  let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
+  /** `upgrading` is how many files in this pass are a one-time index top-up
+   *  rather than newly discovered ones — see `HashProgressEmitter` in
+   *  `commands/sharing.rs`. Shown differently because it is a different thing:
+   *  the files stay shared and servable throughout, and it never runs again. */
+  let hashProgress: { current: number; total: number; file_name: string; upgrading: number } | null = $state(null);
   let stoppedByUser = $state(false);
   let fileByPath = $derived.by(() => {
     const map = new Map<string, FileInfo>();
@@ -1016,17 +1021,65 @@
 
   let stopConfirmVisible = $state(false);
   let stoppingHashing = $state(false);
+  /** Folders that would actually lose files, resolved before the dialog opens.
+   *  Empty means stopping is free — which is the usual case, and the case the
+   *  dialog used to warn about anyway. */
+  let stopAtRiskFolders = $state<string[]>([]);
+  /** Set when the preview failed, so the dialog falls back to the cautious
+   *  wording instead of promising something it could not check. */
+  let stopConfirmUnknown = $state(false);
+  /** Folder names the stop dialog spells out before it starts counting. */
+  const STOP_FOLDERS_NAMED = 3;
 
-  function handleStopRequest() {
+  /** The at-risk folders, by name, for the confirmation banner.
+   *
+   *  Named rather than counted because "two folders" tells the user nothing
+   *  they can act on, and the whole point of this dialog is to let them decide.
+   *  The cap only bites from the fifth: replacing a fourth name with "and 1
+   *  more" is longer *and* less informative. Full paths are on the title
+   *  attribute, since two shares can end in the same folder name. */
+  function stopAtRiskLabel(): string {
+    const names = stopAtRiskFolders.map((folder) => folderDisplayName(folder));
+    if (names.length <= STOP_FOLDERS_NAMED + 1) {
+      return names.join(', ');
+    }
+    const shown = names.slice(0, STOP_FOLDERS_NAMED);
+    shown.push(
+      m.library_stop_confirm_more_folders({
+        count: (names.length - STOP_FOLDERS_NAMED).toLocaleString(),
+      }),
+    );
+    return shown.join(', ');
+  }
+
+  async function handleStopRequest() {
+    // Ask what stopping would cost before saying anything about it. The dialog
+    // warned unconditionally, so a user upgrading a large library — where every
+    // file is queued for a one-time digest top-up and none of them can be lost —
+    // was told they would lose folders, and left a multi-day pass running
+    // because of it.
+    // Cleared per attempt: the Stop button stays clickable while the banner is
+    // open, so a retry after a failed preview would otherwise keep warning on
+    // the strength of the attempt before it.
+    stopConfirmUnknown = false;
+    try {
+      stopAtRiskFolders = await previewStopHashing();
+    } catch {
+      // Couldn't tell: warn rather than reassure.
+      stopAtRiskFolders = [];
+      stopConfirmUnknown = true;
+    }
     stopConfirmVisible = true;
   }
 
   function handleStopCancel() {
     stopConfirmVisible = false;
+    stopConfirmUnknown = false;
   }
 
   async function handleStopConfirm() {
     stopConfirmVisible = false;
+    stopConfirmUnknown = false;
     stoppingHashing = true;
     try {
       await stopHashing();
@@ -2575,7 +2628,7 @@
           'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
         );
         if (destroyed) { u1(); return; }
-        u2 = await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
+        u2 = await listen<{ current: number; total: number; file_name: string; done?: boolean; upgrading?: number }>(
           'file-hash-progress', (event) => {
             if (!mounted || stoppedByUser) return;
             if (event.payload.done) {
@@ -2587,6 +2640,7 @@
                 current: event.payload.current,
                 total: event.payload.total,
                 file_name: event.payload.file_name,
+                upgrading: event.payload.upgrading ?? 0,
               };
               scanning = true;
             }
@@ -3297,6 +3351,8 @@
         <span class="scan-text">
           {#if stoppingHashing}
             {m.library_stopping_hashing()}
+          {:else if hashProgress && hashProgress.upgrading >= hashProgress.total && hashProgress.total > 0}
+            {m.library_upgrading_index({ current: hashProgress.current, total: hashProgress.total })}
           {:else if hashProgress}
             {m.library_hashing_file({ current: hashProgress.current, total: hashProgress.total, name: hashProgress.file_name })}
           {:else}
@@ -3315,7 +3371,18 @@
     {/if}
     {#if stopConfirmVisible}
       <div class="confirm-banner">
-        <span class="confirm-text">{m.library_stop_confirm_text()}</span>
+        <span
+          class="confirm-text"
+          title={stopAtRiskFolders.length > 0 ? stopAtRiskFolders.join('\n') : undefined}
+        >
+          {#if stopAtRiskFolders.length > 0}
+            {m.library_stop_confirm_folders({ folders: stopAtRiskLabel() })}
+          {:else if stopConfirmUnknown}
+            {m.library_stop_confirm_text()}
+          {:else}
+            {m.library_stop_confirm_safe()}
+          {/if}
+        </span>
         <button class="scan-btn resume-btn" onclick={handleStopCancel}>{m.common_cancel()}</button>
         <button class="scan-btn stop-btn" onclick={handleStopConfirm}>{m.common_stop()}</button>
       </div>

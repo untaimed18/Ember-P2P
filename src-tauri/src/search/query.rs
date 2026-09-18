@@ -305,17 +305,32 @@ fn fold_and(mut nodes: Vec<QueryExpr>) -> Option<QueryExpr> {
     Some(acc)
 }
 
-/// Split a raw word/phrase into eMule keyword tokens (same separator set and
-/// 3-byte minimum as [`extract_keywords`], minus the whole-query de-dup and
-/// trailing-extension strip, which only make sense for an entire filename).
+/// Split a raw word/phrase into eMule keyword tokens: the publisher's own
+/// splitter, minus the trailing-extension strip, which only makes sense for an
+/// entire filename. De-duplication is per term rather than per query, which
+/// changes the shape of the tree a repeated word builds but not the set of
+/// keywords it searches.
 fn tokenize_term(raw: &str) -> Vec<String> {
     if let Some(term) = server_directive(raw) {
         return vec![term];
     }
-    raw.split(is_keyword_separator)
-        .filter(|w| w.len() >= 3)
-        .map(|w| w.to_lowercase())
-        .collect()
+    // The same splitter the publisher indexes filenames with, which is the only
+    // way a term can hash to a key somebody actually wrote.
+    //
+    // This used to have a separator set and a lowercaser of its own, and both
+    // were wrong in exactly the ways `publish.rs` documents at length. Its
+    // separator set ended in `c.is_whitespace()`, which matches `U+00A0` — the
+    // no-break space `INV_KAD_KEYWORD_CHARS` deliberately excludes, so a file
+    // published under `alpha\u{A0}beta` was searched for as `alpha` AND `beta`.
+    // And it lowercased with `str::to_lowercase`, which is full Unicode
+    // lowercasing rather than eMule's 1:1 map: word-final `Σ` became `ς` instead
+    // of `σ`, so `"ΟΔΟΣ"` hashed a key no publisher has ever written.
+    //
+    // Neither reached the plain-keyword path, which has always gone through
+    // this function — so the bug only bit a query that also contained an
+    // operator, a quote, a bracket or a leading `-`. Quoting a word was enough
+    // to make the search return nothing.
+    extract_query_keywords(raw)
 }
 
 /// A term the eD2k server interprets itself rather than matching against
@@ -415,30 +430,6 @@ pub fn ed2k_directive_hashes(term: &str) -> Option<Vec<String>> {
 
 fn is_md4_hex(hash: &str) -> bool {
     hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn is_keyword_separator(c: char) -> bool {
-    matches!(
-        c,
-        '(' | ')'
-            | '['
-            | ']'
-            | '{'
-            | '}'
-            | '<'
-            | '>'
-            | ','
-            | '.'
-            | '_'
-            | '-'
-            | '!'
-            | '?'
-            | ':'
-            | ';'
-            | '\\'
-            | '/'
-            | '"'
-    ) || c.is_whitespace()
 }
 
 enum Tok {
@@ -897,6 +888,54 @@ mod tests {
         let plain = parse("ubuntu server iso").expect("plain parses");
         let boolean = parse("ubuntu AND server AND iso").expect("boolean parses");
         assert_eq!(plain.positive_terms(), boolean.positive_terms());
+    }
+
+    /// Both halves of the parser have to tokenize the way the publisher does,
+    /// or a term hashes to a DHT key nobody wrote and the search returns
+    /// nothing. The operator path had a splitter of its own that differed in
+    /// the two ways `publish.rs` warns about, so quoting a word — or putting any
+    /// operator anywhere in the query — was enough to lose the results.
+    #[test]
+    fn the_operator_path_tokenizes_exactly_like_the_publisher() {
+        for raw in [
+            "alpha beta",
+            "anti-virus",
+            "Some.Movie.2019",
+            // U+00A0 is not a keyword separator: eMule keeps it inside the word,
+            // so a file published under one word must be searched for as one.
+            "alpha\u{A0}beta",
+            // Word-final sigma lowercases to ς under full Unicode rules and to σ
+            // under the 1:1 map every client hashes with.
+            "ΟΔΟΣ",
+            // Turkish dotted capital I expands to two code points under
+            // `str::to_lowercase`.
+            "İZMİR",
+        ] {
+            assert_eq!(
+                tokenize_term(raw),
+                extract_query_keywords(raw),
+                "operator-path tokenization of {raw:?} diverged from the publisher's"
+            );
+        }
+    }
+
+    /// The whole-query paths have to agree with each other too: the only thing
+    /// an operator should change is the shape of the tree, never which keys the
+    /// terms hash to.
+    #[test]
+    fn quoting_a_word_does_not_change_the_keys_it_searches() {
+        for (plain, quoted) in [
+            ("alpha beta", "\"alpha beta\""),
+            ("alpha\u{A0}beta", "\"alpha\u{A0}beta\""),
+            ("ΟΔΟΣ αλφα", "\"ΟΔΟΣ αλφα\""),
+        ] {
+            let plain_terms = parse(plain).expect("plain parses").positive_terms();
+            let quoted_terms = parse(quoted).expect("quoted parses").positive_terms();
+            assert_eq!(
+                plain_terms, quoted_terms,
+                "quoting {plain:?} changed which keywords are searched"
+            );
+        }
     }
 
     #[test]

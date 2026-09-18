@@ -1857,6 +1857,7 @@ pub fn run() {
             commands::sharing::get_scan_status,
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
+            commands::sharing::preview_stop_hashing,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
             commands::sharing::resolve_media_asset_path,

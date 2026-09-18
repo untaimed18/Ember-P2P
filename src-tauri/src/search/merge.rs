@@ -57,8 +57,16 @@ pub fn result_matches_client_filters(
             return false;
         }
     }
+    // Zero is "no maximum", which is what every other layer already reads it as:
+    // `local_file_matches_filters`, the `has_filters` / `has_usable_filters`
+    // gates, the wire encoder (`build_search_expression_with_node` drops zero
+    // numerics) and the results table's own filter. This function was the sole
+    // dissenter, and it is the one that decides what the user sees — so a `0`
+    // typed into Max Size left the constraint off the wire and out of the
+    // library scan, then stripped every row with a nonzero size on the way to
+    // the UI. An empty tab, no error, and a filter that looked inactive.
     if let Some(max) = max_size {
-        if r.file.size > max {
+        if max > 0 && r.file.size > max {
             return false;
         }
     }
@@ -211,6 +219,26 @@ fn elected_name(votes: &NameVotes) -> Option<&str> {
         .map(|(name, _)| name.as_str())
 }
 
+/// Whether a merge adopts the incoming row's spam explanation or keeps the one
+/// it holds.
+///
+/// `spam_rating` merges with max and `is_spam` with OR, so the reason lists have
+/// to follow the verdict that survived: a row showing a high score above a
+/// signal list that only justifies a low one is worse than either alone, because
+/// that list is what a user reads to decide whether to trust a file.
+///
+/// Mirrored by `takesIncomingSpamSignals` in `src/lib/stores/search.ts`, which
+/// merges the streamed batches a second time per tab, and pinned for both sides
+/// by `scripts/fixtures/merge-contract.json`.
+pub(crate) fn takes_incoming_spam_signals(
+    existing_is_spam: bool,
+    existing_rating: u32,
+    incoming_is_spam: bool,
+    incoming_rating: u32,
+) -> bool {
+    (incoming_is_spam && !existing_is_spam) || incoming_rating > existing_rating
+}
+
 fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     let prev_origin = existing.result_origin.clone();
     existing.result_origin = combine_origin(&existing.result_origin, &incoming.result_origin);
@@ -317,7 +345,12 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.origin_server_ip.is_none() {
         existing.origin_server_ip = incoming.origin_server_ip;
     }
-    if (incoming.is_spam && !existing.is_spam) || incoming.spam_rating > existing.spam_rating {
+    if takes_incoming_spam_signals(
+        existing.is_spam,
+        existing.spam_rating,
+        incoming.is_spam,
+        incoming.spam_rating,
+    ) {
         // Both lists describe the same verdict, so they move together — a row
         // whose English came from one scoring pass and whose codes came from
         // another would render two different explanations.
@@ -642,6 +675,32 @@ mod tests {
         ));
     }
 
+    /// A zero size bound is how every other layer spells "no bound", so this
+    /// one has to agree or the layers contradict each other on the same row.
+    /// `search_files` hands the identical `max_size` to the library scan and to
+    /// this function: the scan kept the row, this dropped it, and the search
+    /// came back empty while the filter panel showed nothing was constraining
+    /// it.
+    #[test]
+    fn a_zero_size_bound_constrains_nothing() {
+        let r = sample("aa", 3, ORIGIN_SERVER_TCP); // size 1
+        assert!(result_matches_client_filters(
+            &r, None, None, Some(0), None, None
+        ));
+        assert!(result_matches_client_filters(
+            &r, None, Some(0), Some(0), None, None
+        ));
+        // A real bound still bounds.
+        let mut big = sample("bb", 3, ORIGIN_SERVER_TCP);
+        big.file.size = 100;
+        assert!(result_matches_client_filters(
+            &big, None, None, Some(100), None, None
+        ));
+        assert!(!result_matches_client_filters(
+            &big, None, None, Some(99), None, None
+        ));
+    }
+
     #[test]
     fn merge_prefers_nonempty_ember_file_hash() {
         let mut a = sample("cc", 1, ORIGIN_SERVER_TCP);
@@ -836,6 +895,72 @@ mod tests {
             merged[0].file.ember_file_hash,
             "ab".repeat(32),
             "known.met beats a publisher plurality"
+        );
+    }
+
+    /// The rule that decides which spam explanation a merged row shows. The
+    /// frontend merges the same batches again per tab, and it used to take the
+    /// incoming reasons whenever the incoming row was flagged — ignoring the
+    /// score, which merges with max — so a row could show 85/60 above a list
+    /// that only justified 40.
+    #[test]
+    fn spam_signal_choice_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        let cases = fixture["spam_signal_cases"]
+            .as_array()
+            .expect("fixture has spam_signal_cases");
+        assert!(cases.len() >= 6, "fixture lost its spam_signal cases");
+        for case in cases {
+            let existing_is_spam = case["existing_is_spam"].as_bool().expect("case existing flag");
+            let existing_rating = case["existing_rating"].as_u64().expect("case existing rating");
+            let incoming_is_spam = case["incoming_is_spam"].as_bool().expect("case incoming flag");
+            let incoming_rating = case["incoming_rating"].as_u64().expect("case incoming rating");
+            assert_eq!(
+                takes_incoming_spam_signals(
+                    existing_is_spam,
+                    existing_rating as u32,
+                    incoming_is_spam,
+                    incoming_rating as u32,
+                ),
+                case["takes_incoming"].as_bool().expect("case expectation"),
+                "{}",
+                case["name"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
+    /// End to end through the real merge: a weaker flagged batch must not swap
+    /// the explanation out from under the score that survives.
+    #[test]
+    fn a_weaker_flagged_batch_does_not_replace_the_explanation() {
+        let reason = |text: &str| crate::search::spam::SpamReason {
+            code: text.to_string(),
+            weight: None,
+            percent: None,
+            count: None,
+            votes: None,
+            total: None,
+            text: text.to_string(),
+        };
+
+        let mut strong = sample("aa", 1, ORIGIN_SERVER_TCP);
+        strong.is_spam = true;
+        strong.spam_rating = 85;
+        strong.spam_reasons = vec!["known_hash".to_string()];
+        strong.spam_reason_details = vec![reason("known_hash")];
+
+        let mut weak = sample("aa", 1, ORIGIN_KAD);
+        weak.is_spam = true;
+        weak.spam_rating = 40;
+        weak.spam_reasons = vec!["fake_pattern".to_string()];
+        weak.spam_reason_details = vec![reason("fake_pattern")];
+
+        let merged = merge_search_vecs(vec![strong], vec![weak]);
+        assert_eq!(merged[0].spam_rating, 85);
+        assert_eq!(
+            merged[0].spam_reasons,
+            vec!["known_hash".to_string()],
+            "the explanation has to match the score the row kept"
         );
     }
 
