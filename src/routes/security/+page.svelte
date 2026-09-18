@@ -179,6 +179,16 @@
   // preserve the optimistic switch state and let the toggle's own post-write
   // reload reconcile the authoritative value.
   let togglesInFlight = 0;
+  /** A non-quiet load is outstanding and still owes the user a resolution.
+   *
+   *  Refresh bypasses the debounced scheduler, so it runs alongside the quiet
+   *  fetches the scrolling IP list issues. A quiet one bumping `loadStatsSeq`
+   *  discarded the user's Refresh, and if that quiet fetch then failed its
+   *  `if (!quiet)` guard suppressed the message while `loading = false` ran
+   *  anyway — leaving the Refresh with no data, no error and no spinner.
+   *  Whichever request supersedes a visible one inherits the obligation to
+   *  clear the spinner and report a failure. */
+  let visibleLoadOutstanding = false;
   async function loadStats(opts?: { quiet?: boolean; offset?: number }) {
     if (unmounted) return;
     // Only the latest invocation commits, so overlapping refreshes (mount plus
@@ -191,6 +201,7 @@
     if (!quiet) {
       loading = true;
       error = null;
+      visibleLoadOutstanding = true;
     }
 
     // The network task only starts serving commands after its full startup,
@@ -224,6 +235,9 @@
         }
         error = null;
         loading = false;
+        // Fresh data is on screen, which satisfies any Refresh this request
+        // superseded as well as its own.
+        visibleLoadOutstanding = false;
         return;
       } catch (e: unknown) {
         if (unmounted || seq !== loadStatsSeq) return;
@@ -233,7 +247,13 @@
         if (unmounted || seq !== loadStatsSeq) return;
       }
     }
-    if (!quiet) error = toErrorMsg(lastErr);
+    // Report when this request was itself user-visible, or when it took over
+    // from one that was. Staying silent in the latter case is what left an
+    // explicit Refresh looking like it had simply done nothing.
+    if (!quiet || visibleLoadOutstanding) {
+      error = toErrorMsg(lastErr);
+      visibleLoadOutstanding = false;
+    }
     loading = false;
   }
 

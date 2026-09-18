@@ -1203,12 +1203,33 @@ struct FileRequestTracker {
     /// `MIN_REQUESTTIME` and `BADCLIENTBAN` banned the whole address for
     /// seven days. Only a peer that sent no user hash falls back to its IP.
     entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32)>,
+    /// When the 1h expiry sweep last ran. The sweep is driven from the
+    /// `OP_STARTUPLOADREQ` path, which every uploading peer shares through one
+    /// mutex, so running it per request made a full `retain` part of the cost
+    /// of receiving a 22-byte packet.
+    last_sweep: Option<std::time::Instant>,
 }
+
+/// Hard ceiling on tracked `(peer, file)` request pairs.
+const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
+
+/// What the cap trims *down* to. Trimming to exactly `MAX_FILE_REQUEST_ENTRIES`
+/// left the map one insert over the bound again, so the very next request paid
+/// the whole trim a second time — a peer cycling distinct file hashes could
+/// pin every uploader behind that work indefinitely. Leaving 20% of headroom
+/// means one trim buys 10,000 requests before another is possible.
+const FILE_REQUEST_TRIM_TARGET: usize = 40_000;
+
+/// Minimum gap between full expiry sweeps. Strikes expire after an hour, so
+/// sweeping once a minute keeps the map within 1/60th of an hour of exact —
+/// and the cap below, which is the actual memory bound, still runs every call.
+const FILE_REQUEST_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl FileRequestTracker {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            last_sweep: None,
         }
     }
 
@@ -1276,28 +1297,36 @@ impl FileRequestTracker {
     }
 
     fn cleanup_stale(&mut self) {
-        self.entries
-            .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        let now = std::time::Instant::now();
+        // Throttled: this is called from the inbound-request path, under the
+        // mutex every upload connection shares.
+        if self
+            .last_sweep
+            .is_none_or(|last| now.duration_since(last) >= FILE_REQUEST_SWEEP_INTERVAL)
+        {
+            self.last_sweep = Some(now);
+            self.entries
+                .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        }
         // Hard cap: a peer rotating through millions of distinct file
         // hashes within the 1h window could otherwise grow this map
-        // without bound (cleanup_stale only drops entries older than 1h).
+        // without bound (the sweep above only drops entries older than 1h).
         // When over the cap, keep the most-recently-active entries (those
         // closest to a ban decision) and drop the oldest — dropping an old
         // entry only resets a stale, near-expiry counter.
-        const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
         if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
-            let mut by_age: Vec<((QueueIdentity, [u8; 16]), std::time::Instant)> = self
-                .entries
-                .iter()
-                .map(|(k, (t, _))| (k.clone(), *t))
-                .collect();
-            by_age.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-            let keep: std::collections::HashSet<(QueueIdentity, [u8; 16])> = by_age
-                .into_iter()
-                .take(MAX_FILE_REQUEST_ENTRIES)
-                .map(|(k, _)| k)
-                .collect();
-            self.entries.retain(|k, _| keep.contains(k));
+            // Partition on the cutoff timestamp rather than sorting the whole
+            // map and building a `HashSet` of survivors: O(n) instead of
+            // O(n log n), and no second allocation the size of the map.
+            let mut times: Vec<std::time::Instant> =
+                self.entries.values().map(|(t, _)| *t).collect();
+            if FILE_REQUEST_TRIM_TARGET < times.len() {
+                // Descending, so index `FILE_REQUEST_TRIM_TARGET` is the oldest
+                // entry we still intend to keep.
+                times.select_nth_unstable_by(FILE_REQUEST_TRIM_TARGET, |a, b| b.cmp(a));
+                let cutoff = times[FILE_REQUEST_TRIM_TARGET];
+                self.entries.retain(|_, (t, _)| *t > cutoff);
+            }
         }
     }
 }
@@ -7071,6 +7100,10 @@ impl UploadHandler {
             PathBuf,
             super::part_tracker::PartTracker,
             std::time::Instant,
+            // `part_tracker::verification_epoch()` when this was parsed. The
+            // time-based refresh below is only safe in the "newly verified"
+            // direction; losing a verified bit has to invalidate immediately.
+            u64,
         )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
         // Keep the disk-backed cache short-lived so a just-verified part can
@@ -9182,9 +9215,17 @@ impl UploadHandler {
                     if !is_partial_serve {
                         cached_part_tracker = None;
                     } else {
+                        let current_verification_epoch =
+                            super::part_tracker::verification_epoch();
                         let need_rebuild = match cached_part_tracker.as_ref() {
-                            Some((p, _, at)) => {
-                                p != &file_path || at.elapsed() >= PART_TRACKER_REFRESH
+                            Some((p, _, at, epoch)) => {
+                                p != &file_path
+                                    || at.elapsed() >= PART_TRACKER_REFRESH
+                                    // Some tracker cleared a verified bit since
+                                    // this was parsed. Re-read rather than serve
+                                    // bytes on the strength of a hash check that
+                                    // has since been withdrawn.
+                                    || *epoch != current_verification_epoch
                             }
                             None => true,
                         };
@@ -9204,11 +9245,19 @@ impl UploadHandler {
                             .unwrap_or_else(|_| {
                                 super::part_tracker::PartTracker::new(total_size, &file_path)
                             });
-                            cached_part_tracker =
-                                Some((file_path.clone(), tracker, std::time::Instant::now()));
+                            // Epoch read *before* the parse, not after: a clear
+                            // that lands while `.part.met` is being read must
+                            // invalidate this entry rather than be swallowed by
+                            // a newer epoch stamped onto older bytes.
+                            cached_part_tracker = Some((
+                                file_path.clone(),
+                                tracker,
+                                std::time::Instant::now(),
+                                current_verification_epoch,
+                            ));
                         }
                     }
-                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _)| t);
+                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _, _)| t);
 
                     // Hoist video-ext computation out of the per-block loop:
                     // it's a property of the file, not the block, and

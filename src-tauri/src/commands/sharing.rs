@@ -830,6 +830,18 @@ pub(crate) async fn reconcile_shared_folder_roots(
     removed_roots: &[String],
     added_roots: &[String],
 ) {
+    // This runs detached, queued behind `scan_coordination`, which a first-run
+    // library hash pass can hold for hours. Shutdown aborts the scan holding
+    // that lock, which releases this task — so without the gate a settings
+    // change made hours earlier wakes up during exit and starts a fresh reload
+    // behind the authoritative flush. The config it would reconcile is already
+    // saved; the in-memory revocation below has no consumer left once the
+    // upload listener is gone.
+    if state.bw_shutdown.load(Ordering::Acquire) {
+        debug!("Shared-folder root reconcile declined: shutdown in progress");
+        return;
+    }
+
     // The upload listener consults this list before serving an index row, so
     // update it before waiting for a scan. This is the immediate revocation
     // boundary even while a long-running discovery pass still owns
@@ -3904,6 +3916,17 @@ async fn reload_shared_files_page(
     state: &AppState,
     chained_pages_left: u32,
 ) -> Result<(), String> {
+    // Shutdown raises `bw_shutdown` before joining the scans it tracks. A
+    // reload that starts after that point takes `local_index.write()` and
+    // updates `known_files` behind the authoritative flush, then gets aborted
+    // mid-write — the half-written `known.met` the join exists to prevent. The
+    // chained-page gap already declines for this reason; the entry point has
+    // to as well, because the FS watcher and the Settings root reconcile can
+    // both arrive here during exit. Not an error: there is nothing left to do.
+    if state.bw_shutdown.load(Ordering::Acquire) {
+        debug!("Shared-file reload declined: shutdown in progress");
+        return Ok(());
+    }
     let reload_flight =
         crate::security::try_begin_single_flight(&RELOAD_IN_FLIGHT).ok_or_else(|| {
             coded(

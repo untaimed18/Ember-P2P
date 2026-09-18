@@ -9,6 +9,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +35,26 @@ pub const USERNAME_IDLE_SECS: i64 = 365 * 24 * 60 * 60;
 /// a room has actually changed hands.
 pub const CLAIM_AFTER_DAYS_MIN: u32 = 7;
 pub const CLAIM_AFTER_DAYS_MAX: u32 = 365;
+
+/// Hard ceilings on the registry maps, in the spirit of `MAX_STORE_ENTRIES`
+/// and friends in `main.rs`.
+///
+/// Every other shared map on this server is bounded; these were not, and two
+/// endpoints write into them from unauthenticated requests whose only cost is
+/// generating a throwaway keypair. A username claim is retained for
+/// [`USERNAME_IDLE_SECS`] and a tombstone is retained forever, so unbounded
+/// growth here is permanent: it does not recover when the flood stops, and
+/// because [`ChannelRegistry::persist`] rewrites the whole document, every
+/// later request pays for the accumulated size.
+///
+/// Refusing past the cap rather than evicting is deliberate. Evicting a
+/// username hands someone else's handle to whoever asks next, and evicting a
+/// tombstone un-deletes a room its owner destroyed — both worse than refusing
+/// a claim. The rate limits on the two writing endpoints are what keep an
+/// honest deployment from ever reaching these numbers.
+pub const MAX_USERNAMES: usize = 100_000;
+pub const MAX_CHANNEL_NAMES: usize = 100_000;
+pub const MAX_DELETED: usize = 100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelNameRecord {
@@ -108,6 +132,36 @@ pub struct ChannelRegistry {
     names: HashMap<String, ChannelNameRecord>,
     deleted: HashSet<String>,
     username_activity: HashMap<String, i64>,
+    /// Ticket dispenser and completion gate for [`Self::persist`]. See
+    /// [`PersistGate`].
+    persist_gate: Arc<PersistGate>,
+}
+
+/// Serialises the registry's disk writes and keeps them off the request path.
+///
+/// `persist` runs while the caller holds the `channels_registry` write lock,
+/// and the write itself is `create` + `write_all` + `sync_all` + one or two
+/// renames. Performed inline that parked a Tokio worker on an fsync and
+/// blocked every other channel endpoint for its duration. The write now goes
+/// to `spawn_blocking`, which means two of them can be in flight at once, so
+/// ordering has to be enforced explicitly: each write takes a monotonic
+/// ticket, and a write whose ticket is older than what has already landed is
+/// dropped rather than rewinding the file to stale content.
+#[derive(Debug)]
+struct PersistGate {
+    next_ticket: AtomicU64,
+    /// Highest ticket already written. Guarded by a blocking mutex because it
+    /// is only ever touched from inside `spawn_blocking`.
+    written: Mutex<u64>,
+}
+
+impl PersistGate {
+    fn new() -> Self {
+        Self {
+            next_ticket: AtomicU64::new(0),
+            written: Mutex::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +169,10 @@ pub enum RegistryError {
     InvalidName,
     Taken,
     Forbidden,
+    /// A registry map is at its hard ceiling. Distinct from `Taken` so the
+    /// handler can answer 503 rather than 409: nothing is wrong with the name
+    /// the caller asked for, the server simply has no room to record it.
+    Full,
 }
 
 impl ChannelRegistry {
@@ -126,6 +184,7 @@ impl ChannelRegistry {
             names: HashMap::new(),
             deleted: HashSet::new(),
             username_activity: HashMap::new(),
+            persist_gate: Arc::new(PersistGate::new()),
         }
     }
 
@@ -152,6 +211,7 @@ impl ChannelRegistry {
             names: parsed.names,
             deleted: parsed.deleted,
             username_activity: parsed.username_activity,
+            persist_gate: Arc::new(PersistGate::new()),
         };
         if reg.grandfather_legacy_timestamps(unix_now()) {
             reg.persist();
@@ -172,9 +232,19 @@ impl ChannelRegistry {
         let Ok(json) = serde_json::to_vec_pretty(&file) else {
             return;
         };
-        let tmp = path.with_extension("json.tmp");
-        if atomic_write(&tmp, path, &json).is_err() {
-            tracing::warn!(path = %path.display(), "could not persist the channels registry");
+        let path = path.clone();
+        let gate = self.persist_gate.clone();
+        // Ticket taken here, under the registry write lock the caller holds,
+        // so tickets are issued in the same order the mutations happened.
+        let ticket = gate.next_ticket.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // `load` runs before the server is serving and may not be inside a
+        // runtime, so fall back to writing inline there.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || write_registry(&gate, ticket, &path, &json));
+            }
+            Err(_) => write_registry(&gate, ticket, &path, &json),
         }
     }
 
@@ -205,11 +275,36 @@ impl ChannelRegistry {
         if let Some(old) = self.by_pubkey.remove(&pk) {
             self.usernames.remove(&old);
         }
+        // Checked after the rename path above, which is net-neutral on size,
+        // and after `reap_stale` has had its chance to free an idle handle.
+        if self.usernames.len() >= MAX_USERNAMES {
+            tracing::warn!(
+                usernames = self.usernames.len(),
+                "channel username registry is at its cap; refusing new claims"
+            );
+            return Err(RegistryError::Full);
+        }
         self.usernames.insert(normalized.clone(), pk.clone());
         self.by_pubkey.insert(pk.clone(), normalized);
         self.username_activity.insert(pk, now);
         self.persist();
         Ok(())
+    }
+
+    /// Whether this pubkey already holds this username.
+    ///
+    /// The username counterpart to [`Self::has_channel`], and there for the
+    /// same reason: the creation budget should charge for taking a *new*
+    /// handle, not for the periodic re-claim that keeps an existing one from
+    /// ageing out after [`USERNAME_IDLE_SECS`]. Charging the refresh would
+    /// eventually free the handle of a user who is still active.
+    pub fn holds_username(&self, pubkey_hex: &str, name: &str) -> bool {
+        let Some(normalized) = normalize_username(name) else {
+            return false;
+        };
+        self.usernames
+            .get(&normalized)
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(pubkey_hex))
     }
 
     /// Whether this room already holds a name here.
@@ -300,6 +395,16 @@ impl ChannelRegistry {
                 return Ok(());
             }
             return Err(RegistryError::Taken);
+        }
+        // Only reached when this is a genuinely new name — every refresh and
+        // re-case path above returns before here — so the cap cannot lock an
+        // existing room out of keeping its own claim alive.
+        if self.names.len() >= MAX_CHANNEL_NAMES {
+            tracing::warn!(
+                names = self.names.len(),
+                "channel name registry is at its cap; refusing new claims"
+            );
+            return Err(RegistryError::Full);
         }
         self.names.insert(
             normalized,
@@ -450,6 +555,20 @@ impl ChannelRegistry {
         if !found && self.deleted.contains(&id) {
             return Ok(());
         }
+        // Tombstones are kept forever by policy (see `RegistryFileRef`), which
+        // makes this the one map an attacker can grow permanently — a delete
+        // for an id that never had a name claim is accepted on the strength of
+        // a freshly generated keypair. Bound it. A room that *does* hold a
+        // name is still tombstoned below even at the cap, because its record
+        // is already marked deleted and refusing would leave the two
+        // disagreeing.
+        if !found && self.deleted.len() >= MAX_DELETED {
+            tracing::warn!(
+                deleted = self.deleted.len(),
+                "channel tombstone set is at its cap; refusing to record an unknown id"
+            );
+            return Err(RegistryError::Full);
+        }
         if !found {
             // Owner can tombstone an id even if the name claim never landed,
             // so Discover cannot keep serving a room they have destroyed.
@@ -571,6 +690,36 @@ impl ChannelRegistry {
         ids.dedup();
         ids
     }
+
+    /// Whether this channel id is already tombstoned.
+    ///
+    /// Lets `delete_channel_v4` tell a first deletion from an idempotent
+    /// repeat without cloning the whole tombstone set.
+    pub fn is_deleted(&self, channel_id: &str) -> bool {
+        let id = channel_id.to_ascii_lowercase();
+        if self.deleted.contains(&id) {
+            return true;
+        }
+        self.names
+            .values()
+            .any(|rec| rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+    }
+
+    /// One page of [`Self::deleted_ids`], starting after `after`.
+    ///
+    /// `deleted_ids` clones, sorts and dedups the entire tombstone set on every
+    /// call, and `/v4/channels/deleted` is unauthenticated and polled by every
+    /// client — so a ~200-byte request bought an unbounded response plus
+    /// O(n log n) work. The list is sorted, so a plain "greater than the last
+    /// id you saw" cursor pages it without holding any server-side state.
+    pub fn deleted_ids_page(&self, after: Option<&str>, limit: usize) -> Vec<String> {
+        let all = self.deleted_ids();
+        let start = match after {
+            Some(cursor) => all.partition_point(|id| id.as_str() <= cursor),
+            None => 0,
+        };
+        all.into_iter().skip(start).take(limit).collect()
+    }
 }
 
 /// Where [`atomic_write`] parks the previous copy while it swaps in a new one.
@@ -601,6 +750,33 @@ pub(crate) fn recover_interrupted_write(dest: &Path) {
             "restored the channels registry from its backup after an interrupted write"
         );
     }
+}
+
+/// Write one registry snapshot, skipping it if a newer one already landed.
+///
+/// The mutex also serialises concurrent writers, which matters beyond
+/// ordering: `atomic_write` on Windows moves the destination aside before
+/// renaming, and two of those interleaving would fight over the same backup
+/// path.
+fn write_registry(gate: &PersistGate, ticket: u64, dest: &Path, bytes: &[u8]) {
+    let mut written = match gate.written.lock() {
+        Ok(guard) => guard,
+        // Another writer panicked mid-write. The file is still consistent —
+        // `atomic_write` only ever renames a fully-synced temp into place — so
+        // take the lock back and continue rather than leaving the registry
+        // unwritable for the life of the process.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *written >= ticket {
+        // A newer snapshot is already on disk; this one would rewind it.
+        return;
+    }
+    let tmp = dest.with_extension("json.tmp");
+    if atomic_write(&tmp, dest, bytes).is_err() {
+        tracing::warn!(path = %dest.display(), "could not persist the channels registry");
+        return;
+    }
+    *written = ticket;
 }
 
 fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -750,6 +926,118 @@ fn is_bidi_or_zero_width(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The username map is one of two an unauthenticated caller can grow, and
+    /// entries are held for a year. Refusing at the cap — rather than evicting
+    /// — matters: eviction would hand someone else's handle to whoever asked
+    /// next.
+    #[test]
+    fn the_username_map_refuses_new_claims_at_its_cap() {
+        let mut reg = ChannelRegistry::in_memory();
+        // Filled directly rather than through `claim_username`: every claim
+        // runs `reap_stale` over the whole map, so seeding the cap through the
+        // public path would be quadratic.
+        let now = unix_now();
+        for i in 0..MAX_USERNAMES {
+            let pk = format!("{i:064x}");
+            let name = format!("u{i:x}");
+            reg.usernames.insert(name.clone(), pk.clone());
+            reg.by_pubkey.insert(pk.clone(), name);
+            reg.username_activity.insert(pk, now);
+        }
+
+        let overflow = format!("{:064x}", MAX_USERNAMES + 1);
+        assert_eq!(
+            reg.claim_username(&overflow, "onemore"),
+            Err(RegistryError::Full)
+        );
+
+        // An existing holder refreshing its own handle is the keep-alive path
+        // and must not be refused, or the cap would start expiring live users.
+        let existing = format!("{:064x}", 0);
+        assert!(reg.claim_username(&existing, "u0").is_ok());
+
+        // Nor may a holder be blocked from renaming: that swap is net-neutral
+        // on map size, so the cap has no reason to reject it.
+        assert!(reg.claim_username(&existing, "renamed").is_ok());
+    }
+
+    /// Tombstones are kept forever by policy, so an id that never held a name
+    /// is the one unbounded write on the server. A known room is still
+    /// tombstoned at the cap — its record is already marked deleted, and
+    /// refusing would leave the two halves disagreeing.
+    #[test]
+    fn the_tombstone_set_refuses_unknown_ids_at_its_cap() {
+        let mut reg = ChannelRegistry::in_memory();
+        for i in 0..MAX_DELETED {
+            reg.deleted.insert(format!("{i:032x}"));
+        }
+        let unknown_pk = "cc".repeat(32);
+        let unknown_id = format!("{:032x}", MAX_DELETED + 1);
+        assert_eq!(
+            reg.delete_channel(&unknown_id, &unknown_pk),
+            Err(RegistryError::Full)
+        );
+
+        let owner = ed25519_test_pubkey();
+        let owned_id = "ab".repeat(16);
+        assert!(reg.claim_channel_name(&owned_id, &owner, "lobby", false).is_ok());
+        assert!(
+            reg.delete_channel(&owned_id, &owner).is_ok(),
+            "an owner must still be able to destroy a room they actually hold"
+        );
+    }
+
+    /// `is_deleted` is what decides whether a delete costs creation budget, so
+    /// a repeat of an already-tombstoned id has to read as deleted through
+    /// both the tombstone set and a name record marked deleted.
+    #[test]
+    fn is_deleted_sees_both_tombstones_and_deleted_name_records() {
+        let mut reg = ChannelRegistry::in_memory();
+        let owner = ed25519_test_pubkey();
+        let id = "ab".repeat(16);
+        assert!(!reg.is_deleted(&id));
+        assert!(reg.claim_channel_name(&id, &owner, "lobby", false).is_ok());
+        assert!(!reg.is_deleted(&id));
+        assert!(reg.delete_channel(&id, &owner).is_ok());
+        assert!(reg.is_deleted(&id), "a destroyed room reads as deleted");
+        assert!(
+            reg.is_deleted(&id.to_uppercase()),
+            "ids are compared case-insensitively"
+        );
+    }
+
+    /// Paging has to cover the whole set exactly once, in order and without
+    /// gaps, or a client would silently keep a room its owner destroyed.
+    #[test]
+    fn deleted_ids_page_walks_the_whole_set_once() {
+        let mut reg = ChannelRegistry::in_memory();
+        for i in 0..25 {
+            reg.deleted.insert(format!("{i:032x}"));
+        }
+        let expected = reg.deleted_ids();
+        assert_eq!(expected.len(), 25);
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = reg.deleted_ids_page(cursor.as_deref(), 10);
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            walked.extend(page);
+        }
+        assert_eq!(walked, expected, "paging must reproduce the full list in order");
+
+        // A cursor past the end yields nothing rather than wrapping.
+        assert!(reg.deleted_ids_page(Some(&"f".repeat(32)), 10).is_empty());
+    }
+
+    fn ed25519_test_pubkey() -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        hex::encode(key.verifying_key().to_bytes())
+    }
 
     #[test]
     fn username_first_write_wins_and_rename_releases_the_old_name() {

@@ -14995,6 +14995,10 @@ struct NetworkState {
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// Earliest tick at which [`maybe_dial_channel_neighbors`] should read the
+    /// member roster again. `None` means "next tick". See
+    /// [`CHANNEL_NEIGHBOR_IDLE_RESCAN`].
+    channel_neighbor_scan_after: Option<std::time::Instant>,
     /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
     ///
     /// Keyed with the session id that registered the outbox so a close can be
@@ -17691,6 +17695,14 @@ fn flush_channel_presence_if_idle(state: &mut NetworkState, channel_id: [u8; 16]
     }
 }
 
+/// How long [`maybe_dial_channel_neighbors`] waits before re-reading the
+/// channel member roster after a pass that started no lookups.
+///
+/// Well under `CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS` (30s), so backing off cannot
+/// delay a retry that is actually due; it only stops the 1 Hz maintenance tick
+/// from re-running the same SQLite reads to reach the same conclusion.
+const CHANNEL_NEIGHBOR_IDLE_RESCAN: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn maybe_dial_channel_neighbors(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -17707,13 +17719,29 @@ async fn maybe_dial_channel_neighbors(
     if settings.rendezvous_url.is_empty() {
         return;
     }
+    // The per-peer gates that decide whether any lookup actually happens are
+    // evaluated *after* the roster read below, so a pass that starts nothing
+    // still paid for up to `CHANNEL_RENDEZVOUS_MAX_CHANNELS`
+    // `list_channel_members` queries — blocking `rusqlite` behind one
+    // `Mutex<Connection>`, run directly on the Tokio worker driving the network
+    // `select!`, contending with every `spawn_blocking` writer including
+    // `wal_checkpoint(TRUNCATE)` and `VACUUM`. Driven at 1 Hz against a 30s
+    // per-peer retry, ~29 of every 30 passes were exactly that. Back off after
+    // an idle pass; `CHANNEL_NEIGHBOR_IDLE_RESCAN` is far below the retry
+    // interval, so a newly joined member is still picked up promptly.
+    let now = std::time::Instant::now();
+    if state
+        .channel_neighbor_scan_after
+        .is_some_and(|resume_at| now < resume_at)
+    {
+        return;
+    }
     let Some(roster) = channels_lite_cached(state, db) else {
         return;
     };
     let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey) else {
         return;
     };
-    let now = std::time::Instant::now();
     let mut started = 0usize;
     let mut find_nodes = 0usize;
     let mut pending_find = Vec::new();
@@ -17759,6 +17787,14 @@ async fn maybe_dial_channel_neighbors(
             }
         }
     }
+    // A pass that dialled someone keeps scanning every tick so the rest of the
+    // candidate set is picked up without waiting; one that found nothing to do
+    // would find nothing to do next second either.
+    state.channel_neighbor_scan_after = if started > 0 {
+        None
+    } else {
+        Some(now + CHANNEL_NEIGHBOR_IDLE_RESCAN)
+    };
     for search_id in pending_find {
         drive_ember_search(socket, state, search_id).await;
     }
@@ -23187,6 +23223,40 @@ fn sync_shared_friends_only_hashes(
     }
 }
 
+/// Cheap change-detector for everything [`apply_publish_badges`] reads.
+///
+/// XOR-folding each set is order-independent, so the result does not depend on
+/// `HashSet` iteration order, and mixing the length in makes a same-tick swap
+/// (one hash published, another dropped) visible where comparing lengths alone
+/// would miss it. Costs one XOR per published hash, which buys skipping a deep
+/// clone of the entire shared-file list on every tick that changed nothing.
+fn publish_badge_fingerprint(
+    kad_connected: bool,
+    server_connected: bool,
+    ember_live: bool,
+    kad_published: &HashSet<[u8; 16]>,
+    ed2k_offered: &HashSet<[u8; 16]>,
+    ember_published: &HashSet<[u8; 16]>,
+) -> u64 {
+    fn fold(set: &HashSet<[u8; 16]>) -> u64 {
+        let mut acc = set.len() as u64;
+        for hash in set {
+            // Two independently rotated lanes so two hashes cannot swap which
+            // half each contributes and cancel out.
+            let lo = u64::from_le_bytes(hash[0..8].try_into().unwrap_or_default());
+            let hi = u64::from_le_bytes(hash[8..16].try_into().unwrap_or_default());
+            acc ^= lo.rotate_left(17) ^ hi.rotate_left(43);
+        }
+        acc
+    }
+    let flags =
+        (kad_connected as u64) | ((server_connected as u64) << 1) | ((ember_live as u64) << 2);
+    flags
+        ^ fold(kad_published).rotate_left(3)
+        ^ fold(ed2k_offered).rotate_left(23)
+        ^ fold(ember_published).rotate_left(47)
+}
+
 /// Set the Library KAD / eD2K / Ember badges from real publish/offer state,
 /// not mere connectivity.
 /// `ember_live` must be a real liveness test (verified contacts > 0), not
@@ -24497,6 +24567,21 @@ async fn flush_credit_state(
         cm_w.cleanup_stale(90);
     }
 
+    // Skip the whole sequence when nothing has changed since the last
+    // successful flush. It is expensive — DELETE plus full re-INSERT of both
+    // credit tables, an `incremental_vacuum`, a `clients.met` copy and an
+    // fsync'd rewrite — and this ran unconditionally every 60s, rewriting
+    // byte-identical state ~1,440 times a day on a node whose peers had gone
+    // quiet. The sweep above marks dirty when it evicts, so ageing still gets
+    // persisted; the generation is captured after it for that reason.
+    let flush_generation = {
+        let cm = credit_manager.read().await;
+        if !cm.is_dirty() {
+            return;
+        }
+        cm.dirty_generation()
+    };
+
     let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
@@ -24582,6 +24667,7 @@ async fn flush_credit_state(
         // clients.met cache after that transaction succeeds.
         let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
         db_ref.incremental_vacuum();
+        let mut cache_written = false;
         if result.is_ok() {
             let clients_met = data_dir.join("clients.met");
             let clients_bak = data_dir.join("clients.met.bak");
@@ -24590,19 +24676,33 @@ async fn flush_credit_state(
                     debug!("Failed to create clients.met backup: {e}");
                 }
             }
-            if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
-                debug!("Failed to finalize clients.met: {e}");
+            match crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
+                Ok(()) => cache_written = true,
+                Err(e) => debug!("Failed to finalize clients.met: {e}"),
             }
         }
-        result
+        (result, cache_written)
     })
     .await;
     match &save_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Failed to save credits: {e}"),
+        Ok((Ok(()), cache_written)) => {
+            if *cache_written {
+                // Disk now matches the snapshot. A mutation that landed while
+                // the blocking write ran bumped the generation, so the flag
+                // stays set and the next tick persists it instead of dropping
+                // it.
+                credit_manager
+                    .write()
+                    .await
+                    .mark_saved_if_generation(flush_generation);
+            } else {
+                debug!("clients.met cache write failed; keeping credits dirty for the next tick");
+            }
+        }
+        Ok((Err(e), _)) => error!("Failed to save credits: {e}"),
         Err(e) => error!("Credit save task failed: {e}"),
     }
-    if !matches!(save_result, Ok(Ok(()))) {
+    if !matches!(save_result, Ok((Ok(()), _))) {
         debug!("Skipping clients.met cache write because the DB credit flush failed");
     }
 }
@@ -25953,14 +26053,21 @@ async fn known_clients_snapshot(
     // Friends table is small; read off the network task so we never hold
     // the credit lock across a blocking SQLite call.
     let db_q = db.clone();
-    let friend_meta: std::collections::HashMap<String, FriendMeta> =
+    // Keyed by raw hash bytes rather than lowercase hex: the ranking pass
+    // below consults this once per credit record, and a hex key would force a
+    // `String` allocation per record purely to do the lookup. The friends
+    // table is small, so decoding once here is strictly cheaper.
+    let friend_meta: std::collections::HashMap<[u8; 16], FriendMeta> =
         match tokio::task::spawn_blocking(move || {
             let mut map = std::collections::HashMap::new();
             match db_q.get_friends_full() {
                 Ok(rows) => {
                     for (hash, nick, _added, last_ip, _port, last_seen, _mutual) in rows {
+                        let Some(key) = parse_ed2k_hash16(&hash) else {
+                            continue;
+                        };
                         map.insert(
-                            hash.to_lowercase(),
+                            key,
                             FriendMeta {
                                 nickname: nick,
                                 last_ip,
@@ -26006,9 +26113,52 @@ async fn known_clients_snapshot(
 
     let cm = credit_manager.read().await;
     let friends = friend_hashes.read().await;
-    let mut out: Vec<crate::types::KnownClient> = cm
-        .all_records()
+    let records = cm.all_records();
+
+    // Rank before enriching. Every record used to pay an ident-state lookup, a
+    // score-ratio computation, two `hex::encode`s, an IP parse, a GeoIP mmdb
+    // lookup and several more allocations — up to 50,000 times at the credit
+    // cap — and the truncate below then discarded ~90% of it. The sort key is
+    // the same one the old code sorted on, `max(record.last_seen, friend
+    // last_seen)`, but computing it now costs no allocation at all, so only
+    // the survivors are built. This also cuts how long the credit read lock is
+    // held roughly tenfold, which matters because tokio's fair `RwLock` parks
+    // the upload path's credit writers behind this snapshot.
+    let mut ranked: Vec<(i64, usize)> = records
         .iter()
+        .enumerate()
+        .map(|(idx, record)| {
+            let ember = record
+                .ember_hash
+                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let meta_last_seen = ember
+                .and_then(|eh| friend_meta.get(&eh))
+                .map(|m| m.last_seen)
+                .unwrap_or(i64::MIN);
+            (record.last_seen.max(meta_last_seen), idx)
+        })
+        .collect();
+    // Bound what crosses IPC. The credit ledger holds up to
+    // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
+    // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
+    // on a repeating timer for a table that renders a thousand rows. Trimming
+    // the *oldest* entries is the right end to lose: they are the peers a
+    // lifetime-view is least likely to be asked about.
+    if ranked.len() > MAX_KNOWN_CLIENT_ROWS {
+        debug!(
+            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
+            ranked.len()
+        );
+        ranked.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
+        ranked.truncate(MAX_KNOWN_CLIENT_ROWS);
+    }
+    // Stable, useful default order: most-recently-seen first. The UI can
+    // re-sort by any column.
+    ranked.sort_by_key(|(last_seen, _)| std::cmp::Reverse(*last_seen));
+
+    ranked
+        .into_iter()
+        .filter_map(|(_, idx)| records.get(idx).copied())
         .map(|record| {
             let ident_state =
                 ident_state_label(cm.get_current_ident_state(&record.user_hash, record.ident_ip))
@@ -26018,9 +26168,7 @@ async fn known_clients_snapshot(
                 .ember_hash
                 .or_else(|| live_ember.get(&record.user_hash).copied());
             let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
-            let meta = ember
-                .map(hex::encode)
-                .and_then(|h| friend_meta.get(&h.to_lowercase()));
+            let meta = ember.and_then(|eh| friend_meta.get(&eh));
 
             let mut last_known_ip = if record.ident_ip != 0 {
                 let octets = record.ident_ip.to_be_bytes();
@@ -26067,25 +26215,7 @@ async fn known_clients_snapshot(
                 nickname: meta.map(|m| m.nickname.clone()).unwrap_or_default(),
             }
         })
-        .collect();
-    // Stable, useful default order: most-recently-seen first. The UI
-    // can re-sort by any column.
-    out.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
-    // Bound what crosses IPC. The credit ledger holds up to
-    // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
-    // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
-    // on a repeating timer for a table that renders a thousand rows. Trimming
-    // the *oldest* entries is the right end to lose: they are the peers a
-    // lifetime-view is least likely to be asked about, and the sort above has
-    // already put everything recent first.
-    if out.len() > MAX_KNOWN_CLIENT_ROWS {
-        debug!(
-            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
-            out.len()
-        );
-        out.truncate(MAX_KNOWN_CLIENT_ROWS);
-    }
-    out
+        .collect()
 }
 
 // ----- AntiLeech filter command helpers ----------------------------
@@ -26226,6 +26356,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_member_touch_flushed_at = None;
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
+    state.channel_neighbor_scan_after = None;
     state.channel_relay_outboxes.clear();
     state.channel_relay_pending.clear();
     state.channel_relay_offer_at.clear();
@@ -27280,6 +27411,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_roster_cache: None,
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_neighbor_scan_after: None,
         channel_relay_outboxes: HashMap::new(),
         channel_relay_pending: HashSet::new(),
         channel_relay_offer_at: HashMap::new(),
@@ -28232,6 +28364,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut stats_save_started_at: Option<tokio::time::Instant> = None;
     let mut reputation_save_in_flight = false;
     let mut reputation_save_started_at: Option<tokio::time::Instant> = None;
+    // Same dirty-check shape as `known2_saved_len` below: the generation the
+    // last *durable* reputation write covered, and the one the in-flight write
+    // is carrying. On a long-lived node the peer/IP maps sit near their 20k cap
+    // and rarely change between 5-minute ticks, so without this the timer
+    // cloned 20k entries and fsync'd ~2 MB of identical JSON 288 times a day.
+    let mut reputation_saved_generation: Option<u64> = None;
+    let mut reputation_in_flight_generation: u64 = 0;
     let mut known2_save_in_flight = false;
     let mut known2_save_started_at: Option<tokio::time::Instant> = None;
     // Length of `aich_hash_sets` as of the last durable `known2_64.met` write,
@@ -28269,6 +28408,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
+    // `(known.met dirty generation, publish-badge fingerprint)` the cached
+    // shared-file list was last built from. `None` until the first refresh, so
+    // the first tick after startup always builds one.
+    let mut last_file_snapshot_inputs: Option<(u64, u64)> = None;
 
     // Defer transfer resume, orphan sweep, firewall rules, and heavy disk
     // loads until the event loop can service splash IPC. UPnP setup is also
@@ -45144,6 +45287,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     PeriodicSaveJob::Reputation => {
                         reputation_save_in_flight = false;
                         reputation_save_started_at = None;
+                        if result.result.is_ok() {
+                            // Only a durable write lets the next tick skip; a
+                            // failed one leaves the file behind the maps.
+                            reputation_saved_generation = Some(reputation_in_flight_generation);
+                        }
                         "reputation.json"
                     }
                     PeriodicSaveJob::Known2 => {
@@ -45265,11 +45413,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Periodic reputation save (every 5 minutes)
             _ = reputation_save_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if !reputation_save_in_flight {
+                let reputation_generation = state.reputation.generation();
+                if !reputation_save_in_flight
+                    && reputation_saved_generation != Some(reputation_generation)
+                {
                     let rep_path = state.data_dir.join("reputation.json");
                     let reputation_snapshot = state.reputation.clone();
                     let tx = periodic_save_result_tx.clone();
                     reputation_save_in_flight = true;
+                    reputation_in_flight_generation = reputation_generation;
                     reputation_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
@@ -47444,11 +47596,46 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 let cached_tstats = stats_manager.get_stats();
 
-                // Collect known-file stats for the background task (can't move known_files into spawn)
-                let known_stats: Vec<([u8; 16], u32, u32, u64)> = known_files
-                    .all_records()
-                    .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
-                    .collect();
+                let kad_connected = state.stats.status == NetworkStatus::Connected;
+                let srv_connected = state.server_connected;
+                let ember_live =
+                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
+                let kad_published = state.publish_manager.source_published_md4_hashes();
+                let ed2k_offered = state.offered_ed2k_hashes.clone();
+                let ember_published = state.ember_published_sources.clone();
+
+                // The peer/contact/stats half of this bundle genuinely changes
+                // every tick, but the file snapshot underneath it depends on
+                // exactly two things: the all-time counters in known.met and the
+                // publish-badge inputs. Index *content* edits are pushed by
+                // `refresh_file_cache` at each of its mutation sites, so this
+                // timer never had to re-derive them. Rebuilding regardless meant
+                // an idle node took `local_index.write()` every 5s and deep-cloned
+                // every `FileInfo` behind it — on a large library that starves
+                // hashing, scans and IPC readers for as long as it runs.
+                let known_generation = known_files.dirty_generation();
+                let badge_fingerprint = publish_badge_fingerprint(
+                    kad_connected,
+                    srv_connected,
+                    ember_live,
+                    &kad_published,
+                    &ed2k_offered,
+                    &ember_published,
+                );
+                let file_snapshot_stale =
+                    last_file_snapshot_inputs != Some((known_generation, badge_fingerprint));
+
+                // Collect known-file stats for the background task (can't move
+                // known_files into spawn). Skipped entirely when the snapshot is
+                // current: at a full library this is ~140k tuples per tick.
+                let known_stats: Vec<([u8; 16], u32, u32, u64)> = if file_snapshot_stale {
+                    known_files
+                        .all_records()
+                        .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 // Spawn ALL heavy work (hex conversion, distance computation, writes,
                 // and the local_index stats merge) as a background task so the event
@@ -47464,20 +47651,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let db_ref = db.clone();
                 let li_ref = local_index.clone();
                 let app_for_cache = app_handle.clone();
-                let kad_connected = state.stats.status == NetworkStatus::Connected;
-                let srv_connected = state.server_connected;
-                let ember_live =
-                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
-                let kad_published = state.publish_manager.source_published_md4_hashes();
-                let ed2k_offered = state.offered_ed2k_hashes.clone();
-                let ember_published = state.ember_published_sources.clone();
                 last_cache_refresh_started_at = chrono::Utc::now().timestamp();
+                // Marked applied here rather than inside the task: the watchdog
+                // never aborts this one, and a task that panics only costs a
+                // delayed merge, which the next known.met change re-triggers.
+                last_file_snapshot_inputs = Some((known_generation, badge_fingerprint));
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
                     // snapshot the file list for frontend IPC reads.
                     // IMPORTANT: release the local_index lock before acquiring
                     // cached_shared_files -- never nest these two locks.
-                    let file_snap = {
+                    let file_snap = if file_snapshot_stale {
                         let mut index = li_ref.write().await;
                         index.update_alltime_stats_bulk(&known_stats);
                         let mut snap = index.all_files().to_vec();
@@ -47490,7 +47674,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &ed2k_offered,
                             &ember_published,
                         );
-                        snap
+                        Some(snap)
+                    } else {
+                        None
                     };
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();
@@ -47555,11 +47741,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // a badge actually flips, so the flags land in the UI without
                     // waiting on unrelated activity and without reloading the
                     // whole list on a five-second clock.
-                    let badges_changed = {
-                        let mut cache = s_files.write().await;
-                        let changed = badge_counts(&file_snap) != badge_counts(&cache);
-                        *cache = file_snap;
-                        changed
+                    let badges_changed = match file_snap {
+                        Some(file_snap) => {
+                            let mut cache = s_files.write().await;
+                            let changed = badge_counts(&file_snap) != badge_counts(&cache);
+                            *cache = file_snap;
+                            changed
+                        }
+                        // Neither the known.met counters nor any badge input
+                        // moved, so the cache already holds this exact list and
+                        // no badge can have flipped.
+                        None => false,
                     };
                     if badges_changed {
                         let _ = app_for_cache.emit(

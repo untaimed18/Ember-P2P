@@ -2713,30 +2713,86 @@ pub(crate) async fn fetch_channel_directory(
     serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
 }
 
+/// Pages of `/v4/channels/deleted` this will follow before giving up.
+///
+/// The server hands back at most 2,000 ids per page and caps its tombstone set
+/// at 100,000, so 50 pages covers a full registry. The bound matters because
+/// the cursor comes from the server: a misbehaving or hostile one could
+/// otherwise keep answering with a full page and a fresh cursor forever.
+const MAX_DELETED_ID_PAGES: usize = 50;
+
 pub(crate) async fn fetch_deleted_channel_ids(
     base_url: &str,
 ) -> Result<Vec<String>, ChannelRegistryError> {
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
-    let resp = client(base_url)
-        .await
-        .map_err(|_| ChannelRegistryError::Unavailable)?
-        .get(format!(
-            "{}/v4/channels/deleted",
-            base_url.trim_end_matches('/')
-        ))
-        .send()
+    let base = base_url.trim_end_matches('/');
+    let http = client(base_url)
         .await
         .map_err(|_| ChannelRegistryError::Unavailable)?;
-    if !resp.status().is_success() {
-        return Err(map_registry_status(resp.status()));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    for _ in 0..MAX_DELETED_ID_PAGES {
+        let url = match &cursor {
+            Some(after) => format!(
+                "{base}/v4/channels/deleted?after={}",
+                urlencoding_hex(after)
+            ),
+            None => format!("{base}/v4/channels/deleted"),
+        };
+        let resp = http
+            .get(url)
+            .send()
+            .await
             .map_err(|_| ChannelRegistryError::Unavailable)?;
-    let Some(list) = body.get("ids") else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+        if !resp.status().is_success() {
+            return Err(map_registry_status(resp.status()));
+        }
+        let body: serde_json::Value = serde_json::from_slice(
+            &read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES)
+                .await
+                .map_err(|_| ChannelRegistryError::Unavailable)?,
+        )
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+        let Some(list) = body.get("ids") else {
+            return Ok(out);
+        };
+        let page: Vec<String> = serde_json::from_value(list.clone())
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+        let page_was_empty = page.is_empty();
+        out.extend(page);
+        // A server that predates paging sends no `next` and the loop ends on
+        // the first pass, exactly as before.
+        let next = body
+            .get("next")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .filter(|next| !next.is_empty());
+        match next {
+            // Refuse to walk backwards or in place: the cursor must advance, or
+            // a server answering with a constant `next` would loop us until the
+            // page bound.
+            Some(next) if !page_was_empty && cursor.as_deref().is_none_or(|c| next.as_str() > c) => {
+                cursor = Some(next);
+            }
+            _ => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// Percent-encode a cursor for use in a query string.
+///
+/// The server only ever emits lowercase hex ids and rejects anything else, so
+/// in practice nothing needs escaping — this exists so a malformed cursor from
+/// a hostile server cannot inject additional query parameters into the next
+/// request we build from it.
+fn urlencoding_hex(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(64)
+        .collect()
 }
 
 #[cfg(test)]

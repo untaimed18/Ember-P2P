@@ -22,25 +22,68 @@
   let emberJoinSince: number | null = null;
   let emberJoinTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // How long verified contacts must hold above zero before the join counts as
+  // real. Without a dwell this was level-triggered: every ~3s poll that caught
+  // `verified > 0` cleared `emberJoinSince`, so a join oscillating around zero
+  // — cold start, partition recovery, eviction churn — restarted the grace
+  // period on each such poll and the timeout never fired. The user was never
+  // told the overlay had failed to join.
+  const EMBER_JOIN_DWELL_MS = 10_000;
+  let emberJoinedSince: number | null = null;
+  /** Plain mirror of `emberJoinTimedOut`, read by `recomputeEmberJoin` so the
+   *  `$effect` below does not subscribe to the very `$state` it writes. The
+   *  two are always set and cleared together. */
+  let emberJoinExpired = false;
+
+  function clearEmberJoinTimer() {
+    if (emberJoinTimer) {
+      clearTimeout(emberJoinTimer);
+      emberJoinTimer = null;
+    }
+  }
+
   function recomputeEmberJoin(stats: typeof $networkStats) {
     const enabled = !!stats.ember_native_enabled;
     const verified = stats.ember_dht_verified_contacts ?? 0;
-    if (!enabled || verified > 0) {
-      if (emberJoinTimer) {
-        clearTimeout(emberJoinTimer);
-        emberJoinTimer = null;
-      }
+    const now = Date.now();
+
+    if (!enabled) {
+      clearEmberJoinTimer();
       emberJoinSince = null;
+      emberJoinedSince = null;
+      emberJoinExpired = false;
       emberJoinTimedOut = false;
       return;
     }
+
+    if (verified > 0) {
+      if (emberJoinedSince === null) emberJoinedSince = now;
+      // Stop the timer straight away so a join in progress cannot flash the
+      // warning, but hold `emberJoinSince` until the dwell elapses. If
+      // contacts drop back before then, the branch below re-arms for the
+      // *remaining* budget rather than a fresh full one.
+      clearEmberJoinTimer();
+      if (now - emberJoinedSince >= EMBER_JOIN_DWELL_MS) {
+        emberJoinSince = null;
+        emberJoinExpired = false;
+        emberJoinTimedOut = false;
+      }
+      return;
+    }
+
+    emberJoinedSince = null;
     if (emberJoinSince === null) {
-      emberJoinSince = Date.now();
+      emberJoinSince = now;
+      emberJoinExpired = false;
       emberJoinTimedOut = false;
+    }
+    if (!emberJoinExpired && emberJoinTimer === null) {
+      const remaining = Math.max(0, EMBER_JOIN_TIMEOUT_MS - (now - emberJoinSince));
       emberJoinTimer = setTimeout(() => {
+        emberJoinExpired = true;
         emberJoinTimedOut = true;
         emberJoinTimer = null;
-      }, EMBER_JOIN_TIMEOUT_MS);
+      }, remaining);
     }
   }
 

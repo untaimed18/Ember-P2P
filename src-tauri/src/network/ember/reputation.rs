@@ -232,6 +232,14 @@ pub struct ReputationManager {
     peers: HashMap<[u8; 16], PeerReputation>,
     ips: HashMap<[u8; 4], IpReputation>,
     last_decay: u64,
+    /// Bumped by every mutation that changes persisted state. The 300s save
+    /// timer compares this against the value it last wrote and skips the
+    /// clone-serialise-fsync entirely when it has not moved — on a long-lived
+    /// node the maps sit near their 20k cap and rarely change between ticks,
+    /// so that was ~2 MB rewritten 288 times a day to persist identical bytes.
+    /// Not part of `PersistedReputation`, so the on-disk format is unchanged
+    /// and a restart simply starts counting from zero.
+    generation: u64,
 }
 
 impl ReputationManager {
@@ -240,7 +248,22 @@ impl ReputationManager {
             peers: HashMap::new(),
             ips: HashMap::new(),
             last_decay: now_secs(),
+            generation: 0,
         }
+    }
+
+    /// Mark persisted state as changed. Callers must only invoke this when
+    /// something actually changed — a mutator that early-returns, or one whose
+    /// guard found nothing to do, must not bump, or the save gate degrades
+    /// back into an unconditional write.
+    fn touch(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Counter to compare against the value captured at the last successful
+    /// save. See [`Self::touch`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Record an event for a peer, creating their entry if needed.
@@ -258,6 +281,7 @@ impl ReputationManager {
         if self.peers.len() > MAX_TRACKED_PEERS {
             self.evict_stale();
         }
+        self.touch();
 
         !was_banned && now_banned
     }
@@ -345,6 +369,7 @@ impl ReputationManager {
             if peer.score <= BAN_THRESHOLD {
                 peer.score = BAN_THRESHOLD + 1;
             }
+            self.touch();
             true
         } else {
             false
@@ -362,6 +387,7 @@ impl ReputationManager {
             if entry.score <= IP_BAN_THRESHOLD {
                 entry.score = IP_BAN_THRESHOLD + 1;
             }
+            self.touch();
             true
         } else {
             false
@@ -384,6 +410,7 @@ impl ReputationManager {
         if self.ips.len() > MAX_TRACKED_IPS {
             self.evict_stale_ips();
         }
+        self.touch();
     }
 
     /// Node identities whose reputation ban has not yet expired.
@@ -420,16 +447,22 @@ impl ReputationManager {
         if peer.score > BAN_THRESHOLD {
             peer.score = BAN_THRESHOLD;
         }
+        self.touch();
     }
 
     /// Lift bans that have expired.
     pub fn lift_expired_bans(&mut self) {
         let now = now_secs();
+        // Counted rather than assumed: this runs on a timer, and bumping the
+        // generation on a tick that lifted nothing would re-dirty the state
+        // every cycle and defeat the save gate.
+        let mut lifted = 0usize;
         for peer in self.peers.values_mut() {
             if let Some(until) = peer.banned_until {
                 if now >= until {
                     peer.banned_until = None;
                     peer.score = (peer.score / 2).max(BAN_THRESHOLD + 1);
+                    lifted += 1;
                 }
             }
         }
@@ -437,7 +470,11 @@ impl ReputationManager {
             if ip.banned_until.is_some_and(|until| now >= until) {
                 ip.banned_until = None;
                 ip.score = (ip.score / 2).max(IP_BAN_THRESHOLD + 1);
+                lifted += 1;
             }
+        }
+        if lifted > 0 {
+            self.touch();
         }
     }
 
@@ -463,6 +500,10 @@ impl ReputationManager {
         for ip in self.ips.values_mut() {
             ip.apply_decay(intervals);
         }
+        // `last_decay` advanced above, which is itself persisted state, so this
+        // is unconditional — but only reached when `intervals > 0`, i.e. about
+        // once an hour rather than on every 60s tick.
+        self.touch();
     }
 
     /// Save reputation data to disk as JSON.
@@ -578,10 +619,13 @@ impl ReputationManager {
             }
         }
 
+        // Starts at 0 like a fresh manager: what was just loaded matches disk,
+        // so the first save tick has nothing to write until something changes.
         let mut mgr = Self {
             peers,
             ips,
             last_decay: now,
+            generation: 0,
         };
         // Defensive: enforce the per-load size cap too in case the
         // file claims more peers than the runtime cap (also a

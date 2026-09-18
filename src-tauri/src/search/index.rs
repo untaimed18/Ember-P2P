@@ -589,16 +589,23 @@ impl LocalIndex {
     /// inside that critical section for a large share. This reuses one key
     /// buffer and borrows the index list in place.
     pub fn update_alltime_stats_bulk(&mut self, stats: &[([u8; 16], u32, u32, u64)]) {
-        use std::fmt::Write as _;
         let files = &mut self.files;
         let hash_map = &self.hash_map;
-        let mut key = String::with_capacity(32);
+        // `hex::encode_to_slice` into a fixed stack buffer rather than 16
+        // `write!` calls per record: at a full library that was ~2.2M
+        // formatter invocations per pass, all of it inside the index write
+        // lock this function already holds.
+        let mut key_buf = [0u8; 32];
         for (file_hash, requests, accepted, transferred) in stats {
-            key.clear();
-            for byte in file_hash {
-                let _ = write!(key, "{byte:02x}");
+            if hex::encode_to_slice(file_hash, &mut key_buf).is_err() {
+                continue;
             }
-            let Some(indices) = hash_map.get(&key) else {
+            // Always valid ASCII by construction; `continue` keeps this
+            // panic-free without asserting that.
+            let Ok(key) = std::str::from_utf8(&key_buf) else {
+                continue;
+            };
+            let Some(indices) = hash_map.get(key) else {
                 continue;
             };
             for &idx in indices {

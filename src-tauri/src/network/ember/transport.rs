@@ -2238,18 +2238,33 @@ impl EmberTransport {
             }
         }
 
+        // Named before consumed, for the reason spelled out in
+        // `handle_xx_msg2`: `extract_remote_static` rejects a non-contributory
+        // static key that the AEAD read above accepts, so failing here after
+        // `remove` would discard the handshake and every payload queued behind
+        // it without telling anyone.
+        let remote_noise_pub = match self.pending.get(&from) {
+            Some(PendingHandshake::IkInitiator { state, .. }) => {
+                match extract_remote_static(state, &self.local_noise_key) {
+                    Some(k) => k,
+                    None => {
+                        debug!(
+                            "IK initiator: handshake completed without remote static key from {from}"
+                        );
+                        return IncomingResult::Rejected;
+                    }
+                }
+            }
+            _ => {
+                debug!("IK resp from {from}: pending handshake changed shape mid-dispatch");
+                return IncomingResult::Rejected;
+            }
+        };
+
         let Some(PendingHandshake::IkInitiator { state, queued, .. }) = self.pending.remove(&from)
         else {
             debug!("IK resp from {from}: pending handshake changed shape mid-dispatch");
             return IncomingResult::Rejected;
-        };
-
-        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
-            Some(k) => k,
-            None => {
-                debug!("IK initiator: handshake completed without remote static key from {from}");
-                return IncomingResult::Rejected;
-            }
         };
 
         // Sessions coexist per static key, so completing this handshake cannot
@@ -2655,18 +2670,6 @@ impl EmberTransport {
             }
         };
 
-        // Authenticated, so the handshake is ours to consume. The variant is
-        // the one matched above — nothing can have run in between under
-        // `&mut self` — and the arm exists only so a future refactor cannot
-        // turn a mismatch into a panic.
-        let Some(PendingHandshake::XxInitiatorMsg1 {
-            mut state, queued, ..
-        }) = self.pending.remove(&from)
-        else {
-            debug!("XX msg2 from {from}: pending handshake changed shape mid-dispatch");
-            return IncomingResult::Rejected;
-        };
-
         // Read out who answered before deciding what to send them. Message 2
         // carried the responder's static key, so the identity is known here —
         // and it has to be, because the msg3 payload below is the first thing
@@ -2675,12 +2678,42 @@ impl EmberTransport {
         // sit at this address: an XX handshake is only ever started by an
         // unkeyed `prepare_outgoing`, so the peer here was never named by the
         // caller whose payload is at the head of the queue.
-        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
-            Some(k) => k,
-            None => {
-                debug!("XX initiator: handshake completed without remote static key from {from}");
+        //
+        // Done against the *parked* handshake, before consuming it, for the
+        // same reason `read_message` above is: `extract_remote_static` is
+        // stricter than the AEAD read — it refuses a non-contributory
+        // (low-order) X25519 static — so a responder can answer with a
+        // well-formed msg2 and still fail here. Consuming first meant that
+        // dropped the handshake *and* silently discarded every payload queued
+        // behind it, with no notice to the callers that enqueued them.
+        let remote_noise_pub = match self.pending.get(&from) {
+            Some(PendingHandshake::XxInitiatorMsg1 { state, .. }) => {
+                match extract_remote_static(state, &self.local_noise_key) {
+                    Some(k) => k,
+                    None => {
+                        debug!(
+                            "XX initiator: handshake completed without remote static key from {from}"
+                        );
+                        return IncomingResult::Rejected;
+                    }
+                }
+            }
+            _ => {
+                debug!("XX msg2 from {from}: pending handshake changed shape mid-dispatch");
                 return IncomingResult::Rejected;
             }
+        };
+
+        // Authenticated and the responder named, so the handshake is ours to
+        // consume. The variant is the one matched above — nothing can have run
+        // in between under `&mut self` — and the arm exists only so a future
+        // refactor cannot turn a mismatch into a panic.
+        let Some(PendingHandshake::XxInitiatorMsg1 {
+            mut state, queued, ..
+        }) = self.pending.remove(&from)
+        else {
+            debug!("XX msg2 from {from}: pending handshake changed shape mid-dispatch");
+            return IncomingResult::Rejected;
         };
         let deliverable = retain_addressed_to(queued, &remote_noise_pub);
 

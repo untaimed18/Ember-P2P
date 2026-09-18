@@ -16,7 +16,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, DefaultBodyLimit, Path, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
     },
     http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
@@ -749,6 +749,9 @@ fn registry_error_status(err: registry::RegistryError) -> StatusCode {
         registry::RegistryError::InvalidName => StatusCode::BAD_REQUEST,
         registry::RegistryError::Taken => StatusCode::CONFLICT,
         registry::RegistryError::Forbidden => StatusCode::FORBIDDEN,
+        // Not the caller's fault and not about the name they asked for, so
+        // neither 400 nor 409: the server has no capacity to record it.
+        registry::RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -2844,6 +2847,21 @@ async fn claim_channel_username_v4(
     {
         return status;
     }
+    // Charged the creation budget, not just the general one. Claiming a
+    // username mints permanent shared state — the entry is held for
+    // `USERNAME_IDLE_SECS` (a year) and every later request pays to re-serialise
+    // it — and the signature proves only that the caller generated a keypair,
+    // which costs nothing. Under the general 60/min limit alone this endpoint
+    // was 600x cheaper to abuse than `claim_channel_name_v4`, which charges
+    // this budget for writing to the very same file. Charged after the replay
+    // check so a retransmitted request cannot spend a second slot.
+    let claims_new_handle = {
+        let registry = state.channels_registry.read().await;
+        !registry.holds_username(&hex::encode(pubkey), &normalized)
+    };
+    if claims_new_handle && !check_channel_create_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     let mut registry = state.channels_registry.write().await;
     match registry.claim_username(&hex::encode(pubkey), &normalized) {
         Ok(()) => StatusCode::OK,
@@ -2955,8 +2973,21 @@ async fn delete_channel_v4(
     {
         return status;
     }
+    // A delete writes a tombstone that is kept forever, so it mints more
+    // durable state than a name claim does and must not be cheaper to issue.
+    // Only charged when it would actually record something new: re-deleting an
+    // already-tombstoned room is idempotent and free, so a client retrying
+    // cannot burn its own budget.
+    let channel_hex = hex::encode(channel_id);
+    let records_new_tombstone = {
+        let registry = state.channels_registry.read().await;
+        !registry.is_deleted(&channel_hex)
+    };
+    if records_new_tombstone && !check_channel_create_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     let mut registry = state.channels_registry.write().await;
-    match registry.delete_channel(&hex::encode(channel_id), &hex::encode(pubkey)) {
+    match registry.delete_channel(&channel_hex, &hex::encode(pubkey)) {
         Ok(()) => StatusCode::OK,
         Err(err) => registry_error_status(err),
     }
@@ -3100,18 +3131,51 @@ async fn channel_directory_v4(
     })))
 }
 
+/// Ids returned per `/v4/channels/deleted` page.
+///
+/// Each id is 32 hex characters, so a full page is ~70 KB of JSON — well
+/// inside the client's 256 KiB response bound, and a fixed ceiling on what a
+/// single unauthenticated request can make the server serialise. Unpaginated,
+/// this endpoint turned a ~200-byte request into an unbounded response plus an
+/// O(n log n) rebuild of the whole tombstone list, and every client polls it.
+const MAX_DELETED_IDS_PER_PAGE: usize = 2_000;
+
+#[derive(Deserialize)]
+struct DeletedIdsQuery {
+    /// Last id the caller already has. Omitted for the first page.
+    #[serde(default)]
+    after: Option<String>,
+}
+
 async fn channel_deleted_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<DeletedIdsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
+    // The cursor is only ever compared against stored ids, so it cannot be
+    // used to reach anything — but bounding it keeps a multi-megabyte query
+    // string from being a cheap way to make us allocate.
+    if query.after.as_deref().is_some_and(|cursor| {
+        cursor.len() > 64 || !cursor.bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let registry = state.channels_registry.read().await;
+    let ids = registry.deleted_ids_page(query.after.as_deref(), MAX_DELETED_IDS_PER_PAGE);
+    // A cursor is only offered on a full page; a short page is the last one.
+    // Clients that predate paging read `ids` and ignore `next`, which is
+    // correct for every deployment whose tombstone set fits in one page.
+    let next = (ids.len() == MAX_DELETED_IDS_PER_PAGE)
+        .then(|| ids.last().cloned())
+        .flatten();
     Ok(Json(serde_json::json!({
-        "ids": registry.deleted_ids(),
+        "ids": ids,
+        "next": next,
     })))
 }
 
@@ -7570,6 +7634,7 @@ mod relay_ticket_tests {
             State(state.clone()),
             ConnectInfo(addr),
             HeaderMap::new(),
+            Query(DeletedIdsQuery { after: None }),
         )
         .await
         .expect("deleted");

@@ -200,6 +200,30 @@ pub(crate) async fn run_graceful_shutdown(
     const SCAN_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
     state.await_background_scans(SCAN_JOIN_GRACE).await;
 
+    // `await_background_scans` joins the tasks we track by handle;
+    // `scanning_count` additionally covers the `spawn_blocking` hash workers
+    // those tasks fan out to, which can outlive the parent that spawned them.
+    // Both have to be quiet *before* the network task runs the authoritative
+    // flush below, not after it — this wait used to sit past that flush, where
+    // it could no longer protect anything, and aborted stragglers without
+    // joining them. `register_background_scan` refuses new work once
+    // `bw_shutdown` is set, so neither set can be repopulated after this point.
+    const SCAN_QUIESCE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+    let scan_quiesce_deadline = std::time::Instant::now() + SCAN_QUIESCE_GRACE;
+    let scanning = state.scanning_count.clone();
+    while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && std::time::Instant::now() < scan_quiesce_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if scanning.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        tracing::warn!(
+            "Shutdown: {} hash worker(s) still running after {}s; flushing anyway",
+            scanning.load(std::sync::atomic::Ordering::Relaxed),
+            SCAN_QUIESCE_GRACE.as_secs()
+        );
+    }
+
     let tx = state.network_tx.clone();
     const SHUTDOWN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
     let start = std::time::Instant::now();
@@ -253,23 +277,6 @@ pub(crate) async fn run_graceful_shutdown(
              no authoritative network writes ran this teardown",
             SHUTDOWN_SEND_WAIT.as_secs()
         );
-    }
-
-    // Wait for in-flight discovery/hash workers to finish or abort after a
-    // short grace window. Prevents scans from mutating state (known.met,
-    // local_index) while we're flushing it to disk below.
-    let scanning = state.scanning_count.clone();
-    while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
-        && std::time::Instant::now() < shutdown_deadline
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let handles: Vec<_> = {
-        let mut map = state.background_scans.write().await;
-        map.drain().map(|(_, h)| h).collect()
-    };
-    for h in handles {
-        h.abort();
     }
 
     // Flush any learned spam signals not yet persisted by the periodic flush

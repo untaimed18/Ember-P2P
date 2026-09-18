@@ -448,6 +448,18 @@ pub struct CreditManager {
     /// grant credits to unverified peers.
     #[zeroize(skip)]
     crypto_unreadable: bool,
+    /// Whether anything has changed since the last successful flush.
+    ///
+    /// Persisting credits is expensive — `DELETE`+re-`INSERT` of both tables,
+    /// an `incremental_vacuum`, and a full `clients.met` rewrite with an
+    /// fsync — and the 60s flush timer used to pay all of it unconditionally,
+    /// rewriting identical bytes ~1,440 times a day on a node whose peers had
+    /// gone quiet. Mirrors the `KnownFileList` dirty/generation pair so an
+    /// edit landing *during* a flush is not mistaken for one the flush covered.
+    #[zeroize(skip)]
+    dirty: bool,
+    #[zeroize(skip)]
+    dirty_generation: u64,
 }
 
 impl CreditManager {
@@ -459,6 +471,42 @@ impl CreditManager {
             our_private_key: Vec::new(),
             crypto_available: false,
             crypto_unreadable: false,
+            dirty: false,
+            dirty_generation: 0,
+        }
+    }
+
+    /// Mark the in-memory credit state as needing a flush.
+    ///
+    /// Called from `get_or_create` / `get_or_create_ember` — the only two
+    /// methods that hand out `&mut` to a record, and therefore the choke point
+    /// every mutating operation (`add_uploaded`, `set_public_key`,
+    /// `set_ident_state`, `record_ember_session`, …) already routes through.
+    /// Deliberately over-approximates: a caller that takes `&mut` and changes
+    /// nothing still marks dirty. An extra flush is cheap; a missed one loses
+    /// the user's accumulated upload credit.
+    fn touch_dirty(&mut self) {
+        self.dirty = true;
+        self.dirty_generation = self.dirty_generation.saturating_add(1);
+    }
+
+    /// True when a flush would persist something not already on disk.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Generation to hand back to [`Self::mark_saved_if_generation`] after a
+    /// successful flush. Captured before the flush starts.
+    pub fn dirty_generation(&self) -> u64 {
+        self.dirty_generation
+    }
+
+    /// Clear the dirty flag only if nothing was modified since `generation`
+    /// was taken. A mutation that lands mid-flush leaves the flag set, so the
+    /// next tick persists it rather than dropping it on the floor.
+    pub fn mark_saved_if_generation(&mut self, generation: u64) {
+        if self.dirty_generation == generation {
+            self.dirty = false;
         }
     }
 
@@ -693,6 +741,9 @@ impl CreditManager {
                 self.credits.remove(&oldest);
             }
         }
+        // Before handing out `&mut`: the caller may mutate any field, and once
+        // `record` is borrowed from `self` we can no longer touch the flag.
+        self.touch_dirty();
         let record = self
             .credits
             .entry(user_hash)
@@ -1196,12 +1247,19 @@ impl CreditManager {
 
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
+        let before = self.credits.len() + self.ember_credits.len();
         self.credits.retain(|_, r| r.last_seen > cutoff);
         // Same cutoff for Ember records so the two tables age in
         // lockstep. `last_seen` on EmberCreditRecord is bumped by
         // every credit-granting or session-recording operation, so
         // active peers stay regardless of their public-key format.
         self.ember_credits.retain(|_, r| r.last_seen > cutoff);
+        // Only dirty when the sweep actually evicted something. This runs on
+        // the same 60s tick as the flush, so bumping unconditionally would
+        // re-dirty the state every tick and defeat the gate entirely.
+        if self.credits.len() + self.ember_credits.len() != before {
+            self.touch_dirty();
+        }
     }
 
     // ---- Ember credit helpers ----
@@ -1228,6 +1286,8 @@ impl CreditManager {
                 self.ember_credits.remove(&oldest);
             }
         }
+        // Same reason as `get_or_create`: flag before the borrow escapes.
+        self.touch_dirty();
         let record = self
             .ember_credits
             .entry(pub_key)
@@ -1655,6 +1715,13 @@ impl CreditManager {
                     }
                 }
             }
+        }
+        // Loading matches disk, so this is not itself a change to persist —
+        // except when the file we just read predates the current format. The
+        // flush is dirty-gated now, so an older `clients.met` would otherwise
+        // never be rewritten and would stay on the old layout indefinitely.
+        if !has_identity_section {
+            self.touch_dirty();
         }
         tracing::info!("Loaded {} credit records from {}", loaded, path.display());
         Ok(loaded)
@@ -2578,6 +2645,74 @@ mod tests {
         assert!(
             cm.get_record(&stale).is_none(),
             "100d-old record must be pruned"
+        );
+    }
+
+    /// A fresh manager owes disk nothing, and any record mutation makes it
+    /// owe one flush. The 60s credit flush is gated on this, so a mutation
+    /// that failed to set it would lose the user's accumulated upload credit.
+    #[test]
+    fn a_record_mutation_marks_the_manager_dirty() {
+        let mut cm = CreditManager::new();
+        assert!(!cm.is_dirty(), "a new manager has nothing to persist");
+
+        cm.add_uploaded([0x01u8; 16], 4096);
+        assert!(cm.is_dirty(), "granting upload credit must request a flush");
+
+        let generation = cm.dirty_generation();
+        cm.mark_saved_if_generation(generation);
+        assert!(!cm.is_dirty(), "a completed flush clears the debt");
+
+        cm.add_downloaded([0x01u8; 16], 4096);
+        assert!(cm.is_dirty(), "a later edit re-arms the flush");
+    }
+
+    /// The flush captures a generation, then does its DB and `clients.met`
+    /// work without the lock. An edit landing in that window is *not* covered
+    /// by the snapshot being written, so the flag has to survive it — this is
+    /// the difference between "saved a moment late" and "silently dropped".
+    #[test]
+    fn an_edit_during_a_flush_is_not_marked_saved() {
+        let mut cm = CreditManager::new();
+        cm.add_uploaded([0x07u8; 16], 1024);
+        let in_flight = cm.dirty_generation();
+
+        // Lands while the blocking write is still running.
+        cm.add_uploaded([0x08u8; 16], 2048);
+
+        cm.mark_saved_if_generation(in_flight);
+        assert!(
+            cm.is_dirty(),
+            "the edit the snapshot did not include must still be owed to disk"
+        );
+    }
+
+    /// `cleanup_stale` runs on the same 60s tick as the flush. Bumping the
+    /// generation on a sweep that evicted nothing would re-dirty the state
+    /// every cycle and turn the gate back into an unconditional write.
+    #[test]
+    fn a_sweep_that_evicts_nothing_leaves_the_manager_clean() {
+        let mut cm = CreditManager::new();
+        cm.get_or_create([0x09u8; 16]);
+        let generation = cm.dirty_generation();
+        cm.mark_saved_if_generation(generation);
+        assert!(!cm.is_dirty());
+
+        cm.cleanup_stale(90);
+        assert!(
+            !cm.is_dirty(),
+            "a no-op sweep must not schedule another full rewrite"
+        );
+
+        // ...but one that actually evicts does have to be persisted.
+        let stale = [0x0Au8; 16];
+        cm.get_or_create(stale).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        let generation = cm.dirty_generation();
+        cm.mark_saved_if_generation(generation);
+        cm.cleanup_stale(90);
+        assert!(
+            cm.is_dirty(),
+            "an eviction changes what belongs on disk and must be flushed"
         );
     }
 

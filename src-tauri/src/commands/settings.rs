@@ -1577,8 +1577,14 @@ pub async fn update_settings(
         // command here froze the Settings save UI for that whole time (and a
         // user retry then failed with `settings_stale_revision`). The task
         // re-reads current config under the lock, so a later save is safe.
+        //
+        // Registered as a background scan rather than detached: it can sit on
+        // `scan_coordination` past the point where the user asks to exit, and
+        // an untracked task there is one shutdown cannot join or abort — it
+        // would wake when shutdown cancels the scan holding the lock and start
+        // a reload behind the authoritative flush.
         let reconcile_app = app.clone();
-        tauri::async_runtime::spawn(async move {
+        let handle = tokio::spawn(async move {
             let state = reconcile_app.state::<AppState>();
             crate::commands::sharing::reconcile_shared_folder_roots(
                 &reconcile_app,
@@ -1588,6 +1594,7 @@ pub async fn update_settings(
             )
             .await;
         });
+        state.register_background_scan(handle).await;
     }
 
     if runtime_update_deferred {
