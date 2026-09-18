@@ -28984,16 +28984,28 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &[allowed_root],
                                     )
                                     .ok()?;
-                                let md4 = ed2k::hash::ed2k_hash_file(&verified_path).ok()?;
-                                if !md4.eq_ignore_ascii_case(&expected) {
+                                // All three digests from one read. Checked one
+                                // at a time, this walked a restored multi-GB
+                                // file up to three times over — and a restore
+                                // re-verification is the moment a user is
+                                // waiting to learn whether their file survived.
+                                static NEVER: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                let mut file = std::fs::File::open(&verified_path).ok()?;
+                                let digests = ed2k::hash::hash_open_file_digests_cancellable(
+                                    &mut file,
+                                    ed2k::hash::WantedDigests {
+                                        aich: expected_aich.is_some(),
+                                        ember: expected_ember.is_some(),
+                                    },
+                                    &NEVER,
+                                )
+                                .ok()?;
+                                if !digests.ed2k.eq_ignore_ascii_case(&expected) {
                                     return Some(Err("Restored final file hash mismatch".to_string()));
                                 }
                                 if let Some(expected_aich) = expected_aich {
-                                    let actual = ed2k::aich::AICHRecoveryHashSet::build_from_file(
-                                        &verified_path,
-                                    )
-                                    .ok()
-                                    .map(|set| hex::encode(set.root_hash))?;
+                                    let actual = hex::encode(digests.aich.unwrap_or_default());
                                     if !actual.eq_ignore_ascii_case(&expected_aich) {
                                         return Some(Err(format!(
                                             "Expected AICH hash mismatch (expected {expected_aich}, got {actual})"
@@ -29001,10 +29013,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(expected_ember) = expected_ember {
-                                    let actual =
-                                        ember::crypto::blake3_hash_file_path(&verified_path)
-                                            .ok()
-                                            .map(hex::encode)?;
+                                    let actual = hex::encode(digests.ember.unwrap_or_default());
                                     if !actual.eq_ignore_ascii_case(&expected_ember) {
                                         // Reopening parts cannot turn these bytes
                                         // into the content the pin names, so use

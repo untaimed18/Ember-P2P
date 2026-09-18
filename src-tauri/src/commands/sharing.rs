@@ -155,6 +155,30 @@ fn digest_only_inputs(file: &FileInfo) -> Option<(String, String)> {
     Some((file.hash.clone(), file.aich_hash.clone()))
 }
 
+/// What the look-ahead has for the consumer right now.
+///
+/// `Busy` and `Done` were once the same answer — `None` — and that conflation
+/// was a bug the moment a device could be occupied by a read the pass did not
+/// start. Every consumer treats "nothing to hand out" as "the pass is over", so
+/// a download verifying itself on the same drive ended the scan early, silently
+/// skipped every remaining file, and let the resume cursor advance past them.
+enum NextHash {
+    Ready(StartedHash),
+    /// Every device with work left is at its read limit. Nothing to do but
+    /// wait; the queues are not empty.
+    Busy,
+    /// Queues are empty. The pass is finished.
+    Done,
+}
+
+/// How long the pass defers to reads it does not own before proceeding anyway.
+///
+/// A verification takes seconds to minutes. A `spawn_blocking` read wedged on a
+/// drive that stopped answering never returns at all, and cannot be aborted —
+/// its guard would otherwise stall this and every later scan for the life of
+/// the process. Courtesy with a deadline, rather than a new way to hang.
+const EXTERNAL_READ_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One file hash started ahead of the loop that will consume it.
 struct StartedHash {
     index: usize,
@@ -196,6 +220,9 @@ struct HashLookahead<'a> {
     /// as far as the drive is concerned until the consumer comes back for the
     /// next one.
     handed_out: Option<usize>,
+    /// When the pass first found every remaining device occupied by a read it
+    /// did not start. Cleared as soon as one is handed out again.
+    busy_since: Option<std::time::Instant>,
     /// Files passed over because another pass still holds their claim. The
     /// caller must treat a non-zero count as an incomplete page, or the resume
     /// cursor advances past a file nothing hashed.
@@ -204,6 +231,9 @@ struct HashLookahead<'a> {
 
 /// One device's share of the pass.
 struct DeviceQueue {
+    /// Identity, kept so the scheduler can ask how busy this device is with
+    /// work that is not ours. `None` for devices we could not identify.
+    key: Option<String>,
     limit: usize,
     pending: std::collections::VecDeque<usize>,
 }
@@ -237,6 +267,7 @@ impl<'a> HashLookahead<'a> {
                 .entry(info.as_ref().map(|d| d.key.clone()))
                 .or_insert_with(|| {
                     devices.push(DeviceQueue {
+                        key: info.as_ref().map(|d| d.key.clone()),
                         limit: info.as_ref().map_or(1, |d| d.concurrency),
                         pending: std::collections::VecDeque::new(),
                     });
@@ -251,14 +282,32 @@ impl<'a> HashLookahead<'a> {
             cancel,
             inflight: std::collections::VecDeque::new(),
             handed_out: None,
+            busy_since: None,
             skipped: 0,
         }
     }
 
-    /// Reads in flight on one device, counting the row the consumer holds.
+    /// Reads in flight on one device, counting the row the consumer holds and
+    /// any read someone else is running on the same drive.
+    ///
+    /// The external count is what keeps a completing download from turning a
+    /// carefully rationed one-read-at-a-time pass into two: the transfer never
+    /// waits, so the scan is the side that has to notice and stand down. Past
+    /// [`EXTERNAL_READ_GRACE`] it stops counting them, so a read that will
+    /// never finish cannot stall the pass forever.
     fn device_inflight(&self, device: usize) -> usize {
-        self.inflight.iter().filter(|s| s.device == device).count()
-            + usize::from(self.handed_out == Some(device))
+        let ours = self.inflight.iter().filter(|s| s.device == device).count()
+            + usize::from(self.handed_out == Some(device));
+        if self.waited_out_external() {
+            return ours;
+        }
+        ours + crate::sharing::disk::external_reads(self.devices[device].key.as_deref())
+    }
+
+    /// Whether we have deferred to other readers for long enough.
+    fn waited_out_external(&self) -> bool {
+        self.busy_since
+            .is_some_and(|since| since.elapsed() >= EXTERNAL_READ_GRACE)
     }
 
     fn total_inflight(&self) -> usize {
@@ -297,15 +346,27 @@ impl<'a> HashLookahead<'a> {
     /// concurrency of 1 that is the difference between the strictly sequential
     /// pass a spinning disk needs and two concurrent reads, which is the exact
     /// thing `sharing::disk` exists to prevent.
-    fn next_started(&mut self) -> Option<StartedHash> {
+    fn next_started(&mut self) -> NextHash {
         // The consumer asking for another row is what tells us the previous one
         // is finished; nothing else reports back into here. Releasing its
         // device slot first is what lets `fill` start that drive's next file.
         self.handed_out = None;
         self.fill();
-        let started = self.inflight.pop_front();
-        self.handed_out = started.as_ref().map(|s| s.device);
-        started
+        if let Some(started) = self.inflight.pop_front() {
+            self.busy_since = None;
+            self.handed_out = Some(started.device);
+            return NextHash::Ready(started);
+        }
+        // Nothing in flight. Whether that means "finished" or "wait" is decided
+        // by the queues, not by this moment's capacity: work still pending with
+        // nothing running means every device holding it is busy with somebody
+        // else's read.
+        if self.devices.iter().all(|d| d.pending.is_empty()) {
+            self.busy_since = None;
+            return NextHash::Done;
+        }
+        self.busy_since.get_or_insert_with(std::time::Instant::now);
+        NextHash::Busy
     }
 
     fn fill(&mut self) {
@@ -1500,6 +1561,7 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
+    let scanning = state.scanning_count.clone();
     let mut updated_since_reconcile = 0usize;
 
     // Assigned by the single `break` below, which is the loop's only exit.
@@ -1540,7 +1602,31 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
 
         let mut pipeline = HashLookahead::new(&batch, cancel.clone());
         pipeline.log_plan("Backfilling Ember digests for", batch.len());
-        while let Some(started) = pipeline.next_started() {
+        loop {
+            // Stand aside for any real scan. A scan is hashing files the
+            // Library cannot show until it finishes; this is topping up an
+            // optional digest on files that already work. Running both puts two
+            // readers on the same drives and makes the one the user is watching
+            // slower. Checked before `next_started`, which is what starts the
+            // next read — the one already in flight finishes, and nothing new
+            // begins until the scan is done.
+            while scanning.load(Ordering::Relaxed) > 0 && !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let started = match pipeline.next_started() {
+                NextHash::Ready(started) => started,
+                // A drive busy with someone else's read. Wait — dropping out
+                // here would abandon the rest of the batch, and `seen` would
+                // stop a later scan from offering those files again.
+                NextHash::Busy => {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                NextHash::Done => break,
+            };
             if cancel.load(Ordering::Relaxed) {
                 pipeline.drain_started(started);
                 break;
@@ -2281,7 +2367,23 @@ pub async fn add_shared_folder(
         // no seek penalty; see `sharing::disk`.
         let mut pipeline = HashLookahead::new(&files_to_hash, cancel_flag.clone());
         pipeline.log_plan("Hashing", total_to_hash);
-        while let Some(started) = pipeline.next_started() {
+        loop {
+            let started = match pipeline.next_started() {
+                NextHash::Ready(started) => started,
+                // Every drive with work left is busy with a read we did not
+                // start — a download verifying itself, most likely. Wait for
+                // it rather than piling on, and never mistake it for the end
+                // of the pass.
+                NextHash::Busy => {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                NextHash::Done => break,
+            };
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Hashing cancelled for {path} at {hashed_count}/{total_to_hash}");
                 was_cancelled = true;
@@ -3861,7 +3963,20 @@ async fn reload_shared_files_page(
         // no seek penalty; see `sharing::disk`.
         let mut pipeline = HashLookahead::new(&files_to_hash, cancel_flag.clone());
         pipeline.log_plan("Reload hashing", total_to_hash);
-        while let Some(started) = pipeline.next_started() {
+        loop {
+            let started = match pipeline.next_started() {
+                NextHash::Ready(started) => started,
+                // See the folder-add loop: busy is not finished.
+                NextHash::Busy => {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                NextHash::Done => break,
+            };
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Reload hashing cancelled at {hashed_count}/{total_to_hash}");
                 was_cancelled = true;
@@ -4949,7 +5064,7 @@ mod tests {
         let limits: Vec<usize> = pipeline.devices.iter().map(|d| d.limit).collect();
 
         let mut handed_out = 0usize;
-        while let Some(started) = pipeline.next_started() {
+        while let NextHash::Ready(started) = pipeline.next_started() {
             handed_out += 1;
             for (device, limit) in limits.iter().enumerate() {
                 assert!(
@@ -4984,12 +5099,15 @@ mod tests {
         // hardware. Built by hand because the test machine has one disk.
         pipeline.devices = (0..4)
             .map(|i| DeviceQueue {
+                key: Some(format!("disk:test-{i}")),
                 limit: 1,
                 pending: std::collections::VecDeque::from(vec![i]),
             })
             .collect();
 
-        let first = pipeline.next_started().expect("a file to start");
+        let NextHash::Ready(first) = pipeline.next_started() else {
+            panic!("a file to start");
+        };
         assert_eq!(
             pipeline.total_inflight(),
             4,
@@ -4997,6 +5115,103 @@ mod tests {
         );
         release_in_flight_hash(&files[first.index].path, first.claim);
         pipeline.abandon();
+    }
+
+    /// A read the scheduler did not start still occupies the drive. A download
+    /// finishing mid-scan verifies itself by reading the whole file, and if the
+    /// pass cannot see that, it puts its own read alongside — two heads on one
+    /// spindle, which is the thing the per-device limit exists to prevent. The
+    /// transfer never waits; the scan is the side that stands down.
+    #[tokio::test]
+    async fn a_read_the_scheduler_did_not_start_still_holds_the_drive() {
+        let files: Vec<FileInfo> = (0..3)
+            .map(|i| indexed_file(&format!("C:/busy/f{i}.bin"), &"ab".repeat(16)))
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut pipeline = HashLookahead::new(&files, cancel);
+        // A real device key, so `external_reads` can be keyed to match.
+        let key = format!("disk:busy-{}", std::process::id());
+        pipeline.devices = vec![DeviceQueue {
+            key: Some(key.clone()),
+            limit: 1,
+            pending: (0..files.len()).collect(),
+        }];
+
+        // Stand in for a download verifying itself on this drive. Registered
+        // through the same path the transfer uses, via a path we can key.
+        {
+            let _busy = ExternalReadForTest::new(&key);
+            assert_eq!(
+                pipeline.device_inflight(0),
+                1,
+                "the drive is busy even though the pass has started nothing"
+            );
+            // Busy, emphatically *not* Done. Reporting "nothing to hand out"
+            // here would end the scan with every file still queued, and let the
+            // resume cursor move past files nothing ever hashed.
+            assert!(
+                matches!(pipeline.next_started(), NextHash::Busy),
+                "a full device must make the pass wait, not make it think it finished"
+            );
+        }
+
+        // Released, so the pass may proceed.
+        assert_eq!(pipeline.device_inflight(0), 0);
+        let NextHash::Ready(started) = pipeline.next_started() else {
+            panic!("the drive is free again");
+        };
+        release_in_flight_hash(&files[started.index].path, started.claim);
+        pipeline.abandon();
+    }
+
+    /// Deferring to another reader must not become a way to hang. A
+    /// `spawn_blocking` read cannot be aborted, so one wedged on a drive that
+    /// stopped answering holds its guard forever — and without a deadline the
+    /// library would never hash anything again for the rest of the session.
+    #[tokio::test]
+    async fn the_pass_stops_deferring_to_a_read_that_never_ends() {
+        let files: Vec<FileInfo> = vec![indexed_file("C:/stuck/f.bin", &"ab".repeat(16))];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut pipeline = HashLookahead::new(&files, cancel);
+        let key = format!("disk:stuck-{}", std::process::id());
+        pipeline.devices = vec![DeviceQueue {
+            key: Some(key.clone()),
+            limit: 1,
+            pending: (0..files.len()).collect(),
+        }];
+
+        let _never_finishes = ExternalReadForTest::new(&key);
+        assert!(matches!(pipeline.next_started(), NextHash::Busy));
+
+        // Pretend the wait started longer ago than the grace period.
+        pipeline.busy_since = Some(
+            std::time::Instant::now() - EXTERNAL_READ_GRACE - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(
+            pipeline.device_inflight(0),
+            0,
+            "past the grace period the stuck read stops being counted"
+        );
+        let NextHash::Ready(started) = pipeline.next_started() else {
+            panic!("the pass must go ahead rather than wait forever");
+        };
+        release_in_flight_hash(&files[started.index].path, started.claim);
+        pipeline.abandon();
+    }
+
+    /// Registers an external read directly against a device key, which is what
+    /// `disk::note_external_read` does once it has resolved a path to one.
+    struct ExternalReadForTest(String);
+    impl ExternalReadForTest {
+        fn new(key: &str) -> Self {
+            crate::sharing::disk::note_external_read_by_key(key);
+            Self(key.to_string())
+        }
+    }
+    impl Drop for ExternalReadForTest {
+        fn drop(&mut self) {
+            crate::sharing::disk::release_external_read_by_key(&self.0);
+        }
     }
 
     /// The flip side, and the safeguard that must survive all of this: a
@@ -5010,11 +5225,12 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
         let mut pipeline = HashLookahead::new(&files, cancel);
         pipeline.devices = vec![DeviceQueue {
+            key: Some("disk:test-single".to_string()),
             limit: 1,
             pending: (0..files.len()).collect(),
         }];
 
-        while let Some(started) = pipeline.next_started() {
+        while let NextHash::Ready(started) = pipeline.next_started() {
             assert_eq!(
                 pipeline.total_inflight(),
                 1,

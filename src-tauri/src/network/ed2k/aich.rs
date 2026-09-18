@@ -22,31 +22,6 @@ const BLOCKS_PER_FULL_PART: usize = (PARTSIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOC
 /// AICH wait window.
 pub const MAX_AICH_RECOVERY_BYTES: usize = 256 * 1024;
 
-pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    compute_aich_root_cancellable(path, &NEVER)
-}
-
-pub fn compute_aich_root_cancellable(
-    path: &Path,
-    cancelled: &AtomicBool,
-) -> anyhow::Result<[u8; 20]> {
-    let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    if file_size == 0 {
-        return Ok(Sha1::digest([]).into());
-    }
-
-    // Must go through `hash_leaves_from_reader`: chunking the whole file into
-    // fixed AICH_BLOCK_SIZE blocks (what this used to do) ignores the
-    // PARTSIZE restart rule and produces a master hash that disagrees with
-    // `AICHRecoveryHashSet` and with real eMule peers for any multi-part file.
-    let leaf_hashes = hash_leaves_from_reader_cancellable(&mut file, file_size, cancelled)?;
-
-    Ok(hierarchical_root(&leaf_hashes, file_size))
-}
-
 /// Compute the AICH subtree hash for a single part, as that part appears in
 /// the file's top-level part tree.
 ///

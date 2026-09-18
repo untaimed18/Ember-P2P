@@ -94,6 +94,81 @@ pub fn describe_device(path: &Path) -> Option<DeviceInfo> {
     answer
 }
 
+/// Reads in progress that the library scheduler did not start, per device.
+///
+/// A completing download verifies itself by reading the whole file, and that
+/// read lands on a drive the library pass believes it has fully accounted for.
+/// Recording it here lets the scheduler subtract it from that device's budget
+/// rather than pile a read on top of it — on a mechanical drive, the difference
+/// between one seek-free reader and two heads fighting.
+///
+/// Deliberately advisory and one-directional: nothing here blocks or delays the
+/// transfer. A download the user is waiting on outranks a library scan, so the
+/// scan yields to it and never the other way round.
+static EXTERNAL_READS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn external_reads_map() -> &'static Mutex<HashMap<String, usize>> {
+    EXTERNAL_READS.get_or_init(Default::default)
+}
+
+/// Record a read this module's scheduler does not own, until the guard drops.
+#[must_use = "the read is only counted while the guard is alive"]
+pub fn note_external_read(path: &Path) -> ExternalRead {
+    let key = describe_device(path).map(|d| d.key);
+    if let Some(key) = key.as_ref() {
+        note_external_read_by_key(key);
+    }
+    ExternalRead { key }
+}
+
+/// Raise the count for an already-resolved device. Split out so a test can
+/// stand in for a drive without owning one.
+pub(crate) fn note_external_read_by_key(key: &str) {
+    *external_reads_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.to_string())
+        .or_insert(0) += 1;
+}
+
+pub(crate) fn release_external_read_by_key(key: &str) {
+    let mut reads = external_reads_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(count) = reads.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            reads.remove(key);
+        }
+    }
+}
+
+/// How many reads someone else currently has running on this device.
+pub fn external_reads(key: Option<&str>) -> usize {
+    let Some(key) = key else {
+        return 0;
+    };
+    external_reads_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Drop handle for [`note_external_read`].
+pub struct ExternalRead {
+    key: Option<String>,
+}
+
+impl Drop for ExternalRead {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.as_ref() {
+            release_external_read_by_key(key);
+        }
+    }
+}
+
 /// Reads to allow against a device whose seek behaviour is `seeks`.
 ///
 /// `None` — could not find out — is treated exactly as `Some(true)`. That is
