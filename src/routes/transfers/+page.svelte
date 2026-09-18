@@ -146,7 +146,7 @@
     .filter((column) => !DOWNLOAD_COMPACT_COLUMN_KEYS.has(column.key))
     .map((column) => column.key);
   const UPLOAD_COLUMNS: TransferColumn<UlSortField>[] = [
-    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-ul-flag', sortField: 'country' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-ul-flag', sortField: 'country' },
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-ul-client', sortField: 'peer_name' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
     { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },

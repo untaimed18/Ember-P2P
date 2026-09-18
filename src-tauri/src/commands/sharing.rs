@@ -1550,6 +1550,19 @@ struct DigestBackfill {
     /// Paths already queued or done this session, so overlapping scans of the
     /// same folders do not hash the same file twice.
     seen: HashSet<String>,
+    /// Content hashes this pass already has a file queued for.
+    ///
+    /// One digest covers every copy of the same content —
+    /// `set_ember_file_hash_by_hash` stamps it onto every index row sharing the
+    /// hash — so reading the other copies is a whole file read each for an
+    /// answer already in hand, on a pass written to be gentle with the drives.
+    ///
+    /// Deliberately not folded into `seen`: a skipped copy's *path* stays
+    /// unseen, so if the copy that was queued fails, the next scan offers the
+    /// others again. And if it succeeded, their index rows now carry the
+    /// digest and `queue_digest_backfill`'s `ember_file_hash` check drops them
+    /// without a read. Cleared when the pass ends, alongside `running`.
+    queued_hashes: HashSet<String>,
     queued: Vec<FileInfo>,
     done: usize,
     total: usize,
@@ -1585,13 +1598,22 @@ pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<File
         if file.hash.is_empty() || !file.ember_file_hash.is_empty() {
             continue;
         }
-        if state
-            .seen
-            .insert(crate::search::index::normalize_path_key(&file.path))
-        {
-            state.total += 1;
-            state.queued.push(file);
+        let path_key = crate::search::index::normalize_path_key(&file.path);
+        // Path first, and without recording anything: this row is already
+        // queued or done, so it must not consume the content reservation
+        // below on behalf of a copy it is not.
+        if state.seen.contains(&path_key) {
+            continue;
         }
+        // One copy per content hash. A skipped copy's path stays out of
+        // `seen`, so a later scan can offer it if the copy we kept never
+        // produces a digest. See `queued_hashes`.
+        if !state.queued_hashes.insert(file.hash.to_ascii_lowercase()) {
+            continue;
+        }
+        state.seen.insert(path_key);
+        state.total += 1;
+        state.queued.push(file);
     }
     if state.running || state.queued.is_empty() {
         return;
@@ -1672,6 +1694,14 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
                 if backfill.queued.is_empty() {
                     backfill.done = 0;
                     backfill.total = 0;
+                    // Released with the tally, and for the same reason: the
+                    // reservations belong to the queue. Held while work
+                    // remains so a scan arriving mid-pass cannot queue a
+                    // second copy of something still waiting, and dropped once
+                    // there is nothing left for them to protect — which is
+                    // what lets a later scan retry the copies passed over if
+                    // the one that was kept failed.
+                    backfill.queued_hashes.clear();
                 }
                 break;
             }
