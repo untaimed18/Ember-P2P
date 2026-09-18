@@ -1413,16 +1413,48 @@ pub fn run() {
                 let mut was_cancelled = false;
                 let mut page_complete = true;
 
-                for file in &files_to_hash {
+                // Same scheduler the folder-add and reload passes use: one read
+                // at a time per physical drive, more only where a drive has
+                // reported that its reads do not seek. A cold start on a
+                // library spread over several drives used to hash strictly one
+                // file at a time and leave every other drive idle — the same
+                // waste the reload path was fixed for, on the path that runs
+                // before anything else in the app works.
+                let mut pipeline = commands::sharing::HashLookahead::new(
+                    &files_to_hash,
+                    cancel_flag.clone(),
+                );
+                pipeline.log_plan("Startup hashing", total_to_hash);
+                loop {
+                    let started = match pipeline.next_started() {
+                        commands::sharing::NextHash::Ready(started) => started,
+                        // Every drive with work left is busy with a read this
+                        // pass did not start, most likely a download verifying
+                        // itself. Wait rather than pile on, and never mistake
+                        // it for the end of the queue.
+                        commands::sharing::NextHash::Busy => {
+                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                was_cancelled = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        commands::sharing::NextHash::Done => break,
+                    };
                     if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         info!("Startup hashing cancelled at {hashed}/{total_to_hash}");
                         was_cancelled = true;
+                        // Claimed and already running: hand it to the drain or
+                        // its claim outlives the scan.
+                        pipeline.drain_started(started);
                         break;
                     }
 
-                    let file_path = file.path.clone();
+                    let file = &files_to_hash[started.index];
                     let file_temp_id = file.id.clone();
-                    let cf = cancel_flag.clone();
+                    let hash_claim = started.claim;
+                    let mut hash_task = started.task;
 
                     tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
@@ -1432,9 +1464,6 @@ pub fn run() {
                         "file_name": file.name,
                     }));
 
-                    let mut hash_task = tokio::task::spawn_blocking(move || {
-                        FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-                    });
                     let hash_result = tokio::time::timeout(
                         std::time::Duration::from_secs(300),
                         &mut hash_task,
@@ -1543,6 +1572,7 @@ pub fn run() {
                                     }
                                 }
                             }
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Ok(Err(e))) => {
                             if e.to_string().contains("cancelled") {
@@ -1550,18 +1580,24 @@ pub fn run() {
                                 was_cancelled = true;
                                 let mut idx = index_clone.write().await;
                                 idx.abandon_hash_placeholder(&file_temp_id);
+                                drop(idx);
+                                commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
+                            drop(idx);
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
+                            drop(idx);
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Err(_) => {
                             // One slow file must not end the scan. Cancelling the
@@ -1577,23 +1613,39 @@ pub fn run() {
                                 file.name
                             );
                             page_complete = false;
-                            // Drain the abandoned blocking hash for its log line
-                            // only. It must hold no scan lease: the read may be
-                            // stuck in the kernel where the cancel flag cannot
-                            // reach it, and holding the coordination/scan guards
-                            // across that wait would block every later reload and
-                            // stall shutdown for the rest of the session.
+                            // Drain the abandoned blocking hash and release its
+                            // claim only once it really ends. It must hold no
+                            // scan lease: the read may be stuck in the kernel
+                            // where the cancel flag cannot reach it, and holding
+                            // the coordination/scan guards across that wait
+                            // would block every later reload and stall shutdown
+                            // for the rest of the session.
                             let timed_out_name = file.name.clone();
+                            let timed_out_path = file.path.clone();
                             tokio::spawn(async move {
                                 if let Err(error) = hash_task.await {
                                     tracing::warn!(
                                         "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
                                     );
                                 }
+                                commands::sharing::release_in_flight_hash(
+                                    &timed_out_path,
+                                    hash_claim,
+                                );
                             });
                             continue;
                         }
                     }
+                }
+                // Cancelling leaves the look-ahead window full of claimed,
+                // still-running hashes; hand them off to drain rather than
+                // stranding their claims for the length of the lease.
+                pipeline.abandon();
+                // A file another pass still held was never hashed here, so this
+                // page is unfinished and nothing may be reconciled away on the
+                // strength of it.
+                if pipeline.skipped() > 0 {
+                    page_complete = false;
                 }
 
                 {

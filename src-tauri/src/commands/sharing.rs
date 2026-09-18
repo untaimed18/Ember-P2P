@@ -117,7 +117,7 @@ fn try_claim_in_flight_hash(path: &str) -> Option<u64> {
     Some(claim)
 }
 
-fn release_in_flight_hash(path: &str, claim: u64) {
+pub(crate) fn release_in_flight_hash(path: &str, claim: u64) {
     let mut claims = hashing_in_flight()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -162,7 +162,7 @@ fn digest_only_inputs(file: &FileInfo) -> Option<(String, String)> {
 /// start. Every consumer treats "nothing to hand out" as "the pass is over", so
 /// a download verifying itself on the same drive ended the scan early, silently
 /// skipped every remaining file, and let the resume cursor advance past them.
-enum NextHash {
+pub(crate) enum NextHash {
     Ready(StartedHash),
     /// Every device with work left is at its read limit. Nothing to do but
     /// wait; the queues are not empty.
@@ -180,12 +180,12 @@ enum NextHash {
 const EXTERNAL_READ_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One file hash started ahead of the loop that will consume it.
-struct StartedHash {
-    index: usize,
+pub(crate) struct StartedHash {
+    pub(crate) index: usize,
     /// Which device's budget this read is spending, so it can be given back.
     device: usize,
-    claim: u64,
-    task: tokio::task::JoinHandle<HashPassResult>,
+    pub(crate) claim: u64,
+    pub(crate) task: tokio::task::JoinHandle<HashPassResult>,
 }
 
 /// Keeps up to `concurrency` file hashes running ahead of the consumer, handing
@@ -206,7 +206,7 @@ struct StartedHash {
 /// into head travel, but one read each on four drives is four drives working
 /// instead of three sitting idle. A library on a single mechanical disk still
 /// reads exactly one file at a time.
-struct HashLookahead<'a> {
+pub(crate) struct HashLookahead<'a> {
     files: &'a [FileInfo],
     /// One queue per distinct device, each holding its files in discovery
     /// order, plus how many of its reads may be in flight at once.
@@ -239,7 +239,7 @@ struct DeviceQueue {
 }
 
 impl<'a> HashLookahead<'a> {
-    fn new(files: &'a [FileInfo], cancel: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(files: &'a [FileInfo], cancel: Arc<AtomicBool>) -> Self {
         // Group by physical device. Memoised on the parent directory because a
         // file and its directory are always on the same device, and resolving
         // one costs a syscall per path on Linux — tens of thousands of them on
@@ -333,7 +333,7 @@ impl<'a> HashLookahead<'a> {
     }
 
     /// How many files this pass could not start. See [`Self::skipped`].
-    fn skipped(&self) -> usize {
+    pub(crate) fn skipped(&self) -> usize {
         self.skipped
     }
 
@@ -346,7 +346,7 @@ impl<'a> HashLookahead<'a> {
     /// concurrency of 1 that is the difference between the strictly sequential
     /// pass a spinning disk needs and two concurrent reads, which is the exact
     /// thing `sharing::disk` exists to prevent.
-    fn next_started(&mut self) -> NextHash {
+    pub(crate) fn next_started(&mut self) -> NextHash {
         // The consumer asking for another row is what tells us the previous one
         // is finished; nothing else reports back into here. Releasing its
         // device slot first is what lets `fill` start that drive's next file.
@@ -413,7 +413,7 @@ impl<'a> HashLookahead<'a> {
     /// strand the claim until the 15-minute lease expired, and the next scan
     /// would refuse to touch that file. Same drain the per-file timeout branch
     /// performs, for the same reason.
-    fn drain_started(&self, started: StartedHash) {
+    pub(crate) fn drain_started(&self, started: StartedHash) {
         let path = self.files[started.index].path.clone();
         tokio::spawn(async move {
             let _ = started.task.await;
@@ -424,7 +424,7 @@ impl<'a> HashLookahead<'a> {
     /// What this pass decided to do, once, before it starts. Worth a line in
     /// the log because "days" versus "hours" on a big library is entirely down
     /// to how many drives it found and what each of them said about seeking.
-    fn log_plan(&self, what: &str, total: usize) {
+    pub(crate) fn log_plan(&self, what: &str, total: usize) {
         let width: usize = self.devices.iter().map(|d| d.limit).sum();
         if self.devices.len() > 1 || width > 1 {
             info!(
@@ -438,7 +438,7 @@ impl<'a> HashLookahead<'a> {
     /// Let go of everything still queued. Cancelling breaks out of the consumer
     /// loop with the look-ahead window still full, and every file in it is
     /// claimed.
-    fn abandon(&mut self) {
+    pub(crate) fn abandon(&mut self) {
         let pending: Vec<StartedHash> = self.inflight.drain(..).collect();
         for started in pending {
             self.drain_started(started);
