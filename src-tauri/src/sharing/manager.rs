@@ -8,9 +8,32 @@ use crate::types::*;
 
 /// eMule-style rolling window speed measurement.
 /// Stores (cumulative_bytes, timestamp) pairs over a sliding window.
-const SPEED_WINDOW_MS: u128 = 10_000;
+///
+/// Sized to where the status-bar total sits. `BandwidthLimiter::update_speeds`
+/// smooths one-second samples keeping `SPEED_SMOOTHING_NEW` of the new one, so
+/// its step response settles over roughly `1 / (1 - 0.7)` = 3.3 seconds. A row
+/// and the total are the same traffic measured twice, and a user adds the rows
+/// up and compares them against the total — so the two have to answer on the
+/// same timescale. At the old ten seconds they did not: a slot handover dipped
+/// the total at once while every row still showed its pre-handover rate, which
+/// is what made the slot sum read as more than both the total and the
+/// configured limit.
+///
+/// Rounded down rather than up, deliberately. Slightly quicker than the total
+/// means rows lead it through a change instead of trailing above it, so what
+/// divergence is left puts the sum under the total rather than over — the
+/// direction that does not look like the limit being breached.
+const SPEED_WINDOW_MS: u128 = 3_000;
 /// Shortest span a displayed rate may be divided by. See `update_progress`.
 const MIN_SPEED_WINDOW_MS: u128 = 1_000;
+/// How long a row keeps its last rate with no progress event before decaying to
+/// zero, and how long an active download may be quiet and still read healthy.
+///
+/// Deliberately longer than [`SPEED_WINDOW_MS`]: that window is a display
+/// choice about smoothing, while this answers "has this transfer stopped", and
+/// one that has gone quiet for three seconds has not stopped. The two were a
+/// single constant until the window was shortened to track the status bar.
+const SPEED_IDLE_MS: u128 = 10_000;
 const MAX_SPEED_SAMPLES: usize = 500;
 const ACTIVE_DEGRADED_SECS: i64 = 20;
 const ACTIVE_STALLED_SECS: i64 = 60;
@@ -394,7 +417,7 @@ impl TransferManager {
             TransferStatus::Active => {
                 let last_activity = transfer.last_received.unwrap_or(transfer.started_at);
                 let idle_secs = now.saturating_sub(last_activity);
-                if transfer.speed > 0 && idle_secs < (SPEED_WINDOW_MS / 1000) as i64 {
+                if transfer.speed > 0 && idle_secs < (SPEED_IDLE_MS / 1000) as i64 {
                     return (TransferHealth::Healthy, None);
                 }
                 if idle_secs >= ACTIVE_STALLED_SECS {
@@ -620,7 +643,16 @@ impl TransferManager {
             while history.len() > MAX_SPEED_SAMPLES {
                 history.pop_front();
             }
-            while history.len() > 1 {
+            // Down to two, not one. The window bounds how much history a rate
+            // is averaged over; it must not be able to leave nothing to
+            // measure against. Progress events only arrive when bytes move, so
+            // a slow transfer can emit them further apart than the window —
+            // pruning to a single sample would make it report 0 B/s while it
+            // is visibly still going. Keeping the previous sample means the
+            // span simply grows to whatever it really was, which is the honest
+            // rate for a transfer that sparse. `refresh_health` is what
+            // decides when silence means stopped, at `SPEED_IDLE_MS`.
+            while history.len() > 2 {
                 let elapsed = now
                     .saturating_duration_since(history.front().unwrap().1)
                     .as_millis();
@@ -1492,11 +1524,11 @@ impl TransferManager {
     pub fn refresh_health(&mut self, now: i64) -> (Vec<TransferHealthUpdate>, Vec<SpeedReset>) {
         let mut updates = Vec::new();
         let mut speed_resets = Vec::new();
-        let stale_threshold = (SPEED_WINDOW_MS / 1000) as i64;
+        let stale_threshold = (SPEED_IDLE_MS / 1000) as i64;
 
         for transfer in self.active.values_mut() {
             // Decay `speed` to 0 on both directions once no progress event
-            // has landed within the speed-averaging window. Without this,
+            // has landed within the idle window. Without this,
             // upload rows froze their displayed speed forever after a peer
             // stopped requesting blocks: `update_progress` is only called
             // when bytes actually move, so the row retained its last-known
@@ -2264,6 +2296,78 @@ mod tests {
         assert!(
             speed > 0,
             "a slot that has started moving bytes must still ramp, not read zero"
+        );
+    }
+
+    /// Progress events only fire when bytes move, so a slow transfer can emit
+    /// them further apart than the averaging window. Pruning the window down
+    /// to a single sample would leave nothing to measure against and report
+    /// 0 B/s for a transfer that is visibly still running — reachable as soon
+    /// as the window was shortened to track the status bar, and invisible
+    /// before that only because the idle decay used the same ten seconds.
+    ///
+    /// Slow by design: the sleep has to outlast a real `SPEED_WINDOW_MS` for
+    /// the aged-out path to be the one under test.
+    #[test]
+    fn a_transfer_slower_than_the_window_still_reports_a_rate() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+
+        manager.update_progress("a", 0, Some(0));
+        std::thread::sleep(std::time::Duration::from_millis(
+            (SPEED_WINDOW_MS as u64) + 200,
+        ));
+        manager.update_progress("a", 8_000, Some(8_000));
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        assert!(
+            speed > 0,
+            "a transfer whose samples straddle the window read as stopped"
+        );
+        assert_eq!(
+            manager.speed_history["a"].len(),
+            2,
+            "the prune must leave a prior sample to measure against"
+        );
+    }
+
+    /// A transfer row and the status-bar total are the same bytes measured
+    /// twice, and the Uploads tab invites adding the rows up and comparing
+    /// them to the total. That only holds if both answer on the same
+    /// timescale, so the row window is pinned to the settling time of the
+    /// limiter's smoothing rather than chosen independently. Retuning either
+    /// side without the other is what made a slot handover look like the
+    /// upload limit had been breached, so fail here rather than let it drift
+    /// back apart.
+    #[test]
+    fn speed_window_matches_the_status_bar_smoothing() {
+        use crate::bandwidth::limiter::{SPEED_SMOOTHING_DENOMINATOR, SPEED_SMOOTHING_NEW};
+
+        // Retaining `1 - new` of the previous value each second settles over
+        // about `1 / (1 - retained)` seconds.
+        let retained =
+            (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
+                / SPEED_SMOOTHING_DENOMINATOR as f64;
+        let settle_ms = 1_000.0 / (1.0 - retained);
+        assert!(
+            (SPEED_WINDOW_MS as f64) <= settle_ms,
+            "the row window ({SPEED_WINDOW_MS} ms) must not lag the total's \
+             ~{settle_ms:.0} ms settling time — trailing above a dipping total \
+             is the reported bug"
+        );
+        assert!(
+            settle_ms - SPEED_WINDOW_MS as f64 <= 1_000.0,
+            "the row window ({SPEED_WINDOW_MS} ms) has drifted well ahead of \
+             the total's ~{settle_ms:.0} ms settling time"
+        );
+
+        assert!(
+            MIN_SPEED_WINDOW_MS <= SPEED_WINDOW_MS,
+            "the divisor floor cannot exceed the window it floors"
+        );
+        assert!(
+            SPEED_IDLE_MS > SPEED_WINDOW_MS,
+            "a transfer quiet for less than one averaging window has not stopped"
         );
     }
 }

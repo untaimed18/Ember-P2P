@@ -3,6 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+/// Weight given to the newest one-second sample when smoothing the displayed
+/// rate, out of [`SPEED_SMOOTHING_DENOMINATOR`]; the remainder carries the
+/// previous value forward. See [`BandwidthLimiter::update_speeds`].
+///
+/// Named because the per-row rolling window in `sharing::manager` is sized to
+/// the settling time these imply — the status-bar total and the transfer rows
+/// are the same traffic measured twice, and they have to answer on the same
+/// timescale. `speed_window_matches_the_status_bar_smoothing` holds the two
+/// together.
+pub(crate) const SPEED_SMOOTHING_NEW: u64 = 30;
+pub(crate) const SPEED_SMOOTHING_DENOMINATOR: u64 = 100;
+
 /// eMule-style bandwidth limiter with token bucket and partial acquisition.
 ///
 /// Key differences from a naive token bucket:
@@ -518,18 +530,19 @@ impl BandwidthLimiter {
         self.download_speed
             .store(downloaded_delta, Ordering::Relaxed);
 
+        let prev_weight = SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW;
         let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
         let smoothed_up = uploaded_delta
-            .saturating_mul(30)
-            .saturating_add(prev_up.saturating_mul(70))
-            / 100;
+            .saturating_mul(SPEED_SMOOTHING_NEW)
+            .saturating_add(prev_up.saturating_mul(prev_weight))
+            / SPEED_SMOOTHING_DENOMINATOR;
         self.smoothed_upload.store(smoothed_up, Ordering::Relaxed);
 
         let prev_down = self.smoothed_download.load(Ordering::Relaxed);
         let smoothed_down = downloaded_delta
-            .saturating_mul(30)
-            .saturating_add(prev_down.saturating_mul(70))
-            / 100;
+            .saturating_mul(SPEED_SMOOTHING_NEW)
+            .saturating_add(prev_down.saturating_mul(prev_weight))
+            / SPEED_SMOOTHING_DENOMINATOR;
         self.smoothed_download
             .store(smoothed_down, Ordering::Relaxed);
     }
