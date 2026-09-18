@@ -1110,6 +1110,56 @@ mod combined_hash_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The two part-count shapes the multi-part test above cannot reach, now
+    /// that download completion records these part hashes in `known.met`
+    /// instead of re-reading the file to recompute them. They are served to
+    /// peers as the file's hashset, so a disagreement with the standalone
+    /// reader would be a wrong hashset handed out, not merely a slow path.
+    ///
+    /// An exact multiple of `PARTSIZE` gains a trailing `MD4("")` sentinel, and
+    /// a single-part file has no hashset at all. Both are easy to get wrong in
+    /// one implementation and not the other.
+    #[test]
+    fn part_hashes_from_one_pass_match_the_standalone_reader_at_the_boundaries() {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        for (label, file_size) in [
+            ("exactly one part", PARTSIZE),
+            ("single part, short", 4096u64),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "ember-part-boundary-{}-{file_size}.bin",
+                std::process::id()
+            ));
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&path).expect("create temp file");
+                let chunk = vec![0x5au8; 1024 * 1024];
+                let mut remaining = file_size;
+                while remaining > 0 {
+                    let n = remaining.min(chunk.len() as u64) as usize;
+                    f.write_all(&chunk[..n]).expect("write");
+                    remaining -= n as u64;
+                }
+            }
+
+            let mut file = std::fs::File::open(&path).expect("open");
+            let digests = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+                .expect("digests");
+            let standalone = ed2k_part_hashes_file_cancellable(&path, &NEVER).expect("part hashes");
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                digests.part_hashes, standalone,
+                "{label}: the pass and the standalone reader disagree"
+            );
+            assert_eq!(
+                digests.part_hashes.len(),
+                ed2k_known_met_part_hash_count(file_size),
+                "{label}: wrong number of part hashes for known.met"
+            );
+        }
+    }
+
     /// An empty file still answers for whatever was asked, and only that.
     #[test]
     fn an_empty_file_answers_only_what_was_asked() {

@@ -4433,18 +4433,18 @@ impl MultiSourceDownload {
                         );
                     }
                 }
-                Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich))
+                Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich, digests.part_hashes))
             })
             .await
             {
-                Ok(Ok((actual, identity, actual_aich))) if actual == expected => {
+                Ok(Ok((actual, identity, actual_aich, part_hashes))) if actual == expected => {
                     info!(
                         "Multi-source download complete and verified from disk: {}",
                         self.file_name
                     );
-                    Some((identity, actual_aich))
+                    Some((identity, actual_aich, part_hashes))
                 }
-                Ok(Ok((actual, _, _))) => {
+                Ok(Ok((actual, _, _, _))) => {
                     warn!(
                         "Multi-source download hash mismatch for {}: expected={}, got={}",
                         self.file_name, expected, actual
@@ -4496,7 +4496,9 @@ impl MultiSourceDownload {
                         failure_kind: super::transfer::SourceFailureKind::Permanent,
                     })
                     .await;
-            } else if let Some((verified_identity, actual_aich)) = verified_result {
+            } else if let Some((verified_identity, actual_aich, verified_part_hashes)) =
+                verified_result
+            {
                 if let Some(expected_aich) = self.expected_aich_master {
                     let computed = actual_aich.ok_or_else(|| {
                         anyhow::anyhow!("AICH verification did not produce a root")
@@ -4543,7 +4545,18 @@ impl MultiSourceDownload {
                 // instead of making the completion handler re-read this
                 // whole file from disk just to recompute the same values
                 // for `known.met`.
-                let verified_part_hashes = part_hashes.read().await.clone();
+                //
+                // No peer supplied one for some downloads, and the verification
+                // that just ran computed the very same values as a by-product of
+                // the pass it had to make anyway. Handing those over is what
+                // stops the completion handler reading the whole file a second
+                // time purely to learn what we already know.
+                let peer_part_hashes = part_hashes.read().await.clone();
+                let verified_part_hashes = if peer_part_hashes.is_empty() {
+                    verified_part_hashes
+                } else {
+                    peer_part_hashes
+                };
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),

@@ -30083,6 +30083,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     let hash_path = completed_path.clone();
                                     let hashset_tx = part_hashset_result_tx.clone();
                                     tokio::task::spawn_blocking(move || {
+                                        // Another whole-file read the library
+                                        // scheduler would otherwise not see. It
+                                        // rations reads per physical drive, and
+                                        // this one lands on the same spindle a
+                                        // scan may be working through.
+                                        let _drive_busy =
+                                            crate::sharing::disk::note_external_read(&hash_path);
                                         if let Ok(hashes) =
                                             ed2k::hash::ed2k_part_hashes_file(&hash_path)
                                         {
