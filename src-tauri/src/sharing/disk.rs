@@ -111,14 +111,39 @@ fn external_reads_map() -> &'static Mutex<HashMap<String, usize>> {
     EXTERNAL_READS.get_or_init(Default::default)
 }
 
+/// Key standing in for "we could not tell which device this is".
+///
+/// Unknown storage is treated like spinning rust everywhere else in this
+/// module, and an external read has to follow the same rule. Dropping these on
+/// the floor made unknown mean *invisible*, which is the opposite of
+/// conservative: `volume_key` returns `None` for every path on macOS and for
+/// UNC / network shares on Windows, so the whole courtesy mechanism was inert
+/// there and a library scan would read a drive a download was already
+/// verifying itself on. `HashLookahead` groups every unidentifiable path into
+/// one device queue with a limit of 1, so this is the key that queue consults.
+pub(crate) const UNKNOWN_DEVICE_KEY: &str = "disk:unknown";
+
 /// Record a read this module's scheduler does not own, until the guard drops.
 #[must_use = "the read is only counted while the guard is alive"]
 pub fn note_external_read(path: &Path) -> ExternalRead {
-    let key = describe_device(path).map(|d| d.key);
-    if let Some(key) = key.as_ref() {
-        note_external_read_by_key(key);
-    }
-    ExternalRead { key }
+    let key = describe_device(path)
+        .map(|d| d.key)
+        .unwrap_or_else(|| UNKNOWN_DEVICE_KEY.to_string());
+    note_external_read_by_key(&key);
+    ExternalRead { key: Some(key) }
+}
+
+/// Count a read against an already-resolved device until the guard drops.
+///
+/// For a caller that has taken ownership of a read this module's scheduler
+/// started — a timed-out `spawn_blocking` hash being drained — and needs the
+/// drive to stay accounted for meanwhile. `None` is the unidentifiable-device
+/// queue; see [`UNKNOWN_DEVICE_KEY`].
+#[must_use = "the read is only counted while the guard is alive"]
+pub(crate) fn note_external_read_for_key(key: Option<&str>) -> ExternalRead {
+    let key = key.unwrap_or(UNKNOWN_DEVICE_KEY).to_string();
+    note_external_read_by_key(&key);
+    ExternalRead { key: Some(key) }
 }
 
 /// Raise the count for an already-resolved device. Split out so a test can
@@ -144,10 +169,12 @@ pub(crate) fn release_external_read_by_key(key: &str) {
 }
 
 /// How many reads someone else currently has running on this device.
+///
+/// `None` is the unidentifiable-device queue, not "no device": it asks about
+/// [`UNKNOWN_DEVICE_KEY`], where reads on paths we could not resolve are
+/// counted. Returning 0 for it was what made the mechanism inert on macOS.
 pub fn external_reads(key: Option<&str>) -> usize {
-    let Some(key) = key else {
-        return 0;
-    };
+    let key = key.unwrap_or(UNKNOWN_DEVICE_KEY);
     external_reads_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -378,6 +405,28 @@ fn query_device(_key: &str) -> Option<(String, Option<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same rule, applied to the other direction. An external read on
+    /// storage we could not identify used to be discarded outright, which made
+    /// unknown mean *invisible* rather than *assume the worst* — `volume_key`
+    /// answers `None` for every path on macOS and for UNC shares on Windows,
+    /// so the whole courtesy mechanism was inert there and a scan would read a
+    /// drive a download was already verifying itself on.
+    ///
+    /// Counted relative to whatever else is live, since the table is global
+    /// and the test suite runs in parallel.
+    #[test]
+    fn an_unidentifiable_device_still_counts_its_external_reads() {
+        let before = external_reads(None);
+        let guard = note_external_read_for_key(None);
+        assert_eq!(
+            external_reads(None),
+            before + 1,
+            "a read we could not attribute to a drive must still hold that drive's budget"
+        );
+        drop(guard);
+        assert_eq!(external_reads(None), before, "the guard must give it back");
+    }
 
     /// The rule the whole module exists to enforce: widen only on a positive
     /// answer. A device that did not report its seek behaviour reads one file

@@ -628,6 +628,23 @@ pub async fn search_files(
                 client_min_availability,
             )
     });
+    // Rebuild the exemption by hash now the merged list exists. The set handed
+    // to the network task above comes from `local_hits`, which is a *name*
+    // match against the query, so a file held under a different local name was
+    // never exempt there — and it is also truncated at `LOCAL_SEARCH_MAX`.
+    // `rescore_search_results` has always used the hash, which is the actual
+    // "do we hold this file" test, and the two disagreeing is what let a row
+    // be hidden by the search and then un-hidden the moment the user touched
+    // any spam setting. Same lock discipline as the rescore: take the index,
+    // build the set, drop it before `enrich_results_with_batch` takes
+    // `spam_filter`.
+    let owned_ctx = {
+        let li = state.local_index.read().await;
+        BatchSpamContext::for_owned_hashes(results.iter().filter_map(|r| {
+            li.get_by_hash(&r.file.hash.to_ascii_lowercase())
+                .map(|_| r.file.hash.clone())
+        }))
+    };
     // No batch *statistics*: invoke often re-delivers hashes already shown via
     // streamed events, and batch heuristics can flip clean → spam. The owned-file
     // exemption still applies — this list has just been merged with `local_hits`,
@@ -1397,9 +1414,32 @@ pub async fn explain_spam_result(
         }
     };
 
-    let spam = state.spam_filter.read().await;
     const MAX_EXPLAIN_BATCH: usize = 256;
-    let batch = match (batch_file_hashes.as_deref(), batch_file_names.as_deref()) {
+    // Resolve the owned-file exemption before taking `spam_filter`, which is
+    // the lock order `rescore_search_results` is careful about.
+    //
+    // Both scoring paths pass this, so leaving it off here made the one
+    // on-demand "why is this flagged?" path disagree with the row it explains:
+    // a file you are seeding that a poisoning batch collides with shows
+    // "Already in your library" in the list and a nonzero score with collision
+    // reasons in the tooltip the user opened to check it.
+    let owned_hashes: Vec<String> = {
+        let li = state.local_index.read().await;
+        std::iter::once(result.file.hash.clone())
+            .chain(
+                batch_file_hashes
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .take(MAX_EXPLAIN_BATCH)
+                    .cloned(),
+            )
+            .filter(|h| li.get_by_hash(&h.to_ascii_lowercase()).is_some())
+            .collect()
+    };
+
+    let spam = state.spam_filter.read().await;
+    let mut batch = match (batch_file_hashes.as_deref(), batch_file_names.as_deref()) {
         (Some(hashes), Some(names)) if !hashes.is_empty() && hashes.len() == names.len() => {
             let stubs: Vec<SearchResult> = hashes
                 .iter()
@@ -1452,6 +1492,7 @@ pub async fn explain_spam_result(
         }
         _ => BatchSpamContext::default(),
     };
+    batch.set_owned_hashes(owned_hashes);
     let details = spam.explain_result(
         &result,
         &keywords,

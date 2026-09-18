@@ -1027,6 +1027,9 @@
 
   let stopConfirmVisible = $state(false);
   let stoppingHashing = $state(false);
+  /** A `preview_stop_hashing` round trip is in flight. Keeps Stop from being
+   *  pressed twice while it waits. */
+  let stopPreviewPending = $state(false);
   /** Folders that would actually lose files, resolved before the dialog opens.
    *  Empty means stopping is free — which is the usual case, and the case the
    *  dialog used to warn about anyway. */
@@ -1059,6 +1062,11 @@
   }
 
   async function handleStopRequest() {
+    // The preview is an IPC round trip and the button stays mounted for its
+    // duration, so without a guard a double-click issues two previews whose
+    // replies race and the banner can end up describing the wrong one.
+    if (stopPreviewPending) return;
+    stopPreviewPending = true;
     // Ask what stopping would cost before saying anything about it. The dialog
     // warned unconditionally, so a user upgrading a large library — where every
     // file is queued for a one-time digest top-up and none of them can be lost —
@@ -1074,8 +1082,15 @@
       // Couldn't tell: warn rather than reassure.
       stopAtRiskFolders = [];
       stopConfirmUnknown = true;
+    } finally {
+      stopPreviewPending = false;
     }
-    stopConfirmVisible = true;
+    // Only offer the confirmation if there is still something to stop. The
+    // round trip above is long enough for the pass to have finished on its
+    // own, and confirming then would call `stopHashing()` against nothing.
+    if (scanning || hashProgress) {
+      stopConfirmVisible = true;
+    }
   }
 
   function handleStopCancel() {
@@ -1091,6 +1106,13 @@
       await stopHashing();
       scanning = false;
       hashProgress = null;
+      // `stop_hashing` cancels the digest pass too — stopping means stopping
+      // the reads, and that pass reads from the same drives. Clear the note
+      // with it: `stoppedByUser` (set just below) is what gates `runScanPoll`,
+      // the only thing that ever writes this, so a note left standing here
+      // would keep claiming background disk work was running, at a frozen
+      // count, until Resume / Reload / Add folder or a revisit.
+      digestBackfill = null;
       stoppedByUser = true;
       // Keep `stoppedByUser` true: it's exactly what gates the "Resume
       // hashing" banner. Clearing it here (the old behaviour) meant the
@@ -3372,7 +3394,7 @@
           {/if}
         </span>
         {#if !stoppingHashing}
-          <button class="scan-btn stop-btn" onclick={handleStopRequest}>{m.common_stop()}</button>
+          <button class="scan-btn stop-btn" onclick={handleStopRequest} disabled={stopPreviewPending}>{m.common_stop()}</button>
         {/if}
       </div>
       {#if hashProgress && hashProgress.total > 0}

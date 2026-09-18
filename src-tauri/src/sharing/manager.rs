@@ -34,6 +34,16 @@ const MIN_SPEED_WINDOW_MS: u128 = 1_000;
 /// one that has gone quiet for three seconds has not stopped. The two were a
 /// single constant until the window was shortened to track the status bar.
 const SPEED_IDLE_MS: u128 = 10_000;
+// Both relations are between constants, so state them where they are decided
+// and let a bad edit fail the build rather than a test run.
+const _: () = assert!(
+    MIN_SPEED_WINDOW_MS <= SPEED_WINDOW_MS,
+    "the divisor floor cannot exceed the window it floors",
+);
+const _: () = assert!(
+    SPEED_IDLE_MS > SPEED_WINDOW_MS,
+    "a transfer quiet for less than one averaging window has not stopped",
+);
 const MAX_SPEED_SAMPLES: usize = 500;
 const ACTIVE_DEGRADED_SECS: i64 = 20;
 const ACTIVE_STALLED_SECS: i64 = 60;
@@ -2359,15 +2369,6 @@ mod tests {
             settle_ms - SPEED_WINDOW_MS as f64 <= 1_000.0,
             "the row window ({SPEED_WINDOW_MS} ms) has drifted well ahead of \
              the total's ~{settle_ms:.0} ms settling time"
-        );
-
-        assert!(
-            MIN_SPEED_WINDOW_MS <= SPEED_WINDOW_MS,
-            "the divisor floor cannot exceed the window it floors"
-        );
-        assert!(
-            SPEED_IDLE_MS > SPEED_WINDOW_MS,
-            "a transfer quiet for less than one averaging window has not stopped"
         );
     }
 }

@@ -180,6 +180,14 @@ pub(crate) async fn run_graceful_shutdown(
         }
     }
 
+    // The digest backfill deliberately outlives the scan that queued it, so it
+    // is not in `hash_cancel_flags` and the loop above does not reach it. It
+    // reads whole files and it takes `local_index.write()`, which makes it
+    // exactly the kind of task the join below exists to fence — being absent
+    // from both sets meant it kept reading the user's drives through exit and
+    // could still be mid-update during the authoritative flush.
+    crate::commands::sharing::cancel_digest_backfill().await;
+
     // Cancelling a hasher only asks it to stop; the task still has to unwind,
     // and dropping its `JoinHandle` detaches it rather than aborting it. Join
     // the registered scans here so none of them can still hold
@@ -1622,7 +1630,15 @@ pub fn run() {
                             // for the rest of the session.
                             let timed_out_name = file.name.clone();
                             let timed_out_path = file.path.clone();
+                            // Keep the drive spoken for until the abandoned
+                            // read really ends; otherwise the look-ahead sees
+                            // the device as free and stacks another read on
+                            // top of the one still running.
+                            let orphan_device = sharing::disk::note_external_read_for_key(
+                                pipeline.device_key(started.device),
+                            );
                             tokio::spawn(async move {
+                                let _orphan_device = orphan_device;
                                 if let Err(error) = hash_task.await {
                                     tracing::warn!(
                                         "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"

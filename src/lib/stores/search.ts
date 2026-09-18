@@ -81,9 +81,23 @@ function persistSearch() {
   }
 }
 
-const persistedSearch = parsePersistedSearch(
-  typeof sessionStorage === 'undefined' ? null : sessionStorage.getItem(SEARCH_STORAGE_KEY),
-);
+/** Read the persisted blob, or `null` if it cannot be read at all.
+ *
+ *  `persistSearch` already wraps its writes, but this read was guarded only
+ *  against `sessionStorage` being undefined. A webview with storage disabled by
+ *  policy throws `SecurityError` from the property access itself, and because
+ *  this runs at module scope that throw takes the store — and the whole search
+ *  page — down with it. */
+function readPersistedSearch(): string | null {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    return sessionStorage.getItem(SEARCH_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+const persistedSearch = parsePersistedSearch(readPersistedSearch());
 
 export const searchTabs = writable<SearchTab[]>(persistedSearch.tabs);
 export const activeSearchTabId = writable<string | null>(persistedSearch.activeId);
@@ -187,8 +201,12 @@ function pickEmberDigest(existingDigest: string, existingOrigin: string, incomin
  * `spam_rating` is merged with max and `is_spam` with OR, so the two lists have
  * to follow the verdict that survived — otherwise a row shows a high score above
  * a signal list that only justifies a low one, which is exactly what a user
- * reads to decide whether to trust a file. Adopt only when the incoming row
- * newly flags the file or outscores what we hold.
+ * reads to decide whether to trust a file. The merged verdict is the OR, so the
+ * explanation must come from a side that actually flagged the row; only once the
+ * two agree on the verdict does the score decide. Asking merely "does incoming
+ * newly flag, or outscore?" left a flagged 50 meeting an unflagged 60 keeping
+ * `is_spam` while adopting the unflagged pass's reasons, and made the result
+ * depend on which batch happened to arrive first.
  *
  * Mirrors `takes_incoming_spam_signals` in `src-tauri/src/search/merge.rs`;
  * pinned for both sides by `scripts/fixtures/merge-contract.json`. Keep it
@@ -196,7 +214,8 @@ function pickEmberDigest(existingDigest: string, existingOrigin: string, incomin
  * and runs it.
  */
 function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: number, incomingIsSpam: boolean, incomingRating: number): boolean {
-  return (incomingIsSpam && !existingIsSpam) || incomingRating > existingRating;
+  if (incomingIsSpam !== existingIsSpam) return incomingIsSpam;
+  return incomingRating > existingRating;
 }
 
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges

@@ -183,7 +183,7 @@ const EXTERNAL_READ_GRACE: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) struct StartedHash {
     pub(crate) index: usize,
     /// Which device's budget this read is spending, so it can be given back.
-    device: usize,
+    pub(crate) device: usize,
     pub(crate) claim: u64,
     pub(crate) task: tokio::task::JoinHandle<HashPassResult>,
 }
@@ -220,6 +220,10 @@ pub(crate) struct HashLookahead<'a> {
     /// as far as the drive is concerned until the consumer comes back for the
     /// next one.
     handed_out: Option<usize>,
+    /// Latched once [`EXTERNAL_READ_GRACE`] has elapsed with no progress, and
+    /// held until the other readers actually finish. Without the latch the
+    /// decision was re-derived from `busy_since`, which every hand-out clears.
+    ignoring_external: bool,
     /// When the pass first found every remaining device occupied by a read it
     /// did not start. Cleared as soon as one is handed out again.
     busy_since: Option<std::time::Instant>,
@@ -282,6 +286,7 @@ impl<'a> HashLookahead<'a> {
             cancel,
             inflight: std::collections::VecDeque::new(),
             handed_out: None,
+            ignoring_external: false,
             busy_since: None,
             skipped: 0,
         }
@@ -298,7 +303,7 @@ impl<'a> HashLookahead<'a> {
     fn device_inflight(&self, device: usize) -> usize {
         let ours = self.inflight.iter().filter(|s| s.device == device).count()
             + usize::from(self.handed_out == Some(device));
-        if self.waited_out_external() {
+        if self.ignoring_external || self.waited_out_external() {
             return ours;
         }
         ours + crate::sharing::disk::external_reads(self.devices[device].key.as_deref())
@@ -337,6 +342,22 @@ impl<'a> HashLookahead<'a> {
         self.skipped
     }
 
+    /// Identity of the device a handed-out read is spending, for a caller that
+    /// has to keep it accounted for after taking the read over.
+    ///
+    /// A `spawn_blocking` read that hits its timeout cannot be cancelled, so
+    /// the consumer detaches it into a drain task — and from that moment this
+    /// pass stops counting it. Nothing else does either, so `device_inflight`
+    /// sees the drive as free and `fill` starts another read on top of the one
+    /// still going: one extra concurrent read per device per timeout, on
+    /// precisely the wedging storage the timeout exists for, defeating both
+    /// the per-device limit and `MAX_TOTAL_HASH_CONCURRENCY`. Pair this with
+    /// [`crate::sharing::disk::note_external_read_for_key`] and hold the guard
+    /// for the life of the drain.
+    pub(crate) fn device_key(&self, device: usize) -> Option<&str> {
+        self.devices.get(device).and_then(|d| d.key.as_deref())
+    }
+
     /// The next started hash in queue order, or `None` when the queue is spent.
     ///
     /// Tops the window up *before* handing one out, never after. The one it
@@ -351,6 +372,28 @@ impl<'a> HashLookahead<'a> {
         // is finished; nothing else reports back into here. Releasing its
         // device slot first is what lets `fill` start that drive's next file.
         self.handed_out = None;
+        // Latch the decision to stop deferring, rather than re-deriving it from
+        // a timer that the next hand-out clears. `busy_since` is reset every
+        // time a row goes out, so without this the grace bought exactly one
+        // file and then started over: against a read that never returns — the
+        // case the grace exists for — the pass advanced one file per two
+        // minutes forever, which on a large library is indistinguishable from
+        // the hang it was meant to break.
+        if self.waited_out_external() {
+            self.ignoring_external = true;
+        }
+        // Drop the latch once the readers we stood down for have actually
+        // gone, so a later stall gets its own full grace period instead of
+        // inheriting this one.
+        if self.ignoring_external
+            && self
+                .devices
+                .iter()
+                .all(|d| crate::sharing::disk::external_reads(d.key.as_deref()) == 0)
+        {
+            self.ignoring_external = false;
+            self.busy_since = None;
+        }
         self.fill();
         if let Some(started) = self.inflight.pop_front() {
             self.busy_since = None;
@@ -443,6 +486,20 @@ impl<'a> HashLookahead<'a> {
         for started in pending {
             self.drain_started(started);
         }
+    }
+
+    /// Indices still queued behind the look-ahead window, in device order.
+    ///
+    /// [`Self::abandon`] settles the reads already running; these never
+    /// started, so a caller stopping early can hand them back to whatever owns
+    /// the work list instead of dropping them on the floor. Drains, so calling
+    /// it twice yields nothing the second time.
+    pub(crate) fn unstarted(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for device in &mut self.devices {
+            out.extend(device.pending.drain(..));
+        }
+        out
     }
 }
 
@@ -1511,6 +1568,18 @@ pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<File
     if files.is_empty() {
         return;
     }
+    // Stop latches `hashing_paused` before it flips the cancel flags, so a
+    // scan already past its own cancel check still reaches here. Without this
+    // that scan spawned a fresh worker with a fresh cancel flag and the drives
+    // started up again moments after the user asked them to stop. The files
+    // are not lost: they are offered again by the next scan or resume.
+    if app
+        .state::<AppState>()
+        .hashing_paused
+        .load(Ordering::Relaxed)
+    {
+        return;
+    }
     let mut state = digest_backfill().lock().await;
     for file in files {
         if file.hash.is_empty() || !file.ember_file_hash.is_empty() {
@@ -1531,7 +1600,16 @@ pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<File
     state.running = true;
     state.cancel = Some(cancel.clone());
     drop(state);
-    tokio::spawn(async move { run_digest_backfill(app, cancel).await });
+    // Registered like any other background scan so shutdown joins it. It holds
+    // `local_index.write()` and updates `known_files`, which is precisely the
+    // race `await_background_scans` was added to close; detaching it here left
+    // it outside that fence.
+    let app_for_registry = app.clone();
+    let handle = tokio::spawn(async move { run_digest_backfill(app, cancel).await });
+    app_for_registry
+        .state::<AppState>()
+        .register_background_scan(handle)
+        .await;
 }
 
 /// Stop the background pass. Nothing is lost: a file whose digest was never
@@ -1717,6 +1795,26 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         // them strands each claim until its 15-minute lease expires, and
         // nothing may hash those paths in the meantime.
         pipeline.abandon();
+        // Everything the window never reached goes back on the queue. The
+        // top-of-loop cancel branch can only return `batch` — which
+        // `mem::take` emptied — so without this the rest of the batch was
+        // dropped here, and `seen` then kept every one of those paths from
+        // being re-offered for the rest of the session. That is the loss the
+        // branch's own comment says must not happen; it just could not see
+        // these files, because the look-ahead owns them.
+        let unstarted = pipeline.unstarted();
+        // Files the look-ahead could not claim are never coming back this
+        // pass, so count them finished or `done` can never reach `total` — the
+        // same "a progress line that can never reach its total reads as stuck"
+        // the timeout branch above guards against.
+        let skipped = pipeline.skipped();
+        if !unstarted.is_empty() || skipped > 0 {
+            let mut backfill = digest_backfill().lock().await;
+            backfill.done = backfill.done.saturating_add(skipped);
+            for index in unstarted {
+                backfill.queued.push(batch[index].clone());
+            }
+        }
     }
 
     if updated_since_reconcile > 0 {
@@ -2527,7 +2625,14 @@ pub async fn add_shared_folder(
                     // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
                     let timed_out_path = file.path.clone();
+                    // The read is still going; keep its drive spoken for until
+                    // it really ends, or the look-ahead treats the device as
+                    // free and stacks another read on top of it.
+                    let orphan_device = crate::sharing::disk::note_external_read_for_key(
+                        pipeline.device_key(started.device),
+                    );
                     tokio::spawn(async move {
+                        let _orphan_device = orphan_device;
                         let result = hash_task.await;
                         release_in_flight_hash(&timed_out_path, hash_claim);
                         if let Err(error) = result {
@@ -4115,7 +4220,13 @@ async fn reload_shared_files_page(
                     // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
                     let timed_out_path = file.path.clone();
+                    // See the folder-add loop: the drive stays accounted for
+                    // until the abandoned read actually finishes.
+                    let orphan_device = crate::sharing::disk::note_external_read_for_key(
+                        pipeline.device_key(started.device),
+                    );
                     tokio::spawn(async move {
+                        let _orphan_device = orphan_device;
                         let result = hash_task.await;
                         release_in_flight_hash(&timed_out_path, hash_claim);
                         if let Err(error) = result {
@@ -5196,6 +5307,49 @@ mod tests {
             panic!("the pass must go ahead rather than wait forever");
         };
         release_in_flight_hash(&files[started.index].path, started.claim);
+        pipeline.abandon();
+    }
+
+    /// Waiting out a stuck read has to stay waited out. `busy_since` is
+    /// cleared by every hand-out, so deriving the decision from it afresh each
+    /// time bought exactly one file per grace period: against a read that
+    /// never returns the pass crawled at one file every two minutes, which on
+    /// a real library is the same hang the grace was added to break. The
+    /// single-iteration test above cannot see this — it takes a second file.
+    #[tokio::test]
+    async fn waiting_out_a_stuck_read_stays_waited_out() {
+        let files: Vec<FileInfo> = vec![
+            indexed_file("C:/stuck/a.bin", &"ab".repeat(16)),
+            indexed_file("C:/stuck/b.bin", &"cd".repeat(16)),
+        ];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut pipeline = HashLookahead::new(&files, cancel);
+        let key = format!("disk:latched-{}", std::process::id());
+        pipeline.devices = vec![DeviceQueue {
+            key: Some(key.clone()),
+            limit: 1,
+            pending: (0..files.len()).collect(),
+        }];
+
+        let _never_finishes = ExternalReadForTest::new(&key);
+        assert!(matches!(pipeline.next_started(), NextHash::Busy));
+        pipeline.busy_since = Some(
+            std::time::Instant::now() - EXTERNAL_READ_GRACE - std::time::Duration::from_secs(1),
+        );
+
+        // First file: the grace has elapsed, so the wedged read is ignored.
+        let NextHash::Ready(first) = pipeline.next_started() else {
+            panic!("the pass must go ahead once the grace has elapsed");
+        };
+        release_in_flight_hash(&files[first.index].path, first.claim);
+
+        // Second file, with the read still wedged and `busy_since` cleared by
+        // that hand-out. This is the call that used to return `Busy` and start
+        // the two-minute wait over.
+        let NextHash::Ready(second) = pipeline.next_started() else {
+            panic!("the pass must keep going, not re-defer to the same stuck read");
+        };
+        release_in_flight_hash(&files[second.index].path, second.claim);
         pipeline.abandon();
     }
 

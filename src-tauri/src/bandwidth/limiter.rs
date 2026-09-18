@@ -468,33 +468,49 @@ impl BandwidthLimiter {
         if cap == 0 {
             return false;
         }
+        // `.max(1)`: for a cap under 8 the division truncates to zero and the
+        // comparison becomes unsatisfiable, which would silently disable the
+        // gate rather than trip it.
+        let floor = (cap / 8).max(1);
         self.smoothed_upload_speed() >= cap.saturating_mul(3) / 4
-            && self.available_upload_tokens() < cap / 8
+            && self.available_upload_tokens() < floor
     }
 
     /// Charge `bytes` of lower-priority uplink (peer-relay, overlay fan-out
     /// helpers) without taking the share file-upload slots are using.
     ///
-    /// Waits while the bucket is below a quarter of the cap *and* file uploads
-    /// are actually moving; then takes what it can. Unlimited caps skip the
-    /// wait and only count the bytes so the UI still sees the traffic.
+    /// While anything is uploading, this spends only what sits *above* a
+    /// quarter of the cap, so the reserve `file_uploads_own_uplink` keys on is
+    /// genuinely maintained. With the uplink otherwise idle there is nobody to
+    /// protect, so the whole bucket is fair game. Unlimited caps just count the
+    /// bytes so the UI still sees the traffic.
     pub async fn yield_then_take_upload(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let cap = self.effective_upload_rate();
-        if cap == 0 {
-            self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
-            return;
-        }
-        let reserve = (cap / 4).max(1);
         let mut remaining = bytes;
         while remaining > 0 {
-            if self.smoothed_upload_speed() > 0 && self.available_upload_tokens() < reserve {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
+            // Re-read each turn rather than snapshotting: USS moves the
+            // effective rate every second, and a cap lowered while we were
+            // parked left a stale `reserve` above the new bucket ceiling of
+            // `2 * cap`, which no amount of refilling could ever satisfy.
+            let cap = self.effective_upload_rate();
+            if cap == 0 {
+                self.total_uploaded.fetch_add(remaining, Ordering::Relaxed);
+                return;
             }
-            let took = self.try_take_upload(remaining);
+            // Nothing will ever add tokens again, so waiting is waiting
+            // forever. `drain_tokens` reports this to its caller; here there is
+            // no failure channel, so count the bytes and let the transfer that
+            // is about to be torn down anyway proceed.
+            if !self.refill_alive.load(Ordering::Acquire) {
+                self.total_uploaded.fetch_add(remaining, Ordering::Relaxed);
+                return;
+            }
+            let tokens = self.available_upload_tokens();
+            let budget = if self.smoothed_upload_speed() > 0 {
+                tokens.saturating_sub((cap / 4).max(1))
+            } else {
+                tokens
+            };
+            let took = self.try_take_upload(remaining.min(budget));
             if took == 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
@@ -756,6 +772,62 @@ mod tests {
             !unlimited.file_uploads_own_uplink(),
             "unlimited must not refuse buddy/overlay help"
         );
+    }
+
+    /// `file_uploads_own_uplink` can only tell file uploads apart from overlay
+    /// traffic because paced callers leave the bucket above the floor it keys
+    /// on. That was documented but not implemented: the take had no floor, so a
+    /// single relay chunk could drain the bucket dry and the node would then
+    /// report its *own* relay traffic as the thief — suppressing the Ember
+    /// `PROXY_STORE` fan-out with no file uploads running at all, which is the
+    /// opposite of what the pacing is for.
+    #[tokio::test]
+    async fn a_paced_caller_parks_rather_than_eating_the_upload_slots_reserve() {
+        let bw = BandwidthLimiter::new(10_000, 10_000);
+        // Something is uploading, so the reserve applies.
+        for _ in 0..20 {
+            bw.update_speeds(10_000, 0);
+        }
+        assert_eq!(bw.available_upload_tokens(), 10_000);
+
+        // More than the headroom above the reserve (10_000 - 2_500). With no
+        // refill task running, the remainder can only come out of the reserve.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            bw.yield_then_take_upload(9_000),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a paced caller must wait for refill rather than raid the reserve"
+        );
+        assert_eq!(
+            bw.available_upload_tokens(),
+            2_500,
+            "the cap/4 reserve the steal gate keys on has to survive"
+        );
+        assert!(
+            !bw.file_uploads_own_uplink(),
+            "paced traffic must never report itself as owning the uplink"
+        );
+    }
+
+    /// The wait had no exit that did not require tokens, so a dead refill task
+    /// parked the caller at 20 ms forever. `drain_tokens` reports that case to
+    /// its caller; this one has no failure channel, so it has to give up.
+    #[tokio::test]
+    async fn a_paced_caller_gives_up_when_refill_has_died() {
+        let bw = BandwidthLimiter::new(10_000, 10_000);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        bw.stop_refill_for_test();
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            bw.yield_then_take_upload(5_000),
+        )
+        .await
+        .expect("a dead refill task must not park a paced caller forever");
     }
 
     #[test]

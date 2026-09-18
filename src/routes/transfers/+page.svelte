@@ -57,6 +57,24 @@
     return `/flags/${lower}.svg`;
   }
 
+  /** Order two ISO country codes, unknown last on an ascending sort.
+   *
+   *  Shared by all four tables that carry the column, because the same header
+   *  under the same click has to mean the same thing on each of them. A blank
+   *  is not an edge case here — LAN and private ranges never resolve — and
+   *  plain `localeCompare` would open an ascending sort with a block of empty
+   *  flag cells on some tabs and bury them on others. Returns +1 for a blank
+   *  so the caller's `* dir` flip lands it at the end ascending, matching
+   *  `cmpStr` in the Known Peers and queue comparators. */
+  function cmpCountry(a: string | null | undefined, b: string | null | undefined): number {
+    const ax = (a ?? '').toLowerCase();
+    const bx = (b ?? '').toLowerCase();
+    if (ax === bx) return 0;
+    if (!ax) return 1;
+    if (!bx) return -1;
+    return ax < bx ? -1 : 1;
+  }
+
   let sourceUnlisten: UnlistenFn | null = null;
   let searchUnlisten: UnlistenFn | null = null;
   let showAdvancedDlCols = $state(true);
@@ -76,6 +94,19 @@
     defaultHidden?: boolean;
     /** Header tooltip, for a column whose meaning is not self-evident. */
     readonly title?: string;
+  };
+  /** A column in a table where *every* column sorts, so the compiler holds the
+   *  invariant instead of a comment.
+   *
+   *  `sortField` has to stay optional on `TransferColumn` — Uploading, Known
+   *  Peers and Download Clients each carry columns that genuinely cannot sort
+   *  (a progress bar, a name that is identical on every row). But a header only
+   *  becomes clickable, focusable and arrow-bearing when it is set, and the
+   *  click handler early-returns without it, so on a table where all of them
+   *  should sort, a missing one is silently inert and nothing in the type system
+   *  says so. Demanding it here is what makes that a build error. */
+  type SortableColumn<TSort extends string> = TransferColumn<TSort> & {
+    sortField: TSort;
   };
 
   const DOWNLOAD_COLUMNS: TransferColumn<DlSortField>[] = [
@@ -137,21 +168,24 @@
   // user with persisted column widths from the old "On Queue" placeholder
   // tab gets defaults instead of a stale layout that doesn't match the
   // new column set.
-  const QUEUE_COLUMNS: TransferColumn<QuSortField>[] = [
-    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-q-flag', sortField: 'country' },
+  // `SortableColumn`, not `TransferColumn`: every queue column sorts, and that
+  // type is what makes a forgotten `sortField` fail the build rather than ship
+  // an inert header.
+  const QUEUE_COLUMNS: SortableColumn<QuSortField>[] = [
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-q-flag', sortField: 'country' },
     // Nickname and Software sit beside the User ID here for the same reason
     // they do on the Uploading tab: the hash identifies the row, the name is
     // what the person reading it recognises. The queue snapshot carries both
     // now — before, this tab could only offer the truncated hash.
-    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-nick' },
-    { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client' },
-    { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 110, minWidth: 80, className: 'col-q-sw' },
-    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file' },
-    { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait' },
-    { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank' },
-    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-q-score' },
-    { key: 'transfer_history', get label() { return m.transfers_col_up_down(); }, width: 130, minWidth: 110, className: 'col-q-hist' },
-    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident' },
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-nick', sortField: 'peer_name' },
+    { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client', sortField: 'user_name' },
+    { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 110, minWidth: 80, className: 'col-q-sw', sortField: 'client_software' },
+    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file', sortField: 'file_name' },
+    { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait', sortField: 'wait_time' },
+    { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank', sortField: 'queue_rank' },
+    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-q-score', sortField: 'credit_ratio' },
+    { key: 'transfer_history', get label() { return m.transfers_col_up_down(); }, width: 130, minWidth: 110, className: 'col-q-hist', sortField: 'transfer_history' },
+    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident', sortField: 'ident_state' },
   ];
   // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
   // sourced from clients.met. The same columns back both the eD2K-only
@@ -163,7 +197,7 @@
   // persisted via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
   // `KnSortField` type and `toggleKnSort` below).
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
-    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-k-flag', sortField: 'country' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-k-flag', sortField: 'country' },
     { key: 'user_hash', get label() { return showingEmberKnown ? m.transfers_col_user_name() : m.transfers_col_user_hash(); }, width: 248, minWidth: 168, className: 'col-k-hash', sortField: 'user_hash' },
     // The ledger stores what each peer called itself and what it runs, so the
     // eD2K tab no longer has only 32 hex characters to identify a row by.
@@ -191,7 +225,7 @@
   // choice made the rows keep their activity-priority default.
   const CLIENT_COLUMNS: TransferColumn<ClSortField>[] = [
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client', sortField: 'peer_name' },
-    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 48, className: 'col-c-flag', sortField: 'country' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-c-flag', sortField: 'country' },
     { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft', sortField: 'client_software' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
     { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed', sortField: 'speed' },
@@ -759,8 +793,12 @@
     return [...sources].sort((a, b) => {
       let cmp = 0;
       switch (field) {
+        // Unknown country last on ascending, as the Known Peers and queue
+        // tables do it. A blank is common (LAN and private ranges never
+        // resolve), and the same column label under the same click has to mean
+        // the same thing on every tab.
         case 'country':
-          cmp = sortCollator.compare(a.country_code || '', b.country_code || '');
+          cmp = cmpCountry(a.country_code, b.country_code);
           break;
         case 'peer_name':
           cmp = sortCollator.compare(a.peer_name || a.ip, b.peer_name || b.ip);
@@ -2020,7 +2058,7 @@
     sorted.sort((a, b) => {
       let cmp = 0;
       switch (ulSortField) {
-        case 'country': cmp = (a.country_code || '').localeCompare(b.country_code || ''); break;
+        case 'country': cmp = cmpCountry(a.country_code, b.country_code); break;
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
         case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
@@ -2030,7 +2068,15 @@
         case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
         case 'client_software': cmp = (a.client_software || '').localeCompare(b.client_software || ''); break;
       }
-      return ulSortAsc ? cmp : -cmp;
+      if (cmp !== 0) return ulSortAsc ? cmp : -cmp;
+      // Tie-break on the row's own identity, in a fixed direction, the way the
+      // queue / Known Peers / source tables do. `activeUploads` is re-derived
+      // from the store on every poll, so without this the order within a group
+      // of equal keys is whatever the backend last happened to emit, and the
+      // rows visibly reshuffle several times a second. Country made that
+      // obvious — a handful of codes means nearly every pair ties — but Status
+      // and Software have always had the same shape.
+      return a.id.localeCompare(b.id);
     });
     return sorted;
   });

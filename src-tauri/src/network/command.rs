@@ -4269,7 +4269,20 @@ async fn handle_command_inner(
             // single-reporter path the server-connect handler uses for it.
             if let Some(ip) = surviving_highid {
                 state.firewall_checker.handle_server_highid_response(ip);
+                // Paired, as both real HighID paths pair them: a HighID is a
+                // TCP connect-back, so it proves the port is open and not just
+                // what our address is. The address alone left `tcp_status` at
+                // `Unknown` while `firewalled` said false, and
+                // `kad_source_publish_treat_as_firewalled` reads the status
+                // rather than the flag — so the node published no source
+                // records at all until a fresh KAD firewall check completed.
+                state.firewall_checker.handle_tcp_connect_back();
             }
+            // Recompute publish state now that the checker is the one the rest
+            // of the session will read. `reset_stun_keepalive_session` above
+            // refreshed it too, but that ran before the checker was replaced,
+            // so its `tcp_status()` reading was the pre-reset one.
+            update_publish_manager_state(state);
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
             state.last_kad_contact = None;
@@ -4497,8 +4510,17 @@ async fn handle_command_inner(
             // read as going offline, and it is why the upload exemption keyed on
             // a live server session could never fire — this handler used to
             // tear that session down itself a few lines later.
-            let server_session_survives =
-                state.server_connected || state.server_connection.is_some();
+            // `pending_server_connect` counts: this handler deliberately lets a
+            // connect in flight finish, and its completion arm sets
+            // `server_connected` without ever clearing `user_offline`. Reading
+            // that third state as "offline" stranded a node that went on to get
+            // a perfectly good HighID session with its outbound half suppressed
+            // for the rest of the run — no new download workers, no friend
+            // dials, no UDP global search — and nothing to lift it. The window
+            // is seconds wide on startup with `auto_connect_server`.
+            let server_session_survives = state.server_connected
+                || state.server_connection.is_some()
+                || state.pending_server_connect.is_some();
             state
                 .user_offline
                 .store(!server_session_survives, std::sync::atomic::Ordering::Relaxed);

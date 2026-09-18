@@ -227,6 +227,13 @@ fn elected_name(votes: &NameVotes) -> Option<&str> {
 /// signal list that only justifies a low one is worse than either alone, because
 /// that list is what a user reads to decide whether to trust a file.
 ///
+/// The merged verdict is the OR of the two, so the explanation has to come
+/// from a side that actually flagged the row. Only once the two agree on the
+/// verdict does the score decide which of them explains it best. Asking merely
+/// "does incoming newly flag, or outscore?" left the mixed case — a flagged 50
+/// meeting an unflagged 60 — keeping `is_spam` while adopting the *unflagged*
+/// pass's reasons, and made the outcome depend on which batch arrived first.
+///
 /// Mirrored by `takesIncomingSpamSignals` in `src/lib/stores/search.ts`, which
 /// merges the streamed batches a second time per tab, and pinned for both sides
 /// by `scripts/fixtures/merge-contract.json`.
@@ -236,7 +243,10 @@ pub(crate) fn takes_incoming_spam_signals(
     incoming_is_spam: bool,
     incoming_rating: u32,
 ) -> bool {
-    (incoming_is_spam && !existing_is_spam) || incoming_rating > existing_rating
+    if incoming_is_spam != existing_is_spam {
+        return incoming_is_spam;
+    }
+    incoming_rating > existing_rating
 }
 
 fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {

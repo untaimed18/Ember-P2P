@@ -43725,11 +43725,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
                     }
                     Some(BuddyEvent::Disconnected) | None => {
+                        // Retire the receiver unconditionally, and only ask the
+                        // manager to disconnect if it still thinks it is
+                        // connected. The two are not the same condition: a send
+                        // helper that finds its writer dead disconnects the
+                        // session itself, so by the time the channel's close
+                        // reaches us the manager is already `NoBuddy`. A closed
+                        // channel yields `None` from `recv()` immediately and
+                        // forever, so leaving the receiver installed made this
+                        // `select!` arm ready on every iteration and pinned a
+                        // core at 100% for the rest of the session — something
+                        // the peer could induce by accepting our connection and
+                        // then stopping reading.
                         if state.buddy_manager.state() == BuddyState::Connected {
                             state.buddy_manager.disconnect_buddy().await;
-                            state.buddy_event_rx = None;
-                            *state.shared_buddy_info.write().await = None;
                         }
+                        state.buddy_event_rx = None;
+                        *state.shared_buddy_info.write().await = None;
                     }
                 }
             }
@@ -43752,10 +43764,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Unexpected callback on serving side");
                     }
                     Some(BuddyEvent::Disconnected) | None => {
+                        // See the outgoing-buddy arm above: the receiver has to
+                        // be retired even when the manager has already stopped
+                        // serving, or the closed channel spins this arm at
+                        // 100% CPU. `send_pong_to_serving` and
+                        // `send_callback_relay` both disconnect on a dead
+                        // writer, so that ordering is the common case rather
+                        // than a corner.
                         if state.buddy_manager.is_serving() {
                             state.buddy_manager.disconnect_serving();
-                            state.serving_event_rx = None;
                         }
+                        state.serving_event_rx = None;
                     }
                 }
             }

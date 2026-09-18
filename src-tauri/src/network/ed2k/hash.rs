@@ -232,8 +232,15 @@ pub fn hash_open_file_digests_cancellable(
     };
 
     let mut aich_block_hasher = Sha1::new();
-    let num_aich_blocks = file_size.div_ceil(aich_block_size) as usize;
-    let mut aich_leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_aich_blocks);
+    // Reserved only when AICH was asked for. The download-verify paths pass
+    // `aich: expected_aich.is_some()`, which is false whenever no AICH master
+    // is known — the common case — and at 20 bytes per 180 KiB block this
+    // committed ~12 MB for a 100 GiB file that was then never written to.
+    let mut aich_leaf_hashes: Vec<[u8; 20]> = if want.aich {
+        Vec::with_capacity(file_size.div_ceil(aich_block_size) as usize)
+    } else {
+        Vec::new()
+    };
     let mut ember_hasher = crate::network::ember::crypto::Blake3FileHasher::new();
 
     let mut ed2k_part_remaining: u64 = file_size.min(PARTSIZE);

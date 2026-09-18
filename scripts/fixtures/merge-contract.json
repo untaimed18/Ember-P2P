@@ -197,6 +197,22 @@
       "incoming_is_spam": true,
       "incoming_rating": 60,
       "takes_incoming": false
+    },
+    {
+      "name": "an unflagged row cannot take over by outscoring a flagged one",
+      "existing_is_spam": true,
+      "existing_rating": 50,
+      "incoming_is_spam": false,
+      "incoming_rating": 60,
+      "takes_incoming": false
+    },
+    {
+      "name": "and the same two rows in the other order resolve the same way",
+      "existing_is_spam": false,
+      "existing_rating": 60,
+      "incoming_is_spam": true,
+      "incoming_rating": 50,
+      "takes_incoming": true
     }
   ],
   "clamp_source_count_cases": [
