@@ -45,7 +45,7 @@ use self::ed2k::sources::SourceManager;
 use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::kad::bootstrap;
-use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, BuddyWriteStream, PendingBuddySet};
+use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, PendingBuddySet};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::legacy_challenge::LegacyChallengeTracker;
@@ -14278,23 +14278,9 @@ struct NetworkState {
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
     serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
-    /// Background buddy outgoing connect+handshake task
-    /// Yields `(buddy_id, ip, tcp_port, udp_port, …)`; the UDP port is the
-    /// source port of the `FindBuddyRes` and is what firewalled source records
-    /// have to advertise for callbacks.
-    pending_outgoing_buddy: Option<
-        tokio::task::JoinHandle<
-            Option<(
-                KadId,
-                std::net::Ipv4Addr,
-                u16,
-                u16,
-                mpsc::Receiver<BuddyEvent>,
-                BuddyWriteStream,
-                tokio::task::JoinHandle<()>,
-            )>,
-        >,
-    >,
+    /// Background buddy outgoing connect+handshake task.
+    pending_outgoing_buddy:
+        Option<tokio::task::JoinHandle<Option<kad::buddy::OutgoingBuddyConnection>>>,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect
     /// or after auto-connect gives up on the preferred server.
@@ -29683,6 +29669,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &local_index,
                                     &db,
                                     &app_handle,
+                                    &bandwidth_limiter,
                                 ).await;
                             }
                         } else {
@@ -29712,6 +29699,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &transfer_manager,
                                 &source_manager,
                                 &known_files,
+                                &bandwidth_limiter,
                             ).await;
                         }
                     }
@@ -29747,6 +29735,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &local_index,
                                         &db,
                                         &app_handle,
+                                        &bandwidth_limiter,
                                     ).await;
                                 }
                             } else {
@@ -29776,6 +29765,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &transfer_manager,
                                     &source_manager,
                                     &known_files,
+                                    &bandwidth_limiter,
                                 ).await;
                             }
                         }
@@ -35888,6 +35878,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     .filter_incoming_shared
                                                     .clone(),
                                             },
+                                            bandwidth_limiter.clone(),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
 
@@ -43752,7 +43743,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } => {
                 match event {
                     Some(BuddyEvent::PingReceived) => {
-                        state.buddy_manager.send_pong_to_serving().await;
+                        state.buddy_manager.send_pong_to_serving();
                     }
                     Some(BuddyEvent::PongReceived) => {
                         debug!("Serving buddy pong received");
@@ -43778,12 +43769,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } => {
                 state.pending_outgoing_buddy = None;
                 match result {
-                    Ok(Some((buddy_id, buddy_ip, buddy_port, buddy_udp_port, rx, writer, reader_handle))) => {
+                    Ok(Some(conn)) => {
+                        let buddy_id = conn.buddy_id;
+                        let buddy_ip = conn.buddy_ip;
+                        let buddy_port = conn.buddy_tcp_port;
+                        let rx = state.buddy_manager.install_buddy_connection(conn);
                         state.buddy_event_rx = Some(rx);
-                        state.buddy_manager.install_buddy_connection(
-                            buddy_id, buddy_ip, buddy_port, buddy_udp_port,
-                            writer, reader_handle,
-                        );
                         // `CT_EMULE_BUDDYIP` (Hello tag 0xFC) follows the same
                         // wire convention as KAD `TAG_SERVERIP`: eMule sends
                         // `GetBuddy()->GetIP()` (raw `m_dwUserIP` = Winsock
@@ -49290,6 +49281,7 @@ async fn handle_ember_native_udp(
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
         socket,
@@ -49301,6 +49293,7 @@ async fn handle_ember_native_udp(
         local_index,
         db,
         app_handle,
+        bandwidth_limiter,
     ))
     .catch_unwind()
     .await
@@ -49323,6 +49316,7 @@ async fn handle_ember_native_udp_inner(
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     let outcome = state.ember_transport.dispatch_incoming(data, from);
 
@@ -49383,6 +49377,7 @@ async fn handle_ember_native_udp_inner(
                 state,
                 db,
                 app_handle,
+                bandwidth_limiter,
             )
             .await;
         }
@@ -53435,6 +53430,7 @@ async fn handle_ember_dht_message(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Slice 14: per-IP rate limit before any crypto/table work. Wire layout
     // is version(1) + msg_type(1) + …; a truncated frame is dropped by the
@@ -53766,8 +53762,16 @@ async fn handle_ember_dht_message(
     // source record out via the normal publish driver. Charge budget and
     // remember the publisher only after start_publish_to succeeds so a full
     // publish table does not spend quota on a silent drop.
+    //
+    // When file uploads already own a configured cap, skip the fan-out
+    // (and the ACK). The publisher retries; taking the uplink now would
+    // steal tokens from peers we are already serving.
     if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
-        if let Some(publisher) = inbound.sender_id {
+        if bandwidth_limiter.file_uploads_own_uplink() {
+            debug!(
+                "Ember DHT: deferring PROXY_STORE fan-out from {from}; file uploads own the uplink"
+            );
+        } else if let Some(publisher) = inbound.sender_id {
             let now_inst = std::time::Instant::now();
             if state.ember_dht.can_accept_proxy_forward(publisher, now_inst) {
                 let key = forward.keyword_hash;
@@ -54242,6 +54246,7 @@ async fn handle_udp_packet(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -54258,6 +54263,7 @@ async fn handle_udp_packet(
         transfer_manager,
         source_manager,
         known_files,
+        bandwidth_limiter,
     ))
     .catch_unwind()
     .await
@@ -54285,6 +54291,7 @@ async fn handle_udp_packet_inner(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -54355,6 +54362,7 @@ async fn handle_udp_packet_inner(
                     local_index,
                     db,
                     app_handle,
+                    bandwidth_limiter,
                 )
                 .await;
             }
@@ -57160,11 +57168,12 @@ async fn handle_udp_packet_inner(
                             buddy_id,
                             buddy_ip,
                             peer_tcp_port,
+                            buddy_udp_port,
                             user_hash,
                             connect_options,
                             allow_obfuscation,
                         )
-                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, buddy_udp_port, rx, writer, reader_handle))
+                        .await
                 }));
             }
         }
@@ -57185,8 +57194,7 @@ async fn handle_udp_packet_inner(
                 };
                 let relayed = state
                     .buddy_manager
-                    .send_callback_relay(&buddy_id, client_ip, peer_tcp_port, file_id.0)
-                    .await;
+                    .send_callback_relay(&buddy_id, client_ip, peer_tcp_port, file_id.0);
                 if relayed {
                     debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {

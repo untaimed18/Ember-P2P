@@ -436,6 +436,61 @@ impl BandwidthLimiter {
         self.upload_tokens.load(Ordering::Relaxed)
     }
 
+    /// True when a configured upload cap is already being spent on file data,
+    /// so unmetered overlay egress (the Ember `PROXY_STORE` fan-out) would
+    /// steal uplink from peers we are already uploading to.
+    ///
+    /// The token floor is what distinguishes *file* uploads from overlay work,
+    /// and it relies on the reserve in [`Self::yield_then_take_upload`]: paced
+    /// callers hold the bucket at or above `cap / 4`, which is above this
+    /// `cap / 8` floor, so relay traffic never reports itself as the thief.
+    /// Only an unpaced consumer — the eD2K upload slots, which park on
+    /// [`Self::acquire_upload`] and drain the bucket dry — trips this. Keep the
+    /// two fractions apart if either is ever retuned.
+    ///
+    /// Unlimited (`effective_upload_rate() == 0`) never trips this: there is
+    /// no cap to steal from. The Kad buddy TCP path is what must stay off the
+    /// network loop in that case, not a refusal to help.
+    pub fn file_uploads_own_uplink(&self) -> bool {
+        let cap = self.effective_upload_rate();
+        if cap == 0 {
+            return false;
+        }
+        self.smoothed_upload_speed() >= cap.saturating_mul(3) / 4
+            && self.available_upload_tokens() < cap / 8
+    }
+
+    /// Charge `bytes` of lower-priority uplink (peer-relay, overlay fan-out
+    /// helpers) without taking the share file-upload slots are using.
+    ///
+    /// Waits while the bucket is below a quarter of the cap *and* file uploads
+    /// are actually moving; then takes what it can. Unlimited caps skip the
+    /// wait and only count the bytes so the UI still sees the traffic.
+    pub async fn yield_then_take_upload(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let cap = self.effective_upload_rate();
+        if cap == 0 {
+            self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        let reserve = (cap / 4).max(1);
+        let mut remaining = bytes;
+        while remaining > 0 {
+            if self.smoothed_upload_speed() > 0 && self.available_upload_tokens() < reserve {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            let took = self.try_take_upload(remaining);
+            if took == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            remaining -= took;
+        }
+    }
+
     pub fn total_uploaded(&self) -> u64 {
         self.total_uploaded.load(Ordering::Relaxed)
     }
@@ -661,6 +716,34 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn file_uploads_own_uplink_requires_a_saturated_cap() {
+        let bw = BandwidthLimiter::new(10_000, 10_000);
+        assert!(
+            !bw.file_uploads_own_uplink(),
+            "idle cap must not look saturated"
+        );
+        for _ in 0..20 {
+            bw.update_speeds(10_000, 0);
+        }
+        assert!(
+            !bw.file_uploads_own_uplink(),
+            "tokens still full: leftover overlay work is fine"
+        );
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        assert!(
+            bw.file_uploads_own_uplink(),
+            "near-cap observed rate plus an empty bucket is the steal case"
+        );
+
+        let unlimited = BandwidthLimiter::new(0, 0);
+        unlimited.update_speeds(10_000, 0);
+        assert!(
+            !unlimited.file_uploads_own_uplink(),
+            "unlimited must not refuse buddy/overlay help"
+        );
+    }
 
     #[test]
     fn set_configured_limits_applies_fully_when_uss_inactive() {
