@@ -4233,9 +4233,20 @@ async fn handle_command_inner(
 
             // Reset network state (eMule resets firewall, deletes routing zone)
             state.routing_table.clear();
-            set_external_ip(state, None);
+            // A surviving HighID server session still proves two things this
+            // reset used to throw away: our external address, and that our TCP
+            // port is reachable. The address is not even lost — the session is
+            // still holding the client ID `live_highid_external_ip` derives it
+            // from. Discarding them left hole punching, relay and source
+            // records with no notion of where we are, and advertised us as
+            // firewalled while a server was demonstrably connecting back, with
+            // nothing to restore either until the next server login. That was
+            // harmless while this handler also dropped the server; it is
+            // reachable now that it leaves the server alone.
+            let surviving_highid = live_highid_external_ip(state);
+            set_external_ip(state, surviving_highid);
             state.external_udp_port = None;
-            state.firewalled = true;
+            state.firewalled = surviving_highid.is_none();
             // New KAD session (possibly a different network): any STUN
             // candidate/suspend progress and remapped advertise ports from
             // before this disconnect are stale. Also resets the live
@@ -4249,9 +4260,16 @@ async fn handle_command_inner(
             reset_stun_keepalive_session(state);
             state
                 .firewalled_shared
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(surviving_highid.is_none(), std::sync::atomic::Ordering::Relaxed);
             state.firewall_checks_sent = 0;
             state.firewall_checker = FirewallChecker::new();
+            // Hand the fresh checker back the one report that is still true.
+            // KAD's peer votes went with the session; the server's HighID
+            // stands for as long as that session does, and this is the same
+            // single-reporter path the server-connect handler uses for it.
+            if let Some(ip) = surviving_highid {
+                state.firewall_checker.handle_server_highid_response(ip);
+            }
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
             state.last_kad_contact = None;
@@ -4487,8 +4505,10 @@ async fn handle_command_inner(
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
-            state.stats.external_ip = String::new();
-            state.stats.firewalled = true;
+            state.stats.external_ip = surviving_highid
+                .map(|ip| ip.to_string())
+                .unwrap_or_default();
+            state.stats.firewalled = state.firewalled;
             state.stats.buddy_status = "none".to_string();
             state.stats.stores_acknowledged = 0;
             let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
