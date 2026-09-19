@@ -177,7 +177,7 @@ export interface Transfer {
 export interface SourceInfo {
   ip: string;
   port: number;
-  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'unreachable' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed';
+  status: 'connecting' | 'wait_callback' | 'friend_connect' | 'unreachable' | 'queued' | 'stalled' | 'queue_full' | 'no_needed_parts' | 'transferring' | 'completed' | 'failed' | 'parts_busy' | 'waiting_for_slot';
   queue_rank?: number;
   speed: number;
   transferred: number;
@@ -193,7 +193,20 @@ export interface SourceInfo {
    *  its advertised listening port and the ephemeral port of an adopted
    *  inbound connection. */
   user_hash?: number[];
+  /** Which network first told us about this peer, for the sources list's
+   *  Origin column — the backend's `SourceOrigin`, set once at discovery.
+   *
+   *  Absent is a real and expected state, not a gap to paper over: sources
+   *  reloaded from `sources.met` arrive without one (the file has nowhere to
+   *  keep it), as do peers the A4AF swapper moved across files. Render those
+   *  as unknown rather than guessing a network for them. */
+  origin?: SourceOrigin;
 }
+
+/** The networks a download source can be discovered through. Mirrors the Rust
+ *  enum of the same name; see its doc comment for why source exchange is one
+ *  value and why there is no passive equivalent. */
+export type SourceOrigin = 'server' | 'kad' | 'ember' | 'exchange';
 
 /** Media metadata for a search hit (eMule `FT_MEDIA_*` tags). */
 export interface MediaMetadata {
@@ -716,21 +729,44 @@ export interface ServerInfo {
   soft_files: number;
   hard_files: number;
   is_static: boolean;
+  priority: ServerPriority;
   fail_count: number;
   client_id: number;
   is_low_id: boolean;
+}
+
+/** Matches `ServerPriority` in `network/ed2k/server_list.rs`. */
+export type ServerPriority = 'low' | 'normal' | 'high';
+
+/** One line of the backend's server log. Mirrors `network::ServerLogLine`, and
+ *  arrives both as the `server-log` event payload and in the replay returned by
+ *  `invoke('get_server_log')`. */
+export interface ServerLogLine {
+  /** Assigned by the backend, so a replayed line and the live event announcing
+   *  it can be told apart from two genuinely repeated messages. */
+  seq: number;
+  /** Epoch milliseconds the backend recorded the line. */
+  at: number;
+  message: string;
 }
 
 /** Row in the upload-pane "Queued" tab. Mirrors `crate::types::UploadQueueClient`
  *  in the Rust backend; populated by `invoke('get_upload_queue')`. */
 export interface UploadQueueClient {
   user_hash: string;
+  /** Best known address: the live socket, or the last one seen. Waiting peers
+   *  are usually disconnected, so it is mostly the latter. */
   peer_ip: string;
+  /** The peer's advertised listen port. Part of the row key, not displayed. */
   peer_port: number;
   file_hash: string;
   file_name: string;
   wait_seconds: number;
-  queue_rank: number | null;
+  queue_rank: number;
+  /** Whether the peer currently holds a connection; waiting peers usually don't. */
+  connected: boolean;
+  peer_name: string;
+  client_software: string;
   credit_ratio: number;
   uploaded: number;
   downloaded: number;
@@ -740,12 +776,50 @@ export interface UploadQueueClient {
   emule_version: number;
 }
 
+/** Chunk map and part counters behind the downloads "File Details" window.
+ *  Mirrors `crate::types::DownloadFileDetails`; populated by
+ *  `invoke('get_download_file_details')`.
+ *
+ *  Every bitmap is `part_count` bits in the encoding `PartsBar` reads — byte
+ *  index = part / 8, bit = part % 8, LSB-first, lowercase hex. */
+export interface DownloadFileDetails {
+  /** Zero when nothing could be read; see `tracked`. */
+  part_count: number;
+  /** Parts fully on disk. */
+  local_part_status: string;
+  /** Parts at least one known source holds. */
+  swarm_part_status: string;
+  /** Parts whose MD4 has been checked. A count, not a bitmap: only the two
+   *  bitmaps above are drawn. */
+  verified_parts: number;
+  /** Parts being fetched right now. */
+  in_progress_parts: number;
+  /** Holders of the scarcest part, across the sources that have sent a bitmap.
+   *  Zero means some part is held by none of them, so the download cannot
+   *  finish from what we currently know of. */
+  rarest_part_sources: number;
+  /** Sources the frequency figures are drawn from, which is fewer than the
+   *  transfer's source count while some have yet to send a bitmap. */
+  sources_with_bitmaps: number;
+  completed_bytes: number;
+  verified_bytes: number;
+  remaining_bytes: number;
+  /** Wire bytes, which can exceed the file size once retries are counted. */
+  transferred: number;
+  /** False when the download has no registered part tracker, so the window can
+   *  explain the absence rather than imply the file has no parts. */
+  tracked: boolean;
+}
+
 /** Row in the upload-pane "Known ED2K Peers" / "Known Ember Peers"
  *  tabs. Mirrors `crate::types::KnownClient`. Populated by
  *  `invoke('get_known_clients')`. Ember-bound rows (`ember_hash` set)
  *  are shown only on the Ember tab. */
 export interface KnownClient {
   user_hash: string;
+  /** The eD2K client's own Hello nickname; `nickname` below is an Ember friend name. */
+  peer_name: string;
+  client_software: string;
   downloaded: number;
   uploaded: number;
   credit_ratio: number;
@@ -759,6 +833,15 @@ export interface KnownClient {
   is_friend: boolean;
   /** Friend nickname from the friends DB when this row is a friend. */
   nickname?: string;
+}
+
+/** Row counts for the two known-peer tabs, split the same way `KnownClient`
+ *  rows are: a record with a bound Ember identity is an Ember peer, everything
+ *  else is an eD2K peer. Mirrors `crate::types::KnownClientCounts`.
+ *  Populated by `invoke('get_known_client_counts')`. */
+export interface KnownClientCounts {
+  ed2k: number;
+  ember: number;
 }
 
 /** Snapshot of the anti-leech client filter — the eMule-style
@@ -818,11 +901,19 @@ export interface AppSettings {
   /** eD2K only. KAD always bootstraps on startup and has no setting. */
   auto_connect_server: boolean;
   max_sources_per_file: number;
+  /** eMule `maxconnections`. One machine-wide budget shared by the upload
+   *  listener and the outbound download sources. */
   max_connections: number;
+  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast the upload listener
+   *  opens new sockets; 0 disables the gate. */
+  max_connections_per_five_secs: number;
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
   /** Globally prioritize first/last part of every download for faster preview. */
   preview_priority_all: boolean;
+  /** External media player for Preview; empty uses the system default handler.
+   *  Only settable via `pickPreviewPlayer()` — see that function. */
+  preview_player: string;
   skip_compress_video: boolean;
   /** When on, peers whose advertised client-software string matches any
    *  pattern in `<data_dir>/antileech.dat` are rejected at handshake

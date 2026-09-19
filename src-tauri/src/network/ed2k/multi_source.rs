@@ -245,6 +245,39 @@ where
     write_packet_async_ms(writer, req_proto, req_op, &req_payload).await
 }
 
+/// Drop blocks from an already-cut batch that are no longer missing.
+///
+/// `batches` is cut once, on part entry, and then streamed out across the whole
+/// part. Another worker on the same part — the deliberate endgame pile-on that
+/// `in_progress_claims` documents — can fill any of those ranges in the
+/// meantime, and nothing re-checked them before the request went out: the peer
+/// sent the data and the write path dropped it against the gap list. That is a
+/// duplicate download paid for at both ends, and on a file smaller than one
+/// part, where every source is necessarily on the same part, it roughly doubled
+/// the bytes off the wire.
+///
+/// eMule cannot reach this state. It tops its pending list up one block at a
+/// time straight from the live gap list
+/// (`CPartFile::GetNextEmptyBlockInPart`, `PartFile.cpp:1775`), so a range that
+/// filled while it was working is simply never asked for.
+///
+/// Only ranges already on disk are dropped, so this cannot strand bytes: a
+/// range with no gap left needs no request, and gap-filling never reverses
+/// except through `invalidate_range`, which reopens the range for the block
+/// list cut after it. An emptied batch is skipped rather than sent, because an
+/// OP_REQUESTPARTS carrying no range asks the peer for nothing.
+async fn drop_filled_blocks(
+    tracker: &Arc<RwLock<PartTracker>>,
+    batch: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    let t = tracker.read().await;
+    batch
+        .iter()
+        .copied()
+        .filter(|&(start, end)| !t.fillable_subranges(start, end).is_empty())
+        .collect()
+}
+
 /// Persist a snapshot after releasing the tracker lock. The shared
 /// per-path coordinator in `part_tracker` preserves snapshot order.
 async fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
@@ -264,18 +297,113 @@ async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'s
 /// how a popular file ends up *queued* on far more peers than it holds open
 /// sockets to, mirroring eMule (which keeps a large per-file source pool but
 /// only a bounded number of live connections). The machine-wide ceiling is
-/// `GLOBAL_DL_CONN_LIMITER` (eMule `maxconnections`).
+/// `GLOBAL_CONN_LIMITER` (eMule `maxconnections`).
 const MAX_CONCURRENT_SOURCES: usize = 50;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
 
-/// Global cap on simultaneously held outbound download-source connections
-/// across *all* active downloads, wired from `AppSettings::max_connections`
-/// (eMule's machine-wide `maxconnections`). Installed at network start and
-/// resized on settings change. A held connection takes one permit for its
-/// lifetime; detaching to `OnQueue` releases it. This is the safety bound
-/// that keeps the raised per-file budget from exhausting the OS connection
-/// table when many downloads run concurrently.
-static GLOBAL_DL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::sync::OnceLock::new();
+/// The machine-wide cap on client TCP connections, wired from
+/// `AppSettings::max_connections` (eMule's `maxconnections`). Installed at
+/// network start and resized on settings change.
+///
+/// Both directions draw on it, which is what makes the setting mean what it
+/// says. eMule counts every `CClientReqSocket` in one list regardless of who
+/// dialled whom — the constructor registers it at `ListenSocket.cpp:62`, and
+/// `GetOpenSockets()` is that list's length — so `TooManySockets()` gates
+/// inbound accepts and outbound connects against a single number. Ember used
+/// to apply the same setting to each direction separately, which let a user
+/// who asked for 500 end up holding closer to 1000.
+///
+/// A held connection takes one unit for its lifetime; for downloads, detaching
+/// to `OnQueue` releases it. See [`listener_reserve`] for how the two
+/// directions are arbitrated.
+static GLOBAL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::sync::OnceLock::new();
+
+/// Fallback ceiling if a caller reaches the budget before `start_network` has
+/// installed the configured one. Matches `AppSettings::max_connections`'s own
+/// default so the behaviour is the same either way.
+const FALLBACK_CONN_LIMIT: usize = 500;
+
+fn conn_limiter() -> &'static GlobalConnLimiter {
+    GLOBAL_CONN_LIMITER.get_or_init(|| GlobalConnLimiter::new(FALLBACK_CONN_LIMIT))
+}
+
+/// Capacity kept available to the upload listener however many download
+/// sources are running.
+///
+/// eMule has no equivalent, and arbitrates the other way round: inbound accepts
+/// and outbound download connects compete first-come-first-served, and only
+/// upload *promotion* is exempt from the cap — `CUploadQueue::AddUpNextClient`
+/// dials a waiter with `TryToConnect(true)` (`UploadQueue.cpp:208`) where the
+/// download path passes `false` (`DownloadClient.cpp:209`). Holding a slice
+/// back is strictly friendlier than that exemption: it gives the same
+/// guarantee — peers that want to download *from* us are never crowded out by
+/// our own downloads — without letting the total exceed the number the user
+/// configured, which is the whole point of sharing one budget.
+fn listener_reserve(max: usize) -> usize {
+    (max / 4).min(max.saturating_sub(1))
+}
+
+/// How long a download waits for capacity outside [`listener_reserve`] before
+/// it is allowed to draw on the reserve itself. See the loop in
+/// [`acquire_global_dl_conn`] for why the floor is not permanent.
+const MAX_LISTENER_FLOOR_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest a parked download sleeps before re-testing the floor. Only reached
+/// when no connection was released in the meantime.
+const LISTENER_FLOOR_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One connection held by the upload listener against the shared budget.
+/// Releases on drop, exactly as [`GlobalConnPermit`] does for a download.
+pub struct ListenerConnPermit {
+    limiter: &'static GlobalConnLimiter,
+}
+
+impl Drop for ListenerConnPermit {
+    fn drop(&mut self) {
+        self.limiter
+            .in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.limiter.notify.notify_waiters();
+    }
+}
+
+/// Take one connection from the shared budget for the upload listener.
+///
+/// Non-blocking, because the accept loop's only choices are to admit now or
+/// drop the peer; it cannot park. `headroom` is extra capacity *above* the
+/// configured ceiling, used solely by the eD2K server's HighID port-test so a
+/// saturated pool can never cost us a HighID.
+pub fn try_acquire_listener_conn(headroom: usize) -> Option<ListenerConnPermit> {
+    use std::sync::atomic::Ordering;
+    let l = conn_limiter();
+    let ceiling = l
+        .desired_max
+        .load(Ordering::Acquire)
+        .saturating_add(headroom);
+    let mut cur = l.in_use.load(Ordering::Acquire);
+    loop {
+        if cur >= ceiling {
+            return None;
+        }
+        match l
+            .in_use
+            .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return Some(ListenerConnPermit { limiter: l }),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// `(in_use, configured_max)` for the shared budget.
+pub fn shared_conn_snapshot() -> (usize, usize) {
+    use std::sync::atomic::Ordering;
+    let l = conn_limiter();
+    (
+        l.in_use.load(Ordering::Acquire),
+        l.desired_max.load(Ordering::Acquire),
+    )
+}
 
 struct GlobalConnLimiter {
     sem: Arc<tokio::sync::Semaphore>,
@@ -346,13 +474,13 @@ impl GlobalConnLimiter {
     }
 }
 
-/// Install or resize the global download-connection cap. Idempotent; safe to
-/// call from the network-start path and the settings-update arm.
-pub fn set_global_download_conn_limit(max: usize) {
-    match GLOBAL_DL_CONN_LIMITER.get() {
+/// Install or resize the machine-wide connection cap. Idempotent; safe to call
+/// from the network-start path and the settings-update arm.
+pub fn set_global_conn_limit(max: usize) {
+    match GLOBAL_CONN_LIMITER.get() {
         Some(l) => l.set_max(max),
         None => {
-            let _ = GLOBAL_DL_CONN_LIMITER.set(GlobalConnLimiter::new(max));
+            let _ = GLOBAL_CONN_LIMITER.set(GlobalConnLimiter::new(max));
         }
     }
 }
@@ -361,7 +489,7 @@ pub fn set_global_download_conn_limit(max: usize) {
 //
 // Lightweight machine-wide counters so a real run can confirm the queued-source
 // model is behaving and the constants are tuned right. Read by the network
-// loop's periodic summary (`pathb_event_counts` / `global_dl_conn_stats`).
+// loop's periodic summary (`pathb_event_counts` / `global_conn_stats`).
 // Monotonic since process start; cheap relaxed atomics on hot-ish paths.
 static QUEUE_DETACH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PUSH_GRANT_DIVERSION_COUNT: std::sync::atomic::AtomicU64 =
@@ -397,12 +525,17 @@ pub fn pathb_event_counts() -> (u64, u64, u64) {
     )
 }
 
-/// Snapshot of the global download-connection cap for telemetry:
-/// `(in_use, max, total_acquires, contended_acquires)`. `None` before the
-/// limiter is installed (pre-network-start).
-pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
+/// Snapshot of the machine-wide connection budget for telemetry:
+/// `(in_use, max, total_acquires, contended_acquires)`.
+///
+/// `in_use` and `max` cover both directions since the budget was shared; the
+/// two acquire counters remain download-only, which is what they have always
+/// measured. `None` before the limiter is installed, unlike
+/// [`shared_conn_snapshot`], which force-installs it — telemetry should report
+/// "not started yet" rather than bring the budget into being as a side effect.
+pub fn global_conn_stats() -> Option<(usize, usize, u64, u64)> {
     use std::sync::atomic::Ordering;
-    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    let l = GLOBAL_CONN_LIMITER.get()?;
     let max = l.desired_max.load(Ordering::SeqCst);
     let in_use = l.in_use.load(Ordering::SeqCst);
     Some((
@@ -417,7 +550,7 @@ pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
 /// connection slot is in use). Used by trickle-source rotation to confirm the
 /// slot it would free is actually contended before dropping a slow source.
 fn global_dl_conn_contended() -> bool {
-    GLOBAL_DL_CONN_LIMITER.get().is_some_and(|l| {
+    GLOBAL_CONN_LIMITER.get().is_some_and(|l| {
         l.in_use.load(std::sync::atomic::Ordering::Acquire)
             >= l.desired_max.load(std::sync::atomic::Ordering::Acquire)
     })
@@ -463,10 +596,21 @@ impl InUseAcquireGuard {
 
 async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     use std::sync::atomic::Ordering;
-    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    let l = GLOBAL_CONN_LIMITER.get()?;
     GLOBAL_DL_ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let max = l.desired_max.load(Ordering::SeqCst);
+    // The listener's share is not negotiable and is added to every tier,
+    // including the ones that reserve nothing for their own siblings: it is a
+    // floor against the *other direction*, not a priority ordering among our
+    // downloads. The soft wait below can time out and proceed into a priority
+    // reserve, but never into this one — `listener_floor` in the loop is what
+    // makes it hard.
+    // Priority only. The listener's share is enforced as a floor in the loop
+    // below, not here: folding it in made `reserve` non-zero for every tier,
+    // so `high`/`release` — the tiers that are supposed to wait for nothing —
+    // sat out the full `MAX_RESERVE_WAIT` before reaching a check that would
+    // have blocked them at the same threshold anyway.
     let reserve = match priority_ord {
         4 | 5 => 0,                                    // high / release
         2 | 3 => (max / 5).min(max.saturating_sub(1)), // normal / auto (~20%)
@@ -488,6 +632,10 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     } else if l.in_use.load(Ordering::Acquire) >= max {
         GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+    // How long a download defers to the listener's reserve before taking from
+    // it. Matches `MAX_RESERVE_WAIT` above, which is the same trade for the
+    // per-priority reserve.
+    let listener_floor_deadline = std::time::Instant::now() + MAX_LISTENER_FLOOR_WAIT;
     loop {
         // Register the waiter before the capacity check below. `Notified`
         // only enrolls when it is first polled, and every release site uses
@@ -501,8 +649,23 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
         notified.as_mut().enable();
 
         let desired = l.desired_max.load(Ordering::Acquire);
+        // Downloads stop short of the configured ceiling so the upload listener
+        // always has somewhere to put an arriving peer (see `listener_reserve`)
+        // — but only for a bounded time. The listener has no reciprocal cap: it
+        // may take the whole budget, so an enforced-forever floor would let a
+        // node with a busy upload queue park every source dial indefinitely,
+        // which is worse than briefly lending the listener's share back. eMule
+        // does not park at all here — `TryToConnect` simply fails when
+        // `TooManySockets()` and the source is retried later
+        // (`DownloadClient.cpp:209`) — so yielding after a wait is already more
+        // patient than the client we follow.
+        let floor = if std::time::Instant::now() < listener_floor_deadline {
+            desired.saturating_sub(listener_reserve(desired))
+        } else {
+            desired
+        };
         let active = l.in_use.load(Ordering::Acquire);
-        if active < desired {
+        if active < floor {
             if l.in_use
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -528,7 +691,10 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
             }
             continue;
         }
-        notified.await;
+        // Bounded, so the listener-floor deadline above can actually come due.
+        // A release always notifies, so this timeout only fires when nothing
+        // has moved — exactly the case where the floor needs re-evaluating.
+        let _ = tokio::time::timeout(LISTENER_FLOOR_RECHECK, notified).await;
     }
 }
 
@@ -785,6 +951,55 @@ fn no_source_can_ever_arrive(
     sources_empty && !has_source_rx && !has_established_rx
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadTimeoutAction {
+    /// Every byte of the file landed while this worker sat in its read.
+    /// Outranks the rest: whatever this source was waiting for, the file no
+    /// longer needs it, and the part claim it holds is the only thing keeping
+    /// `all_complete_and_settled` false and the transfer out of Verifying.
+    FileComplete,
+    /// Nothing outstanding and no batch left to send.
+    RequestsDrained,
+    /// Slot granted but not a byte has arrived. eMule stays connected and
+    /// re-states the request rather than dropping a peer that may just be
+    /// slow to start.
+    Reassert,
+    /// Slot granted, still nothing, and the patience budget is spent.
+    GiveUpNoData,
+    /// Was transferring, then went silent past `DOWNLOADTIMEOUT_SECS`.
+    GiveUpStalled,
+}
+
+/// What a worker does when its read deadline expires.
+///
+/// Extracted for the same reason as [`injection_wait_action`]: the branch it
+/// replaces sits inside a `select!` inside the receive loop, where the only way
+/// to reach it from a test is a live socket and a real timer.
+fn read_timeout_action(
+    file_complete: bool,
+    outstanding_empty: bool,
+    batches_drained: bool,
+    got_any_data: bool,
+    reasserts_used: u32,
+    max_reasserts: u32,
+    within_patience_budget: bool,
+    has_blocks: bool,
+) -> ReadTimeoutAction {
+    if file_complete {
+        return ReadTimeoutAction::FileComplete;
+    }
+    if outstanding_empty && batches_drained {
+        return ReadTimeoutAction::RequestsDrained;
+    }
+    if got_any_data {
+        return ReadTimeoutAction::GiveUpStalled;
+    }
+    if reasserts_used < max_reasserts && within_patience_budget && has_blocks {
+        return ReadTimeoutAction::Reassert;
+    }
+    ReadTimeoutAction::GiveUpNoData
+}
+
 fn injection_wait_action(
     pending_handles_empty: bool,
     injection_channel_open: bool,
@@ -818,6 +1033,14 @@ impl SourceAbortSet {
 
     fn track<T>(&self, handle: &tokio::task::JoinHandle<T>) {
         if let Ok(mut v) = self.handles.lock() {
+            // Drop handles whose task has already finished before appending.
+            // Five spawn sites feed this set and nothing else drains it until
+            // the worker is dropped, so a long download that cycles through
+            // sources across retry rounds otherwise retains one handle — and
+            // the task allocation it keeps alive — per attempt ever made.
+            // Aborting a finished task is a no-op, so the only thing these
+            // rows cost is memory.
+            v.retain(|h| !h.is_finished());
             v.push(handle.abort_handle());
         }
     }
@@ -2635,15 +2858,14 @@ impl MultiSourceDownload {
                                     queued: queued_count.load(Ordering::Relaxed),
                                 })
                                 .await;
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
+                            // Spelled as `add_source` rather than open-coded, so
+                            // that grepping the add/remove pair finds it. The
+                            // matching `remove_source` is at the bottom of the
+                            // task spawned just below.
+                            chunk_selector
+                                .write()
+                                .await
+                                .add_source(&source.available_parts);
                             info!("Injecting new source {}:{} (idx {src_idx}) into active download", source.peer_ip, source.peer_port);
                             remember_injected_source(&mut injected_sources, source.clone());
                             let src = source.clone();
@@ -2706,6 +2928,8 @@ impl MultiSourceDownload {
                                     Ok(p) => p,
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
+                                // Paired with the `add_source` at the injection
+                                // site above, before this task was spawned.
                                 let freq_avail = avail.clone();
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
@@ -2890,15 +3114,14 @@ impl MultiSourceDownload {
                                     queued: queued_count.load(Ordering::Relaxed),
                                 })
                                 .await;
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
+                            // Spelled as `add_source` rather than open-coded, so
+                            // that grepping the add/remove pair finds it. The
+                            // matching `remove_source` is at the bottom of the
+                            // task spawned just below.
+                            chunk_selector
+                                .write()
+                                .await
+                                .add_source(&source.available_parts);
                             info!(
                                 "Injecting pre-established source {}:{} (idx {src_idx}) into active download",
                                 source.peer_ip, source.peer_port,
@@ -2964,6 +3187,8 @@ impl MultiSourceDownload {
                                     Ok(p) => p,
                                     Err(e) => return (src_idx, Vec::new(), Err(e)),
                                 };
+                                // Paired with the `add_source` at the injection
+                                // site above, before this task was spawned.
                                 let freq_avail = avail.clone();
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
@@ -3402,15 +3627,13 @@ impl MultiSourceDownload {
                         queued: queued_count.load(Ordering::Relaxed),
                     })
                     .await;
-                if !source.available_parts.is_empty() {
-                    let mut cs = chunk_selector.write().await;
-                    for (i, &has) in source.available_parts.iter().enumerate() {
-                        if i < cs.part_frequency.len() && has {
-                            cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                        }
-                    }
-                    cs.total_sources = cs.total_sources.saturating_add(1);
-                }
+                // Spelled as `add_source` rather than open-coded, so that
+                // grepping the add/remove pair finds it. The matching
+                // `remove_source` is at the bottom of the task spawned below.
+                chunk_selector
+                    .write()
+                    .await
+                    .add_source(&source.available_parts);
                 info!(
                     "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
                     retry_round + 1,
@@ -3475,6 +3698,8 @@ impl MultiSourceDownload {
                         Ok(p) => p,
                         Err(_) => return,
                     };
+                    // Paired with the `add_source` at the adoption site above,
+                    // before this task was spawned.
                     let freq_avail = avail.clone();
                     let cancel_ctrl = ctrl.clone();
                     let result = tokio::select! {
@@ -3893,6 +4118,10 @@ impl MultiSourceDownload {
                 let rcmt = self.comment_manager.clone();
 
                 let rcs = chunk_selector.clone();
+                // Second handle on the selector: `rcs` is moved into
+                // `download_parts_from_source`, and this round has to restore
+                // the source's frequency contribution around that call.
+                let rcs_freq = chunk_selector.clone();
                 let ravail = all_sources[src_idx].available_parts.clone();
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
@@ -3940,6 +4169,18 @@ impl MultiSourceDownload {
                         Ok(p) => p,
                         Err(_) => return,
                     };
+                    // Restore this source's frequency contribution for the
+                    // duration of the re-dial. `update_frequencies` counted it
+                    // once at construction and the source's previous task
+                    // removed it on exit, so without this the retry rounds run
+                    // against a table that only ever drains — by the second
+                    // round `total_sources` is 0, every part lands in the
+                    // "very rare" zone, and both rarest-first and the endgame
+                    // availability tie-break stop discriminating.
+                    let freq_avail = ravail.clone();
+                    if !freq_avail.is_empty() {
+                        rcs_freq.write().await.add_source(&freq_avail);
+                    }
                     let cancel_ctrl = rctrl.clone();
                     let result = tokio::select! {
                         res = download_parts_from_source(
@@ -3969,6 +4210,9 @@ impl MultiSourceDownload {
                         ) => res,
                         _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                     };
+                    if !freq_avail.is_empty() {
+                        rcs_freq.write().await.remove_source(&freq_avail);
+                    }
                     if let Err(e) = result {
                         let err_str = e.to_string();
                         note_disk_full(&r_disk_full, &e);
@@ -4158,42 +4402,29 @@ impl MultiSourceDownload {
             });
             let job_cancel = verify_cancel.clone();
             let verified_result = match tokio::task::spawn_blocking(move || {
-                use std::io::{Read, Seek, SeekFrom};
                 let allowed = vec![verify_root.to_string_lossy().into_owned()];
+                // Tell the library scheduler this drive is in use; it rations
+                // reads per physical device and cannot see this one otherwise.
+                // Advisory only — the user is waiting on this file.
+                let _drive_busy = crate::sharing::disk::note_external_read(&verify_path);
                 let (_, mut file) = crate::security::filesystem::open_existing_approved(
                     &verify_path,
                     &allowed,
                     false,
                 )?;
                 let identity = crate::security::filesystem::opened_file_identity(&file)?;
-                let hash =
-                    super::hash::ed2k_hash_open_file_cancellable(&mut file, job_cancel.as_ref())?;
-                let aich = if expected_aich.is_some() {
-                    if job_cancel.load(Ordering::Relaxed) {
-                        anyhow::bail!("cancelled");
-                    }
-                    Some(
-                        super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?
-                            .root_hash,
-                    )
-                } else {
-                    None
-                };
-                if ember_expected != [0u8; 32] {
-                    file.seek(SeekFrom::Start(0))?;
-                    let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
-                    let mut buf = vec![0u8; 1024 * 1024];
-                    loop {
-                        if job_cancel.load(Ordering::Relaxed) {
-                            anyhow::bail!("cancelled");
-                        }
-                        let n = file.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buf[..n]);
-                    }
-                    let got = hasher.finalize();
+                // One pass for all three, as the single-source path does. Read
+                // one at a time, this walked a finished multi-gigabyte download
+                // from end to end once per digest.
+                let digests = super::hash::hash_open_file_digests_cancellable(
+                    &mut file,
+                    super::hash::WantedDigests {
+                        aich: expected_aich.is_some(),
+                        ember: ember_expected != [0u8; 32],
+                    },
+                    job_cancel.as_ref(),
+                )?;
+                if let Some(got) = digests.ember {
                     if got != ember_expected {
                         anyhow::bail!(
                             "ember blake3 mismatch: expected={} got={}",
@@ -4202,18 +4433,18 @@ impl MultiSourceDownload {
                         );
                     }
                 }
-                Ok::<_, anyhow::Error>((hash, identity, aich))
+                Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich, digests.part_hashes))
             })
             .await
             {
-                Ok(Ok((actual, identity, actual_aich))) if actual == expected => {
+                Ok(Ok((actual, identity, actual_aich, part_hashes))) if actual == expected => {
                     info!(
                         "Multi-source download complete and verified from disk: {}",
                         self.file_name
                     );
-                    Some((identity, actual_aich))
+                    Some((identity, actual_aich, part_hashes))
                 }
-                Ok(Ok((actual, _, _))) => {
+                Ok(Ok((actual, _, _, _))) => {
                     warn!(
                         "Multi-source download hash mismatch for {}: expected={}, got={}",
                         self.file_name, expected, actual
@@ -4265,7 +4496,9 @@ impl MultiSourceDownload {
                         failure_kind: super::transfer::SourceFailureKind::Permanent,
                     })
                     .await;
-            } else if let Some((verified_identity, actual_aich)) = verified_result {
+            } else if let Some((verified_identity, actual_aich, verified_part_hashes)) =
+                verified_result
+            {
                 if let Some(expected_aich) = self.expected_aich_master {
                     let computed = actual_aich.ok_or_else(|| {
                         anyhow::anyhow!("AICH verification did not produce a root")
@@ -4312,7 +4545,18 @@ impl MultiSourceDownload {
                 // instead of making the completion handler re-read this
                 // whole file from disk just to recompute the same values
                 // for `known.met`.
-                let verified_part_hashes = part_hashes.read().await.clone();
+                //
+                // No peer supplied one for some downloads, and the verification
+                // that just ran computed the very same values as a by-product of
+                // the pass it had to make anyway. Handing those over is what
+                // stops the completion handler reading the whole file a second
+                // time purely to learn what we already know.
+                let peer_part_hashes = part_hashes.read().await.clone();
+                let verified_part_hashes = if peer_part_hashes.is_empty() {
+                    verified_part_hashes
+                } else {
+                    peer_part_hashes
+                };
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
@@ -4885,10 +5129,12 @@ async fn download_parts_from_source(
             };
 
             // Register this source with the source manager (idempotent).
+            // No origin: we are dialling a peer we already decided to dial, so
+            // whichever network produced it has already said so.
             if let Some(sm) = &source_mgr {
                 if let std::net::IpAddr::V4(v4) = addr.ip() {
                     let mut sm = sm.write().await;
-                    sm.register_source(*file_hash, v4, addr.port());
+                    sm.register_source(*file_hash, v4, addr.port(), None);
                 }
             }
 
@@ -7591,27 +7837,39 @@ async fn download_parts_from_source(
             // network (eMule mods) do not implement the I64 handler and
             // silently drop the request, causing "accepted but no data"
             // timeouts.
-            while sent_idx < batches.len() && sent_idx < max_outstanding {
-                let batch = &batches[sent_idx];
+            // Bounded on blocks actually in flight, not on how far the index
+            // has walked — the same bound both refill loops below use. Keyed
+            // on `sent_idx`, a batch dropped here as already-filled still
+            // consumed a pipeline slot, so a part whose first `max_outstanding`
+            // batches had all been landed by another worker left this loop
+            // having sent nothing at all. Nothing recovers from that: the stall
+            // tick only refills when a request has expired, and there are none.
+            while sent_idx < batches.len() && outstanding_ranges.len() < max_outstanding_blocks {
+                let batch = drop_filled_blocks(&tracker, &batches[sent_idx]).await;
+                if batch.is_empty() {
+                    sent_idx += 1;
+                    continue;
+                }
+                let first_send = sent_idx == 0 && !resumed;
                 let (req_payload, req_proto, req_op) = if needs_i64 {
                     (
-                        build_request_parts_i64(file_hash, batch),
+                        build_request_parts_i64(file_hash, &batch),
                         OP_EMULEPROT,
                         OP_REQUESTPARTS_I64,
                     )
                 } else {
                     (
-                        build_request_parts(file_hash, batch),
+                        build_request_parts(file_hash, &batch),
                         OP_EDONKEYHEADER,
                         OP_REQUESTPARTS,
                     )
                 };
-                if sent_idx == 0 && !resumed {
+                if first_send {
                     info!("Source {} ({}) sending OP_REQUESTPARTS: proto=0x{:02X} op=0x{:02X} len={} payload_hex={}",
                     _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
                 }
                 write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
-                push_outstanding_batch(&mut outstanding_ranges, batch);
+                push_outstanding_batch(&mut outstanding_ranges, &batch);
                 sent_idx += 1;
             }
             // Republished at each send rather than on every receipt: another
@@ -7688,7 +7946,18 @@ async fn download_parts_from_source(
             //     bytes came from this source's blocks for `part_idx` or
             //     from another source piling on for the same part, or
             //     from this source's pipelined blocks for part N+1
-            //     overlapping nothing in part N).
+            //     overlapping nothing in part N), OR
+            //   * the whole file became complete while this worker was
+            //     blocked on read. The `is_part_complete` check at the
+            //     top of the loop only runs between packets; another
+            //     source can close the last gap during a 100s wait, and
+            //     the in-progress claim we still hold then keeps
+            //     `all_complete_and_settled()` false, so the parent
+            //     never enters Verifying. The stall tick / hard timeout
+            //     interrupt that wait only when the *file* is complete,
+            //     because dropping an in-flight read desynchronises the
+            //     socket — safe here because this connection is not
+            //     reused for another part.
             //
             // Was: `while total_received < total_sent_bytes` — broken under
             // pipelining because pipelined N+1 bytes also arrive on this
@@ -7698,6 +7967,11 @@ async fn download_parts_from_source(
             let mut bytes_received_this_part: u64 = 0;
             let mut chunks_received_this_part: u32 = 0;
             let mut bytes_received_for_other_parts: u64 = 0;
+            // Set when we abandon a read that may have consumed part of a
+            // packet, which leaves the stream unparseable. Nothing below reads
+            // from it again, but the AICH repair still *writes* to it and then
+            // waits for an answer, so that request has to be skipped.
+            let mut stream_maybe_desynced = false;
             let receive_loop_started = std::time::Instant::now();
             // DIAG: snapshot the gap state for this part at entry so we can
             // tell whether is_part_complete tripping mid-loop is "the only
@@ -7894,6 +8168,15 @@ async fn download_parts_from_source(
                                 res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
                                 _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
                                 _ = stall_check.tick() => {
+                                    // Another source may have closed the
+                                    // last gap while we were blocked here.
+                                    // See the receive-loop comment above.
+                                    {
+                                        let t = tracker.read().await;
+                                        if t.all_complete() {
+                                            break Err(());
+                                        }
+                                    }
                                     // Emit a fresh `transferring` update
                                     // with recalculated speed (which will
                                     // trend toward 0 as the byte window
@@ -7922,11 +8205,17 @@ async fn download_parts_from_source(
                                         );
                                     }
                                     if expired > 0 {
-                                        let before = sent_idx;
+                                        let mut sent_any = false;
                                         while sent_idx < batches.len()
                                             && outstanding_ranges.len() < max_outstanding_blocks
                                         {
-                                            let batch = batches[sent_idx].clone();
+                                            let batch =
+                                                drop_filled_blocks(&tracker, &batches[sent_idx])
+                                                    .await;
+                                            sent_idx += 1;
+                                            if batch.is_empty() {
+                                                continue;
+                                            }
                                             if write_part_request_batch(
                                                 &mut *writer,
                                                 file_hash,
@@ -7944,9 +8233,16 @@ async fn download_parts_from_source(
                                                 &mut outstanding_ranges,
                                                 &batch,
                                             );
-                                            sent_idx += 1;
+                                            sent_any = true;
                                         }
-                                        if sent_idx > before {
+                                        // Keyed on a request actually going out,
+                                        // not on `sent_idx` moving: skipping a
+                                        // batch whose bytes another worker
+                                        // already landed advances the index
+                                        // without extending the deadline, so a
+                                        // worker whose whole tail went stale
+                                        // still falls through to the exit below.
+                                        if sent_any {
                                             hard_deadline =
                                                 tokio::time::Instant::now() + read_timeout;
                                             ip_guard
@@ -8034,20 +8330,30 @@ async fn download_parts_from_source(
                         return Err(e);
                     }
                     Err(()) => {
-                        if outstanding_ranges.is_empty() && sent_idx >= batches.len() {
-                            exit_reason = "outstanding_drained";
-                            break;
-                        }
-                        if !got_any_data {
-                            // Peer accepted the slot but hasn't begun sending.
-                            // Stay connected and re-assert our block request like
-                            // eMule, as long as we're within the per-source patience
-                            // budget (bounded by the configured queue-wait time and
-                            // a hard re-assert cap).
-                            if no_data_reasserts < MAX_NO_DATA_REASSERTS
-                                && receive_loop_started.elapsed().as_secs() < queue_wait_secs
-                                && !all_blocks.is_empty()
-                            {
+                        let file_complete = tracker.read().await.all_complete();
+                        match read_timeout_action(
+                            file_complete,
+                            outstanding_ranges.is_empty(),
+                            sent_idx >= batches.len(),
+                            got_any_data,
+                            no_data_reasserts,
+                            MAX_NO_DATA_REASSERTS,
+                            receive_loop_started.elapsed().as_secs() < queue_wait_secs,
+                            !all_blocks.is_empty(),
+                        ) {
+                            ReadTimeoutAction::FileComplete => {
+                                // The read we just abandoned may have taken a
+                                // partial packet with it, so the stream can no
+                                // longer be framed.
+                                stream_maybe_desynced = true;
+                                exit_reason = "all_complete";
+                                break;
+                            }
+                            ReadTimeoutAction::RequestsDrained => {
+                                exit_reason = "outstanding_drained";
+                                break;
+                            }
+                            ReadTimeoutAction::Reassert => {
                                 no_data_reasserts += 1;
                                 debug!(
                                 "Source {} ({}) accepted upload but sent no data in {}s — re-asserting part {} request (attempt {}/{}), staying connected like eMule",
@@ -8056,19 +8362,25 @@ async fn download_parts_from_source(
                             );
                                 emit_source!("queued", None, 0u64);
                                 // Re-send the part requests we already had
-                                // outstanding for this part (indices 0..sent_idx).
-                                // Re-sending already-requested ranges is safe: the
-                                // gap tracker ignores bytes for gaps already filled.
+                                // outstanding for this part (indices 0..sent_idx),
+                                // minus anything another worker has landed in the
+                                // meantime — this source has sent us nothing yet,
+                                // so its whole window can be stale by now and
+                                // re-asserting it verbatim would buy duplicates.
                                 for batch in &batches[..sent_idx] {
+                                    let batch = drop_filled_blocks(&tracker, batch).await;
+                                    if batch.is_empty() {
+                                        continue;
+                                    }
                                     let (req_payload, req_proto, req_op) = if needs_i64 {
                                         (
-                                            build_request_parts_i64(file_hash, batch),
+                                            build_request_parts_i64(file_hash, &batch),
                                             OP_EMULEPROT,
                                             OP_REQUESTPARTS_I64,
                                         )
                                     } else {
                                         (
-                                            build_request_parts(file_hash, batch),
+                                            build_request_parts(file_hash, &batch),
                                             OP_EDONKEYHEADER,
                                             OP_REQUESTPARTS,
                                         )
@@ -8088,31 +8400,34 @@ async fn download_parts_from_source(
                                 data_loop_start = std::time::Instant::now();
                                 continue;
                             }
-                            let _ = write_packet_async_ms(
-                                &mut *writer,
-                                OP_EDONKEYHEADER,
-                                OP_CANCELTRANSFER,
-                                &[],
-                            )
-                            .await;
-                            debug!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
-                            _src_idx, addr, no_data_reasserts);
-                            anyhow::bail!(
-                                "peer accepted transfer but sent no data after {} re-assert(s)",
-                                no_data_reasserts
-                            );
-                        } else {
-                            let _ = write_packet_async_ms(
-                                &mut *writer,
-                                OP_EDONKEYHEADER,
-                                OP_CANCELTRANSFER,
-                                &[],
-                            )
-                            .await;
-                            anyhow::bail!(
-                                "stage:data_wait download timeout: no data for {}s",
-                                super::dead_sources::DOWNLOADTIMEOUT_SECS
-                            );
+                            ReadTimeoutAction::GiveUpNoData => {
+                                let _ = write_packet_async_ms(
+                                    &mut *writer,
+                                    OP_EDONKEYHEADER,
+                                    OP_CANCELTRANSFER,
+                                    &[],
+                                )
+                                .await;
+                                debug!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
+                                _src_idx, addr, no_data_reasserts);
+                                anyhow::bail!(
+                                    "peer accepted transfer but sent no data after {} re-assert(s)",
+                                    no_data_reasserts
+                                );
+                            }
+                            ReadTimeoutAction::GiveUpStalled => {
+                                let _ = write_packet_async_ms(
+                                    &mut *writer,
+                                    OP_EDONKEYHEADER,
+                                    OP_CANCELTRANSFER,
+                                    &[],
+                                )
+                                .await;
+                                anyhow::bail!(
+                                    "stage:data_wait download timeout: no data for {}s",
+                                    super::dead_sources::DOWNLOADTIMEOUT_SECS
+                                );
+                            }
                         }
                     }
                 };
@@ -8691,6 +9006,10 @@ async fn download_parts_from_source(
                                                 entry.server_port,
                                                 uh,
                                                 co,
+                                                // Another peer passed this on;
+                                                // the server address is only how
+                                                // the callback gets relayed.
+                                                Some(crate::types::SourceOrigin::Exchange),
                                             );
                                         }
                                         sx_count += 1;
@@ -8713,6 +9032,13 @@ async fn download_parts_from_source(
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer handed us this
+                                            // address. `entry.server_ip` names
+                                            // the server *that peer* uses, not
+                                            // who told us — mistaking the two
+                                            // is what made the first version of
+                                            // this column unreliable.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_entries.push(super::transfer::SourceExchangeEntry {
@@ -8786,6 +9112,10 @@ async fn download_parts_from_source(
                                                 entry.server_port,
                                                 uh,
                                                 co,
+                                                // Another peer passed this on;
+                                                // the server address is only how
+                                                // the callback gets relayed.
+                                                Some(crate::types::SourceOrigin::Exchange),
                                             );
                                         }
                                         sx_count += 1;
@@ -8814,6 +9144,13 @@ async fn download_parts_from_source(
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer handed us this
+                                            // address. `entry.server_ip` names
+                                            // the server *that peer* uses, not
+                                            // who told us — mistaking the two
+                                            // is what made the first version of
+                                            // this column unreliable.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_entries.push(super::transfer::SourceExchangeEntry {
@@ -9282,17 +9619,21 @@ async fn download_parts_from_source(
                 }
 
                 if expired > 0 {
-                    let before = sent_idx;
+                    let mut sent_any = false;
                     while sent_idx < batches.len()
                         && outstanding_ranges.len() < max_outstanding_blocks
                     {
-                        let batch = batches[sent_idx].clone();
+                        let batch = drop_filled_blocks(&tracker, &batches[sent_idx]).await;
+                        sent_idx += 1;
+                        if batch.is_empty() {
+                            continue;
+                        }
                         write_part_request_batch(&mut *writer, file_hash, &batch, needs_i64)
                             .await?;
                         push_outstanding_batch(&mut outstanding_ranges, &batch);
-                        sent_idx += 1;
+                        sent_any = true;
                     }
-                    if sent_idx > before {
+                    if sent_any {
                         ip_guard.publish_in_flight(&outstanding_ranges).await;
                     }
                 }
@@ -9461,7 +9802,10 @@ async fn download_parts_from_source(
                             aich_recovery_data.as_ref().map(|(_, d)| d.clone());
                         let master_opt = *shared_aich_master.master.read().await;
                         if let Some(master_hash) = master_opt {
-                            if recovery_bytes.is_none() && peer_supports_aich {
+                            if recovery_bytes.is_none()
+                                && peer_supports_aich
+                                && !stream_maybe_desynced
+                            {
                                 let aich_should_try = if let std::net::IpAddr::V4(v4) = addr.ip() {
                                     if let Some(ref pending) = aich_pending {
                                         if let Ok(map) = pending.read() {
@@ -9698,6 +10042,33 @@ async fn download_parts_from_source(
                             if let Some(cm) = &credit_mgr {
                                 let mut cm = cm.write().await;
                                 cm.add_downloaded(peer_user_hash, verified_bytes);
+                                // Name the row these bytes just created.
+                                //
+                                // The download side learns the peer's Hello
+                                // name and client software across seven
+                                // different connect paths (plain, obfuscated,
+                                // callback, Ember-Hello, …), all of which have
+                                // converged into `src_peer_name` /
+                                // `src_client_software` by the time bytes
+                                // verify. Recording it here rather than at
+                                // each of those sites covers them all, under
+                                // a lock this path already holds — and it
+                                // names exactly the peers that end up with a
+                                // durable ledger row, since `downloaded > 0`
+                                // is what keeps a record past the
+                                // `clients.met` filter.
+                                //
+                                // Without this, a peer we only ever download
+                                // from stayed a bare 32-character hash in
+                                // Known eD2K Peers: the upload handler was
+                                // the only thing recording identity, and it
+                                // never sees a peer that does not ask us for
+                                // anything.
+                                cm.note_client_identity(
+                                    peer_user_hash,
+                                    &src_peer_name,
+                                    &src_client_software,
+                                );
                                 // Ember credit mirror: record how much
                                 // PoP-verified peers have uploaded to
                                 // us, so their `downloaded` column (from
@@ -10080,7 +10451,25 @@ async fn download_parts_from_source(
         .await
         .ok();
 
-    emit_source!("completed", None, 0u64);
+    // Four different endings reach here and they are not the same event: the
+    // source delivered the parts it was given, or its queue was exhausted with
+    // nothing it could serve, or the peer ran out of part requests and had
+    // nothing left for us, or the in-session re-queue timed out waiting for a
+    // slot. All four reported "completed", which the UI renders as "Done" — so a
+    // peer that had handed over nothing at all, and a peer whose wait for a slot
+    // simply expired, both read as having finished their work.
+    //
+    // That is also why it survived a restart and looked like remembered state:
+    // nothing is persisted, so on every launch these sources reconnected, found
+    // nothing to serve, and reported "Done" again within seconds.
+    //
+    // `src_transferred` is what this source actually contributed, so it settles
+    // which ending this was without any new bookkeeping.
+    if src_transferred > 0 {
+        emit_source!("completed", None, 0u64);
+    } else {
+        emit_source!("no_needed_parts", None, 0u64);
+    }
 
     // Wire-learned availability is released by `_wire_avail_guard` on the way
     // out, whichever exit this source takes. Sources with pre-existing
@@ -10806,6 +11195,36 @@ mod tests {
 
     use super::super::messages::PARTSIZE;
 
+    /// The listener's share of the shared budget has to be real capacity and
+    /// has to leave downloads a usable majority. It is the thing standing
+    /// between "one pool" and downloads crowding out every peer that wants to
+    /// queue with us — which is the failure the single pool would otherwise
+    /// reintroduce.
+    #[test]
+    fn the_listener_reserve_is_a_minority_of_the_budget_above_the_degenerate_range() {
+        // From 4 up. `a_single_connection_budget_still_leaves_downloads_a_slot`
+        // covers 0..=3, where there is nothing to divide.
+        for max in [4usize, 20, 100, 500, 2000] {
+            let reserve = listener_reserve(max);
+            assert!(reserve > 0, "max={max} must hold something back");
+            assert!(
+                reserve < max,
+                "max={max} must leave downloads somewhere to go"
+            );
+            assert!(
+                max - reserve > reserve,
+                "max={max}: downloads should still get the larger share"
+            );
+        }
+    }
+
+    /// Degenerate limits must not underflow or deadlock the download path.
+    #[test]
+    fn a_single_connection_budget_still_leaves_downloads_a_slot() {
+        assert_eq!(listener_reserve(1), 0);
+        assert_eq!(listener_reserve(0), 0);
+    }
+
     /// `yy` in the Sources column is the size of the source list, so committing
     /// a peer that is already in it must not raise the total. Re-committing is
     /// routine — a `parts_busy` source is re-offered about a minute later, an
@@ -10907,6 +11326,51 @@ mod tests {
         // ever against *other* workers.
         let (own, _, _) = compute_part_blocks_ms(&tracker, 0, 0).await;
         assert_eq!(own[0], held[0]);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    /// Ordering the cut is not enough on its own: the batch list is built once
+    /// on part entry and then streamed out for the whole part, so a worker
+    /// sharing the part walks into ranges the other one landed in the meantime
+    /// and asks for them anyway. The peer pays to send them and the write path
+    /// throws them away. eMule never gets here because it pulls one block at a
+    /// time from the live gap list (`PartFile.cpp:1775`).
+    #[tokio::test]
+    async fn a_batch_drops_blocks_another_worker_landed_after_it_was_cut() {
+        use crate::network::ed2k::messages::EMBLOCKSIZE;
+        let (tracker, path) = test_tracker("stale-batch", EMBLOCKSIZE * 3);
+        let batch: Vec<(u64, u64)> = (0..3)
+            .map(|i| (i * EMBLOCKSIZE, (i + 1) * EMBLOCKSIZE))
+            .collect();
+
+        assert_eq!(
+            drop_filled_blocks(&tracker, &batch).await,
+            batch,
+            "nothing is on disk yet, so every block is still worth asking for"
+        );
+
+        tracker.write().await.fill_range(EMBLOCKSIZE, EMBLOCKSIZE * 2);
+        assert_eq!(
+            drop_filled_blocks(&tracker, &batch).await,
+            vec![batch[0], batch[2]],
+            "the block another worker landed must not go out again"
+        );
+
+        // A block only partly on disk still carries a real gap, so it stays:
+        // dropping it is what would strand bytes.
+        tracker.write().await.fill_range(0, EMBLOCKSIZE / 2);
+        assert_eq!(
+            drop_filled_blocks(&tracker, &batch).await,
+            vec![batch[0], batch[2]],
+        );
+
+        tracker.write().await.fill_range(0, EMBLOCKSIZE * 3);
+        assert!(
+            drop_filled_blocks(&tracker, &batch).await.is_empty(),
+            "a fully-landed batch empties, and the caller skips the send rather \
+             than asking the peer for no range at all"
+        );
 
         let _ = std::fs::remove_file(path.with_extension("part.met"));
     }
@@ -11255,6 +11719,84 @@ mod tests {
         assert_eq!(
             injection_wait_action(true, true, true, true),
             InjectionWaitAction::Break,
+        );
+    }
+
+    /// The file finishing while this worker sat in its read outranks every
+    /// other exit. The part claim it still holds is the one thing keeping
+    /// `all_complete_and_settled` false, so until it lets go the parent never
+    /// emits Verifying and the row sits at 100% still calling itself active —
+    /// for up to `DOWNLOADTIMEOUT_SECS`, since nothing else here would fire.
+    #[test]
+    fn a_finished_file_ends_the_read_wait_whatever_else_is_true() {
+        // Mid-transfer, requests outstanding, patience to spare: still done.
+        assert_eq!(
+            read_timeout_action(true, false, false, true, 0, 5, true, true),
+            ReadTimeoutAction::FileComplete,
+        );
+        // And for a source that never got its first byte.
+        assert_eq!(
+            read_timeout_action(true, false, false, false, 0, 5, true, true),
+            ReadTimeoutAction::FileComplete,
+        );
+    }
+
+    /// eMule keeps a peer that took the slot but hasn't started, and re-states
+    /// the request instead of dropping it. That patience is bounded three ways.
+    #[test]
+    fn a_peer_that_never_started_is_re_asserted_until_its_budget_is_spent() {
+        assert_eq!(
+            read_timeout_action(false, false, false, false, 0, 5, true, true),
+            ReadTimeoutAction::Reassert,
+        );
+        assert_eq!(
+            read_timeout_action(false, false, false, false, 5, 5, true, true),
+            ReadTimeoutAction::GiveUpNoData,
+            "re-assert cap reached",
+        );
+        assert_eq!(
+            read_timeout_action(false, false, false, false, 0, 5, false, true),
+            ReadTimeoutAction::GiveUpNoData,
+            "past the queue-wait budget",
+        );
+        assert_eq!(
+            read_timeout_action(false, false, false, false, 0, 5, true, false),
+            ReadTimeoutAction::GiveUpNoData,
+            "nothing left to re-assert",
+        );
+    }
+
+    /// A peer that delivered and then went quiet is a stall, not a slow start:
+    /// re-asserting it would hold a slot open on a dead connection.
+    #[test]
+    fn a_peer_that_went_silent_mid_transfer_is_never_re_asserted() {
+        assert_eq!(
+            read_timeout_action(false, false, false, true, 0, 5, true, true),
+            ReadTimeoutAction::GiveUpStalled,
+        );
+    }
+
+    /// Having drained every request is an ordinary exit, not a failure, so it
+    /// must be reached before either give-up arm marks the source bad.
+    #[test]
+    fn a_worker_with_nothing_left_in_flight_exits_cleanly() {
+        assert_eq!(
+            read_timeout_action(false, true, true, true, 0, 5, true, true),
+            ReadTimeoutAction::RequestsDrained,
+        );
+        assert_eq!(
+            read_timeout_action(false, true, true, false, 0, 5, true, true),
+            ReadTimeoutAction::RequestsDrained,
+        );
+        // Outstanding empty but batches left (or the reverse) is not drained:
+        // there is still work this source can be asked to do.
+        assert_eq!(
+            read_timeout_action(false, true, false, true, 0, 5, true, true),
+            ReadTimeoutAction::GiveUpStalled,
+        );
+        assert_eq!(
+            read_timeout_action(false, false, true, false, 0, 5, true, true),
+            ReadTimeoutAction::Reassert,
         );
     }
 

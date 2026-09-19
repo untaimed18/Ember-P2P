@@ -15,12 +15,6 @@ pub const PARTSIZE: u64 = 9_728_000;
 
 const HASH_BUF_SIZE: usize = 1024 * 1024;
 
-/// Non-cancellable version used by download verification (transfer.rs, multi_source.rs).
-pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    ed2k_hash_file_cancellable(path, &NEVER)
-}
-
 pub fn ed2k_part_hashes_file(path: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
     static NEVER: AtomicBool = AtomicBool::new(false);
     ed2k_part_hashes_file_cancellable(path, &NEVER)
@@ -32,11 +26,6 @@ pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     } else {
         file_size.div_ceil(PARTSIZE) as usize + usize::from(file_size.is_multiple_of(PARTSIZE))
     }
-}
-
-pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    ed2k_hash_open_file_cancellable(&mut file, cancelled)
 }
 
 /// Hash an already-opened file. Callers that enforce filesystem policy use
@@ -164,26 +153,65 @@ pub fn ed2k_part_hashes_file_cancellable(
     Ok(part_hashes)
 }
 
-/// Compute both ED2K and AICH hashes in a single pass over the file,
-/// halving disk I/O compared to computing them separately.
-/// Returns `(ed2k_hash_hex, aich_hash_hex, ed2k_part_hashes, ember_blake3_hex)`.
+/// Which digests a single pass should produce, beyond the ed2k hash it always
+/// computes.
 ///
-/// `ember_blake3_hex` is the streaming BLAKE3 of the whole file (slice 18) —
-/// the Ember content integrity digest published alongside the eD2K MD4 id.
-pub fn hash_file_combined_cancellable(
-    path: &Path,
+/// Selective because the cost is not uniform: MD4 alone runs several times
+/// faster than MD4 with SHA-1 and BLAKE3 alongside it, so a caller that needs
+/// only the ed2k id should not pay for the other two. What it must *not* do is
+/// buy that saving with a second pass over the disk — one read computing three
+/// hashes beats three reads computing one each, on every storage kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WantedDigests {
+    pub aich: bool,
+    pub ember: bool,
+}
+
+impl WantedDigests {
+    /// Everything — what the library indexer records for a file.
+    pub const ALL: Self = Self {
+        aich: true,
+        ember: true,
+    };
+}
+
+/// What one pass over a file produced. `aich` and `ember` are `Some` exactly
+/// when they were asked for.
+#[derive(Clone, Debug)]
+pub struct FileDigests {
+    pub ed2k: String,
+    pub part_hashes: Vec<[u8; 16]>,
+    pub aich: Option<[u8; 20]>,
+    pub ember: Option<[u8; 32]>,
+}
+
+/// Compute the ed2k hash, and whichever of AICH and BLAKE3 were asked for, in a
+/// single pass over an already-open file.
+///
+/// One pass is the entire point. The three digests chunk the file differently —
+/// ed2k by 9500 KiB part, AICH by 180 KiB block, BLAKE3 not at all — so they
+/// look like they want separate reads, and the interleaving below is what lets
+/// them share one. Download verification used to read the file three times over
+/// for exactly this reason.
+///
+/// Seeks to the start, so the caller's file position does not matter.
+pub fn hash_open_file_digests_cancellable(
+    file: &mut std::fs::File,
+    want: WantedDigests,
     cancelled: &AtomicBool,
-) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String)> {
+) -> anyhow::Result<FileDigests> {
     use sha1::Sha1;
 
-    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
     let file_size = file.metadata()?.len();
 
     if file_size == 0 {
-        let ed2k = hex::encode(Md4::digest([]));
-        let aich = hex::encode(<[u8; 20]>::from(Sha1::digest([])));
-        let ember = hex::encode(blake3::hash(&[]).as_bytes());
-        return Ok((ed2k, aich, Vec::new(), ember));
+        return Ok(FileDigests {
+            ed2k: hex::encode(Md4::digest([])),
+            part_hashes: Vec::new(),
+            aich: want.aich.then(|| <[u8; 20]>::from(Sha1::digest([]))),
+            ember: want.ember.then(|| *blake3::hash(&[]).as_bytes()),
+        });
     }
 
     let is_single_part = file_size < PARTSIZE;
@@ -204,8 +232,15 @@ pub fn hash_file_combined_cancellable(
     };
 
     let mut aich_block_hasher = Sha1::new();
-    let num_aich_blocks = file_size.div_ceil(aich_block_size) as usize;
-    let mut aich_leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_aich_blocks);
+    // Reserved only when AICH was asked for. The download-verify paths pass
+    // `aich: expected_aich.is_some()`, which is false whenever no AICH master
+    // is known — the common case — and at 20 bytes per 180 KiB block this
+    // committed ~12 MB for a 100 GiB file that was then never written to.
+    let mut aich_leaf_hashes: Vec<[u8; 20]> = if want.aich {
+        Vec::with_capacity(file_size.div_ceil(aich_block_size) as usize)
+    } else {
+        Vec::new()
+    };
     let mut ember_hasher = crate::network::ember::crypto::Blake3FileHasher::new();
 
     let mut ed2k_part_remaining: u64 = file_size.min(PARTSIZE);
@@ -224,21 +259,30 @@ pub fn hash_file_combined_cancellable(
             anyhow::bail!("unexpected EOF: {} bytes remaining", file_remaining);
         }
 
-        ember_hasher.update(&buf[..n]);
+        if want.ember {
+            ember_hasher.update(&buf[..n]);
+        }
 
         let mut offset = 0;
         while offset < n {
             let available = n - offset;
-            let can_take = available
-                .min(ed2k_part_remaining as usize)
-                .min(aich_block_remaining as usize);
+            // The slice has to stop at whichever boundary comes first among the
+            // digests actually being computed. An AICH block boundary is not a
+            // boundary at all when AICH was not asked for, and letting it split
+            // the slice anyway would only cost extra loop turns.
+            let mut can_take = available.min(ed2k_part_remaining as usize);
+            if want.aich {
+                can_take = can_take.min(aich_block_remaining as usize);
+            }
 
             let data = &buf[offset..offset + can_take];
             ed2k_part_hasher.update(data);
-            aich_block_hasher.update(data);
+            if want.aich {
+                aich_block_hasher.update(data);
+                aich_block_remaining -= can_take as u64;
+            }
 
             ed2k_part_remaining -= can_take as u64;
-            aich_block_remaining -= can_take as u64;
             file_remaining -= can_take as u64;
             offset += can_take;
 
@@ -248,16 +292,18 @@ pub fn hash_file_combined_cancellable(
                 ed2k_part_hash_list.push(part_hash);
                 ed2k_part_remaining = file_remaining.min(PARTSIZE);
 
-                // AICH blocks never straddle a part boundary — eMule's
-                // CAICHHashTree hashes each part's blocks independently
-                // (SHAHashSet.cpp), so force-finalize the current block
-                // here even if it's short of a full AICH_BLOCK_SIZE (this
-                // is *always* the case, since PARTSIZE isn't a multiple of
-                // AICH_BLOCK_SIZE), then start the next part's block count
-                // fresh from its own beginning.
-                aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
-                aich_block_remaining = file_remaining.min(aich_block_size);
-            } else if aich_block_remaining == 0 {
+                if want.aich {
+                    // AICH blocks never straddle a part boundary — eMule's
+                    // CAICHHashTree hashes each part's blocks independently
+                    // (SHAHashSet.cpp), so force-finalize the current block
+                    // here even if it's short of a full AICH_BLOCK_SIZE (this
+                    // is *always* the case, since PARTSIZE isn't a multiple of
+                    // AICH_BLOCK_SIZE), then start the next part's block count
+                    // fresh from its own beginning.
+                    aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
+                    aich_block_remaining = file_remaining.min(aich_block_size);
+                }
+            } else if want.aich && aich_block_remaining == 0 {
                 aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
                 aich_block_remaining = file_remaining.min(aich_block_size);
             }
@@ -275,11 +321,63 @@ pub fn hash_file_combined_cancellable(
         hex::encode(Md4::digest(&ed2k_part_hashes))
     };
 
-    let aich_root = super::aich::hierarchical_root(&aich_leaf_hashes, file_size);
-    let aich_hash = hex::encode(aich_root);
-    let ember_hash = hex::encode(ember_hasher.finalize());
+    Ok(FileDigests {
+        ed2k: ed2k_hash,
+        part_hashes: ed2k_part_hash_list,
+        aich: want
+            .aich
+            .then(|| super::aich::hierarchical_root(&aich_leaf_hashes, file_size)),
+        ember: want.ember.then(|| ember_hasher.finalize()),
+    })
+}
 
-    Ok((ed2k_hash, aich_hash, ed2k_part_hash_list, ember_hash))
+/// Compute ED2K, AICH and the Ember BLAKE3 in a single pass over the file.
+/// Returns `(ed2k_hash_hex, aich_hash_hex, ed2k_part_hashes, ember_blake3_hex)`.
+///
+/// `ember_blake3_hex` is the streaming BLAKE3 of the whole file (slice 18) —
+/// the Ember content integrity digest published alongside the eD2K MD4 id.
+pub fn hash_file_combined_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String)> {
+    let mut file = std::fs::File::open(path)?;
+    let digests = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, cancelled)?;
+    Ok((
+        digests.ed2k,
+        hex::encode(digests.aich.unwrap_or_default()),
+        digests.part_hashes,
+        hex::encode(digests.ember.unwrap_or_default()),
+    ))
+}
+
+/// Streaming BLAKE3 of the whole file and nothing else.
+///
+/// For the one-time digest migration the ed2k MD4 and the AICH root are already
+/// on the `known.met` record — only this is missing — and asking
+/// [`hash_file_combined_cancellable`] for it recomputes all three. That is not a
+/// rounding difference: measured on one machine over a page-cached 256 MiB
+/// sample, the combined pass ran at 618 MB/s against 5.6 GB/s for BLAKE3 alone.
+/// On a solid-state disk the combined pass is therefore the bottleneck rather
+/// than the drive, and a library big enough to take hours spends most of them
+/// recomputing two hashes it already has.
+///
+/// Reads through the same `HASH_BUF_SIZE` buffer and honours the same
+/// cancellation flag, so it stops as promptly mid-file as the full pass does.
+pub fn blake3_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// In-memory equivalent of [`ed2k_hash_file`]. Used by the
@@ -938,6 +1036,164 @@ mod link_tests {
 #[cfg(test)]
 mod combined_hash_tests {
     use super::*;
+
+    /// Asking for fewer digests must not change the ones you do get, and must
+    /// not change the ed2k hash at all. The pass slices its read buffer at
+    /// whichever digest boundary comes first, so dropping AICH removes a set of
+    /// boundaries from that calculation — the loop takes different-sized bites
+    /// of the same bytes. If that ever perturbed the ed2k or BLAKE3 result, a
+    /// verified download would disagree with the library's own index of the
+    /// very same file.
+    ///
+    /// Sized to straddle two ed2k parts and an odd AICH block, so every
+    /// boundary interaction is actually exercised.
+    #[test]
+    fn asking_for_fewer_digests_does_not_change_the_rest() {
+        let aich_block_size = super::super::aich::AICH_BLOCK_SIZE as u64;
+        let file_size = PARTSIZE + aich_block_size / 2 + 12_345;
+        let path = std::env::temp_dir().join(format!(
+            "ember-selective-hash-{}-{file_size}.bin",
+            std::process::id()
+        ));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            let block: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+            let mut written = 0u64;
+            while written < file_size {
+                let take = ((file_size - written) as usize).min(block.len());
+                f.write_all(&block[..take]).expect("write");
+                written += take as u64;
+            }
+        }
+
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let mut file = std::fs::File::open(&path).expect("open");
+        let all = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+            .expect("all digests");
+
+        for want in [
+            WantedDigests {
+                aich: false,
+                ember: false,
+            },
+            WantedDigests {
+                aich: true,
+                ember: false,
+            },
+            WantedDigests {
+                aich: false,
+                ember: true,
+            },
+        ] {
+            let got = hash_open_file_digests_cancellable(&mut file, want, &NEVER)
+                .unwrap_or_else(|e| panic!("{want:?}: {e}"));
+            assert_eq!(got.ed2k, all.ed2k, "{want:?} changed the ed2k hash");
+            assert_eq!(
+                got.part_hashes, all.part_hashes,
+                "{want:?} changed the part hashes"
+            );
+            assert_eq!(got.aich.is_some(), want.aich);
+            assert_eq!(got.ember.is_some(), want.ember);
+            if want.aich {
+                assert_eq!(got.aich, all.aich, "{want:?} changed the AICH root");
+            }
+            if want.ember {
+                assert_eq!(got.ember, all.ember, "{want:?} changed the BLAKE3 digest");
+            }
+        }
+
+        // The pass seeks for itself, so a caller handing over a used handle
+        // gets the same answer — which is what the download verifier does.
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(37)).expect("seek");
+        let mut scratch = [0u8; 8];
+        let _ = file.read(&mut scratch);
+        let after_seek = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+            .expect("digests from a moved handle");
+        assert_eq!(after_seek.ed2k, all.ed2k);
+        assert_eq!(after_seek.ember, all.ember);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two part-count shapes the multi-part test above cannot reach, now
+    /// that download completion records these part hashes in `known.met`
+    /// instead of re-reading the file to recompute them. They are served to
+    /// peers as the file's hashset, so a disagreement with the standalone
+    /// reader would be a wrong hashset handed out, not merely a slow path.
+    ///
+    /// An exact multiple of `PARTSIZE` gains a trailing `MD4("")` sentinel, and
+    /// a single-part file has no hashset at all. Both are easy to get wrong in
+    /// one implementation and not the other.
+    #[test]
+    fn part_hashes_from_one_pass_match_the_standalone_reader_at_the_boundaries() {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        for (label, file_size) in [
+            ("exactly one part", PARTSIZE),
+            ("single part, short", 4096u64),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "ember-part-boundary-{}-{file_size}.bin",
+                std::process::id()
+            ));
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&path).expect("create temp file");
+                let chunk = vec![0x5au8; 1024 * 1024];
+                let mut remaining = file_size;
+                while remaining > 0 {
+                    let n = remaining.min(chunk.len() as u64) as usize;
+                    f.write_all(&chunk[..n]).expect("write");
+                    remaining -= n as u64;
+                }
+            }
+
+            let mut file = std::fs::File::open(&path).expect("open");
+            let digests = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+                .expect("digests");
+            let standalone = ed2k_part_hashes_file_cancellable(&path, &NEVER).expect("part hashes");
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                digests.part_hashes, standalone,
+                "{label}: the pass and the standalone reader disagree"
+            );
+            assert_eq!(
+                digests.part_hashes.len(),
+                ed2k_known_met_part_hash_count(file_size),
+                "{label}: wrong number of part hashes for known.met"
+            );
+        }
+    }
+
+    /// An empty file still answers for whatever was asked, and only that.
+    #[test]
+    fn an_empty_file_answers_only_what_was_asked() {
+        let path =
+            std::env::temp_dir().join(format!("ember-selective-empty-{}.bin", std::process::id()));
+        std::fs::File::create(&path).expect("create");
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let mut file = std::fs::File::open(&path).expect("open");
+
+        let none = hash_open_file_digests_cancellable(
+            &mut file,
+            WantedDigests {
+                aich: false,
+                ember: false,
+            },
+            &NEVER,
+        )
+        .expect("digests");
+        assert!(none.aich.is_none() && none.ember.is_none());
+
+        let all = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+            .expect("digests");
+        assert_eq!(all.ed2k, none.ed2k);
+        assert_eq!(all.ember, Some(*blake3::hash(&[]).as_bytes()));
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Cross-validates the two independent AICH-hashing code paths — the
     /// streaming combined ed2k+AICH hasher used when sharing a real file,

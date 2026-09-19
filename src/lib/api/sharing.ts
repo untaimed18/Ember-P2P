@@ -96,6 +96,28 @@ export async function stopHashing(): Promise<string[]> {
   return invoke('stop_hashing');
 }
 
+/**
+ * Which shared folders would actually lose files if hashing stopped now, without
+ * stopping it. Empty means stopping costs nothing — every file in the Library
+ * keeps its hash, its shares and its stats.
+ */
+export async function previewStopHashing(): Promise<string[]> {
+  return invoke('preview_stop_hashing');
+}
+
+/**
+ * Progress of the background pass that fills in missing Ember digests, as
+ * `[done, total]`, or `null` when it isn't running.
+ *
+ * Separate from the scan's own progress because it is a different kind of work:
+ * every file it touches is already shared and servable, so there is nothing at
+ * stake and nothing to wait for. It is reported only so the drives are not busy
+ * for an unexplained reason.
+ */
+export async function digestBackfillStatus(): Promise<[number, number] | null> {
+  return invoke('digest_backfill_status');
+}
+
 export async function resumeHashing(): Promise<void> {
   return invoke('resume_hashing');
 }

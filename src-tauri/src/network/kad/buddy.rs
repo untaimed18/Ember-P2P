@@ -41,6 +41,11 @@ const MAX_PENDING_BUDDY_HASHES: usize = 512;
 /// buddy on *write* failure, not a connection that accepts writes but never
 /// replies).
 const BUDDY_IDLE_TIMEOUT_SECS: u64 = 180;
+/// Packets queued for the dedicated buddy writer task. Keep this small: a
+/// stalled firewalled client must not pin unbounded callback/reask payloads
+/// in memory, and `try_send` failing with Full is the signal to drop the
+/// extra relay rather than park the network event loop on TCP.
+const BUDDY_WRITE_CHANNEL_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuddyState {
@@ -72,6 +77,86 @@ pub type PendingBuddySet = Arc<Mutex<std::collections::HashMap<[u8; 16], (KadId,
 type BuddyReadStream = Box<dyn AsyncRead + Unpin + Send>;
 pub type BuddyWriteStream = Box<dyn AsyncWrite + Unpin + Send + Sync>;
 
+/// A completed outgoing buddy handshake, handed from the spawned connect task
+/// to the real [`BuddyManager`] on the network loop.
+///
+/// The connect/handshake runs on a throwaway clone of the manager, so
+/// everything the live manager needs has to travel back here.
+pub struct OutgoingBuddyConnection {
+    pub buddy_id: KadId,
+    pub buddy_ip: Ipv4Addr,
+    pub buddy_tcp_port: u16,
+    /// Source port of the `FindBuddyRes`. Nothing later in the handshake
+    /// carries it, and firewalled source records must advertise it for
+    /// callbacks, so it is captured at the datagram and passed through.
+    pub buddy_udp_port: u16,
+    pub events: mpsc::Receiver<BuddyEvent>,
+    /// Clone of the reader's event sender, so the writer task can report its
+    /// own failures instead of waiting to be noticed on the next ping tick.
+    pub disconnect_tx: mpsc::Sender<BuddyEvent>,
+    pub writer: BuddyWriteStream,
+    pub reader_handle: tokio::task::JoinHandle<()>,
+}
+
+enum Enqueue {
+    Queued,
+    Busy,
+    Dead,
+}
+
+/// Owns the TCP write half of a buddy connection on a dedicated task so the
+/// network event loop never `.await`s a stalled firewalled peer. USS samples
+/// KAD RTT from that same loop; a 10s `write_all` there used to look like
+/// congestion and slash the upload cap for every other peer.
+struct BuddyWriteQueue {
+    tx: mpsc::Sender<Vec<u8>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl BuddyWriteQueue {
+    fn spawn(
+        mut writer: BuddyWriteStream,
+        disconnect_tx: Option<mpsc::Sender<BuddyEvent>>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(BUDDY_WRITE_CHANNEL_SIZE);
+        let handle = tokio::spawn(async move {
+            while let Some(pkt) = rx.recv().await {
+                let ok = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    writer.write_all(&pkt).await?;
+                    writer.flush().await
+                })
+                .await;
+                if !matches!(ok, Ok(Ok(()))) {
+                    debug!("Buddy writer failed or timed out");
+                    if let Some(tx) = disconnect_tx {
+                        let _ = tx.try_send(BuddyEvent::Disconnected);
+                    }
+                    break;
+                }
+            }
+        });
+        Self { tx, handle }
+    }
+
+    fn try_enqueue(&self, pkt: Vec<u8>) -> Enqueue {
+        match self.tx.try_send(pkt) {
+            Ok(()) => Enqueue::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => Enqueue::Busy,
+            Err(mpsc::error::TrySendError::Closed(_)) => Enqueue::Dead,
+        }
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for BuddyWriteQueue {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 pub struct BuddyManager {
     local_id: KadId,
     user_hash: [u8; 16],
@@ -89,13 +174,13 @@ pub struct BuddyManager {
     last_find_attempt: i64,
     find_attempt_count: u32,
 
-    buddy_writer: Option<BuddyWriteStream>,
+    buddy_writer: Option<BuddyWriteQueue>,
     buddy_reader_handle: Option<tokio::task::JoinHandle<()>>,
 
     serving_buddy_for: Option<KadId>,
     serving_callback_check: Option<KadId>,
     serving_callback_budget: u32,
-    serving_writer: Option<BuddyWriteStream>,
+    serving_writer: Option<BuddyWriteQueue>,
     serving_reader_handle: Option<tokio::task::JoinHandle<()>>,
 
     pending_buddy_hashes: PendingBuddySet,
@@ -143,11 +228,15 @@ impl BuddyManager {
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();
         }
-        self.buddy_writer = None;
+        if let Some(w) = self.buddy_writer.take() {
+            w.abort();
+        }
         if let Some(h) = self.serving_reader_handle.take() {
             h.abort();
         }
-        self.serving_writer = None;
+        if let Some(w) = self.serving_writer.take() {
+            w.abort();
+        }
         self.serving_buddy_for = None;
         self.serving_callback_check = None;
         self.serving_callback_budget = 0;
@@ -300,21 +389,19 @@ impl BuddyManager {
 
     /// Handle FindBuddyRes: connect to buddy, do Hello handshake, start read loop.
     /// We are the firewalled client connecting to a non-firewalled buddy.
-    /// Returns (event_receiver, writer) so the caller can install the writer
-    /// on the real BuddyManager (this method may run on a temporary clone).
+    /// Returns everything the real `BuddyManager` needs to adopt the
+    /// connection via [`Self::install_buddy_connection`], because this method
+    /// may run on a temporary clone whose state is discarded.
     pub async fn handle_findbuddy_response(
         &mut self,
         buddy_id: KadId,
         buddy_ip: Ipv4Addr,
         tcp_port: u16,
+        buddy_udp_port: u16,
         peer_user_hash: [u8; 16],
         connect_options: u8,
         allow_obfuscation: bool,
-    ) -> Option<(
-        mpsc::Receiver<BuddyEvent>,
-        BuddyWriteStream,
-        tokio::task::JoinHandle<()>,
-    )> {
+    ) -> Option<OutgoingBuddyConnection> {
         let addr = SocketAddr::new(buddy_ip.into(), tcp_port);
         info!("Connecting to buddy {} at {}", buddy_id, addr);
 
@@ -421,32 +508,44 @@ impl BuddyManager {
         }
 
         info!("Buddy connected: {} at {}", buddy_id, addr);
-        let (rx, reader_handle) = event_rx_from_reader(reader, self.find_buddy_target());
-        Some((rx, writer, reader_handle))
+        let (events, disconnect_tx, reader_handle) =
+            event_rx_from_reader(reader, self.find_buddy_target());
+        Some(OutgoingBuddyConnection {
+            buddy_id,
+            buddy_ip,
+            buddy_tcp_port: tcp_port,
+            buddy_udp_port,
+            events,
+            disconnect_tx,
+            writer,
+            reader_handle,
+        })
     }
 
-    /// Install an externally-completed buddy connection (writer from spawned task).
-    /// Called on the real BuddyManager after a spawned connect task succeeds.
-    /// The event receiver is stored separately in NetworkState.buddy_event_rx.
+    /// Adopt an externally-completed buddy connection (from the spawned
+    /// connect task). Returns the event receiver for the caller to store in
+    /// `NetworkState::buddy_event_rx`.
     pub fn install_buddy_connection(
         &mut self,
-        buddy_id: KadId,
-        buddy_ip: Ipv4Addr,
-        buddy_port: u16,
-        buddy_udp_port: u16,
-        writer: BuddyWriteStream,
-        reader_handle: tokio::task::JoinHandle<()>,
-    ) {
+        conn: OutgoingBuddyConnection,
+    ) -> mpsc::Receiver<BuddyEvent> {
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();
         }
-        self.buddy_id = Some(buddy_id);
-        self.buddy_addr = Some(SocketAddr::new(buddy_ip.into(), buddy_port));
-        self.buddy_udp_port = Some(buddy_udp_port);
-        self.buddy_writer = Some(writer);
-        self.buddy_reader_handle = Some(reader_handle);
+        self.buddy_id = Some(conn.buddy_id);
+        self.buddy_addr = Some(SocketAddr::new(
+            conn.buddy_ip.into(),
+            conn.buddy_tcp_port,
+        ));
+        self.buddy_udp_port = Some(conn.buddy_udp_port);
+        self.buddy_writer = Some(BuddyWriteQueue::spawn(
+            conn.writer,
+            Some(conn.disconnect_tx),
+        ));
+        self.buddy_reader_handle = Some(conn.reader_handle);
         self.state = BuddyState::Connected;
         self.find_attempt_count = 0;
+        conn.events
     }
 
     /// Accept an incoming buddy connection (we are the non-firewalled buddy).
@@ -469,7 +568,7 @@ impl BuddyManager {
         let (event_tx, event_rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
         let handle = tokio::spawn(run_buddy_reader(
             reader,
-            event_tx,
+            event_tx.clone(),
             None,
             std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
         ));
@@ -477,7 +576,7 @@ impl BuddyManager {
         self.serving_buddy_for = Some(requester_id);
         self.serving_callback_check = Some(callback_check);
         self.serving_callback_budget = 32;
-        self.serving_writer = Some(Box::new(writer));
+        self.serving_writer = Some(BuddyWriteQueue::spawn(writer, Some(event_tx)));
         self.serving_reader_handle = Some(handle);
         info!("Now serving as buddy for {}", requester_id);
         Some(event_rx)
@@ -503,48 +602,48 @@ impl BuddyManager {
 
     /// Send OP_BUDDYPING to our buddy (we are firewalled).
     pub async fn send_buddy_ping(&mut self) -> bool {
-        if let Some(ref mut w) = self.buddy_writer {
-            let pkt = build_emule_packet(OP_BUDDYPING, &[]);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                w.write_all(&pkt).await?;
-                w.flush().await
-            })
-            .await
-            {
-                Ok(Ok(())) => true,
-                _ => {
-                    debug!("Buddy ping failed, connection lost");
-                    self.disconnect_buddy().await;
-                    false
-                }
+        let pkt = build_emule_packet(OP_BUDDYPING, &[]);
+        match self.enqueue_buddy(pkt) {
+            Enqueue::Queued | Enqueue::Busy => true,
+            Enqueue::Dead => {
+                debug!("Buddy ping failed, connection lost");
+                self.disconnect_buddy().await;
+                false
             }
-        } else {
-            false
         }
     }
 
     /// Send OP_BUDDYPONG reply on a writer.
     pub async fn send_pong_to_buddy(&mut self) -> bool {
-        if let Some(ref mut w) = self.buddy_writer {
-            send_pong(w).await
-        } else {
-            false
+        match self.enqueue_buddy(build_emule_packet(OP_BUDDYPONG, &[])) {
+            Enqueue::Queued | Enqueue::Busy => true,
+            Enqueue::Dead => {
+                self.disconnect_buddy().await;
+                false
+            }
         }
     }
 
     /// Send OP_BUDDYPONG reply to our serving client.
-    pub async fn send_pong_to_serving(&mut self) -> bool {
-        if let Some(ref mut w) = self.serving_writer {
-            send_pong(w).await
-        } else {
-            false
+    pub fn send_pong_to_serving(&mut self) -> bool {
+        match self.enqueue_serving(build_emule_packet(OP_BUDDYPONG, &[])) {
+            Enqueue::Queued | Enqueue::Busy => true,
+            Enqueue::Dead => {
+                self.disconnect_serving();
+                false
+            }
         }
     }
 
     /// Send OP_CALLBACK (0x99) to our serving buddy client (Kad callback relay).
     /// Format: [check_hash:16][file_id:16][client_ip:4][client_tcp_port:2]
     /// check_hash = buddy's KadID XOR'd with 0xFF..FF mask (eMule verification)
-    pub async fn send_callback_relay(
+    ///
+    /// Queues the packet on the dedicated writer task. Never `.await`s TCP:
+    /// a stalled firewalled client must not block the network event loop
+    /// (USS samples KAD RTT there, and a 10s write used to slash every
+    /// other peer's upload cap).
+    pub fn send_callback_relay(
         &mut self,
         buddy_kad_id: &KadId,
         client_ip: Ipv4Addr,
@@ -565,35 +664,26 @@ impl BuddyManager {
             debug!("Rejecting CallbackReq relay: per-session budget exhausted");
             return false;
         }
-        self.serving_callback_budget -= 1;
 
-        if let Some(ref mut w) = self.serving_writer {
-            let mut payload = Vec::with_capacity(38);
-            payload.extend_from_slice(&check_id.0);
-            payload.extend_from_slice(&file_hash);
-            payload.extend_from_slice(&u32::from(client_ip).to_le_bytes());
-            payload.extend_from_slice(&client_port.to_le_bytes());
-            let pkt = build_emule_packet(OP_CALLBACK, &payload);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                w.write_all(&pkt).await?;
-                w.flush().await
-            })
-            .await
-            {
-                Ok(Ok(())) => true,
-                Ok(Err(e)) => {
-                    debug!("Failed to relay callback: {e}");
-                    self.disconnect_serving();
-                    false
-                }
-                Err(_) => {
-                    debug!("Callback relay write timed out");
-                    self.disconnect_serving();
-                    false
-                }
+        let mut payload = Vec::with_capacity(38);
+        payload.extend_from_slice(&check_id.0);
+        payload.extend_from_slice(&file_hash);
+        payload.extend_from_slice(&u32::from(client_ip).to_le_bytes());
+        payload.extend_from_slice(&client_port.to_le_bytes());
+        let pkt = build_emule_packet(OP_CALLBACK, &payload);
+        match self.enqueue_serving(pkt) {
+            Enqueue::Queued => {
+                self.serving_callback_budget -= 1;
+                true
             }
-        } else {
-            false
+            Enqueue::Busy => {
+                debug!("Dropping CallbackReq relay: serving writer is backed up");
+                false
+            }
+            Enqueue::Dead => {
+                self.disconnect_serving();
+                false
+            }
         }
     }
 
@@ -615,41 +705,41 @@ impl BuddyManager {
     /// the 16-byte `buddy_id` header (typically a 16-byte file hash;
     /// any extended tail is forwarded as-is).
     ///
-    /// Returns `false` (and drops the buddy connection) on write
-    /// failure / timeout, matching the semantics of the sibling
-    /// ping / callback relay helpers. No-ops if we don't currently
-    /// have an outbound buddy TCP writer open.
+    /// Returns `false` (and drops the buddy connection) when the writer
+    /// is gone. A full queue drops this reask without tearing the
+    /// session down — the peer will re-ask.
     pub async fn forward_reask_callback(
         &mut self,
         sender_ip: Ipv4Addr,
         sender_port: u16,
         trailing: &[u8],
     ) -> bool {
-        let Some(ref mut w) = self.buddy_writer else {
-            return false;
-        };
         let mut payload = Vec::with_capacity(6 + trailing.len());
         payload.extend_from_slice(&u32::from(sender_ip).to_le_bytes());
         payload.extend_from_slice(&sender_port.to_le_bytes());
         payload.extend_from_slice(trailing);
         let pkt = build_emule_packet(OP_REASKCALLBACKTCP, &payload);
-        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            w.write_all(&pkt).await?;
-            w.flush().await
-        })
-        .await
-        {
-            Ok(Ok(())) => true,
-            Ok(Err(e)) => {
-                debug!("Failed to forward OP_REASKCALLBACKUDP to buddy over TCP: {e}");
+        match self.enqueue_buddy(pkt) {
+            Enqueue::Queued | Enqueue::Busy => true,
+            Enqueue::Dead => {
+                debug!("Failed to forward OP_REASKCALLBACKUDP: buddy writer is gone");
                 self.disconnect_buddy().await;
                 false
             }
-            Err(_) => {
-                debug!("OP_REASKCALLBACKUDP forward to buddy TCP timed out");
-                self.disconnect_buddy().await;
-                false
-            }
+        }
+    }
+
+    fn enqueue_buddy(&self, pkt: Vec<u8>) -> Enqueue {
+        match self.buddy_writer.as_ref() {
+            Some(w) => w.try_enqueue(pkt),
+            None => Enqueue::Dead,
+        }
+    }
+
+    fn enqueue_serving(&self, pkt: Vec<u8>) -> Enqueue {
+        match self.serving_writer.as_ref() {
+            Some(w) => w.try_enqueue(pkt),
+            None => Enqueue::Dead,
         }
     }
 
@@ -657,7 +747,9 @@ impl BuddyManager {
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();
         }
-        self.buddy_writer = None;
+        if let Some(w) = self.buddy_writer.take() {
+            w.abort();
+        }
         self.buddy_id = None;
         self.buddy_addr = None;
         self.buddy_udp_port = None;
@@ -676,7 +768,9 @@ impl BuddyManager {
         if let Some(h) = self.serving_reader_handle.take() {
             h.abort();
         }
-        self.serving_writer = None;
+        if let Some(w) = self.serving_writer.take() {
+            w.abort();
+        }
         self.serving_buddy_for = None;
         // Clear the callback-check token too (mirrors `reset()`); leaving a
         // stale token behind would let a later relay path validate against a
@@ -693,18 +787,6 @@ impl BuddyManager {
     pub fn serving_for(&self) -> Option<&KadId> {
         self.serving_buddy_for.as_ref()
     }
-}
-
-async fn send_pong<W: AsyncWriteExt + Unpin + ?Sized>(w: &mut W) -> bool {
-    let pkt = build_emule_packet(OP_BUDDYPONG, &[]);
-    matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            w.write_all(&pkt).await?;
-            w.flush().await
-        })
-        .await,
-        Ok(Ok(()))
-    )
 }
 
 /// Outgoing buddy handshake: we send Hello, read HelloAnswer, then exchange EmuleInfo.
@@ -768,18 +850,24 @@ async fn buddy_hello_handshake_outgoing(
 }
 
 /// Spawn a buddy reader task and return the event receiver and task handle.
+/// Spawn the reader task and hand back its receiver plus a spare sender, so
+/// the buddy write queue can announce its own failures on the same channel.
 fn event_rx_from_reader(
     reader: BuddyReadStream,
     buddy_id: KadId,
-) -> (mpsc::Receiver<BuddyEvent>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Receiver<BuddyEvent>,
+    mpsc::Sender<BuddyEvent>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
     let handle = tokio::spawn(run_buddy_reader(
         reader,
-        tx,
+        tx.clone(),
         Some(buddy_id),
         std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
     ));
-    (rx, handle)
+    (rx, tx, handle)
 }
 
 /// Long-running reader task for a buddy TCP connection.
@@ -1031,6 +1119,7 @@ fn build_emule_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::net::Ipv4Addr;
 
     fn test_manager() -> BuddyManager {
         let pending: PendingBuddySet = Arc::new(Mutex::new(HashMap::new()));
@@ -1124,5 +1213,42 @@ mod tests {
 
         drop(client);
         let _ = handle.await;
+    }
+
+    /// Serving as a buddy used to `.await` `OP_CALLBACK` on the network
+    /// event loop. A firewalled client that stopped reading filled the TCP
+    /// window and parked every other upload for up to 10s per callback (USS
+    /// then slashed the cap). Relays must enqueue without waiting on I/O.
+    #[tokio::test]
+    async fn send_callback_relay_does_not_block_on_stalled_peer() {
+        let mut mgr = test_manager();
+        let (client, server) = tokio::io::duplex(32);
+        let (reader, writer) = tokio::io::split(server);
+        let _client = client;
+        let check = KadId([0x11; 16]);
+        assert!(mgr
+            .accept_buddy_connection(
+                KadId([0x22; 16]),
+                check,
+                Box::new(reader),
+                Box::new(writer),
+            )
+            .is_some());
+
+        let start = std::time::Instant::now();
+        for _ in 0..BUDDY_WRITE_CHANNEL_SIZE + 4 {
+            let _ = mgr.send_callback_relay(
+                &check,
+                Ipv4Addr::new(203, 0, 113, 1),
+                4662,
+                [0xAB; 16],
+            );
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "callback relay must not wait on TCP, took {:?}",
+            start.elapsed()
+        );
+        mgr.disconnect_serving();
     }
 }

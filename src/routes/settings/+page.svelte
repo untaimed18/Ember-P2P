@@ -8,6 +8,7 @@
     getLogFolderPath,
     openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
+    pickPreviewPlayer as pickPreviewPlayerDialog,
     importWebServicesFile,
     getExampleWebService,
     type UpdateSettingsResult,
@@ -41,7 +42,7 @@
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
-  import { goto } from '$app/navigation';
+  import { goto, replaceState } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
@@ -652,18 +653,31 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
+  /// Sidebar order, and the order the cards are declared in below.
+  ///
+  /// The two had drifted: Search was ninth here, between Channels and Backup,
+  /// while its card has always sat fourth, right after Transfers. Fourth is
+  /// the right answer — search is the front of the download flow, not an
+  /// afterthought behind the social sections — so this follows the markup
+  /// rather than the other way round. Keep them in step: the arrow-key
+  /// handling below walks this array, so a mismatch makes the keyboard order
+  /// disagree with what is on screen.
   const sections: SettingsSection[] = [
     'general',
     'notifications',
     'downloads',
+    // Declared between Transfers and Search in the markup below, so it sits
+    // there here too. While filtering, every matching card is on screen in DOM
+    // order, and this array is what the tablist and the arrow keys walk.
+    'webservices',
+    'search',
     'bandwidth',
     'network',
     'security',
     'friends',
     'channels',
-    'search',
     'backup',
     'about',
   ];
@@ -692,6 +706,124 @@
 
   let activeSection: SettingsSection = $state(initialSection());
 
+  /**
+   * Free-text filter across every control on the page.
+   *
+   * Eleven sections and around sixty controls is past the point where
+   * scanning works, and "which section is the obfuscation toggle in?" has no
+   * good answer until you have already found it.
+   *
+   * Matching reads the *rendered* text of each field rather than a hand-kept
+   * registry of labels, so it cannot drift out of step with the markup the
+   * way a parallel list would. `textContent` covers the label, the toggle
+   * title and the hint — everything that describes a control — and excludes
+   * input values, which is what we want: filtering by a port number someone
+   * happens to have typed would be noise.
+   */
+  let settingsFilter = $state('');
+  let filterQuery = $derived(settingsFilter.trim().toLowerCase());
+  let filtering = $derived(filterQuery.length > 0);
+  /// Set by the effect below, which is the only thing that can count matches
+  /// (it has to read the DOM). Drives the result count and the empty state.
+  let filterMatchCount = $state(0);
+  let cardsGridEl: HTMLDivElement | undefined = $state(undefined);
+
+  /**
+   * Show only the fields that match, and only the sections that still have
+   * one.
+   *
+   * Done imperatively because the thing being matched is rendered text, which
+   * is not available to a `$derived`. The attributes written here
+   * (`data-filtered`) are ones Svelte never manages, so this cannot fight the
+   * `class:hidden` binding on the cards — that stays in charge of which
+   * single section shows when no filter is active.
+   */
+  $effect(() => {
+    const query = filterQuery;
+    const grid = cardsGridEl;
+    if (!grid) return;
+    // Referenced so the effect re-runs once the sections have rendered their
+    // contents, not just when the query changes.
+    void settings;
+    const cards = grid.querySelectorAll<HTMLElement>('.card');
+    if (!query) {
+      for (const card of cards) {
+        card.removeAttribute('data-filtered');
+        // Clear by attribute rather than by selector list. The marking pass
+        // below reaches more kinds of element than the three it used to, and
+        // a cleanup that names them individually is one edit away from
+        // stranding something permanently hidden.
+        for (const el of card.querySelectorAll<HTMLElement>('[data-filtered]')) {
+          el.removeAttribute('data-filtered');
+        }
+      }
+      filterMatchCount = 0;
+      return;
+    }
+    let matches = 0;
+    for (const card of cards) {
+      // A section whose own name matches keeps all of its fields, so
+      // searching "backup" shows the Backup section rather than only the
+      // rows that happen to repeat the word.
+      const heading = card.querySelector('.card-header')?.textContent?.toLowerCase() ?? '';
+      const wholeCard = heading.includes(query);
+      let cardMatches = 0;
+      for (const field of card.querySelectorAll<HTMLElement>('.field')) {
+        const hit = wholeCard || (field.textContent?.toLowerCase().includes(query) ?? false);
+        if (hit) {
+          field.removeAttribute('data-filtered');
+          cardMatches += 1;
+        } else {
+          field.setAttribute('data-filtered', 'out');
+        }
+      }
+      // One rule for every wrapper: a two-up row and a named group are both
+      // just containers, and a container is worth showing only while it still
+      // holds something.
+      //
+      // Order within this loop does not matter, even though a group encloses
+      // a row: the test looks for a surviving *field*, and every field was
+      // decided by the loop above. A container asking about its child
+      // containers would have had to run innermost-first.
+      for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group')) {
+        if (box.querySelector('.field:not([data-filtered])')) box.removeAttribute('data-filtered');
+        else box.setAttribute('data-filtered', 'out');
+      }
+      // Everything else the body holds. Plenty of a card is not a `.field`:
+      // About's identity block and updater panel, Backup's action rows,
+      // Bandwidth's active-schedule banner. Judging the card on fields alone
+      // made all of that both unfindable — a query matching only such text
+      // scored zero and hid the whole card, putting eight controls out of
+      // reach, among them "Open log folder", "Choose Backup File…" and the
+      // updater's Install button — and unhideable, since nothing ever marked
+      // it, so it leaked into every card that survived on some other match.
+      const body = card.querySelector<HTMLElement>('.card-body');
+      for (const block of body ? (Array.from(body.children) as HTMLElement[]) : []) {
+        if (block.matches('.field, .field-row, .settings-group')) continue;
+        if (block.querySelector('.field')) {
+          // Holds fields the loops above already ruled on; follow them.
+          if (block.querySelector('.field:not([data-filtered])')) {
+            block.removeAttribute('data-filtered');
+          } else {
+            block.setAttribute('data-filtered', 'out');
+          }
+          continue;
+        }
+        const hit = wholeCard || (block.textContent?.toLowerCase().includes(query) ?? false);
+        if (hit) {
+          block.removeAttribute('data-filtered');
+          cardMatches += 1;
+        } else {
+          block.setAttribute('data-filtered', 'out');
+        }
+      }
+      if (cardMatches > 0) card.removeAttribute('data-filtered');
+      else card.setAttribute('data-filtered', 'out');
+      matches += cardMatches;
+    }
+    filterMatchCount = matches;
+  });
+
   function sectionLabel(id: SettingsSection): string {
     switch (id) {
       case 'general': return m.settings_section_general();
@@ -703,9 +835,67 @@
       case 'friends': return m.settings_section_friends();
       case 'channels': return m.settings_section_channels();
       case 'search': return m.settings_section_search();
+      case 'webservices': return m.webservices_title();
       case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
     }
+  }
+
+  /// Ids for the tab/panel pairing, so each panel names the tab that controls
+  /// it and vice versa.
+  function tabId(id: SettingsSection): string {
+    return `settings-tab-${id}`;
+  }
+  function panelId(id: SettingsSection): string {
+    return `settings-panel-${id}`;
+  }
+
+  /**
+   * Switch section, and keep `?section=` pointing at what is on screen.
+   *
+   * The query parameter was read on load but never written, so it went stale
+   * the moment the user clicked anything: arriving from another page's
+   * "change this in Network" link and then moving to Backup left the URL
+   * saying `network`, and a reload silently jumped back there. Writing it
+   * also makes the section the user is looking at linkable.
+   *
+   * `replaceState` rather than `goto`/`pushState`: switching a panel is not a
+   * navigation, and stacking twelve history entries would turn Back into a
+   * tour of the sidebar instead of a way out of Settings. It also stays clear
+   * of `beforeNavigate`, which guards unsaved edits — a section switch must
+   * not trip the leave prompt.
+   */
+  function selectSection(id: SettingsSection) {
+    activeSection = id;
+    settingsFilter = '';
+    if (typeof window === 'undefined') return;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('section', id);
+      replaceState(url, {});
+    } catch {
+      /* Non-fatal: the panel is already switched, only the URL is stale. */
+    }
+  }
+
+  /**
+   * Arrow-key movement between tabs, as the tabs pattern requires.
+   *
+   * Roving tabindex means only the selected tab is in the tab order, so
+   * without this the other eleven would be unreachable from the keyboard.
+   */
+  function onTabKeydown(event: KeyboardEvent, index: number) {
+    const last = sections.length - 1;
+    let next: number | null = null;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = index === last ? 0 : index + 1;
+    else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = index === 0 ? last : index - 1;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = last;
+    if (next === null) return;
+    event.preventDefault();
+    selectSection(sections[next]);
+    // Selection follows focus in this pattern, so move focus with it.
+    document.getElementById(tabId(sections[next]))?.focus();
   }
 
   let unmounted = false;
@@ -914,7 +1104,8 @@
     const numericFields = [
       'tcp_port', 'udp_port', 'max_upload_speed', 'max_download_speed',
       'max_concurrent_downloads', 'max_concurrent_uploads', 'max_sources_per_file',
-      'max_connections', 'download_queue_wait_secs', 'multisource_retry_rounds',
+      'max_connections', 'max_connections_per_five_secs',
+      'download_queue_wait_secs', 'multisource_retry_rounds',
       'download_part_retry_rounds', 'max_download_file_size_gib',
       'search_timeout_secs', 'max_friends',
     ] as const;
@@ -953,6 +1144,9 @@
     s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
     s.max_sources_per_file = ci(s.max_sources_per_file, 1, 2000, 1000);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
+    // Lower bound 0: that is the documented "no burst gate" value, not an
+    // empty box — `numericFields` above already rejects those.
+    s.max_connections_per_five_secs = ci(s.max_connections_per_five_secs, 0, 500, 20);
     s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
@@ -1388,6 +1582,21 @@
       showSaveMsg(translateError(e, m.settings_spam_reset_failed()), true, 5000);
     } finally {
       spamResetting = false;
+    }
+  }
+
+  async function pickPreviewPlayer() {
+    if (!settings) return;
+    try {
+      // Backend picker, so the path is authorized where it is chosen — saving
+      // a player the renderer named on its own is refused.
+      const selected = await pickPreviewPlayerDialog();
+      if (selected) {
+        settings.preview_player = selected;
+      }
+    } catch (e) {
+      const msg = translateError(e, m.settings_preview_player_pick_failed());
+      showSaveMsg(msg, true, 5000);
     }
   }
 
@@ -1971,12 +2180,33 @@
     <div class="settings-layout">
       <aside class="settings-nav" aria-label={m.settings_nav_aria()}>
         <div class="settings-nav-title">{m.settings_title()}</div>
-        {#each sections as section}
+        <div class="settings-filter">
+          <input
+            type="search"
+            class="settings-filter-input"
+            placeholder={m.settings_filter_placeholder()}
+            aria-label={m.settings_filter_placeholder()}
+            bind:value={settingsFilter}
+          />
+        </div>
+        <!-- The tablist is hidden while filtering, because results span every
+             section and a tablist that claims one tab is selected would be
+             describing something that is no longer on screen. This is also
+             how the editors people are used to behave: filtering replaces the
+             tree with results. -->
+        {#if !filtering}
+        <div class="settings-tablist" role="tablist" aria-orientation="vertical" aria-label={m.settings_nav_aria()}>
+        {#each sections as section, sectionIndex}
           <button
             class="settings-nav-item"
             class:active={activeSection === section}
-            aria-current={activeSection === section ? 'page' : undefined}
-            onclick={() => activeSection = section}
+            role="tab"
+            id={tabId(section)}
+            aria-selected={activeSection === section}
+            aria-controls={panelId(section)}
+            tabindex={activeSection === section ? 0 : -1}
+            onkeydown={(e) => onTabKeydown(e, sectionIndex)}
+            onclick={() => selectSection(section)}
           >
             <span class="settings-nav-icon" aria-hidden="true">
               {#if section === 'general'}
@@ -2036,6 +2266,12 @@
                   <circle cx="8.5" cy="8.5" r="5.5"/>
                   <line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
+              {:else if section === 'webservices'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="10" r="7.5"/>
+                  <line x1="2.5" y1="10" x2="17.5" y2="10"/>
+                  <path d="M10 2.5c2.2 2 3.4 4.7 3.4 7.5s-1.2 5.5-3.4 7.5c-2.2-2-3.4-4.7-3.4-7.5S7.8 4.5 10 2.5z"/>
+                </svg>
               {:else if section === 'backup'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="2.5" y="4" width="15" height="4" rx="1"/>
@@ -2053,12 +2289,26 @@
             <span>{sectionLabel(section)}</span>
           </button>
         {/each}
+        </div>
+        {:else}
+          <p class="settings-filter-status" role="status">
+            {filterMatchCount === 1
+              ? m.settings_filter_one_result()
+              : m.settings_filter_results({ count: filterMatchCount })}
+          </p>
+          <button class="ghost btn-sm settings-filter-clear" onclick={() => (settingsFilter = '')}>
+            {m.common_clear_filters()}
+          </button>
+        {/if}
       </aside>
 
-      <div class="cards-grid">
+      <div class="cards-grid" class:filtering bind:this={cardsGridEl}>
 
       <!-- General -->
-      <section class="card" class:hidden={activeSection !== 'general'}>
+      <!-- `role` and `aria-labelledby` only apply in tab mode: while filtering
+           there is no tablist on screen, so a panel claiming to be controlled
+           by a tab would be pointing at nothing. -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'general'} id={panelId('general')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('general')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2330,7 +2580,7 @@
       </section>
 
       <!-- Notifications -->
-      <section class="card" class:hidden={activeSection !== 'notifications'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'notifications'} id={panelId('notifications')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('notifications')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2436,7 +2686,7 @@
       </section>
 
       <!-- Transfers -->
-      <section class="card" class:hidden={activeSection !== 'downloads'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'downloads'} id={panelId('downloads')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('downloads')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2451,122 +2701,208 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <label for="download-folder">{m.settings_download_folder_label()}</label>
-            <div class="folder-input">
-              <input id="download-folder" value={settings.download_folder} readonly />
-              <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+          <!-- This section carries more than any other — a destination, four
+               limits, queue behaviour, preview, compression and history — and
+               the rules between those groups said nothing about what they
+               separated. Naming the groups is what makes the longest section
+               on the page scannable.
+               Each group is a container rather than a heading followed by
+               loose siblings, so the filter can decide a group's visibility
+               with the same rule it uses for everything else: show it if it
+               still holds a visible field. Deciding it by walking forward
+               from a heading to the next heading is what it did first, and
+               that missed the fields nested inside a `.field-row`. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_destination()}</h4>
+            <div class="field">
+              <label for="download-folder">{m.settings_download_folder_label()}</label>
+              <div class="folder-input">
+                <input id="download-folder" value={settings.download_folder} readonly />
+                <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+              </div>
+              <span class="field-hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
             </div>
-            <span class="field-hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
           </div>
-          <div class="field-row">
-            <div class="field half">
-              <label for="max-concurrent">{m.settings_max_downloads()}</label>
-              <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_limits()}</h4>
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-concurrent">{m.settings_max_downloads()}</label>
+                <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
+                <!-- The only two numeric inputs on the page that had no hint,
+                     and the pair most in need of one: "Max Uploads" counts
+                     slots, which is easy to read as a speed when the actual
+                     speed limits live in a different section entirely. -->
+                <span class="hint">{m.settings_max_downloads_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-uploads">{m.settings_max_uploads()}</label>
+                <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
+                <span class="hint">{m.settings_max_uploads_hint()}</span>
+              </div>
             </div>
-            <div class="field half">
-              <label for="max-uploads">{m.settings_max_uploads()}</label>
-              <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
+
+            <!-- eMule's Connection page keeps `maxconnections` and
+                 `MaxConnectionsPerFiveSeconds` beside the transfer limits, and
+                 the first of the two decides how many peers can be waiting in
+                 your upload queue at all — so it belongs in front of the user
+                 rather than in config.json. -->
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-connections">{m.settings_max_connections()}</label>
+                <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
+                <span class="hint">{m.settings_max_connections_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-conn-per-five">{m.settings_max_conn_per_five()}</label>
+                <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} />
+                <span class="hint">{m.settings_max_conn_per_five_hint()}</span>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
+              <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+              <span class="hint">{m.settings_max_file_size_hint()}</span>
             </div>
           </div>
 
-          <div class="field">
-            <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-            <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
-            <span class="hint">{m.settings_max_file_size_hint()}</span>
-          </div>
-
-          <div class="divider"></div>
-
-          <!-- Protocol budget / retry knobs (max_sources, max_connections,
+          <!-- The remaining protocol budget / retry knobs (max_sources,
                queue wait, retry rounds) stay in AppSettings for config.json
-               and backend clamps, but are intentionally not exposed here. -->
+               and backend clamps, but are intentionally not exposed here.
+               `max_connections` used to be in that list; it is above now,
+               because it governs upload-queue capacity and eMule has always
+               exposed it. -->
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_add_paused()}</span>
-              <span class="hint">{m.settings_add_paused_hint()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_behavior()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_add_paused()}</span>
+                <span class="hint">{m.settings_add_paused_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel={m.settings_add_paused()} />
             </div>
-            <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel={m.settings_add_paused()} />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_auto_remove()}</span>
-              <span class="hint">{m.settings_auto_remove_hint()}</span>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_auto_remove()}</span>
+                <span class="hint">{m.settings_auto_remove_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
             </div>
-            <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_preview_priority_all()}</span>
-              <span class="hint">{m.settings_preview_priority_all_hint()}</span>
+            <!-- Grouped with the other transfer behaviour rather than with
+                 Preview, where it briefly sat: this governs what we send when
+                 uploading, and has nothing to do with previewing. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_skip_compress_video()}</span>
+                <span class="hint">{m.settings_skip_compress_video_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel={m.settings_skip_compress_video()} />
             </div>
-            <ToggleSwitch bind:checked={settings.preview_priority_all} ariaLabel={m.settings_preview_priority_all()} />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_skip_compress_video()}</span>
-              <span class="hint">{m.settings_skip_compress_video_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel={m.settings_skip_compress_video()} />
           </div>
 
-          <div class="divider"></div>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_preview()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_preview_priority_all()}</span>
+                <span class="hint">{m.settings_preview_priority_all_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.preview_priority_all} ariaLabel={m.settings_preview_priority_all()} />
+            </div>
+            <div class="field">
+              <label for="preview-player">{m.settings_preview_player_label()}</label>
+              <div class="folder-input">
+                <!-- Read-only for the same reason the download folder is: the
+                     value has to come from the backend picker, and a typed
+                     path would be refused on save anyway. -->
+                <input id="preview-player" value={settings.preview_player} readonly placeholder={m.settings_preview_player_placeholder()} />
+                <button class="folder-btn" onclick={pickPreviewPlayer}>{m.settings_browse()}</button>
+                {#if settings.preview_player}
+                  <button class="folder-btn" onclick={() => (settings && (settings.preview_player = ''))}>{m.common_clear()}</button>
+                {/if}
+              </div>
+              <span class="field-hint">{m.settings_preview_player_hint()}</span>
+            </div>
+          </div>
 
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_history()}</h4>
+            <div class="field">
+              <span class="toggle-title">{m.settings_download_history()}</span>
+              <span class="field-hint">
+                {m.settings_download_history_hint()}
+              </span>
+              <div class="history-grid">
+                <div class="history-card">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
+                </div>
+                <div class="history-card">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+                </div>
+                <div class="history-card history-card-total">
+                  <div class="history-stat-body">
+                    <span class="history-stat-label">{m.settings_history_stat_total()}</span>
+                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
+                    </strong>
+                  </div>
+                  <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
+                </div>
+              </div>
+              {#if historyStatsError}
+                <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
+              {/if}
+              {#if historyClearMsg}
+                <span class="hint">{historyClearMsg}</span>
+              {/if}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Web services -->
+      <!-- Its own section rather than a group inside Transfers. It used to sit
+           under there on the grounds that it answers "why will this not
+           finish?", but it is reached from a file's right-click menu in
+           Search, Library and Transfers alike, and it is neither storage nor
+           concurrency — the two things that section says it is about. It is
+           also the only entry there that sends a file's details to a third
+           party, which is worth being able to find on its own. -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'webservices'} id={panelId('webservices')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('webservices')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="10" cy="10" r="7.5"/>
+              <line x1="2.5" y1="10" x2="17.5" y2="10"/>
+              <path d="M10 2.5c2.2 2 3.4 4.7 3.4 7.5s-1.2 5.5-3.4 7.5c-2.2-2-3.4-4.7-3.4-7.5S7.8 4.5 10 2.5z"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.webservices_title()}</h3>
+            <p class="card-desc">{m.webservices_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
           <div class="field">
-            <span class="toggle-title">{m.settings_download_history()}</span>
-            <span class="field-hint">
-              {m.settings_download_history_hint()}
-            </span>
-            <div class="history-grid">
-              <div class="history-card">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
-                  </strong>
-                </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
-              </div>
-              <div class="history-card">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
-                  </strong>
-                </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
-              </div>
-              <div class="history-card history-card-total">
-                <div class="history-stat-body">
-                  <span class="history-stat-label">{m.settings_history_stat_total()}</span>
-                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
-                  </strong>
-                </div>
-                <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
-              </div>
-            </div>
-            {#if historyStatsError}
-              <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
-            {/if}
-            {#if historyClearMsg}
-              <span class="hint">{historyClearMsg}</span>
-            {/if}
-          </div>
-
-          <div class="divider"></div>
-
-          <!-- eMule's web services, reached from a file's right-click menu.
-               Lives under Downloads because the question it answers is "why
-               will this not finish?". -->
-          <div class="field">
-            <span class="toggle-title">{m.webservices_title()}</span>
-            <!-- The two notes are one thought — what the feature is, and what
-                 using it discloses — so they sit closer to each other than to
-                 the list, rather than reading as two unrelated paragraphs. -->
+            <!-- What using it discloses. The what-it-is half of this pair is
+                 now the card description above, so only the consequence is
+                 repeated here. -->
             <div class="webservice-intro">
-              <span class="hint">{m.webservices_desc()}</span>
               <span class="hint">{m.webservices_privacy_note()}</span>
             </div>
 
@@ -2642,7 +2978,7 @@
       </section>
 
       <!-- Search -->
-      <section class="card" class:hidden={activeSection !== 'search'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'search'} id={panelId('search')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('search')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2728,7 +3064,7 @@
       </section>
 
       <!-- Bandwidth -->
-      <section class="card" class:hidden={activeSection !== 'bandwidth'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'bandwidth'} id={panelId('bandwidth')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('bandwidth')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2967,7 +3303,7 @@
       </section>
 
       <!-- Network -->
-      <section class="card" class:hidden={activeSection !== 'network'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'network'} id={panelId('network')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('network')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3122,7 +3458,7 @@
       </section>
 
       <!-- Security -->
-      <section class="card" class:hidden={activeSection !== 'security'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'security'} id={panelId('security')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('security')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3265,7 +3601,7 @@
       </section>
 
       <!-- Friends -->
-      <section class="card" class:hidden={activeSection !== 'friends'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'friends'} id={panelId('friends')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('friends')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3321,7 +3657,7 @@
       </section>
 
       <!-- Channels -->
-      <section class="card" class:hidden={activeSection !== 'channels'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'channels'} id={panelId('channels')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('channels')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3495,7 +3831,7 @@
       </section>
 
       <!-- Backup & Restore -->
-      <section class="card" class:hidden={activeSection !== 'backup'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'backup'} id={panelId('backup')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('backup')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3648,7 +3984,7 @@
       </section>
 
       <!-- About & Updates -->
-      <section class="card" class:hidden={activeSection !== 'about'}>
+      <section class="card" class:hidden={!filtering && activeSection !== 'about'} id={panelId('about')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('about')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3831,6 +4167,12 @@
           </div>
         </div>
       </section>
+
+      <!-- A filter that matches nothing would otherwise leave the pane blank
+           with no explanation, which reads as the page having broken. -->
+      {#if filtering && filterMatchCount === 0}
+        <p class="settings-no-results">{m.settings_filter_no_results({ query: settingsFilter.trim() })}</p>
+      {/if}
 
       </div>
     </div>
@@ -4136,6 +4478,99 @@
 
   .card.hidden {
     display: none;
+  }
+
+  /* Filter mode. `data-filtered` is written by the effect that reads rendered
+     text; Svelte never manages it, so the two cannot fight over the same
+     attribute.
+     `:global` on the matched element is load-bearing, not stylistic: the
+     attribute only ever appears at runtime, so Svelte's CSS pruning removed
+     these three rules as unused and the filter hid nothing at all. The
+     `.cards-grid` prefix stays scoped, which keeps the escape hatch confined
+     to this page. */
+  .cards-grid :global([data-filtered='out']) {
+    display: none;
+  }
+
+  /* Several cards are on screen at once while filtering, so they need the
+     separation the single-card layout never had to provide. */
+  .cards-grid.filtering .card + .card {
+    margin-top: 12px;
+  }
+
+  .settings-filter {
+    padding: 0 8px 8px;
+  }
+
+  .settings-filter-input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .settings-filter-status {
+    margin: 0 8px 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .settings-filter-clear {
+    margin: 0 8px;
+  }
+
+  /* A group has to lay its own children out, not just contain them. `.card-body`
+     is a flex column with an 18px gap and `.field` carries no margin of its
+     own, so once these wrappers became the flex children the gap applied
+     between *groups* and the fields inside each one collapsed against each
+     other — which is why this section alone looked wrong. Same axis, same gap,
+     so a field sits exactly where it does in every other section. */
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* Names the run of fields under it. */
+  .subsection-title {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+
+  /* A heading belongs to the controls beneath it, so it sits nearer them than
+     they sit to one another. Pulling it in against the group's own gap keeps
+     one number in charge of the rhythm. */
+  .settings-group > .subsection-title {
+    margin-bottom: -7px;
+  }
+
+  /* Naming the groups replaced the rules that used to separate them, which
+     left this the only section on the page with no hairlines in it. They come
+     back, with the heading now saying what each one introduces. The first
+     group needs none — the card header is already that boundary. */
+  .card-body > .settings-group + .settings-group {
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    margin-top: 2px;
+    padding-top: 20px;
+  }
+
+  /* `+` cannot see past a hidden sibling, so a filter that drops the first
+     group would leave the next one's rule stranded directly under the card
+     header, reading as a stray line. The groups on screen while filtering are
+     a subset anyway, so a rule claiming to divide them says nothing true —
+     the card-body gap is separation enough. */
+  .cards-grid.filtering .card-body > .settings-group + .settings-group {
+    border-top: none;
+    margin-top: 0;
+    padding-top: 0;
+  }
+
+  .settings-no-results {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-secondary);
   }
 
   .card-header {

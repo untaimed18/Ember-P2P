@@ -887,10 +887,23 @@ impl SearchState {
             SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL,
             _ => false,
         };
+        // Stop early enough that a query we send can still be answered before
+        // the search expires — and no earlier. The margin is one
+        // `PENDING_TIMEOUT_SECS`, which is exactly how long a sent query is
+        // given before `expire_pending` writes it off, so the last query this
+        // allows is the last one whose answer can still count.
+        //
+        // It was a flat 20 seconds, the only number in this file with no eMule
+        // citation behind it and twice the margin the timeout actually needs. On
+        // a 45-second keyword search that ended querying at 25 seconds and left
+        // the remaining twenty listening to nodes it had already asked: nearly
+        // half the walk spent unable to reach anyone new, on every keyword,
+        // source and notes lookup alike.
         let now = chrono::Utc::now().timestamp();
         let early_lifetime_stop = (self.search_type.accepts_search_results()
             || matches!(self.search_type, SearchType::FindBuddy))
-            && now.saturating_sub(self.started_at) >= self.lifetime_secs().saturating_sub(20);
+            && now.saturating_sub(self.started_at)
+                >= self.lifetime_secs().saturating_sub(PENDING_TIMEOUT_SECS);
         threshold_reached || early_lifetime_stop
     }
 
@@ -1750,6 +1763,35 @@ mod tests {
         assert!(
             state.should_stop_querying(),
             "stop_querying must engage once the cap is reached, not one request later"
+        );
+    }
+
+    /// A keyword walk should keep reaching new nodes for as long as their answer
+    /// can still count. The margin that ends it early is one query timeout — no
+    /// more — so the last query it allows is the last one `expire_pending` would
+    /// not have written off by the time the search is over.
+    #[test]
+    fn a_keyword_walk_queries_until_an_answer_could_no_longer_arrive() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::FindKeyword);
+        let now = chrono::Utc::now().timestamp();
+        let lifetime = state.lifetime_secs();
+
+        // One second before the margin opens, the walk is still querying.
+        state.started_at = now - (lifetime - PENDING_TIMEOUT_SECS - 1);
+        assert!(
+            !state.should_stop_querying(),
+            "a query sent here still has {PENDING_TIMEOUT_SECS}s to be answered"
+        );
+
+        // At the margin it stops, leaving exactly one timeout for the answers.
+        state.started_at = now - (lifetime - PENDING_TIMEOUT_SECS);
+        assert!(state.should_stop_querying());
+
+        // The window that buys back: it used to be a flat 20s.
+        assert!(
+            PENDING_TIMEOUT_SECS < 20,
+            "the margin is meant to be the query timeout, not a larger round number"
         );
     }
 

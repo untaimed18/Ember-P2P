@@ -123,6 +123,20 @@ impl SharedFoldersWatcher {
                 }
 
                 let state_ref = app_for_handler.state::<AppState>();
+                // An FS event during exit must not start a reload: shutdown has
+                // already joined the scans it tracks, so a rescan queued now
+                // would mutate `known_files` behind the authoritative flush and
+                // be aborted mid-write. Leave the loop rather than `continue` —
+                // the flag is never cleared, so every later ping is dead work,
+                // and dropping the receiver lets the watcher's `try_send` learn
+                // the driver is gone instead of filling a queue nobody drains.
+                if state_ref
+                    .bw_shutdown
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    info!("FS watcher: shutting down; rescan driver stopping");
+                    break;
+                }
                 // Honour an explicit Stop: reloading here would cancel the
                 // pause latch and start hashing again without user consent.
                 if state_ref

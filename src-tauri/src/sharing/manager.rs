@@ -8,7 +8,42 @@ use crate::types::*;
 
 /// eMule-style rolling window speed measurement.
 /// Stores (cumulative_bytes, timestamp) pairs over a sliding window.
-const SPEED_WINDOW_MS: u128 = 10_000;
+///
+/// Sized to where the status-bar total sits. `BandwidthLimiter::update_speeds`
+/// smooths one-second samples keeping `SPEED_SMOOTHING_NEW` of the new one, so
+/// its step response settles over roughly `1 / (1 - 0.7)` = 3.3 seconds. A row
+/// and the total are the same traffic measured twice, and a user adds the rows
+/// up and compares them against the total — so the two have to answer on the
+/// same timescale. At the old ten seconds they did not: a slot handover dipped
+/// the total at once while every row still showed its pre-handover rate, which
+/// is what made the slot sum read as more than both the total and the
+/// configured limit.
+///
+/// Rounded down rather than up, deliberately. Slightly quicker than the total
+/// means rows lead it through a change instead of trailing above it, so what
+/// divergence is left puts the sum under the total rather than over — the
+/// direction that does not look like the limit being breached.
+const SPEED_WINDOW_MS: u128 = 3_000;
+/// Shortest span a displayed rate may be divided by. See `update_progress`.
+const MIN_SPEED_WINDOW_MS: u128 = 1_000;
+/// How long a row keeps its last rate with no progress event before decaying to
+/// zero, and how long an active download may be quiet and still read healthy.
+///
+/// Deliberately longer than [`SPEED_WINDOW_MS`]: that window is a display
+/// choice about smoothing, while this answers "has this transfer stopped", and
+/// one that has gone quiet for three seconds has not stopped. The two were a
+/// single constant until the window was shortened to track the status bar.
+const SPEED_IDLE_MS: u128 = 10_000;
+// Both relations are between constants, so state them where they are decided
+// and let a bad edit fail the build rather than a test run.
+const _: () = assert!(
+    MIN_SPEED_WINDOW_MS <= SPEED_WINDOW_MS,
+    "the divisor floor cannot exceed the window it floors",
+);
+const _: () = assert!(
+    SPEED_IDLE_MS > SPEED_WINDOW_MS,
+    "a transfer quiet for less than one averaging window has not stopped",
+);
 const MAX_SPEED_SAMPLES: usize = 500;
 const ACTIVE_DEGRADED_SECS: i64 = 20;
 const ACTIVE_STALLED_SECS: i64 = 60;
@@ -392,7 +427,7 @@ impl TransferManager {
             TransferStatus::Active => {
                 let last_activity = transfer.last_received.unwrap_or(transfer.started_at);
                 let idle_secs = now.saturating_sub(last_activity);
-                if transfer.speed > 0 && idle_secs < (SPEED_WINDOW_MS / 1000) as i64 {
+                if transfer.speed > 0 && idle_secs < (SPEED_IDLE_MS / 1000) as i64 {
                     return (TransferHealth::Healthy, None);
                 }
                 if idle_secs >= ACTIVE_STALLED_SECS {
@@ -618,7 +653,16 @@ impl TransferManager {
             while history.len() > MAX_SPEED_SAMPLES {
                 history.pop_front();
             }
-            while history.len() > 1 {
+            // Down to two, not one. The window bounds how much history a rate
+            // is averaged over; it must not be able to leave nothing to
+            // measure against. Progress events only arrive when bytes move, so
+            // a slow transfer can emit them further apart than the window —
+            // pruning to a single sample would make it report 0 B/s while it
+            // is visibly still going. Keeping the previous sample means the
+            // span simply grows to whatever it really was, which is the honest
+            // rate for a transfer that sparse. `refresh_health` is what
+            // decides when silence means stopped, at `SPEED_IDLE_MS`.
+            while history.len() > 2 {
                 let elapsed = now
                     .saturating_duration_since(history.front().unwrap().1)
                     .as_millis();
@@ -634,9 +678,30 @@ impl TransferManager {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
                 let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
                 let bytes_delta = transferred.saturating_sub(*oldest_bytes);
-                (bytes_delta as u128 * 1000)
-                    .checked_div(elapsed_ms)
-                    .map_or(transfer.speed, |bytes_per_sec| bytes_per_sec as u64)
+                // Divide by at least one second. A window is short whenever it
+                // has just been created — a new transfer, a new upload slot
+                // after a rotation, or a history dropped by the idle decay in
+                // `refresh_health` — and dividing by the 200 ms between the
+                // first two progress events reported several times the real
+                // rate. The upload token bucket holds up to 2x the cap, so a
+                // slot starting with a full bucket really does move that many
+                // bytes; it just did not move them in 200 ms. That is what put
+                // individual upload slots above the configured limit, and it
+                // showed up around slot changes because that is when a fresh
+                // window is most likely.
+                //
+                // One second is also the basis the status-bar total is computed
+                // on (`BandwidthLimiter::update_speeds` samples once a second),
+                // so a row and the total are no longer measured over windows
+                // two orders of magnitude apart.
+                //
+                // Flooring the divisor rather than reporting nothing until the
+                // window fills lets a starting slot ramp up instead of sitting
+                // at zero for a second. It also means the divisor is never 0,
+                // which is what the old `checked_div` guarded — its fallback
+                // carried the previous speed forward instead.
+                let divisor = elapsed_ms.max(MIN_SPEED_WINDOW_MS);
+                ((bytes_delta as u128 * 1000) / divisor) as u64
             } else {
                 0
             };
@@ -979,6 +1044,18 @@ impl TransferManager {
             if source.user_hash.is_some() {
                 existing.user_hash = source.user_hash;
             }
+            // Same never-downgrade rule as the identity above: the live worker
+            // path can report a source whose origin it could not look up, and
+            // that must not erase what discovery recorded.
+            if source.origin.is_some() {
+                existing.origin = source.origin;
+            }
+            // Overwritten outright, unlike the fields above. This one is not a
+            // fact we accumulate about the peer but a statement about the row's
+            // current standing, and the newest writer is the one that knows:
+            // a worker event means we are in contact, which is precisely what
+            // stops the row being a placeholder.
+            existing.placeholder = source.placeholder;
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {
@@ -1024,14 +1101,20 @@ impl TransferManager {
             .unwrap_or_default()
     }
 
+    /// A row we seeded from a discovery answer and have not contacted yet.
+    ///
+    /// This used to sniff `client_software` for the three labels the discovery
+    /// sites wrote into it. That worked but coupled the predicate to a display
+    /// string, and it had already drifted: the Ember callback site writes
+    /// "Ember Callback", which was never in the list, so Ember placeholders
+    /// were not recognised and survived alongside the live row that replaced
+    /// them. `SourceInfo::placeholder` is set by every one of those sites,
+    /// Ember included, so the two cannot come apart again.
     fn is_callback_placeholder_row(s: &crate::types::SourceInfo) -> bool {
         matches!(
             s.status,
             crate::types::SourceStatus::Connecting | crate::types::SourceStatus::WaitCallback
-        ) && matches!(
-            s.client_software.as_str(),
-            "KAD Callback" | "KAD Direct Callback" | "Low ID (Server Relay)"
-        )
+        ) && s.placeholder
     }
 
     /// True if `transfer_id` has any source-detail row for `peer_ip`,
@@ -1469,11 +1552,11 @@ impl TransferManager {
     pub fn refresh_health(&mut self, now: i64) -> (Vec<TransferHealthUpdate>, Vec<SpeedReset>) {
         let mut updates = Vec::new();
         let mut speed_resets = Vec::new();
-        let stale_threshold = (SPEED_WINDOW_MS / 1000) as i64;
+        let stale_threshold = (SPEED_IDLE_MS / 1000) as i64;
 
         for transfer in self.active.values_mut() {
             // Decay `speed` to 0 on both directions once no progress event
-            // has landed within the speed-averaging window. Without this,
+            // has landed within the idle window. Without this,
             // upload rows froze their displayed speed forever after a peer
             // stopped requesting blocks: `update_progress` is only called
             // when bytes actually move, so the row retained its last-known
@@ -1840,7 +1923,84 @@ mod tests {
             total_parts: None,
             country_code: None,
             user_hash: None,
+            origin: None,
+            placeholder: false,
         }
+    }
+
+    #[test]
+    fn source_detail_merge_keeps_a_known_origin_and_clears_placeholder_on_contact() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        // Discovery seeds the row: we know which network named the peer, and
+        // we have not spoken to it, so it carries no client software.
+        let mut seeded = src("198.51.100.7", SourceStatus::WaitCallback);
+        seeded.origin = Some(SourceOrigin::Kad);
+        seeded.placeholder = true;
+        manager.update_source_detail("a", seeded);
+
+        // The worker reaches the peer. It reports what the peer runs but may
+        // not have resolved an origin — that must not blank the one we have.
+        let mut live = src("198.51.100.7", SourceStatus::Transferring);
+        live.client_software = "eMule 0.60a".to_string();
+        live.origin = None;
+        live.placeholder = false;
+        manager.update_source_detail("a", live);
+
+        let row = &manager.get_source_details("a")[0];
+        assert_eq!(
+            row.origin,
+            Some(SourceOrigin::Kad),
+            "a worker event with no origin must not erase what discovery recorded"
+        );
+        assert!(
+            !row.placeholder,
+            "being in contact with the peer is what stops the row being a placeholder"
+        );
+        assert_eq!(row.client_software, "eMule 0.60a");
+    }
+
+    #[test]
+    fn ember_callback_placeholders_are_superseded_like_the_others() {
+        use crate::types::SourceOrigin;
+        // Regression: the predicate used to match three hard-coded strings in
+        // `client_software`, and the Ember callback site wrote a fourth that
+        // was never in the list — so an Ember placeholder outlived the live
+        // row that replaced it and the peer showed up twice.
+        //
+        // Both rows deliberately carry *no* user hash. `supersede_duplicate_
+        // peer_rows` removes on `same_peer_by_hash || labeled_callback_
+        // placeholder`, so giving them a matching identity would let the hash
+        // branch do the work and the test would pass whether or not the
+        // placeholder predicate recognises Ember at all.
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        let mut placeholder = src("198.51.100.8", SourceStatus::WaitCallback);
+        placeholder.origin = Some(SourceOrigin::Ember);
+        placeholder.placeholder = true;
+        manager.update_source_detail("a", placeholder);
+
+        // A contacted peer at the same IP, which must survive: it is a real
+        // row, not a placeholder standing in for one.
+        let mut neighbour = src("198.51.100.8", SourceStatus::Transferring);
+        neighbour.port = 4663;
+        manager.update_source_detail("a", neighbour);
+
+        // The callback lands on the peer's ephemeral port: a different key.
+        let removed = manager.supersede_duplicate_peer_rows("a", "198.51.100.8", 51000, None);
+        assert_eq!(
+            removed,
+            vec![("198.51.100.8".to_string(), 4662)],
+            "the Ember placeholder should be superseded, and only it"
+        );
+        assert_eq!(
+            manager.get_source_details("a").len(),
+            1,
+            "the contacted peer at the same IP must survive"
+        );
     }
 
     #[test]
@@ -2115,6 +2275,8 @@ mod tests {
                 total_parts: None,
                 country_code: None,
                 user_hash: None,
+                origin: None,
+                placeholder: false,
             },
         );
         assert!(
@@ -2209,6 +2371,101 @@ mod tests {
         assert_eq!(
             manager.queue.iter().find(|t| t.id == "c").unwrap().status,
             TransferStatus::Paused
+        );
+    }
+
+    /// A rate measured over a window that has only just opened used to be
+    /// divided by the 200 ms between the first two progress events, reporting
+    /// several times what actually moved. That is how a single upload slot
+    /// could show more than the whole configured upload limit, and why it
+    /// showed up around slot changes — a rotated slot is a new row with an
+    /// empty window.
+    ///
+    /// The sleep is what makes this meaningful: it puts a real, non-zero span
+    /// between the two samples that is still well under the one-second floor,
+    /// which is exactly the case that used to inflate. A slow machine that
+    /// overshoots the floor only makes the reported rate smaller, so the
+    /// assertion holds either way.
+    #[test]
+    fn a_fresh_speed_window_cannot_report_more_than_the_bytes_that_moved() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+
+        manager.update_progress("a", 0, Some(0));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        manager.update_progress("a", 400_000, Some(400_000));
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        assert!(
+            speed <= 400_000,
+            "400 kB moved in under a second reported as {speed} B/s"
+        );
+        assert!(
+            speed > 0,
+            "a slot that has started moving bytes must still ramp, not read zero"
+        );
+    }
+
+    /// Progress events only fire when bytes move, so a slow transfer can emit
+    /// them further apart than the averaging window. Pruning the window down
+    /// to a single sample would leave nothing to measure against and report
+    /// 0 B/s for a transfer that is visibly still running — reachable as soon
+    /// as the window was shortened to track the status bar, and invisible
+    /// before that only because the idle decay used the same ten seconds.
+    ///
+    /// Slow by design: the sleep has to outlast a real `SPEED_WINDOW_MS` for
+    /// the aged-out path to be the one under test.
+    #[test]
+    fn a_transfer_slower_than_the_window_still_reports_a_rate() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+
+        manager.update_progress("a", 0, Some(0));
+        std::thread::sleep(std::time::Duration::from_millis(
+            (SPEED_WINDOW_MS as u64) + 200,
+        ));
+        manager.update_progress("a", 8_000, Some(8_000));
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        assert!(
+            speed > 0,
+            "a transfer whose samples straddle the window read as stopped"
+        );
+        assert_eq!(
+            manager.speed_history["a"].len(),
+            2,
+            "the prune must leave a prior sample to measure against"
+        );
+    }
+
+    /// A transfer row and the status-bar total are the same bytes measured
+    /// twice, and the Uploads tab invites adding the rows up and comparing
+    /// them to the total. That only holds if both answer on the same
+    /// timescale, so the row window is pinned to the settling time of the
+    /// limiter's smoothing rather than chosen independently. Retuning either
+    /// side without the other is what made a slot handover look like the
+    /// upload limit had been breached, so fail here rather than let it drift
+    /// back apart.
+    #[test]
+    fn speed_window_matches_the_status_bar_smoothing() {
+        use crate::bandwidth::limiter::{SPEED_SMOOTHING_DENOMINATOR, SPEED_SMOOTHING_NEW};
+
+        // Retaining `1 - new` of the previous value each second settles over
+        // about `1 / (1 - retained)` seconds.
+        let retained =
+            (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
+                / SPEED_SMOOTHING_DENOMINATOR as f64;
+        let settle_ms = 1_000.0 / (1.0 - retained);
+        assert!(
+            (SPEED_WINDOW_MS as f64) <= settle_ms,
+            "the row window ({SPEED_WINDOW_MS} ms) must not lag the total's \
+             ~{settle_ms:.0} ms settling time — trailing above a dipping total \
+             is the reported bug"
+        );
+        assert!(
+            settle_ms - SPEED_WINDOW_MS as f64 <= 1_000.0,
+            "the row window ({SPEED_WINDOW_MS} ms) has drifted well ahead of \
+             the total's ~{settle_ms:.0} ms settling time"
         );
     }
 }

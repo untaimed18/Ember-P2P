@@ -22,33 +22,17 @@ const BLOCKS_PER_FULL_PART: usize = (PARTSIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOC
 /// AICH wait window.
 pub const MAX_AICH_RECOVERY_BYTES: usize = 256 * 1024;
 
-pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    compute_aich_root_cancellable(path, &NEVER)
-}
-
-pub fn compute_aich_root_cancellable(
-    path: &Path,
-    cancelled: &AtomicBool,
-) -> anyhow::Result<[u8; 20]> {
-    let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    if file_size == 0 {
-        return Ok(Sha1::digest([]).into());
-    }
-
-    // Must go through `hash_leaves_from_reader`: chunking the whole file into
-    // fixed AICH_BLOCK_SIZE blocks (what this used to do) ignores the
-    // PARTSIZE restart rule and produces a master hash that disagrees with
-    // `AICHRecoveryHashSet` and with real eMule peers for any multi-part file.
-    let leaf_hashes = hash_leaves_from_reader_cancellable(&mut file, file_size, cancelled)?;
-
-    Ok(hierarchical_root(&leaf_hashes, file_size))
-}
-
-/// Compute the AICH hash for a single part (for verification).
-pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {
+/// Compute the AICH subtree hash for a single part, as that part appears in
+/// the file's top-level part tree.
+///
+/// `part_index` and `num_parts` are not optional context: a part's own
+/// `is_left_branch` is a property of where it sits in the top-level tree (see
+/// [`compute_part_is_left`]), and a full part holds an odd 53 blocks, so the
+/// branch genuinely moves the internal split point — `(53 + is_left) / 2`, 27
+/// against 26 — and with it the SHA-1. Routing through [`merkle_root`], which
+/// hardcodes `is_left_branch = true`, therefore disagreed with
+/// [`compute_all_part_hashes`] for roughly half of all parts.
+pub fn compute_aich_part(data: &[u8], part_index: usize, num_parts: usize) -> [u8; 20] {
     if data.is_empty() {
         return Sha1::digest([]).into();
     }
@@ -60,7 +44,16 @@ pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {
         leaf_hashes.push(hash_leaf(chunk));
     }
 
-    merkle_root(&leaf_hashes)
+    // Single-leaf parts are their own subtree root, matching
+    // `compute_all_part_hashes`.
+    if leaf_hashes.len() == 1 {
+        return leaf_hashes[0];
+    }
+    let is_left = compute_part_is_left(num_parts.max(1))
+        .get(part_index)
+        .copied()
+        .unwrap_or(true);
+    build_tree_recursive(&leaf_hashes, is_left)
 }
 
 /// eMule AICH leaf hash: SHA1(data) with NO prefix byte.
@@ -923,15 +916,53 @@ mod tests {
 
     #[test]
     fn test_aich_empty() {
-        let hash = compute_aich_part(&[]);
+        let hash = compute_aich_part(&[], 0, 1);
         assert_eq!(hash.len(), 20);
     }
 
     #[test]
     fn test_aich_small() {
         let data = vec![0xABu8; 1000];
-        let hash = compute_aich_part(&data);
+        let hash = compute_aich_part(&data, 0, 1);
         assert_eq!(hash.len(), 20);
+    }
+
+    /// A part's subtree hash depends on which branch of the top-level tree it
+    /// sits on, because a full part holds an odd 53 blocks. The single-part
+    /// helper must therefore agree with the tree that produces the real part
+    /// hashes — it used to assume a left branch for every part and so
+    /// disagreed for roughly half of them.
+    #[test]
+    fn compute_aich_part_agrees_with_the_hierarchical_part_tree() {
+        // Three parts: part 0 is left, parts 1 and 2 land on the right side,
+        // so at least one has `is_left_branch == false`.
+        const NUM_PARTS: usize = 3;
+        let file_size = (PARTSIZE * NUM_PARTS) as u64;
+        let part_is_left = compute_part_is_left(NUM_PARTS);
+        assert!(
+            part_is_left.iter().any(|&l| !l),
+            "this fixture needs a right-branch part to be meaningful"
+        );
+
+        let mut all_leaves: Vec<[u8; 20]> = Vec::new();
+        let mut part_data: Vec<Vec<u8>> = Vec::new();
+        for p in 0..NUM_PARTS {
+            let data = vec![(p as u8).wrapping_add(1); PARTSIZE];
+            for chunk in data.chunks(AICH_BLOCK_SIZE) {
+                all_leaves.push(hash_leaf(chunk));
+            }
+            part_data.push(data);
+        }
+
+        let expected = compute_all_part_hashes(&all_leaves, file_size, NUM_PARTS);
+        for (p, data) in part_data.iter().enumerate() {
+            assert_eq!(
+                compute_aich_part(data, p, NUM_PARTS),
+                expected[p],
+                "part {p} (is_left={}) must match the tree that produced the master root",
+                part_is_left[p]
+            );
+        }
     }
 
     #[test]

@@ -77,6 +77,13 @@ const pickEmberDigest = ruleFromStore(
 const mergeResultBody = bodyFromStore(
   "function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {",
 );
+const takesIncomingSpamSignals = ruleFromStore(
+  "function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: number, incomingIsSpam: boolean, incomingRating: number): boolean {",
+  "existingIsSpam",
+  "existingRating",
+  "incomingIsSpam",
+  "incomingRating",
+);
 
 const declaredCeiling = /const MAX_PLAUSIBLE_SOURCES = ([0-9_]+);/.exec(store);
 
@@ -107,6 +114,27 @@ test("pickEmberDigest chooses the digest the Rust side chooses", () => {
         testCase.incoming_digest,
       ),
       testCase.chosen,
+      testCase.name,
+    );
+  }
+});
+
+test("both sides keep the spam explanation that matches the surviving verdict", () => {
+  // `spam_rating` merges with max and `is_spam` with OR, so the reason lists
+  // have to follow the verdict that survived. The store used to adopt the
+  // incoming pair whenever the incoming row was flagged, ignoring the score,
+  // which left rows showing a high score above a weak explanation — and nothing
+  // caught it, because this rule was in neither side's list of deliberate
+  // divergences and in no fixture.
+  for (const testCase of fixture.spam_signal_cases) {
+    assert.equal(
+      takesIncomingSpamSignals(
+        testCase.existing_is_spam,
+        testCase.existing_rating,
+        testCase.incoming_is_spam,
+        testCase.incoming_rating,
+      ),
+      testCase.takes_incoming,
       testCase.name,
     );
   }
@@ -242,4 +270,5 @@ test("the fixture actually carries cases", () => {
     fixture.clamp_source_count_cases.length >= 4,
     "too few source-count clamp cases",
   );
+  assert.ok(fixture.spam_signal_cases.length >= 6, "too few spam-signal cases");
 });

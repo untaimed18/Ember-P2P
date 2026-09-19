@@ -150,6 +150,7 @@ async fn handle_command_inner(
             search_filters,
             related_hashes,
             exclude_hashes,
+            owned_hashes,
         } => {
             // Cancel the prior request while it is still `active_search_request`
             // so cancel can clear the UDP queue and emit `search-complete`.
@@ -185,7 +186,9 @@ async fn handle_command_inner(
                 udp_search_deadline: 0,
                 udp_search_sent_ips: HashSet::new(),
                 ed2k_found_sources: 0,
+                udp_found_sources: 0,
                 ed2k_noted_availability: HashMap::new(),
+                ed2k_noted_complete_sources: HashMap::new(),
                 dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
@@ -199,7 +202,10 @@ async fn handle_command_inner(
                 server_result_count: 0,
                 streamed_hashes: std::collections::HashSet::new(),
                 exclude_hashes: exclude_hashes.iter().cloned().collect(),
-                batch_spam: crate::search::spam::BatchSpamContext::default(),
+                // Seeded with the library hashes the caller resolved, so every
+                // streamed packet of this search scores them as files we hold
+                // rather than as rows in whatever result set they arrived in.
+                batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -416,7 +422,7 @@ async fn handle_command_inner(
                             dropped = dropped.saturating_add(1);
                             continue;
                         }
-                        state.udp_search_queue.push_back(pkt);
+                        state.udp_search_queue.push_back((request_id, pkt.0, pkt.1));
                     }
                 }
                 if dropped > 0 {
@@ -509,12 +515,16 @@ async fn handle_command_inner(
                 if let Some(search) = state.search_manager.get_mut(&sid) {
                     search.search_terms_data = kad_search_expr;
                 }
-                active_request.kad_pending = true;
-                active_request.kad_ran = true;
+                // Claim the oneshot before marking the leg pending. The other
+                // order left `kad_pending` set on a leg that never started, and
+                // nothing else clears it — so `maybe_finish_active_search` would
+                // wait on it forever and `search-complete` would never fire.
                 let Some(search_tx) = tx.take() else {
                     tracing::error!("KAD search: tx already consumed");
                     break 'kad false;
                 };
+                active_request.kad_pending = true;
+                active_request.kad_ran = true;
                 state.pending_keyword_searches.insert(
                     sid,
                     PendingKeywordSearch {
@@ -1144,16 +1154,26 @@ async fn handle_command_inner(
                                         0,
                                         uh,
                                         0,
+                                        // This branch is reached only for a
+                                        // friend transfer, which is the Ember
+                                        // overlay by definition.
+                                        Some(crate::types::SourceOrigin::Ember),
                                     );
                                 }
                                 None => {
-                                    sm.register_source(hash_bytes, v4, source_addr.port());
+                                    // The address a StartDownload was issued
+                                    // with. It came from a search hit, and
+                                    // which network produced that hit is not
+                                    // carried this far — so claim nothing and
+                                    // let the first network to re-announce
+                                    // this peer name itself.
+                                    sm.register_source(hash_bytes, v4, source_addr.port(), None);
                                 }
                             }
                         }
                     }
                     for (parsed_ip, extra_port, _) in &validated_extras {
-                        sm.register_source(hash_bytes, *parsed_ip, *extra_port);
+                        sm.register_source(hash_bytes, *parsed_ip, *extra_port, None);
                     }
                 }
 
@@ -1328,7 +1348,11 @@ async fn handle_command_inner(
                         if !seen_addrs.insert((ip, port)) {
                             continue;
                         }
-                        sm.register_source_full(hash_bytes, ip, port, udp_port, [0u8; 16]);
+                        // `per_file_sources` is a mixed pool — EPX peers sit in
+                        // it beside ones some other network found — so this
+                        // asserts nothing and leaves the origin to whichever
+                        // path actually discovered each peer.
+                        sm.register_source_full(hash_bytes, ip, port, udp_port, [0u8; 16], None);
                         validated_extras.push((ip, port, ip.to_string()));
                     }
                 }
@@ -3366,6 +3390,14 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::DropChannelTransfers { channel_id, member } => {
+            // `delete_owned_channel` tombstones the row and then sends this, so
+            // it is the point at which the network task learns a room it may be
+            // publishing for is gone. The cached roster still holds the
+            // pre-tombstone row, and the owner-publish pass skips only rows
+            // whose `deleted` flag it can see — so without this, a destroyed
+            // room could be re-STOREd once more, with a 24 h record TTL, inside
+            // the cache's TTL. Dropping the snapshot costs one re-read.
+            state.channel_roster_cache = None;
             drop_channel_transfers_for(
                 state,
                 app_handle,
@@ -3436,6 +3468,10 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(result));
         }
 
+        NetworkCommand::GetDownloadFileDetails { transfer_id, tx } => {
+            let details = download_file_details(state, &transfer_id).await;
+            let _ = tx.send(details);
+        }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
             let snap = upload_queue_snapshot(
                 upload_queue,
@@ -3471,6 +3507,20 @@ async fn handle_command_inner(
                 )
                 .await;
                 let _ = tx.send(snap);
+            });
+        }
+
+        NetworkCommand::GetKnownClientCounts { tx } => {
+            // Off the network task for the same reason as the snapshot above:
+            // the record walk is bounded by `MAX_CREDIT_RECORDS`. It is far
+            // cheaper per record — an integer test, no allocation — but this
+            // is the poll that runs whichever tab is showing, so it is the one
+            // that must never be the thing holding up UDP receive.
+            let credit_manager = credit_manager.clone();
+            let upload_queue = upload_queue.clone();
+            tokio::spawn(async move {
+                let counts = known_client_counts(&credit_manager, &upload_queue).await;
+                let _ = tx.send(counts);
             });
         }
 
@@ -4140,7 +4190,26 @@ async fn handle_command_inner(
                 }
             });
 
-            // Stop all searches and cancel pending oneshot channels
+            // Stop all searches and cancel pending oneshot channels.
+            //
+            // The active keyword search goes through the real teardown first,
+            // because nulling `active_search_request` by hand — which is what
+            // this used to do, further down — skips everything cancelling a
+            // search actually means. No `search-complete` reaches the frontend,
+            // so the tab spins until its ten-minute ed2k grace period expires;
+            // `udp_search_queue` keeps its backlog and the UDP timer goes on
+            // sending up to `MAX_UDP_SEARCH_QUEUE` `OP_GLOBSEARCH` packets for
+            // a search the user cancelled by pressing Disconnect; and the Ember
+            // keyword walk keeps running against an id nothing will match
+            // again. The drains below still cover the searches this does not:
+            // `find_notes` carries its own request id.
+            if let Some(active_id) = state
+                .active_search_request
+                .as_ref()
+                .map(|active| active.request_id)
+            {
+                cancel_search_request(state, app_handle, active_id);
+            }
             state.search_manager = SearchManager::new();
             for (
                 _,
@@ -4154,7 +4223,10 @@ async fn handle_command_inner(
             for (_, (_, tx)) in state.pending_notes_searches.drain() {
                 let _ = tx.send(Ok(Vec::new()));
             }
+            // `cancel_search_request` above already cleared it, along with the
+            // UDP queue and the `search-complete` the frontend waits on.
             state.active_search_request = None;
+            state.udp_search_queue.clear();
             state.download_source_searches.clear();
             state.store_keyword_searches.clear();
             // A disconnect drops the rendezvous advert along with everything
@@ -4175,9 +4247,20 @@ async fn handle_command_inner(
 
             // Reset network state (eMule resets firewall, deletes routing zone)
             state.routing_table.clear();
-            set_external_ip(state, None);
+            // A surviving HighID server session still proves two things this
+            // reset used to throw away: our external address, and that our TCP
+            // port is reachable. The address is not even lost — the session is
+            // still holding the client ID `live_highid_external_ip` derives it
+            // from. Discarding them left hole punching, relay and source
+            // records with no notion of where we are, and advertised us as
+            // firewalled while a server was demonstrably connecting back, with
+            // nothing to restore either until the next server login. That was
+            // harmless while this handler also dropped the server; it is
+            // reachable now that it leaves the server alone.
+            let surviving_highid = live_highid_external_ip(state);
+            set_external_ip(state, surviving_highid);
             state.external_udp_port = None;
-            state.firewalled = true;
+            state.firewalled = surviving_highid.is_none();
             // New KAD session (possibly a different network): any STUN
             // candidate/suspend progress and remapped advertise ports from
             // before this disconnect are stale. Also resets the live
@@ -4191,9 +4274,29 @@ async fn handle_command_inner(
             reset_stun_keepalive_session(state);
             state
                 .firewalled_shared
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(surviving_highid.is_none(), std::sync::atomic::Ordering::Relaxed);
             state.firewall_checks_sent = 0;
             state.firewall_checker = FirewallChecker::new();
+            // Hand the fresh checker back the one report that is still true.
+            // KAD's peer votes went with the session; the server's HighID
+            // stands for as long as that session does, and this is the same
+            // single-reporter path the server-connect handler uses for it.
+            if let Some(ip) = surviving_highid {
+                state.firewall_checker.handle_server_highid_response(ip);
+                // Paired, as both real HighID paths pair them: a HighID is a
+                // TCP connect-back, so it proves the port is open and not just
+                // what our address is. The address alone left `tcp_status` at
+                // `Unknown` while `firewalled` said false, and
+                // `kad_source_publish_treat_as_firewalled` reads the status
+                // rather than the flag — so the node published no source
+                // records at all until a fresh KAD firewall check completed.
+                state.firewall_checker.handle_tcp_connect_back();
+            }
+            // Recompute publish state now that the checker is the one the rest
+            // of the session will read. `reset_stun_keepalive_session` above
+            // refreshed it too, but that ran before the checker was replaced,
+            // so its `tcp_status()` reading was the pre-reset one.
+            update_publish_manager_state(state);
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
             state.last_kad_contact = None;
@@ -4410,64 +4513,60 @@ async fn handle_command_inner(
             // can still finish its download. That is why a queue survives a
             // reconnect.
             //
-            // An earlier attempt kept uploads alive only while an eD2K server
-            // session was still live, which read as a reasonable "no transport
-            // left" rule but could never work from here: this handler sets
-            // `user_offline` immediately below and then tears the server session
-            // down itself a few lines later, and `handle_server_disconnect` used
-            // to re-raise the gate whenever the server went away while
-            // `user_offline` was set. The exemption was undone by its own handler
-            // before any upload could benefit from it, so uploads still stopped.
+            // Stop the outbound half — no new download workers, no friend
+            // dials, no server search — but only when leaving KAD actually
+            // leaves the node with no eD2K transport at all.
             //
-            // The old justification also sat badly with what this command
-            // deliberately keeps running: the Ember overlay, its DHT, channel
-            // transfers and the publish cycle all carry on (see the note further
-            // down). A node still publishing to one DHT is not a node that has
-            // gone offline, so refusing to serve the peers who already know it
-            // was never coherent.
-            //
-            // Stop the outbound half only: no new download workers, no friend
-            // dials, no server search until the user comes back online.
+            // KAD off with a server still connected is a normal eMule mode, not
+            // an offline node, and this is the command's only caller: the
+            // Disconnect button in the KAD Network page header. Raising the
+            // outbound gate unconditionally is what made leaving one network
+            // read as going offline, and it is why the upload exemption keyed on
+            // a live server session could never fire — this handler used to
+            // tear that session down itself a few lines later.
+            // `pending_server_connect` counts: this handler deliberately lets a
+            // connect in flight finish, and its completion arm sets
+            // `server_connected` without ever clearing `user_offline`. Reading
+            // that third state as "offline" stranded a node that went on to get
+            // a perfectly good HighID session with its outbound half suppressed
+            // for the rest of the run — no new download workers, no friend
+            // dials, no UDP global search — and nothing to lift it. The window
+            // is seconds wide on startup with `auto_connect_server`.
+            let server_session_survives = state.server_connected
+                || state.server_connection.is_some()
+                || state.pending_server_connect.is_some();
             state
                 .user_offline
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(!server_session_survives, std::sync::atomic::Ordering::Relaxed);
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
-            state.stats.external_ip = String::new();
-            state.stats.firewalled = true;
+            state.stats.external_ip = surviving_highid
+                .map(|ip| ip.to_string())
+                .unwrap_or_default();
+            state.stats.firewalled = state.firewalled;
             state.stats.buddy_status = "none".to_string();
             state.stats.stores_acknowledged = 0;
             let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
 
-            // Tear down the eD2K server too. Not because eD2K depends on KAD —
-            // it does not, and treating the two as coupled is what used to stop
-            // uploads on a session that only ever had a server (see
-            // `handle_server_disconnect`) — but because this command is the
-            // app's single Disconnect: the user asked to go offline, not to
-            // leave one network.
-            if let Some(handle) = state.pending_server_connect.take() {
-                handle.abort();
-            }
-            if state.server_connected || state.server_connection.is_some() {
-                if let Some(conn) = state.server_connection.take() {
-                    conn.disconnect().await;
-                }
-                handle_server_disconnect(
-                    state,
-                    shared_server_addr,
-                    app_handle,
-                    "KAD disconnected",
-                )
-                .await;
-            }
+            // The eD2K server session is deliberately left alone, including a
+            // connect still in flight. KAD and the server are independent
+            // networks in eMule and in the protocol, and using one without the
+            // other is ordinary: server-only with KAD disabled, or KAD-only
+            // with no server. The server's own Disconnect is
+            // `NetworkCommand::DisconnectServer`, reached from the Servers
+            // page, and it is equally careful not to touch KAD.
 
             // Deliberately not "all activity stopped": the Ember overlay has no
             // off switch and keeps its DHT, channel transfers and publishing
-            // republish cycle running by design. What this tears down is KAD,
-            // the eD2K server session, uploads, friend sessions and the active
-            // download workers.
-            info!("KAD disconnected — KAD, eD2K server, uploads and friend sessions stopped");
+            // republish cycle running by design, and uploads keep serving (see
+            // the note above). What this tears down is KAD itself, friend
+            // sessions and the active download workers.
+            if server_session_survives {
+                info!("KAD disconnected — eD2K server session left connected");
+            } else {
+                info!("KAD disconnected — no eD2K transport left, outbound work stopped");
+            }
         }
 
         NetworkCommand::KadBootstrapIp { ip, port, tx } => {
@@ -4768,6 +4867,54 @@ async fn handle_command_inner(
                 Ok(format!("Removed server {ip}:{port}"))
             } else {
                 Err(format!("Server {ip}:{port} not found in the list"))
+            };
+            let _ = tx.send(result);
+        }
+
+        NetworkCommand::SetServerStatic {
+            ip,
+            port,
+            is_static,
+            tx,
+        } => {
+            let result = if state.server_list.set_static(&ip, port, is_static) {
+                let met_path = state.data_dir.join("server.met");
+                spawn_save_server_met(
+                    &state.server_list,
+                    met_path,
+                    &state.server_met_save_generation,
+                    &state.server_met_save_lock,
+                );
+                Ok(format!("Updated static flag for server {ip}:{port}"))
+            } else {
+                Err(format!("Server {ip}:{port} not found in the list"))
+            };
+            let _ = tx.send(result);
+        }
+
+        NetworkCommand::SetServerPriority {
+            ip,
+            port,
+            priority,
+            tx,
+        } => {
+            use crate::network::ed2k::server_list::ServerPriority;
+            let result = match ServerPriority::parse_name(&priority) {
+                None => Err(format!("Unknown server priority {priority}")),
+                Some(priority) => {
+                    if state.server_list.set_priority(&ip, port, priority) {
+                        let met_path = state.data_dir.join("server.met");
+                        spawn_save_server_met(
+                            &state.server_list,
+                            met_path,
+                            &state.server_met_save_generation,
+                            &state.server_met_save_lock,
+                        );
+                        Ok(format!("Set server {ip}:{port} priority"))
+                    } else {
+                        Err(format!("Server {ip}:{port} not found in the list"))
+                    }
+                }
             };
             let _ = tx.send(result);
         }
@@ -5689,6 +5836,7 @@ async fn handle_command_inner(
             single_flight,
         } => {
             let download_folder = settings.download_folder.clone();
+            let preview_player = settings.preview_player.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
                 // Dropped when this task ends, which is what makes the claim
@@ -5797,7 +5945,7 @@ async fn handle_command_inner(
                         )
                         .map_err(|e| format!("Failed to create preview file: {e}"))?;
 
-                        ed2k::preview::launch_preview(&preview_path)
+                        ed2k::preview::launch_preview(&preview_path, &preview_player)
                             .map_err(|e| format!("Failed to launch preview: {e}"))?;
 
                         // The full path is PII (username, folder layout) and the

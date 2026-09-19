@@ -809,6 +809,14 @@ tr:hover td {
   border-bottom: 1px solid color-mix(in srgb, var(--success) 36%, var(--border));
   color: var(--badge-success-text);
 }
+/* For a state that is the user's own choice rather than a fault: the app is
+   working as asked, but the consequence is worth saying out loud. Danger red
+   would overstate it and success green would hide it. */
+.warning-banner {
+  background: color-mix(in srgb, var(--warning) 9%, var(--bg-secondary));
+  border-bottom: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
+  color: var(--badge-warning-text);
+}
 
 .page-header {
   display: flex;

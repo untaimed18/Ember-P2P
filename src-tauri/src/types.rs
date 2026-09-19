@@ -381,6 +381,62 @@ pub struct SourceInfo {
     /// push-grant) connection. `None` when the identity isn't known yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_hash: Option<[u8; 16]>,
+    /// Which network told us about this peer. `None` while unknown — see
+    /// [`SourceOrigin`] for why that is a state we are willing to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SourceOrigin>,
+    /// True for a row we seeded from a discovery answer that we have not
+    /// contacted yet — a KAD/Ember callback request or a LowID server relay.
+    ///
+    /// These used to be marked by writing the label into `client_software`
+    /// ("KAD Callback", "Ember Callback", "Low ID (Server Relay)"), which
+    /// `TransferManager::is_callback_placeholder_row` then string-matched.
+    /// That made the software field say where the peer came from rather than
+    /// what it runs, so neither fact could be shown on its own. The provenance
+    /// now lives in `origin` and the placeholder-ness lives here, leaving
+    /// `client_software` free to mean only what the peer's Hello said.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub placeholder: bool,
+}
+
+/// Where a source was first learned from — eMule's `CUpDownClient::m_nSourceFrom`
+/// (`SF_SERVER` / `SF_KADEMLIA` / `SF_SOURCE_EXCHANGE` …), widened to cover the
+/// Ember overlay, which eMule has no equivalent of.
+///
+/// There is deliberately no `Passive` here, though eMule has `SF_PASSIVE`.
+/// eMule sets it when a stranger connects to *us* and turns out to want a file
+/// we are also downloading; Ember never adds a source that way. Every inbound
+/// adoption it performs (`register_inbound_callback_ports`) is a callback or
+/// push-grant we asked for, for a peer some other network already told us
+/// about — so the variant could never be produced, and a column value that
+/// cannot occur is its own kind of lie.
+///
+/// Recorded once, when the source is first registered, and never revised. That
+/// matters: a peer learned from KAD is routinely re-announced later over source
+/// exchange or by a server, and an origin that tracked the most recent mention
+/// would drift to whichever network gossiped most. eMule sets `m_nSourceFrom`
+/// at construction for the same reason.
+///
+/// An earlier version of this feature (removed in 97489faf) had no field at all
+/// and instead inferred the origin at read time from whether `SourceEntry`
+/// carried a server IP. That was wrong in both directions: `server_ip` is
+/// back-filled onto an existing row by any later announcement that supplies one,
+/// so a KAD source re-announced over SX began reporting itself as an eD2K one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOrigin {
+    /// An eD2K server answered with it (`OP_FOUNDSOURCES`, or the UDP global
+    /// `OP_GLOBFOUNDSOURCES`), including the LowID callback relay.
+    Server,
+    /// A KAD source search or publish — eMule's `SF_KADEMLIA`.
+    Kad,
+    /// The Ember overlay: an Ember DHT source answer, or a friend session.
+    Ember,
+    /// Peer exchange: eD2K source exchange (`OP_ANSWERSOURCES`) or its Ember
+    /// counterpart (EPX). One value rather than two because both mean the same
+    /// thing to someone reading the column — another peer, not a network,
+    /// passed this address along.
+    Exchange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -404,6 +460,23 @@ pub enum SourceStatus {
     /// we sit behind a symmetric NAT. Shown rather than dropped so the cause
     /// is visible; it clears by itself once our reachability changes.
     Unreachable,
+    /// Every part this peer holds is already being fetched from someone else, so
+    /// there is nothing to ask it for yet. Re-offered about a minute later.
+    ///
+    /// Its own state because the alternatives both lie. It was rendered as
+    /// [`Self::NoNeededParts`], which says the peer is useless when it is not,
+    /// and then as [`Self::Connecting`], which says a dial is in progress when
+    /// none is — and a row that sits at "Connecting" for minutes is the single
+    /// thing that makes a healthy download look broken.
+    PartsBusy,
+    /// Waiting for one of our own connection slots, having not dialled yet. Also
+    /// re-offered shortly; the cap is per file and saturates on any busy
+    /// download.
+    ///
+    /// Distinct from [`Self::Connecting`] for the same reason as
+    /// [`Self::PartsBusy`]: nothing is being attempted, so reporting an attempt
+    /// hides the one fact that explains the wait.
+    WaitingForSlot,
 }
 
 impl SourceStatus {
@@ -430,6 +503,8 @@ impl SourceStatus {
             Self::Failed => "failed",
             Self::FriendConnect => "friend_connect",
             Self::Unreachable => "unreachable",
+            Self::PartsBusy => "parts_busy",
+            Self::WaitingForSlot => "waiting_for_slot",
         }
     }
 }
@@ -1353,9 +1428,24 @@ pub struct AppSettings {
     /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
     #[serde(default = "default_max_sources_per_file")]
     pub max_sources_per_file: u32,
-    /// Maximum total TCP connections (eMule: maxconnections, default 500)
+    /// Maximum total TCP connections (eMule: maxconnections, default 500).
+    ///
+    /// One machine-wide budget shared by the upload listener and the outbound
+    /// download sources, as in eMule — every `CClientReqSocket` joins one list
+    /// whoever dialled it, and `TooManySockets` gates both directions against
+    /// its length. Downloads leave a reserve free so a burst of them can never
+    /// cost us the ability to accept a peer that wants to queue with us; see
+    /// `ed2k::multi_source::listener_reserve`.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Most new TCP connections the upload listener will accept in any
+    /// five-second window (eMule: `MaxConnectionsPerFiveSeconds`, default 20
+    /// via `MAXCONPER5SEC`). `0` disables the gate.
+    ///
+    /// Bounds the *rate* of socket creation rather than the count, which is
+    /// what keeps consumer routers and NAT tables from choking on a burst.
+    #[serde(default = "default_max_connections_per_five_secs")]
+    pub max_connections_per_five_secs: u32,
     /// Add new downloads in paused state (eMule: addnewfilespaused)
     #[serde(default)]
     pub add_downloads_paused: bool,
@@ -1369,6 +1459,18 @@ pub struct AppSettings {
     /// per-file flag. Off by default (rarest-first is best for swarm health).
     #[serde(default)]
     pub preview_priority_all: bool,
+    /// Absolute path to an external media player for Preview, or empty to
+    /// hand the file to the system's default handler (eMule's "Video Player"
+    /// preference).
+    ///
+    /// Write-gated on provenance, not on shape: this names a program Ember
+    /// will execute, so a path the renderer invented is local code execution
+    /// over IPC. `update_settings` refuses a *change* to this field unless
+    /// `pick_preview_player` produced that exact path this session — the same
+    /// rule `download_folder` is under, for a stronger reason. Clearing it
+    /// back to empty is always allowed, because that is the safe default.
+    #[serde(default)]
+    pub preview_player: String,
     /// Skip compressing video files during upload (eMule: dontcompressavi)
     #[serde(default)]
     pub skip_compress_video: bool,
@@ -1689,11 +1791,22 @@ pub struct ServerInfo {
     pub soft_files: u32,
     pub hard_files: u32,
     pub is_static: bool,
+    /// Connection priority, as `"low"` / `"normal"` / `"high"`.
+    ///
+    /// Tracked and persisted (`server.met` tag `0x0E`) since the list was
+    /// first written, but withheld from this struct — so the Servers tab
+    /// could neither show it nor offer eMule's High/Normal/Low choice.
+    #[serde(default = "default_server_priority")]
+    pub priority: String,
     pub fail_count: u32,
     #[serde(default)]
     pub client_id: u32,
     #[serde(default)]
     pub is_low_id: bool,
+}
+
+fn default_server_priority() -> String {
+    "normal".to_string()
 }
 
 /// Snapshot of the AntiLeech filter for the Settings UI. Carries the
@@ -1730,16 +1843,35 @@ pub struct UploadQueueClient {
     /// 32-char hex ed2k user hash, or empty when the peer didn't
     /// advertise one (queue identity falls back to IP in that case).
     pub user_hash: String,
+    /// Best known address: the live socket, the identity when that is an
+    /// address, or the last one seen. A queued peer is normally disconnected
+    /// between re-asks, so the last-seen fallback is what makes this — and the
+    /// country flag derived from it — present at all for most rows.
     pub peer_ip: String,
+    /// The peer's advertised listen port, not the source port of any
+    /// connection. Row identity for the UI rather than something it displays.
     pub peer_port: u16,
     pub file_hash: String,
     pub file_name: String,
     pub wait_seconds: u64,
     /// 1-based queue rank computed via the eMule scoring rules
-    /// (`compute_queue_rank` in the upload module). `None` when the
-    /// peer is currently disconnected and only `m_bAddNextConnect` is
-    /// keeping their slot warm.
-    pub queue_rank: Option<u32>,
+    /// (`compute_queue_rank` in the upload module).
+    ///
+    /// Always known: it is derived from the whole queue, not from the peer.
+    /// This was `Option<u32>`, withheld whenever the peer had no live socket
+    /// — which is the normal state of a waiting peer — so the column showed
+    /// `?` for every row.
+    pub queue_rank: u32,
+    /// Whether the peer currently holds a connection to us.
+    ///
+    /// A waiting peer is usually disconnected between re-asks, which is not a
+    /// problem; it is still worth showing, and it is what the old `None` rank
+    /// was trying (and failing) to convey.
+    pub connected: bool,
+    /// Peer's Hello nickname, empty when it advertised none.
+    pub peer_name: String,
+    /// Client software and version, e.g. `eMule 0.60a`.
+    pub client_software: String,
     /// SecIdent credit ratio (1.0–10.0). 1.0 for first-time peers.
     pub credit_ratio: f64,
     /// Lifetime bytes we have uploaded TO this peer across all sessions.
@@ -1756,6 +1888,71 @@ pub struct UploadQueueClient {
     pub emule_version: u8,
 }
 
+/// Backs the downloads "File Details" window: eMule's chunk map, plus the
+/// per-file counters that live on the part tracker rather than on the transfer
+/// row.
+///
+/// Every bitmap uses the encoding `PartsBar.svelte` reads and the upload
+/// direction already ships — byte index = `part / 8`, bit = `part % 8`,
+/// LSB-first, lowercase hex — so the chunk map reuses the component that draws
+/// the upload bar. All four are `part_count` bits wide.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadFileDetails {
+    /// `ceil(total_size / PARTSIZE)`. Zero when no tracker could be read, which
+    /// is how the window knows to say so rather than draw an empty map.
+    pub part_count: u32,
+    /// Parts fully on disk.
+    pub local_part_status: String,
+    /// Parts at least one known source holds. Drawn behind `local_part_status`,
+    /// so together they read as "what exists out there, and how much of it we
+    /// have" — the question eMule's map answers.
+    pub swarm_part_status: String,
+    /// Parts whose MD4 has been checked, as a count rather than a bitmap: the
+    /// map is drawn from the two above, and shipping a third and fourth bitmap
+    /// that nothing draws would be paid for on every refresh.
+    pub verified_parts: u32,
+    /// Parts a source worker is fetching right now.
+    pub in_progress_parts: u32,
+    /// Holders of the scarcest part, across the sources that have sent a
+    /// bitmap. Zero means some part is held by none of them, which is the one
+    /// thing worth saying out loud: the download cannot finish from what we
+    /// know of right now.
+    ///
+    /// A single number rather than the whole per-part frequency table. The
+    /// table is `part_count` wide — tens of thousands of entries for a large
+    /// file — and nothing draws it, so shipping it on every refresh of the
+    /// window would be paid for in vain.
+    pub rarest_part_sources: u16,
+    /// Sources the frequency figures are drawn from. Lower than the transfer's
+    /// source count, because a source that has not sent its bitmap yet cannot
+    /// contribute to it.
+    pub sources_with_bitmaps: u32,
+    /// Unique bytes on disk.
+    pub completed_bytes: u64,
+    /// Bytes inside MD4-verified parts.
+    pub verified_bytes: u64,
+    /// Bytes still missing.
+    pub remaining_bytes: u64,
+    /// Wire bytes, which can exceed the file size once retries are counted.
+    pub transferred: u64,
+    /// False when the download has no registered part tracker — the
+    /// single-source and callback paths do not register one — so the window can
+    /// explain the absence instead of implying the file has no parts.
+    pub tracked: bool,
+}
+
+/// Row counts for the two known-peer tabs, split the same way
+/// [`KnownClient`] rows are split: a record with a bound Ember identity is an
+/// Ember peer, everything else is an eD2K peer.
+///
+/// Exists so the tab labels can stay current without polling the full
+/// snapshot — see `NetworkCommand::GetKnownClientCounts`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct KnownClientCounts {
+    pub ed2k: u32,
+    pub ember: u32,
+}
+
 /// One row in the upload-pane "Known Clients" tab — a SecIdent credit
 /// record. These are persistent across sessions (clients.met) so the
 /// list is the lifetime view of every peer we've ever traded credit
@@ -1764,6 +1961,14 @@ pub struct UploadQueueClient {
 pub struct KnownClient {
     /// 32-char hex ed2k user hash.
     pub user_hash: String,
+    /// Peer's Hello nickname, empty until it has told us one.
+    ///
+    /// Distinct from `nickname` below, which is an Ember *friend* name out of
+    /// the friends database. This is what the eD2K client itself advertises,
+    /// and it is what the eD2K tab could not show at all.
+    pub peer_name: String,
+    /// Client software and version, e.g. `eMule 0.60a`.
+    pub client_software: String,
     /// Bytes WE downloaded from them across all sessions (eMule's
     /// `m_nDownloaded`). This is the value that buys us upload-queue
     /// priority on their side.
@@ -1809,6 +2014,10 @@ fn default_max_sources_per_file() -> u32 {
 
 fn default_max_connections() -> u32 {
     500
+}
+
+fn default_max_connections_per_five_secs() -> u32 {
+    20
 }
 
 fn default_download_queue_wait_secs() -> u64 {
@@ -2015,9 +2224,11 @@ impl Default for AppSettings {
             auto_connect_server: false,
             max_sources_per_file: 400,
             max_connections: 500,
+            max_connections_per_five_secs: 20,
             add_downloads_paused: false,
             remove_finished_downloads: false,
             preview_priority_all: false,
+            preview_player: String::new(),
             skip_compress_video: false,
             antileech_enabled: false,
             uss_enabled: false,

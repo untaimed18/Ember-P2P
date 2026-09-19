@@ -9,7 +9,7 @@
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
-    getUploadQueue, getKnownClients,
+    getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
@@ -25,7 +25,12 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
+  import type {
+    Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
+  } from '$lib/types';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
@@ -52,6 +57,38 @@
     return `/flags/${lower}.svg`;
   }
 
+  /** Order two ISO country codes, unknown last on an ascending sort.
+   *
+   *  Shared by all four tables that carry the column, because the same header
+   *  under the same click has to mean the same thing on each of them. A blank
+   *  is not an edge case here — LAN and private ranges never resolve — and
+   *  plain `localeCompare` would open an ascending sort with a block of empty
+   *  flag cells on some tabs and bury them on others. Returns +1 for a blank
+   *  so the caller's `* dir` flip lands it at the end ascending, matching
+   *  `cmpStr` in the Known Peers and queue comparators. */
+  function cmpCountry(a: string | null | undefined, b: string | null | undefined): number {
+    const ax = (a ?? '').toLowerCase();
+    const bx = (b ?? '').toLowerCase();
+    if (ax === bx) return 0;
+    if (!ax) return 1;
+    if (!bx) return -1;
+    return ax < bx ? -1 : 1;
+  }
+
+  /** Order two source origins, unknown last on an ascending sort.
+   *
+   *  Compares the rendered labels, not the wire values, so the rows group the
+   *  way the column reads in whatever locale is active. Same blank-last rule as
+   *  `cmpCountry`, and for the same reason: an absent origin is routine — every
+   *  source restored from `sources.met` has one — so it belongs at the end
+   *  rather than heading the list. */
+  function cmpOrigin(a: SourceInfo['origin'], b: SourceInfo['origin']): number {
+    if (a === b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+    return sortCollator.compare(sourceOriginLabel(a), sourceOriginLabel(b));
+  }
+
   let sourceUnlisten: UnlistenFn | null = null;
   let searchUnlisten: UnlistenFn | null = null;
   let showAdvancedDlCols = $state(true);
@@ -71,6 +108,19 @@
     defaultHidden?: boolean;
     /** Header tooltip, for a column whose meaning is not self-evident. */
     readonly title?: string;
+  };
+  /** A column in a table where *every* column sorts, so the compiler holds the
+   *  invariant instead of a comment.
+   *
+   *  `sortField` has to stay optional on `TransferColumn` — Uploading, Known
+   *  Peers and Download Clients each carry columns that genuinely cannot sort
+   *  (a progress bar, a name that is identical on every row). But a header only
+   *  becomes clickable, focusable and arrow-bearing when it is set, and the
+   *  click handler early-returns without it, so on a table where all of them
+   *  should sort, a missing one is silently inert and nothing in the type system
+   *  says so. Demanding it here is what makes that a build error. */
+  type SortableColumn<TSort extends string> = TransferColumn<TSort> & {
+    sortField: TSort;
   };
 
   const DOWNLOAD_COLUMNS: TransferColumn<DlSortField>[] = [
@@ -110,7 +160,7 @@
     .filter((column) => !DOWNLOAD_COMPACT_COLUMN_KEYS.has(column.key))
     .map((column) => column.key);
   const UPLOAD_COLUMNS: TransferColumn<UlSortField>[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-ul-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-ul-flag', sortField: 'country' },
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-ul-client', sortField: 'peer_name' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
     { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
@@ -132,27 +182,48 @@
   // user with persisted column widths from the old "On Queue" placeholder
   // tab gets defaults instead of a stale layout that doesn't match the
   // new column set.
-  const QUEUE_COLUMNS: TransferColumn[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
-    { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client' },
-    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file' },
-    { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait' },
-    { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank' },
-    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-q-score' },
-    { key: 'transfer_history', get label() { return m.transfers_col_up_down(); }, width: 130, minWidth: 110, className: 'col-q-hist' },
-    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident' },
+  // `SortableColumn`, not `TransferColumn`: every queue column sorts, and that
+  // type is what makes a forgotten `sortField` fail the build rather than ship
+  // an inert header.
+  const QUEUE_COLUMNS: SortableColumn<QuSortField>[] = [
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-q-flag', sortField: 'country' },
+    // Nickname and Software sit beside the User ID here for the same reason
+    // they do on the Uploading tab: the hash identifies the row, the name is
+    // what the person reading it recognises. The queue snapshot carries both
+    // now — before, this tab could only offer the truncated hash.
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-nick', sortField: 'peer_name' },
+    { key: 'user_name', get label() { return m.transfers_col_user_id(); }, width: 150, minWidth: 120, className: 'col-q-client', sortField: 'user_name' },
+    { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 110, minWidth: 80, className: 'col-q-sw', sortField: 'client_software' },
+    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file', sortField: 'file_name' },
+    { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait', sortField: 'wait_time' },
+    { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank', sortField: 'queue_rank' },
+    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-q-score', sortField: 'credit_ratio' },
+    { key: 'transfer_history', get label() { return m.transfers_col_up_down(); }, width: 130, minWidth: 110, className: 'col-q-hist', sortField: 'transfer_history' },
+    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident', sortField: 'ident_state' },
   ];
   // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
   // sourced from clients.met. The same columns back both the eD2K-only
   // and Ember-only tabs; the first data column's header switches to
   // "User Name" on the Ember tab. Independent of which peers are
   // connected, so this view is the "credit ledger" view of the network.
-  // Every non-flag column is sortable; the user's last-used sort is persisted
-  // via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
+  // Every column is sortable, the flag included — it orders by the ISO code,
+  // which is all the GeoIP lookup returns. The user's last-used sort is
+  // persisted via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
   // `KnSortField` type and `toggleKnSort` below).
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-k-flag', sortField: 'country' },
     { key: 'user_hash', get label() { return showingEmberKnown ? m.transfers_col_user_name() : m.transfers_col_user_hash(); }, width: 248, minWidth: 168, className: 'col-k-hash', sortField: 'user_hash' },
+    // The ledger stores what each peer called itself and what it runs, so the
+    // eD2K tab no longer has only 32 hex characters to identify a row by.
+    //
+    // The header has to change on the Ember tab: there the first column is
+    // itself labelled "User Name" (it shows the friend nickname), so calling
+    // this one that too would put two identical headers side by side. The
+    // eD2K Hello name is still worth showing for an Ember peer — it is just a
+    // different name from the friend one — so it is relabelled rather than
+    // dropped.
+    { key: 'peer_name', get label() { return showingEmberKnown ? m.transfers_col_ed2k_name() : m.transfers_col_user_name(); }, width: 150, minWidth: 110, className: 'col-k-nick', sortField: 'peer_name' },
+    { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 120, minWidth: 96, className: 'col-k-soft', sortField: 'client_software' },
     { key: 'last_known_ip', get label() { return m.transfers_col_last_ip(); }, width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip', defaultHidden: true },
     { key: 'uploaded', get label() { return m.transfers_col_uploaded_to(); }, width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
     { key: 'downloaded', get label() { return m.transfers_col_downloaded_from(); }, width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
@@ -168,8 +239,9 @@
   // choice made the rows keep their activity-priority default.
   const CLIENT_COLUMNS: TransferColumn<ClSortField>[] = [
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client', sortField: 'peer_name' },
-    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-c-flag' },
+    { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-c-flag', sortField: 'country' },
     { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft', sortField: 'client_software' },
+    { key: 'origin', get label() { return m.transfers_col_origin(); }, get title() { return m.transfers_col_origin_hint(); }, width: 84, minWidth: 64, className: 'col-c-origin', sortField: 'origin' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
     { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed', sortField: 'speed' },
     { key: 'downloaded', get label() { return m.transfers_col_downloaded(); }, width: 65, minWidth: 65, className: 'col-c-down', sortField: 'downloaded' },
@@ -204,8 +276,12 @@
   const COLUMN_ORDER_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-column-order-DownloadListCtrl',
     uploads: 'transfers-column-order-UploadListCtrl',
-    queue: 'transfers-column-order-QueueListCtrlV2',
-    known: 'transfers-column-order-KnownClientsCtrl',
+    // V3: bumped when Nickname and Software were added, so the two land where
+    // the schema puts them instead of being appended after Identification.
+    queue: 'transfers-column-order-QueueListCtrlV3',
+    // V2: bumped when Nickname and Client Software were added, so the two
+    // land beside the hash they identify instead of after Last Seen.
+    known: 'transfers-column-order-KnownClientsCtrlV2',
     clients: 'transfers-column-order-DownloadClientsCtrl',
   };
 
@@ -287,24 +363,21 @@
     compactMq.addEventListener('change', onCompactMq);
     viewportCompactCleanup = () => compactMq.removeEventListener('change', onCompactMq);
 
-    // One-shot fetch of the upload-queue and known-clients snapshots so
-    // the bottom-tab labels show their counts immediately on page load,
-    // not just after the user has clicked each tab. The per-tab
-    // `$effect`s below still own the ongoing polling while a tab is
-    // visible — this only primes the counts for tabs the user hasn't
-    // opened yet. Without it, "Queued (N)" / "Known ED2K Peers (N)"
-    // rendered as bare "Queued" / "Known ED2K Peers" until first click,
-    // and the numbers vanished again every time the user navigated
-    // away from /transfers and back.
-    refreshUploadQueue();
-    // Priming the tab counts only needs the list, not a badge sweep — this
-    // runs on every visit to /transfers whether or not the tab is opened.
-    refreshKnownClients(false);
+    // Prime the known-peer tab labels so they carry a count on first paint
+    // rather than after the first poll interval. The `$effect` below now keeps
+    // them current on any tab — via the counts-only command when its own tab is
+    // hidden — so this is purely about the gap before its first tick, and it
+    // uses the same cheap command rather than pulling the whole ledger.
+    //
+    // The upload queue needs no equivalent: its poll runs on whichever tab
+    // is showing, so it primes its own count.
+    void refreshKnownCounts();
     void refreshFriendHashes();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
       available_parts?: number; total_parts?: number; country_code?: string;
+      origin?: SourceInfo['origin'];
     }>('transfer-source-detail', (event) => {
       if (!mounted) return;
       const d = event.payload;
@@ -334,7 +407,7 @@
           // tier until the next ranked event put it back.
           const queue_rank =
             d.queue_rank ?? (status === 'queued' ? s.queue_rank : undefined);
-          const updated: SourceInfo = { ...s, status, queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
+          const updated: SourceInfo = { ...s, status, queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code, origin: d.origin ?? s.origin };
           expandedSources[idx] = updated;
           expandedSources = [...expandedSources];
         }
@@ -360,7 +433,7 @@
           next.splice(victim, 1);
           expandedSources = next;
         }
-        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
+        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code, origin: d.origin } as SourceInfo];
       }
     }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch(() => { /* backend may not be up yet; the store also listens for the same event */ });
 
@@ -634,11 +707,41 @@
       case 'stalled': return m.transfers_src_stalled();
       case 'queue_full': return m.transfers_src_queue_full();
       case 'no_needed_parts': return m.transfers_src_no_needed_parts();
+      case 'parts_busy': return m.transfers_src_parts_busy();
+      case 'waiting_for_slot': return m.transfers_src_waiting_for_slot();
       case 'transferring': return m.transfers_src_transferring();
       case 'completed': return m.transfers_src_done();
       case 'failed': return m.transfers_src_status_failed();
       default: return m.common_unknown();
     }
+  }
+
+  /// Short label for the Origin column — which network told us about a source.
+  ///
+  /// `undefined` is a genuine answer, not a hole to fill. A source reloaded
+  /// from `sources.met` has no recorded origin (the file cannot carry one) and
+  /// neither does one the A4AF swapper moved between files, so those read as
+  /// unknown until some network mentions the peer again — which resume-time
+  /// discovery normally does within a cycle or so.
+  function sourceOriginLabel(origin: SourceInfo['origin']): string {
+    switch (origin) {
+      case 'server': return m.transfers_origin_server();
+      case 'kad': return m.transfers_origin_kad();
+      case 'ember': return m.transfers_origin_ember();
+      case 'exchange': return m.transfers_origin_exchange();
+      default: return '\u2014';
+    }
+  }
+
+  function sourceOriginTitle(origin: SourceInfo['origin']): string {
+    return origin ? m.transfers_origin_title({ origin: sourceOriginLabel(origin) }) : m.transfers_origin_unknown();
+  }
+
+  /// What the peer says it runs. Empty until its Hello handshake lands, which
+  /// is why a not-yet-contacted source shows a dash here rather than the name
+  /// of the network that found it — the two used to share this field.
+  function sourceClientLabel(s: SourceInfo): string {
+    return s.client_software || '\u2014';
   }
 
   // Source-list ordering: transferring rises to the top (most useful
@@ -685,14 +788,21 @@
     transferring: 0,
     queued: 1,
     connecting: 2,
-    wait_callback: 3,
-    friend_connect: 4,
-    stalled: 5,
-    queue_full: 6,
-    no_needed_parts: 7,
-    unreachable: 8,
-    completed: 9,
-    failed: 10,
+    // Not yet dialled, but only because of our own connection cap, so it is
+    // about as close to sending bytes as one that is dialling.
+    waiting_for_slot: 3,
+    wait_callback: 4,
+    friend_connect: 5,
+    stalled: 6,
+    queue_full: 7,
+    // Reachable and willing, just with nothing to give this minute. Ranked
+    // ahead of `no_needed_parts`, which means the peer has nothing at all, so
+    // the drawer sheds the genuinely useless rows first.
+    parts_busy: 8,
+    no_needed_parts: 9,
+    unreachable: 10,
+    completed: 11,
+    failed: 12,
   };
 
   /** Sort order for a status this build does not know about: last, with the
@@ -704,7 +814,7 @@
    *  drawer's rows however the status vocabulary grows. */
   const SOURCE_CHIP_STATUSES: ReadonlySet<SourceInfo['status']> = new Set([
     'transferring', 'queued', 'wait_callback', 'friend_connect',
-    'unreachable', 'connecting', 'failed',
+    'unreachable', 'connecting', 'waiting_for_slot', 'parts_busy', 'failed',
   ]);
 
   /**
@@ -727,11 +837,24 @@
     return [...sources].sort((a, b) => {
       let cmp = 0;
       switch (field) {
+        // Unknown country last on ascending, as the Known Peers and queue
+        // tables do it. A blank is common (LAN and private ranges never
+        // resolve), and the same column label under the same click has to mean
+        // the same thing on every tab.
+        case 'country':
+          cmp = cmpCountry(a.country_code, b.country_code);
+          break;
         case 'peer_name':
           cmp = sortCollator.compare(a.peer_name || a.ip, b.peer_name || b.ip);
           break;
         case 'client_software':
           cmp = sortCollator.compare(a.client_software || '', b.client_software || '');
+          break;
+        // Sorted by the label the user can see rather than the wire value, so
+        // the grouping matches the column in every locale. Unknown sorts last
+        // on ascending, like Country above.
+        case 'origin':
+          cmp = cmpOrigin(a.origin, b.origin);
           break;
         case 'speed':
           cmp = a.speed - b.speed;
@@ -903,6 +1026,15 @@
   //     visibility so background tabs don't keep the network task busy.
   let uploadQueueClients: UploadQueueClient[] = $state([]);
   let knownClients: KnownClient[] = $state([]);
+  /** Counts behind the two known-peer tab labels.
+   *
+   *  Deliberately separate from `knownClients`, and the only thing the labels
+   *  read. The full ledger is fetched only while one of those tabs is showing,
+   *  so deriving the labels from it left them frozen at whatever the last visit
+   *  saw — a peer count that never moved until clicked. This is fed by the
+   *  cheap counts command off-tab and by the full snapshot on it, so there is
+   *  one source of truth and it is always the freshest answer received. */
+  let knownCounts = $state<KnownClientCounts | null>(null);
   let uploadQueueLoaded = $state(false);
   let knownClientsLoaded = $state(false);
 
@@ -918,12 +1050,28 @@
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
+  // Cadence while some other bottom tab is showing. The Queued tab's label
+  // carries the queue count, so the poll cannot stop when the tab is hidden —
+  // it just slows down to what a count badge is worth.
+  const QUEUE_BADGE_POLL_INTERVAL_MS = 15000;
+  let queueTabActive = $derived(bottomView === 'queued');
   const KNOWN_POLL_INTERVAL_MS = 8000;
+  // Cadence for the counts-only poll that runs on every other bottom tab.
+  // Slower than the queue's badge poll because credit records accrue far more
+  // slowly than queue rank changes, and this is a number in a label.
+  const KNOWN_BADGE_POLL_INTERVAL_MS = 30000;
+  let knownLedgerActive = $derived(isKnownLedgerView(bottomView));
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
   let uploadQueueGen = 0;
   let knownClientsGen = 0;
+  // Guards `knownCounts` alone, and is claimed by both writers — the cheap
+  // counts poll and the full snapshot — so whichever *started* last wins
+  // regardless of which resolves first. Without a shared counter a slow
+  // counts request begun before a tab switch could land on top of the fresher
+  // figures the snapshot had already published.
+  let knownCountsGen = 0;
   // Consecutive-failure counters for the *first* load only (reset on any
   // success). If the very first snapshot keeps failing — e.g. the tab is
   // opened right after launch, before the network task's command loop is
@@ -969,12 +1117,35 @@
       }
     }
   }
+  /** Refresh just the tab-label counts. Cheap enough to run on any tab. */
+  async function refreshKnownCounts() {
+    const gen = ++knownCountsGen;
+    try {
+      const counts = await getKnownClientCounts();
+      if (!mounted || gen !== knownCountsGen) return;
+      knownCounts = counts;
+    } catch (e) {
+      // Leave the last good figures up rather than blanking the labels; the
+      // next tick retries.
+      console.warn('Failed to refresh known client counts:', e);
+    }
+  }
+
   async function refreshKnownClients(refreshBadges = true) {
     const gen = ++knownClientsGen;
+    const countGen = ++knownCountsGen;
     try {
       const data = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
       knownClients = data;
+      // The ledger we just fetched is a stricter answer than the counts poll
+      // can give, so publish the labels from it. Split exactly as `knownSplit`
+      // does, or the label and the table it opens would disagree.
+      if (countGen === knownCountsGen) {
+        let ember = 0;
+        for (const kc of data) if (kc.ember_hash) ember++;
+        knownCounts = { ed2k: data.length - ember, ember };
+      }
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
@@ -1163,34 +1334,44 @@
   });
 
   $effect(() => {
-    // Poll the upload queue only while its tab is visible. Refresh
-    // immediately on activation so the table is populated before the
-    // next interval tick fires.
-    if (bottomView === 'queued') {
-      refreshUploadQueue();
-      if (queuePollHandle === null) {
-        queuePollHandle = setInterval(() => {
-          // Same gate as the known-clients poll below and every poll in the
-          // stores: a minimized client has nobody to show a queue rank to.
-          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-            return;
-          }
-          refreshUploadQueue();
-        }, QUEUE_POLL_INTERVAL_MS);
-      }
-      // Skipping ticks while hidden means the first thing the user sees on
-      // restoring the window is up to a full interval out of date, so pump
-      // once on the way back.
-      if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
-        queueVisibilityHandler = () => {
-          if (document.visibilityState !== 'visible' || bottomView !== 'queued') return;
-          refreshUploadQueue();
-        };
-        document.addEventListener('visibilitychange', queueVisibilityHandler);
-      }
-    } else if (queuePollHandle !== null) {
-      clearInterval(queuePollHandle);
-      queuePollHandle = null;
+    // Poll the upload queue for as long as this page is mounted, fast while
+    // its own tab is showing and slowly otherwise.
+    //
+    // This used to stop entirely unless `bottomView === 'queued'`. The Queued
+    // tab is not the default one, so on arriving at Transfers the queue was
+    // read exactly once — by the mount-time fetch — and then left alone: the
+    // count in the tab label went stale, and peers who joined the queue after
+    // that never showed up. Reported as the queue not populating, with a
+    // right-click "Reload" as the only thing that helped. That Reload is the
+    // webview's own, and what it does is remount the page, which re-runs that
+    // single fetch; hence also having to repeat it.
+    //
+    // Read through a `$derived` so that moving between two tabs that are both
+    // "not the queue" doesn't tear down and rebuild the interval.
+    const fast = queueTabActive;
+    refreshUploadQueue();
+    // Rebuilt rather than reused when the cadence changes, so switching to the
+    // tab starts polling at the tab's rate instead of keeping the badge's.
+    queuePollHandle = setInterval(
+      () => {
+        // Same gate as the known-clients poll below and every poll in the
+        // stores: a minimized client has nobody to show a queue rank to.
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+          return;
+        }
+        refreshUploadQueue();
+      },
+      fast ? QUEUE_POLL_INTERVAL_MS : QUEUE_BADGE_POLL_INTERVAL_MS,
+    );
+    // Skipping ticks while hidden means the first thing the user sees on
+    // restoring the window is up to a full interval out of date, so pump
+    // once on the way back.
+    if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
+      queueVisibilityHandler = () => {
+        if (document.visibilityState !== 'visible') return;
+        refreshUploadQueue();
+      };
+      document.addEventListener('visibilitychange', queueVisibilityHandler);
     }
     return () => {
       if (queuePollHandle !== null) {
@@ -1205,42 +1386,66 @@
   });
 
   $effect(() => {
-    // Same pattern as the queue poll; longer interval because credit
-    // records change far less often than queue rank. Friend hashes are
-    // refreshed on the same cadence so add/remove from the Friends page
-    // updates markers while this tab stays open.
-    if (isKnownLedgerView(bottomView)) {
-      refreshKnownClients();
-      void refreshFriendHashes();
-      if (knownPollHandle === null) {
-        knownPollHandle = setInterval(() => {
-          // Every other poll in the app skips work while the window is
-          // hidden; this one did not, so a minimized client kept sweeping
-          // reputations forever.
-          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-            return;
-          }
+    // Same pattern as the queue poll, and for the same reason: both known-peer
+    // tab labels carry a count, so the poll cannot stop when the tab is hidden.
+    // It used to, which left "Known ED2K Peers (1678)" frozen at whatever the
+    // last visit happened to see — or at the mount-time prime — for the rest of
+    // the session.
+    //
+    // What changes off-tab is *what* is fetched, not just how often. The full
+    // ledger joins a `spawn_blocking` database read and resolves an ident
+    // state, credit ratio and GeoIP country for every one of up to
+    // `MAX_CREDIT_RECORDS` rows; running that to keep two integers current
+    // would cost more than the tabs are worth. `get_known_client_counts`
+    // answers the same question without the database, the lookups or the
+    // per-row allocation, so that is what runs on every other tab.
+    //
+    // Read through a `$derived` so moving between two tabs that are both "not
+    // a known-peer tab" doesn't tear down and rebuild the interval.
+    const onTab = knownLedgerActive;
+    const pump = () => {
+      if (onTab) {
+        refreshKnownClients();
+        // Friend hashes ride the ledger poll so add/remove from the Friends
+        // page updates the markers while the tab stays open. The labels carry
+        // no friend state, so the counts-only path does not need them.
+        void refreshFriendHashes();
+      } else {
+        void refreshKnownCounts();
+      }
+    };
+    pump();
+    // Rebuilt rather than reused when the cadence changes, so arriving on the
+    // tab starts polling at the ledger's rate instead of keeping the label's.
+    knownPollHandle = setInterval(
+      () => {
+        // Every other poll in the app skips work while the window is
+        // hidden; this one did not, so a minimized client kept sweeping
+        // reputations forever.
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+          return;
+        }
+        pump();
+      },
+      onTab ? KNOWN_POLL_INTERVAL_MS : KNOWN_BADGE_POLL_INTERVAL_MS,
+    );
+    // Skipping ticks while hidden means the first thing the user sees on
+    // restoring the window is up to a full interval out of date, so pump
+    // once on the way back — the same catch-up the network and transfer
+    // stores do around their own visibility gates. Reads `bottomView` live
+    // rather than closing over `onTab`, because this handler outlives the
+    // effect run that registered it.
+    if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
+      knownVisibilityHandler = () => {
+        if (document.visibilityState !== 'visible') return;
+        if (isKnownLedgerView(bottomView)) {
           refreshKnownClients();
           void refreshFriendHashes();
-        }, KNOWN_POLL_INTERVAL_MS);
-      }
-      // Skipping ticks while hidden means the first thing the user sees on
-      // restoring the window is up to a full interval out of date, so pump
-      // once on the way back — the same catch-up the network and transfer
-      // stores do around their own visibility gates.
-      if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
-        knownVisibilityHandler = () => {
-          if (document.visibilityState !== 'visible' || !isKnownLedgerView(bottomView)) {
-            return;
-          }
-          refreshKnownClients();
-          void refreshFriendHashes();
-        };
-        document.addEventListener('visibilitychange', knownVisibilityHandler);
-      }
-    } else if (knownPollHandle !== null) {
-      clearInterval(knownPollHandle);
-      knownPollHandle = null;
+        } else {
+          void refreshKnownCounts();
+        }
+      };
+      document.addEventListener('visibilitychange', knownVisibilityHandler);
     }
     return () => {
       if (knownPollHandle !== null) {
@@ -1320,6 +1525,15 @@
           raw = cmpStr(nameOf(a), nameOf(b));
           break;
         }
+        case 'peer_name':
+          raw = cmpStr(a.peer_name, b.peer_name);
+          break;
+        case 'country':
+          raw = cmpStr(a.country_code, b.country_code);
+          break;
+        case 'client_software':
+          raw = cmpStr(a.client_software, b.client_software);
+          break;
         case 'last_known_ip':
           raw = cmpIp(a.last_known_ip, b.last_known_ip);
           break;
@@ -1350,17 +1564,71 @@
     return sorted;
   });
 
+  /** Sorted view of the upload queue snapshot, driven by the column-header
+   *  click state. Empty country / name / software values go to the end on an
+   *  ascending sort, as they do on the Known Peers table, and every comparison
+   *  falls back to the row's own key so equal values resolve the same way on
+   *  every re-poll instead of showing the backend's arrival order as movement. */
+  let sortedUploadQueueClients = $derived.by(() => {
+    if (uploadQueueClients.length === 0) return uploadQueueClients;
+    const sorted = [...uploadQueueClients];
+    const dir = quSortAsc ? 1 : -1;
+    const cmpStr = (a: string | null | undefined, b: string | null | undefined) => {
+      const ax = (a ?? '').toLowerCase();
+      const bx = (b ?? '').toLowerCase();
+      if (ax === bx) return 0;
+      // +1 for empty so the outer `raw * dir` puts it last ascending; see the
+      // matching note on `sortedKnownClients`.
+      if (!ax) return 1;
+      if (!bx) return -1;
+      return ax < bx ? -1 : 1;
+    };
+    const cmpNum = (a: number, b: number) => (a === b ? 0 : a < b ? -1 : 1);
+    sorted.sort((a, b) => {
+      let raw = 0;
+      switch (quSortField) {
+        case 'country': raw = cmpStr(a.country_code, b.country_code); break;
+        case 'peer_name': raw = cmpStr(a.peer_name, b.peer_name); break;
+        case 'user_name': raw = cmpStr(a.user_hash || a.peer_ip, b.user_hash || b.peer_ip); break;
+        case 'client_software': raw = cmpStr(a.client_software, b.client_software); break;
+        case 'file_name': raw = cmpStr(a.file_name, b.file_name); break;
+        case 'wait_time': raw = cmpNum(a.wait_seconds, b.wait_seconds); break;
+        case 'queue_rank': raw = cmpNum(a.queue_rank, b.queue_rank); break;
+        case 'credit_ratio': raw = cmpNum(a.credit_ratio, b.credit_ratio); break;
+        case 'transfer_history': raw = cmpNum(a.uploaded, b.uploaded); break;
+        // Same trust ordering the Known Peers table sorts by, not the raw
+        // code: the cell shows a translated label, so an alphabetical sort on
+        // the wire string would match the displayed order in no locale.
+        case 'ident_state':
+          raw = cmpNum(
+            KNOWN_IDENT_ORDER[a.ident_state] ?? 99,
+            KNOWN_IDENT_ORDER[b.ident_state] ?? 99,
+          );
+          break;
+      }
+      if (raw === 0) return cmpNum(a.queue_rank, b.queue_rank);
+      return raw * dir;
+    });
+    return sorted;
+  });
+
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
-  type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
-  type KnSortField = 'user_hash' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
+  type UlSortField = 'country' | 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
+  // Every queue column says something per-row, so all of them sort. `user_name`
+  // orders by the user hash the column actually shows (falling back to the
+  // address, as the cell does), and `transfer_history` by what we sent them —
+  // the first of the two figures in the cell.
+  type QuSortField = 'country' | 'peer_name' | 'user_name' | 'client_software' | 'file_name' | 'wait_time' | 'queue_rank' | 'credit_ratio' | 'transfer_history' | 'ident_state';
+  type KnSortField = 'country' | 'user_hash' | 'peer_name' | 'client_software' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
   // No `file_name`: that column shows the parent download's name, which is the
   // same string on every row here, so sorting by it would do nothing.
-  type ClSortField = 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
+  type ClSortField = 'country' | 'peer_name' | 'client_software' | 'origin' | 'speed' | 'downloaded' | 'parts' | 'status';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
-  const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
-  const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
-  const CL_SORT_FIELDS: ClSortField[] = ['peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
+  const UL_SORT_FIELDS: UlSortField[] = ['country', 'peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
+  const QU_SORT_FIELDS: QuSortField[] = ['country', 'peer_name', 'user_name', 'client_software', 'file_name', 'wait_time', 'queue_rank', 'credit_ratio', 'transfer_history', 'ident_state'];
+  const KN_SORT_FIELDS: KnSortField[] = ['country', 'user_hash', 'peer_name', 'client_software', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
+  const CL_SORT_FIELDS: ClSortField[] = ['country', 'peer_name', 'client_software', 'origin', 'speed', 'downloaded', 'parts', 'status'];
   // localStorage can throw in private mode / on quota-exceeded, and
   // `loadStoredColumnWidths` runs during mount — an escaped throw there
   // aborted page initialization. The sort and column-setup persistence below
@@ -1373,6 +1641,11 @@
   let dlSortAsc = $state(safeGetItem('transfers-dl-sort-asc') !== 'false');
   let ulSortField: UlSortField = $state(UL_SORT_FIELDS.includes(safeGetItem('transfers-ul-sort-field') as UlSortField) ? safeGetItem('transfers-ul-sort-field') as UlSortField : 'file_name');
   let ulSortAsc = $state(safeGetItem('transfers-ul-sort-asc') !== 'false');
+  // Default queue sort: rank ascending, which is the order the backend
+  // snapshot already arrives in and the order eMule shows a queue in, so the
+  // first paint is unchanged for anyone who never clicks a header.
+  let quSortField: QuSortField = $state(QU_SORT_FIELDS.includes(safeGetItem('transfers-qu-sort-field') as QuSortField) ? safeGetItem('transfers-qu-sort-field') as QuSortField : 'queue_rank');
+  let quSortAsc = $state(safeGetItem('transfers-qu-sort-asc') !== 'false');
   // Default Known Clients sort: most-recently-seen first. Matches the
   // backend snapshot's default ordering so the first paint is stable
   // even before the user picks a column. `dlSortAsc` semantics: true =
@@ -1400,6 +1673,27 @@
     safeSetItem('transfers-ul-sort-field', ulSortField);
     safeSetItem('transfers-ul-sort-asc', String(ulSortAsc));
   }
+  function toggleQuSort(field: QuSortField) {
+    if (quSortField === field) {
+      quSortAsc = !quSortAsc;
+    } else {
+      // Same "natural direction" rule as the Known Peers table: text reads
+      // best A-Z, numbers largest-first. Rank is the exception among the
+      // numbers — rank 1 is the front of the queue, so ascending is what
+      // someone clicking it wants to see.
+      quSortField = field;
+      quSortAsc =
+        field === 'country' ||
+        field === 'peer_name' ||
+        field === 'user_name' ||
+        field === 'client_software' ||
+        field === 'file_name' ||
+        field === 'ident_state' ||
+        field === 'queue_rank';
+    }
+    safeSetItem('transfers-qu-sort-field', quSortField);
+    safeSetItem('transfers-qu-sort-asc', String(quSortAsc));
+  }
   function toggleKnSort(field: KnSortField) {
     if (knSortField === field) {
       knSortAsc = !knSortAsc;
@@ -1409,7 +1703,13 @@
       // string columns default to ascending (A-Z first). Matches the
       // sorting UX in eMule and most file managers.
       knSortField = field;
-      knSortAsc = field === 'user_hash' || field === 'last_known_ip' || field === 'ident_state';
+      knSortAsc =
+        field === 'country' ||
+        field === 'user_hash' ||
+        field === 'peer_name' ||
+        field === 'client_software' ||
+        field === 'last_known_ip' ||
+        field === 'ident_state';
     }
     safeSetItem('transfers-kn-sort-field', knSortField);
     safeSetItem('transfers-kn-sort-asc', String(knSortAsc));
@@ -1423,7 +1723,7 @@
       clSortField = field;
       // Text columns read best A-Z; numbers and status read best largest- /
       // most-active-first, matching the Known Clients table.
-      clSortAsc = field === 'peer_name' || field === 'client_software';
+      clSortAsc = field === 'country' || field === 'peer_name' || field === 'client_software' || field === 'origin';
     } else if (clSortAsc) {
       clSortAsc = false;
     } else {
@@ -1530,6 +1830,18 @@
     return 0;
   }
 
+  /** True when every byte is on disk, including the 1-byte hold
+   *  `progress_bytes` uses until part MD4 / whole-file hash. That hold is
+   *  what made a finished-looking bar sit next to "Downloading (Idle)".
+   *  A 1-byte file's hold is 0, so "one byte remaining" is only treated as
+   *  complete on files larger than that. */
+  function downloadCoverageComplete(t: Transfer): boolean {
+    const completed = t.completed_size ?? 0;
+    if (t.total_size <= 0) return false;
+    if (completed >= t.total_size) return true;
+    return t.total_size > 1 && completed + 1 >= t.total_size;
+  }
+
   /** D23: pick the progress-bar fill colour for a download row. Respects
    *  both status (paused/stopped/verifying/completing/failed) and health
    *  (stalled / degraded) so an active row with bad health doesn't still
@@ -1541,6 +1853,7 @@
       return 'var(--success)';
     }
     if (t.status === 'active') {
+      if (downloadCoverageComplete(t)) return 'var(--accent)';
       if (t.health === 'stalled') return 'var(--danger)';
       if (t.health === 'degraded') return 'var(--warning)';
     }
@@ -1795,6 +2108,7 @@
     sorted.sort((a, b) => {
       let cmp = 0;
       switch (ulSortField) {
+        case 'country': cmp = cmpCountry(a.country_code, b.country_code); break;
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
         case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
@@ -1804,7 +2118,15 @@
         case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
         case 'client_software': cmp = (a.client_software || '').localeCompare(b.client_software || ''); break;
       }
-      return ulSortAsc ? cmp : -cmp;
+      if (cmp !== 0) return ulSortAsc ? cmp : -cmp;
+      // Tie-break on the row's own identity, in a fixed direction, the way the
+      // queue / Known Peers / source tables do. `activeUploads` is re-derived
+      // from the store on every poll, so without this the order within a group
+      // of equal keys is whatever the backend last happened to emit, and the
+      // rows visibly reshuffle several times a second. Country made that
+      // obvious — a handful of codes means nearly every pair ties — but Status
+      // and Software have always had the same shape.
+      return a.id.localeCompare(b.id);
     });
     return sorted;
   });
@@ -1840,6 +2162,7 @@
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
+        if (downloadCoverageComplete(t)) return m.transfers_dl_status_finishing();
         if (t.health === 'stalled') return m.transfers_dl_status_stalled();
         if (t.health === 'degraded') return m.transfers_dl_status_downloading_idle();
         return m.transfers_dl_status_downloading();
@@ -2054,6 +2377,7 @@
     closeColumnMenu();
     closeKnownCtx();
     closePaneCtx();
+    closeUploadsPaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
     ctxWebSub = false;
@@ -2066,6 +2390,7 @@
     closeCtx();
     closeColumnMenu();
     closePaneCtx();
+    closeUploadsPaneCtx();
     knownCtxMenu = { x: e.clientX, y: e.clientY, client };
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
@@ -2074,29 +2399,220 @@
   /// need no row, and are most wanted when the list is empty.
   let paneCtxMenu: { x: number; y: number } | null = $state(null);
 
-  function onDownloadsPaneCtx(e: MouseEvent) {
-    // The header and the rows already own their right-click, and neither
-    // stops propagation, so this has to bow out for both rather than opening a
-    // second menu on top of theirs.
+  /// Whether a right-click inside a pane has already been answered, or landed
+  /// somewhere that should keep the platform's own menu.
+  ///
+  /// Anything that owns a right-click — a row menu, a column menu — calls
+  /// `preventDefault` before a pane handler sees the event, so asking that is
+  /// both simpler and more accurate than guessing at ancestors. The guess this
+  /// replaces bowed out for every `tbody tr`, and two kinds of row have no menu
+  /// of their own: each table's empty state, and the upload queue's rows. Both
+  /// fell through to the webview's Back/Forward/Stop/Reload — the empty state
+  /// being exactly where someone with nothing in the list would right-click,
+  /// and Reload there throws away the page.
+  ///
+  /// Text fields keep their own menu, because that is where paste lives.
+  function paneCtxHandledElsewhere(e: MouseEvent): boolean {
+    if (e.defaultPrevented) return true;
     const target = e.target as HTMLElement | null;
-    if (target?.closest('thead') || target?.closest('tbody tr')) return;
+    return !!target?.closest('input, textarea, select, [contenteditable="true"]');
+  }
+
+  function onDownloadsPaneCtx(e: MouseEvent) {
+    if (paneCtxHandledElsewhere(e)) return;
     e.preventDefault();
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
+    closeUploadsPaneCtx();
     paneCtxMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  /// Background menu for the uploads pane. Mostly it exists so that the pane
+  /// answers its own right-click: with no handler here the webview offered
+  /// Back/Forward/Stop/Reload instead, and Reload — a genuine reload of the
+  /// whole page — was being used as a refresh button, which also took the
+  /// server log with it.
+  let uploadsPaneCtxMenu: { x: number; y: number } | null = $state(null);
+
+  function onUploadsPaneCtx(e: MouseEvent) {
+    if (paneCtxHandledElsewhere(e)) return;
+    e.preventDefault();
+    closeCtx();
+    closeKnownCtx();
+    closeColumnMenu();
+    closePaneCtx();
+    uploadsPaneCtxMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  /**
+   * eMule's File Details, for a download.
+   *
+   * A modal rather than another pane: it is about one file, it is opened
+   * deliberately, and the chunk map wants the width. The map itself reuses
+   * `PartsBar` — the component that already draws the upload direction's parts
+   * bar — because the backend hands this window bitmaps in the same encoding.
+   */
+  let fileDetailsId: string | null = $state(null);
+  let fileDetails: DownloadFileDetails | null = $state(null);
+  let fileDetailsLoading = $state(false);
+  let fileDetailsError: string | null = $state(null);
+  let fileDetailsOverlayEl: HTMLDivElement | undefined = $state();
+  let fileDetailsModalEl: HTMLDivElement | undefined = $state();
+  let fileDetailsCloseBtn: HTMLButtonElement | undefined = $state();
+  let fileDetailsReturnFocusEl: HTMLElement | null = null;
+  let fileDetailsGen = 0;
+  /// Slower than the transfers poll: a chunk map that redraws every second is
+  /// harder to read than one that settles, and parts complete in minutes.
+  const FILE_DETAILS_POLL_MS = 4000;
+
+  /// The live row for the open window, so its stats track the download rather
+  /// than freezing at whatever they were when it opened.
+  let fileDetailsTransfer = $derived(
+    fileDetailsId ? ($transfers.find((t) => t.id === fileDetailsId) ?? null) : null,
+  );
+
+  async function refreshFileDetails(transferId: string) {
+    const gen = ++fileDetailsGen;
+    try {
+      const data = await getDownloadFileDetails(transferId);
+      if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
+      fileDetails = data;
+      fileDetailsError = null;
+    } catch (e) {
+      if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
+      // Keep the last good map rather than blanking it: a busy network task is
+      // a reason to show stale parts, not no parts.
+      if (!fileDetails) fileDetailsError = translateError(e, m.transfers_file_details_failed());
+    } finally {
+      if (mounted && gen === fileDetailsGen && fileDetailsId === transferId) {
+        fileDetailsLoading = false;
+      }
+    }
+  }
+
+  function openFileDetails(t: Transfer) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    fileDetailsReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    fileDetailsId = t.id;
+    fileDetails = null;
+    fileDetailsError = null;
+    fileDetailsLoading = true;
+    void refreshFileDetails(t.id);
+  }
+
+  function closeFileDetails() {
+    fileDetailsId = null;
+    fileDetails = null;
+    fileDetailsError = null;
+    fileDetailsLoading = false;
+    fileDetailsGen += 1;
+  }
+
+  $effect(() => {
+    if (!fileDetailsOverlayEl) return;
+    return inertBackground(fileDetailsOverlayEl);
+  });
+
+  // Focus the dialog on open and hand focus back to the row that opened it.
+  $effect(() => {
+    if (!fileDetailsId) return;
+    const raf = requestAnimationFrame(() => fileDetailsCloseBtn?.focus());
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = fileDetailsReturnFocusEl;
+      fileDetailsReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  // Close the window if its download goes away — cancelled from another row,
+  // cleared, removed. The markup already stops rendering without a row behind
+  // it, so without this the dialog would vanish while its poll kept asking
+  // about an id nothing answers for.
+  $effect(() => {
+    if (fileDetailsId && !fileDetailsTransfer) closeFileDetails();
+  });
+
+  $effect(() => {
+    const id = fileDetailsId;
+    if (!id) return;
+    const handle = setInterval(() => {
+      // Same gate as every other poll here: nothing to redraw for a window
+      // nobody can see.
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void refreshFileDetails(id);
+    }, FILE_DETAILS_POLL_MS);
+    return () => clearInterval(handle);
+  });
+
+  function handleFileDetailsKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      // Handled here so the page-level Escape does not also fire; that one
+      // stays as the fallback for when focus is somehow outside.
+      e.preventDefault();
+      e.stopPropagation();
+      closeFileDetails();
+      return;
+    }
+    trapTabKey(e, fileDetailsModalEl);
+  }
+
+  /// Count set bits in one of the window's part bitmaps, in the same packing
+  /// `PartsBar` decodes.
+  function countBits(hex: string, parts: number): number {
+    let total = 0;
+    for (let i = 0; i < parts; i++) {
+      const off = (i >> 3) * 2;
+      const byte = Number.parseInt(hex.slice(off, off + 2), 16);
+      if (!Number.isNaN(byte) && (byte & (1 << (i & 7))) !== 0) total += 1;
+    }
+    return total;
+  }
+
+  /// Counted once per snapshot rather than per render: a large file runs to
+  /// tens of thousands of parts. The other two counts arrive ready-made,
+  /// because their bitmaps are not drawn and so are not sent.
+  let fileDetailsHaveParts = $derived.by(() => {
+    const d = fileDetails;
+    return d ? countBits(d.local_part_status, d.part_count) : 0;
+  });
+
+  /// Re-read the things this page fetches for itself: the upload queue, the
+  /// credit ledger, and the expanded download's source list (which is what the
+  /// Download Clients tab shows). The Uploading tab is fed by the transfers
+  /// store, which runs its own poll, so there is nothing here to refresh on its
+  /// behalf. Polling keeps all of this current regardless; the menu item is for
+  /// the user who wants to be sure.
+  function refreshBottomPane() {
+    refreshUploadQueue();
+    if (isKnownLedgerView(bottomView)) {
+      refreshKnownClients();
+      void refreshFriendHashes();
+    } else {
+      // Not on a known-peer tab, but their labels are still on screen.
+      void refreshKnownCounts();
+    }
+    if (expandedTransferId) {
+      void refreshExpandedSourceDetails(expandedTransferId);
+    }
   }
 
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
+  function closeUploadsPaneCtx() { uploadsPaneCtxMenu = null; }
 
   function onDocClick() {
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
     closePaneCtx();
+    closeUploadsPaneCtx();
     // Match ctx/column menus: native <details> stays open on outside click.
     document
       .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
@@ -2755,6 +3271,18 @@
     sortOnKey(event, () => toggleUlSort(sortField));
   }
 
+  function onQueueHeaderClick(column: TransferColumn<QuSortField>) {
+    if (Date.now() < suppressHeaderClickUntil) return;
+    if (!column.sortField) return;
+    toggleQuSort(column.sortField);
+  }
+
+  function onQueueHeaderKeydown(event: KeyboardEvent, column: TransferColumn<QuSortField>) {
+    const sortField = column.sortField;
+    if (!sortField) return;
+    sortOnKey(event, () => toggleQuSort(sortField));
+  }
+
   function onKnownHeaderClick(column: TransferColumn<KnSortField>) {
     if (Date.now() < suppressHeaderClickUntil) return;
     if (!column.sortField) return;
@@ -2823,7 +3351,7 @@
 
   let visibleDownloadColumns = $derived.by(() => getVisibleColumns('downloads') as TransferColumn<DlSortField>[]);
   let visibleUploadColumns = $derived.by(() => getVisibleColumns('uploads') as TransferColumn<UlSortField>[]);
-  let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue'));
+  let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue') as TransferColumn<QuSortField>[]);
   let visibleKnownColumns = $derived.by(() => getVisibleColumns('known') as TransferColumn<KnSortField>[]);
   let visibleClientColumns = $derived.by(() => getVisibleColumns('clients') as TransferColumn<ClSortField>[]);
 
@@ -3018,6 +3546,7 @@
     event.stopPropagation();
     closeCtx();
     closePaneCtx();
+    closeUploadsPaneCtx();
     columnMenu = { table, x: event.clientX, y: event.clientY };
   }
 
@@ -3257,6 +3786,7 @@
         // D6: mirror dlStatusLabel's health-sensitive branches so the
         // tooltip never contradicts the label (e.g. label "Stalled" +
         // tooltip "Actively downloading").
+        if (downloadCoverageComplete(t)) return m.transfers_dl_tooltip_finishing();
         const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
         if (t.health === 'stalled') {
           return health
@@ -3495,8 +4025,13 @@
 
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
+    // The dialog handles its own Escape and stops it there; this is the
+    // fallback for when focus has somehow ended up outside it, and it comes
+    // first because the dialog sits above everything else.
+    if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
+    else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); e.stopPropagation(); }
     else {
@@ -3755,7 +4290,7 @@
                     eMule computes remaining the same way, from Completed
                     (DownloadListCtrl.cpp:1731).
                   -->
-                  <td class="num-cell">{formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
+                  <td class="num-cell">{downloadCoverageComplete(t) ? '\u2014' : formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
                 {:else if column.key === 'last_seen_complete'}
                   <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                 {:else if column.key === 'last_received'}
@@ -3816,6 +4351,8 @@
                 {@const friendConnectCount = expandedSources.filter(s => s.status === 'friend_connect').length}
                 {@const unreachableCount = expandedSources.filter(s => s.status === 'unreachable').length}
                 {@const connectCount = expandedSources.filter(s => s.status === 'connecting').length}
+                {@const waitingSlotCount = expandedSources.filter(s => s.status === 'waiting_for_slot').length}
+                {@const partsBusyCount = expandedSources.filter(s => s.status === 'parts_busy').length}
                 {@const otherCount = expandedSources.filter(s => !SOURCE_CHIP_STATUSES.has(s.status)).length}
                 <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
@@ -3827,6 +4364,8 @@
                       {#if friendConnectCount > 0}<span class="ss-chip ss-friend-connect">{m.transfers_chip_friend_connect({ count: friendConnectCount })}</span>{/if}
                       {#if unreachableCount > 0}<span class="ss-chip ss-unreachable">{m.transfers_chip_unreachable({ count: unreachableCount })}</span>{/if}
                       {#if connectCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_connecting({ count: connectCount })}</span>{/if}
+                      {#if waitingSlotCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_waiting_for_slot({ count: waitingSlotCount })}</span>{/if}
+                      {#if partsBusyCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_parts_busy({ count: partsBusyCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
                       {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
                     </span>
@@ -3838,7 +4377,13 @@
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
-                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi dir="auto">{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
+                        <span class="source-origin src-origin-{src.origin ?? 'unknown'}" title={sourceOriginTitle(src.origin)}>{sourceOriginLabel(src.origin)}</span>
+                        <!-- No longer falls back to `client_software`: that is
+                             its own field now, and while a peer was still
+                             uncontacted the fallback put the name of the
+                             network that found it where its nickname goes. -->
+                        <span class="source-client" title={src.peer_name || m.transfers_unknown_client()}><bdi dir="auto">{src.peer_name || m.transfers_unknown_client()}</bdi></span>
+                        <span class="source-software" title={src.client_software}><bdi dir="auto">{sourceClientLabel(src)}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
                         <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
@@ -4119,7 +4664,7 @@
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title={m.transfers_tab_known_title()}
-        >{knownClientsLoaded ? m.transfers_tab_known_count({ count: knownSplit.ed2k.length }) : m.transfers_tab_known()}</button>
+        >{knownCounts ? m.transfers_tab_known_count({ count: knownCounts.ed2k }) : m.transfers_tab_known()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_ember'}
@@ -4129,7 +4674,7 @@
           tabindex={bottomView === 'known_ember' ? 0 : -1}
           onclick={() => bottomView = 'known_ember'}
           title={m.transfers_tab_known_ember_title()}
-        >{knownClientsLoaded ? m.transfers_tab_known_ember_count({ count: knownSplit.ember.length }) : m.transfers_tab_known_ember()}</button>
+        >{knownCounts ? m.transfers_tab_known_ember_count({ count: knownCounts.ember }) : m.transfers_tab_known_ember()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -4141,10 +4686,16 @@
         >{m.transfers_tab_download_clients()}</button>
       </div>
     </div>
+    <!-- `tabindex`: answering the pane's own right-click makes this element
+         interactive as far as the a11y check is concerned, which then wants it
+         focusable. -1 keeps it out of the tab order, leaving the tables and
+         buttons inside it as what keyboard users actually move through. -->
     <div
       class="pane-content scroll-shadows"
       id="bottom-pane-content"
+      oncontextmenu={onUploadsPaneCtx}
       role="tabpanel"
+      tabindex={-1}
       aria-label={
         bottomView === 'uploading' ? m.transfers_tab_uploading_label()
         : bottomView === 'queued' ? m.transfers_tab_queued()
@@ -4326,18 +4877,25 @@
               {#each visibleQueueColumns as column (column.key)}
                 <th
                   class={column.className}
+                  class:sortable={Boolean(column.sortField)}
                   class:resizing={isResizingColumn('queue', column.key)}
                   class:drag-enabled={canDragColumn('queue', column.key)}
                   class:drop-before={isDropBefore('queue', column.key)}
                   class:drop-after={isDropAfter('queue', column.key)}
                   role="columnheader"
+                  tabindex={column.sortField ? 0 : undefined}
+                  aria-sort={column.sortField ? ariaSortValue(quSortField, column.sortField, quSortAsc) : undefined}
                   draggable={canDragColumn('queue', column.key)}
+                  onclick={() => onQueueHeaderClick(column)}
+                  onkeydown={(e) => onQueueHeaderKeydown(e, column)}
                   ondragstart={(e) => handleColumnDragStart(e, 'queue', column.key)}
                   ondragover={(e) => handleColumnDragOver(e, 'queue', column.key)}
                   ondrop={(e) => handleColumnDrop(e, 'queue', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">{column.label}</span>
+                  <span class="header-content" title={column.title}>
+                    {column.label}{column.sortField ? sortArrow(quSortField, column.sortField, quSortAsc) : ''}
+                  </span>
                   <button
                     type="button"
                     class="col-resize-handle"
@@ -4352,20 +4910,28 @@
             </tr>
           </thead>
           <tbody>
-            {#each uploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
+            {#each sortedUploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
               <tr class="ul-row">
                 {#each visibleQueueColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={q.country_code ?? ''}>{#if countryFlagSrc(q.country_code ?? undefined)}<img src={countryFlagSrc(q.country_code ?? undefined)} alt={q.country_code ?? ''} class="flag-img" />{/if}</td>
+                  {:else if column.key === 'peer_name'}
+                    <td class="client-cell" title={q.peer_name}>{q.is_friend ? '\u2605 ' : ''}<bdi dir="auto">{q.peer_name || '\u2014'}</bdi></td>
                   {:else if column.key === 'user_name'}
                     {@const label = q.user_hash ? q.user_hash.slice(0, 8) + '\u2026' : (q.peer_ip || '\u2014')}
-                    <td class="client-cell" title={q.user_hash || q.peer_ip}>{q.is_friend ? '\u2605 ' : ''}{label}</td>
+                    <td class="client-cell" title={q.user_hash || q.peer_ip}>{label}</td>
+                  {:else if column.key === 'client_software'}
+                    <td class="client-cell" title={q.client_software}>{q.client_software || '\u2014'}</td>
                   {:else if column.key === 'file_name'}
                     <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
                   {:else if column.key === 'queue_rank'}
-                    <td class="num-cell" title={q.queue_rank == null ? m.transfers_queue_disconnected_title() : ''}>{q.queue_rank == null ? '?' : q.queue_rank}</td>
+                    <!-- Always a number. The rank is computed from the whole
+                         queue, so it is known whether or not the peer happens
+                         to be connected right now; "disconnected" is said by
+                         dimming the row's position, not by replacing it. -->
+                    <td class="num-cell" class:rank-idle={!q.connected} title={q.connected ? '' : m.transfers_queue_disconnected_title()}>{q.queue_rank}</td>
                   {:else if column.key === 'credit_ratio'}
                     <td class="num-cell" title={m.transfers_queue_credit_title()}>{q.credit_ratio.toFixed(2)}</td>
                   {:else if column.key === 'transfer_history'}
@@ -4556,6 +5122,10 @@
                         {/if}
                       </button>
                     </td>
+                  {:else if column.key === 'peer_name'}
+                    <td class="client-cell" title={kc.peer_name}><bdi dir="auto">{kc.peer_name || '\u2014'}</bdi></td>
+                  {:else if column.key === 'client_software'}
+                    <td class="client-cell" title={kc.client_software}>{kc.client_software || '\u2014'}</td>
                   {:else if column.key === 'last_known_ip'}
                     <td class="client-cell" title={kc.last_known_ip ?? m.transfers_known_never_identified()}>{kc.last_known_ip ?? '\u2014'}</td>
                   {:else if column.key === 'uploaded'}
@@ -4702,6 +5272,10 @@
                       <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
                       <td title={src.client_software}><bdi dir="auto">{src.client_software || '\u2014'}</bdi></td>
+                    {:else if column.key === 'origin'}
+                      <td class="origin-cell" title={sourceOriginTitle(src.origin)}>
+                        <span class="source-origin src-origin-{src.origin ?? 'unknown'}">{sourceOriginLabel(src.origin)}</span>
+                      </td>
                     {:else if column.key === 'file_name'}
                       <td class="name-cell" title={clientParent?.file_name || ''}><bdi dir="auto">{clientParent?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
@@ -4873,6 +5447,15 @@
   </div>
 {/if}
 
+{#if uploadsPaneCtxMenu}
+  <!-- Uploads pane background menu. Short on purpose: the pane's tables act on
+       rows, and what this needs to do is answer the right-click at all. -->
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: uploadsPaneCtxMenu.x, y: uploadsPaneCtxMenu.y }} onclick={(e) => e.stopPropagation()}>
+    <button class="ctx-item" role="menuitem" onclick={() => { closeUploadsPaneCtx(); refreshBottomPane(); }}>{m.common_refresh()}</button>
+  </div>
+{/if}
+
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
@@ -4889,6 +5472,8 @@
       {#if canResume(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button
@@ -4992,6 +5577,8 @@
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button
@@ -5203,7 +5790,318 @@
   }}
 />
 
+{#if fileDetailsId && fileDetailsTransfer}
+  {@const t = fileDetailsTransfer}
+  {@const d = fileDetails}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={fileDetailsOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-file-details-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
+    onkeydown={handleFileDetailsKeydown}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+  >
+    <div
+      class="modal-content dl-details-modal"
+      bind:this={fileDetailsModalEl}
+      transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+    >
+      <div class="modal-header">
+        <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
+        <button
+          type="button"
+          class="modal-close"
+          bind:this={fileDetailsCloseBtn}
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          onclick={closeFileDetails}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="dl-details-hero">
+          <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+        </div>
+
+        {#if fileDetailsLoading && !d}
+          <p class="dl-details-note">{m.common_loading()}</p>
+        {:else if fileDetailsError}
+          <p class="dl-details-note error-msg">{fileDetailsError}</p>
+        {:else if d}
+          {@const hasMap = d.tracked && d.part_count > 0}
+          {#if !hasMap}
+            <!-- Said plainly rather than drawn as an empty map. A finished
+                 download has had its part map released, and the single-source
+                 path never registers one; either way the file has parts, we
+                 just cannot see them from here. The figures below do not all
+                 depend on the map, so the dialog is not a dead end. -->
+            <p class="dl-details-note">{m.transfers_file_details_untracked()}</p>
+          {:else}
+          <div class="dl-chunk-block">
+            <span class="dl-chunk-label">{m.transfers_file_details_chunk_map()}</span>
+            <PartsBar
+              partStatus={d.local_part_status}
+              peerPartStatus={d.swarm_part_status}
+              peerSense="swarm"
+              partCount={d.part_count}
+              transferred={d.completed_bytes}
+              total={t.total_size}
+              title={m.transfers_file_details_chunk_map_title()}
+            />
+            <span class="dl-chunk-legend">
+              {m.transfers_file_details_legend({
+                have: fileDetailsHaveParts,
+                parts: d.part_count,
+              })}
+            </span>
+          </div>
+          {/if}
+
+          <dl class="dl-details-grid">
+            {#if hasMap}
+              <dt>{m.transfers_file_details_verified()}</dt>
+              <dd>{m.transfers_file_details_parts_of({
+                n: d.verified_parts,
+                parts: d.part_count,
+              })}</dd>
+
+              <dt>{m.transfers_file_details_in_progress()}</dt>
+              <dd>{d.in_progress_parts}</dd>
+            {/if}
+
+            <!-- The tracker's figures where there is one, the transfer row's
+                 otherwise: both are gap-derived, and a dialog that shows
+                 nothing at all once a download finishes is worse than one that
+                 shows the row it already had. -->
+            <dt>{m.transfers_file_details_on_disk()}</dt>
+            <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
+
+            <dt>{m.transfers_file_details_remaining()}</dt>
+            <dd>{formatSize(hasMap
+              ? d.remaining_bytes
+              : Math.max(0, t.total_size - t.completed_size))}</dd>
+
+            <!-- Wire bytes, which exceed the file once a corrupt part has been
+                 re-fetched. Worth showing next to the on-disk figure, because
+                 the gap between them is what a bad source costs. -->
+            <dt>{m.transfers_file_details_transferred()}</dt>
+            <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
+
+            {#if hasMap}
+              <dt>{m.transfers_file_details_availability()}</dt>
+              <dd>
+                {#if d.sources_with_bitmaps === 0}
+                  {m.common_unknown()}
+                {:else}
+                  {m.transfers_file_details_rarest({
+                    n: d.rarest_part_sources,
+                    sources: d.sources_with_bitmaps,
+                  })}
+                {/if}
+              </dd>
+            {/if}
+
+            <dt>{m.transfers_col_last_seen_complete()}</dt>
+            <dd>
+              <!-- Relative here, where the question is "is this file still
+                   out there"; the column gives the absolute date. Both take
+                   unix *seconds* — `formatRelativeTime` compares against
+                   `Date.now() / 1000`, so passing milliseconds would read as
+                   "now" for every value. -->
+              {t.last_seen_complete
+                ? formatRelativeTime(t.last_seen_complete)
+                : m.common_unknown()}
+            </dd>
+
+            <dt>{m.transfers_col_sources()}</dt>
+            <dd>{sourcesLabel(t)}</dd>
+          </dl>
+        {/if}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
+  /* --- File Details dialog ---
+     Same shell as the Search page's details modal, so the two read as the same
+     kind of window. Scoped styles, so it is repeated rather than shared; the
+     alternative is a component extraction that neither page needs yet. */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--overlay-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .modal-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .dl-details-modal {
+    width: min(560px, 100%);
+    max-height: min(640px, calc(100vh - 48px));
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .modal-title {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .modal-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+
+  .modal-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .modal-body {
+    padding: 16px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  /* The filename leads: it is what the reader opened the dialog to check, and
+     release names need the full width. */
+  .dl-details-hero {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .dl-details-name {
+    font-weight: 600;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .dl-details-sub,
+  .dl-chunk-legend {
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .dl-chunk-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+
+  .dl-chunk-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-grid {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+    gap: 6px 16px;
+    margin: 0;
+    font-size: 12px;
+  }
+
+  .dl-details-grid dt {
+    color: var(--text-secondary);
+  }
+
+  .dl-details-grid dd {
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+
+  @media (max-width: 560px) {
+    .modal-overlay {
+      padding: 0;
+      align-items: stretch;
+    }
+
+    .dl-details-modal {
+      width: 100%;
+      max-height: 100vh;
+      border: none;
+      border-radius: 0;
+    }
+
+    .dl-details-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0;
+    }
+
+    .dl-details-grid dt {
+      margin-top: 6px;
+    }
+  }
+
   /* --- Layout --- */
   .transfers-split {
     flex: 1;
@@ -5674,6 +6572,11 @@
     text-align: right;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
+  }
+  /* A queued peer with no live connection still has a position, so the rank
+     is shown either way and only dimmed — the tooltip says why. */
+  .num-cell.rank-idle {
+    opacity: 0.55;
   }
   /* Numeric columns render their values right-aligned (.num-cell), but the
      default header is flush-left, so the label drifted to the opposite edge
@@ -6371,6 +7274,49 @@
     object-fit: cover;
     vertical-align: middle;
   }
+  /* Which network found this source. Reuses the network hues the Library's
+     published-to badges already use, so "KAD" means the same thing and looks
+     the same in both places — but the network is always spelled out too, never
+     carried by colour alone (WCAG "use of color"). Fixed width so the labels
+     line up into a scannable column down the drawer. */
+  .source-origin {
+    flex-shrink: 0;
+    min-width: 52px;
+    text-align: center;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    line-height: 1.5;
+    padding: 1px 5px;
+    border-radius: var(--radius-pill);
+    border: 1px solid transparent;
+  }
+  .src-origin-server {
+    color: var(--ed2k-color);
+    background: color-mix(in srgb, var(--ed2k-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
+  }
+  .src-origin-kad {
+    color: var(--kad-color);
+    background: color-mix(in srgb, var(--kad-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--kad-color) 30%, transparent);
+  }
+  .src-origin-ember {
+    color: var(--ember-color);
+    background: color-mix(in srgb, var(--ember-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--ember-color) 30%, transparent);
+  }
+  .src-origin-exchange {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--text-secondary) 26%, transparent);
+  }
+  /* Deliberately flat: an unknown origin is a fact about our records, not a
+     network, so it must not look like one more category. */
+  .src-origin-unknown {
+    color: var(--text-disabled);
+  }
   .source-client {
     color: var(--text-primary);
     font-weight: 600;
@@ -6378,6 +7324,21 @@
     max-width: 200px;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* In the Download Clients table the chip sits in a real cell, so it keeps its
+     natural width instead of the drawer's alignment minimum. */
+  .origin-cell .source-origin {
+    min-width: 0;
+  }
+  /* The peer's self-reported software, beside but distinct from its nickname:
+     lighter weight so the name still leads the row. */
+  .source-software {
+    color: var(--text-muted);
+    font-size: 10px;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 0;
   }
   .source-sep {
     width: 1px;

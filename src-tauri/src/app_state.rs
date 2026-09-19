@@ -207,11 +207,27 @@ pub struct AppState {
 impl AppState {
     /// Register a background scan task so it can be awaited on shutdown.
     /// The caller spawns with `tokio::spawn` and passes the returned handle.
+    ///
+    /// Refuses once `bw_shutdown` is set, aborting the handle instead of
+    /// tracking it. Without that refusal the shutdown join is not exhaustive:
+    /// a scan queued after `await_background_scans` returned would be free to
+    /// take `local_index.write()` and update `known_files` while the network
+    /// task performs the authoritative flush, which is the half-written
+    /// `known.met` this map exists to prevent. Aborting rather than dropping
+    /// matters because dropping a `JoinHandle` detaches the task.
     pub async fn register_background_scan(&self, handle: tokio::task::JoinHandle<()>) -> u64 {
+        // Tested under the same write lock `await_background_scans` drains
+        // under, so a registration either lands before the drain (and is
+        // joined by it) or observes the flag and is refused. Reading the flag
+        // outside the lock would leave exactly the gap this closes.
+        let mut map = self.background_scans.write().await;
+        if self.bw_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            handle.abort();
+            return u64::MAX;
+        }
         let id = self
             .background_scan_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
-        let mut map = self.background_scans.write().await;
         // Reap already-finished scans so the map can't grow unbounded across a
         // long session of folder adds / reloads (each spawns one task and we
         // don't otherwise remove completed entries until shutdown).

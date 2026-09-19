@@ -313,8 +313,9 @@ async fn mutual_friend_access(
 fn allow_long_lived_session_under_admission(
     from_configured_server_ip: bool,
     total_connections: usize,
+    ordinary_limit: usize,
 ) -> bool {
-    !from_configured_server_ip || total_connections <= MAX_TOTAL_CONNECTIONS
+    !from_configured_server_ip || total_connections <= ordinary_limit
 }
 
 /// Remove `hash`'s entry from `sessions` if present but stale (see
@@ -565,26 +566,32 @@ struct UploadSlotGuard {
     armed: bool,
 }
 
+/// Holds one connection's admission for as long as the session lives: its unit
+/// of the machine-wide budget and its entry in the per-IP count. Both are
+/// released together on drop, whichever way the session ends.
 struct ConnectionAdmissionGuard {
-    total: Arc<std::sync::atomic::AtomicUsize>,
+    /// Dropped with the guard, returning the unit to the shared budget.
+    _conn: super::multi_source::ListenerConnPermit,
     per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
 }
 
 impl ConnectionAdmissionGuard {
     fn new(
-        total: Arc<std::sync::atomic::AtomicUsize>,
+        conn: super::multi_source::ListenerConnPermit,
         per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
         ip: IpAddr,
     ) -> Self {
-        Self { total, per_ip, ip }
+        Self {
+            _conn: conn,
+            per_ip,
+            ip,
+        }
     }
 }
 
 impl Drop for ConnectionAdmissionGuard {
     fn drop(&mut self) {
-        self.total
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let mut counts = self.per_ip.lock();
         if let Some(count) = counts.get_mut(&self.ip) {
             *count = count.saturating_sub(1);
@@ -944,6 +951,32 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+
+/// How long a peer that is only *waiting* in the queue may hold its TCP session
+/// open without saying anything.
+///
+/// eMule drops such a socket after `CONNECTION_TIMEOUT` (40 s) in
+/// `CClientReqSocket::CheckTimeOut` (`ListenSocket.cpp:136-153`). The
+/// extensions there are for a client that is downloading, chatting or acting as
+/// a KAD buddy; a plain waiter gets none of them.
+///
+/// The queue *row* is unaffected by the disconnect, in eMule and here alike:
+/// eMule's waiting-list purge (`UploadQueue.cpp:119`) keys on
+/// `GetLastUpRequest` and `MAX_PURGEQUEUETIME` (1 h) and never looks at the
+/// socket, and the peer keeps its place by re-asking over UDP
+/// `OP_REASKFILEPING`. Ember already matches both halves of that — the row
+/// survives with `current_addr` cleared, `udp_queue_rank_for_peer` answers the
+/// re-ask, and `AddUpNextClient` dials a HighID waiter back when a slot opens.
+///
+/// What Ember did *not* match is letting go of the socket. The queued branch
+/// polled once a second and never closed, so every waiter pinned one of the
+/// listener's connection slots for as long as it cared to stay connected. Once
+/// those were full the accept loop dropped new peers before they could send
+/// `OP_STARTUPLOADREQ`, which bounded the waiting list by the connection limit
+/// rather than by `MAX_UPLOAD_QUEUE_SIZE` — reported as Ember plateauing around
+/// 150 queued peers where aMule reached ~400 on the same share and server
+/// (issue #111).
+const QUEUED_SOCKET_IDLE_SECS: u64 = 40;
 /// One wall-clock budget covers transport discrimination, optional
 /// obfuscation/secure-stream negotiation, and receipt of the first complete
 /// eD2K frame.
@@ -1019,8 +1052,12 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// still-queued entries (via [`QueueEntry::last_ip`]), so a peer cannot
 /// churn connections with rotating user-hashes to dilute the queue.
 const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
-/// Maximum total concurrent TCP connections to the upload server
-const MAX_TOTAL_CONNECTIONS: usize = 100;
+// The listener's connection ceiling is not a constant here. It is
+// `AppSettings::max_connections` — eMule's `maxconnections`, gating accepts
+// through `CListenSocket::TooManySockets` (`ListenSocket.cpp:2181`) — and it is
+// shared with the download side, because eMule counts every client socket in
+// one list whoever dialled it. See `multi_source::GLOBAL_CONN_LIMITER` and
+// `multi_source::try_acquire_listener_conn`.
 /// Extra accept slots reserved so the configured eD2K server can still complete
 /// its short HighID port-test while ordinary capacity is saturated.  Long-lived
 /// sessions from that IP that only fit because of this reserve are rejected in
@@ -1166,12 +1203,33 @@ struct FileRequestTracker {
     /// `MIN_REQUESTTIME` and `BADCLIENTBAN` banned the whole address for
     /// seven days. Only a peer that sent no user hash falls back to its IP.
     entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32)>,
+    /// When the 1h expiry sweep last ran. The sweep is driven from the
+    /// `OP_STARTUPLOADREQ` path, which every uploading peer shares through one
+    /// mutex, so running it per request made a full `retain` part of the cost
+    /// of receiving a 22-byte packet.
+    last_sweep: Option<std::time::Instant>,
 }
+
+/// Hard ceiling on tracked `(peer, file)` request pairs.
+const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
+
+/// What the cap trims *down* to. Trimming to exactly `MAX_FILE_REQUEST_ENTRIES`
+/// left the map one insert over the bound again, so the very next request paid
+/// the whole trim a second time — a peer cycling distinct file hashes could
+/// pin every uploader behind that work indefinitely. Leaving 20% of headroom
+/// means one trim buys 10,000 requests before another is possible.
+const FILE_REQUEST_TRIM_TARGET: usize = 40_000;
+
+/// Minimum gap between full expiry sweeps. Strikes expire after an hour, so
+/// sweeping once a minute keeps the map within 1/60th of an hour of exact —
+/// and the cap below, which is the actual memory bound, still runs every call.
+const FILE_REQUEST_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl FileRequestTracker {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            last_sweep: None,
         }
     }
 
@@ -1239,28 +1297,36 @@ impl FileRequestTracker {
     }
 
     fn cleanup_stale(&mut self) {
-        self.entries
-            .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        let now = std::time::Instant::now();
+        // Throttled: this is called from the inbound-request path, under the
+        // mutex every upload connection shares.
+        if self
+            .last_sweep
+            .is_none_or(|last| now.duration_since(last) >= FILE_REQUEST_SWEEP_INTERVAL)
+        {
+            self.last_sweep = Some(now);
+            self.entries
+                .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        }
         // Hard cap: a peer rotating through millions of distinct file
         // hashes within the 1h window could otherwise grow this map
-        // without bound (cleanup_stale only drops entries older than 1h).
+        // without bound (the sweep above only drops entries older than 1h).
         // When over the cap, keep the most-recently-active entries (those
         // closest to a ban decision) and drop the oldest — dropping an old
         // entry only resets a stale, near-expiry counter.
-        const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
         if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
-            let mut by_age: Vec<((QueueIdentity, [u8; 16]), std::time::Instant)> = self
-                .entries
-                .iter()
-                .map(|(k, (t, _))| (k.clone(), *t))
-                .collect();
-            by_age.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-            let keep: std::collections::HashSet<(QueueIdentity, [u8; 16])> = by_age
-                .into_iter()
-                .take(MAX_FILE_REQUEST_ENTRIES)
-                .map(|(k, _)| k)
-                .collect();
-            self.entries.retain(|k, _| keep.contains(k));
+            // Partition on the cutoff timestamp rather than sorting the whole
+            // map and building a `HashSet` of survivors: O(n) instead of
+            // O(n log n), and no second allocation the size of the map.
+            let mut times: Vec<std::time::Instant> =
+                self.entries.values().map(|(t, _)| *t).collect();
+            if FILE_REQUEST_TRIM_TARGET < times.len() {
+                // Descending, so index `FILE_REQUEST_TRIM_TARGET` is the oldest
+                // entry we still intend to keep.
+                times.select_nth_unstable_by(FILE_REQUEST_TRIM_TARGET, |a, b| b.cmp(a));
+                let cutoff = times[FILE_REQUEST_TRIM_TARGET];
+                self.entries.retain(|_, (t, _)| *t > cutoff);
+            }
         }
     }
 }
@@ -1600,6 +1666,18 @@ pub(crate) struct QueueEntry {
     /// insertion/update time — re-evaluated each time the peer
     /// re-enters the queue (session-expired, queue-full rotation).
     pub(crate) ember_verified: bool,
+    /// Peer's self-reported nickname from Hello (`CT_NAME`), empty when it
+    /// advertised none.
+    ///
+    /// Snapshotted here for the same reason `emule_version` is: the Queue tab
+    /// is built from these rows alone, and the session that carried the Hello
+    /// is usually long gone by the time anyone looks — a queued peer hangs up
+    /// and re-asks. Without it the tab could only show a truncated user hash,
+    /// while the Uploading tab beside it showed the name.
+    pub(crate) peer_name: String,
+    /// Client software and version, as `client_software_from_caps` renders it
+    /// for the Uploading tab (`eMule 0.60a`, `Ember`, …).
+    pub(crate) client_software: String,
 }
 
 /// Classify a peer as HighID for upload-queue dialability (`AddUpNextClient`).
@@ -1651,6 +1729,8 @@ fn queue_entry_from_hello(
         is_friend_slot,
         ember_pubkey: hello_caps.ember_pubkey,
         ember_verified,
+        peer_name: hello_caps.peer_name.clone(),
+        client_software: client_software_from_caps(hello_caps),
     }
 }
 
@@ -2093,11 +2173,16 @@ struct UploadHandler {
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
+    /// `AppSettings::max_connections_per_five_secs`, live-updated. See
+    /// [`UploadHandler::accept_budget_allows`].
+    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rolling accept-rate window: when it started, and how many connections
+    /// have been accepted inside it.
+    accept_window: parking_lot::Mutex<(std::time::Instant, usize)>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
         Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
-    total_connections: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -2907,10 +2992,43 @@ pub(crate) fn score_queue_entry(
     ember_pubkey: Option<&[u8; 32]>,
     ember_verified: bool,
 ) -> f64 {
-    let file_prio = idx
-        .get_by_hash(&hex::encode(file_hash))
+    score_queue_entry_with_prio(
+        cm,
+        file_priority_weight(idx, file_hash),
+        user_hash,
+        wait_secs,
+        current_addr,
+        emule_version,
+        is_friend_slot,
+        ember_pubkey,
+        ember_verified,
+    )
+}
+
+/// The file-priority term of [`score_queue_entry`], resolved on its own.
+///
+/// Queue rows cluster on a handful of files, so [`compute_queue_rank`] — which
+/// scores every row — resolves each distinct hash once and reuses the weight
+/// rather than paying a `hex::encode` allocation and an index lookup per row.
+pub(crate) fn file_priority_weight(idx: &LocalIndex, file_hash: [u8; 16]) -> f64 {
+    idx.get_by_hash(&hex::encode(file_hash))
         .map(|f| priority_weight(&f.priority))
-        .unwrap_or(0.7);
+        .unwrap_or(0.7)
+}
+
+/// [`score_queue_entry`] with the file-priority lookup already done. See
+/// [`file_priority_weight`] for why the split exists.
+pub(crate) fn score_queue_entry_with_prio(
+    cm: &CreditManager,
+    file_prio: f64,
+    user_hash: &[u8; 16],
+    wait_secs: u64,
+    current_addr: Option<SocketAddr>,
+    emule_version: u8,
+    is_friend_slot: bool,
+    ember_pubkey: Option<&[u8; 32]>,
+    ember_verified: bool,
+) -> f64 {
     // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) so queue scoring and
     // BadGuy IP checks work for peers connecting over dual-stack sockets.
     // Previously these peers got peer_ip=0, which defeated the credit
@@ -2974,15 +3092,22 @@ pub(crate) fn compute_queue_rank(
     my_join_time: std::time::Instant,
 ) -> u16 {
     let mut rank: u16 = 1;
+    // One index lookup per distinct file rather than per row. At
+    // `HARD_UPLOAD_QUEUE_SIZE` rows the per-row form was thousands of
+    // `hex::encode` allocations for a single rank query, and a UDP re-ask
+    // triggers one of those per datagram.
+    let mut prio_cache: HashMap<[u8; 16], f64> = HashMap::new();
     for entry in queue.iter() {
         if entry.identity == *my_identity {
             continue;
         }
-        let es = score_queue_entry(
+        let file_prio = *prio_cache
+            .entry(entry.file_hash)
+            .or_insert_with(|| file_priority_weight(idx, entry.file_hash));
+        let es = score_queue_entry_with_prio(
             cm,
-            idx,
+            file_prio,
             &entry.user_hash,
-            entry.file_hash,
             entry.join_time.elapsed().as_secs(),
             entry.current_addr,
             entry.emule_version,
@@ -3156,47 +3281,46 @@ pub(crate) async fn udp_queue_rank_for_peer(
     from_udp_port: u16,
     file_hash: &[u8; 16],
 ) -> Option<u16> {
-    // Snapshot the queue and release its lock BEFORE acquiring the credit /
-    // index read locks, so `upload_queue` is never held across an `.await`
-    // (and no two of these locks are ever held simultaneously — this sidesteps
-    // both contention and any lock-ordering hazard). The reported rank is
-    // advisory, so scoring a snapshot taken microseconds earlier is fine.
-    let queue: Vec<QueueEntry> = {
-        let guard = upload_queue.lock().await;
-        guard.clone()
-    };
-    // A UDP re-ask is the peer holding its place, so it has to refresh the purge
-    // clock exactly as the TCP path does — eMule stamps `SetLastUpRequest` here
-    // too (`ClientUDPSocket.cpp:255`). Done as a separate short critical section
-    // rather than while scoring, to keep the "queue lock is never held across an
-    // await" rule above intact.
-    {
-        let mut guard = upload_queue.lock().await;
-        let now = std::time::Instant::now();
-        for entry in guard.iter_mut() {
-            if entry.file_hash == *file_hash
-                && (matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-                    || entry.current_addr.map(|a| a.ip() == from_ip).unwrap_or(false))
-            {
-                entry.last_request = now;
-            }
-        }
-    }
+    // Lock order is credit manager → index → queue, matching every other
+    // ranking site in this file (see the `OP_QUEUERANKING` resend and the
+    // Hello re-ask path in `serve_peer`, both of which hold all three).
+    //
+    // Taking them in that order up front is what lets this scan in place. The
+    // previous shape cloned the whole queue so the queue lock would not be
+    // held across the two `.await`s below it — but `QueueEntry` owns two
+    // `String`s, so at `HARD_UPLOAD_QUEUE_SIZE` rows that was thousands of
+    // allocations per inbound re-ask datagram, on the network event loop, and
+    // the UDP arm drains a burst of them per pass. Nothing after this point
+    // awaits, so the queue lock is still never held across a suspension point.
     let cm = credit_manager.read().await;
     let idx = local_index.read().await;
-    let mut best: Option<&QueueEntry> = None;
-    for entry in queue.iter() {
+    let mut queue = upload_queue.lock().await;
+
+    // A UDP re-ask is the peer holding its place, so it has to refresh the
+    // purge clock exactly as the TCP path does — eMule stamps
+    // `SetLastUpRequest` here too (`ClientUDPSocket.cpp:255`). Folded into the
+    // match scan rather than run as a second pass, but note the two conditions
+    // differ: the refresh is deliberately not gated on the UDP port.
+    let now = std::time::Instant::now();
+    let mut best: Option<usize> = None;
+    let mut best_join: Option<std::time::Instant> = None;
+    for i in 0..queue.len() {
+        let entry = &mut queue[i];
         if entry.file_hash != *file_hash {
             continue;
+        }
+        let ip_matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
+            || entry
+                .current_addr
+                .map(|a| a.ip() == from_ip)
+                .unwrap_or(false);
+        if ip_matches {
+            entry.last_request = now;
         }
         if entry.udp_port != 0 && entry.udp_port != from_udp_port {
             continue;
         }
-        let matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-            || entry
-                .current_addr
-                .map(|a| a.ip() == from_ip)
-                .unwrap_or(false)
+        let matches = ip_matches
             // Port-only fallback for entries with no known address yet.
             // Requires a real (non-zero) stored UDP port so multiple
             // queued peers that both still have `udp_port == 0` can't
@@ -3207,13 +3331,17 @@ pub(crate) async fn udp_queue_rank_for_peer(
                 && entry.udp_port != 0
                 && entry.udp_port == from_udp_port);
         if matches {
-            match best {
-                Some(prev) if prev.join_time <= entry.join_time => {}
-                _ => best = Some(entry),
+            // Earliest join wins, so the reported rank is stable and
+            // non-inflationary when several peers NAT to one address.
+            let join = entry.join_time;
+            if best_join.is_none_or(|bj| join < bj) {
+                best = Some(i);
+                best_join = Some(join);
             }
         }
     }
-    let target = best?;
+
+    let target = &queue[best?];
     let my_score = score_queue_entry(
         &cm,
         &idx,
@@ -3251,6 +3379,7 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
+    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -3364,10 +3493,11 @@ pub async fn start_upload_server(
         advertise_udp_port,
         active_count,
         max_concurrent_uploads,
+        max_conn_per_five,
+        accept_window: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-        total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         source_manager,
         comment_manager,
         credit_manager,
@@ -3572,45 +3702,40 @@ pub async fn start_upload_server(
                             continue;
                         }
 
-                        // Enforce global connection limit. Reserve the slot with
-                        // an atomic compare-exchange rather than a separate
-                        // load-check-then-`fetch_add`: under a burst of
-                        // simultaneous accepts the old check-then-act let
-                        // multiple handlers each observe `< MAX` and increment
-                        // past MAX_TOTAL_CONNECTIONS.
-                        let reserved = {
-                            let connection_limit = if is_server_port_test_ip {
-                                MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
-                            } else {
-                                MAX_TOTAL_CONNECTIONS
-                            };
-                            let mut cur = server
-                                .total_connections
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                if cur >= connection_limit {
-                                    break false;
-                                }
-                                match server.total_connections.compare_exchange_weak(
-                                    cur,
-                                    cur + 1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break true,
-                                    Err(actual) => cur = actual,
-                                }
-                            }
-                        };
-                        if !reserved {
-                            debug!("Rejecting connection from {peer_addr}: global connection limit reached");
+                        // Accept-rate gate, ahead of the capacity check because
+                        // it is about how fast we open sockets rather than how
+                        // many we hold. The configured server is exempt: its
+                        // HighID port-test must never lose to a burst from
+                        // ordinary peers, which is the same carve-out eMule
+                        // makes for `serverconnect->IsConnecting()`
+                        // (`ListenSocket.cpp:2013`).
+                        if !is_server_port_test_ip && !server.accept_budget_allows() {
+                            debug!(
+                                "Rejecting connection from {peer_addr}: accept rate budget spent for this window"
+                            );
                             drop(stream);
                             continue;
                         }
 
-                        // Enforce per-IP connection limit. If we reject here,
-                        // release the global slot reserved just above so the
-                        // reservation isn't leaked.
+                        // Take one unit of the machine-wide budget, which the
+                        // download side draws on too. The port-test headroom
+                        // is the one thing allowed above the configured
+                        // ceiling; see `RESERVED_PORT_TEST_CONNECTIONS`.
+                        let headroom = if is_server_port_test_ip {
+                            RESERVED_PORT_TEST_CONNECTIONS
+                        } else {
+                            0
+                        };
+                        let Some(conn_permit) =
+                            super::multi_source::try_acquire_listener_conn(headroom)
+                        else {
+                            debug!("Rejecting connection from {peer_addr}: global connection limit reached");
+                            drop(stream);
+                            continue;
+                        };
+
+                        // Enforce per-IP connection limit. Dropping
+                        // `conn_permit` on the reject path returns the unit.
                         {
                             let mut counts = server.ip_connection_counts.lock();
                             let count = counts.entry(peer_addr.ip()).or_insert(0);
@@ -3622,16 +3747,14 @@ pub async fn start_upload_server(
                             if *count >= per_ip_limit {
                                 debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
                                 drop(counts);
-                                server
-                                    .total_connections
-                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                drop(conn_permit);
                                 drop(stream);
                                 continue;
                             }
                             *count += 1;
                         }
                         let admission_guard = ConnectionAdmissionGuard::new(
-                            server.total_connections.clone(),
+                            conn_permit,
                             server.ip_connection_counts.clone(),
                             peer_addr.ip(),
                         );
@@ -3735,35 +3858,16 @@ pub async fn start_upload_server(
                 };
                 let peer_ip = req.peer_addr.ip();
 
-                // Reserve a global slot with the same cap + atomic CAS the
-                // inbound accept path uses, so outbound callback serves can't
-                // push the process past MAX_TOTAL_CONNECTIONS.
-                let reserved = {
-                    let mut cur = server
-                        .total_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    loop {
-                        if cur >= MAX_TOTAL_CONNECTIONS {
-                            break false;
-                        }
-                        match server.total_connections.compare_exchange_weak(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break true,
-                            Err(actual) => cur = actual,
-                        }
-                    }
-                };
-                if !reserved {
+                // Draw on the same machine-wide budget the inbound accept path
+                // uses, so outbound callback serves can't push the process
+                // past the configured connection limit.
+                let Some(conn_permit) = super::multi_source::try_acquire_listener_conn(0) else {
                     debug!(
                         "Dropping callback-serve to {}: global connection limit reached",
                         req.peer_addr
                     );
                     continue;
-                }
+                };
                 {
                     let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
@@ -3773,15 +3877,13 @@ pub async fn start_upload_server(
                             req.peer_addr
                         );
                         drop(counts);
-                        server
-                            .total_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        drop(conn_permit);
                         continue;
                     }
                     *count += 1;
                 }
                 let admission_guard = ConnectionAdmissionGuard::new(
-                    server.total_connections.clone(),
+                    conn_permit,
                     server.ip_connection_counts.clone(),
                     peer_ip,
                 );
@@ -3899,31 +4001,12 @@ pub async fn start_upload_server(
                     }
                 }
 
-                let reserved = {
-                    let mut cur = server
-                        .total_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    loop {
-                        if cur >= MAX_TOTAL_CONNECTIONS {
-                            break false;
-                        }
-                        match server.total_connections.compare_exchange_weak(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break true,
-                            Err(actual) => cur = actual,
-                        }
-                    }
-                };
-                if !reserved {
+                let Some(conn_permit) = super::multi_source::try_acquire_listener_conn(0) else {
                     debug!(
                         "Dropping punch/relay-adopted stream from {peer_addr}: global connection limit reached"
                     );
                     continue;
-                }
+                };
                 {
                     let mut counts = server.ip_connection_counts.lock();
                     let count = counts.entry(peer_ip).or_insert(0);
@@ -3932,15 +4015,13 @@ pub async fn start_upload_server(
                             "Dropping punch/relay-adopted stream from {peer_addr}: per-IP limit reached"
                         );
                         drop(counts);
-                        server
-                            .total_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        drop(conn_permit);
                         continue;
                     }
                     *count += 1;
                 }
                 let admission_guard = ConnectionAdmissionGuard::new(
-                    server.total_connections.clone(),
+                    conn_permit,
                     server.ip_connection_counts.clone(),
                     peer_ip,
                 );
@@ -4491,6 +4572,38 @@ impl UploadHandler {
     /// per-slot rate is compared against the target: if existing slots are
     /// already starved (median < target * 0.5), we avoid opening more even
     /// if the formula would allow it.
+    /// eMule's `MaxConperFive` gate: at most N newly accepted connections in
+    /// any five-second window (`CListenSocket::TooManySockets`,
+    /// `ListenSocket.cpp:2182`, default `MAXCONPER5SEC` = 20).
+    ///
+    /// This bounds the rate at which we open sockets, not how many we hold —
+    /// the point is to stay friendly to NAT tables and to routers that choke on
+    /// connection bursts, which is why eMule ships it as a user-visible
+    /// preference. Returns false when the budget for the current window is
+    /// spent; the caller drops the connection and the peer retries, which is
+    /// the same outcome as eMule's `StopListening`.
+    ///
+    /// `0` disables the gate, for a user who would rather not have one.
+    fn accept_budget_allows(&self) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        let budget = self
+            .max_conn_per_five
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if budget == 0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut window = self.accept_window.lock();
+        if now.duration_since(window.0) >= WINDOW {
+            *window = (now, 0);
+        }
+        if window.1 >= budget {
+            return false;
+        }
+        window.1 += 1;
+        true
+    }
+
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let max_configured = self
@@ -4875,32 +4988,21 @@ impl UploadHandler {
             hex::encode(entry.file_hash)
         );
 
-        // Reserve global + per-IP connection slots like the callback-serve arm.
-        let reserved = {
-            let mut cur = self
-                .total_connections
-                .load(std::sync::atomic::Ordering::Relaxed);
-            loop {
-                if cur >= MAX_TOTAL_CONNECTIONS {
-                    break false;
-                }
-                match self.total_connections.compare_exchange_weak(
-                    cur,
-                    cur + 1,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                ) {
-                    Ok(_) => break true,
-                    Err(c) => cur = c,
-                }
-            }
-        };
-        if !reserved {
+        // Granting a queued peer its slot is the one connection eMule refuses
+        // to let the cap block: `CUploadQueue::AddUpNextClient` dials with
+        // `TryToConnect(true)` (`UploadQueue.cpp:208`) where the download path
+        // passes `false` (`DownloadClient.cpp:209`). Same intent here, but
+        // bounded rather than unlimited — `MAX_PUSH_GRANT_DIALS` already caps
+        // how many of these can be in flight, so that is exactly the headroom
+        // this needs and no more.
+        let Some(conn_permit) =
+            super::multi_source::try_acquire_listener_conn(MAX_PUSH_GRANT_DIALS)
+        else {
             self.push_grant_dials
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             return;
-        }
+        };
         let per_ip_reserved = {
             let mut counts = self.ip_connection_counts.lock();
             let count = counts.entry(ip).or_insert(0);
@@ -4912,19 +5014,15 @@ impl UploadHandler {
             }
         };
         if !per_ip_reserved {
-            self.total_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            drop(conn_permit);
             self.push_grant_dials
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
             return;
         }
-        let _admission_guard = ConnectionAdmissionGuard::new(
-            self.total_connections.clone(),
-            self.ip_connection_counts.clone(),
-            ip,
-        );
+        let _admission_guard =
+            ConnectionAdmissionGuard::new(conn_permit, self.ip_connection_counts.clone(), ip);
 
         let result = self.connect_and_serve(req).await;
         self.push_grant_dials
@@ -5898,14 +5996,16 @@ impl UploadHandler {
                     .map(|a| a.ip() == peer_addr.ip())
                     .unwrap_or(false)
             };
-            let total = self
-                .total_connections
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if !allow_long_lived_session_under_admission(from_configured_server_ip, total) {
+            let (total, ordinary_max) = super::multi_source::shared_conn_snapshot();
+            if !allow_long_lived_session_under_admission(
+                from_configured_server_ip,
+                total,
+                ordinary_max,
+            ) {
                 info!(
                     "Rejecting long-lived connection from configured server IP {peer_addr}: \
                      reserved capacity is only for the short HighID port-test protocol \
-                     (connections={total}, ordinary_max={MAX_TOTAL_CONNECTIONS})"
+                     (connections={total}, ordinary_max={ordinary_max})"
                 );
                 return Ok(());
             }
@@ -5921,6 +6021,19 @@ impl UploadHandler {
         };
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
+
+        // Remember who this is for the Known eD2K Peers ledger, which is
+        // built from credit records alone and so has no session to ask later.
+        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
+        // back to the peer's address for display, and an `IP:port` is not a
+        // nickname worth persisting.
+        if peer_user_hash != [0u8; 16] {
+            self.credit_manager.write().await.note_client_identity(
+                peer_user_hash,
+                &hello_caps.peer_name,
+                &ul_client_software,
+            );
+        }
 
         if peer_user_hash != [0u8; 16] {
             if let Ok(set) = self.banned_hashes.read() {
@@ -6423,6 +6536,15 @@ impl UploadHandler {
                 ul_client_software = client_software_from_caps(&hello_caps);
                 if !hello_caps.peer_name.is_empty() {
                     ul_peer_name = hello_caps.peer_name.clone();
+                }
+                // OP_EMULEINFO is where the version details arrive, so the
+                // software string is only now complete — re-record it.
+                if peer_user_hash != [0u8; 16] {
+                    self.credit_manager.write().await.note_client_identity(
+                        peer_user_hash,
+                        &hello_caps.peer_name,
+                        &ul_client_software,
+                    );
                 }
                 let emule_payload = build_emule_info(
                     self.advertised_udp_port(),
@@ -6943,6 +7065,13 @@ impl UploadHandler {
         let mut last_heartbeat_log: Option<std::time::Instant> = None;
         let mut outer_loop_iterations: u64 = 0;
         let session_open_at: std::time::Instant = std::time::Instant::now();
+        // Last frame received from the peer, i.e. eMule's `timeout_timer` and
+        // its `ResetTimeOutTimer()` on receive. Drives
+        // [`QUEUED_SOCKET_IDLE_SECS`], which is the only thing that lets go of
+        // a waiting peer's connection slot.
+        let mut last_inbound: std::time::Instant = std::time::Instant::now();
+        // Separate from `last_inbound`, which stays purely a receive clock.
+        let mut last_friend_keepalive: std::time::Instant = std::time::Instant::now();
 
         // Session-local caches populated lazily on OP_REQUESTPARTS and reused
         // across batches / blocks so we don't re-open the serve file, re-read
@@ -6971,6 +7100,10 @@ impl UploadHandler {
             PathBuf,
             super::part_tracker::PartTracker,
             std::time::Instant,
+            // `part_tracker::verification_epoch()` when this was parsed. The
+            // time-based refresh below is only safe in the "newly verified"
+            // direction; losing a verified bit has to invalidate immediately.
+            u64,
         )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
         // Keep the disk-backed cache short-lived so a just-verified part can
@@ -6996,7 +7129,7 @@ impl UploadHandler {
         // tens of seconds inside an `OP_REQUESTPARTS` batch (`WRITE_PACKET_TIMEOUT`
         // is 60 s), so a peer that stops reading our writes could park several
         // maximum-size frames per connection — heap it chooses and we never
-        // look at, multiplied by `MAX_TOTAL_CONNECTIONS`. One in flight plus one
+        // look at, multiplied by `AppSettings::max_connections`. One in flight plus one
         // buffered is all the decoupling this needs: the reason the task exists
         // is frame-state isolation from `select!` cancellation, not throughput.
         let (pkt_tx, mut pkt_rx) =
@@ -7319,7 +7452,10 @@ impl UploadHandler {
                 };
 
                 match read_result {
-                    Ok(Some(Ok(p))) => p,
+                    Ok(Some(Ok(p))) => {
+                        last_inbound = std::time::Instant::now();
+                        p
+                    }
                     Ok(Some(Err(e))) => {
                         info!(
                             target: "ember::upload_diag",
@@ -7571,6 +7707,47 @@ impl UploadHandler {
                                         &mut writer, OP_EMULEPROT, OP_QUEUERANKING, &qr_payload,
                                     ).await;
                                 }
+                            }
+                            // A peer can hold an Ember friend session *and* a
+                            // queue place at once, and this branch runs first,
+                            // so the `owns_ember_slot` keepalive below is
+                            // unreachable for it. Such a session is not idle in
+                            // the sense the check below means — it carries chat
+                            // and browse, and dropping it would take the peer's
+                            // `ember_sessions` routing entry with it every 40s.
+                            // eMule extends its own timeout for exactly this
+                            // case, a client whose chat state is live
+                            // (`ListenSocket.cpp:143`). Paced off its own clock
+                            // so this is one packet per idle window rather than
+                            // one per 1s queued poll.
+                            if owns_ember_slot {
+                                if last_friend_keepalive.elapsed().as_secs()
+                                    >= QUEUED_SOCKET_IDLE_SECS
+                                {
+                                    last_friend_keepalive = std::time::Instant::now();
+                                    if write_packet_async(
+                                        &mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[],
+                                    ).await.is_err() {
+                                        debug!("Friend keepalive failed, closing session");
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            // Promotion has had its chance on this tick; if the
+                            // peer is still only waiting and has been silent for
+                            // longer than eMule would hold the socket, hand the
+                            // connection slot back. The row stays — see
+                            // `QUEUED_SOCKET_IDLE_SECS`.
+                            if last_inbound.elapsed().as_secs() >= QUEUED_SOCKET_IDLE_SECS {
+                                debug!(
+                                    target: "ember::upload_diag",
+                                    "session_end {peer_addr} reason=queued_socket_idle \
+                                     idle={}s session_age={}s — queue row retained",
+                                    last_inbound.elapsed().as_secs(),
+                                    session_open_at.elapsed().as_secs(),
+                                );
+                                break;
                             }
                             continue;
                         }
@@ -8431,6 +8608,11 @@ impl UploadHandler {
                                 peer_is_high_id_for_queue(&hello_caps, peer_addr);
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                            // Refreshed with the rest of the Hello-derived
+                            // fields, so a peer that only sent its name on a
+                            // later handshake still names itself in the tab.
+                            queue[pos].peer_name = hello_caps.peer_name.clone();
+                            queue[pos].client_software = client_software_from_caps(&hello_caps);
                             // If the peer has since completed PoP, upgrade
                             // an existing queue entry's friend-slot flag
                             // (it may have been added while auth was still
@@ -9033,9 +9215,17 @@ impl UploadHandler {
                     if !is_partial_serve {
                         cached_part_tracker = None;
                     } else {
+                        let current_verification_epoch =
+                            super::part_tracker::verification_epoch();
                         let need_rebuild = match cached_part_tracker.as_ref() {
-                            Some((p, _, at)) => {
-                                p != &file_path || at.elapsed() >= PART_TRACKER_REFRESH
+                            Some((p, _, at, epoch)) => {
+                                p != &file_path
+                                    || at.elapsed() >= PART_TRACKER_REFRESH
+                                    // Some tracker cleared a verified bit since
+                                    // this was parsed. Re-read rather than serve
+                                    // bytes on the strength of a hash check that
+                                    // has since been withdrawn.
+                                    || *epoch != current_verification_epoch
                             }
                             None => true,
                         };
@@ -9055,11 +9245,19 @@ impl UploadHandler {
                             .unwrap_or_else(|_| {
                                 super::part_tracker::PartTracker::new(total_size, &file_path)
                             });
-                            cached_part_tracker =
-                                Some((file_path.clone(), tracker, std::time::Instant::now()));
+                            // Epoch read *before* the parse, not after: a clear
+                            // that lands while `.part.met` is being read must
+                            // invalidate this entry rather than be swallowed by
+                            // a newer epoch stamped onto older bytes.
+                            cached_part_tracker = Some((
+                                file_path.clone(),
+                                tracker,
+                                std::time::Instant::now(),
+                                current_verification_epoch,
+                            ));
                         }
                     }
-                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _)| t);
+                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _, _)| t);
 
                     // Hoist video-ext computation out of the per-block loop:
                     // it's a property of the file, not the block, and
@@ -9951,6 +10149,8 @@ impl UploadHandler {
                                     peer_is_high_id_for_queue(&hello_caps, peer_addr);
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                                entry.peer_name = hello_caps.peer_name.clone();
+                                entry.client_software = client_software_from_caps(&hello_caps);
                                 if is_verified_friend {
                                     entry.is_friend_slot = true;
                                 }
@@ -11047,6 +11247,13 @@ impl UploadHandler {
                             }
                         }
                         ul_client_software = client_software_from_caps(&hello_caps);
+                        if peer_user_hash != [0u8; 16] {
+                            self.credit_manager.write().await.note_client_identity(
+                                peer_user_hash,
+                                &hello_caps.peer_name,
+                                &ul_client_software,
+                            );
+                        }
                         info!(
                             "Peer {peer_addr} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
                             ident.mod_version, ident.nickname,
@@ -13447,17 +13654,17 @@ mod ember_session_handle_tests {
 
     #[test]
     fn reserved_port_test_admission_rejects_long_lived_over_capacity() {
+        const LIMIT: usize = 500;
         assert!(allow_long_lived_session_under_admission(
             false,
-            MAX_TOTAL_CONNECTIONS + RESERVED_PORT_TEST_CONNECTIONS
+            LIMIT + RESERVED_PORT_TEST_CONNECTIONS,
+            LIMIT
         ));
-        assert!(allow_long_lived_session_under_admission(
-            true,
-            MAX_TOTAL_CONNECTIONS
-        ));
+        assert!(allow_long_lived_session_under_admission(true, LIMIT, LIMIT));
         assert!(!allow_long_lived_session_under_admission(
             true,
-            MAX_TOTAL_CONNECTIONS + 1
+            LIMIT + 1,
+            LIMIT
         ));
     }
 
@@ -13478,25 +13685,51 @@ mod ember_session_handle_tests {
         assert!(*shutdown_b.borrow());
     }
 
+    /// The guard owns both halves of an admission — the unit of the
+    /// machine-wide budget and the per-IP count — and must release them
+    /// together however the session ends.
     #[test]
     fn connection_admission_guard_releases_all_counters() {
-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let per_ip = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let ip: IpAddr = "203.0.113.20".parse().unwrap();
         per_ip.lock().insert(ip, 1);
+        let before = super::super::multi_source::shared_conn_snapshot().0;
         {
-            let _guard = ConnectionAdmissionGuard::new(total.clone(), per_ip.clone(), ip);
-            assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let permit = super::super::multi_source::try_acquire_listener_conn(0)
+                .expect("budget has room in a test process");
+            assert_eq!(
+                super::super::multi_source::shared_conn_snapshot().0,
+                before + 1
+            );
+            let _guard = ConnectionAdmissionGuard::new(permit, per_ip.clone(), ip);
         }
-        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            super::super::multi_source::shared_conn_snapshot().0,
+            before,
+            "the budget unit must go back when the session ends"
+        );
         assert!(!per_ip.lock().contains_key(&ip));
     }
 
     #[test]
     fn port_test_reserve_does_not_expand_ordinary_capacity() {
-        assert_eq!(MAX_TOTAL_CONNECTIONS, 100);
+        // The listener's ceiling is `AppSettings::max_connections`, shared with
+        // the download side; only the reserve on top of it is fixed here.
         const _: () = assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
         const _: () = assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
+    }
+
+    /// A waiting peer must not be able to hold a connection slot forever; that
+    /// is what bounded the queue by the connection limit instead of by
+    /// `MAX_UPLOAD_QUEUE_SIZE`. eMule drops the socket after
+    /// `CONNECTION_TIMEOUT` and keeps the row for `MAX_PURGEQUEUETIME`.
+    #[test]
+    fn a_queued_socket_is_released_long_before_its_queue_row_expires() {
+        // Releasing the socket must not also drop the peer's place in the queue.
+        const _: () = assert!(QUEUED_SOCKET_IDLE_SECS < MAX_PURGEQUEUETIME_SECS);
+        // eMule's CONNECTION_TIMEOUT (Opcodes.h:63) is 40s, and a plain waiter
+        // gets none of the extensions in CClientReqSocket::CheckTimeOut.
+        assert_eq!(QUEUED_SOCKET_IDLE_SECS, 40);
     }
 
     #[tokio::test]
@@ -13932,6 +14165,8 @@ mod abuse_and_seniority_tests {
             is_friend_slot: false,
             ember_pubkey,
             ember_verified: ember_pubkey.is_some(),
+            peer_name: String::new(),
+            client_software: String::new(),
         }
     }
 

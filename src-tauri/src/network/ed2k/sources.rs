@@ -1368,6 +1368,16 @@ pub struct SourceEntry {
     /// each relaunch re-seeded every prior session's ephemeral ports and the
     /// per-download source total climbed by ~2 per close/reopen.
     pub not_for_reconnect: bool,
+    /// Which network first told us about this source, for the UI's Origin
+    /// column. Write-once: see [`crate::types::SourceOrigin`].
+    ///
+    /// Not persisted to `sources.met` — that format is a fixed 43-byte record
+    /// whose loader rejects any version but 1, so carrying this across a
+    /// restart would mean a format bump that older builds could not read. A
+    /// source restored from disk therefore reports no origin until some
+    /// network mentions it again, which is honest: we genuinely no longer
+    /// know where it came from.
+    pub origin: Option<crate::types::SourceOrigin>,
 }
 
 /// Which entry to drop when a file's source list is already at capacity.
@@ -1434,8 +1444,20 @@ impl SourceManager {
         self.sources.remove(file_hash);
     }
 
-    pub fn register_source(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16) {
-        self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16]);
+    /// `origin` says which network is telling us about this source, for the
+    /// UI's Origin column. It is a required argument on every one of these
+    /// entry points rather than an optional extra, so that a new discovery
+    /// path cannot be added without someone deciding what it should report.
+    /// `None` is the honest answer for a re-registration of a peer we already
+    /// know — the first caller's value is kept either way.
+    pub fn register_source(
+        &mut self,
+        file_hash: [u8; 16],
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        origin: Option<crate::types::SourceOrigin>,
+    ) {
+        self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16], origin);
     }
 
     pub fn register_source_with_hash(
@@ -1444,8 +1466,9 @@ impl SourceManager {
         ip: Ipv4Addr,
         tcp_port: u16,
         user_hash: [u8; 16],
+        origin: Option<crate::types::SourceOrigin>,
     ) {
-        self.register_source_full(file_hash, ip, tcp_port, 0, user_hash);
+        self.register_source_full(file_hash, ip, tcp_port, 0, user_hash, origin);
     }
 
     pub fn register_source_full(
@@ -1455,8 +1478,9 @@ impl SourceManager {
         tcp_port: u16,
         udp_port: u16,
         user_hash: [u8; 16],
+        origin: Option<crate::types::SourceOrigin>,
     ) {
-        self.register_source_full_opts(file_hash, ip, tcp_port, udp_port, user_hash, 0);
+        self.register_source_full_opts(file_hash, ip, tcp_port, udp_port, user_hash, 0, origin);
     }
 
     pub fn register_source_full_opts(
@@ -1467,6 +1491,7 @@ impl SourceManager {
         udp_port: u16,
         user_hash: [u8; 16],
         connect_options: u8,
+        origin: Option<crate::types::SourceOrigin>,
     ) {
         self.register_source_full_server(
             file_hash,
@@ -1477,6 +1502,7 @@ impl SourceManager {
             0,
             user_hash,
             connect_options,
+            origin,
         );
     }
 
@@ -1491,6 +1517,9 @@ impl SourceManager {
         user_hash: [u8; 16],
         connect_options: u8,
     ) {
+        // No origin: this is the ephemeral port of a callback we requested for
+        // a peer some other network already told us about, so the row that
+        // matters already carries the real provenance.
         self.register_source_full_server_ex(
             file_hash,
             ip,
@@ -1501,6 +1530,7 @@ impl SourceManager {
             user_hash,
             connect_options,
             true,
+            None,
         );
     }
 
@@ -1543,6 +1573,8 @@ impl SourceManager {
                     0,
                     user_hash,
                     connect_options,
+                    // Same peer, second port — see `register_live_session_port`.
+                    None,
                 );
             } else if ephemeral_port > 0 {
                 // Same port: clear the session flag by registering as
@@ -1577,11 +1609,13 @@ impl SourceManager {
         user_hash: [u8; 16],
         peer_is_highid: bool,
     ) {
+        // Ports observed on a live connection, not a discovery answer, so
+        // these assert no origin — see `register_live_session_port`.
         if connection_port > 0 {
-            self.register_source_full(file_hash, ip, connection_port, udp_port, user_hash);
+            self.register_source_full(file_hash, ip, connection_port, udp_port, user_hash, None);
         }
         if peer_is_highid && listening_port > 0 && listening_port != connection_port {
-            self.register_source_full(file_hash, ip, listening_port, udp_port, user_hash);
+            self.register_source_full(file_hash, ip, listening_port, udp_port, user_hash, None);
         }
     }
 
@@ -1595,6 +1629,7 @@ impl SourceManager {
         server_port: u16,
         user_hash: [u8; 16],
         connect_options: u8,
+        origin: Option<crate::types::SourceOrigin>,
     ) {
         self.register_source_full_server_ex(
             file_hash,
@@ -1606,9 +1641,11 @@ impl SourceManager {
             user_hash,
             connect_options,
             false,
+            origin,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_source_full_server_ex(
         &mut self,
         file_hash: [u8; 16],
@@ -1620,6 +1657,7 @@ impl SourceManager {
         user_hash: [u8; 16],
         connect_options: u8,
         not_for_reconnect: bool,
+        origin: Option<crate::types::SourceOrigin>,
     ) {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
@@ -1652,6 +1690,15 @@ impl SourceManager {
             if existing.connect_options == 0 && connect_options != 0 {
                 existing.connect_options = connect_options;
             }
+            // Write-once, like the identity fields above, but for a different
+            // reason: a popular source is announced by several networks in
+            // turn, so an origin that took the newest mention would drift to
+            // whichever network gossips most rather than naming the one that
+            // actually found the peer. eMule fixes `m_nSourceFrom` at
+            // construction for the same reason.
+            if existing.origin.is_none() {
+                existing.origin = origin;
+            }
             // Sticky: once a port is known to be an inbound session port,
             // never "promote" it to reconnectable via a later EmuleInfo /
             // SX register on the same (ip, port). The reverse (marking a
@@ -1682,6 +1729,7 @@ impl SourceManager {
             last_sx_sent: 0,
             last_callback_at: 0,
             not_for_reconnect,
+            origin,
         });
 
         if self.sources.len() > MAX_TRACKED_FILES {
@@ -1828,6 +1876,8 @@ impl SourceManager {
                     udp_port,
                     user_hash,
                     connect_options,
+                    // The same source at a new address, not a new discovery.
+                    None,
                 );
             }
             if old_endpoints.is_empty() {
@@ -2217,6 +2267,33 @@ impl SourceManager {
         None
     }
 
+    /// Which network first told us about the peer at `ip:port`, for the UI's
+    /// Origin column.
+    ///
+    /// Scoped to one file, unlike the identity lookups above. Those are global
+    /// because an eD2k identity *is* global — the same peer has one user hash
+    /// whatever it is sharing. Provenance is not: the peer serving you one file
+    /// because a server listed it may be serving you another because KAD did,
+    /// and answering with whichever file happened to be scanned first would put
+    /// a wrong label on a row roughly at random.
+    pub fn get_source_origin(
+        &self,
+        file_hash: &[u8; 16],
+        ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<crate::types::SourceOrigin> {
+        let entries = self.sources.get(file_hash)?;
+        entries
+            .iter()
+            .find(|e| e.ip == ip && e.tcp_port == port)
+            .and_then(|e| e.origin)
+            // A callback/push-grant lands on the peer's ephemeral port, which
+            // is a different row from the one discovery created and never
+            // carries an origin of its own. Fall back to any other row for the
+            // same IP *in this file*, which is where that provenance lives.
+            .or_else(|| entries.iter().find_map(|e| (e.ip == ip).then_some(e.origin)?))
+    }
+
     /// Look up stored connect/crypt options for a peer by IP:port across ALL
     /// tracked files (see [`get_user_hash_by_addr`]).
     pub fn get_connect_options_by_addr(&self, ip: Ipv4Addr, port: u16) -> Option<u8> {
@@ -2423,6 +2500,10 @@ impl SourceManager {
                     last_sx_sent: 0,
                     last_callback_at: 0,
                     not_for_reconnect: false,
+                    // `sources.met` has nowhere to put it — see the field's
+                    // doc comment. Re-learned the next time any network
+                    // mentions this peer.
+                    origin: None,
                 });
                 loaded += 1;
             }
@@ -2480,6 +2561,15 @@ impl SourceManager {
     }
 
     /// Register a LowID source (behind NAT, needs server callback to reach).
+    ///
+    /// `origin` is the caller's, not `Server`, even though every row here
+    /// carries a server address. That address is how the peer is *reached* — a
+    /// LowID peer is only reachable by asking a server to relay a callback —
+    /// and says nothing about who *found* it. KAD source searches and source
+    /// exchange both hand us LowID peers complete with the server they are
+    /// registered on, and labelling those "Server" would be the same conflation
+    /// that made the first version of this column unreliable.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_lowid_source(
         &mut self,
         file_hash: [u8; 16],
@@ -2489,6 +2579,7 @@ impl SourceManager {
         server_port: u16,
         user_hash: [u8; 16],
         connect_options: u8,
+        origin: Option<crate::types::SourceOrigin>,
     ) {
         // A zero LowID is not a source. It cannot be called back
         // (`get_lowid_sources_needing_callback` requires `client_id > 0`), it is
@@ -2526,6 +2617,12 @@ impl SourceManager {
             if connect_options != 0 {
                 existing.connect_options = connect_options;
             }
+            // Write-once, as in `register_source_full_server_ex`: whoever found
+            // the peer keeps the label, and a row that has none yet can still
+            // acquire one.
+            if existing.origin.is_none() {
+                existing.origin = origin;
+            }
             return;
         }
 
@@ -2551,6 +2648,7 @@ impl SourceManager {
             last_sx_sent: 0,
             last_callback_at: 0,
             not_for_reconnect: false,
+            origin,
         });
     }
 
@@ -2901,8 +2999,8 @@ mod tests {
         let mut sm = SourceManager::new();
         let live = Ipv4Addr::new(7, 7, 7, 7);
         let stale = Ipv4Addr::new(8, 8, 8, 8);
-        sm.register_source(hash, live, 4662);
-        sm.register_source(hash, stale, 4663);
+        sm.register_source(hash, live, 4662, None);
+        sm.register_source(hash, stale, 4663, None);
         assert_eq!(sm.source_count(&hash), 2);
 
         let now = chrono::Utc::now().timestamp();
@@ -3524,7 +3622,7 @@ mod tests {
 
         let mut sm = SourceManager::new();
         // LowID row from the server source list: client_id set, hash unknown.
-        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0);
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0, None);
         // Live callback connection lands on the ephemeral port, hash known.
         sm.register_live_session_port(hash, real_ip, ephemeral_port, peer_hash, 0);
         assert_eq!(sm.source_count(&hash), 2, "before linking: counted twice");
@@ -3572,8 +3670,8 @@ mod tests {
         let listening_port = 4662u16;
 
         let mut sm = SourceManager::new();
-        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0);
-        sm.register_lowid_source(hash, 7, listening_port, srv_ip, srv_port, [0u8; 16], 0);
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0, None);
+        sm.register_lowid_source(hash, 7, listening_port, srv_ip, srv_port, [0u8; 16], 0, None);
 
         sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
 
@@ -3600,8 +3698,8 @@ mod tests {
         // Known peer (already linked earlier) and a different hash-less peer,
         // both LowID on the same server but *different* listening ports so the
         // known one is matched unambiguously.
-        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, known_hash, 0);
-        sm.register_lowid_source(hash, 7, 5001, srv_ip, srv_port, other_hash, 0);
+        sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, known_hash, 0, None);
+        sm.register_lowid_source(hash, 7, 5001, srv_ip, srv_port, other_hash, 0, None);
         // Age the known row so we can observe the refresh.
         let stale = chrono::Utc::now().timestamp() - 100;
         for e in sm.sources.get_mut(&hash).unwrap().iter_mut() {
@@ -3630,8 +3728,8 @@ mod tests {
         let spoofed_hash = [0xBB; 16];
 
         let mut sm = SourceManager::new();
-        sm.register_source_full_opts(hash, ip, 4662, 4672, real_hash, 1);
-        sm.register_source_full_opts(hash, ip, 4662, 4673, spoofed_hash, 2);
+        sm.register_source_full_opts(hash, ip, 4662, 4672, real_hash, 1, None);
+        sm.register_source_full_opts(hash, ip, 4662, 4673, spoofed_hash, 2, None);
 
         let entry = sm
             .sources
@@ -3651,6 +3749,107 @@ mod tests {
     }
 
     #[test]
+    fn source_origin_records_the_network_that_found_the_peer_not_the_latest_one() {
+        // The fact behind the UI's Origin column. A popular source gets
+        // re-announced by one network after another, and the first version of
+        // this feature derived the origin from `server_ip` — which this very
+        // function back-fills — so a KAD peer later mentioned over source
+        // exchange started reporting itself as an eD2K one. Whoever found it
+        // first owns the label; nothing afterwards may revise it, including a
+        // re-registration that names no origin at all.
+        use crate::types::SourceOrigin;
+        let hash = [0x61; 16];
+        let ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mut sm = SourceManager::new();
+
+        sm.register_source_full_opts(hash, ip, 4662, 0, [0u8; 16], 0, Some(SourceOrigin::Kad));
+        assert_eq!(sm.get_source_origin(&hash, ip, 4662), Some(SourceOrigin::Kad));
+
+        // Re-announced over source exchange, which also supplies a server IP.
+        sm.register_source_full_server(
+            hash,
+            ip,
+            4662,
+            0,
+            u32::from(Ipv4Addr::new(203, 0, 113, 9)),
+            4661,
+            [0u8; 16],
+            0,
+            Some(SourceOrigin::Exchange),
+        );
+        assert_eq!(
+            sm.get_source_origin(&hash, ip, 4662),
+            Some(SourceOrigin::Kad),
+            "a later network's announcement must not relabel who found the peer"
+        );
+
+        // And a plain re-registration on the dial path erases nothing.
+        sm.register_source(hash, ip, 4662, None);
+        assert_eq!(sm.get_source_origin(&hash, ip, 4662), Some(SourceOrigin::Kad));
+    }
+
+    #[test]
+    fn source_origin_is_scoped_per_file_and_reaches_the_ephemeral_callback_port() {
+        use crate::types::SourceOrigin;
+        let kad_file = [0x62; 16];
+        let server_file = [0x63; 16];
+        let ip = Ipv4Addr::new(10, 0, 0, 3);
+        let mut sm = SourceManager::new();
+
+        // The same peer, found for two files by two different networks. A
+        // global lookup would answer with whichever file it scanned first.
+        sm.register_source(kad_file, ip, 4662, Some(SourceOrigin::Kad));
+        sm.register_source(server_file, ip, 4662, Some(SourceOrigin::Server));
+        assert_eq!(sm.get_source_origin(&kad_file, ip, 4662), Some(SourceOrigin::Kad));
+        assert_eq!(sm.get_source_origin(&server_file, ip, 4662), Some(SourceOrigin::Server));
+
+        // A callback arrives on the peer's ephemeral port, which is its own
+        // row and carries no origin. The answer has to come from the row
+        // discovery created, or every firewalled source would read as unknown.
+        sm.register_live_session_port(kad_file, ip, 51000, [0u8; 16], 0);
+        assert_eq!(
+            sm.get_source_origin(&kad_file, ip, 51000),
+            Some(SourceOrigin::Kad),
+            "the ephemeral session port should inherit the peer's provenance"
+        );
+
+        // A peer we have no row for at all is unknown, not defaulted.
+        assert_eq!(sm.get_source_origin(&kad_file, Ipv4Addr::new(10, 0, 0, 9), 4662), None);
+    }
+
+    #[test]
+    fn a_lowid_source_reports_who_found_it_not_the_server_that_relays_to_it() {
+        // Every LowID row carries a server address, because that is the only
+        // way to reach a firewalled peer. It is not evidence the server found
+        // it: KAD source searches and source exchange both hand us LowID peers
+        // complete with the server they are registered on. Reading the relay as
+        // the origin is precisely the conflation that made the removed version
+        // of this column unreliable, so the caller states it instead.
+        use crate::types::SourceOrigin;
+        let hash = [0x64; 16];
+        let srv_ip = u32::from(Ipv4Addr::new(203, 0, 113, 8));
+        let mut sm = SourceManager::new();
+
+        sm.register_lowid_source(hash, 5, 4662, srv_ip, 4661, [0u8; 16], 0, Some(SourceOrigin::Kad));
+        sm.register_lowid_source(hash, 6, 4662, srv_ip, 4661, [0u8; 16], 0, Some(SourceOrigin::Exchange));
+        sm.register_lowid_source(hash, 7, 4662, srv_ip, 4661, [0u8; 16], 0, Some(SourceOrigin::Server));
+
+        let origins: Vec<_> = sm.sources[&hash]
+            .iter()
+            .map(|e| (e.client_id, e.origin))
+            .collect();
+        assert_eq!(
+            origins,
+            vec![
+                (5, Some(SourceOrigin::Kad)),
+                (6, Some(SourceOrigin::Exchange)),
+                (7, Some(SourceOrigin::Server)),
+            ],
+            "a LowID row must report its finder, not the server relaying to it"
+        );
+    }
+
+    #[test]
     fn register_source_eviction_prefers_anonymous_never_asked_entries() {
         // At capacity, a newly-seen anonymous source must not be able to
         // evict an older but already-identified/contacted source purely by
@@ -3666,8 +3865,8 @@ mod tests {
         let mut sm = SourceManager::new();
         sm.max_per_file = 2;
 
-        sm.register_source_full_opts(hash, identified_ip, 4662, 0, [0xCC; 16], 0);
-        sm.register_source_full_opts(hash, anon_ip, 4663, 0, [0u8; 16], 0);
+        sm.register_source_full_opts(hash, identified_ip, 4662, 0, [0xCC; 16], 0, None);
+        sm.register_source_full_opts(hash, anon_ip, 4663, 0, [0u8; 16], 0, None);
 
         // Make the identified source the OLDER of the two by `last_seen`
         // (and mark it as having actually been contacted) so a naive
@@ -3683,7 +3882,7 @@ mod tests {
             }
         }
 
-        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0u8; 16], 0);
+        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0u8; 16], 0, None);
 
         let ips: Vec<_> = sm
             .sources
@@ -3718,10 +3917,10 @@ mod tests {
         sm.max_per_file = 2;
 
         // A real source we have actually reached.
-        sm.register_source_full_opts(hash, contacted_ip, 4662, 0, [0xCC; 16], 0);
+        sm.register_source_full_opts(hash, contacted_ip, 4662, 0, [0xCC; 16], 0, None);
         // A gossip row we have never contacted, but which claims an identity —
         // exactly what a hostile SX answer supplies.
-        sm.register_source_full_opts(hash, injected_ip, 4663, 0, [0xAB; 16], 0);
+        sm.register_source_full_opts(hash, injected_ip, 4663, 0, [0xAB; 16], 0, None);
 
         // Make the genuine source the older of the two so a plain oldest-wins
         // eviction would take it.
@@ -3735,7 +3934,7 @@ mod tests {
             }
         }
 
-        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0xCD; 16], 0);
+        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0xCD; 16], 0, None);
 
         let ips: Vec<_> = sm
             .sources
@@ -3763,7 +3962,7 @@ mod tests {
         let mut sm = SourceManager::new();
 
         for _ in 0..5 {
-            sm.register_lowid_source(hash, 0, 4662, 0x0100_0001, 4661, [0xEE; 16], 0);
+            sm.register_lowid_source(hash, 0, 4662, 0x0100_0001, 4661, [0xEE; 16], 0, None);
         }
 
         assert!(
@@ -3853,7 +4052,7 @@ mod tests {
         let peer = [0xC4; 16];
         let ip = Ipv4Addr::new(9, 9, 9, 10);
         let mut sm = SourceManager::new();
-        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0);
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0, None);
 
         assert!(
             sm.get_udp_sources_due_for_reask(&hash, FILEREASKTIME_SECS)
@@ -3884,11 +4083,11 @@ mod tests {
         let ip = Ipv4Addr::new(9, 9, 9, 9);
         let mut sm = SourceManager::new();
 
-        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0);
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0, None);
         sm.register_live_session_port(hash, ip, 51000, peer, 0);
         // Legacy dual reconnectable rows (same hash, different ports) must
         // collapse to the UDP-capable listening port.
-        sm.register_source_full_opts(hash, ip, 52000, 0, peer, 0);
+        sm.register_source_full_opts(hash, ip, 52000, 0, peer, 0, None);
 
         let dialable = sm.get_sources(&hash);
         assert_eq!(dialable, vec![(ip, 4662)]);
@@ -3902,7 +4101,7 @@ mod tests {
         let old_ip = Ipv4Addr::new(10, 0, 0, 1);
         let new_ip = Ipv4Addr::new(10, 0, 0, 2);
         let mut sm = SourceManager::new();
-        sm.register_source_full_opts(file_hash, old_ip, 4662, 4672, peer, 1);
+        sm.register_source_full_opts(file_hash, old_ip, 4662, 4672, peer, 1, None);
 
         let relocated = sm.relocate_user_hash(peer, new_ip, 4663);
         assert_eq!(relocated, vec![(file_hash, old_ip, 4662)]);
@@ -3922,7 +4121,7 @@ mod tests {
         let peer = [0xD4; 16];
         let ip = Ipv4Addr::new(11, 22, 33, 44);
         let mut sm = SourceManager::new();
-        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 1);
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 1, None);
         sm.register_live_session_port(hash, ip, 51000, peer, 1);
 
         let written = sm.save_to_disk(&path).unwrap();
@@ -3986,7 +4185,7 @@ mod tests {
         let mut sm = SourceManager::new();
         sm.register_live_session_port(hash, ip, 51000, peer, 0);
         // EmuleInfo path historically called register_source_full on addr.port().
-        sm.register_source_full(hash, ip, 51000, 4672, peer);
+        sm.register_source_full(hash, ip, 51000, 4672, peer, None);
 
         let entry = sm
             .sources
@@ -4053,8 +4252,8 @@ mod tests {
 
         // A LowID source carrying a perfectly usable server reference, which is
         // the case the old code deliberately forwarded.
-        sm.register_lowid_source(hash, 16_777_000, 4662, server_ip, 4661, peer, 0);
-        sm.register_source_full_opts(hash, highid_ip, 4662, 0, [0x7E; 16], 0);
+        sm.register_lowid_source(hash, 16_777_000, 4662, server_ip, 4661, peer, 0, None);
+        sm.register_source_full_opts(hash, highid_ip, 4662, 0, [0x7E; 16], 0, None);
 
         let now = chrono::Utc::now().timestamp();
         let other = Ipv4Addr::new(1, 1, 1, 1);
@@ -4079,7 +4278,7 @@ mod tests {
         let peer = [0x6C; 16];
         let ip = Ipv4Addr::new(9, 8, 7, 6);
         let mut sm = SourceManager::new();
-        sm.register_source_full_opts(hash, ip, 4662, 0, peer, 0);
+        sm.register_source_full_opts(hash, ip, 4662, 0, peer, 0, None);
         sm.register_live_session_port(hash, ip, 51000, peer, 0);
 
         let now = chrono::Utc::now().timestamp();

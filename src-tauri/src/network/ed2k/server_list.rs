@@ -156,6 +156,37 @@ pub enum ServerPriority {
     High,
 }
 
+impl ServerPriority {
+    /// Stable lowercase name for the IPC boundary.
+    ///
+    /// A name rather than eMule's wire number (`0` Normal, `1` High, `2` Low)
+    /// because that encoding is neither ordered nor obvious, and it belongs to
+    /// the `server.met` tag writer, not to the renderer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServerPriority::Low => "low",
+            ServerPriority::Normal => "normal",
+            ServerPriority::High => "high",
+        }
+    }
+
+    /// Parse the name the renderer sends back.
+    ///
+    /// Unknown values are rejected rather than normalized to `Normal`, which
+    /// is what [`apply_server_int_tag`] has to do with an out-of-range tag
+    /// from a third-party `server.met`. Here the value came from our own UI,
+    /// so a typo should surface as a failed command instead of silently
+    /// resetting the priority the user had set.
+    pub fn parse_name(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(ServerPriority::Low),
+            "normal" => Some(ServerPriority::Normal),
+            "high" => Some(ServerPriority::High),
+            _ => None,
+        }
+    }
+}
+
 impl ServerEntry {
     pub fn new(ip: String, port: u16) -> Self {
         Self {
@@ -594,6 +625,55 @@ impl ServerList {
 
     pub fn servers(&self) -> &[ServerEntry] {
         &self.servers
+    }
+
+    /// Mark a server static, or let it become prunable again.
+    ///
+    /// Static is eMule's "keep this one": [`Self::record_failure`] exempts it
+    /// from the fail-count eviction, and `to_server_met_bytes` persists it as
+    /// tag `0x8A`. `add_filtered` already sets it for a server the user typed
+    /// in by hand; this is the only way a server that arrived in a downloaded
+    /// `server.met` can be given the same standing without being removed and
+    /// re-added.
+    ///
+    /// Returns whether the server was in the list.
+    pub fn set_static(&mut self, ip: &str, port: u16, is_static: bool) -> bool {
+        match self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
+            Some(entry) => {
+                entry.is_static = is_static;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set a server's connection priority.
+    ///
+    /// Marks the list for re-sorting, because priority is the first key
+    /// [`Self::get_next_server`] orders by and it also sets the post-failure
+    /// cooldown in [`Self::connect_cooldown_secs`] — neither of which would
+    /// notice the new value until the list is sorted again.
+    ///
+    /// Returns whether the server was in the list.
+    pub fn set_priority(&mut self, ip: &str, port: u16, priority: ServerPriority) -> bool {
+        match self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
+            Some(entry) => {
+                if entry.priority != priority {
+                    entry.priority = priority;
+                    self.needs_sort = true;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn find_by_addr(&self, ip: &str, port: u16) -> Option<&ServerEntry> {

@@ -116,7 +116,7 @@ pub fn load_nodes_dat_with_format(
     let mut format = NodesDatFormat::LegacyNoVerified;
     // Track the count the file *claims* so we can detect short loads
     // below. If the parser stops early (truncation or a bad record)
-    // we'd silently return a partial list â€” and the next
+    // we'd silently return a partial list — and the next
     // `save_nodes_dat` would overwrite the original file with the
     // shorter list, permanently losing every contact we couldn't
     // parse. The end-of-function guard backs the file up before
@@ -246,7 +246,7 @@ pub fn load_nodes_dat_with_format(
 /// single corrupt or truncated record causes permanent loss of every
 /// later contact on the very next `save_nodes_dat`. The backup is
 /// best-effort: if we can't write it (disk full, perms), we still
-/// return â€” the user just loses recovery rather than getting a worse
+/// return — the user just loses recovery rather than getting a worse
 /// outcome than today.
 fn backup_if_short_load(path: &Path, loaded: usize, expected: usize) {
     // expected == 0 means the header didn't declare a count (or
@@ -258,7 +258,7 @@ fn backup_if_short_load(path: &Path, loaded: usize, expected: usize) {
     let bak = path.with_extension(format!("dat.bak.{now}"));
     match std::fs::copy(path, &bak) {
         Ok(bytes) => warn!(
-            "nodes.dat parse stopped at {loaded}/{expected} contacts â€” backup written to {} ({bytes} bytes); the next save will overwrite the live file with {loaded} contacts",
+            "nodes.dat parse stopped at {loaded}/{expected} contacts — backup written to {} ({bytes} bytes); the next save will overwrite the live file with {loaded} contacts",
             bak.display(),
         ),
         Err(e) => warn!(
@@ -413,7 +413,7 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     // `.bak` copy so an unclean shutdown during the atomic write (or a
     // corrupted buffer that still parses enough to pass header checks)
     // doesn't wipe out our only working contact list. The `.bak` is
-    // intentionally silent on failure â€” we'd rather save the new file
+    // intentionally silent on failure — we'd rather save the new file
     // than refuse because a backup couldn't be made.
     if path.exists() {
         let bak = path.with_extension("dat.bak");

@@ -124,9 +124,12 @@ impl IpReputation {
     }
 
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
-        self.score = (self.score + event.score_delta()).clamp(MIN_REPUTATION, MAX_REPUTATION);
+        let delta = event.score_delta();
+        self.score = (self.score + delta).clamp(MIN_REPUTATION, MAX_REPUTATION);
         self.last_interaction = now;
-        if self.score <= IP_BAN_THRESHOLD {
+        // See `PeerReputation::apply_event` for why this is gated on a
+        // negative delta and on not already being banned.
+        if delta < 0 && self.score <= IP_BAN_THRESHOLD && !self.is_banned(now) {
             self.banned_until = Some(now + BAN_DURATION.as_secs());
         }
     }
@@ -176,7 +179,17 @@ impl PeerReputation {
             _ => {}
         }
 
-        if self.score <= BAN_THRESHOLD {
+        // Arm the ban on the *downward crossing* only. Testing the score
+        // alone re-armed a full `BAN_DURATION` on every subsequent event,
+        // including positive ones — a peer at or below the threshold could
+        // never reach `banned_until`, so `lift_expired_bans` (the only path
+        // that restores a usable score) never fired for it and the ban was
+        // effectively permanent. The `is_banned` guard also keeps a negative
+        // event arriving during a live ban from extending it, while still
+        // arming a fresh ban for a record that is below the threshold but
+        // unbanned — a peer loaded from disk that way, or one whose ban
+        // lapsed before `lift_expired_bans` next ran.
+        if delta < 0 && self.score <= BAN_THRESHOLD && !self.is_banned(now) {
             self.banned_until = Some(now + BAN_DURATION.as_secs());
         }
     }
@@ -219,6 +232,14 @@ pub struct ReputationManager {
     peers: HashMap<[u8; 16], PeerReputation>,
     ips: HashMap<[u8; 4], IpReputation>,
     last_decay: u64,
+    /// Bumped by every mutation that changes persisted state. The 300s save
+    /// timer compares this against the value it last wrote and skips the
+    /// clone-serialise-fsync entirely when it has not moved — on a long-lived
+    /// node the maps sit near their 20k cap and rarely change between ticks,
+    /// so that was ~2 MB rewritten 288 times a day to persist identical bytes.
+    /// Not part of `PersistedReputation`, so the on-disk format is unchanged
+    /// and a restart simply starts counting from zero.
+    generation: u64,
 }
 
 impl ReputationManager {
@@ -227,7 +248,22 @@ impl ReputationManager {
             peers: HashMap::new(),
             ips: HashMap::new(),
             last_decay: now_secs(),
+            generation: 0,
         }
+    }
+
+    /// Mark persisted state as changed. Callers must only invoke this when
+    /// something actually changed — a mutator that early-returns, or one whose
+    /// guard found nothing to do, must not bump, or the save gate degrades
+    /// back into an unconditional write.
+    fn touch(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Counter to compare against the value captured at the last successful
+    /// save. See [`Self::touch`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Record an event for a peer, creating their entry if needed.
@@ -245,6 +281,7 @@ impl ReputationManager {
         if self.peers.len() > MAX_TRACKED_PEERS {
             self.evict_stale();
         }
+        self.touch();
 
         !was_banned && now_banned
     }
@@ -332,6 +369,7 @@ impl ReputationManager {
             if peer.score <= BAN_THRESHOLD {
                 peer.score = BAN_THRESHOLD + 1;
             }
+            self.touch();
             true
         } else {
             false
@@ -349,6 +387,7 @@ impl ReputationManager {
             if entry.score <= IP_BAN_THRESHOLD {
                 entry.score = IP_BAN_THRESHOLD + 1;
             }
+            self.touch();
             true
         } else {
             false
@@ -371,6 +410,7 @@ impl ReputationManager {
         if self.ips.len() > MAX_TRACKED_IPS {
             self.evict_stale_ips();
         }
+        self.touch();
     }
 
     /// Node identities whose reputation ban has not yet expired.
@@ -407,16 +447,22 @@ impl ReputationManager {
         if peer.score > BAN_THRESHOLD {
             peer.score = BAN_THRESHOLD;
         }
+        self.touch();
     }
 
     /// Lift bans that have expired.
     pub fn lift_expired_bans(&mut self) {
         let now = now_secs();
+        // Counted rather than assumed: this runs on a timer, and bumping the
+        // generation on a tick that lifted nothing would re-dirty the state
+        // every cycle and defeat the save gate.
+        let mut lifted = 0usize;
         for peer in self.peers.values_mut() {
             if let Some(until) = peer.banned_until {
                 if now >= until {
                     peer.banned_until = None;
                     peer.score = (peer.score / 2).max(BAN_THRESHOLD + 1);
+                    lifted += 1;
                 }
             }
         }
@@ -424,7 +470,11 @@ impl ReputationManager {
             if ip.banned_until.is_some_and(|until| now >= until) {
                 ip.banned_until = None;
                 ip.score = (ip.score / 2).max(IP_BAN_THRESHOLD + 1);
+                lifted += 1;
             }
+        }
+        if lifted > 0 {
+            self.touch();
         }
     }
 
@@ -436,13 +486,24 @@ impl ReputationManager {
         if intervals == 0 {
             return;
         }
-        self.last_decay = now;
+        // Advance by whole intervals rather than to `now`. The caller ticks
+        // every 60s, so `elapsed` at the moment `intervals` first reaches 1 is
+        // typically 3600..3659 — assigning `now` discarded that remainder and
+        // made decay drift measurably slower than its hourly contract, with
+        // the error compounding across a long session.
+        self.last_decay = self
+            .last_decay
+            .saturating_add(u64::from(intervals) * DECAY_INTERVAL.as_secs());
         for peer in self.peers.values_mut() {
             peer.apply_decay(intervals);
         }
         for ip in self.ips.values_mut() {
             ip.apply_decay(intervals);
         }
+        // `last_decay` advanced above, which is itself persisted state, so this
+        // is unconditional — but only reached when `intervals > 0`, i.e. about
+        // once an hour rather than on every 60s tick.
+        self.touch();
     }
 
     /// Save reputation data to disk as JSON.
@@ -558,10 +619,13 @@ impl ReputationManager {
             }
         }
 
+        // Starts at 0 like a fresh manager: what was just loaded matches disk,
+        // so the first save tick has nothing to write until something changes.
         let mut mgr = Self {
             peers,
             ips,
             last_decay: now,
+            generation: 0,
         };
         // Defensive: enforce the per-load size cap too in case the
         // file claims more peers than the runtime cap (also a
@@ -592,8 +656,12 @@ impl ReputationManager {
                 )
             })
             .collect();
-        // Preserve active bans; otherwise evict lowest-value, stalest rows.
-        entries.sort_by_key(|(_, banned, score, last)| (*banned, *score, *last));
+        // Preserve active bans; otherwise evict least-informative, stalest
+        // rows first. See `evict_stale` for why "least informative" is
+        // distance from `DEFAULT_REPUTATION` with negatives kept longest.
+        entries.sort_by_key(|(_, banned, score, last)| {
+            (*banned, *score < 0, score.unsigned_abs(), *last)
+        });
         for (ip, _, _, _) in entries.into_iter().take(self.ips.len() - MAX_TRACKED_IPS) {
             self.ips.remove(&ip);
         }
@@ -624,8 +692,18 @@ impl ReputationManager {
                 non_banned.push((*id, p.score, p.last_interaction));
             }
         }
-        // Sort: lowest score first, oldest interaction first
-        non_banned.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+        // Evicting a peer forgets it completely: `get_score` on an unknown id
+        // returns `DEFAULT_REPUTATION` and `is_banned` returns false. So a
+        // record's worth is how far it sits from that default, and the cost of
+        // dropping it is asymmetric — forgetting goodwill only costs the peer
+        // some priority, while forgetting a penalty silently forgives
+        // misbehaviour that has not yet reached the ban threshold. Order is
+        // therefore: scores at/above the default first (nearest the default
+        // first, so a peer at 0 carrying no information goes before one that
+        // earned +900), and negative scores last (least negative first), so
+        // the rows closest to a ban are the very last to be forgotten. Oldest
+        // interaction breaks ties.
+        non_banned.sort_by_key(|(_, score, last)| (*score < 0, score.unsigned_abs(), *last));
 
         let mut removed = 0usize;
         for (id, _, _) in non_banned.iter() {
@@ -712,6 +790,119 @@ mod tests {
             mgr.record_event(&id2, ReputationEvent::CorruptData);
         }
         assert_eq!(mgr.get_score(&id2), MIN_REPUTATION);
+    }
+
+    /// A ban has to be able to expire. Re-arming it on every subsequent event
+    /// — including the positive ones a recovering peer earns — pushed
+    /// `banned_until` forever forward, so `lift_expired_bans` never fired and
+    /// the ban was permanent in practice.
+    #[test]
+    fn a_positive_event_does_not_extend_a_live_ban() {
+        let mut peer = PeerReputation::new([7u8; 16], test_now());
+        let mut now = test_now();
+        while peer.score > BAN_THRESHOLD {
+            peer.apply_event(ReputationEvent::CorruptData, now);
+        }
+        let armed_until = peer.banned_until.expect("crossing the threshold bans");
+
+        // Time passes, and the peer behaves. Neither the good behaviour nor
+        // the passage of time may move the expiry out.
+        now += 3600;
+        peer.apply_event(ReputationEvent::SuccessfulChunk, now);
+        peer.apply_event(ReputationEvent::SuccessfulHandshake, now);
+        assert_eq!(
+            peer.banned_until,
+            Some(armed_until),
+            "a peer that is behaving must not have its ban pushed out"
+        );
+
+        // And the ban genuinely lapses.
+        assert!(!peer.is_banned(armed_until));
+    }
+
+    /// The flip side: misbehaving again after a ban has lapsed, but before
+    /// `lift_expired_bans` has restored the score, must still re-arm.
+    #[test]
+    fn misbehaving_after_a_lapsed_ban_re_arms_it() {
+        let mut peer = PeerReputation::new([8u8; 16], test_now());
+        let mut now = test_now();
+        while peer.score > BAN_THRESHOLD {
+            peer.apply_event(ReputationEvent::CorruptData, now);
+        }
+        let first = peer.banned_until.expect("banned");
+
+        now = first + 1;
+        assert!(!peer.is_banned(now), "the first ban has lapsed");
+        peer.apply_event(ReputationEvent::CorruptData, now);
+        assert!(
+            peer.banned_until.is_some_and(|until| until > first),
+            "a fresh violation must arm a fresh ban"
+        );
+        assert!(peer.is_banned(now));
+    }
+
+    /// Eviction forgets a peer completely, and an unknown peer scores
+    /// `DEFAULT_REPUTATION` with no ban. Shedding the most-negative records
+    /// first therefore forgave exactly the peers worth remembering.
+    #[test]
+    fn eviction_sheds_uninformative_rows_before_negative_ones() {
+        let mut mgr = ReputationManager::new();
+        let now = now_secs();
+
+        // One peer close to the ban threshold, one with earned goodwill, and
+        // enough neutral rows to force eviction.
+        let nearly_banned = [0xA1u8; 16];
+        let trusted = [0xA2u8; 16];
+        mgr.peers.insert(
+            nearly_banned,
+            PeerReputation {
+                score: BAN_THRESHOLD + 1,
+                ..PeerReputation::new(nearly_banned, now)
+            },
+        );
+        mgr.peers.insert(
+            trusted,
+            PeerReputation {
+                score: 900,
+                ..PeerReputation::new(trusted, now)
+            },
+        );
+        for i in 0..(MAX_TRACKED_PEERS + 10) {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            id[15] = 0x5A;
+            mgr.peers.insert(id, PeerReputation::new(id, now));
+        }
+
+        mgr.evict_stale();
+
+        assert_eq!(mgr.peers.len(), MAX_TRACKED_PEERS);
+        assert!(
+            mgr.peers.contains_key(&nearly_banned),
+            "a record one point from a ban must outlive neutral filler"
+        );
+        assert!(
+            mgr.peers.contains_key(&trusted),
+            "earned goodwill should also outlive rows carrying no information"
+        );
+    }
+
+    /// Decay has to advance by whole intervals. Snapping `last_decay` to `now`
+    /// discarded the sub-interval remainder on every tick, so scores decayed
+    /// slower than the documented hourly rate and the error compounded.
+    #[test]
+    fn decay_does_not_lose_the_sub_interval_remainder() {
+        let mut mgr = ReputationManager::new();
+        let start = now_secs();
+        // Pretend the last decay was 90 minutes ago: one whole interval plus
+        // half of the next.
+        mgr.last_decay = start.saturating_sub(DECAY_INTERVAL.as_secs() + 1800);
+        mgr.maybe_decay();
+        assert_eq!(
+            mgr.last_decay,
+            start.saturating_sub(DECAY_INTERVAL.as_secs() + 1800) + DECAY_INTERVAL.as_secs(),
+            "the unconsumed 30 minutes must stay on the clock"
+        );
     }
 
     #[test]

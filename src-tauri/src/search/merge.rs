@@ -57,8 +57,16 @@ pub fn result_matches_client_filters(
             return false;
         }
     }
+    // Zero is "no maximum", which is what every other layer already reads it as:
+    // `local_file_matches_filters`, the `has_filters` / `has_usable_filters`
+    // gates, the wire encoder (`build_search_expression_with_node` drops zero
+    // numerics) and the results table's own filter. This function was the sole
+    // dissenter, and it is the one that decides what the user sees — so a `0`
+    // typed into Max Size left the constraint off the wire and out of the
+    // library scan, then stripped every row with a nonzero size on the way to
+    // the UI. An empty tab, no error, and a filter that looked inactive.
     if let Some(max) = max_size {
-        if r.file.size > max {
+        if max > 0 && r.file.size > max {
             return false;
         }
     }
@@ -211,6 +219,36 @@ fn elected_name(votes: &NameVotes) -> Option<&str> {
         .map(|(name, _)| name.as_str())
 }
 
+/// Whether a merge adopts the incoming row's spam explanation or keeps the one
+/// it holds.
+///
+/// `spam_rating` merges with max and `is_spam` with OR, so the reason lists have
+/// to follow the verdict that survived: a row showing a high score above a
+/// signal list that only justifies a low one is worse than either alone, because
+/// that list is what a user reads to decide whether to trust a file.
+///
+/// The merged verdict is the OR of the two, so the explanation has to come
+/// from a side that actually flagged the row. Only once the two agree on the
+/// verdict does the score decide which of them explains it best. Asking merely
+/// "does incoming newly flag, or outscore?" left the mixed case — a flagged 50
+/// meeting an unflagged 60 — keeping `is_spam` while adopting the *unflagged*
+/// pass's reasons, and made the outcome depend on which batch arrived first.
+///
+/// Mirrored by `takesIncomingSpamSignals` in `src/lib/stores/search.ts`, which
+/// merges the streamed batches a second time per tab, and pinned for both sides
+/// by `scripts/fixtures/merge-contract.json`.
+pub(crate) fn takes_incoming_spam_signals(
+    existing_is_spam: bool,
+    existing_rating: u32,
+    incoming_is_spam: bool,
+    incoming_rating: u32,
+) -> bool {
+    if incoming_is_spam != existing_is_spam {
+        return incoming_is_spam;
+    }
+    incoming_rating > existing_rating
+}
+
 fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     let prev_origin = existing.result_origin.clone();
     existing.result_origin = combine_origin(&existing.result_origin, &incoming.result_origin);
@@ -222,29 +260,38 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
             existing.source_addresses.push(addr);
         }
     }
-    // eMule SearchList: ed2k (server/UDP) hits for the same hash *sum*
-    // availability; Kad uses max. Mixed Kad+ed2k keeps max. Both inputs are
-    // peer-supplied, so the result is held to `MAX_PLAUSIBLE_SOURCES` — an
-    // uncapped `saturating_add` let a padded claim keep growing across merges.
+    // eMule `CSearchFile::AddSources` / `AddCompleteSources`: ed2k (server/UDP)
+    // hits for the same hash *sum*; Kad takes the max. Mixed Kad+ed2k keeps
+    // max. Both inputs are peer-supplied, so the result is held to
+    // `MAX_PLAUSIBLE_SOURCES` — an uncapped `saturating_add` let a padded claim
+    // keep growing across merges.
+    let both_ed2k =
+        is_ed2k_network_origin(&prev_origin) && is_ed2k_network_origin(&incoming.result_origin);
     existing.availability = clamp_source_count(
-        if is_ed2k_network_origin(&prev_origin) && is_ed2k_network_origin(&incoming.result_origin) {
-            existing
-                .availability
-                .saturating_add(incoming.availability)
-                .max(existing.source_addresses.len() as u32)
+        if both_ed2k {
+            existing.availability.saturating_add(incoming.availability)
         } else {
-            existing
-                .availability
-                .max(incoming.availability)
-                .max(existing.source_addresses.len() as u32)
-        },
+            existing.availability.max(incoming.availability)
+        }
+        .max(existing.source_addresses.len() as u32),
     );
-    existing.file.complete_sources = clamp_source_count(
+    // The same rule, because eMule applies the same rule: `AddCompleteSources`
+    // is `AddSources` with a different tag, summing on ed2k and maxing on Kad.
+    // This used to max unconditionally, which undercounted every multi-server
+    // result — two servers reporting three and five complete sources gave five
+    // rather than eight — and, paired with a summed availability, put the two
+    // columns on scales that could not be read against each other.
+    existing.file.complete_sources = clamp_source_count(if both_ed2k {
         existing
             .file
             .complete_sources
-            .max(incoming.file.complete_sources),
-    );
+            .saturating_add(incoming.file.complete_sources)
+    } else {
+        existing
+            .file
+            .complete_sources
+            .max(incoming.file.complete_sources)
+    });
     if existing.file_type.is_empty() && !incoming.file_type.is_empty() {
         existing.file_type = incoming.file_type;
     }
@@ -308,7 +355,12 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.origin_server_ip.is_none() {
         existing.origin_server_ip = incoming.origin_server_ip;
     }
-    if (incoming.is_spam && !existing.is_spam) || incoming.spam_rating > existing.spam_rating {
+    if takes_incoming_spam_signals(
+        existing.is_spam,
+        existing.spam_rating,
+        incoming.is_spam,
+        incoming.spam_rating,
+    ) {
         // Both lists describe the same verdict, so they move together — a row
         // whose English came from one scoring pass and whose codes came from
         // another would render two different explanations.
@@ -334,6 +386,28 @@ pub fn is_ed2k_network_origin(origin: &str) -> bool {
         saw = true;
     }
     saw
+}
+
+/// Whether a row's Complete Sources figure means anything, or whether the only
+/// honest answer is "unknown".
+///
+/// eMule decides this in `CSearchFile::IsComplete`, which returns unknown for
+/// every Kademlia result, and leaves the Kad rollup of `FT_COMPLETE_SOURCES`
+/// commented out in `CSearchList::AddToList` as "not yet supported". The reason
+/// is in the shape of the number: a Kad publisher's `TAG_COMPLETE_SOURCES` is
+/// its claim about a swarm it cannot see, whereas a server counts from its own
+/// source table and an Ember row counts distinct signatures. So a Kad-only row
+/// has a figure that should not be shown as if it were one of those.
+///
+/// `ORIGIN_NOTES` is not enough on its own either — a Kad note carries no
+/// source accounting at all.
+pub fn complete_sources_known(origin: &str) -> bool {
+    origin.split('·').any(|part| {
+        matches!(
+            part.trim(),
+            ORIGIN_SERVER_TCP | ORIGIN_SERVER_UDP | ORIGIN_EMBER | ORIGIN_LOCAL
+        )
+    })
 }
 
 /// Merge two result lists; rows with the same hash are combined. Output is sorted for display.
@@ -368,12 +442,23 @@ pub fn merge_search_vecs(
 }
 
 pub fn sort_search_results(v: &mut [SearchResult]) {
+    // Rows whose complete count is unknown rank as zero on that key, so they
+    // are not ordered by a figure the UI refuses to show them with. eMule ends
+    // up in the same place: the Kad rollup of `FT_COMPLETE_SOURCES` is left at
+    // zero, so its Kad rows sort at the bottom of that column too.
+    let ranked_complete = |r: &SearchResult| {
+        if complete_sources_known(&r.result_origin) {
+            clamp_source_count(r.file.complete_sources)
+        } else {
+            0
+        }
+    };
     v.sort_by(|a, b| {
         // Rank on clamped counts: both fields are remote-controlled, so a row
         // that has never been merged (and therefore never passed through the
         // cap in `merge_into`) must not buy the top slot with a padded number.
-        clamp_source_count(b.file.complete_sources)
-            .cmp(&clamp_source_count(a.file.complete_sources))
+        ranked_complete(b)
+            .cmp(&ranked_complete(a))
             .then_with(|| {
                 clamp_source_count(b.availability).cmp(&clamp_source_count(a.availability))
             })
@@ -480,6 +565,89 @@ mod tests {
         assert_eq!(merged[0].availability, 10);
     }
 
+    /// `AddCompleteSources` is `AddSources` with a different tag: eMule sums
+    /// both across ed2k replies and maxes both on Kad. Maxing the complete
+    /// count while summing availability left the two columns on scales that
+    /// could not be compared — a five-server result reporting three complete
+    /// sources each showed fifteen sources and three complete.
+    #[test]
+    fn complete_sources_follow_the_same_rule_as_availability() {
+        let with_complete = |hash: &str, avail: u32, complete: u32, origin: &str| {
+            let mut r = sample(hash, avail, origin);
+            r.file.complete_sources = complete;
+            r
+        };
+
+        let merged = merge_search_vecs(
+            vec![with_complete("aa", 10, 3, ORIGIN_SERVER_TCP)],
+            vec![with_complete("aa", 7, 5, ORIGIN_SERVER_UDP)],
+        );
+        assert_eq!(merged[0].availability, 17);
+        assert_eq!(merged[0].file.complete_sources, 8, "ed2k replies sum");
+
+        let merged = merge_search_vecs(
+            vec![with_complete("bb", 10, 3, ORIGIN_KAD)],
+            vec![with_complete("bb", 7, 5, ORIGIN_SERVER_TCP)],
+        );
+        assert_eq!(merged[0].availability, 10);
+        assert_eq!(
+            merged[0].file.complete_sources, 5,
+            "a Kad estimate and a server count describe overlapping swarms, so \
+             the larger stands rather than their sum"
+        );
+    }
+
+    /// Summing each responder's complete count cannot exceed the summed
+    /// availability, so long as no single responder claims more complete
+    /// sources than it has sources. That is the invariant the old max-against-
+    /// sum pairing broke, and the reason eMule's two columns can be read as a
+    /// ratio.
+    #[test]
+    fn summed_complete_sources_stay_within_summed_availability() {
+        let with_complete = |avail: u32, complete: u32, origin: &str| {
+            let mut r = sample("cc", avail, origin);
+            r.file.complete_sources = complete;
+            r
+        };
+        let merged = merge_search_vecs(
+            vec![with_complete(10, 10, ORIGIN_SERVER_TCP)],
+            vec![with_complete(15, 15, ORIGIN_SERVER_UDP)],
+        );
+        assert_eq!(merged[0].availability, 25);
+        assert_eq!(merged[0].file.complete_sources, 25);
+        assert!(merged[0].file.complete_sources <= merged[0].availability);
+    }
+
+    /// eMule shows no Complete Sources figure for a Kad result at all
+    /// (`CSearchFile::IsComplete` returns unknown, and the Kad rollup of
+    /// `FT_COMPLETE_SOURCES` is commented out as "not yet supported").
+    #[test]
+    fn complete_sources_are_known_only_where_something_counted_them() {
+        assert!(complete_sources_known(ORIGIN_SERVER_TCP));
+        assert!(complete_sources_known(ORIGIN_SERVER_UDP));
+        assert!(complete_sources_known(ORIGIN_EMBER));
+        assert!(complete_sources_known(ORIGIN_LOCAL));
+
+        assert!(!complete_sources_known(ORIGIN_KAD));
+        assert!(!complete_sources_known(ORIGIN_NOTES));
+        assert!(!complete_sources_known(""));
+        assert!(!complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_NOTES
+        )));
+
+        // One trustworthy counter is enough: the row carries a real count plus
+        // a Kad sighting, not a Kad guess.
+        assert!(complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_SERVER_TCP
+        )));
+        assert!(complete_sources_known(&combine_origin(
+            ORIGIN_KAD,
+            ORIGIN_EMBER
+        )));
+    }
+
     #[test]
     fn result_matches_client_filters_size_ext_and_type() {
         let r = sample("aa", 3, ORIGIN_SERVER_TCP);
@@ -514,6 +682,32 @@ mod tests {
             None,
             None,
             None
+        ));
+    }
+
+    /// A zero size bound is how every other layer spells "no bound", so this
+    /// one has to agree or the layers contradict each other on the same row.
+    /// `search_files` hands the identical `max_size` to the library scan and to
+    /// this function: the scan kept the row, this dropped it, and the search
+    /// came back empty while the filter panel showed nothing was constraining
+    /// it.
+    #[test]
+    fn a_zero_size_bound_constrains_nothing() {
+        let r = sample("aa", 3, ORIGIN_SERVER_TCP); // size 1
+        assert!(result_matches_client_filters(
+            &r, None, None, Some(0), None, None
+        ));
+        assert!(result_matches_client_filters(
+            &r, None, Some(0), Some(0), None, None
+        ));
+        // A real bound still bounds.
+        let mut big = sample("bb", 3, ORIGIN_SERVER_TCP);
+        big.file.size = 100;
+        assert!(result_matches_client_filters(
+            &big, None, None, Some(100), None, None
+        ));
+        assert!(!result_matches_client_filters(
+            &big, None, None, Some(99), None, None
         ));
     }
 
@@ -605,10 +799,13 @@ mod tests {
     /// side moved.
     ///
     /// Only genuinely shared rules are in the fixture. The deliberate
-    /// divergences stay out of it: the frontend takes `max` where `merge_into`
-    /// sums ed2k availability (the backend has already summed within a network),
-    /// it keeps the first name where `merge_search_vecs` elects one by vote, and
-    /// both sides cap `source_addresses` at `MAX_SOURCE_ADDRS`.
+    /// divergences stay out of it: the frontend takes `max` for both source
+    /// counts where `merge_into` sums them across ed2k replies — the backend
+    /// has already summed within a network, and emits the absolute running
+    /// total (`ed2k_noted_availability` / `ed2k_noted_complete_sources`), so a
+    /// second sum over the batches would double it — it keeps the first name
+    /// where `merge_search_vecs` elects one by vote, and both sides cap
+    /// `source_addresses` at `MAX_SOURCE_ADDRS`.
     fn merge_contract_fixture() -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/fixtures/merge-contract.json");
@@ -708,6 +905,72 @@ mod tests {
             merged[0].file.ember_file_hash,
             "ab".repeat(32),
             "known.met beats a publisher plurality"
+        );
+    }
+
+    /// The rule that decides which spam explanation a merged row shows. The
+    /// frontend merges the same batches again per tab, and it used to take the
+    /// incoming reasons whenever the incoming row was flagged — ignoring the
+    /// score, which merges with max — so a row could show 85/60 above a list
+    /// that only justified 40.
+    #[test]
+    fn spam_signal_choice_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        let cases = fixture["spam_signal_cases"]
+            .as_array()
+            .expect("fixture has spam_signal_cases");
+        assert!(cases.len() >= 6, "fixture lost its spam_signal cases");
+        for case in cases {
+            let existing_is_spam = case["existing_is_spam"].as_bool().expect("case existing flag");
+            let existing_rating = case["existing_rating"].as_u64().expect("case existing rating");
+            let incoming_is_spam = case["incoming_is_spam"].as_bool().expect("case incoming flag");
+            let incoming_rating = case["incoming_rating"].as_u64().expect("case incoming rating");
+            assert_eq!(
+                takes_incoming_spam_signals(
+                    existing_is_spam,
+                    existing_rating as u32,
+                    incoming_is_spam,
+                    incoming_rating as u32,
+                ),
+                case["takes_incoming"].as_bool().expect("case expectation"),
+                "{}",
+                case["name"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
+    /// End to end through the real merge: a weaker flagged batch must not swap
+    /// the explanation out from under the score that survives.
+    #[test]
+    fn a_weaker_flagged_batch_does_not_replace_the_explanation() {
+        let reason = |text: &str| crate::search::spam::SpamReason {
+            code: text.to_string(),
+            weight: None,
+            percent: None,
+            count: None,
+            votes: None,
+            total: None,
+            text: text.to_string(),
+        };
+
+        let mut strong = sample("aa", 1, ORIGIN_SERVER_TCP);
+        strong.is_spam = true;
+        strong.spam_rating = 85;
+        strong.spam_reasons = vec!["known_hash".to_string()];
+        strong.spam_reason_details = vec![reason("known_hash")];
+
+        let mut weak = sample("aa", 1, ORIGIN_KAD);
+        weak.is_spam = true;
+        weak.spam_rating = 40;
+        weak.spam_reasons = vec!["fake_pattern".to_string()];
+        weak.spam_reason_details = vec![reason("fake_pattern")];
+
+        let merged = merge_search_vecs(vec![strong], vec![weak]);
+        assert_eq!(merged[0].spam_rating, 85);
+        assert_eq!(
+            merged[0].spam_reasons,
+            vec!["known_hash".to_string()],
+            "the explanation has to match the score the row kept"
         );
     }
 

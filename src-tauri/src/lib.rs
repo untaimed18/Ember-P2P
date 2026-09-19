@@ -180,6 +180,14 @@ pub(crate) async fn run_graceful_shutdown(
         }
     }
 
+    // The digest backfill deliberately outlives the scan that queued it, so it
+    // is not in `hash_cancel_flags` and the loop above does not reach it. It
+    // reads whole files and it takes `local_index.write()`, which makes it
+    // exactly the kind of task the join below exists to fence — being absent
+    // from both sets meant it kept reading the user's drives through exit and
+    // could still be mid-update during the authoritative flush.
+    crate::commands::sharing::cancel_digest_backfill().await;
+
     // Cancelling a hasher only asks it to stop; the task still has to unwind,
     // and dropping its `JoinHandle` detaches it rather than aborting it. Join
     // the registered scans here so none of them can still hold
@@ -191,6 +199,30 @@ pub(crate) async fn run_graceful_shutdown(
     // cancel flags already set a cooperative scan stops within ~100ms.
     const SCAN_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
     state.await_background_scans(SCAN_JOIN_GRACE).await;
+
+    // `await_background_scans` joins the tasks we track by handle;
+    // `scanning_count` additionally covers the `spawn_blocking` hash workers
+    // those tasks fan out to, which can outlive the parent that spawned them.
+    // Both have to be quiet *before* the network task runs the authoritative
+    // flush below, not after it — this wait used to sit past that flush, where
+    // it could no longer protect anything, and aborted stragglers without
+    // joining them. `register_background_scan` refuses new work once
+    // `bw_shutdown` is set, so neither set can be repopulated after this point.
+    const SCAN_QUIESCE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+    let scan_quiesce_deadline = std::time::Instant::now() + SCAN_QUIESCE_GRACE;
+    let scanning = state.scanning_count.clone();
+    while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && std::time::Instant::now() < scan_quiesce_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if scanning.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        tracing::warn!(
+            "Shutdown: {} hash worker(s) still running after {}s; flushing anyway",
+            scanning.load(std::sync::atomic::Ordering::Relaxed),
+            SCAN_QUIESCE_GRACE.as_secs()
+        );
+    }
 
     let tx = state.network_tx.clone();
     const SHUTDOWN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -245,23 +277,6 @@ pub(crate) async fn run_graceful_shutdown(
              no authoritative network writes ran this teardown",
             SHUTDOWN_SEND_WAIT.as_secs()
         );
-    }
-
-    // Wait for in-flight discovery/hash workers to finish or abort after a
-    // short grace window. Prevents scans from mutating state (known.met,
-    // local_index) while we're flushing it to disk below.
-    let scanning = state.scanning_count.clone();
-    while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
-        && std::time::Instant::now() < shutdown_deadline
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let handles: Vec<_> = {
-        let mut map = state.background_scans.write().await;
-        map.drain().map(|(_, h)| h).collect()
-    };
-    for h in handles {
-        h.abort();
     }
 
     // Flush any learned spam signals not yet persisted by the periodic flush
@@ -1130,6 +1145,11 @@ pub fn run() {
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
+                // Already-servable rows wanting only the Ember digest. Kept
+                // out of `files_to_hash` so a cold start is not a full re-read
+                // of the library; handed to the background pass once the scan
+                // has finished with the drives.
+                let mut startup_digest_backfill: Vec<crate::types::FileInfo> = Vec::new();
                 // Paths with no known.met record at all — genuinely new to
                 // this library, as opposed to a previously-shared file that's
                 // merely being rediscovered. Only these should inherit a
@@ -1166,18 +1186,26 @@ pub fn run() {
                         // doesn't show 0 until the next 60s source-count sync.
                         file.complete_sources = record.complete_sources;
                         // A matched record short-circuits hashing unless we
-                        // still need a one-time repair pass:
-                        // - empty AICH on multi-part (v2 migration / missing root)
-                        // - empty ember_file_hash (slice 18 migration: pre-upgrade
-                        //   shares must get streaming BLAKE3 for DHT publish +
-                        //   download verify)
-                        // ed2k comes out identical; only the missing digests
-                        // are filled. Single-part empty AICH is left as-is
-                        // (roots never straddled a part boundary).
+                        // still need a one-time repair pass. The two repairs
+                        // are not equally urgent, and are scheduled apart:
+                        //
+                        // - empty AICH on multi-part (v2 migration / missing
+                        //   root) is eD2k protocol data. Without it a corrupt
+                        //   chunk cannot be identified or recovered, so it is
+                        //   worth making the scan wait. Single-part empty AICH
+                        //   is left as-is (roots never straddled a part
+                        //   boundary).
+                        // - empty ember_file_hash is an Ember-only extra that
+                        //   lets a downloader double-check the whole file. The
+                        //   row is fully servable without it, so it is filled
+                        //   in the background rather than holding up a scan
+                        //   that would otherwise take days on a large library.
+                        //
+                        // ed2k comes out identical either way; only the
+                        // missing digests are filled.
                         let needs_aich = file.aich_hash.is_empty()
                             && file.size > crate::network::ed2k::hash::PARTSIZE;
-                        let needs_ember = file.ember_file_hash.is_empty();
-                        if needs_aich || needs_ember {
+                        if needs_aich {
                             // Path-unique id while this copy is queued for
                             // re-hashing. `file.id` is the content hash,
                             // which every duplicate of the same content
@@ -1192,6 +1220,8 @@ pub fn run() {
                             // See [`crate::search::index::REHASH_ID_PREFIX`].
                             file.id = crate::search::index::rehash_id(&file.path);
                             files_to_hash.push(file.clone());
+                        } else if file.ember_file_hash.is_empty() {
+                            startup_digest_backfill.push(file.clone());
                         }
                     } else {
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
@@ -1398,16 +1428,48 @@ pub fn run() {
                 let mut was_cancelled = false;
                 let mut page_complete = true;
 
-                for file in &files_to_hash {
+                // Same scheduler the folder-add and reload passes use: one read
+                // at a time per physical drive, more only where a drive has
+                // reported that its reads do not seek. A cold start on a
+                // library spread over several drives used to hash strictly one
+                // file at a time and leave every other drive idle — the same
+                // waste the reload path was fixed for, on the path that runs
+                // before anything else in the app works.
+                let mut pipeline = commands::sharing::HashLookahead::new(
+                    &files_to_hash,
+                    cancel_flag.clone(),
+                );
+                pipeline.log_plan("Startup hashing", total_to_hash);
+                loop {
+                    let started = match pipeline.next_started() {
+                        commands::sharing::NextHash::Ready(started) => started,
+                        // Every drive with work left is busy with a read this
+                        // pass did not start, most likely a download verifying
+                        // itself. Wait rather than pile on, and never mistake
+                        // it for the end of the queue.
+                        commands::sharing::NextHash::Busy => {
+                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                was_cancelled = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        commands::sharing::NextHash::Done => break,
+                    };
                     if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         info!("Startup hashing cancelled at {hashed}/{total_to_hash}");
                         was_cancelled = true;
+                        // Claimed and already running: hand it to the drain or
+                        // its claim outlives the scan.
+                        pipeline.drain_started(started);
                         break;
                     }
 
-                    let file_path = file.path.clone();
+                    let file = &files_to_hash[started.index];
                     let file_temp_id = file.id.clone();
-                    let cf = cancel_flag.clone();
+                    let hash_claim = started.claim;
+                    let mut hash_task = started.task;
 
                     tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
@@ -1417,9 +1479,6 @@ pub fn run() {
                         "file_name": file.name,
                     }));
 
-                    let mut hash_task = tokio::task::spawn_blocking(move || {
-                        FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
-                    });
                     let hash_result = tokio::time::timeout(
                         std::time::Duration::from_secs(300),
                         &mut hash_task,
@@ -1528,6 +1587,7 @@ pub fn run() {
                                     }
                                 }
                             }
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Ok(Err(e))) => {
                             if e.to_string().contains("cancelled") {
@@ -1535,18 +1595,24 @@ pub fn run() {
                                 was_cancelled = true;
                                 let mut idx = index_clone.write().await;
                                 idx.abandon_hash_placeholder(&file_temp_id);
+                                drop(idx);
+                                commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
+                            drop(idx);
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
+                            drop(idx);
+                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Err(_) => {
                             // One slow file must not end the scan. Cancelling the
@@ -1562,23 +1628,47 @@ pub fn run() {
                                 file.name
                             );
                             page_complete = false;
-                            // Drain the abandoned blocking hash for its log line
-                            // only. It must hold no scan lease: the read may be
-                            // stuck in the kernel where the cancel flag cannot
-                            // reach it, and holding the coordination/scan guards
-                            // across that wait would block every later reload and
-                            // stall shutdown for the rest of the session.
+                            // Drain the abandoned blocking hash and release its
+                            // claim only once it really ends. It must hold no
+                            // scan lease: the read may be stuck in the kernel
+                            // where the cancel flag cannot reach it, and holding
+                            // the coordination/scan guards across that wait
+                            // would block every later reload and stall shutdown
+                            // for the rest of the session.
                             let timed_out_name = file.name.clone();
+                            let timed_out_path = file.path.clone();
+                            // Keep the drive spoken for until the abandoned
+                            // read really ends; otherwise the look-ahead sees
+                            // the device as free and stacks another read on
+                            // top of the one still running.
+                            let orphan_device = sharing::disk::note_external_read_for_key(
+                                pipeline.device_key(started.device),
+                            );
                             tokio::spawn(async move {
+                                let _orphan_device = orphan_device;
                                 if let Err(error) = hash_task.await {
                                     tracing::warn!(
                                         "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
                                     );
                                 }
+                                commands::sharing::release_in_flight_hash(
+                                    &timed_out_path,
+                                    hash_claim,
+                                );
                             });
                             continue;
                         }
                     }
+                }
+                // Cancelling leaves the look-ahead window full of claimed,
+                // still-running hashes; hand them off to drain rather than
+                // stranding their claims for the length of the lease.
+                pipeline.abandon();
+                // A file another pass still held was never hashed here, so this
+                // page is unfinished and nothing may be reconciled away on the
+                // strength of it.
+                if pipeline.skipped() > 0 {
+                    page_complete = false;
                 }
 
                 {
@@ -1629,6 +1719,14 @@ pub fn run() {
                     // can't re-apply share/priority flips on a later rehash.
                     let app_state = startup_app.state::<AppState>();
                     commands::sharing::prune_pending_intents_for_hashed(&app_state).await;
+                }
+                if !was_cancelled {
+                    // Last, and only once the scan has let go of the drives.
+                    commands::sharing::queue_digest_backfill(
+                        startup_app.clone(),
+                        startup_digest_backfill,
+                    )
+                    .await;
                 }
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total_to_hash,
@@ -1820,7 +1918,9 @@ pub fn run() {
             commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
             commands::transfers::get_upload_queue,
+            commands::transfers::get_download_file_details,
             commands::transfers::get_known_clients,
+            commands::transfers::get_known_client_counts,
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
@@ -1855,6 +1955,8 @@ pub fn run() {
             commands::sharing::get_scan_status,
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
+            commands::sharing::preview_stop_hashing,
+            commands::sharing::digest_backfill_status,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
             commands::sharing::resolve_media_asset_path,
@@ -1949,6 +2051,7 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
+            commands::settings::pick_preview_player,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
@@ -1985,8 +2088,12 @@ pub fn run() {
             commands::server::disconnect_server,
             commands::server::add_server,
             commands::server::remove_server,
+            commands::server::set_server_static,
+            commands::server::set_server_priority,
             commands::server::get_server_list,
             commands::server::get_connected_server,
+            commands::server::get_server_log,
+            commands::server::clear_server_log,
             commands::server::download_server_met,
             commands::comments::set_file_comment,
             commands::comments::get_file_comments,

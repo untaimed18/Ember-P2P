@@ -1866,6 +1866,60 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GuardedWrite<W> {
     }
 }
 
+const RELAY_PACE_CHUNK: usize = 16 * 1024;
+/// How long a paced bridge may go without winning any upload allowance
+/// before the session is torn down.
+///
+/// Pacing makes starvation reachable: with a small cap and busy file-upload
+/// slots, `yield_then_take_upload` can wait indefinitely. An `Active` session
+/// is exempt from `RELAY_IDLE_TIMEOUT` (see `RelaySession::is_expired`) and is
+/// only reaped at `RELAY_MAX_DURATION`, so a starved bridge would otherwise
+/// squat one of `MAX_CONCURRENT_RELAY_SESSIONS` for two hours while moving
+/// nothing. Failing out frees the slot and logs the cause.
+const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Copy `reader` → `writer`, yielding to file-upload slots when a cap is set.
+///
+/// `tokio::io::copy` would drain the uplink as fast as TCP/QUIC allow, on
+/// top of the token bucket file uploads already live in. HighID nodes that
+/// serve as a Kad buddy are also the nodes that donate relay, so an
+/// unmetered bridge looked like "buddy serving killed my upload speed".
+async fn copy_yielding_to_file_uploads<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    max_bytes: u64,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; RELAY_PACE_CHUNK];
+    let mut copied = 0u64;
+    loop {
+        if copied >= max_bytes {
+            break;
+        }
+        let want = ((max_bytes - copied) as usize).min(buf.len());
+        let n = reader.read(&mut buf[..want]).await?;
+        if n == 0 {
+            break;
+        }
+        if tokio::time::timeout(RELAY_STALL_TIMEOUT, limiter.yield_then_take_upload(n as u64))
+            .await
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "relay starved: file uploads hold the whole upload cap",
+            ));
+        }
+        writer.write_all(&buf[..n]).await?;
+        copied += n as u64;
+    }
+    Ok(copied)
+}
+
 /// Run the QUIC accept loop. Handles three kinds of inbound QUIC connections:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
 ///   2. **RELAY_CONNECT** — a relay node is forwarding a client to us (relay target)
@@ -1886,6 +1940,7 @@ pub async fn run_quic_accept_loop(
     >,
     friend_hashes: crate::app_state::SharedFriendHashes,
     address_policy: RelayAddressPolicy,
+    bandwidth_limiter: std::sync::Arc<crate::bandwidth::limiter::BandwidthLimiter>,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
@@ -1972,6 +2027,7 @@ pub async fn run_quic_accept_loop(
         let friends = friend_hashes.clone();
         let active_counts = active_session_counts.clone();
         let policy = address_policy.clone();
+        let limiter = bandwidth_limiter.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
             let pending_ip_guard = pending_ip_guard;
@@ -2290,8 +2346,18 @@ pub async fn run_quic_accept_loop(
                 let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
                     let mut i2t_limited = init_recv.take(bw_limit);
                     let mut t2i_limited = tgt_recv.take(bw_limit);
-                    let i2t = tokio::io::copy(&mut i2t_limited, &mut tgt_send);
-                    let t2i = tokio::io::copy(&mut t2i_limited, &mut init_send);
+                    let i2t = copy_yielding_to_file_uploads(
+                        &mut i2t_limited,
+                        &mut tgt_send,
+                        &limiter,
+                        bw_limit,
+                    );
+                    let t2i = copy_yielding_to_file_uploads(
+                        &mut t2i_limited,
+                        &mut init_send,
+                        &limiter,
+                        bw_limit,
+                    );
 
                     match tokio::try_join!(i2t, t2i) {
                         Ok((i2t_bytes, t2i_bytes)) => {

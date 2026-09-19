@@ -33,10 +33,14 @@ const OP_IDENTITY_LOOKUP_V4: u8 = 0x20;
 const OP_CAPABILITY_REGISTER_V4: u8 = 0x21;
 const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
 const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
+/// Superseded by [`OP_CHANNEL_NAME_DISPLAY_V4`], which also commits to the
+/// published display string. Still sent as a fallback to servers that predate
+/// that message; the value must never be reused for anything else.
 const OP_CHANNEL_NAME_V4: u8 = 0x27;
 const OP_CHANNEL_DELETE_V4: u8 = 0x28;
 const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
 const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
+const OP_CHANNEL_NAME_DISPLAY_V4: u8 = 0x2b;
 const SIGNED_IP_V4: u8 = 4;
 const SIGNED_IP_V6: u8 = 6;
 
@@ -74,8 +78,50 @@ fn explicit_version_unsupported(status: reqwest::StatusCode) -> bool {
     )
 }
 
+/// How long a negotiated protocol version is trusted before re-probing.
+///
+/// The answer only changes when the server is upgraded, so an hour is
+/// conservative. Before this was cached, every presence lookup, register and
+/// relay call re-probed `/v4/protocol` over its own connection first — and the
+/// channel-neighbour dialler starts up to four lookups a second, so a single
+/// client could spend a dozen requests per second re-asking a question whose
+/// answer had not changed since startup.
+const RENDEZVOUS_PROTOCOL_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn protocol_cache(
+) -> &'static tokio::sync::RwLock<std::collections::HashMap<String, (RendezvousProtocol, std::time::Instant)>>
+{
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, (RendezvousProtocol, std::time::Instant)>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Record a successfully negotiated version. Only definite answers are cached
+/// — a transport failure leaves the cache alone so the next call re-probes
+/// rather than pinning a guess for the whole TTL.
+async fn remember_protocol(base_url: &str, protocol: RendezvousProtocol) {
+    let mut cache = protocol_cache().write().await;
+    let now = std::time::Instant::now();
+    cache.retain(|_, (_, at)| now.duration_since(*at) < RENDEZVOUS_PROTOCOL_TTL);
+    if cache.len() >= RENDEZVOUS_CLIENT_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(base_url.to_string(), (protocol, now));
+}
+
 pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProtocol, String> {
     require_https(base_url)?;
+    {
+        let cache = protocol_cache().read().await;
+        if let Some((protocol, at)) = cache.get(base_url) {
+            if at.elapsed() < RENDEZVOUS_PROTOCOL_TTL {
+                return Ok(*protocol);
+            }
+        }
+    }
     let response = client(base_url)
         .await?
         .get(format!("{}/v4/protocol", base_url.trim_end_matches('/')))
@@ -87,6 +133,7 @@ pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProto
             serde_json::from_slice(&read_bounded_bytes(response, MAX_RESPONSE_BYTES).await?)
                 .map_err(|error| format!("rendezvous protocol probe bad body: {error}"))?;
         return if body["version"].as_u64() == Some(4) {
+            remember_protocol(base_url, RendezvousProtocol::IpBoundV4).await;
             Ok(RendezvousProtocol::IpBoundV4)
         } else {
             Err("rendezvous protocol probe returned an unsupported version".to_string())
@@ -94,6 +141,7 @@ pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProto
     }
     if explicit_version_unsupported(response.status()) {
         debug!("Rendezvous: server explicitly lacks v4; using bounded legacy v3 compatibility");
+        remember_protocol(base_url, RendezvousProtocol::LegacyV3).await;
         Ok(RendezvousProtocol::LegacyV3)
     } else {
         Err(format!(
@@ -435,12 +483,74 @@ pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// How long a validated, DNS-pinned rendezvous client is reused before its pin
+/// is re-resolved.
+///
+/// Long enough that the mailbox poll (1 Hz) and the channel-neighbour dialler
+/// share one pool instead of opening a fresh connection each time; short
+/// enough that a rendezvous host that moves is picked up in minutes.
+const RENDEZVOUS_CLIENT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Budget for one friend-relay mailbox poll attempt, including the DNS
+/// resolution `client` may have to do on a cache miss.
+const FRIEND_RELAY_MAILBOX_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Cap on distinct rendezvous URLs kept in the client cache. In practice there
+/// is one; the bound is only so a caller looping over URLs cannot grow it.
+const RENDEZVOUS_CLIENT_CACHE_MAX: usize = 8;
+
+struct CachedClient {
+    client: reqwest::Client,
+    built_at: std::time::Instant,
+}
+
+fn client_cache() -> &'static tokio::sync::RwLock<std::collections::HashMap<String, CachedClient>> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::RwLock<std::collections::HashMap<String, CachedClient>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// A validated, certificate- and DNS-pinned HTTP client for `rendezvous_url`.
+///
+/// Cached, because this used to build a brand-new `reqwest::Client` on every
+/// call. A client owns its connection pool and the pool dies with it, so each
+/// caller got zero keep-alive reuse — and the friend-relay mailbox poll calls
+/// this once a second for the life of the session, i.e. ~86,400 DNS lookups
+/// and ~86,400 full TCP+TLS handshakes per client per day against one server.
+/// Cloning a `reqwest::Client` shares the pool, so handing out clones is what
+/// makes connection reuse and TLS session resumption actually apply.
 async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
+    {
+        let cache = client_cache().read().await;
+        if let Some(hit) = cache.get(rendezvous_url) {
+            if hit.built_at.elapsed() < RENDEZVOUS_CLIENT_TTL {
+                return Ok(hit.client.clone());
+            }
+        }
+    }
     let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
         .await
         .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
-    crate::security::build_pinned_client(&host, &addrs)
-        .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))
+    let built = crate::security::build_pinned_client(&host, &addrs)
+        .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))?;
+    {
+        let mut cache = client_cache().write().await;
+        // Expired rows first; only then the blunt cap, so a live entry is not
+        // shed while stale ones sit beside it.
+        cache.retain(|_, entry| entry.built_at.elapsed() < RENDEZVOUS_CLIENT_TTL);
+        if cache.len() >= RENDEZVOUS_CLIENT_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(
+            rendezvous_url.to_string(),
+            CachedClient {
+                client: built.clone(),
+                built_at: std::time::Instant::now(),
+            },
+        );
+    }
+    Ok(built)
 }
 
 /// Reject non-HTTPS rendezvous URLs before we send any traffic. The
@@ -1974,7 +2084,13 @@ pub async fn poll_friend_relay_tickets(
 
     let mut last_error = None;
     for attempt in 0..2 {
-        match tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        // Has to clear the DNS budget inside `validate_fetch_url`, which
+        // `client` may spend on a cache miss. At one second it could not: on a
+        // cold or slow resolver every attempt timed out before the request was
+        // ever sent, so relay tickets were never received and nothing said so.
+        // Still well inside the caller's 1 Hz cadence in the warm case, which
+        // is now the common one.
+        match tokio::time::timeout(FRIEND_RELAY_MAILBOX_POLL_TIMEOUT, async {
             let resp = client(base_url)
                 .await?
                 .post(&url)
@@ -2189,7 +2305,74 @@ fn build_channel_username_v4_msg(pubkey: &[u8; 32], name: &str, ts: i64) -> Vec<
     message
 }
 
-fn build_channel_name_v4_msg(
+/// Mirror of the rendezvous server's `strip_invisible`, so the display string
+/// this client signs is byte-identical to the one the server derives from the
+/// same request and stores. The two must not drift: a mismatch makes the
+/// signature fail to verify and the claim 403.
+fn strip_invisible(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && *c != '\0' && is_not_bidi_or_zero_width(*c))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn is_not_bidi_or_zero_width(c: char) -> bool {
+    !matches!(
+        c,
+        '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+            | '\u{FEFF}'
+            | '\u{061C}'
+            // Zl / Zp. Not `char::is_control()`, so nothing else removes them,
+            // and a name pasted out of a PDF or word processor carries them.
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Channel-name claim that also commits to the display string the directory
+/// publishes. See the server's `build_channel_name_display_v4_msg` for why the
+/// normalised-only form was not enough.
+fn build_channel_name_display_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    normalized: &str,
+    display: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 4 + normalized.len() + 4 + display.len() + 1 + 8,
+    );
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NAME_DISPLAY_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
+    message.extend_from_slice(normalized.as_bytes());
+    message.extend_from_slice(&(display.len() as u32).to_le_bytes());
+    message.extend_from_slice(display.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// The pre-display channel-name claim. Kept only for the fallback in
+/// [`claim_channel_name`] against a server that cannot verify the newer form.
+fn build_channel_name_legacy_v4_msg(
     channel_id: &[u8; 16],
     pubkey: &[u8; 32],
     name: &str,
@@ -2393,30 +2576,70 @@ pub(crate) async fn claim_channel_name(
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
     use ed25519_dalek::Signer;
     let ts = current_timestamp();
-    let signed_name = name.to_lowercase();
-    let signed = build_channel_name_v4_msg(channel_id, pubkey, &signed_name, private, ts);
-    let sig = signing_key_from_secret(secret).sign(&signed);
-    let resp = client(base_url)
-        .await
-        .map_err(|_| ChannelRegistryError::Unavailable)?
-        .post(format!(
-            "{}/v4/channels/name",
-            base_url.trim_end_matches('/')
-        ))
-        .json(&serde_json::json!({
-            "channel_id": hex::encode(channel_id),
-            "pubkey": hex::encode(pubkey),
-            "name": name,
-            "private": private,
-            "ts": ts,
-            "sig": hex::encode(sig.to_bytes()),
-        }))
-        .send()
-        .await
-        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    // The server derives both of these from the `name` field below, so they
+    // have to be computed the same way here: the key it will file the claim
+    // under, and the display string it will publish. Signing only the former
+    // left the published bytes uncovered by any signature.
+    let display = strip_invisible(name);
+    let signed_name = display.to_lowercase();
+    let key = signing_key_from_secret(secret);
+
+    let post = |signed: Vec<u8>| {
+        let sig = key.sign(&signed);
+        async move {
+            client(base_url)
+                .await
+                .map_err(|_| ChannelRegistryError::Unavailable)?
+                .post(format!(
+                    "{}/v4/channels/name",
+                    base_url.trim_end_matches('/')
+                ))
+                .json(&serde_json::json!({
+                    "channel_id": hex::encode(channel_id),
+                    "pubkey": hex::encode(pubkey),
+                    "name": name,
+                    "private": private,
+                    "ts": ts,
+                    "sig": hex::encode(sig.to_bytes()),
+                }))
+                .send()
+                .await
+                .map_err(|_| ChannelRegistryError::Unavailable)
+        }
+    };
+
+    let resp = post(build_channel_name_display_v4_msg(
+        channel_id,
+        pubkey,
+        &signed_name,
+        &display,
+        private,
+        ts,
+    ))
+    .await?;
     if resp.status().is_success() {
         let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
         return Ok(());
+    }
+    // A rendezvous server that predates the display-committing message cannot
+    // verify it and answers 403. Fall back to the legacy form so a client that
+    // upgrades ahead of its server can still claim a name — at the cost, on
+    // that server only, of the name being published in its normalised form.
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        let legacy = post(build_channel_name_legacy_v4_msg(
+            channel_id,
+            pubkey,
+            &signed_name,
+            private,
+            ts,
+        ))
+        .await?;
+        if legacy.status().is_success() {
+            let _ = read_bounded_bytes(legacy, MAX_RESPONSE_BYTES).await;
+            return Ok(());
+        }
+        return Err(map_registry_status(legacy.status()));
     }
     Err(map_registry_status(resp.status()))
 }
@@ -2490,35 +2713,117 @@ pub(crate) async fn fetch_channel_directory(
     serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
 }
 
+/// Pages of `/v4/channels/deleted` this will follow before giving up.
+///
+/// The server hands back at most 2,000 ids per page and caps its tombstone set
+/// at 100,000, so 50 pages covers a full registry. The bound matters because
+/// the cursor comes from the server: a misbehaving or hostile one could
+/// otherwise keep answering with a full page and a fresh cursor forever.
+const MAX_DELETED_ID_PAGES: usize = 50;
+
 pub(crate) async fn fetch_deleted_channel_ids(
     base_url: &str,
 ) -> Result<Vec<String>, ChannelRegistryError> {
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
-    let resp = client(base_url)
-        .await
-        .map_err(|_| ChannelRegistryError::Unavailable)?
-        .get(format!(
-            "{}/v4/channels/deleted",
-            base_url.trim_end_matches('/')
-        ))
-        .send()
+    let base = base_url.trim_end_matches('/');
+    let http = client(base_url)
         .await
         .map_err(|_| ChannelRegistryError::Unavailable)?;
-    if !resp.status().is_success() {
-        return Err(map_registry_status(resp.status()));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    for _ in 0..MAX_DELETED_ID_PAGES {
+        let url = match &cursor {
+            Some(after) => format!(
+                "{base}/v4/channels/deleted?after={}",
+                urlencoding_hex(after)
+            ),
+            None => format!("{base}/v4/channels/deleted"),
+        };
+        let resp = http
+            .get(url)
+            .send()
+            .await
             .map_err(|_| ChannelRegistryError::Unavailable)?;
-    let Some(list) = body.get("ids") else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+        if !resp.status().is_success() {
+            return Err(map_registry_status(resp.status()));
+        }
+        let body: serde_json::Value = serde_json::from_slice(
+            &read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES)
+                .await
+                .map_err(|_| ChannelRegistryError::Unavailable)?,
+        )
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+        let Some(list) = body.get("ids") else {
+            return Ok(out);
+        };
+        let page: Vec<String> = serde_json::from_value(list.clone())
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+        let page_was_empty = page.is_empty();
+        out.extend(page);
+        // A server that predates paging sends no `next` and the loop ends on
+        // the first pass, exactly as before.
+        let next = body
+            .get("next")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .filter(|next| !next.is_empty());
+        match next {
+            // Refuse to walk backwards or in place: the cursor must advance, or
+            // a server answering with a constant `next` would loop us until the
+            // page bound.
+            Some(next) if !page_was_empty && cursor.as_deref().is_none_or(|c| next.as_str() > c) => {
+                cursor = Some(next);
+            }
+            _ => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// Percent-encode a cursor for use in a query string.
+///
+/// The server only ever emits lowercase hex ids and rejects anything else, so
+/// in practice nothing needs escaping — this exists so a malformed cursor from
+/// a hostile server cannot inject additional query parameters into the next
+/// request we build from it.
+fn urlencoding_hex(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(64)
+        .collect()
 }
 
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
+
+    /// This mirrors the rendezvous server's `strip_invisible`, and a
+    /// divergence is silent and total: the client signs over a string the
+    /// server never derives, so the claim 403s on the new message, 403s again
+    /// on the legacy fallback, and the user sees no reason why. U+2028/U+2029
+    /// are the easy ones to miss — they are `Zl`/`Zp`, not `is_control()`, so
+    /// only the explicit list removes them, and they ride in on text pasted
+    /// from a PDF or word processor.
+    #[test]
+    fn the_invisible_char_filter_matches_the_rendezvous_server() {
+        for c in [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{FEFF}', '\u{061C}', '\u{2028}', '\u{2029}',
+        ] {
+            assert_eq!(
+                strip_invisible(&format!("Lo{c}bby")),
+                "Lobby",
+                "U+{:04X} must be stripped exactly as the server strips it",
+                c as u32
+            );
+        }
+        // Ordinary text, including non-Latin, is untouched.
+        assert_eq!(strip_invisible("  Lobby  "), "Lobby");
+        assert_eq!(strip_invisible("ロビー"), "ロビー");
+    }
 
     #[test]
     fn current_privacy_operation_codes_are_stable() {
@@ -2536,6 +2841,7 @@ mod relay_ticket_tests {
         assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
         assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
         assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
+        assert_eq!(OP_CHANNEL_NAME_DISPLAY_V4, 0x2b);
     }
 
     #[test]

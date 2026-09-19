@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 46;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 47;
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -116,8 +116,10 @@ pub enum ChannelEditOutcome {
     Forgotten,
 }
 
-/// One row of the eD2K `credits` table, in `load_credits` order. The trailing
-/// flag is the durable "has ever been cryptographically verified" anchor.
+/// One row of the eD2K `credits` table, in `load_credits` order. The
+/// `bool` is the durable "has ever been cryptographically verified" anchor;
+/// the two trailing strings are the peer's Hello nickname and client
+/// software (v47).
 pub type CreditRow = (
     [u8; 16],
     u64,
@@ -128,6 +130,8 @@ pub type CreditRow = (
     u8,
     Option<[u8; 16]>,
     bool,
+    String,
+    String,
 );
 
 /// Borrowed form of [`CreditRow`] used by the save path.
@@ -141,6 +145,8 @@ pub type CreditRowRef<'a> = (
     u8,
     Option<&'a [u8; 16]>,
     bool,
+    &'a str,
+    &'a str,
 );
 
 /// One public room remembered from an earlier Discover walk.
@@ -2257,6 +2263,34 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 47 {
+            // Who a known peer says it is: its Hello nickname and its client
+            // software string.
+            //
+            // The credit ledger only ever stored accounting, so the Known
+            // eD2K Peers tab could identify a row by 32 hex characters and
+            // nothing else. These are the two things a person actually
+            // recognises, and they have to be persisted rather than read from
+            // a live session, because the tab is a *lifetime* view — almost
+            // none of its rows have a session open.
+            //
+            // Columns on `credits` rather than a side table: they are keyed by
+            // the same `user_hash`, they are written and pruned on exactly the
+            // same schedule, and `save_all_credits` replaces the table
+            // wholesale, so a separate table would only add a second thing to
+            // keep in step with that replacement.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "credits", "peer_name", "TEXT NOT NULL DEFAULT ''")?;
+            Self::add_column_if_missing(
+                &tx,
+                "credits",
+                "client_software",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 47)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -3199,7 +3233,7 @@ impl Database {
     pub fn load_credits(&self) -> anyhow::Result<Vec<CreditRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once FROM credits",
+            "SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once, peer_name, client_software FROM credits",
         )?;
         let records = stmt
             .query_map([], |row| {
@@ -3241,6 +3275,8 @@ impl Database {
                     row.get::<_, i64>(6)?.clamp(0, u8::MAX as i64) as u8,
                     ember_hash,
                     row.get::<_, i64>(8)? != 0,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             })?
             .filter_map(|r| match r {
@@ -3441,7 +3477,7 @@ impl Database {
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once, peer_name, client_software) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             )?;
             for (
                 hash,
@@ -3453,6 +3489,8 @@ impl Database {
                 ident_state,
                 ember_hash,
                 crypto_verified_once,
+                peer_name,
+                client_software,
             ) in credits
             {
                 stmt.execute(params![
@@ -3465,6 +3503,8 @@ impl Database {
                     i64::from(*ident_state),
                     ember_hash.map(|eh| eh.as_slice()),
                     i64::from(*crypto_verified_once),
+                    *peer_name,
+                    *client_software,
                 ])?;
             }
         }
@@ -3607,7 +3647,7 @@ impl Database {
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once, peer_name, client_software) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             )?;
             for (
                 hash,
@@ -3619,6 +3659,8 @@ impl Database {
                 ident_state,
                 ember_hash,
                 crypto_verified_once,
+                peer_name,
+                client_software,
             ) in credits
             {
                 stmt.execute(params![
@@ -3631,6 +3673,8 @@ impl Database {
                     i64::from(*ident_state),
                     ember_hash.map(|eh| eh.as_slice()),
                     i64::from(*crypto_verified_once),
+                    *peer_name,
+                    *client_software,
                 ])?;
             }
         }
@@ -7531,7 +7575,9 @@ mod tests {
                 ident_ip INTEGER NOT NULL DEFAULT 0,
                 ident_state INTEGER NOT NULL DEFAULT 0,
                 ember_hash BLOB,
-                crypto_verified_once INTEGER NOT NULL DEFAULT 0
+                crypto_verified_once INTEGER NOT NULL DEFAULT 0,
+                peer_name TEXT NOT NULL DEFAULT '',
+                client_software TEXT NOT NULL DEFAULT ''
             );",
         )
         .expect("create schema");
@@ -8241,9 +8287,9 @@ mod tests {
 
         // Seed three records.
         db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false),
-            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true),
-            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false),
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", ""),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", ""),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", ""),
         ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
@@ -8252,7 +8298,7 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true)])
+        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a")])
             .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -8266,6 +8312,14 @@ mod tests {
         // keeps the peer's last IP + country flag across restarts.
         assert_eq!(after[0].5, 0x0102_0304, "ident_ip must persist");
         assert_eq!(after[0].6, 1, "ident_state must persist");
+        // Same reasoning for the peer's name and client software: the Known
+        // eD2K Peers tab is a lifetime view, so a row it draws almost never
+        // has a live session to re-learn them from.
+        assert_eq!(after[0].9, "Nia", "peer_name must persist");
+        assert_eq!(
+            after[0].10, "eMule 0.60a",
+            "client_software must persist"
+        );
     }
 
     /// Saving an empty slice must clear every existing row — the only
@@ -8275,7 +8329,7 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let db = credits_only_db();
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false)])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "")])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
@@ -8296,10 +8350,10 @@ mod tests {
         let pk: &[u8] = &[0xAA; 4];
 
         db.save_all_credits(&[
-            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true),
+            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", ""),
             // Persisted `Failed` (2) with no anchor: exactly the state a
             // stranger can force by failing one challenge under this hash.
-            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false),
+            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", ""),
         ])
         .expect("seed");
 
@@ -8703,7 +8757,10 @@ mod tests {
         };
 
         let db = Database::open_at(&path).expect("open db");
-        assert_eq!(db.schema_version(), 46);
+        // The current version, not 46: this test is about the two indexes
+        // surviving the v45→v46 step, and pinning the number here only made
+        // it fail on the next unrelated migration.
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
         assert_eq!(index_count(&db), 2, "fresh database gets both indexes");
 
         // Back to a v45 profile: version rolled back and the indexes gone.
@@ -8720,13 +8777,13 @@ mod tests {
         drop(db);
 
         let upgraded = Database::open_at(&path).expect("reopen and migrate");
-        assert_eq!(upgraded.schema_version(), 46);
+        assert_eq!(upgraded.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
         assert_eq!(index_count(&upgraded), 2, "upgrade recreates both indexes");
 
         // Idempotent: opening again must not fail on indexes that now exist.
         drop(upgraded);
-        let again = Database::open_at(&path).expect("reopen at v46");
-        assert_eq!(again.schema_version(), 46);
+        let again = Database::open_at(&path).expect("reopen at the current version");
+        assert_eq!(again.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
         assert_eq!(index_count(&again), 2);
 
         drop(again);

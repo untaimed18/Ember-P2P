@@ -21,10 +21,17 @@
     color = '',
     peerColor = '',
     title = '',
+    peerSense = 'served',
   }: {
     partStatus?: string;
     partCount?: number;
     peerPartStatus?: string;
+    /** What the dark overlay means, which differs by direction and is only
+     *  observable in the accessible readout. Uploading, `peerPartStatus` is
+     *  what the peer already holds; downloading, it is what the swarm holds
+     *  and we do not. Saying "already on peer" for the latter states the
+     *  opposite of what the bar shows. */
+    peerSense?: 'served' | 'swarm';
     /** Unique coverage bytes. Unused while `partCount` is set — the overlay
      *  is served-parts / part-count so it matches the filled segments.
      *  Fallback when the bitmap is missing. */
@@ -36,7 +43,22 @@
   } = $props();
 
   const MAX_RENDERED_PARTS = 10_000;
-  let count = $derived(Math.min(MAX_RENDERED_PARTS, Math.max(0, Math.floor(Number(partCount) || 0))));
+  /** The file's real part count. Everything the caller can read back — the
+   *  accessible readout, `aria-valuenow` — is in these terms, so it agrees
+   *  with the legend a caller renders beside the bar. */
+  let count = $derived(Math.max(0, Math.floor(Number(partCount) || 0)));
+  /** Segments actually drawn. Past the cap the parts are *bucketed*, not
+   *  dropped: clamping `count` truncated instead, so a 65,000-part file drew
+   *  its first 10,000 parts — 15% of the file — under a legend describing all
+   *  of it. At or below the cap this is 1:1 and nothing changes. */
+  /// Derived in this order, not the other way round: picking `segments` first
+  /// and dividing to get the bucket size overshoots whenever the division is
+  /// inexact. At 10,001 parts that gives 10,000 segments of 2, covering 20,000
+  /// parts — so half the bar would be drawn past the end of the file, empty.
+  let partsPerSegment = $derived(
+    count > MAX_RENDERED_PARTS ? Math.ceil(count / MAX_RENDERED_PARTS) : 1,
+  );
+  let segments = $derived(Math.ceil(count / partsPerSegment));
   let servedColor = $derived(color || 'var(--accent)');
   // Dark "peer already has" tone — clearly distinct from both the empty track
   // and the green served fill.
@@ -64,11 +86,28 @@
     peerBits.reduce((acc, b, i) => acc + (b && !bits[i] ? 1 : 0), 0)
   );
 
-  // Per-part state: 2 = served (green), 1 = peer-has (dark), 0 = empty (grey).
+  // Per-segment state: 2 = served (green), 1 = peer-has (dark), 0 = empty.
+  //
+  // While `partsPerSegment` is 1 this is exactly the per-part mapping it has
+  // always been. When several parts share a segment, only a fully-served
+  // segment reads as served, so the bar can under-state progress but never
+  // claim any the file does not have.
   let states = $derived.by(() => {
-    const n = count;
+    const n = segments;
+    const per = partsPerSegment;
     const s = new Array(n).fill(0) as number[];
-    for (let i = 0; i < n; i++) s[i] = bits[i] ? 2 : peerBits[i] ? 1 : 0;
+    for (let seg = 0; seg < n; seg++) {
+      const start = seg * per;
+      const end = Math.min(count, start + per);
+      let served = 0;
+      let peer = 0;
+      for (let i = start; i < end; i++) {
+        if (bits[i]) served += 1;
+        else if (peerBits[i]) peer += 1;
+      }
+      const held = end - start;
+      s[seg] = held > 0 && served === held ? 2 : served > 0 || peer > 0 ? 1 : 0;
+    }
     return s;
   });
 
@@ -96,10 +135,10 @@
   // Thin per-part dividers, but only while parts stay wide enough to read;
   // past ~120 segments the 1px lines smear into a haze, so we drop them and
   // let the filled/empty gradient carry the structure on its own.
-  let showSeparators = $derived(count > 1 && count <= 120);
+  let showSeparators = $derived(segments > 1 && segments <= 120);
   let separator = $derived.by(() => {
     if (!showSeparators) return '';
-    const seg = (100 / count).toFixed(4);
+    const seg = (100 / segments).toFixed(4);
     const line = 'color-mix(in srgb, var(--border) 70%, transparent)';
     return `repeating-linear-gradient(to right, transparent 0, transparent calc(${seg}% - 1px), ${line} calc(${seg}% - 1px), ${line} ${seg}%)`;
   });
@@ -135,7 +174,11 @@
   <div class="parts-fill" style="background: {background};"></div>
   <span class="sr-only"
     >{m.transfers_parts({ have: servedCount, total: count })}{peerOnlyCount > 0
-      ? `, ${m.transfers_parts_peer({ peer: peerOnlyCount })}`
+      ? `, ${
+          peerSense === 'swarm'
+            ? m.transfers_parts_swarm({ peer: peerOnlyCount })
+            : m.transfers_parts_peer({ peer: peerOnlyCount })
+        }`
       : ''}</span
   >
 </div>

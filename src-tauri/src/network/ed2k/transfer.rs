@@ -2161,6 +2161,7 @@ impl Ed2kDownload {
         }
 
         let mut completed_path_out: Option<String> = None;
+        let mut verified_part_hashes: Vec<[u8; 16]> = Vec::new();
         match self
             .download_from_streams(
                 &mut *reader,
@@ -2173,6 +2174,7 @@ impl Ed2kDownload {
                 &event_tx,
                 emule_info_done,
                 &mut completed_path_out,
+                &mut verified_part_hashes,
             )
             .await
         {
@@ -2181,10 +2183,11 @@ impl Ed2kDownload {
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
                         final_path: completed_path_out,
-                        // `download_from_streams` doesn't currently surface its
-                        // internal verified hashset to this out-parameter list;
-                        // the completion handler falls back to a disk re-read.
-                        part_hashes: Vec::new(),
+                        // Computed by the final verification, which had to read
+                        // the file anyway. This path never gets a peer-supplied
+                        // hashset, so without these the completion handler read
+                        // the whole file again to recompute them.
+                        part_hashes: verified_part_hashes,
                         // `download_from_streams` only reaches `Ok` after its
                         // internal Ember BLAKE3 check passed (or there was
                         // none to run) — reflect the latter case here from
@@ -2216,6 +2219,10 @@ impl Ed2kDownload {
         // the deduplicated path instead of letting Open/Reveal reconstruct
         // (and mis-resolve) it from the file name.
         completed_path_out: &mut Option<String>,
+        // Set to the part hashes the final verification computed, so the
+        // completion handler can record them in known.met without reading the
+        // whole file again to derive what this pass already produced.
+        part_hashes_out: &mut Vec<[u8; 16]>,
     ) -> anyhow::Result<()> {
         let mut peer_supports_large_files = initial_caps.supports_large_files;
         let mut peer_supports_multipacket = initial_caps.supports_multi_packet;
@@ -4182,6 +4189,10 @@ impl Ed2kDownload {
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer passed this on; the
+                                            // server address is only how the
+                                            // callback gets relayed.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_count += 1;
@@ -4204,6 +4215,10 @@ impl Ed2kDownload {
                                         entry.server_port,
                                         uh,
                                         co,
+                                        // Another peer handed us this address;
+                                        // `entry.server_ip` is the server that
+                                        // peer uses, not who told us.
+                                        Some(crate::types::SourceOrigin::Exchange),
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {
@@ -4271,6 +4286,10 @@ impl Ed2kDownload {
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer passed this on; the
+                                            // server address is only how the
+                                            // callback gets relayed.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_count += 1;
@@ -4299,6 +4318,10 @@ impl Ed2kDownload {
                                         entry.server_port,
                                         uh,
                                         co,
+                                        // Another peer handed us this address;
+                                        // `entry.server_ip` is the server that
+                                        // peer uses, not who told us.
+                                        Some(crate::types::SourceOrigin::Exchange),
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {
@@ -5690,7 +5713,11 @@ impl Ed2kDownload {
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_part = super::aich::compute_aich_part(&part_data);
+                        let aich_part = super::aich::compute_aich_part(
+                            &part_data,
+                            part_idx,
+                            tracker.part_count,
+                        );
                         let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
                             / super::aich::AICH_BLOCK_SIZE;
                         warn!(
@@ -6028,36 +6055,30 @@ impl Ed2kDownload {
         });
         let job_cancel = verify_cancel.clone();
         let verified_result = match tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Seek, SeekFrom};
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
+            // Tell the library scheduler this drive is busy. It rations reads
+            // per physical device to keep a mechanical disk from thrashing, and
+            // a verification it cannot see is a read straight through that
+            // budget. Advisory only: this never waits, because the user is
+            // waiting on this file and a background scan is not.
+            let _drive_busy = crate::sharing::disk::note_external_read(&verify_path);
             let (_, mut file) =
                 crate::security::filesystem::open_existing_approved(&verify_path, &allowed, false)?;
             let identity = crate::security::filesystem::opened_file_identity(&file)?;
-            let hash =
-                super::hash::ed2k_hash_open_file_cancellable(&mut file, job_cancel.as_ref())?;
-            let aich = if expected_aich.is_some() {
-                if job_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    anyhow::bail!("cancelled");
-                }
-                Some(super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash)
-            } else {
-                None
-            };
-            if ember_expected != [0u8; 32] {
-                file.seek(SeekFrom::Start(0))?;
-                let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
-                let mut buf = vec![0u8; 1024 * 1024];
-                loop {
-                    if job_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        anyhow::bail!("cancelled");
-                    }
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                let got = hasher.finalize();
+            // One pass for all three. Read separately, this cost a full extra
+            // trip over the file per digest — three reads of a finished
+            // download, on the drive the user is waiting on, to check things
+            // that chunk the same bytes differently and can perfectly well be
+            // computed together.
+            let digests = super::hash::hash_open_file_digests_cancellable(
+                &mut file,
+                super::hash::WantedDigests {
+                    aich: expected_aich.is_some(),
+                    ember: ember_expected != [0u8; 32],
+                },
+                job_cancel.as_ref(),
+            )?;
+            if let Some(got) = digests.ember {
                 if got != ember_expected {
                     anyhow::bail!(
                         "ember blake3 mismatch: expected={} got={}",
@@ -6066,18 +6087,20 @@ impl Ed2kDownload {
                     );
                 }
             }
-            Ok::<_, anyhow::Error>((hash, identity, aich))
+            Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich, digests.part_hashes))
         })
         .await
         {
-            Ok(Ok((actual_hash, identity, actual_aich))) if actual_hash == expected_hash => {
+            Ok(Ok((actual_hash, identity, actual_aich, part_hashes)))
+                if actual_hash == expected_hash =>
+            {
                 info!(
                     "Download complete and verified from disk: {}",
                     self.file_name
                 );
-                Some((identity, actual_aich))
+                Some((identity, actual_aich, part_hashes))
             }
-            Ok(Ok((actual_hash, _, _))) => {
+            Ok(Ok((actual_hash, _, _, _))) => {
                 warn!(
                     "Download hash mismatch for {}: expected={}, got={}",
                     self.file_name, expected_hash, actual_hash
@@ -6110,7 +6133,7 @@ impl Ed2kDownload {
         };
         drop(cancel_watch);
 
-        let Some((verified_identity, actual_aich)) = verified_result else {
+        let Some((verified_identity, actual_aich, verified_part_hashes)) = verified_result else {
             if ember_pin_failed {
                 anyhow::bail!(EMBER_BLAKE3_MISMATCH_MSG);
             }
@@ -6195,6 +6218,12 @@ impl Ed2kDownload {
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
             *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
         }
+        // The verification above computed these as a by-product of the pass it
+        // had to make anyway. Without handing them over, the completion handler
+        // read the whole file a second time to recompute exactly these values
+        // for known.met — every time, because this path never obtains a
+        // peer-supplied hashset.
+        *part_hashes_out = verified_part_hashes;
         tracker.delete_met(&[self.download_dir.to_string_lossy().into_owned()]);
 
         Ok(())

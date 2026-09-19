@@ -62,6 +62,17 @@ export async function pickDownloadFolder(): Promise<string | null> {
   return invoke<string | null>('pick_download_folder');
 }
 
+/** Open the native picker for the external Preview player, returning the
+ *  chosen path or `null` if the user cancelled.
+ *
+ *  Same provenance rule as `pickDownloadFolder`, and it matters more here:
+ *  this names a program Ember will execute, so `update_settings` refuses a
+ *  *changed* `preview_player` that did not come from this dialog. Clearing it
+ *  back to empty needs no picker. */
+export async function pickPreviewPlayer(): Promise<string | null> {
+  return invoke<string | null>('pick_preview_player');
+}
+
 export async function downloadNodesDat(): Promise<NodesDatDownloadResult> {
   return invoke('download_nodes_dat');
 }

@@ -7,6 +7,8 @@ import type {
   StartDownloadResponse,
   UploadQueueClient,
   KnownClient,
+  KnownClientCounts,
+  DownloadFileDetails,
 } from '$lib/types';
 
 /** Normalize a trusted AICH pin while rejecting malformed non-empty values. */
@@ -117,6 +119,22 @@ export async function getUploadQueue(): Promise<UploadQueueClient[]> {
   return withTimeout(invoke<UploadQueueClient[]>('get_upload_queue'), 'get_upload_queue', 8_000);
 }
 
+/** Chunk map and part counters for one download, for the File Details window.
+ *  Read when the window opens and while it stays open, never on the transfers
+ *  poll — a per-part bitmap on every tick would be paid for by every user who
+ *  never opens it. */
+export async function getDownloadFileDetails(
+  transferId: string,
+): Promise<DownloadFileDetails> {
+  // Bounded for the same reason the queue snapshot is: the window refreshes on
+  // a timer, so a wedged backend must not latch the caller's in-flight guard.
+  return withTimeout(
+    invoke<DownloadFileDetails>('get_download_file_details', { transferId }),
+    'get_download_file_details',
+    8_000,
+  );
+}
+
 /** Snapshot of every persistent SecIdent credit record (transfers bottom
  *  pane, Known ED2K Peers / Known Ember Peers tabs). Lifetime view
  *  independent of which peers are connected right now. */
@@ -124,6 +142,20 @@ export async function getKnownClients(): Promise<KnownClient[]> {
   // Also polled (8 s). Reads the persistent credit store, so allow more room
   // than the queue snapshot above.
   return withTimeout(invoke<KnownClient[]>('get_known_clients'), 'get_known_clients', 15_000);
+}
+
+/** Just the two row counts the tab labels carry.
+ *
+ *  Polled on whichever bottom tab is showing, so that the counts keep moving
+ *  without the user visiting the tab. `getKnownClients` cannot be used for
+ *  that: it joins a database read and resolves an ident state, credit ratio
+ *  and country per record, none of which the labels need. */
+export async function getKnownClientCounts(): Promise<KnownClientCounts> {
+  return withTimeout(
+    invoke<KnownClientCounts>('get_known_client_counts'),
+    'get_known_client_counts',
+    8_000,
+  );
 }
 
 export async function clearCompleted(): Promise<number> {

@@ -201,6 +201,31 @@
   /** The same guard for the roster, which is re-fetched from several places at
    *  once: selection, presence gossip, moderation changes, and handoff. */
   let membersGen = 0;
+  /** Focus is a *write*, so the roster's generation guard does not transfer:
+   *  discarding a superseded reply is no help when the backend has already
+   *  acted on it. Switching rooms A→B quickly left two `set_channel_focus`
+   *  calls racing, and if A's landed last the backend walked A's presence at
+   *  the watched rate while the UI showed B. One call in flight at a time,
+   *  with only the newest selection held as pending, makes the last selection
+   *  the last write. `undefined` means "nothing queued" — distinct from the
+   *  `null` that means "no room open". */
+  let focusInFlight = false;
+  let focusPending: string | null | undefined = undefined;
+
+  async function pushChannelFocus(id: string | null) {
+    focusPending = id;
+    if (focusInFlight) return;
+    focusInFlight = true;
+    try {
+      while (focusPending !== undefined) {
+        const next = focusPending;
+        focusPending = undefined;
+        await setChannelFocus(next).catch(() => {});
+      }
+    } finally {
+      focusInFlight = false;
+    }
+  }
   /** This visit followed a previous one on the same session, so whatever the
    *  user had open — including the directory — is the selection to keep. */
   let returningToChannels = false;
@@ -688,7 +713,7 @@
       document.removeEventListener('keydown', onPageKeydown);
       // Leaving the page is not leaving the room, but it does mean nobody is
       // reading this roster, so it goes back to the resting walk rate.
-      void setChannelFocus(null).catch(() => {});
+      void pushChannelFocus(null);
       stashActiveChannelOnLeave();
     };
   });
@@ -701,10 +726,13 @@
    *  also set and cleared by leaving a room, deleting one, following a deep
    *  link, and being restored on the way back to this page — each of which
    *  would otherwise have to remember, and one of them already had forgotten.
-   *  Repeats of the room the backend already holds are ignored there. */
+   *  Repeats of the room the backend already holds are ignored there.
+   *
+   *  Pushed through `pushChannelFocus` so two selections cannot be in flight
+   *  at once — the backend ignoring a repeat of the room it already holds says
+   *  nothing about the order two *different* rooms arrive in. */
   $effect(() => {
-    const id = selectedId;
-    void setChannelFocus(id).catch(() => {});
+    void pushChannelFocus(selectedId);
   });
 
   $effect(() => {

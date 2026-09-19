@@ -45,7 +45,7 @@ use self::ed2k::sources::SourceManager;
 use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::kad::bootstrap;
-use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, BuddyWriteStream, PendingBuddySet};
+use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, PendingBuddySet};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::legacy_challenge::LegacyChallengeTracker;
@@ -847,14 +847,68 @@ fn apply_tcp_mapping_keepalive(
     confirmed
 }
 
-/// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
-/// then falling back to plain text (for LowID).
+/// One recorded line of eD2K server activity.
 ///
-/// Many servers use the same port for both plain and obfuscated connections (the server
-/// detects the mode from the first byte). If no dedicated obfuscation port is known,
-/// we try DH on the regular port first.
+/// `seq` is assigned here rather than in the frontend so a replayed line and
+/// the live event announcing it can be recognised as the same line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerLogLine {
+    pub seq: u64,
+    /// Epoch milliseconds at the moment the line was recorded. Carried through
+    /// so replayed lines keep the time they happened rather than the time they
+    /// were read back.
+    pub at: i64,
+    pub message: String,
+}
+
+/// Lines kept for replay. Matches `MAX_ENTRIES` in `stores/serverLog.ts`;
+/// there is no point holding more here than the view will show.
+const SERVER_LOG_HISTORY: usize = 200;
+
+/// Replay buffer behind [`get_server_log`](crate::commands::server::get_server_log).
+///
+/// `emit_server_log` used to only emit. That was survivable while the sole
+/// consumer was a frontend store that outlived tab switches, but the store
+/// does not outlive a reload of the webview — and the uploads pane was
+/// offering the webview's own Reload as its context menu — so the log came
+/// back empty with the connection still up and no way to get the history
+/// back. Keeping the last lines here means the frontend can ask.
+///
+/// Process-global because `emit_server_log` is called from all over the
+/// network task with nothing but an `AppHandle` to hand.
+static SERVER_LOG: std::sync::LazyLock<parking_lot::Mutex<VecDeque<ServerLogLine>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
+
+/// Record a line in the replay buffer and return it, ready to emit.
+fn record_server_log(message: &str) -> ServerLogLine {
+    static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let line = ServerLogLine {
+        seq: NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        at: chrono::Utc::now().timestamp_millis(),
+        message: message.to_string(),
+    };
+    let mut log = SERVER_LOG.lock();
+    if log.len() >= SERVER_LOG_HISTORY {
+        log.pop_front();
+    }
+    log.push_back(line.clone());
+    line
+}
+
 fn emit_server_log(app: &tauri::AppHandle, message: &str) {
-    let _ = app.emit("server-log", serde_json::json!({ "message": message }));
+    let _ = app.emit("server-log", record_server_log(message));
+}
+
+/// The retained log, oldest first.
+pub fn server_log_history() -> Vec<ServerLogLine> {
+    SERVER_LOG.lock().iter().cloned().collect()
+}
+
+/// Discard the retained log. `seq` deliberately keeps counting, so a line
+/// recorded after a clear can still never collide with one the frontend is
+/// already holding.
+pub fn clear_server_log_history() {
+    SERVER_LOG.lock().clear();
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
@@ -2350,7 +2404,15 @@ async fn handle_epx_sources(
             // reseed from SM (PFS-only peers were previously lost).
             if stats.injected > 0 || stats.persisted > 0 {
                 let mut sm = source_manager.write().await;
-                sm.register_source_full(*file_hash, ip, port, udp_port, [0u8; 16]);
+                sm.register_source_full(
+                    *file_hash,
+                    ip,
+                    port,
+                    udp_port,
+                    [0u8; 16],
+                    // Ember Peer Exchange: another peer passed it on.
+                    Some(crate::types::SourceOrigin::Exchange),
+                );
             }
             // Only count sources that were actually new injections
             // against the per-event ceiling. The earlier behaviour
@@ -2544,11 +2606,38 @@ const MAX_UDP_SEARCH_QUEUE: usize = 500;
 /// before the hard deadline steps in.
 const UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS: i64 = 90;
 
-/// eMule `MAX_RESULTS` — cancel the ed2k (TCP More / UDP global) sweep once
-/// the **summed** availability of accepted ed2k hits exceeds this. Counts are
-/// per-result FT_SOURCES, spam-capped at 5 (eMule `AddResultCount`).
-const MAX_ED2K_SEARCH_RESULTS: u32 = 100;
+/// Backstop on the UDP global sweep: stop querying further servers once the
+/// replies *from that sweep* have summed to this many sources. Counts are
+/// per-result FT_SOURCES, spam-capped at 5 (eMule `AddResultCount`), so this is
+/// roughly 200–1000 distinct files depending on how well-sourced they are.
+///
+/// Two things about this number are deliberate, because getting either wrong is
+/// what made a "Global" search stop being global.
+///
+/// It is a *backstop*, not the thing that normally ends the sweep. The sweep's
+/// real limits are the 750 ms send throttle, the post-drain grace period and
+/// `udp_search_deadline`; this only exists so a query that is pulling in
+/// thousands of sources does not keep working through a 500-entry server list
+/// for results nobody will scroll to. At 100 — where it used to sit — it was
+/// the *first* limit to fire rather than the last, and it ended the sweep after
+/// twenty-odd files.
+///
+/// And it counts only what the UDP leg itself brought back. It used to be one
+/// counter shared with the TCP leg, which is the same bug in a more damaging
+/// form: the connected server answers in a single ~200-row batch on a 2 s
+/// timer, while UDP leaves at one packet per 750 ms — so the first TCP reply
+/// spent the whole budget before three of the other servers had been asked, and
+/// `stop_ed2k_udp_search_if_capped` then cleared the rest of the queue. A global
+/// search reached two or three of a hundred servers. What the connected server
+/// indexes says nothing about what the others do; that is the entire reason the
+/// global leg exists.
+const MAX_UDP_SEARCH_SOURCES: u32 = 1_000;
 const ED2K_SEARCH_SOURCE_CAP: u32 = 5;
+
+/// `OP_QUERY_MORE_RESULT` pages we will ask the connected server for, on top of
+/// the first batch. Paired with the 1000-result ceiling in the same gate: a
+/// server answering 200 at a time is exhausted in five pages either way.
+const MAX_SERVER_MORE_REQUESTS: u8 = 5;
 
 /// Whether the UDP global-search leg should be force-completed this tick.
 /// True once the post-drain quiet-period grace expires (`server_udp_search_age`
@@ -2893,8 +2982,9 @@ mod search_legs_tests {
     }
 }
 
-/// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
-/// (eMule spam-caps each result at 5).
+/// Contribute one ed2k result's sources toward the running ed2k totals — the
+/// diagnostic `ed2k_found_sources` and, for a UDP reply, the sweep's own
+/// [`MAX_UDP_SEARCH_SOURCES`] backstop (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
     availability.clamp(1, ED2K_SEARCH_SOURCE_CAP)
 }
@@ -2938,18 +3028,24 @@ fn note_ed2k_search_results(
     skip_hashes: &HashSet<String>,
 ) -> bool {
     for r in results {
+        let from_udp = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
+            && r.result_origin
+                .split('·')
+                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
         if r.file.hash.is_empty() {
-            active.ed2k_found_sources = active
-                .ed2k_found_sources
-                .saturating_add(ed2k_result_source_contribution(r.availability));
+            let contribution = ed2k_result_source_contribution(r.availability);
+            active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(contribution);
+            if from_udp {
+                active.udp_found_sources = active.udp_found_sources.saturating_add(contribution);
+            }
             continue;
         }
         let skip_count = skip_hashes.contains(&r.file.hash);
         let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
-        let sum_incoming = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
-            && r.result_origin
-                .split('·')
-                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
+        // A UDP reply is a different server than the last one that reported this
+        // file, so its sources add; a TCP "More" re-list is the same server
+        // repeating itself, so its figure replaces.
+        let sum_incoming = from_udp;
         let (new_avail, old_contrib) = match prev {
             Some(p) => {
                 let merged = crate::search::merge::clamp_source_count(if sum_incoming {
@@ -2966,15 +3062,33 @@ fn note_ed2k_search_results(
         };
         let new_contrib = ed2k_result_source_contribution(new_avail);
         if !skip_count && new_contrib > old_contrib {
-            active.ed2k_found_sources = active
-                .ed2k_found_sources
-                .saturating_add(new_contrib - old_contrib);
+            let delta = new_contrib - old_contrib;
+            active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(delta);
+            // Only a UDP reply advances the sweep's own backstop.
+            if from_udp {
+                active.udp_found_sources = active.udp_found_sources.saturating_add(delta);
+            }
         }
         active
             .ed2k_noted_availability
             .insert(r.file.hash.clone(), new_avail);
+
+        // Complete sources ride along on the same rule, and deliberately do not
+        // feed `ed2k_found_sources`: the result cap counts sources, and a
+        // complete source has already been counted as one.
+        let new_complete = match active.ed2k_noted_complete_sources.get(&r.file.hash) {
+            Some(&p) => crate::search::merge::clamp_source_count(if sum_incoming {
+                p.saturating_add(r.file.complete_sources)
+            } else {
+                p.max(r.file.complete_sources)
+            }),
+            None => crate::search::merge::clamp_source_count(r.file.complete_sources),
+        };
+        active
+            .ed2k_noted_complete_sources
+            .insert(r.file.hash.clone(), new_complete);
     }
-    active.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
+    active.udp_found_sources > MAX_UDP_SEARCH_SOURCES
 }
 
 /// Mark hashes as streamed only after a row was actually accepted/emitted
@@ -3094,6 +3208,9 @@ fn note_ed2k_resight_availability(
             if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
                 r.availability = total;
             }
+            if let Some(&total) = active.ed2k_noted_complete_sources.get(&r.file.hash) {
+                r.file.complete_sources = total;
+            }
         }
     }
 }
@@ -3126,17 +3243,16 @@ fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::
     if !active.udp_pending {
         return;
     }
-    if active.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS {
+    if active.udp_found_sources <= MAX_UDP_SEARCH_SOURCES {
         return;
     }
     let request_id = active.request_id;
     active.udp_pending = false;
     state.server_udp_search_age = 0;
     state.udp_search_queue.clear();
-    state.server_search_more_needed = false;
     debug!(
-        "Stopping ed2k UDP search: summed sources {} > MAX_RESULTS ({})",
-        active.ed2k_found_sources, MAX_ED2K_SEARCH_RESULTS
+        "Stopping ed2k UDP global sweep: it has returned {} summed sources (backstop {})",
+        active.udp_found_sources, MAX_UDP_SEARCH_SOURCES
     );
     maybe_finish_active_search(state, app_handle, request_id);
 }
@@ -4527,6 +4643,10 @@ async fn maybe_escalate_to_friend_transfer(
                 total_parts: None,
                 country_code: None,
                 user_hash: None,
+                // Parking an existing row, not discovering a source: the merge
+                // in `update_source_detail` keeps whatever origin it has.
+                origin: None,
+                placeholder: false,
             },
         );
         transferred
@@ -5800,6 +5920,9 @@ async fn release_friend_connect_sources(
                     total_parts: None,
                     country_code: None,
                     user_hash: None,
+                    // Releasing an existing row — see the parking site.
+                    origin: None,
+                    placeholder: false,
                 },
             );
             released_bytes.push((*ip, *port, transferred));
@@ -6428,6 +6551,12 @@ fn inject_source_into_active_transfers(
     stats
 }
 
+/// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
+/// then falling back to plain text (for LowID).
+///
+/// Many servers use the same port for both plain and obfuscated connections (the server
+/// detects the mode from the first byte). If no dedicated obfuscation port is known,
+/// we try DH on the regular port first.
 async fn try_connect_server(
     ip: &str,
     port: u16,
@@ -7184,6 +7313,63 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// The server log is held here so the frontend can ask for it back. It has
+    /// to survive a reload of the webview, which wipes the store that used to
+    /// be the only copy — and the uploads pane was offering the webview's own
+    /// Reload as its context menu, so users were hitting exactly that.
+    ///
+    /// One test rather than several: the buffer is process-global, and nothing
+    /// else in the suite writes to it, so this owns it for the duration.
+    #[test]
+    fn the_server_log_replays_its_last_lines_and_forgets_them_when_cleared() {
+        clear_server_log_history();
+        assert!(server_log_history().is_empty());
+
+        let first = record_server_log("connecting");
+        let second = record_server_log("connected");
+        assert!(
+            second.seq > first.seq,
+            "sequence numbers order the replay and identify a line the \
+             frontend is already holding, so they have to keep rising"
+        );
+
+        let history = server_log_history();
+        assert_eq!(
+            history.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(),
+            ["connecting", "connected"],
+            "replayed oldest first, the order the view reads in"
+        );
+        assert_eq!(history[0].seq, first.seq);
+        assert_eq!(history[0].at, first.at);
+
+        // Past the cap the oldest go, so a long-running session cannot grow
+        // this without bound.
+        for i in 0..SERVER_LOG_HISTORY {
+            record_server_log(&format!("line {i}"));
+        }
+        let history = server_log_history();
+        assert_eq!(history.len(), SERVER_LOG_HISTORY);
+        assert_eq!(
+            history.last().map(|l| l.message.as_str()),
+            Some(format!("line {}", SERVER_LOG_HISTORY - 1).as_str()),
+        );
+        assert!(
+            !history.iter().any(|l| l.message == "connecting"),
+            "the first line should have been pushed out by now"
+        );
+
+        // Clearing the view clears this too, or the next reload would hand the
+        // cleared lines straight back.
+        clear_server_log_history();
+        assert!(server_log_history().is_empty());
+        assert!(
+            record_server_log("after clear").seq > second.seq,
+            "sequence numbers keep counting across a clear, so a line recorded \
+             after one cannot collide with a line the frontend still holds"
+        );
+        clear_server_log_history();
+    }
 
     /// Firsthand session contacts sit beside the routing table and are exempt
     /// from everything that disciplines a resident: no liveness ping reaches
@@ -8075,7 +8261,9 @@ mod tests {
             udp_search_deadline: 0,
             udp_search_sent_ips: HashSet::new(),
             ed2k_found_sources: 0,
+            udp_found_sources: 0,
             ed2k_noted_availability: HashMap::new(),
+            ed2k_noted_complete_sources: HashMap::new(),
             dht_noted_availability: HashMap::new(),
             file_type_filter: None,
             min_size: None,
@@ -8215,6 +8403,105 @@ mod tests {
         assert_eq!(resights[0].availability, 7);
     }
 
+    /// The connected server answers in one ~200-row batch on a 2 s timer; the
+    /// UDP sweep leaves at one packet per 750 ms. Sharing a single 100-source
+    /// budget between them meant that first TCP reply spent the whole thing
+    /// before three of the other servers had been asked, and the sweep's queue
+    /// was then cleared — a "Global" search that reached two or three of a
+    /// hundred servers. What the connected server indexes says nothing about
+    /// what the rest do, which is the entire reason the global leg exists.
+    #[test]
+    fn a_tcp_batch_cannot_spend_the_udp_sweeps_budget() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+
+        // A generous first batch from the connected server: far more sources
+        // than the old shared cap of 100 allowed.
+        let tcp: Vec<SearchResult> = (0..300)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                availability: 5,
+                ..sample_search_result(&format!("tcp{i}"))
+            })
+            .collect();
+        assert!(
+            !note_ed2k_search_results(&mut active, &tcp, &none),
+            "the connected server's own reply must never stop the UDP sweep"
+        );
+        assert_eq!(active.ed2k_found_sources, 1_500);
+        assert_eq!(
+            active.udp_found_sources, 0,
+            "nothing the TCP leg found belongs to the sweep's budget"
+        );
+
+        // The sweep's own replies do advance it, and it does still have a
+        // backstop.
+        let udp: Vec<SearchResult> = (0..MAX_UDP_SEARCH_SOURCES / ED2K_SEARCH_SOURCE_CAP)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+                availability: ED2K_SEARCH_SOURCE_CAP,
+                ..sample_search_result(&format!("udp{i}"))
+            })
+            .collect();
+        assert!(
+            !note_ed2k_search_results(&mut active, &udp, &none),
+            "exactly at the backstop is still under it"
+        );
+        assert_eq!(active.udp_found_sources, MAX_UDP_SEARCH_SOURCES);
+
+        let one_more = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 1,
+            ..sample_search_result("udp-last")
+        };
+        assert!(
+            note_ed2k_search_results(&mut active, &[one_more], &none),
+            "past the backstop the sweep stops"
+        );
+    }
+
+    /// The backstop has to sit above the point where a server signals it has
+    /// more to give, or the "More results" gate — which requires a full 200-row
+    /// batch *and* room under the budget — can never open. Those were the two
+    /// halves of one `if`, and `note_ed2k_search_results` charges the batch
+    /// before the gate reads the counter, so page two was never asked for.
+    #[test]
+    fn the_more_results_gate_is_reachable() {
+        // The batch size that makes a server worth asking again.
+        const FULL_BATCH: u32 = 200;
+        assert!(
+            MAX_SERVER_MORE_REQUESTS >= 1,
+            "at least one follow-up page, or the loop is decorative"
+        );
+        assert!(
+            MAX_UDP_SEARCH_SOURCES >= FULL_BATCH * ED2K_SEARCH_SOURCE_CAP,
+            "the sweep's backstop has to outlast a whole well-sourced batch, or \
+             it stops being a backstop and starts being the limit"
+        );
+
+        // The gate no longer consults a source budget at all, so its two halves
+        // can no longer contradict each other: a batch large enough to ask about
+        // leaves the sweep's counter untouched.
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let batch: Vec<SearchResult> = (0..FULL_BATCH)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                availability: ED2K_SEARCH_SOURCE_CAP,
+                ..sample_search_result(&format!("row{i}"))
+            })
+            .collect();
+        note_ed2k_search_results(&mut active, &batch, &none);
+        assert_eq!(
+            active.ed2k_found_sources,
+            FULL_BATCH * ED2K_SEARCH_SOURCE_CAP
+        );
+        assert_eq!(
+            active.udp_found_sources, 0,
+            "the server's own pages must not spend the sweep's budget"
+        );
+    }
+
     #[test]
     fn note_ed2k_search_results_udp_sums_tcp_uses_max() {
         let mut active = sample_active_search_request(1);
@@ -8294,6 +8581,57 @@ mod tests {
         }];
         note_ed2k_resight_availability(&mut active, &mut resights, &none);
         assert_eq!(resights[0].availability, 29);
+    }
+
+    /// Complete sources accumulate across servers exactly as availability does,
+    /// because eMule's `AddCompleteSources` is `AddSources` with a different
+    /// tag. This lives here rather than only in `search::merge` because a
+    /// streamed re-sight carries one server's slice: the frontend merges
+    /// batches by max, so a row emitted with anything but the absolute total
+    /// would settle on whichever single server answered with the most.
+    #[test]
+    fn a_resight_is_emitted_with_every_servers_complete_sources_summed() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let ed2k_row = |origin: &str, avail: u32, complete: u32| {
+            let mut r = SearchResult {
+                result_origin: origin.to_string(),
+                availability: avail,
+                ..sample_search_result("hash1")
+            };
+            r.file.complete_sources = complete;
+            r
+        };
+
+        note_ed2k_search_results(
+            &mut active,
+            &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 3)],
+            &none,
+        );
+        assert_eq!(
+            active.ed2k_noted_complete_sources.get("hash1"),
+            Some(&3),
+            "the first server's count stands on its own"
+        );
+
+        // A TCP "More results" re-list repeats the same server's figure, so it
+        // replaces rather than accumulates.
+        note_ed2k_search_results(
+            &mut active,
+            &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 4)],
+            &none,
+        );
+        assert_eq!(active.ed2k_noted_complete_sources.get("hash1"), Some(&4));
+
+        // A UDP reply is a different server, so it adds.
+        let mut resights = vec![ed2k_row(crate::search::merge::ORIGIN_SERVER_UDP, 4, 5)];
+        note_ed2k_resight_availability(&mut active, &mut resights, &none);
+        assert_eq!(resights[0].availability, 29);
+        assert_eq!(resights[0].file.complete_sources, 9);
+        assert!(
+            resights[0].file.complete_sources <= resights[0].availability,
+            "summing both keeps the pair readable as a ratio"
+        );
     }
 
     /// The client-side "Min sources" filter drops rows, and a re-sight is not a
@@ -11729,8 +12067,11 @@ mod tests {
         assert!(results[0].media.is_none());
     }
 
+    /// Both Kad counts are estimates of one swarm, so neither accumulates with
+    /// the number of nodes that answered. eMule branches on `m_bKademlia` in
+    /// `AddSources` and `AddCompleteSources` alike and keeps the larger value.
     #[test]
-    fn kad_complete_sources_takes_max_across_publishers() {
+    fn kad_source_counts_take_max_across_publishers() {
         use crate::network::kad::types::{TAG_COMPLETE_SOURCES, TAG_FILESIZE, TAG_SOURCES};
         let file_id = KadId([0x66; 16]);
         let entry = |complete: u32, sources: u32| SearchResultEntry {
@@ -11756,8 +12097,20 @@ mod tests {
         };
         let results = convert_search_results(&[entry(50, 10), entry(80, 10)], |_| true);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file.complete_sources, 80, "swarm estimates must not sum");
-        assert_eq!(results[0].availability, 20, "TAG_SOURCES still sums");
+        assert_eq!(
+            results[0].file.complete_sources, 80,
+            "swarm estimates must not sum"
+        );
+        assert_eq!(
+            results[0].availability, 10,
+            "two nodes describing the same ten sources are still ten sources"
+        );
+        assert!(
+            results[0].availability >= results[0].file.complete_sources
+                || !crate::search::merge::complete_sources_known(&results[0].result_origin),
+            "a Kad row may report more complete sources than sources, which is \
+             exactly why its complete count is not shown as a known figure"
+        );
     }
 
     #[test]
@@ -11930,6 +12283,15 @@ pub enum NetworkCommand {
         /// Hashes to withhold from the UI for this request: the seed files of
         /// a related search, which are not related to themselves.
         exclude_hashes: Vec<String>,
+        /// Hashes of files this library already holds that matched the query,
+        /// resolved by the caller from the local index.
+        ///
+        /// A network sighting of one of these is the user's own file coming
+        /// back from a server or a DHT, and the spam scorer exempts it: we have
+        /// the bytes, so no claim about the result set it arrived in can make it
+        /// fake. Sent with the search because the network task has no business
+        /// taking the index lock once per inbound result packet to work it out.
+        owned_hashes: Vec<String>,
     },
     StartDownload {
         file_hash: String,
@@ -12104,11 +12466,34 @@ pub enum NetworkCommand {
     GetUploadQueueSnapshot {
         tx: oneshot::Sender<Vec<crate::types::UploadQueueClient>>,
     },
+    /// Chunk map and part-level counters for one download, backing the
+    /// "File Details" window. Lives here rather than on the transfer row
+    /// because the part tracker and the sources' part bitmaps belong to the
+    /// network task, and because it is read on demand — a per-part bitmap on
+    /// every transfers poll would be paid for by every user who never opens
+    /// the window.
+    GetDownloadFileDetails {
+        transfer_id: String,
+        tx: oneshot::Sender<crate::types::DownloadFileDetails>,
+    },
     /// Snapshot of every persistent SecIdent credit record. Backs the
     /// "Known Clients" tab — this is the lifetime view from clients.met,
     /// independent of which peers are currently connected.
     GetKnownClientsSnapshot {
         tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
+    },
+    /// Just the two row counts [`GetKnownClientsSnapshot`] would produce.
+    ///
+    /// The tab labels carry those counts, so they have to keep moving while
+    /// some other tab is showing — but the full snapshot is far too expensive
+    /// to poll for two integers: it joins a `spawn_blocking` SQLite read for
+    /// friend metadata, resolves an ident state, credit ratio and GeoIP
+    /// country per record, and allocates six owned strings per row, for up to
+    /// `MAX_CREDIT_RECORDS` rows. None of that changes which tab a record
+    /// lands on, which is decided solely by whether it has a bound Ember
+    /// identity, so counting needs no allocation, no database and no GeoIP.
+    GetKnownClientCounts {
+        tx: oneshot::Sender<crate::types::KnownClientCounts>,
     },
     /// Anti-leech client filter — read the current pattern list + flag
     /// for the Settings UI.
@@ -12170,6 +12555,18 @@ pub enum NetworkCommand {
     RemoveServer {
         ip: String,
         port: u16,
+        tx: oneshot::Sender<Result<String, String>>,
+    },
+    SetServerStatic {
+        ip: String,
+        port: u16,
+        is_static: bool,
+        tx: oneshot::Sender<Result<String, String>>,
+    },
+    SetServerPriority {
+        ip: String,
+        port: u16,
+        priority: String,
         tx: oneshot::Sender<Result<String, String>>,
     },
     GetServerListSnapshot {
@@ -13167,13 +13564,29 @@ struct ActiveSearchRequest {
     /// request (eMule `SentUDPRequestNotification`). UDP search replies
     /// from any other IP are ignored as unsolicited / late.
     udp_search_sent_ips: HashSet<Ipv4Addr>,
-    /// Running sum of ed2k (TCP/UDP) result availability toward
-    /// [`MAX_ED2K_SEARCH_RESULTS`] (eMule `m_foundSourcesCount`).
+    /// Running sum of ed2k (TCP/UDP) result availability (eMule
+    /// `m_foundSourcesCount`). Diagnostic only — no leg stops on it. Kept
+    /// because it is the one number that says how much the ed2k side of a
+    /// search actually found.
     ed2k_found_sources: u32,
+    /// The part of `ed2k_found_sources` that the UDP global sweep brought in,
+    /// which is what that sweep's backstop ([`MAX_UDP_SEARCH_SOURCES`]) reads.
+    /// Held separately so the connected server's TCP reply cannot spend it.
+    udp_found_sources: u32,
     /// Per-hash summed availability already folded into `ed2k_found_sources`
     /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
     /// delta after summing, matching eMule `UpdateResultCount`).
     ed2k_noted_availability: HashMap<String, u32>,
+    /// Per-hash running total of `FT_COMPLETE_SOURCES`, accumulated by the same
+    /// rule as `ed2k_noted_availability` because eMule accumulates it by the
+    /// same rule: `AddCompleteSources` is `AddSources` with a different tag.
+    ///
+    /// Needed separately from the merge in `search::merge` because a streamed
+    /// re-sight carries one server's slice and the row has to be emitted with
+    /// the file's absolute total — the frontend merges batches by max, so
+    /// without this the Complete column kept whichever single server answered
+    /// with the most instead of the sum across them.
+    ed2k_noted_complete_sources: HashMap<String, u32>,
     /// The same running per-file total for the DHT legs; see
     /// [`DhtNotedAvailability`] for why theirs is kept apart from the ed2k one.
     dht_noted_availability: HashMap<String, DhtNotedAvailability>,
@@ -13242,15 +13655,24 @@ const MAX_KAD_AVAILABILITY: u32 = 5_000;
 /// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
 
+/// Move the request's cross-packet spam context out for one enrichment pass,
+/// leaving an empty one in its place.
+///
+/// Moved rather than cloned. `BatchSpamContext` holds up to 4096 name keys and
+/// 4096 hash keys (each with up to 1024 members) plus 1024 row snapshots, and
+/// this runs on the network task once per inbound result packet — so the clone
+/// was O(context) per packet for the life of a search. Every call site is
+/// `take` → enrich → [`store_search_batch_spam`] with nothing in between that
+/// reads the field, so the empty stand-in is never observed.
 fn take_search_batch_spam(
-    state: &NetworkState,
+    state: &mut NetworkState,
     request_id: u64,
 ) -> crate::search::spam::BatchSpamContext {
     state
         .active_search_request
-        .as_ref()
+        .as_mut()
         .filter(|a| a.request_id == request_id)
-        .map(|a| a.batch_spam.clone())
+        .map(|a| std::mem::take(&mut a.batch_spam))
         .unwrap_or_default()
 }
 
@@ -13456,7 +13878,15 @@ struct NetworkState {
     server_udp_search_age: u32,
     /// Throttled UDP global search queue: packets to send one-at-a-time at
     /// 750ms intervals (eMule UDPSEARCHSPEED = SEC2MS(3)/4).
-    udp_search_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
+    ///
+    /// Each entry carries the `request_id` it was queued for. The queue drains
+    /// over minutes at that rate, so "the search this belongs to is whatever is
+    /// active when the packet finally goes out" is only true for as long as
+    /// every teardown path remembers to clear it — and a server's reply is
+    /// admitted on the strength of its IP being in `udp_search_sent_ips`, so
+    /// getting that wrong puts answers to the previous query into the current
+    /// tab. Carrying the id makes it a property of the packet instead.
+    udp_search_queue: VecDeque<(u64, Vec<u8>, std::net::SocketAddr)>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -13863,23 +14293,9 @@ struct NetworkState {
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
     serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
-    /// Background buddy outgoing connect+handshake task
-    /// Yields `(buddy_id, ip, tcp_port, udp_port, …)`; the UDP port is the
-    /// source port of the `FindBuddyRes` and is what firewalled source records
-    /// have to advertise for callbacks.
-    pending_outgoing_buddy: Option<
-        tokio::task::JoinHandle<
-            Option<(
-                KadId,
-                std::net::Ipv4Addr,
-                u16,
-                u16,
-                mpsc::Receiver<BuddyEvent>,
-                BuddyWriteStream,
-                tokio::task::JoinHandle<()>,
-            )>,
-        >,
-    >,
+    /// Background buddy outgoing connect+handshake task.
+    pending_outgoing_buddy:
+        Option<tokio::task::JoinHandle<Option<kad::buddy::OutgoingBuddyConnection>>>,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect
     /// or after auto-connect gives up on the preferred server.
@@ -13911,6 +14327,13 @@ struct NetworkState {
     aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
     /// Shared max upload slots (updated on settings change, read by upload handler)
     upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// `AppSettings::max_connections_per_five_secs`, read by the upload
+    /// listener's accept path. Shared rather than captured by value so the
+    /// setting takes effect without a restart, like `upload_max_slots` beside
+    /// it. The connection *ceiling* needs no equivalent here: it lives in the
+    /// machine-wide budget both directions draw on
+    /// (`ed2k::multi_source::set_global_conn_limit`).
+    upload_max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     /// Shared obfuscation flag mirroring `state.obfuscation_enabled`. The
     /// upload listener captures this `Arc` at spawn time and reads it on
     /// every Hello / EmuleInfo build, so toggling obfuscation in
@@ -14578,9 +15001,19 @@ struct NetworkState {
     rendezvous_url: String,
     /// Member Ed25519 → Noise static key from presence extra (no IP).
     ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// When `channel_member_touches` was last written through to SQLite. See
+    /// [`flush_channel_member_touches`].
+    channel_member_touch_flushed_at: Option<std::time::Instant>,
+    /// Channel roster as last read from SQLite, and when. See
+    /// [`channels_lite_cached`].
+    channel_roster_cache: Option<(Arc<Vec<crate::storage::database::StoredChannel>>, std::time::Instant)>,
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// Earliest tick at which [`maybe_dial_channel_neighbors`] should read the
+    /// member roster again. `None` means "next tick". See
+    /// [`CHANNEL_NEIGHBOR_IDLE_RESCAN`].
+    channel_neighbor_scan_after: Option<std::time::Instant>,
     /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
     ///
     /// Keyed with the session id that registered the outbox so a close can be
@@ -14617,8 +15050,8 @@ struct NetworkState {
     /// gets its completion frame instead of being timed out by the sender.
     xfer_finish_in_flight: usize,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
-    /// holding the newest timestamp seen. Drained once a second by
-    /// [`flush_channel_member_touches`].
+    /// holding the newest timestamp seen. Drained by
+    /// [`flush_channel_member_touches`] on its own interval.
     channel_member_touches: HashMap<([u8; 16], [u8; 32]), i64>,
     /// Offers waiting on the user to accept or decline.
     xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
@@ -15334,8 +15767,10 @@ fn channel_member_pubkeys(
 
 /// Ceiling on [`NetworkState::channel_member_touches`] between flushes.
 ///
-/// Rooms joined times the roster cap, rounded to something a burst cannot
-/// meaningfully exceed in the one second a buffer lives for.
+/// Rooms joined times the roster cap. The buffer is keyed by
+/// `(room, member)` and keeps only the newest timestamp per key, so its size
+/// tracks how many distinct members have been heard from rather than how many
+/// datagrams arrived — which is why the flush interval does not enter into it.
 const MAX_CHANNEL_MEMBER_TOUCHES: usize = 4096;
 
 /// Queue a roster row for the next presence emit.
@@ -15370,7 +15805,7 @@ fn mark_channel_presence_dirty(
 /// roster is a separate question that public and private rooms answer
 /// differently — see [`ember::channel::chat_author_joins_gossip_roster`] — and
 /// answering it here would quietly route around it.
-/// Buffered rather than written, and flushed once per second by
+/// Buffered rather than written, and flushed on an interval by
 /// [`flush_channel_member_touches`]. This is called for *every* channel
 /// datagram that authenticates, and the write it used to do was a synchronous
 /// autocommitted `UPDATE` on the network task — one transaction, and under
@@ -15411,15 +15846,44 @@ fn note_channel_member_alive(
     *slot = (*slot).max(at);
 }
 
-/// Write the second's worth of buffered `last_seen` touches as one transaction,
-/// and queue a presence delta for each row that actually moved.
+/// Write the buffered `last_seen` touches as one transaction, and queue a
+/// presence delta for each row that actually moved.
 ///
-/// Runs immediately before [`emit_channel_presence_deltas`], so a member heard
-/// from during this tick is still reported on this tick.
+/// Runs immediately before [`emit_channel_presence_deltas`], so a member whose
+/// row moved on this flush is reported on this tick rather than the next.
+/// Presence therefore resolves at [`CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL`]
+/// granularity, not the caller's 1 Hz — which is the point, and is well inside
+/// what a "last seen" column conveys.
 fn flush_channel_member_touches(state: &mut NetworkState, db: &Database) {
     if state.channel_member_touches.is_empty() {
         return;
     }
+    // Paced, because the write commits a transaction and the database is
+    // opened `PRAGMA synchronous=FULL` — so each flush forces an fsync, on the
+    // Tokio worker running the network `select!`. At the caller's 1 Hz that is
+    // 86,400 fsyncs a day, each stalling all UDP/TCP servicing for as long as
+    // the disk takes (tens of milliseconds on a spinning or encrypted volume).
+    // `last_seen` is soft state that the member's next datagram re-establishes,
+    // and the buffer coalesces in the meantime, so batching costs only a little
+    // resolution on a presence timestamp.
+    //
+    // The pacing yields to the buffer's own ceiling. `note_channel_member_alive`
+    // refuses a *new* key once the map is full, so a window long enough to
+    // reach `MAX_CHANNEL_MEMBER_TOUCHES` distinct `(room, member)` pairs starts
+    // silently dropping members' presence instead of merely delaying it — and
+    // the cap is roughly sixteen full rosters, which a user in that many busy
+    // rooms can reach in ten seconds where they could not in one. Draining at
+    // the halfway mark keeps the cap from ever being the thing that loses a
+    // touch, while leaving the common case on the slow cadence.
+    let near_capacity = state.channel_member_touches.len() >= MAX_CHANNEL_MEMBER_TOUCHES / 2;
+    if !near_capacity
+        && state
+            .channel_member_touch_flushed_at
+            .is_some_and(|at| at.elapsed() < CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL)
+    {
+        return;
+    }
+    state.channel_member_touch_flushed_at = Some(std::time::Instant::now());
     let pending: Vec<(([u8; 16], [u8; 32]), i64)> =
         state.channel_member_touches.drain().collect();
     let rows: Vec<(String, String, i64)> = pending
@@ -15599,11 +16063,11 @@ async fn maybe_beat_channel_presence(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut beaten = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if beaten >= CHANNEL_BEACON_BEAT_PER_TICK {
             break;
         }
@@ -15629,7 +16093,7 @@ async fn maybe_beat_channel_presence(
         // has to back off like any other, or every tick re-reads its key and
         // its whole member list to reach the same conclusion a second later.
         state.channel_beacon_beat_at.insert(channel_id, now);
-        let Some(key) = channel_content_key(db, &ch) else {
+        let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
         let neighbors = ember::channel::gossip_neighbors(
@@ -15907,12 +16371,15 @@ async fn apply_channel_presence_beacons(
     }
 }
 
+/// `roster` comes from [`channels_lite_cached`] so this shares the caller's
+/// read rather than running its own `channels` scan on the event loop.
 fn collect_channel_neighbor_caps(
     db: &Database,
+    roster: &[crate::storage::database::StoredChannel],
     our_pubkey: &[u8; 32],
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
     let mut members_by_channel = Vec::new();
-    for ch in db.list_channels_lite()? {
+    for ch in roster {
         // `rendezvous_neighbor_targets` keeps the first
         // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
         // the rest, so stopping here is what that cap already means — and it
@@ -15952,11 +16419,57 @@ async fn load_rendezvous_register_targets(
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
         let friends = db.get_friend_public_keys().unwrap_or_default();
-        let neighbors = collect_channel_neighbor_caps(&db, &our_pubkey).unwrap_or_default();
+        // Already off the reactor, so this reads its own roster rather than
+        // taking a turn on the shared cache.
+        let roster = db.list_channels_lite().unwrap_or_default();
+        let neighbors =
+            collect_channel_neighbor_caps(&db, &roster, &our_pubkey).unwrap_or_default();
         (friends, neighbors)
     })
     .await
     .unwrap_or_default()
+}
+
+/// How long the channel roster is reused before it is re-read from SQLite.
+///
+/// The 1 Hz maintenance pass consults the roster from several helpers, each of
+/// which ran `list_channels_lite` itself: four full `channels` table scans a
+/// second (with `ORDER BY`), as blocking `rusqlite` calls behind one
+/// `Mutex<Connection>`, executed directly on the Tokio worker running the
+/// network `select!`. Each contends with every `spawn_blocking` DB writer —
+/// `wal_checkpoint(TRUNCATE)` and `VACUUM` included — and stalls all
+/// networking for as long as it waits. Worse, the per-room due-time gates that
+/// decide whether any work actually happens are evaluated *after* the query,
+/// so the cost was paid whether or not anything was due.
+///
+/// Deliberately shorter than every per-room gate this roster feeds (the
+/// shortest, the presence beat, is tens of seconds), so nothing observable is
+/// scheduled later than it would have been. That is also why there is no
+/// explicit invalidation: five seconds is already well inside the resolution
+/// any of these decisions have.
+const CHANNEL_ROSTER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortest gap between two durable writes of channel member `last_seen`.
+/// See [`flush_channel_member_touches`].
+const CHANNEL_MEMBER_TOUCH_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// The channel roster, re-read from SQLite at most once per
+/// [`CHANNEL_ROSTER_TTL`]. Returned behind an `Arc` so callers can hold it
+/// while mutating `state`, and so sharing it between helpers on one tick costs
+/// nothing.
+fn channels_lite_cached(
+    state: &mut NetworkState,
+    db: &Database,
+) -> Option<Arc<Vec<crate::storage::database::StoredChannel>>> {
+    if let Some((roster, read_at)) = &state.channel_roster_cache {
+        if read_at.elapsed() < CHANNEL_ROSTER_TTL {
+            return Some(roster.clone());
+        }
+    }
+    let roster = Arc::new(db.list_channels_lite().ok()?);
+    state.channel_roster_cache = Some((roster.clone(), std::time::Instant::now()));
+    Some(roster)
 }
 
 const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
@@ -16067,11 +16580,11 @@ async fn maybe_refresh_channel_members(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16106,7 +16619,7 @@ async fn maybe_refresh_channel_members(
         if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh, focused)) {
             continue;
         }
-        if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
+        if start_channel_presence_fetch(socket, state, db, ch, channel_id, now).await {
             started += 1;
         }
     }
@@ -16127,11 +16640,11 @@ async fn maybe_refresh_channel_moderation(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16250,11 +16763,11 @@ async fn maybe_publish_owned_channel_records(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if ch.deleted {
             continue;
         }
@@ -16297,14 +16810,16 @@ async fn maybe_publish_owned_channel_records(
         // pass is what hands it to each of them — the three have to travel
         // together, exactly as `rotate_and_commit` keeps them together for the
         // owner's own bans.
-        let mut ch = ch;
+        // Borrowed from the shared roster until a rotation forces a re-read,
+        // so the common path does not copy the row.
+        let mut ch = std::borrow::Cow::Borrowed(ch);
         let rotated = if private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false) {
             let minted = rotate_owned_channel_key(db, &ch.channel_id, ch.key_epoch);
             if minted.is_some() {
                 // Re-read: the snapshot's tail and the re-seal both take the
                 // epoch from this row.
                 if let Ok(Some(fresh)) = db.get_channel(&ch.channel_id) {
-                    ch = fresh;
+                    ch = std::borrow::Cow::Owned(fresh);
                 }
             }
             minted
@@ -16616,12 +17131,12 @@ async fn maybe_refresh_channel_key_epoch(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let our_pk = identity.ed25519_public_key;
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -16763,11 +17278,11 @@ async fn maybe_refresh_channel_handoff(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let mut started = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -17195,6 +17710,14 @@ fn flush_channel_presence_if_idle(state: &mut NetworkState, channel_id: [u8; 16]
     }
 }
 
+/// How long [`maybe_dial_channel_neighbors`] waits before re-reading the
+/// channel member roster after a pass that started no lookups.
+///
+/// Well under `CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS` (30s), so backing off cannot
+/// delay a retry that is actually due; it only stops the 1 Hz maintenance tick
+/// from re-running the same SQLite reads to reach the same conclusion.
+const CHANNEL_NEIGHBOR_IDLE_RESCAN: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn maybe_dial_channel_neighbors(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -17211,10 +17734,29 @@ async fn maybe_dial_channel_neighbors(
     if settings.rendezvous_url.is_empty() {
         return;
     }
-    let Ok(neighbors) = collect_channel_neighbor_caps(db, &our_pubkey) else {
+    // The per-peer gates that decide whether any lookup actually happens are
+    // evaluated *after* the roster read below, so a pass that starts nothing
+    // still paid for up to `CHANNEL_RENDEZVOUS_MAX_CHANNELS`
+    // `list_channel_members` queries — blocking `rusqlite` behind one
+    // `Mutex<Connection>`, run directly on the Tokio worker driving the network
+    // `select!`, contending with every `spawn_blocking` writer including
+    // `wal_checkpoint(TRUNCATE)` and `VACUUM`. Driven at 1 Hz against a 30s
+    // per-peer retry, ~29 of every 30 passes were exactly that. Back off after
+    // an idle pass; `CHANNEL_NEIGHBOR_IDLE_RESCAN` is far below the retry
+    // interval, so a newly joined member is still picked up promptly.
+    let now = std::time::Instant::now();
+    if state
+        .channel_neighbor_scan_after
+        .is_some_and(|resume_at| now < resume_at)
+    {
+        return;
+    }
+    let Some(roster) = channels_lite_cached(state, db) else {
         return;
     };
-    let now = std::time::Instant::now();
+    let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey) else {
+        return;
+    };
     let mut started = 0usize;
     let mut find_nodes = 0usize;
     let mut pending_find = Vec::new();
@@ -17260,6 +17802,14 @@ async fn maybe_dial_channel_neighbors(
             }
         }
     }
+    // A pass that dialled someone keeps scanning every tick so the rest of the
+    // candidate set is picked up without waiting; one that found nothing to do
+    // would find nothing to do next second either.
+    state.channel_neighbor_scan_after = if started > 0 {
+        None
+    } else {
+        Some(now + CHANNEL_NEIGHBOR_IDLE_RESCAN)
+    };
     for search_id in pending_find {
         drive_ember_search(socket, state, search_id).await;
     }
@@ -20138,14 +20688,14 @@ async fn maybe_sync_channel_history(
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
     }
-    let Ok(channels) = db.list_channels_lite() else {
+    let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
     let now = std::time::Instant::now();
     let interval = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_SYNC_SECS);
     let our_pk = state.local_ed25519_pubkey;
     let mut sent = 0usize;
-    for ch in channels {
+    for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
         }
@@ -20192,7 +20742,7 @@ async fn maybe_sync_channel_history(
         if due.is_empty() {
             continue;
         }
-        let Some(key) = channel_content_key(db, &ch) else {
+        let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
         let wall = chrono::Utc::now().timestamp();
@@ -22688,6 +23238,40 @@ fn sync_shared_friends_only_hashes(
     }
 }
 
+/// Cheap change-detector for everything [`apply_publish_badges`] reads.
+///
+/// XOR-folding each set is order-independent, so the result does not depend on
+/// `HashSet` iteration order, and mixing the length in makes a same-tick swap
+/// (one hash published, another dropped) visible where comparing lengths alone
+/// would miss it. Costs one XOR per published hash, which buys skipping a deep
+/// clone of the entire shared-file list on every tick that changed nothing.
+fn publish_badge_fingerprint(
+    kad_connected: bool,
+    server_connected: bool,
+    ember_live: bool,
+    kad_published: &HashSet<[u8; 16]>,
+    ed2k_offered: &HashSet<[u8; 16]>,
+    ember_published: &HashSet<[u8; 16]>,
+) -> u64 {
+    fn fold(set: &HashSet<[u8; 16]>) -> u64 {
+        let mut acc = set.len() as u64;
+        for hash in set {
+            // Two independently rotated lanes so two hashes cannot swap which
+            // half each contributes and cancel out.
+            let lo = u64::from_le_bytes(hash[0..8].try_into().unwrap_or_default());
+            let hi = u64::from_le_bytes(hash[8..16].try_into().unwrap_or_default());
+            acc ^= lo.rotate_left(17) ^ hi.rotate_left(43);
+        }
+        acc
+    }
+    let flags =
+        (kad_connected as u64) | ((server_connected as u64) << 1) | ((ember_live as u64) << 2);
+    flags
+        ^ fold(kad_published).rotate_left(3)
+        ^ fold(ed2k_offered).rotate_left(23)
+        ^ fold(ember_published).rotate_left(47)
+}
+
 /// Set the Library KAD / eD2K / Ember badges from real publish/offer state,
 /// not mere connectivity.
 /// `ember_live` must be a real liveness test (verified contacts > 0), not
@@ -22923,10 +23507,17 @@ fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
 /// trusts them.
 ///
 /// Acquires only a read lock on `spam_filter`, so it's safe to call
-/// Enrich, type/size/ext/avail-filter, and emit. Returns the rows actually
-/// emitted so ed2k callers can count toward `MAX_ED2K_SEARCH_RESULTS` only for
-/// accepted results. Hashes must be marked streamed by the caller via
-/// [`mark_streamed_hashes`] after this returns.
+/// Enrich, type/size/ext/avail-filter, and emit. Returns the rows this batch
+/// newly accepted — not everything the emit carried — so ed2k callers count
+/// only accepted results toward their running totals. Hashes must be marked
+/// streamed by the caller via [`mark_streamed_hashes`] after this returns.
+///
+/// The distinction matters because the emit also carries spam *upgrades*: rows
+/// an earlier packet already put on screen, re-sent because this packet pushed
+/// them over a batch-collision bar. They are not new sightings, and the callers
+/// treat what comes back as one — `note_dht_availability` adds a row's
+/// availability onto the leg's running total, so handing an upgrade back would
+/// count the same publishers a second time.
 #[allow(clippy::too_many_arguments)]
 async fn enrich_and_emit_search_results(
     app_handle: &tauri::AppHandle,
@@ -22963,30 +23554,37 @@ async fn enrich_and_emit_search_results(
 
     let mut upgrades = Vec::new();
     let analyzed_batch;
+    // Nothing downstream reads batch statistics with the filter off or under
+    // `relaxed`: `apply_search_enrichment_with_batch` ignores the context, and
+    // `colliding_hashes` walks every name and hash key — up to 4096 each — and
+    // clones a `String` per hash in every colliding bucket. `absorb` is the
+    // heavier half and used to run regardless, allocating a normalized name, a
+    // normalized hash and a snapshot per result, on the network task, for every
+    // inbound packet of a search whose results nobody was going to score.
+    //
+    // The cost of skipping it: a filter switched on *during* a search starts
+    // with whatever the context has absorbed since, not the whole search. The
+    // settings change already triggers `rescoreOpenTabs`, which re-scores
+    // without batch context at all, so this changes nothing a user sees.
+    let batch_stats_wanted =
+        spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed;
     let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
         if let Some(acc) = accumulated_batch {
-            // Only when something will read it. `colliding_hashes` walks every
-            // name and hash key in the batch — up to 4096 each — and clones a
-            // `String` per hash in every colliding bucket, and this runs on the
-            // network task for every inbound result packet. With the spam
-            // filter off or Relaxed the result was discarded, so a broad search
-            // paid that whole allocation on each of hundreds of packets for
-            // nothing.
-            let prev_colliding = (spam_enabled
-                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed)
-                .then(|| acc.colliding_hashes());
-            acc.absorb(&results);
-            if let Some(prev_colliding) = prev_colliding {
+            if batch_stats_wanted {
+                let prev_colliding = acc.colliding_hashes();
+                acc.absorb(&results);
                 let skip: std::collections::HashSet<String> = results
                     .iter()
                     .map(|r| r.file.hash.trim().to_ascii_lowercase())
                     .collect();
                 upgrades = acc.upgrade_rows(&prev_colliding, &skip);
             }
+            // Handed over even when the statistics are off, because this context
+            // also carries the owned-file exemption. With nothing absorbed it
+            // reports `enabled = false`, so not one of the collision signals can
+            // fire off the back of it.
             Some(&*acc)
-        } else if spam_enabled
-            && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
-        {
+        } else if batch_stats_wanted {
             analyzed_batch = crate::search::spam::BatchSpamContext::analyze(&results);
             Some(&analyzed_batch)
         } else {
@@ -23040,7 +23638,6 @@ async fn enrich_and_emit_search_results(
                 batch_for_score,
             );
             upgrades.retain(|r| r.is_spam);
-            results.append(&mut upgrades);
         }
     }
 
@@ -23070,7 +23667,18 @@ async fn enrich_and_emit_search_results(
             min_availability,
         )
     });
+    // Upgrades ride along in the emit but are deliberately not filtered: each
+    // one is a re-send of a row this search already showed, so it has passed
+    // these constraints once. Judging it again on the fields the rebuilt row
+    // carries is the wrong question, and asking it is how every upgrade in a
+    // search narrowed by type, extension or Min sources used to be discarded.
+    //
+    // Appended for the emit and then split off again, so the caller gets only
+    // this packet's own rows (see the note on the return value above).
+    let accepted = results.len();
+    results.append(&mut upgrades);
     emit_search_results_event(app_handle, request_id, &results);
+    results.truncate(accepted);
     results
 }
 
@@ -23974,6 +24582,21 @@ async fn flush_credit_state(
         cm_w.cleanup_stale(90);
     }
 
+    // Skip the whole sequence when nothing has changed since the last
+    // successful flush. It is expensive — DELETE plus full re-INSERT of both
+    // credit tables, an `incremental_vacuum`, a `clients.met` copy and an
+    // fsync'd rewrite — and this ran unconditionally every 60s, rewriting
+    // byte-identical state ~1,440 times a day on a node whose peers had gone
+    // quiet. The sweep above marks dirty when it evicts, so ageing still gets
+    // persisted; the generation is captured after it for that reason.
+    let flush_generation = {
+        let cm = credit_manager.read().await;
+        if !cm.is_dirty() {
+            return;
+        }
+        cm.dirty_generation()
+    };
+
     let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
@@ -23991,6 +24614,8 @@ async fn flush_credit_state(
                     r.ident_state.to_u8(),
                     r.ember_hash,
                     r.crypto_verified_once,
+                    r.peer_name.clone(),
+                    r.client_software.clone(),
                 )
             })
             .collect();
@@ -24028,8 +24653,20 @@ async fn flush_credit_state(
         let _ownership = ownership;
         let refs: Vec<crate::storage::database::CreditRowRef<'_>> = owned
             .iter()
-            .map(|(h, u, d, l, p, ip, st, eh, cv)| {
-                (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref(), *cv)
+            .map(|(h, u, d, l, p, ip, st, eh, cv, name, software)| {
+                (
+                    h,
+                    *u,
+                    *d,
+                    *l,
+                    p.as_slice(),
+                    *ip,
+                    *st,
+                    eh.as_ref(),
+                    *cv,
+                    name.as_str(),
+                    software.as_str(),
+                )
             })
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
@@ -24045,6 +24682,7 @@ async fn flush_credit_state(
         // clients.met cache after that transaction succeeds.
         let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
         db_ref.incremental_vacuum();
+        let mut cache_written = false;
         if result.is_ok() {
             let clients_met = data_dir.join("clients.met");
             let clients_bak = data_dir.join("clients.met.bak");
@@ -24053,19 +24691,33 @@ async fn flush_credit_state(
                     debug!("Failed to create clients.met backup: {e}");
                 }
             }
-            if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
-                debug!("Failed to finalize clients.met: {e}");
+            match crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
+                Ok(()) => cache_written = true,
+                Err(e) => debug!("Failed to finalize clients.met: {e}"),
             }
         }
-        result
+        (result, cache_written)
     })
     .await;
     match &save_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Failed to save credits: {e}"),
+        Ok((Ok(()), cache_written)) => {
+            if *cache_written {
+                // Disk now matches the snapshot. A mutation that landed while
+                // the blocking write ran bumped the generation, so the flag
+                // stays set and the next tick persists it instead of dropping
+                // it.
+                credit_manager
+                    .write()
+                    .await
+                    .mark_saved_if_generation(flush_generation);
+            } else {
+                debug!("clients.met cache write failed; keeping credits dirty for the next tick");
+            }
+        }
+        Ok((Err(e), _)) => error!("Failed to save credits: {e}"),
         Err(e) => error!("Credit save task failed: {e}"),
     }
-    if !matches!(save_result, Ok(Ok(()))) {
+    if !matches!(save_result, Ok((Ok(()), _))) {
         debug!("Skipping clients.met cache write because the DB credit flush failed");
     }
 }
@@ -24262,6 +24914,7 @@ fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
         soft_files: server.soft_files,
         hard_files: server.hard_files,
         is_static: server.is_static,
+        priority: server.priority.as_str().to_string(),
         fail_count: server.fail_count,
         client_id: 0,
         is_low_id: false,
@@ -24290,6 +24943,11 @@ fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
         soft_files: limits.map(|s| s.soft_files).unwrap_or(0),
         hard_files: limits.map(|s| s.hard_files).unwrap_or(0),
         is_static: limits.is_some_and(|s| s.is_static),
+        priority: limits
+            .map(|s| s.priority)
+            .unwrap_or(crate::network::ed2k::server_list::ServerPriority::Normal)
+            .as_str()
+            .to_string(),
         fail_count: 0,
         client_id: state.server_client_id,
         is_low_id: state.low_id,
@@ -24499,7 +25157,7 @@ async fn try_start_pending_download_from_known_sources(
         let mut sm = source_manager.write().await;
         for (ip, port) in &live_sources {
             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                sm.register_source(hash_bytes, v4, *port);
+                sm.register_source(hash_bytes, v4, *port, None);
             }
         }
     }
@@ -25032,6 +25690,103 @@ fn ident_state_label(state: ed2k::credits::IdentState) -> &'static str {
     }
 }
 
+/// Build the chunk map and part counters behind the "File Details" window.
+///
+/// Two sources, because no one place holds both halves: the part tracker knows
+/// what we have, and the persistent per-file source list knows what the swarm
+/// has. The live per-source bitmaps belong to the download task and are not
+/// reachable from here, so the swarm half is whatever the stored list last
+/// learned from a TCP file status or a UDP reask — fresh enough for a window
+/// the user opened deliberately, and the alternative is nothing at all.
+async fn download_file_details(
+    state: &NetworkState,
+    transfer_id: &str,
+) -> crate::types::DownloadFileDetails {
+    use crate::network::ed2k::part_tracker::pack_part_bitmap;
+
+    /// Same budget the reask bitmap read uses: long enough that an uncontended
+    /// read always wins, short enough that a busy tracker answers the window
+    /// with "not available" instead of stalling the network task.
+    const TRACKER_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut details = crate::types::DownloadFileDetails {
+        part_count: 0,
+        local_part_status: String::new(),
+        swarm_part_status: String::new(),
+        verified_parts: 0,
+        in_progress_parts: 0,
+        rarest_part_sources: 0,
+        sources_with_bitmaps: 0,
+        completed_bytes: 0,
+        verified_bytes: 0,
+        remaining_bytes: 0,
+        transferred: 0,
+        tracked: false,
+    };
+
+    let tracker = state.tracker_registry.lock().get(transfer_id).cloned();
+    let Some(tracker) = tracker else {
+        return details;
+    };
+    let Ok(guard) = tokio::time::timeout(TRACKER_READ_BUDGET, tracker.read()).await else {
+        debug!("Tracker busy for {transfer_id}; File Details has nothing to draw this time");
+        return details;
+    };
+
+    let part_count = guard.part_count;
+    let file_size = guard.file_size;
+    details.tracked = true;
+    details.part_count = part_count as u32;
+    details.local_part_status = pack_part_bitmap(&guard.completed_parts());
+    details.verified_parts = guard.verified_parts().iter().filter(|&&v| v).count() as u32;
+    details.in_progress_parts = guard.in_progress_part_count() as u32;
+    details.completed_bytes = guard.completed_bytes();
+    details.verified_bytes = guard.verified_bytes();
+    details.remaining_bytes = guard.remaining_gap_bytes();
+    details.transferred = guard.transferred();
+    drop(guard);
+
+    if part_count == 0 {
+        return details;
+    }
+
+    // Per-part source counts, built the way `ChunkSelector::update_frequencies`
+    // builds its own: one pass per source that has sent a bitmap, ignoring the
+    // ones that have not. The table stays here and only its minimum travels.
+    let mut frequency = vec![0u16; part_count];
+    let mut swarm = vec![false; part_count];
+    // Peers advertise the eD2K *wire* part count, `floor(size / PARTSIZE) + 1`,
+    // which is one more than the tracker's `ceil(size / PARTSIZE)` exactly when
+    // the size is a whole multiple of `PARTSIZE`. Requiring strict equality
+    // therefore rejected every bitmap for such a file, and the window claimed
+    // nobody in the swarm held any part at all.
+    let wire_part_count = ed2k::messages::ed2k_wire_part_count(file_size);
+    if let Some(list) = state.per_file_sources.get(transfer_id) {
+        for source in &list.sources {
+            let len = source.available_parts.len();
+            if len != part_count && len != wire_part_count {
+                // A bitmap for a different part count describes a different
+                // file, or a source that has not answered yet. Either way it
+                // cannot be folded in.
+                continue;
+            }
+            details.sources_with_bitmaps = details.sources_with_bitmaps.saturating_add(1);
+            for (i, &has) in source.available_parts.iter().enumerate() {
+                // Bound as `ChunkSelector::update_frequencies` does, so the
+                // wire count's trailing pseudo-part is ignored rather than
+                // overflowing the table.
+                if has && i < part_count {
+                    frequency[i] = frequency[i].saturating_add(1);
+                    swarm[i] = true;
+                }
+            }
+        }
+    }
+    details.swarm_part_status = pack_part_bitmap(&swarm);
+    details.rarest_part_sources = frequency.iter().copied().min().unwrap_or(0);
+    details
+}
+
 /// Build the on-demand snapshot for the upload-pane "Queued" tab.
 /// Walks the upload queue once with a single read lock on each shared
 /// resource (`upload_queue`, `credit_manager`, `local_index`,
@@ -25057,7 +25812,16 @@ async fn upload_queue_snapshot(
     // could otherwise deadlock against `start_uploading_to_peer`).
     let queue_snapshot: Vec<ed2k::upload::QueueEntry> = {
         let mut q = queue.lock().await;
-        q.retain(|e| e.join_time.elapsed().as_secs() < ed2k::upload::MAX_PURGEQUEUETIME_SECS);
+        // `last_request`, not `join_time`. eMule's waiting-list purge keys on
+        // `GetLastUpRequest` (`UploadQueue.cpp:119`) and `QueueEntry` splits
+        // the two fields precisely so seniority can accrue on one clock while
+        // the purge runs on the other. Keying this site on `join_time` evicted
+        // every waiter an hour after it arrived however faithfully it had been
+        // re-asking — and because this runs from `get_upload_queue`, which the
+        // transfers page polls every 15s on any tab, it bounded the whole
+        // waiting list by arrivals-per-hour. Every other purge site already
+        // uses `last_request`; this one was missed.
+        q.retain(|e| e.last_request.elapsed().as_secs() < ed2k::upload::MAX_PURGEQUEUETIME_SECS);
         q.clone()
     };
     if queue_snapshot.is_empty() {
@@ -25090,37 +25854,70 @@ async fn upload_queue_snapshot(
             score,
             entry.join_time,
         );
-        // Treat "no current connection" as no rank — matches eMule's UI
-        // where a queued LowID waiting for callback shows '?' instead of
-        // a number until they reconnect.
-        let queue_rank: Option<u32> = if entry.current_addr.is_some() {
-            Some(rank as u32)
-        } else {
-            None
-        };
+        // Every waiting peer has a rank, so every row gets one.
+        //
+        // This used to be withheld whenever `current_addr` was `None`, on the
+        // theory that it matched eMule showing `?` for a queued LowID waiting
+        // for a callback. It does not: eMule's `?` is for *our* position in a
+        // *remote* peer's queue, which we genuinely do not know until they
+        // send `OP_QUEUERANKING`. Our own queue is the one place the number is
+        // never in doubt — `compute_queue_rank` above scores the whole queue
+        // and does not care whether a socket happens to be open.
+        //
+        // And `current_addr` is `None` for almost every row: a peer that has
+        // been told it is queued hangs up and re-asks later, which clears the
+        // binding while the entry keeps its seniority. So the Position column
+        // showed `?` and nothing else, for the entire queue. The connection
+        // state it was standing in for now travels as its own field.
+        let queue_rank = rank as u32;
 
-        let (peer_ip_str, peer_port, peer_ip_v4) = match entry.current_addr {
-            Some(addr) => {
-                let v4 = match addr.ip() {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-                };
-                (addr.ip().to_string(), addr.port(), v4)
-            }
+        // The address the credit lookups below are allowed to see: the live
+        // socket, or the identity when the identity *is* an address. Kept
+        // deliberately narrow, and specifically without the `last_ip` fallback
+        // used for display: `CreditManager` reads a zero IP as "we do not know
+        // where this peer is right now" and declines to call a verified peer a
+        // BadGuy on that basis. Handing it a stale address would re-flag every
+        // peer on a dynamic IP the moment they re-asked from a new one.
+        let credit_ip_v4 = match entry.current_addr {
+            Some(addr) => match addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            },
             None => match &entry.identity {
-                ed2k::upload::QueueIdentity::Ip(ip) => {
-                    let v4 = match ip {
-                        std::net::IpAddr::V4(v4) => Some(*v4),
-                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-                    };
-                    (ip.to_string(), 0u16, v4)
-                }
-                ed2k::upload::QueueIdentity::UserHash(_) => (String::new(), 0u16, None),
+                ed2k::upload::QueueIdentity::Ip(ip) => match ip {
+                    std::net::IpAddr::V4(v4) => Some(*v4),
+                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                },
+                ed2k::upload::QueueIdentity::UserHash(_) => None,
             },
         };
-        let peer_ip_u32 = peer_ip_v4
+        let peer_ip_u32 = credit_ip_v4
             .map(|v4| u32::from_be_bytes(v4.octets()))
             .unwrap_or(0);
+
+        // The address the row shows, and the one the flag is resolved from.
+        // `last_ip` is the fallback that matters: it outlives the socket (it is
+        // what the per-IP queue cap counts), and a queued peer is disconnected
+        // between re-asks, so `current_addr` is `None` for nearly every row.
+        // Without it a `UserHash` entry reported no address at all and the
+        // Country column came out blank for the whole queue.
+        let display_ip = entry
+            .current_addr
+            .map(|addr| addr.ip())
+            .or(match &entry.identity {
+                ed2k::upload::QueueIdentity::Ip(ip) => Some(*ip),
+                ed2k::upload::QueueIdentity::UserHash(_) => None,
+            })
+            .or(entry.last_ip);
+        let peer_ip_str = display_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        // Their advertised listen port, never the ephemeral source port of a
+        // connection they happen to hold. Nothing displays this; the UI keys
+        // its rows on it, so it has to name the peer the same way across a
+        // re-ask, and the advertised port is the one the rest of the queue
+        // identifies a peer by (`queue_row_owned_by_session`, matching eMule's
+        // `AttachToAlreadyKnown`). Reporting the source port meant a row was
+        // torn down and rebuilt every time the peer connected or hung up.
+        let peer_port = entry.tcp_port;
         let credit_ratio = cm.get_score_ratio(&entry.user_hash, peer_ip_u32);
         let ident_state =
             ident_state_label(cm.get_current_ident_state(&entry.user_hash, peer_ip_u32))
@@ -25136,9 +25933,9 @@ async fn upload_queue_snapshot(
             .map(|f| f.name.clone())
             .unwrap_or_else(|| String::from("(unknown file)"));
 
-        let country_code = peer_ip_v4
-            .map(std::net::IpAddr::V4)
-            .and_then(|ip| crate::geoip::lookup_country(geoip, ip));
+        // Resolved from the full address, not a v4-mapped copy of it, so a
+        // v6-only peer gets a flag too.
+        let country_code = display_ip.and_then(|ip| crate::geoip::lookup_country(geoip, ip));
 
         let user_hash_hex = if entry.user_hash == [0u8; 16] {
             String::new()
@@ -25164,6 +25961,9 @@ async fn upload_queue_snapshot(
             file_name,
             wait_seconds: wait_secs,
             queue_rank,
+            connected: entry.current_addr.is_some(),
+            peer_name: entry.peer_name.clone(),
+            client_software: entry.client_software.clone(),
             credit_ratio,
             uploaded,
             downloaded,
@@ -25187,6 +25987,71 @@ async fn upload_queue_snapshot(
 /// (reseed / Hello binding) with zero transfer bytes and `ident_ip == 0`.
 /// Their usable address and last-seen live in the friends SQLite table,
 /// so we join that metadata in here before handing rows to the UI.
+/// Most rows [`known_clients_snapshot`] will let cross IPC. Shared with
+/// [`known_client_counts`] so the tab label cannot describe a different set
+/// than the table it opens.
+const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
+
+/// Count what [`known_clients_snapshot`] would return, without building it.
+///
+/// Kept immediately beside that function because the two have to agree: a tab
+/// label that disagrees with the table it opens is worse than a stale one. The
+/// only thing that decides which tab a record lands on is whether it resolves
+/// an Ember identity — from the persisted `ember_hash`, or from a live queue
+/// row that verified one this session before the credit flush landed — so this
+/// reproduces exactly that rule and nothing else. No friends lookup, no ident
+/// state, no credit ratio, no GeoIP, and no per-row allocation.
+async fn known_client_counts(
+    credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
+) -> crate::types::KnownClientCounts {
+    let live_ember: std::collections::HashSet<[u8; 16]> = {
+        let q = upload_queue.lock().await;
+        q.iter()
+            .filter(|entry| {
+                entry.user_hash != [0u8; 16] && entry.ember_verified && entry.ember_pubkey.is_some()
+            })
+            .map(|entry| entry.user_hash)
+            .collect()
+    };
+
+    let cm = credit_manager.read().await;
+    // The snapshot sorts most-recently-seen first and trims to
+    // `MAX_KNOWN_CLIENT_ROWS`, so counting the whole ledger would make the
+    // label jump every time the user entered or left the tab once the ledger
+    // passed the cap. Reproduce the trim on the same key.
+    //
+    // The snapshot's key is `max(record.last_seen, friend last_seen)`; this
+    // uses the record's alone, because reading the friends table is exactly
+    // the cost this command exists to avoid. The two can only disagree about
+    // rows sitting on the cap boundary, and only for friends whose DB row is
+    // fresher than their credit row.
+    let mut rows: Vec<(i64, bool)> = cm
+        .all_records()
+        .iter()
+        .map(|record| {
+            (
+                record.last_seen,
+                record.ember_hash.is_some() || live_ember.contains(&record.user_hash),
+            )
+        })
+        .collect();
+    if rows.len() > MAX_KNOWN_CLIENT_ROWS {
+        rows.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
+        rows.truncate(MAX_KNOWN_CLIENT_ROWS);
+    }
+
+    let mut counts = crate::types::KnownClientCounts::default();
+    for (_, is_ember) in rows {
+        if is_ember {
+            counts.ember = counts.ember.saturating_add(1);
+        } else {
+            counts.ed2k = counts.ed2k.saturating_add(1);
+        }
+    }
+    counts
+}
+
 async fn known_clients_snapshot(
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
     friend_hashes: &crate::app_state::SharedFriendHashes,
@@ -25203,14 +26068,21 @@ async fn known_clients_snapshot(
     // Friends table is small; read off the network task so we never hold
     // the credit lock across a blocking SQLite call.
     let db_q = db.clone();
-    let friend_meta: std::collections::HashMap<String, FriendMeta> =
+    // Keyed by raw hash bytes rather than lowercase hex: the ranking pass
+    // below consults this once per credit record, and a hex key would force a
+    // `String` allocation per record purely to do the lookup. The friends
+    // table is small, so decoding once here is strictly cheaper.
+    let friend_meta: std::collections::HashMap<[u8; 16], FriendMeta> =
         match tokio::task::spawn_blocking(move || {
             let mut map = std::collections::HashMap::new();
             match db_q.get_friends_full() {
                 Ok(rows) => {
                     for (hash, nick, _added, last_ip, _port, last_seen, _mutual) in rows {
+                        let Some(key) = parse_ed2k_hash16(&hash) else {
+                            continue;
+                        };
                         map.insert(
-                            hash.to_lowercase(),
+                            key,
                             FriendMeta {
                                 nickname: nick,
                                 last_ip,
@@ -25256,9 +26128,52 @@ async fn known_clients_snapshot(
 
     let cm = credit_manager.read().await;
     let friends = friend_hashes.read().await;
-    let mut out: Vec<crate::types::KnownClient> = cm
-        .all_records()
+    let records = cm.all_records();
+
+    // Rank before enriching. Every record used to pay an ident-state lookup, a
+    // score-ratio computation, two `hex::encode`s, an IP parse, a GeoIP mmdb
+    // lookup and several more allocations — up to 50,000 times at the credit
+    // cap — and the truncate below then discarded ~90% of it. The sort key is
+    // the same one the old code sorted on, `max(record.last_seen, friend
+    // last_seen)`, but computing it now costs no allocation at all, so only
+    // the survivors are built. This also cuts how long the credit read lock is
+    // held roughly tenfold, which matters because tokio's fair `RwLock` parks
+    // the upload path's credit writers behind this snapshot.
+    let mut ranked: Vec<(i64, usize)> = records
         .iter()
+        .enumerate()
+        .map(|(idx, record)| {
+            let ember = record
+                .ember_hash
+                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let meta_last_seen = ember
+                .and_then(|eh| friend_meta.get(&eh))
+                .map(|m| m.last_seen)
+                .unwrap_or(i64::MIN);
+            (record.last_seen.max(meta_last_seen), idx)
+        })
+        .collect();
+    // Bound what crosses IPC. The credit ledger holds up to
+    // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
+    // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
+    // on a repeating timer for a table that renders a thousand rows. Trimming
+    // the *oldest* entries is the right end to lose: they are the peers a
+    // lifetime-view is least likely to be asked about.
+    if ranked.len() > MAX_KNOWN_CLIENT_ROWS {
+        debug!(
+            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
+            ranked.len()
+        );
+        ranked.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
+        ranked.truncate(MAX_KNOWN_CLIENT_ROWS);
+    }
+    // Stable, useful default order: most-recently-seen first. The UI can
+    // re-sort by any column.
+    ranked.sort_by_key(|(last_seen, _)| std::cmp::Reverse(*last_seen));
+
+    ranked
+        .into_iter()
+        .filter_map(|(_, idx)| records.get(idx).copied())
         .map(|record| {
             let ident_state =
                 ident_state_label(cm.get_current_ident_state(&record.user_hash, record.ident_ip))
@@ -25268,9 +26183,7 @@ async fn known_clients_snapshot(
                 .ember_hash
                 .or_else(|| live_ember.get(&record.user_hash).copied());
             let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
-            let meta = ember
-                .map(hex::encode)
-                .and_then(|h| friend_meta.get(&h.to_lowercase()));
+            let meta = ember.and_then(|eh| friend_meta.get(&eh));
 
             let mut last_known_ip = if record.ident_ip != 0 {
                 let octets = record.ident_ip.to_be_bytes();
@@ -25302,6 +26215,8 @@ async fn known_clients_snapshot(
 
             crate::types::KnownClient {
                 user_hash: hex::encode(record.user_hash),
+                peer_name: record.peer_name.clone(),
+                client_software: record.client_software.clone(),
                 downloaded: record.downloaded,
                 uploaded: record.uploaded,
                 credit_ratio,
@@ -25315,26 +26230,7 @@ async fn known_clients_snapshot(
                 nickname: meta.map(|m| m.nickname.clone()).unwrap_or_default(),
             }
         })
-        .collect();
-    // Stable, useful default order: most-recently-seen first. The UI
-    // can re-sort by any column.
-    out.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
-    // Bound what crosses IPC. The credit ledger holds up to
-    // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
-    // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
-    // on a repeating timer for a table that renders a thousand rows. Trimming
-    // the *oldest* entries is the right end to lose: they are the peers a
-    // lifetime-view is least likely to be asked about, and the sort above has
-    // already put everything recent first.
-    const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
-    if out.len() > MAX_KNOWN_CLIENT_ROWS {
-        debug!(
-            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
-            out.len()
-        );
-        out.truncate(MAX_KNOWN_CLIENT_ROWS);
-    }
-    out
+        .collect()
 }
 
 // ----- AntiLeech filter command helpers ----------------------------
@@ -25471,8 +26367,11 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_moderation_publish_at.clear();
     state.channel_username_refresh_at = 0;
     state.ember_channel_noise_keys.clear();
+    state.channel_roster_cache = None;
+    state.channel_member_touch_flushed_at = None;
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
+    state.channel_neighbor_scan_after = None;
     state.channel_relay_outboxes.clear();
     state.channel_relay_pending.clear();
     state.channel_relay_offer_at.clear();
@@ -25619,7 +26518,11 @@ fn apply_network_settings(
         new_settings.max_concurrent_uploads as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
-    ed2k::multi_source::set_global_download_conn_limit(new_settings.max_connections as usize);
+    state.upload_max_conn_per_five.store(
+        new_settings.max_connections_per_five_secs as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ed2k::multi_source::set_global_conn_limit(new_settings.max_connections as usize);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
     if !new_settings.uss_enabled {
         if let Some((addr, _)) = state.uss_host.take() {
@@ -26348,6 +27251,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(
             settings.max_concurrent_uploads as usize,
         )),
+        upload_max_conn_per_five: Arc::new(std::sync::atomic::AtomicUsize::new(
+            settings.max_connections_per_five_secs as usize,
+        )),
         obfuscation_enabled_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.obfuscation_enabled,
         )),
@@ -26516,8 +27422,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
+        channel_member_touch_flushed_at: None,
+        channel_roster_cache: None,
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_neighbor_scan_after: None,
         channel_relay_outboxes: HashMap::new(),
         channel_relay_pending: HashSet::new(),
         channel_relay_offer_at: HashMap::new(),
@@ -26825,7 +27734,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Install the machine-wide download-connection cap (eMule `maxconnections`)
     // before any download tasks can spawn, so the raised per-file source
     // budget stays globally bounded.
-    ed2k::multi_source::set_global_download_conn_limit(settings.max_connections as usize);
+    ed2k::multi_source::set_global_conn_limit(settings.max_connections as usize);
 
     // Install the global "preview priority for all downloads" preference so the
     // chunk selector front-loads first/last parts from the very first task.
@@ -26881,6 +27790,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ident_state,
                 ember_hash,
                 crypto_verified_once,
+                peer_name,
+                client_software,
             ) in records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
@@ -26908,6 +27819,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // unanchored and the anti-theft reset wipes each peer's totals
                 // on their first verification after a restart.
                 record.crypto_verified_once = crypto_verified_once;
+                record.peer_name = peer_name;
+                record.client_software = client_software;
             }
             info!(
                 "Loaded {} credit records from database",
@@ -27062,6 +27975,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_nickname = shared_nickname.clone();
         let ul_app = app_handle.clone();
         let ul_max = state.upload_max_slots.clone();
+        let ul_max_conn_per_five = state.upload_max_conn_per_five.clone();
         let ul_sm = source_manager.clone();
         let ul_comments = state.comment_manager.clone();
         let ul_cm = credit_manager.clone();
@@ -27117,6 +28031,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_bw,
                 ul_tx,
                 ul_max,
+                ul_max_conn_per_five,
                 ul_sm,
                 ul_comments,
                 ul_cm,
@@ -27464,8 +28379,22 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut stats_save_started_at: Option<tokio::time::Instant> = None;
     let mut reputation_save_in_flight = false;
     let mut reputation_save_started_at: Option<tokio::time::Instant> = None;
+    // Same dirty-check shape as `known2_saved_len` below: the generation the
+    // last *durable* reputation write covered, and the one the in-flight write
+    // is carrying. On a long-lived node the peer/IP maps sit near their 20k cap
+    // and rarely change between 5-minute ticks, so without this the timer
+    // cloned 20k entries and fsync'd ~2 MB of identical JSON 288 times a day.
+    let mut reputation_saved_generation: Option<u64> = None;
+    let mut reputation_in_flight_generation: u64 = 0;
     let mut known2_save_in_flight = false;
     let mut known2_save_started_at: Option<tokio::time::Instant> = None;
+    // Length of `aich_hash_sets` as of the last durable `known2_64.met` write,
+    // or `None` if this session has not written one yet. `aich_hash_sets` is
+    // append-only — nothing removes an entry and the cap refuses new sets
+    // rather than evicting — so its length identifies its contents, which
+    // makes this a sufficient dirty check.
+    let mut known2_saved_len: Option<usize> = None;
+    let mut known2_in_flight_len: usize = 0;
     let mut nodes_save_in_flight = false;
     let mut nodes_save_started_at: Option<tokio::time::Instant> = None;
     let mut spam_save_in_flight = false;
@@ -27494,6 +28423,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut last_server_activity_at = chrono::Utc::now().timestamp();
     let mut last_kad_activity_at = chrono::Utc::now().timestamp();
     let mut last_cache_refresh_started_at = 0i64;
+    // `(known.met dirty generation, publish-badge fingerprint)` the cached
+    // shared-file list was last built from. `None` until the first refresh, so
+    // the first tick after startup always builds one.
+    let mut last_file_snapshot_inputs: Option<(u64, u64)> = None;
 
     // Defer transfer resume, orphan sweep, firewall rules, and heavy disk
     // loads until the event loop can service splash IPC. UPnP setup is also
@@ -27940,6 +28873,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &mut state.ember_published_sources,
                         );
                         state.aich_hash_sets = loads.aich_hash_sets;
+                        // The deferred load replaces the in-memory set wholesale,
+                        // so any length this session already wrote no longer
+                        // describes what is in memory.
+                        known2_saved_len = None;
                         for (k, v) in loads.aich_root_map {
                             if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
                                 break;
@@ -28191,16 +29128,28 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &[allowed_root],
                                     )
                                     .ok()?;
-                                let md4 = ed2k::hash::ed2k_hash_file(&verified_path).ok()?;
-                                if !md4.eq_ignore_ascii_case(&expected) {
+                                // All three digests from one read. Checked one
+                                // at a time, this walked a restored multi-GB
+                                // file up to three times over — and a restore
+                                // re-verification is the moment a user is
+                                // waiting to learn whether their file survived.
+                                static NEVER: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                let mut file = std::fs::File::open(&verified_path).ok()?;
+                                let digests = ed2k::hash::hash_open_file_digests_cancellable(
+                                    &mut file,
+                                    ed2k::hash::WantedDigests {
+                                        aich: expected_aich.is_some(),
+                                        ember: expected_ember.is_some(),
+                                    },
+                                    &NEVER,
+                                )
+                                .ok()?;
+                                if !digests.ed2k.eq_ignore_ascii_case(&expected) {
                                     return Some(Err("Restored final file hash mismatch".to_string()));
                                 }
                                 if let Some(expected_aich) = expected_aich {
-                                    let actual = ed2k::aich::AICHRecoveryHashSet::build_from_file(
-                                        &verified_path,
-                                    )
-                                    .ok()
-                                    .map(|set| hex::encode(set.root_hash))?;
+                                    let actual = hex::encode(digests.aich.unwrap_or_default());
                                     if !actual.eq_ignore_ascii_case(&expected_aich) {
                                         return Some(Err(format!(
                                             "Expected AICH hash mismatch (expected {expected_aich}, got {actual})"
@@ -28208,10 +29157,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(expected_ember) = expected_ember {
-                                    let actual =
-                                        ember::crypto::blake3_hash_file_path(&verified_path)
-                                            .ok()
-                                            .map(hex::encode)?;
+                                    let actual = hex::encode(digests.ember.unwrap_or_default());
                                     if !actual.eq_ignore_ascii_case(&expected_ember) {
                                         // Reopening parts cannot turn these bytes
                                         // into the content the pin names, so use
@@ -28881,6 +29827,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &local_index,
                                     &db,
                                     &app_handle,
+                                    &bandwidth_limiter,
                                 ).await;
                             }
                         } else {
@@ -28910,6 +29857,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &transfer_manager,
                                 &source_manager,
                                 &known_files,
+                                &bandwidth_limiter,
                             ).await;
                         }
                     }
@@ -28945,6 +29893,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &local_index,
                                         &db,
                                         &app_handle,
+                                        &bandwidth_limiter,
                                     ).await;
                                 }
                             } else {
@@ -28974,6 +29923,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &transfer_manager,
                                     &source_manager,
                                     &known_files,
+                                    &bandwidth_limiter,
                                 ).await;
                             }
                         }
@@ -29281,6 +30231,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     let hash_path = completed_path.clone();
                                     let hashset_tx = part_hashset_result_tx.clone();
                                     tokio::task::spawn_blocking(move || {
+                                        // Another whole-file read the library
+                                        // scheduler would otherwise not see. It
+                                        // rations reads per physical drive, and
+                                        // this one lands on the same spindle a
+                                        // scan may be working through.
+                                        let _drive_busy =
+                                            crate::sharing::disk::note_external_read(&hash_path);
                                         if let Ok(hashes) =
                                             ed2k::hash::ed2k_part_hashes_file(&hash_path)
                                         {
@@ -32461,14 +33418,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 pending_request_id,
                                 &mut batch,
                             );
-                            let filter_ctx = state.active_search_request.as_ref().map(|a| {
-                                (a.min_size, a.max_size, a.file_extension.clone(), a.min_availability)
-                            });
+                            // Matched on the id, like `dedup_streamed_batch` and
+                            // `take_search_batch_spam` beside it. Falling back to
+                            // `None` for a request that is no longer active meant
+                            // "apply no client-side filters" while still emitting
+                            // under this batch's own id — rows that ignore the
+                            // user's size, extension and Min-sources settings. An
+                            // empty batch is the honest answer: there is no tab
+                            // asking this question any more.
+                            let filter_ctx = state
+                                .active_search_request
+                                .as_ref()
+                                .filter(|a| a.request_id == pending_request_id)
+                                .map(|a| {
+                                    (a.min_size, a.max_size, a.file_extension.clone(), a.min_availability)
+                                });
+                            if filter_ctx.is_none() {
+                                batch.clear();
+                            }
                             let (min_size, max_size, file_extension, min_availability) =
                                 filter_ctx.unwrap_or((None, None, None, None));
                             if !batch.is_empty() {
                                 let mut batch_spam =
-                                    take_search_batch_spam(&state, pending_request_id);
+                                    take_search_batch_spam(&mut state, pending_request_id);
                                 let mut emitted = enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
@@ -32662,6 +33634,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     ds.udp_port,
                                     ds.source_user_hash.unwrap_or([0u8; 16]),
                                     ds.connect_options,
+                                    Some(crate::types::SourceOrigin::Kad),
                                 );
                             }
                         }
@@ -33313,6 +34286,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     ds.udp_port,
                                     ds.source_user_hash.unwrap_or([0u8; 16]),
                                     ds.connect_options,
+                                    Some(crate::types::SourceOrigin::Kad),
                                 );
                             }
                         }
@@ -33333,6 +34307,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         ls.ed2k_server_port,
                                         ls.source_user_hash.unwrap_or([0u8; 16]),
                                         ls.connect_options,
+                                        // A KAD answer that happens to name the
+                                        // server the peer is registered on. KAD
+                                        // found it; the server is only the route.
+                                        Some(crate::types::SourceOrigin::Kad),
                                     );
                                 }
                                 info!(
@@ -33416,12 +34394,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                // Empty, not "KAD Callback":
+                                                // we have not spoken to this
+                                                // peer yet, so we do not know
+                                                // what it runs. The two facts
+                                                // that string used to stand in
+                                                // for now have fields of their
+                                                // own.
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(cb_src.ip)),
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -33449,12 +34436,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(dc_src.ip)),
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -33477,12 +34466,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     queue_rank: None,
                                                     speed: 0,
                                                     transferred: 0,
-                                                    client_software: "Low ID (Server Relay)".to_string(),
+                                                    client_software: String::new(),
                                                     peer_name: String::new(),
                                                     available_parts: None,
                                                     total_parts: None,
                                                     country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
                                                     user_hash: ls.source_user_hash,
+                                                    // A LowID peer only reachable
+                                                    // because a server will relay
+                                                    // our callback to it.
+                                                    origin: Some(crate::types::SourceOrigin::Server),
+                                                    placeholder: true,
                                                 },
                                             );
                                             state.callback_row_pending_since.insert(
@@ -33560,6 +34554,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: None,
+                                                // `sources` here is the KAD
+                                                // search's own answer list.
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: false,
                                             },
                                         );
                                     }
@@ -33622,12 +34620,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -33658,12 +34658,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -33701,7 +34703,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "Low ID (Server Relay)".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
@@ -33709,6 +34711,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     &geoip, std::net::IpAddr::V4(ls.ip),
                                                 ),
                                                 user_hash: ls.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Server),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -33803,7 +34807,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         let mut sm = source_manager.write().await;
                                         for (ip, port) in &sources {
                                             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                                                sm.register_source(hash_bytes, v4, *port);
+                                                sm.register_source(hash_bytes, v4, *port, None);
                                             }
                                         }
                                     }
@@ -34000,12 +35004,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -34036,12 +35042,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -35064,6 +36072,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     .filter_incoming_shared
                                                     .clone(),
                                             },
+                                            bandwidth_limiter.clone(),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
 
@@ -36646,6 +37655,36 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .retain(|_, attempt| mgr.get_transfer(&attempt.transfer_id).is_some());
                 }
 
+                // Forget neighbour-lookup throttle stamps once they can no
+                // longer suppress a lookup. Keyed by remote member pubkey, so
+                // this map grows with other people's room churn rather than
+                // with anything the user does, and its sibling
+                // `channel_neighbor_lookup_inflight` is already cleared on
+                // completion. A stamp past its interval also keeps suppressing
+                // nothing, so holding it only costs memory.
+                {
+                    let now = std::time::Instant::now();
+                    state.channel_neighbor_lookup_at.retain(|_, at| {
+                        now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL
+                    });
+                }
+
+                // Drop publish-ack counters for files no longer being
+                // published. The field documents itself as reset at the start
+                // of each source-publish cycle, but nothing ever removed an
+                // entry, so a session that rotates shares accumulated one row
+                // per file ever published — and the 60s source-count sync
+                // probes this map once per shared file.
+                // The Ember rendezvous advert is deliberately absent from the
+                // publish record set, so it is kept by key.
+                {
+                    let rendezvous_key = kad::publish::ember_rendezvous_key();
+                    let publish = &state.publish_manager;
+                    state
+                        .source_publish_acks
+                        .retain(|id, _| *id == rendezvous_key || publish.has_record(id));
+                }
+
                 // Forget inbound rate-limit stamps once they can no longer
                 // reject anything.
                 {
@@ -37368,7 +38407,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Throttled UDP global search: send one packet per 750ms tick
             _ = udp_search_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if let Some((packet, addr)) = state.udp_search_queue.pop_front() {
+                if let Some((queued_request_id, packet, addr)) = state.udp_search_queue.pop_front() {
                     let sock = server_udp.socket_handle();
                     if let Err(e) = sock.send_to(&packet, addr).await {
                         // Most common failures are transient ICMP-unreachable
@@ -37383,7 +38422,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if let (Some(active), IpAddr::V4(ip)) =
                             (state.active_search_request.as_mut(), addr.ip())
                         {
-                            if active.udp_pending {
+                            // Only if this packet was queued for the search that
+                            // is running now; otherwise its reply would be
+                            // admitted into a tab that never asked the question.
+                            if active.udp_pending && active.request_id == queued_request_id {
                                 active.udp_search_sent_ips.insert(ip);
                             }
                         }
@@ -37947,7 +38989,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             _ = pathb_stats_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 if let Some((in_use, max, acquires, contended)) =
-                    ed2k::multi_source::global_dl_conn_stats()
+                    ed2k::multi_source::global_conn_stats()
                 {
                     let (detaches, diversions, rotations) =
                         ed2k::multi_source::pathb_event_counts();
@@ -38621,6 +39663,22 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 .map(|(ip, port)| (ip.to_string(), port))
                                 .collect())
                             .unwrap_or_default();
+                        // Captured while the source lock is still held. The row
+                        // writes below happen under the transfer lock, and the
+                        // canonical order (transfer before source, see the
+                        // comment there) forbids reaching back for this then.
+                        // These sources come from the accumulated per-file pool,
+                        // so they are a mix of everything that ever found this
+                        // file — there is no single origin to stamp them with.
+                        let ready_origins: std::collections::HashMap<(String, u16), crate::types::SourceOrigin> =
+                            ready_sources
+                                .iter()
+                                .filter_map(|(ip, port)| {
+                                    let v4 = ip.parse::<Ipv4Addr>().ok()?;
+                                    let origin = sm_guard2.get_source_origin(&hash_bytes, v4, *port)?;
+                                    Some(((ip.clone(), *port), origin))
+                                })
+                                .collect();
                         drop(a4af_snap);
                         drop(sm_guard2);
                         if ready_sources.is_empty() {
@@ -38699,6 +39757,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         total_parts: None,
                                         country_code: cc,
                                         user_hash: None,
+                                        origin: ready_origins.get(&(ip_s.clone(), *port)).copied(),
+                                        placeholder: false,
                                     },
                                 );
                             }
@@ -38810,9 +39870,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        let sm_sources = {
+                        // Origins are read in the same guard as the addresses:
+                        // the rows below are written under the transfer lock,
+                        // and the canonical order forbids taking the source
+                        // lock underneath it. This is the persistent pool, so
+                        // each source keeps whichever network found it.
+                        let (sm_sources, sm_origins) = {
                             let sm = source_manager.read().await;
-                            sm.get_sources(&hash_bytes)
+                            let sources = sm.get_sources(&hash_bytes);
+                            let origins: std::collections::HashMap<(String, u16), crate::types::SourceOrigin> =
+                                sources
+                                    .iter()
+                                    .filter_map(|(ip, port)| {
+                                        let origin = sm.get_source_origin(&hash_bytes, *ip, *port)?;
+                                        Some(((ip.to_string(), *port), origin))
+                                    })
+                                    .collect();
+                            (sources, origins)
                         };
                         let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
                             .filter(|(ip, port)| {
@@ -38892,6 +39966,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         total_parts: None,
                                         country_code: cc,
                                         user_hash: None,
+                                        origin: sm_origins.get(&(ip_s.clone(), *port)).copied(),
+                                        placeholder: false,
                                     },
                                 );
                             }
@@ -38929,7 +40005,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let mut sm = source_manager.write().await;
                             for (ip, port) in &live_sources {
                                 if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                                    sm.register_source(hash_bytes, v4, *port);
+                                    sm.register_source(hash_bytes, v4, *port, None);
                                 }
                             }
                         }
@@ -40002,33 +41078,34 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Feed NNP sources from persistent per-file lists into A4AF.
                 // A source with NNP on file X should be offered to all OTHER
                 // active downloads, not back to file X itself.
+                //
+                // Both sides are collected before the lock is taken, and the
+                // dry list is de-duplicated by address. A peer that has run
+                // dry on several files is still one candidate per target, so
+                // feeding the raw per-file lists in walked every target once
+                // per file the peer appeared on, for no added coverage.
                 {
                     let all_file_hashes: Vec<[u8; 16]> = state.per_file_sources
                         .values()
                         .map(|pfs| pfs.file_hash)
                         .collect();
-                    let mut a4af = a4af_shared.write().await;
+                    let mut seen_dry: HashSet<SocketAddr> = HashSet::new();
+                    let mut dry_sources: Vec<(SocketAddr, [u8; 16])> = Vec::new();
                     for pfs in state.per_file_sources.values() {
                         for src in &pfs.sources {
                             if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
                                 let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
-                                for &other_hash in &all_file_hashes {
-                                    if other_hash != pfs.file_hash {
-                                        a4af.add_a4af_source(
-                                            other_hash,
-                                            addr,
-                                            pfs.file_hash,
-                                            // This sweep selects on
-                                            // `NoneNeededParts`, so by
-                                            // construction the peer has nothing
-                                            // left for the file it is on — which
-                                            // is the whole reason to retask it.
-                                            false,
-                                        );
-                                    }
+                                if seen_dry.insert(addr) {
+                                    dry_sources.push((addr, pfs.file_hash));
                                 }
                             }
                         }
+                    }
+                    if !dry_sources.is_empty() {
+                        a4af_shared
+                            .write()
+                            .await
+                            .offer_dry_sources(&all_file_hashes, &dry_sources);
                     }
                 }
 
@@ -40174,6 +41251,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         moved_connect_options,
                                     );
                                 } else if let Some(user_hash) = moved_user_hash {
+                                    // A4AF: the peer itself told us, mid-session,
+                                    // that it also holds the target file. That is
+                                    // not something any of the four networks
+                                    // said, and copying the origin it carries for
+                                    // the file it was found for would attribute
+                                    // this one to a network that never mentioned
+                                    // it. So: no origin.
                                     sm.register_source_full_opts(
                                         swap.to_file,
                                         v4,
@@ -40181,6 +41265,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         moved_udp_port,
                                         user_hash,
                                         moved_connect_options,
+                                        None,
                                     );
                                 } else {
                                     sm.register_source_full(
@@ -40189,6 +41274,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         port,
                                         moved_udp_port,
                                         [0u8; 16],
+                                        None,
                                     );
                                 }
                             }
@@ -40421,14 +41507,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             local.extend(search_results);
                                             if count >= 200
                                                 && local.len() < 1000
-                                                && state.server_search_more_requests < 5
-                                                && state
-                                                    .active_search_request
-                                                    .as_ref()
-                                                    .map(|a| {
-                                                        a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS
-                                                    })
-                                                    .unwrap_or(true)
+                                                && state.server_search_more_requests
+                                                    < MAX_SERVER_MORE_REQUESTS
                                             {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -40446,35 +41526,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 finished_search_requests.push(request_id);
                                             }
                                         } else {
-                                            // Drop late More pages once the ed2k source cap
-                                            // has already stopped the UDP/More sweep.
-                                            let capped = state
-                                                .active_search_request
-                                                .as_ref()
-                                                .filter(|a| a.request_id == request_id)
-                                                .is_some_and(|a| {
-                                                    a.ed2k_found_sources > MAX_ED2K_SEARCH_RESULTS
-                                                });
-                                            if capped {
-                                                // The cap has stopped this sweep, so a
-                                                // queued co-share follow-up would only
-                                                // restart what we just decided to end.
-                                                drop_queued_server_followup(
-                                                    &mut state,
-                                                    request_id,
-                                                );
-                                                if let Some(active) =
-                                                    state.active_search_request.as_mut()
-                                                {
-                                                    if active.request_id == request_id {
-                                                        active.server_pending = false;
-                                                    }
-                                                }
-                                                finished_search_requests.push(request_id);
-                                            } else {
+                                            // A page we asked for is a page we use.
+                                            // This whole branch used to be a
+                                            // discard: if the shared source cap
+                                            // had tripped between the request
+                                            // leaving and the answer arriving, up
+                                            // to 200 parsed rows were thrown away
+                                            // unemitted, and any queued co-share
+                                            // follow-up was dropped with them. The
+                                            // round trip had already been spent;
+                                            // refusing to read the reply bought
+                                            // none of it back.
+                                            {
+                                            // Matched on the id for the same
+                                            // reason as the KAD leg above: the
+                                            // `None` fallback meant "no
+                                            // client-side filters" on a batch
+                                            // still emitted under this id, so a
+                                            // search that had already moved on
+                                            // would deliver rows ignoring the
+                                            // user's filters.
                                             let filter_ctx = state
                                                 .active_search_request
                                                 .as_ref()
+                                                .filter(|a| a.request_id == request_id)
                                                 .map(|a| {
                                                     (
                                                         a.file_type_filter.clone(),
@@ -40485,10 +41560,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                         a.keywords.clone(),
                                                         a.server_ip.clone(),
                                                     )
-                                                })
-                                                .unwrap_or((
-                                                    None, None, None, None, None, Vec::new(), None,
-                                                ));
+                                                });
+                                            let ctx_matches = filter_ctx.is_some();
                                             let (
                                                 ft_filter,
                                                 min_size,
@@ -40497,15 +41570,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 min_availability,
                                                 kws,
                                                 srv_ip,
-                                            ) = filter_ctx;
+                                            ) = filter_ctx.unwrap_or((
+                                                None, None, None, None, None, Vec::new(), None,
+                                            ));
                                             let mut search_results = search_results;
+                                            if !ctx_matches {
+                                                search_results.clear();
+                                            }
                                             let resights = dedup_streamed_batch(
                                                 &mut state.active_search_request,
                                                 request_id,
                                                 &mut search_results,
                                             );
                                             let mut batch_spam =
-                                                take_search_batch_spam(&state, request_id);
+                                                take_search_batch_spam(&mut state, request_id);
                                             let emitted = enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
@@ -40560,14 +41638,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 .filter(|active| active.request_id == request_id)
                                                 .map(|active| active.server_result_count < 1000)
                                                 .unwrap_or(true);
+                                            // A full batch means the server has
+                                            // more to give, and the two limits
+                                            // that belong here are already
+                                            // stated: at most 1000 results and
+                                            // at most `MAX_SERVER_MORE_REQUESTS`
+                                            // pages.
+                                            //
+                                            // This used to carry a third term —
+                                            // `ed2k_found_sources <= 100` — which
+                                            // could never hold alongside the
+                                            // first. `note_ed2k_search_results`
+                                            // has already charged this batch, and
+                                            // every emitted row adds at least 1,
+                                            // so `count >= 200` guaranteed the
+                                            // counter was over 200. The five-page
+                                            // budget below was unreachable on any
+                                            // search a filter had not already
+                                            // gutted: page two was never asked
+                                            // for, on exactly the queries where
+                                            // the server said it had more.
                                             if count >= 200
                                                 && under_result_cap
-                                                && state.server_search_more_requests < 5
-                                                && state
-                                                    .active_search_request
-                                                    .as_ref()
-                                                    .map(|a| a.ed2k_found_sources <= MAX_ED2K_SEARCH_RESULTS)
-                                                    .unwrap_or(true)
+                                                && state.server_search_more_requests
+                                                    < MAX_SERVER_MORE_REQUESTS
                                             {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -40582,7 +41676,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     &mut finished_search_requests,
                                                 );
                                             }
-                                            } // end !capped
+                                            } // end of the page-processing block
                                         }
                                     }
                                 }
@@ -40687,6 +41781,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                         server_port,
                                                         src.user_hash.unwrap_or([0u8; 16]),
                                                         src.crypt_options.unwrap_or(0),
+                                                        // OP_FOUNDSOURCES, from
+                                                        // the server we are on.
+                                                        Some(crate::types::SourceOrigin::Server),
                                                     );
                                                 }
                                             } else if !state.low_id {
@@ -40698,6 +41795,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     server_port,
                                                     src.user_hash.unwrap_or([0u8; 16]),
                                                     src.crypt_options.unwrap_or(0),
+                                                    // OP_FOUNDSOURCES: here the
+                                                    // server really is the finder.
+                                                    Some(crate::types::SourceOrigin::Server),
                                                 );
                                             } else {
                                                 // We are LowID too, so this source is a dead end:
@@ -40834,6 +41934,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                             total_parts: None,
                                                             country_code: cc,
                                                             user_hash: None,
+                                                            // Straight from the
+                                                            // server's answer.
+                                                            origin: Some(crate::types::SourceOrigin::Server),
+                                                            placeholder: false,
                                                         },
                                                     );
                                                 }
@@ -40957,6 +42061,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 cb_server_port,
                                                 user_hash.unwrap_or([0u8; 16]),
                                                 crypt_options.unwrap_or(0),
+                                                // Reached us through the
+                                                // server's callback relay.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         }
                                         drop(sm);
@@ -41157,7 +42264,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if server_disconnect_reason.is_none()
                             && state.server_search_more_needed
                             && state.pending_server_search.is_some()
-                            && state.server_search_more_requests < 5
+                            && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
                         {
                             state.server_search_more_needed = false;
                             state.server_search_more_requests += 1;
@@ -41697,6 +42804,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 udp_server_port,
                                                 [0u8; 16],
                                                 0,
+                                                // UDP OP_GLOBFOUNDSOURCES.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         } else {
                                             // HighID source — apply
@@ -41731,6 +42840,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 file_hash, *ip, *port, 0,
                                                 udp_server_ip, udp_server_port,
                                                 [0u8; 16], 0,
+                                                // UDP OP_GLOBFOUNDSOURCES.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         }
                                     }
@@ -41846,6 +42957,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                             total_parts: None,
                                                             country_code: cc.clone(),
                                                             user_hash: None,
+                                                            // UDP global search
+                                                            // answer from a server.
+                                                            origin: Some(crate::types::SourceOrigin::Server),
+                                                            placeholder: false,
                                                         },
                                                     );
                                                 }
@@ -42022,7 +43137,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         request_id,
                                         &mut search_results,
                                     );
-                                    let mut batch_spam = take_search_batch_spam(&state, request_id);
+                                    let mut batch_spam = take_search_batch_spam(&mut state, request_id);
                                     let udp_server_ip = addr.ip().to_string();
                                     let emitted = enrich_and_emit_search_results(
                                         &app_handle,
@@ -42651,7 +43766,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                                 {
                                     let mut sm = source_manager.write().await;
-                                    sm.register_source(file_hash, dest_ip, dest_port);
+                                    // A buddy callback answers a request we
+                                    // made for a peer some network already
+                                    // told us about, so it names no origin of
+                                    // its own.
+                                    sm.register_source(file_hash, dest_ip, dest_port, None);
                                 }
                                 {
                                     let pfs = state
@@ -42792,7 +43911,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             } else {
                                 {
                                     let mut sm = source_manager.write().await;
-                                    sm.register_source(file_hash, dest_ip, dest_port);
+                                    // A buddy callback answers a request we
+                                    // made for a peer some network already
+                                    // told us about, so it names no origin of
+                                    // its own.
+                                    sm.register_source(file_hash, dest_ip, dest_port, None);
                                 }
                                 let source = DownloadSource {
                                     peer_ip: dest_ip.to_string(),
@@ -42868,11 +43991,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
                     }
                     Some(BuddyEvent::Disconnected) | None => {
+                        // Retire the receiver unconditionally, and only ask the
+                        // manager to disconnect if it still thinks it is
+                        // connected. The two are not the same condition: a send
+                        // helper that finds its writer dead disconnects the
+                        // session itself, so by the time the channel's close
+                        // reaches us the manager is already `NoBuddy`. A closed
+                        // channel yields `None` from `recv()` immediately and
+                        // forever, so leaving the receiver installed made this
+                        // `select!` arm ready on every iteration and pinned a
+                        // core at 100% for the rest of the session — something
+                        // the peer could induce by accepting our connection and
+                        // then stopping reading.
                         if state.buddy_manager.state() == BuddyState::Connected {
                             state.buddy_manager.disconnect_buddy().await;
-                            state.buddy_event_rx = None;
-                            *state.shared_buddy_info.write().await = None;
                         }
+                        state.buddy_event_rx = None;
+                        *state.shared_buddy_info.write().await = None;
                     }
                 }
             }
@@ -42886,7 +44021,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } => {
                 match event {
                     Some(BuddyEvent::PingReceived) => {
-                        state.buddy_manager.send_pong_to_serving().await;
+                        state.buddy_manager.send_pong_to_serving();
                     }
                     Some(BuddyEvent::PongReceived) => {
                         debug!("Serving buddy pong received");
@@ -42895,10 +44030,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Unexpected callback on serving side");
                     }
                     Some(BuddyEvent::Disconnected) | None => {
+                        // See the outgoing-buddy arm above: the receiver has to
+                        // be retired even when the manager has already stopped
+                        // serving, or the closed channel spins this arm at
+                        // 100% CPU. `send_pong_to_serving` and
+                        // `send_callback_relay` both disconnect on a dead
+                        // writer, so that ordering is the common case rather
+                        // than a corner.
                         if state.buddy_manager.is_serving() {
                             state.buddy_manager.disconnect_serving();
-                            state.serving_event_rx = None;
                         }
+                        state.serving_event_rx = None;
                     }
                 }
             }
@@ -42912,12 +44054,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } => {
                 state.pending_outgoing_buddy = None;
                 match result {
-                    Ok(Some((buddy_id, buddy_ip, buddy_port, buddy_udp_port, rx, writer, reader_handle))) => {
+                    Ok(Some(conn)) => {
+                        let buddy_id = conn.buddy_id;
+                        let buddy_ip = conn.buddy_ip;
+                        let buddy_port = conn.buddy_tcp_port;
+                        let rx = state.buddy_manager.install_buddy_connection(conn);
                         state.buddy_event_rx = Some(rx);
-                        state.buddy_manager.install_buddy_connection(
-                            buddy_id, buddy_ip, buddy_port, buddy_udp_port,
-                            writer, reader_handle,
-                        );
                         // `CT_EMULE_BUDDYIP` (Hello tag 0xFC) follows the same
                         // wire convention as KAD `TAG_SERVERIP`: eMule sends
                         // `GetBuddy()->GetIP()` (raw `m_dwUserIP` = Winsock
@@ -44268,11 +45410,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     PeriodicSaveJob::Reputation => {
                         reputation_save_in_flight = false;
                         reputation_save_started_at = None;
+                        if result.result.is_ok() {
+                            // Only a durable write lets the next tick skip; a
+                            // failed one leaves the file behind the maps.
+                            reputation_saved_generation = Some(reputation_in_flight_generation);
+                        }
                         "reputation.json"
                     }
                     PeriodicSaveJob::Known2 => {
                         known2_save_in_flight = false;
                         known2_save_started_at = None;
+                        if result.result.is_ok() {
+                            // Only a durable write lets the next tick skip; a
+                            // failed one leaves the file behind the set.
+                            known2_saved_len = Some(known2_in_flight_len);
+                        }
                         "known2_64.met"
                     }
                     PeriodicSaveJob::Nodes => {
@@ -44384,11 +45536,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Periodic reputation save (every 5 minutes)
             _ = reputation_save_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if !reputation_save_in_flight {
+                let reputation_generation = state.reputation.generation();
+                if !reputation_save_in_flight
+                    && reputation_saved_generation != Some(reputation_generation)
+                {
                     let rep_path = state.data_dir.join("reputation.json");
                     let reputation_snapshot = state.reputation.clone();
                     let tx = periodic_save_result_tx.clone();
                     reputation_save_in_flight = true;
+                    reputation_in_flight_generation = reputation_generation;
                     reputation_save_started_at = Some(tokio::time::Instant::now());
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
@@ -44492,9 +45648,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                     state.aich_hash_sets.push(hs);
                 }
-                if !state.aich_hash_sets.is_empty() && !known2_save_in_flight {
+                // Gated on the set having actually grown, the way the
+                // `known.met` save above is gated on `is_dirty()`. Unconditional,
+                // this deep-cloned the whole recovery corpus on the event loop,
+                // re-serialised it in the blocking task and rewrote the file
+                // every 120s for the life of the session — at the loader's
+                // 64 MiB ceiling, tens of GiB of writes a day to persist bytes
+                // already on disk.
+                if !state.aich_hash_sets.is_empty()
+                    && known2_saved_len != Some(state.aich_hash_sets.len())
+                    && !known2_save_in_flight
+                {
                     let known2_path = state.data_dir.join("known2_64.met");
                     let hash_sets = state.aich_hash_sets.clone();
+                    known2_in_flight_len = hash_sets.len();
                     let tx = periodic_save_result_tx.clone();
                     known2_save_in_flight = true;
                     known2_save_started_at = Some(tokio::time::Instant::now());
@@ -45215,6 +46382,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     src.udp_port,
                                     src.user_hash.unwrap_or([0u8; 16]),
                                     connect_options,
+                                    Some(crate::types::SourceOrigin::Ember),
                                 );
                             }
                         }
@@ -45346,7 +46514,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "Ember Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
@@ -45355,6 +46523,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     std::net::IpAddr::V4(src.ip),
                                                 ),
                                                 user_hash: src.user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Ember),
+                                                placeholder: true,
                                             },
                                         );
                                     }
@@ -45601,7 +46771,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             DhtBatchKind::Incremental
                         };
                         if !results.is_empty() {
-                            let mut batch_spam = take_search_batch_spam(&state, request_id);
+                            let mut batch_spam = take_search_batch_spam(&mut state, request_id);
                             let mut emitted = enrich_and_emit_search_results(
                                 &app_handle,
                                 &spam_filter,
@@ -45926,7 +47096,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // and/or KAD peers that ACK'd our source publish. Do NOT use
                 // SourceManager::source_count — that counts every known peer
                 // including incomplete ones and inflated the column.
-                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::new();
+                // `per_file_sources` is keyed by transfer id, so answering
+                // "how many complete sources for this hash" from it is a
+                // linear scan. Done once per shared file that was
+                // O(shared files × tracked files) every 60s on the event loop
+                // — tens of millions of comparisons for a large library.
+                // Invert it once instead, then probe.
+                let complete_by_hash: HashMap<[u8; 16], u32> = {
+                    let mut m: HashMap<[u8; 16], u32> =
+                        HashMap::with_capacity(state.per_file_sources.len());
+                    for pfs in state.per_file_sources.values() {
+                        let count = u32::from(pfs.complete_source_count());
+                        m.entry(pfs.file_hash)
+                            .and_modify(|c| *c = (*c).max(count))
+                            .or_insert(count);
+                    }
+                    m
+                };
+                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::with_capacity(hashes.len());
                 for hash_hex in &hashes {
                     let hash_bytes: [u8; 16] = match hex::decode(hash_hex) {
                         Ok(b) if b.len() == 16 => {
@@ -45936,13 +47123,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                         _ => continue,
                     };
-                    let mut count = 0u32;
-                    for pfs in state.per_file_sources.values() {
-                        if pfs.file_hash == hash_bytes {
-                            count = count.max(u32::from(pfs.complete_source_count()));
-                            break;
-                        }
-                    }
+                    let mut count = complete_by_hash.get(&hash_bytes).copied().unwrap_or(0);
                     // Purely-shared files (never searched/downloaded) have no
                     // PFS entry; fall back to KAD publish ACKs — peers that
                     // stored our source record. Local copy is not counted.
@@ -46526,49 +47707,61 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 let stats_snapshot = state.stats.clone();
 
-                let cached_srv: Vec<ServerInfo> = state.server_list.servers().iter().map(|s| ServerInfo {
-                    ip: s.ip.clone(),
-                    port: s.port,
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    user_count: s.user_count,
-                    file_count: s.file_count,
-                    max_users: s.max_users,
-                    soft_files: s.soft_files,
-                    hard_files: s.hard_files,
-                    is_static: s.is_static,
-                    fail_count: s.fail_count,
-                    client_id: 0,
-                    is_low_id: false,
-                }).collect();
+                // Both of these were hand-copied transcriptions too, and the
+                // connected-server one had drifted in the same way the Kad
+                // copy above had: it zeroed `description`, `max_users`,
+                // `soft_files`, `hard_files` and `is_static`, so the row for
+                // the server the user was actually on lost the very fields
+                // `connected_server_info` exists to borrow from the list
+                // entry — depending on whether the poll or this cache
+                // answered first. Call the one implementation instead.
+                let cached_srv: Vec<ServerInfo> =
+                    state.server_list.servers().iter().map(server_entry_to_info).collect();
 
-                let cached_conn_srv: Option<ServerInfo> = state.server_connection.as_ref().and_then(|conn| {
-                    let session = conn.session.as_ref()?;
-                    let addr = state.server_addr?;
-                    Some(ServerInfo {
-                        ip: addr.ip().to_string(),
-                        port: addr.port(),
-                        name: session.server_name.clone(),
-                        description: String::new(),
-                        user_count: session.user_count,
-                        file_count: session.file_count,
-                        max_users: 0,
-                        soft_files: 0,
-                        hard_files: 0,
-                        is_static: false,
-                        fail_count: 0,
-                        client_id: state.server_client_id,
-                        is_low_id: state.low_id,
-                    })
-                });
+                let cached_conn_srv: Option<ServerInfo> = connected_server_info(&state);
 
                 let cached_tstats = stats_manager.get_stats();
 
-                // Collect known-file stats for the background task (can't move known_files into spawn)
-                let known_stats: Vec<([u8; 16], u32, u32, u64)> = known_files
-                    .all_records()
-                    .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
-                    .collect();
+                let kad_connected = state.stats.status == NetworkStatus::Connected;
+                let srv_connected = state.server_connected;
+                let ember_live =
+                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
+                let kad_published = state.publish_manager.source_published_md4_hashes();
+                let ed2k_offered = state.offered_ed2k_hashes.clone();
+                let ember_published = state.ember_published_sources.clone();
+
+                // The peer/contact/stats half of this bundle genuinely changes
+                // every tick, but the file snapshot underneath it depends on
+                // exactly two things: the all-time counters in known.met and the
+                // publish-badge inputs. Index *content* edits are pushed by
+                // `refresh_file_cache` at each of its mutation sites, so this
+                // timer never had to re-derive them. Rebuilding regardless meant
+                // an idle node took `local_index.write()` every 5s and deep-cloned
+                // every `FileInfo` behind it — on a large library that starves
+                // hashing, scans and IPC readers for as long as it runs.
+                let known_generation = known_files.dirty_generation();
+                let badge_fingerprint = publish_badge_fingerprint(
+                    kad_connected,
+                    srv_connected,
+                    ember_live,
+                    &kad_published,
+                    &ed2k_offered,
+                    &ember_published,
+                );
+                let file_snapshot_stale =
+                    last_file_snapshot_inputs != Some((known_generation, badge_fingerprint));
+
+                // Collect known-file stats for the background task (can't move
+                // known_files into spawn). Skipped entirely when the snapshot is
+                // current: at a full library this is ~140k tuples per tick.
+                let known_stats: Vec<([u8; 16], u32, u32, u64)> = if file_snapshot_stale {
+                    known_files
+                        .all_records()
+                        .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 // Spawn ALL heavy work (hex conversion, distance computation, writes,
                 // and the local_index stats merge) as a background task so the event
@@ -46584,25 +47777,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let db_ref = db.clone();
                 let li_ref = local_index.clone();
                 let app_for_cache = app_handle.clone();
-                let kad_connected = state.stats.status == NetworkStatus::Connected;
-                let srv_connected = state.server_connected;
-                let ember_live =
-                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
-                let kad_published = state.publish_manager.source_published_md4_hashes();
-                let ed2k_offered = state.offered_ed2k_hashes.clone();
-                let ember_published = state.ember_published_sources.clone();
                 last_cache_refresh_started_at = chrono::Utc::now().timestamp();
+                // Marked applied here rather than inside the task: the watchdog
+                // never aborts this one, and a task that panics only costs a
+                // delayed merge, which the next known.met change re-triggers.
+                last_file_snapshot_inputs = Some((known_generation, badge_fingerprint));
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
                     // snapshot the file list for frontend IPC reads.
                     // IMPORTANT: release the local_index lock before acquiring
                     // cached_shared_files -- never nest these two locks.
-                    let file_snap = {
+                    let file_snap = if file_snapshot_stale {
                         let mut index = li_ref.write().await;
-                        for (file_hash, reqs, accepted, transferred) in &known_stats {
-                            let hash_hex = hex::encode(file_hash);
-                            index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
-                        }
+                        index.update_alltime_stats_bulk(&known_stats);
                         let mut snap = index.all_files().to_vec();
                         apply_publish_badges(
                             &mut snap,
@@ -46613,7 +47800,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &ed2k_offered,
                             &ember_published,
                         );
-                        snap
+                        Some(snap)
+                    } else {
+                        None
                     };
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();
@@ -46678,11 +47867,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // a badge actually flips, so the flags land in the UI without
                     // waiting on unrelated activity and without reloading the
                     // whole list on a five-second clock.
-                    let badges_changed = {
-                        let mut cache = s_files.write().await;
-                        let changed = badge_counts(&file_snap) != badge_counts(&cache);
-                        *cache = file_snap;
-                        changed
+                    let badges_changed = match file_snap {
+                        Some(file_snap) => {
+                            let mut cache = s_files.write().await;
+                            let changed = badge_counts(&file_snap) != badge_counts(&cache);
+                            *cache = file_snap;
+                            changed
+                        }
+                        // Neither the known.met counters nor any badge input
+                        // moved, so the cache already holds this exact list and
+                        // no badge can have flipped.
+                        None => false,
                     };
                     if badges_changed {
                         let _ = app_for_cache.emit(
@@ -46894,7 +48089,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     info!("Shutting down network");
     // Final Path B tally so even a short test run (under the 60 s periodic
     // cadence) always captures the queued-source-model counters.
-    if let Some((in_use, max, acquires, contended)) = ed2k::multi_source::global_dl_conn_stats() {
+    if let Some((in_use, max, acquires, contended)) = ed2k::multi_source::global_conn_stats() {
         let (detaches, diversions, rotations) = ed2k::multi_source::pathb_event_counts();
         info!(
             "Path B final stats: dl-conns {in_use}/{max} in use at shutdown, {acquires} acquires \
@@ -48423,6 +49618,7 @@ async fn handle_ember_native_udp(
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
         socket,
@@ -48434,6 +49630,7 @@ async fn handle_ember_native_udp(
         local_index,
         db,
         app_handle,
+        bandwidth_limiter,
     ))
     .catch_unwind()
     .await
@@ -48456,6 +49653,7 @@ async fn handle_ember_native_udp_inner(
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     let outcome = state.ember_transport.dispatch_incoming(data, from);
 
@@ -48516,6 +49714,7 @@ async fn handle_ember_native_udp_inner(
                 state,
                 db,
                 app_handle,
+                bandwidth_limiter,
             )
             .await;
         }
@@ -52568,6 +53767,7 @@ async fn handle_ember_dht_message(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Slice 14: per-IP rate limit before any crypto/table work. Wire layout
     // is version(1) + msg_type(1) + …; a truncated frame is dropped by the
@@ -52899,8 +54099,16 @@ async fn handle_ember_dht_message(
     // source record out via the normal publish driver. Charge budget and
     // remember the publisher only after start_publish_to succeeds so a full
     // publish table does not spend quota on a silent drop.
+    //
+    // When file uploads already own a configured cap, skip the fan-out
+    // (and the ACK). The publisher retries; taking the uplink now would
+    // steal tokens from peers we are already serving.
     if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
-        if let Some(publisher) = inbound.sender_id {
+        if bandwidth_limiter.file_uploads_own_uplink() {
+            debug!(
+                "Ember DHT: deferring PROXY_STORE fan-out from {from}; file uploads own the uplink"
+            );
+        } else if let Some(publisher) = inbound.sender_id {
             let now_inst = std::time::Instant::now();
             if state.ember_dht.can_accept_proxy_forward(publisher, now_inst) {
                 let key = forward.keyword_hash;
@@ -53375,6 +54583,7 @@ async fn handle_udp_packet(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -53391,6 +54600,7 @@ async fn handle_udp_packet(
         transfer_manager,
         source_manager,
         known_files,
+        bandwidth_limiter,
     ))
     .catch_unwind()
     .await
@@ -53418,6 +54628,7 @@ async fn handle_udp_packet_inner(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -53488,6 +54699,7 @@ async fn handle_udp_packet_inner(
                     local_index,
                     db,
                     app_handle,
+                    bandwidth_limiter,
                 )
                 .await;
             }
@@ -56293,11 +57505,12 @@ async fn handle_udp_packet_inner(
                             buddy_id,
                             buddy_ip,
                             peer_tcp_port,
+                            buddy_udp_port,
                             user_hash,
                             connect_options,
                             allow_obfuscation,
                         )
-                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, buddy_udp_port, rx, writer, reader_handle))
+                        .await
                 }));
             }
         }
@@ -56318,8 +57531,7 @@ async fn handle_udp_packet_inner(
                 };
                 let relayed = state
                     .buddy_manager
-                    .send_callback_relay(&buddy_id, client_ip, peer_tcp_port, file_id.0)
-                    .await;
+                    .send_callback_relay(&buddy_id, client_ip, peer_tcp_port, file_id.0);
                 if relayed {
                     debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {
@@ -56707,25 +57919,20 @@ async fn handle_download_event(
                 // source that is waiting perfectly healthily.
                 "friend_connect" => crate::types::SourceStatus::FriendConnect,
                 "unreachable" => crate::types::SourceStatus::Unreachable,
-                // Transient hold-offs, not failures. Both are routine — the
-                // connection semaphore saturates on any busy download
-                // (`too_many_conns`), and every source that arrives once all
-                // remaining parts are already in flight gets `parts_busy`,
-                // which is the normal endgame of a well-swarmed file. Falling
-                // to `Failed` meant the drawer deleted these perfectly healthy
-                // rows and counted them into "N failed sources hidden", and
-                // `update_source_detail` evicted them first at the 500-row cap.
-                // `set_too_many_conns` / `set_parts_busy` both arm a short
-                // retry, so `Connecting` is the honest rendering.
-                "too_many_conns" => crate::types::SourceStatus::Connecting,
-                // `Connecting`, as the comment above concludes for both of these
-                // and as `too_many_conns` already did. This arm said
-                // `NoNeededParts`, contradicting its own rationale two lines up
-                // and telling the user a peer held nothing we needed when the
-                // truth was that another source had the part claimed — routinely
-                // a source merely sitting at a queue rank, since claims are taken
-                // before the queue wait.
-                "parts_busy" => crate::types::SourceStatus::Connecting,
+                // Transient hold-offs, not failures, and each now says which one
+                // it is. Both are routine — the connection cap saturates on any
+                // busy download, and a source arriving while every part it holds
+                // is already in flight is the normal endgame of a well-swarmed
+                // file — but neither is a failure and neither is a dial.
+                //
+                // These have been rendered two wrong ways already. `Failed` meant
+                // the drawer deleted healthy rows and counted them as failures;
+                // `Connecting` meant a row could sit claiming to be connecting for
+                // as long as the hold-off lasted, which is what a stalled download
+                // looks like from the outside and what made a real stall
+                // impossible to tell apart from a busy one.
+                "too_many_conns" => crate::types::SourceStatus::WaitingForSlot,
+                "parts_busy" => crate::types::SourceStatus::PartsBusy,
                 // The LowID/callback path reports its post-handshake state with
                 // this string rather than a bare "connecting".
                 "connected (callback)" => crate::types::SourceStatus::Connecting,
@@ -56765,13 +57972,30 @@ async fn handle_download_event(
             // `None` when the IP maps to more than one identity, so we never
             // mis-attribute a live connection or merge distinct peers behind one
             // NAT; callback placeholders at that IP are still cleaned up by
-            // label inside `supersede_duplicate_peer_rows`.
-            let live_hash = if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+            // their `placeholder` flag inside `supersede_duplicate_peer_rows`.
+            //
+            // The origin rides along on the same lookup. A worker event is the
+            // only thing that ever writes a row for a source nobody seeded a
+            // placeholder for, so without reading it back here those rows would
+            // be the ones with no Origin to show — and they are exactly the
+            // sources that are actually working.
+            let (live_hash, live_origin) = if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                // Provenance is recorded per file, so the lookup needs this
+                // transfer's hash. Read under its own guard, released before the
+                // source lock is taken, so the two are never held at once.
+                let file_hash_bytes = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id)
+                        .and_then(|t| parse_ed2k_hash16(&t.file_hash))
+                };
                 let sm = source_manager.read().await;
-                sm.get_user_hash_by_addr(v4, port)
-                    .or_else(|| sm.unique_user_hash_for_ip(v4))
+                (
+                    sm.get_user_hash_by_addr(v4, port)
+                        .or_else(|| sm.unique_user_hash_for_ip(v4)),
+                    file_hash_bytes.and_then(|fh| sm.get_source_origin(&fh, v4, port)),
+                )
             } else {
-                None
+                (None, None)
             };
             let (placeholder_removed, source_payload) = {
                 let mut mgr = transfer_manager.write().await;
@@ -56799,6 +58023,10 @@ async fn handle_download_event(
                         total_parts,
                         country_code: country_code.clone(),
                         user_hash: live_hash,
+                        origin: live_origin,
+                        // We are in contact with this peer, so whatever row is
+                        // here stops being a not-yet-contacted placeholder.
+                        placeholder: false,
                     },
                 );
                 // This row just changed a peer's state, which is exactly what
@@ -56879,6 +58107,10 @@ async fn handle_download_event(
                     "available_parts": available_parts,
                     "total_parts": total_parts,
                     "country_code": country_code,
+                    // Carried so a row this event creates (a source no
+                    // discovery placeholder was seeded for) shows its Origin
+                    // straight away, rather than blank until the next snapshot.
+                    "origin": live_origin,
                 }),
             );
             if let Some(payload) = source_payload {
@@ -57724,15 +58956,21 @@ fn convert_search_results(
             {
                 existing.source_addresses.push(p.source_addr);
             }
+            // Max, not sum. Both of these are one publisher's estimate of the
+            // same swarm, so adding them counts that swarm twice: eMule's
+            // `AddSources` and `AddCompleteSources` both branch on
+            // `m_bKademlia` and keep the larger value, and its parent rollup in
+            // `CSearchList::AddToList` maxes across children too.
+            //
+            // This summed `TAG_SOURCES`, citing `CSearch::ProcessResult`. That
+            // is the wrong function: it is the Kad search layer handing results
+            // to `AddToList`, which is where the merge — and the max — happens.
+            // The effect was an availability that climbed with the number of
+            // nodes that answered rather than with the size of the swarm.
             let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
-            *acc = acc
-                .saturating_add(effective_sources)
-                .min(MAX_KAD_AVAILABILITY);
+            *acc = (*acc).max(effective_sources).min(MAX_KAD_AVAILABILITY);
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
-            // TAG_COMPLETE_SOURCES is a swarm estimate from each publisher,
-            // not a partial count. Summing 50+50 inflates Complete / ranking;
-            // take max (same as cross-origin merge.rs). TAG_SOURCES still sums.
             let cs = complete_accum.entry(p.hash.clone()).or_insert(0);
             *cs = (*cs).max(p.complete_sources_tag).min(MAX_KAD_AVAILABILITY);
             existing.file.complete_sources = *cs;

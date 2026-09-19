@@ -11,6 +11,35 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use super::messages::PARTSIZE;
 
+/// Bumped whenever any tracker clears a `part_verified` bit.
+///
+/// The upload path caches a `PartTracker` parsed from `.part.met` for up to
+/// `PART_TRACKER_REFRESH` so a partial-file seed does not re-read that file on
+/// every `OP_REQUESTPARTS`. Staleness is harmless in the "newly verified"
+/// direction — advertising a part slightly late costs nothing — but not in the
+/// other one: a failed whole-file hash re-opens verified parts
+/// (`multi_source`), and a rejected hashset clears every bit
+/// (`clear_part_hashes_and_verified`). Until the cache expired, the upload
+/// session kept reporting those parts verified and kept serving their bytes,
+/// which is exactly the corrupt-block propagation `is_range_safe_to_serve`
+/// exists to prevent.
+///
+/// Global rather than per-file because an upload session holds no handle to
+/// the download worker's tracker. The cost of the over-broad signal is one
+/// extra `.part.met` parse on unrelated partial seeds, which is far cheaper
+/// than shipping bytes we can no longer vouch for.
+static VERIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of [`VERIFICATION_EPOCH`]. A cached tracker built at a
+/// different epoch may hold verified bits that have since been cleared.
+pub fn verification_epoch() -> u64 {
+    VERIFICATION_EPOCH.load(Ordering::Acquire)
+}
+
+fn bump_verification_epoch() {
+    VERIFICATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 const OLD_PART_MET_MAGIC: u32 = 0x504D4554; // "PMET" - legacy format
 
 /// eMule version bytes for .part.met files
@@ -277,6 +306,28 @@ pub struct PartTracker {
 /// under `ED2K_MAX_FILE_SIZE_BYTES`). The tracker constructors, the
 /// restore-from-disk path and `commands::transfers::verify_recovery_ranges`
 /// are all reachable without ever passing that gate.
+/// Pack a per-part bitmap for the UI, in the encoding `PartsBar.svelte` reads:
+/// byte index = `part / 8`, bit index = `part % 8`, LSB-first within each byte,
+/// rendered as lowercase hex pairs.
+///
+/// The same encoding the upload direction already ships (`build_up_part_status`
+/// in `upload.rs`), so the download chunk map can reuse the component that
+/// draws the upload one.
+pub fn pack_part_bitmap(bits: &[bool]) -> String {
+    let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            bytes[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 fn tracked_part_count(file_size: u64, part_file: &Path) -> Option<usize> {
     if file_size == 0 {
         return Some(0);
@@ -407,8 +458,14 @@ impl PartTracker {
     pub fn clear_part_hashes_and_verified(&mut self) {
         self.part_hashes.clear();
         self.file_hash_verified = false;
+        let had_verified = self.part_verified.iter().any(|&v| v);
         for flag in self.part_verified.iter_mut() {
             *flag = false;
+        }
+        if had_verified {
+            // An upload session may be serving these parts out of a cached
+            // tracker right now; see `VERIFICATION_EPOCH`.
+            bump_verification_epoch();
         }
     }
 
@@ -464,6 +521,11 @@ impl PartTracker {
         let (start, end) = self.part_range(part_idx);
         self.add_gap(start, end);
         if part_idx < self.part_verified.len() {
+            if self.part_verified[part_idx] {
+                // See `VERIFICATION_EPOCH`: a partial-file upload session may
+                // still be serving this part from a cached tracker.
+                bump_verification_epoch();
+            }
             self.part_verified[part_idx] = false;
         }
     }
@@ -539,8 +601,16 @@ impl PartTracker {
         if start < end && end <= self.file_size && !self.part_verified.is_empty() {
             let first = (start / PARTSIZE) as usize;
             let last = ((end - 1) / PARTSIZE) as usize;
+            let mut cleared = false;
             for p in first..=last.min(self.part_count.saturating_sub(1)) {
+                cleared |= self.part_verified[p];
                 self.part_verified[p] = false;
+            }
+            if cleared {
+                // See `VERIFICATION_EPOCH`. AICH-identified bad blocks land
+                // here, so this is the path that most needs an upload session
+                // to stop serving the range immediately.
+                bump_verification_epoch();
             }
         }
     }
@@ -1968,6 +2038,80 @@ fn write_gap_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path that withdraws a verified bit has to advance the global
+    /// epoch, because a partial-file upload session may be serving that part
+    /// right now out of a `PartTracker` it parsed up to 500 ms ago. Without
+    /// the bump it keeps serving bytes whose hash check has been retracted.
+    ///
+    /// Asserted as "advanced", never as "unchanged": the epoch is process-wide
+    /// and other tests run in parallel, so only a positive claim is sound.
+    #[test]
+    fn withdrawing_a_verified_part_advances_the_verification_epoch() {
+        let file_size = PARTSIZE * 3;
+
+        // mark_incomplete: the whole-file-hash-failure path in multi_source.
+        let mut tracker = PartTracker::new(file_size, Path::new("reopen.part"));
+        tracker.mark_complete(0);
+        tracker.set_part_verified(0);
+        let before = verification_epoch();
+        tracker.mark_incomplete(0);
+        assert!(
+            verification_epoch() > before,
+            "re-opening a verified part must invalidate cached upload trackers"
+        );
+        assert!(!tracker.is_part_verified(0));
+
+        // invalidate_range: the AICH bad-block path.
+        let mut tracker = PartTracker::new(file_size, Path::new("aich.part"));
+        tracker.mark_complete(1);
+        tracker.set_part_verified(1);
+        let before = verification_epoch();
+        tracker.invalidate_range(PARTSIZE, PARTSIZE * 2);
+        assert!(
+            verification_epoch() > before,
+            "an AICH-identified bad range must invalidate cached upload trackers"
+        );
+
+        // clear_part_hashes_and_verified: a rejected `.part.met` hashset.
+        let mut tracker = PartTracker::new(file_size, Path::new("hashset.part"));
+        tracker.mark_complete(2);
+        tracker.set_part_verified(2);
+        let before = verification_epoch();
+        tracker.clear_part_hashes_and_verified();
+        assert!(
+            verification_epoch() > before,
+            "rejecting a hashset must invalidate cached upload trackers"
+        );
+        assert!(!tracker.is_part_verified(2));
+    }
+
+    /// The chunk map in the File Details window is drawn by the same component
+    /// that draws the upload parts bar, so this has to pack bits the way that
+    /// component unpacks them: byte = `part / 8`, bit = `part % 8`, LSB-first.
+    /// Getting the bit order backwards would draw a plausible-looking map of
+    /// the wrong parts.
+    #[test]
+    fn part_bitmaps_pack_lsb_first_within_each_byte() {
+        assert_eq!(pack_part_bitmap(&[]), "");
+        assert_eq!(pack_part_bitmap(&[true]), "01");
+        assert_eq!(pack_part_bitmap(&[false]), "00");
+        // Part 7 is the high bit of the first byte; part 8 opens the second.
+        assert_eq!(
+            pack_part_bitmap(&[false, false, false, false, false, false, false, true]),
+            "80"
+        );
+        assert_eq!(pack_part_bitmap(&[true, false, true]), "05");
+
+        // Round-trip against the reader's own bit test, so the two cannot drift
+        // apart without this failing.
+        let bits: Vec<bool> = (0..20).map(|i| i % 3 == 0).collect();
+        let hex = pack_part_bitmap(&bits);
+        for (i, &want) in bits.iter().enumerate() {
+            let byte = u8::from_str_radix(&hex[(i / 8) * 2..(i / 8) * 2 + 2], 16).unwrap();
+            assert_eq!(byte & (1 << (i % 8)) != 0, want, "part {i}");
+        }
+    }
 
     fn temp_part_path(name: &str) -> PathBuf {
         let unique = format!(

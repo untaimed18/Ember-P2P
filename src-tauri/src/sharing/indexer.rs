@@ -5,8 +5,7 @@ use std::sync::atomic::AtomicBool;
 
 use tracing::{debug, info, warn};
 
-use crate::network::ed2k::aich::compute_aich_root;
-use crate::network::ed2k::hash::{ed2k_hash_file, hash_file_combined_cancellable};
+use crate::network::ed2k::hash::hash_file_combined_cancellable;
 use crate::search::index::normalize_path_key;
 use crate::types::FileInfo;
 
@@ -427,19 +426,7 @@ impl FileIndexer {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn hash_file(path: &Path) -> anyhow::Result<(String, String)> {
-        let ed2k = ed2k_hash_file(path)?;
-        // AICH failures must propagate: an empty AICH hex would look like a
-        // legitimate (empty-file) hash to callers and be served to peers as
-        // authoritative recovery data, which is dangerous.
-        let aich = compute_aich_root(path)
-            .map(hex::encode)
-            .map_err(|e| anyhow::anyhow!("AICH hash failed for {}: {e}", path.display()))?;
-        Ok((ed2k, aich))
-    }
-
-    /// Cancellable version -- computes ed2k, AICH, part hashes, and ember
+    /// Computes ed2k, AICH, part hashes, and ember
     /// BLAKE3 (plus size/mtime) in a single pass for `known.met`.
     pub fn hash_file_cancellable(
         path: &Path,
@@ -462,11 +449,137 @@ impl FileIndexer {
             .unwrap_or(0);
         Ok((ed2k, aich, part_hashes, ember, after.len(), modified_at))
     }
+
+    /// Compute only the Ember BLAKE3 digest, carrying forward an ed2k hash and
+    /// AICH root that `known.met` already holds.
+    ///
+    /// Same shape and same guarantees as [`Self::hash_file_cancellable`] — the
+    /// symlink refusal and the size/mtime check on both sides of the read are
+    /// identical — so callers can swap between them per file.
+    ///
+    /// The returned part-hash list is empty, which is correct rather than
+    /// lossy: a record that already carries an ed2k hash already carries its
+    /// part hashes, and `fresh_part_hash_handoff` treats an empty list as
+    /// "nothing new to hand over" rather than as an erasure.
+    ///
+    /// What this gives up is that the full pass would have recomputed the MD4
+    /// and noticed a file whose contents changed without its size or mtime
+    /// moving. That is not a protection being removed so much as one that was
+    /// never offered: every file this scan *doesn't* queue is accepted on the
+    /// strength of the same path+size+mtime match, by `resolve_from_known`.
+    pub fn hash_file_digest_only_cancellable(
+        path: &Path,
+        known_ed2k: String,
+        known_aich: String,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)> {
+        let before = std::fs::symlink_metadata(path)?;
+        if before.is_symlink() {
+            anyhow::bail!("refusing to hash symlink: {}", path.display());
+        }
+        let before_modified = before.modified().ok();
+        let ember = crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled)?;
+        let after = std::fs::symlink_metadata(path)?;
+        let after_modified = after.modified().ok();
+        if before.len() != after.len() || before_modified != after_modified {
+            anyhow::bail!("file changed while hashing: {}", path.display());
+        }
+        let modified_at = after_modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        Ok((
+            known_ed2k,
+            known_aich,
+            Vec::new(),
+            ember,
+            after.len(),
+            modified_at,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The digest the migration writes is what a download later verifies
+    /// against, so the short-cut pass has to agree with the full one byte for
+    /// byte. Everything else it returns is carried through from `known.met`
+    /// unchanged, and the part-hash list is empty because the record already
+    /// has one.
+    #[test]
+    fn the_digest_only_pass_agrees_with_the_full_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-digest-only-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.bin");
+
+        // Over PARTSIZE, so the full pass produces real part hashes and the
+        // contrast with the short-cut's empty list is meaningful.
+        let size = crate::network::ed2k::hash::PARTSIZE as usize + 4096;
+        let mut data = vec![0u8; size];
+        let mut x: u32 = 0x9E37_79B9;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        std::fs::write(&path, &data).expect("write sample");
+
+        let flag = AtomicBool::new(false);
+        let (ed2k, aich, parts, ember, full_size, full_mtime) =
+            FileIndexer::hash_file_cancellable(&path, &flag).expect("full pass");
+        assert!(!parts.is_empty(), "a multi-part file has part hashes");
+
+        let (short_ed2k, short_aich, short_parts, short_ember, short_size, short_mtime) =
+            FileIndexer::hash_file_digest_only_cancellable(
+                &path,
+                ed2k.clone(),
+                aich.clone(),
+                &flag,
+            )
+            .expect("digest-only pass");
+
+        assert_eq!(short_ember, ember, "the digest must match the full pass");
+        assert_eq!(short_ed2k, ed2k);
+        assert_eq!(short_aich, aich);
+        assert_eq!(short_size, full_size);
+        assert_eq!(short_mtime, full_mtime);
+        assert!(
+            short_parts.is_empty(),
+            "part hashes stay on the known.met record rather than being recomputed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stopping a scan has to stop this pass too, mid-file, the same way the
+    /// full one stops.
+    #[test]
+    fn the_digest_only_pass_honours_cancellation() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-digest-cancel-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.bin");
+        std::fs::write(&path, vec![7u8; 4 * 1024 * 1024]).expect("write sample");
+
+        let flag = AtomicBool::new(true);
+        let result = FileIndexer::hash_file_digest_only_cancellable(
+            &path,
+            "ab".repeat(16),
+            "cd".repeat(20),
+            &flag,
+        );
+        assert!(result.is_err(), "an already-cancelled pass must not return a digest");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn excludes_credential_files() {

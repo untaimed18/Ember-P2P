@@ -5,6 +5,12 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
 import { shedWeakestRows } from '$lib/searchOverflow';
+import {
+  PERSIST_RETRY_LIMITS,
+  SEARCH_STORAGE_KEY,
+  buildPersistPayload,
+  parsePersistedSearch,
+} from '$lib/searchPersistence';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
 
@@ -44,8 +50,66 @@ export type SearchTab = {
   error: string | null;
 };
 
-export const searchTabs = writable<SearchTab[]>([]);
-export const activeSearchTabId = writable<string | null>(null);
+/**
+ * Restore the tabs a reload would otherwise have thrown away. The rules live in
+ * `searchPersistence.ts`; what is left here is the storage itself.
+ *
+ * Written at `pagehide` rather than on every change: results arrive in batches
+ * and a tab can hold thousands of rows, so serialising on each update would
+ * cost far more than the one write that actually matters.
+ */
+function persistSearch() {
+  if (typeof sessionStorage === 'undefined') return;
+  const tabs = get(searchTabs);
+  if (tabs.length === 0) {
+    try {
+      sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+    } catch {
+      /* nothing to lose */
+    }
+    return;
+  }
+  const activeId = get(activeSearchTabId);
+  for (const limit of PERSIST_RETRY_LIMITS) {
+    try {
+      const payload = buildPersistPayload(tabs, activeId, limit);
+      sessionStorage.setItem(SEARCH_STORAGE_KEY, JSON.stringify(payload));
+      return;
+    } catch {
+      // Quota, or a value that would not serialise. Try a smaller payload.
+    }
+  }
+}
+
+/** Read the persisted blob, or `null` if it cannot be read at all.
+ *
+ *  `persistSearch` already wraps its writes, but this read was guarded only
+ *  against `sessionStorage` being undefined. A webview with storage disabled by
+ *  policy throws `SecurityError` from the property access itself, and because
+ *  this runs at module scope that throw takes the store — and the whole search
+ *  page — down with it. */
+function readPersistedSearch(): string | null {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    return sessionStorage.getItem(SEARCH_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+const persistedSearch = parsePersistedSearch(readPersistedSearch());
+
+export const searchTabs = writable<SearchTab[]>(persistedSearch.tabs);
+export const activeSearchTabId = writable<string | null>(persistedSearch.activeId);
+
+if (typeof window !== 'undefined') {
+  // `pagehide` covers the reload and the window going away; the hidden branch
+  // of `visibilitychange` is the backstop for paths that do not fire it.
+  window.addEventListener('pagehide', persistSearch);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') persistSearch();
+  });
+}
 /** Bumped when learned spam data is wiped so the search page can drop
  *  tooltip caches that would otherwise outlive empty `spam_reasons`. */
 export const spamFilterEpoch = writable(0);
@@ -130,6 +194,30 @@ function pickEmberDigest(existingDigest: string, existingOrigin: string, incomin
   return existingOrigin.includes('Local') ? existingDigest : incomingDigest;
 }
 
+/**
+ * Whether a merge adopts the incoming row's spam explanation or keeps the one
+ * it holds.
+ *
+ * `spam_rating` is merged with max and `is_spam` with OR, so the two lists have
+ * to follow the verdict that survived — otherwise a row shows a high score above
+ * a signal list that only justifies a low one, which is exactly what a user
+ * reads to decide whether to trust a file. The merged verdict is the OR, so the
+ * explanation must come from a side that actually flagged the row; only once the
+ * two agree on the verdict does the score decide. Asking merely "does incoming
+ * newly flag, or outscore?" left a flagged 50 meeting an unflagged 60 keeping
+ * `is_spam` while adopting the unflagged pass's reasons, and made the result
+ * depend on which batch happened to arrive first.
+ *
+ * Mirrors `takes_incoming_spam_signals` in `src-tauri/src/search/merge.rs`;
+ * pinned for both sides by `scripts/fixtures/merge-contract.json`. Keep it
+ * closed over nothing — `scripts/merge-contract.test.mjs` lifts this body out
+ * and runs it.
+ */
+function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: number, incomingIsSpam: boolean, incomingRating: number): boolean {
+  if (incomingIsSpam !== existingIsSpam) return incomingIsSpam;
+  return incomingRating > existingRating;
+}
+
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
@@ -191,9 +279,19 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   // to travel together: prose from one scoring pass beside codes from another
   // would render two different explanations for one row. A user override
   // carries no codes — its text is already in the active locale.
+  //
+  // Which verdict's explanation to keep is `takesIncomingSpamSignals`, the same
+  // rule `merge_into` applies in merge.rs. This used to adopt the incoming pair
+  // whenever the incoming row was flagged at all, ignoring the score.
+  const takeIncomingSignals = takesIncomingSpamSignals(
+    !!existing.is_spam,
+    existing.spam_rating ?? 0,
+    !!incoming.is_spam,
+    incoming.spam_rating ?? 0,
+  );
   const spamSignals = override?.reasons
     ? { spam_reasons: override.reasons, spam_reason_details: undefined }
-    : incoming.is_spam && (incoming.spam_reasons?.length ?? 0) > 0
+    : takeIncomingSignals && (incoming.spam_reasons?.length ?? 0) > 0
       ? incoming
       : existing.spam_reasons?.length
         ? existing

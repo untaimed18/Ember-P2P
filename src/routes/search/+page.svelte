@@ -565,8 +565,20 @@
   ];
   const DEFAULT_COLUMN_VIS: Record<MediaColumn, boolean> = {
     length: true, bitrate: true, codec: true,
-    artist: false, album: false, title: false, complete: false,
+    artist: false, album: false, title: false,
+    // Shown by default. It was hidden, and the only way to reach it was the
+    // Columns button above the table — right-clicking the header, which is
+    // where eMule keeps its column picker and where users look first, fell
+    // through to the webview's own menu. So the column read as missing
+    // entirely, which is the one thing it cannot afford to be: it says
+    // whether anyone in the swarm holds the whole file.
+    complete: true,
   };
+  // Bumped when a default above changes in a way that should reach users who
+  // already have prefs stored. `columnVis` is persisted wholesale on every
+  // change, so a stored `false` from the old default would otherwise outlive
+  // it forever, and there is no way to tell it apart from a deliberate choice.
+  const COLUMN_VIS_REV = 1;
   let columnVis = $state<Record<MediaColumn, boolean>>({ ...DEFAULT_COLUMN_VIS });
   let showColumnMenu = $state(false);
   let syntaxHelpEl = $state<HTMLDetailsElement | undefined>(undefined);
@@ -575,6 +587,96 @@
     // Reassign (rather than mutate in place) so the persistence $effect, which
     // tracks `columnVis` by reference, re-runs and saves the change.
     columnVis = { ...columnVis, [key]: !columnVis[key] };
+  }
+
+  /// Right-clicking the header opens the Columns menu, the way the transfers
+  /// tables do it. Without this the header had no handler at all, so the
+  /// webview answered with Back/Forward/Stop/Reload — and picking Reload there
+  /// throws away the results the user was looking at.
+  function openColumnMenuFromHeader(e: MouseEvent) {
+    e.preventDefault();
+    showColumnMenu = true;
+  }
+
+  /// Origins whose Complete Sources figure was counted by something able to
+  /// count it: a server reads its own source table, an Ember row counts
+  /// distinct signatures, a local row is our own file.
+  const COUNTS_COMPLETE_SOURCES = ['Server', 'UDP', 'Ember', 'Local'];
+
+  /// Whether to show this row's Complete Sources figure as a number at all.
+  ///
+  /// Mirrors `complete_sources_known` in `src-tauri/src/search/merge.rs`, which
+  /// follows eMule: `CSearchFile::IsComplete` returns unknown for every
+  /// Kademlia result, and the Kad rollup of `FT_COMPLETE_SOURCES` is commented
+  /// out in `CSearchList::AddToList` as "not yet supported". A Kad publisher's
+  /// count is its claim about a swarm it cannot see, and printing it next to a
+  /// source count that was arrived at differently produced rows asserting more
+  /// complete sources than sources.
+  ///
+  /// Derived from `result_origin` rather than carried as its own field because
+  /// that string is merged by the same rules on both sides, so this cannot
+  /// drift out of step with it.
+  function completeSourcesKnown(origin: string | undefined): boolean {
+    return (origin ?? '')
+      .split('·')
+      .some((part) => COUNTS_COMPLETE_SOURCES.includes(part.trim()));
+  }
+
+  /// One eD2k part (`PARTSIZE`). A file no larger than this has exactly one
+  /// part, so anyone sharing it at all is sharing the whole thing — which is
+  /// how eMule answers "complete?" for a result whose count it otherwise
+  /// declines to trust (`CSearchListCtrl::GetCompleteSourcesDisplayString`).
+  const PARTSIZE = 9_728_000;
+
+  type CompleteState =
+    | { kind: 'unknown' }
+    /// Known complete, but with no usable denominator to express it as a share.
+    | { kind: 'yes' }
+    | { kind: 'ratio'; percent: number; complete: number; sources: number };
+
+  /// What the Complete Sources column can say about a row.
+  ///
+  /// eMule shows this as a share of the sources rather than a bare count
+  /// (`(uCompleteSources*100)/uSources`), which is the more useful reading: two
+  /// complete sources out of three is a download that will finish, and two out
+  /// of two hundred is one that probably will not.
+  function completeState(r: SearchResult): CompleteState {
+    const complete = r.file.complete_sources ?? 0;
+    const sources = r.availability ?? 0;
+    if (!completeSourcesKnown(r.result_origin)) {
+      return r.file.size > 0 && r.file.size <= PARTSIZE
+        ? { kind: 'yes' }
+        : { kind: 'unknown' };
+    }
+    if (complete > 0 && sources > 0) {
+      return {
+        kind: 'ratio',
+        // Floored at 1%, which is the one place this departs from eMule. Its
+        // integer division prints 0% for one complete source among two
+        // hundred, which reads exactly like the case where nobody has the
+        // whole file — the opposite conclusion, on the one question this
+        // column exists to answer. Reserving 0% for a genuine zero keeps that
+        // distinction. Capped at 100% for the converse: a single server
+        // claiming more complete sources than it has sources.
+        percent: Math.min(100, Math.max(1, Math.floor((complete * 100) / sources))),
+        complete,
+        sources,
+      };
+    }
+    // Complete with nothing to divide by, or a known zero — which is the
+    // answer this column exists to give, so it is said as 0% rather than left
+    // blank.
+    return complete > 0 ? { kind: 'yes' } : { kind: 'ratio', percent: 0, complete: 0, sources };
+  }
+
+  /// Ranks by the share shown, so the column sorts by what it displays. eMule
+  /// compares the same ratio. Unknown ranks lowest; the absolute count breaks
+  /// ties so that two complete sources out of two do not outrank fifty out of
+  /// fifty.
+  function completeSourcesForSort(r: SearchResult): number {
+    const state = completeState(r);
+    const percent = state.kind === 'unknown' ? -1 : state.kind === 'yes' ? 100 : state.percent;
+    return percent * 100_000 + Math.min(99_999, r.file.complete_sources ?? 0);
   }
 
   let destroyed = false;
@@ -804,6 +906,11 @@
         for (const c of MEDIA_COLUMNS) {
           if (typeof p.columnVis[c.key] === 'boolean') next[c.key] = p.columnVis[c.key];
         }
+        // Prefs written before the current revision keep the defaults for any
+        // column the revision changed, rather than the value they stored.
+        if (p.columnVisRev !== COLUMN_VIS_REV) {
+          next.complete = DEFAULT_COLUMN_VIS.complete;
+        }
         columnVis = next;
       }
       if (typeof p.hideSpam === 'boolean') hideSpam = p.hideSpam;
@@ -834,6 +941,7 @@
         filterMinSources,
         filterMinComplete,
         columnVis,
+        columnVisRev: COLUMN_VIS_REV,
         hideSpam,
         showAdvancedFilters,
         sortField,
@@ -1080,6 +1188,17 @@
   onMount(() => {
     loadPersistedPrefs();
     prefsRestored = true;
+
+    // Arriving on this page puts the caret in the query box. Typing is what
+    // someone came here to do, and it saves a click every single time.
+    //
+    // Deferred a frame rather than called here: `bind:this` is settled by the
+    // time `onMount` runs, but the tab strip and the readiness hint above the
+    // bar are still laying out, and focusing mid-layout can scroll the page to
+    // an element that is about to move. `focusInput` selects as well as
+    // focuses, so a query restored from a previous session is replaced by
+    // typing rather than appended to.
+    const focusFrame = requestAnimationFrame(() => searchBar?.focusInput());
     getSettings()
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
@@ -1166,6 +1285,7 @@
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
+      cancelAnimationFrame(focusFrame);
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);
       if (typeof document !== 'undefined') {
@@ -1394,7 +1514,14 @@
       if (minBytes > 0 && r.file.size < minBytes) continue;
       if (maxBytes > 0 && r.file.size > maxBytes) continue;
       if (minSrc > 0 && r.availability < minSrc) continue;
-      if (minComplete > 0 && (r.file.complete_sources ?? 0) < minComplete) continue;
+      // A row whose complete count is unknown survives this filter rather than
+      // being judged on a figure the column itself declines to show. eMule does
+      // the same: `CSearchListCtrl::IsComplete` returns true for unknown.
+      if (
+        minComplete > 0
+        && completeSourcesKnown(r.result_origin)
+        && (r.file.complete_sources ?? 0) < minComplete
+      ) continue;
       if (isFilteredByText(r)) continue;
       out.push(r);
     }
@@ -1431,7 +1558,11 @@
           cmp = (a.media?.bitrate ?? 0) - (b.media?.bitrate ?? 0);
           break;
         case 'complete':
-          cmp = (a.file.complete_sources ?? 0) - (b.file.complete_sources ?? 0);
+          // Unknown sorts as zero, so the rows showing `?` group together
+          // instead of being ordered by a number nobody can see. eMule lands in
+          // the same place: its Kad rollup of `FT_COMPLETE_SOURCES` is left at
+          // zero, so those rows sort at the bottom too.
+          cmp = completeSourcesForSort(a) - completeSourcesForSort(b);
           break;
         case 'codec':
           cmp = sortCollator.compare(a.media?.codec ?? '', b.media?.codec ?? '');
@@ -1563,6 +1694,30 @@
   function shortenTabLabel(s: string, max = 28): string {
     const t = s.trim() || '—';
     return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+  }
+
+  /**
+   * Turn a size box's number and unit into a byte count the backend can accept.
+   *
+   * The boxes are `step="any"`, so `1.5` GB is a legitimate thing to type — but
+   * `search_files` declares `min_size` / `max_size` as `Option<u64>`, and serde
+   * rejects a JSON float outright ("invalid type: floating point `104857.6`,
+   * expected u64"). That error comes from argument deserialization, so it fires
+   * before the command body runs: typing `0.1` into Min Size made *every*
+   * search, on every network, fail with an unhelpful invalid-argument message
+   * and no results. And because the box is persisted to `localStorage` and
+   * restored behind nothing stricter than `Number.isFinite`, it stayed broken
+   * across restarts until someone thought to clear the field.
+   *
+   * Rounded, then held to `MAX_SAFE_INTEGER`: past that JS cannot represent the
+   * count exactly anyway, and `JSON.stringify` starts emitting an exponent,
+   * which serde reads as a float and rejects for the same reason.
+   */
+  function sizeToBytes(value: number | null, unit: number): number | undefined {
+    if (value === null) return undefined;
+    const bytes = Math.round(value * unit);
+    if (!Number.isFinite(bytes) || bytes < 0) return undefined;
+    return Math.min(bytes, Number.MAX_SAFE_INTEGER);
   }
 
   /** Split a byte count back into the number and unit the size boxes hold. */
@@ -1779,17 +1934,18 @@
       filterType = searchFileType === 'Pro' ? '' : searchFileType;
     }
     const wireFileType = plan ? undefined : searchFileType || undefined;
-    const parsedMinSize = filterMinSize !== null ? filterMinSize * filterMinUnit : undefined;
-    const parsedMaxSize = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : undefined;
+    // `sizeToBytes` rounds and bounds; NaN, Infinity (e.g. "1e400") and
+    // negatives all come back as `undefined`, which is the same "no constraint"
+    // the boxes mean when empty.
+    const parsedMinSize = sizeToBytes(filterMinSize, filterMinUnit);
+    const parsedMaxSize = sizeToBytes(filterMaxSize, filterMaxUnit);
     const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
-    // Reject NaN *and* Infinity (e.g. "1e400") and negatives — `Number.isFinite`
-    // excludes both, unlike the previous `!isNaN` which let Infinity through.
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
       ? {}
       : {
           fileExtension: filterExtension.trim() || undefined,
-          minSize: parsedMinSize !== undefined && Number.isFinite(parsedMinSize) && parsedMinSize >= 0 ? parsedMinSize : undefined,
-          maxSize: parsedMaxSize !== undefined && Number.isFinite(parsedMaxSize) && parsedMaxSize >= 0 ? parsedMaxSize : undefined,
+          minSize: parsedMinSize,
+          maxSize: parsedMaxSize,
           minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
         };
     // A related search whose seed filename yielded no searchable word is still
@@ -1863,6 +2019,10 @@
       searchInvokeSettled.add(t.requestId);
       clearSearchTimeoutForRequest(t.requestId);
       flushPendingSearchResults(t.requestId);
+      // `openSearchTab` is about to rotate this tab's id, so nothing will ever
+      // consult the entry again. Every other settle path prunes the set; this
+      // one grew it by an id per superseded search until the page unmounted.
+      forgetSettledRequest(t.requestId);
     }
     // `probes` is ordered most-specific-first, so the first one carrying a query
     // is the best one-line answer to "what is this tab looking for".
@@ -2092,6 +2252,21 @@
     spamExplainLoading = false;
     spamExplainError = null;
   }
+
+  // A tab that crosses `MAX_TAB_RESULTS` sheds its weakest rows by availability,
+  // and `shedWeakestRows` knows nothing about which row the user is reading — so
+  // an open details dialog can have its row evicted out from under it. The dialog
+  // itself is gated on `selectedResult` and unmounts on its own, but the key
+  // stayed set, and three things hang off that: the in-flight notes and
+  // spam-explain guards compare against `selectedResult`, so `loadingNotes` and
+  // `spamExplainLoading` were never cleared; the focus-restore effect stayed
+  // armed; and the document Escape handler kept a branch that swallowed the key
+  // with nothing on screen to close. Tear the rest down when the row goes.
+  $effect(() => {
+    if (selectedResultKey && selectedResult === null) {
+      closeFileDetails();
+    }
+  });
 
   $effect(() => {
     if (!detailsOverlayEl) return;
@@ -3297,13 +3472,16 @@
       </div>
 
       <div class="filter-group">
-        <label for="filter-complete">{m.search_min_complete_sources()}</label>
+        <!-- The unit needs saying now that the column beside it reads as a
+             percentage: this box still counts sources. -->
+        <label for="filter-complete" title={m.search_min_complete_sources_hint()}>{m.search_min_complete_sources()}</label>
         <input
           id="filter-complete"
           type="number"
           min="1"
           step="1"
           placeholder="—"
+          title={m.search_min_complete_sources_hint()}
           bind:value={filterMinComplete}
           class="sources-input"
         />
@@ -3463,7 +3641,7 @@
       </div>
     {/if}
     <table class="search-results-table">
-      <thead>
+      <thead oncontextmenu={openColumnMenuFromHeader}>
         <tr>
           <th class="col-check">
             <input
@@ -3487,11 +3665,17 @@
           <th class="sortable col-origin" role="columnheader" aria-sort={sortField === 'origin' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('origin')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('origin'))}>
             {m.search_col_source()}{sortIndicator('origin')}
           </th>
-          <th class="sortable col-sources" role="columnheader" aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
+          <!-- The header says what the number is, because the number is
+               reliably lower than what the Transfers pane shows once the
+               download starts, and that difference reads as a bug. A search
+               carries whatever estimate the answering node happened to hold;
+               starting the download asks every network for sources directly.
+               eMule's search list is the same, and for the same reason. -->
+          <th class="sortable col-sources" role="columnheader" title={m.search_col_sources_hint()} aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
             {m.search_col_sources()}{sortIndicator('sources')}
           </th>
           {#if columnVis.complete}
-            <th class="sortable col-complete" role="columnheader" aria-sort={sortField === 'complete' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('complete')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('complete'))}>
+            <th class="sortable col-complete" role="columnheader" title={m.search_col_complete_sources_hint()} aria-sort={sortField === 'complete' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('complete')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('complete'))}>
               {m.search_col_complete_sources()}{sortIndicator('complete')}
             </th>
           {/if}
@@ -3551,7 +3735,19 @@
               <input
                 type="checkbox"
                 checked={checkedKeys.has(rKey)}
-                onclick={(e) => { e.stopPropagation(); toggleCheck(rKey, idx, e.shiftKey); }}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  toggleCheck(rKey, idx, e.shiftKey);
+                  // The native click has already flipped the DOM. Shift-clicking
+                  // a row that is *inside* the range extends the selection
+                  // without changing this row's membership, so the reactive
+                  // `checked` expression above lands on the value it already
+                  // had, Svelte sees no change and writes nothing back — leaving
+                  // an unticked box on a row that is still selected, still
+                  // highlighted, still counted, and still downloaded by the bulk
+                  // actions. Restore it from the state that just settled.
+                  e.currentTarget.checked = checkedKeys.has(rKey);
+                }}
                 aria-label={m.search_select_result({ name: displayName(result) })}
               />
             </td>
@@ -3622,7 +3818,16 @@
               </span>
             </td>
             {#if columnVis.complete}
-              <td class="col-complete">{result.file.complete_sources ? result.file.complete_sources : '\u2014'}</td>
+              <!-- The share is what the cell has room for at this width; the
+                   counts behind it ride along in the tooltip. -->
+              {@const cs = completeState(result)}
+              {#if cs.kind === 'unknown'}
+                <td class="col-complete" title={m.common_unknown()}>?</td>
+              {:else if cs.kind === 'yes'}
+                <td class="col-complete" title={m.search_complete_single_part()}>{m.common_yes()}</td>
+              {:else}
+                <td class="col-complete" title={`${cs.complete} / ${cs.sources}`}>{cs.percent}%</td>
+              {/if}
             {/if}
             {#if columnVis.length}
               <td class="col-length">{result.media?.duration ? formatMediaLength(result.media.duration) : '\u2014'}</td>

@@ -12,9 +12,11 @@
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import {
     navItems,
+    navGroupLabel,
     navIndexFromShortcutEvent,
     navShortcutDigit,
     visibleNavItems,
+    type NavGroup,
     type NavItem,
   } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
@@ -27,6 +29,31 @@
   // Shared with the keyboard cheat-sheet so Alt+N is numbered against the
   // list the user can actually see.
   let visibleNav = $derived(visibleNavItems($appSettings?.ember_native_enabled));
+
+  /**
+   * The nav split into its titled runs, each entry keeping the index it has in
+   * the flat list.
+   *
+   * The index has to travel with the item because Alt+N is numbered against
+   * the flat order — `navShortcutDigit` takes a position in `visibleNav`, not
+   * a position within a group.
+   *
+   * Grouping in the markup rather than by watching for a change of group
+   * between successive rows, which is how this started: that produced captions
+   * that were siblings of the links rather than headings for them, so the only
+   * way to keep a screen reader from reading them as twelfth and thirteenth
+   * list items was `aria-hidden`, which hid the grouping from exactly the
+   * users who cannot see the layout expressing it.
+   */
+  let navRuns = $derived.by(() => {
+    const runs: { group: NavGroup; entries: { item: NavItem; index: number }[] }[] = [];
+    visibleNav.forEach((item, index) => {
+      const open = runs[runs.length - 1];
+      if (open && open.group === item.group) open.entries.push({ item, index });
+      else runs.push({ group: item.group, entries: [{ item, index }] });
+    });
+    return runs;
+  });
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -295,9 +322,23 @@
     </a>
   </div>
 
-  <ul class="nav-list">
-    {#each visibleNav as item, i}
-      {@const digit = navShortcutDigit(i)}
+  <!-- `.scroll-shadows` is the app's own cue for a pane with more in it than
+       fits; the list only scrolls in a short window, and without it the run it
+       cuts off just ends mid-row with nothing to say so. -->
+  <div class="nav-list scroll-shadows">
+    {#each navRuns as run (run.group)}
+      <!-- A real group with a real heading, so the structure the captions draw
+           is also the structure a screen reader announces. -->
+      <div class="nav-run" role="group" aria-labelledby={`nav-group-${run.group}`}>
+        <p class="nav-group" id={`nav-group-${run.group}`}>
+          <span class="nav-group-label">{navGroupLabel(run.group)}</span>
+          <!-- Stands in for the caption on the collapsed rail, where there is
+               no room for words but the grouping is still worth keeping. -->
+          <span class="nav-group-rule" aria-hidden="true"></span>
+        </p>
+        <ul class="nav-items">
+    {#each run.entries as { item, index } (item.id)}
+      {@const digit = navShortcutDigit(index)}
       <li>
         <a
           href={item.href}
@@ -420,7 +461,10 @@
         </a>
       </li>
     {/each}
-  </ul>
+        </ul>
+      </div>
+    {/each}
+  </div>
 
   <div class="sidebar-footer">
     <button
@@ -499,6 +543,7 @@
       </span>
       <span>{m.sidebar_share_ember()}</span>
     </button>
+    <div class="footer-sep" aria-hidden="true"></div>
     <button
       type="button"
       class="about-btn collapse-btn"
@@ -543,10 +588,14 @@
     width: 64px;
   }
 
+  /* Hairline under the wordmark, matching the one over the footer, so the
+     panel reads as header / destinations / utilities rather than one
+     undivided column. */
   .sidebar-header {
     display: flex;
     align-items: center;
     flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
   }
 
   .logo {
@@ -617,27 +666,98 @@
   }
 
   .nav-list {
-    list-style: none;
     padding: 4px 0 8px;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* The scroll-shadow utility paints its cover colour from this, and the
+       sidebar is a panel rather than the page. Without the override the cover
+       would be the page grey and read as a band across the top of the list. */
+    --scroll-cover: var(--bg-secondary);
   }
 
+  .nav-items {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* The caption over each run of related destinations. Same micro-type the
+     rest of the app uses for the labels above a value — small, spaced,
+     uppercase, muted — so the sidebar reads as part of the same family
+     rather than as chrome with its own rules. */
+  .nav-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    /* `<p>` for the heading, so the margin it arrives with has to go. */
+    margin: 0;
+    padding: 14px 16px 4px;
+  }
+
+  .nav-run:first-child .nav-group {
+    padding-top: 6px;
+  }
+
+  .nav-group-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  /* Only ever seen on the collapsed rail — see the rules below. */
+  .nav-group-rule {
+    display: none;
+  }
+
+  /* Collapsed, the captions are unreadable at 64px, so each becomes the
+     hairline it was standing in for. The grouping is the point; the words
+     were only ever how it was expressed when there was room. */
+  .sidebar.collapsed .nav-group {
+    padding: 10px 14px 6px;
+  }
+
+  .sidebar.collapsed .nav-run:first-child .nav-group {
+    padding-top: 4px;
+  }
+
+  .sidebar.collapsed .nav-group-label {
+    display: none;
+  }
+
+  .sidebar.collapsed .nav-group-rule {
+    display: block;
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* The utilities, closed off from the destinations above by the same hairline
+     the rest of the app divides things with. Deliberately the quietest part of
+     the panel: opening a dialog is not navigation, and a saturated block here
+     put the five least important rows above both the nav and the current-page
+     cue. */
   .sidebar-footer {
     border-top: 1px solid var(--border);
-    padding: 8px 12px 12px;
+    padding: 6px 0 8px;
     flex-shrink: 0;
   }
 
   .about-btn {
     display: flex;
     align-items: center;
-    gap: 10px;
+    /* Matches `.nav-list li a` on both counts, so the icon column and the
+       icon-to-label rhythm continue across the divide. */
+    gap: 12px;
     width: 100%;
+    /* Same row box as `.nav-list li a`, not a pixel off it: the two sit in one
+       column and any difference just reads as imprecision. */
     padding: 10px 16px;
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: 0;
     background: transparent;
     color: var(--text-muted);
     font-size: 13px;
@@ -655,6 +775,15 @@
   .about-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
+    background: var(--bg-hover);
+  }
+
+  /* Collapse is a window control rather than one of the four things you open
+     from here, so it sits under its own hairline. */
+  .footer-sep {
+    height: 1px;
+    margin: 6px 16px;
+    background: var(--border);
   }
 
   /*
@@ -664,7 +793,7 @@
    * the bg + text).
    */
   .chats-btn.active {
-    background: var(--bg-tertiary);
+    background: var(--accent-fill);
     color: var(--accent);
   }
 
@@ -765,8 +894,15 @@
     justify-content: center;
   }
 
+  /* Horizontal padding stays off so the centred icons sit on the rail's own
+     axis; the buttons go full width and centre themselves. */
   .sidebar.collapsed .sidebar-footer {
-    padding: 8px 4px 12px;
+    padding: 6px 0 8px;
+  }
+
+  /* Pulled in to the icon column, since there are no labels to run under. */
+  .sidebar.collapsed .footer-sep {
+    margin: 6px 14px;
   }
 
   /*
@@ -800,15 +936,21 @@
     background: var(--bg-hover);
   }
 
+  /* `--accent-fill` rather than `--bg-tertiary`. The token exists for exactly
+     this — "selected rows, active chips, checked filters" — and it is what
+     every selected row elsewhere in the app uses, so the current page now
+     reads as selected in the same language. The neutral grey it replaces put
+     accent text on a colourless plate, which said "disabled" as readily as
+     "current". */
   .nav-list li a.active {
-    background: var(--bg-tertiary);
+    background: var(--accent-fill);
     color: var(--accent);
+    font-weight: 600;
   }
 
   .nav-list li a.active::before {
     opacity: 1;
     transform: scaleY(1);
-    box-shadow: 0 0 10px 0 var(--accent-halo);
   }
 
   .nav-icon {

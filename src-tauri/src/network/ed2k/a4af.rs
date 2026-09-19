@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+/// Per-file cap on retained A4AF candidates.
+const MAX_A4AF_ENTRIES_PER_FILE: usize = 500;
+
 /// eMule PURGESOURCESWAPSTOP: minimum time between swaps for the same source (15 min).
 /// Applied to peers that are actively transferring — keeps us protocol-compatible
 /// with eMule's swap pacing and avoids hammering peers with re-asks.
@@ -34,8 +37,15 @@ pub struct A4AFEntry {
     pub credit_ratio: f64,
 }
 
+/// Candidates are keyed by peer address rather than held in a `Vec`, because
+/// every mutating operation here is "find this one peer": the duplicate check
+/// in [`A4AFManager::add_a4af_source`], the per-file probe in
+/// [`A4AFManager::update_source_state`], and the removal in
+/// [`A4AFManager::remove_source`]. As a `Vec` each of those was a linear scan
+/// over up to [`MAX_A4AF_ENTRIES_PER_FILE`] entries, which the periodic NNP
+/// sweep then paid once per (source × file) pair.
 pub struct A4AFManager {
-    a4af_sources: HashMap<[u8; 16], Vec<A4AFEntry>>,
+    a4af_sources: HashMap<[u8; 16], HashMap<SocketAddr, A4AFEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,24 +89,77 @@ impl A4AFManager {
         has_needed_parts_on_assigned: bool,
     ) {
         let entries = self.a4af_sources.entry(file_hash).or_default();
+        let full = entries.len() >= MAX_A4AF_ENTRIES_PER_FILE;
+        if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(peer_addr) {
+            if full {
+                return;
+            }
+            slot.insert(A4AFEntry {
+                peer_addr,
+                assigned_file_hash,
+                added_time: chrono::Utc::now().timestamp(),
+                last_swap_time: 0,
+                queue_rank: 0,
+                has_needed_parts: has_needed_parts_on_assigned,
+                credit_ratio: 1.0,
+            });
+        }
+    }
 
-        if entries.iter().any(|e| e.peer_addr == peer_addr) {
+    /// Offer every source in `dry_sources` to every file in `targets` other
+    /// than the one that source is already assigned to.
+    ///
+    /// This is the periodic NNP sweep, and it is the only caller that runs at
+    /// (targets × sources) scale, so it is a method rather than a loop over
+    /// [`A4AFManager::add_a4af_source`] at the call site: the target's map is
+    /// resolved once per target instead of once per pair, a target already at
+    /// [`MAX_A4AF_ENTRIES_PER_FILE`] is abandoned rather than probed for every
+    /// remaining source, and the clock is read once for the whole pass instead
+    /// of once per insert.
+    ///
+    /// Callers should de-duplicate `dry_sources` by address first. A peer that
+    /// has run dry on several files is still just one candidate per target,
+    /// and feeding the raw per-file lists in multiplies the pass by the
+    /// average number of files a peer appears on for no added coverage.
+    pub fn offer_dry_sources(
+        &mut self,
+        targets: &[[u8; 16]],
+        dry_sources: &[(SocketAddr, [u8; 16])],
+    ) {
+        if targets.is_empty() || dry_sources.is_empty() {
             return;
         }
-
-        if entries.len() >= 500 {
-            return;
+        let now = chrono::Utc::now().timestamp();
+        for target in targets {
+            let entries = self.a4af_sources.entry(*target).or_default();
+            if entries.len() >= MAX_A4AF_ENTRIES_PER_FILE {
+                continue;
+            }
+            for (peer_addr, assigned_file_hash) in dry_sources {
+                if assigned_file_hash == target {
+                    continue;
+                }
+                if entries.len() >= MAX_A4AF_ENTRIES_PER_FILE {
+                    break;
+                }
+                entries.entry(*peer_addr).or_insert(A4AFEntry {
+                    peer_addr: *peer_addr,
+                    assigned_file_hash: *assigned_file_hash,
+                    added_time: now,
+                    last_swap_time: 0,
+                    queue_rank: 0,
+                    // This sweep selects on `NoneNeededParts`, so by
+                    // construction the peer has nothing left for the file it
+                    // is on — which is the whole reason to retask it.
+                    has_needed_parts: false,
+                    credit_ratio: 1.0,
+                });
+            }
         }
-
-        entries.push(A4AFEntry {
-            peer_addr,
-            assigned_file_hash,
-            added_time: chrono::Utc::now().timestamp(),
-            last_swap_time: 0,
-            queue_rank: 0,
-            has_needed_parts: has_needed_parts_on_assigned,
-            credit_ratio: 1.0,
-        });
+        // `entry().or_default()` above materialises a map for every target,
+        // including ones that gained nothing because each source was already
+        // assigned to them.
+        self.a4af_sources.retain(|_, v| !v.is_empty());
     }
 
     /// Update queue rank and NNP state for a peer on one specific file.
@@ -117,10 +180,8 @@ impl A4AFManager {
         credit_ratio: f64,
     ) {
         for entries in self.a4af_sources.values_mut() {
-            for entry in entries.iter_mut() {
-                if entry.peer_addr == peer_addr
-                    && entry.assigned_file_hash == assigned_file_hash
-                {
+            if let Some(entry) = entries.get_mut(&peer_addr) {
+                if entry.assigned_file_hash == assigned_file_hash {
                     entry.queue_rank = queue_rank;
                     entry.has_needed_parts = has_needed_parts;
                     entry.credit_ratio = credit_ratio;
@@ -138,7 +199,7 @@ impl A4AFManager {
             .get(file_hash)
             .map(|entries| {
                 entries
-                    .iter()
+                    .values()
                     .filter(|e| e.assigned_file_hash != *file_hash)
                     .count()
             })
@@ -147,7 +208,7 @@ impl A4AFManager {
 
     pub fn remove_source(&mut self, peer_addr: SocketAddr) {
         for entries in self.a4af_sources.values_mut() {
-            entries.retain(|e| e.peer_addr != peer_addr);
+            entries.remove(&peer_addr);
         }
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }
@@ -168,7 +229,7 @@ impl A4AFManager {
                 None => continue,
             };
 
-            for entry in entries {
+            for entry in entries.values() {
                 // Suspension: don't re-swap too quickly. Starved-target
                 // override: when the file we want to swap *to* has zero
                 // active sources, drop the cooldown to STARVED_SWAP_STOP_SECS
@@ -213,10 +274,8 @@ impl A4AFManager {
     pub fn mark_swapped(&mut self, peer_addr: SocketAddr) {
         let now = chrono::Utc::now().timestamp();
         for entries in self.a4af_sources.values_mut() {
-            for entry in entries.iter_mut() {
-                if entry.peer_addr == peer_addr {
-                    entry.last_swap_time = now;
-                }
+            if let Some(entry) = entries.get_mut(&peer_addr) {
+                entry.last_swap_time = now;
             }
         }
     }
@@ -229,8 +288,8 @@ impl A4AFManager {
                 continue;
             }
             if entries
-                .iter()
-                .any(|e| e.peer_addr == peer_addr && e.assigned_file_hash == *current_file)
+                .get(&peer_addr)
+                .is_some_and(|e| e.assigned_file_hash == *current_file)
             {
                 return true;
             }
@@ -241,7 +300,7 @@ impl A4AFManager {
     pub fn cleanup_stale(&mut self, max_age_secs: i64) {
         let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
         for entries in self.a4af_sources.values_mut() {
-            entries.retain(|e| e.added_time > cutoff);
+            entries.retain(|_, e| e.added_time > cutoff);
         }
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }
@@ -355,7 +414,7 @@ mod tests {
         a4af.update_source_state(peer(1), FILE_A, 10, true, 1.0);
 
         let entry_b = a4af.a4af_sources[&FILE_A]
-            .iter()
+            .values()
             .find(|e| e.assigned_file_hash == FILE_B)
             .expect("the B-assigned entry survives");
         assert!(
@@ -365,7 +424,7 @@ mod tests {
         assert_eq!(entry_b.queue_rank, 0, "nor overwrite B's queue position");
 
         let entry_a = a4af.a4af_sources[&FILE_B]
-            .iter()
+            .values()
             .find(|e| e.assigned_file_hash == FILE_A)
             .expect("the A-assigned entry is the one updated");
         assert_eq!(entry_a.queue_rank, 10);
@@ -387,5 +446,64 @@ mod tests {
         // A duplicate peer is one candidate, not two.
         a4af.add_a4af_source(FILE_A, peer(1), FILE_B, false);
         assert_eq!(a4af.a4af_count(&FILE_A), 2);
+    }
+
+    /// The bulk sweep must agree with the one-at-a-time path: a dry source is
+    /// offered to every file except the one it is already on, exactly once.
+    #[test]
+    fn offer_dry_sources_matches_per_call_adds_and_skips_the_assigned_file() {
+        const FILE_C: [u8; 16] = [0xCC; 16];
+        let mut bulk = A4AFManager::new();
+        bulk.offer_dry_sources(
+            &[FILE_A, FILE_B, FILE_C],
+            &[(peer(1), FILE_B), (peer(2), FILE_C)],
+        );
+
+        let mut individual = A4AFManager::new();
+        for (p, assigned) in [(peer(1), FILE_B), (peer(2), FILE_C)] {
+            for target in [FILE_A, FILE_B, FILE_C] {
+                if target != assigned {
+                    individual.add_a4af_source(target, p, assigned, false);
+                }
+            }
+        }
+
+        for file in [FILE_A, FILE_B, FILE_C] {
+            assert_eq!(
+                bulk.a4af_count(&file),
+                individual.a4af_count(&file),
+                "bulk and per-call paths must agree for {}",
+                hex::encode(file)
+            );
+        }
+        assert_eq!(bulk.a4af_count(&FILE_A), 2, "both peers are dry elsewhere");
+        assert_eq!(bulk.a4af_count(&FILE_B), 1, "peer 1 is already on B");
+        assert_eq!(bulk.a4af_count(&FILE_C), 1, "peer 2 is already on C");
+
+        // Re-running the sweep is idempotent rather than duplicating.
+        bulk.offer_dry_sources(
+            &[FILE_A, FILE_B, FILE_C],
+            &[(peer(1), FILE_B), (peer(2), FILE_C)],
+        );
+        assert_eq!(bulk.a4af_count(&FILE_A), 2);
+    }
+
+    /// The per-file cap has to hold under the bulk path too, otherwise the
+    /// sweep is an unbounded insert driven by remote source lists.
+    #[test]
+    fn offer_dry_sources_honours_the_per_file_cap() {
+        let dry: Vec<(SocketAddr, [u8; 16])> = (0..(MAX_A4AF_ENTRIES_PER_FILE + 50))
+            .map(|i| {
+                let addr = SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, (i & 0xFF) as u8, 1)),
+                    4662,
+                );
+                (addr, FILE_B)
+            })
+            .collect();
+
+        let mut a4af = A4AFManager::new();
+        a4af.offer_dry_sources(&[FILE_A], &dry);
+        assert_eq!(a4af.a4af_count(&FILE_A), MAX_A4AF_ENTRIES_PER_FILE);
     }
 }

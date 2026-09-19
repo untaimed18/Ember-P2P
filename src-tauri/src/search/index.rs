@@ -14,7 +14,6 @@ pub struct LocalIndex {
     /// completed row is keyed by its content hash, so two copies of the same
     /// file share one id exactly as they share one `hash_map` key.
     id_map: HashMap<String, Vec<usize>>,
-    name_tokens: HashMap<String, Vec<usize>>,
 }
 
 /// Temporary id for a row that has never been hashed, so the index has nothing
@@ -82,7 +81,6 @@ impl LocalIndex {
             path_map: HashMap::new(),
             hash_map: HashMap::new(),
             id_map: HashMap::new(),
-            name_tokens: HashMap::new(),
         }
     }
 
@@ -312,10 +310,19 @@ impl LocalIndex {
         best
     }
 
+    /// Look a row up by path.
+    ///
+    /// The stored index is re-checked against `files` for the same reason
+    /// [`Self::position_by_id`] and [`Self::remove_file_by_path`] re-check
+    /// theirs: `path_map` is patched incrementally, so a drifted entry must only
+    /// fail to find a row, never resolve onto an unrelated one. This was the
+    /// single reader that took the map's word for it — and it is the one the
+    /// upload path and the Library's own queries go through, where answering
+    /// with the wrong file is worse than answering with none.
     pub fn get_by_path(&self, path: &str) -> Option<&FileInfo> {
-        self.path_map
-            .get(&normalize_path_key(path))
-            .and_then(|&idx| self.files.get(idx))
+        let key = normalize_path_key(path);
+        let file = self.path_map.get(&key).and_then(|&idx| self.files.get(idx))?;
+        (normalize_path_key(&file.path) == key).then_some(file)
     }
 
     pub fn file_count(&self) -> usize {
@@ -523,7 +530,6 @@ impl LocalIndex {
                 self.files[last_idx].path.clone(),
                 self.files[last_idx].hash.clone(),
                 self.files[last_idx].id.clone(),
-                tokenize(&self.files[last_idx].name.to_lowercase()),
             ))
         } else {
             None
@@ -548,24 +554,15 @@ impl LocalIndex {
                 }
             }
         }
-        for token in tokenize(&removed.name.to_lowercase()) {
-            if let Some(v) = self.name_tokens.get_mut(&token) {
-                v.retain(|&i| i != pos && i != last_idx);
-                if v.is_empty() {
-                    self.name_tokens.remove(&token);
-                }
-            }
-        }
-
-        if let Some((moved_path, moved_hash, moved_id, moved_tokens)) = moved_key {
+        if let Some((moved_path, moved_hash, moved_id)) = moved_key {
             // The moved element previously lived at `last_idx`; repoint all of
             // its index entries to `pos`. The removed-file cleanup above only
-            // stripped the *removed* file's hash/tokens (which usually differ
-            // from the moved file's), so we must explicitly remove the stale
-            // `last_idx` from the moved file's own buckets before adding `pos`.
-            // Without this, `hash_map`/`name_tokens` accumulate dangling indices
-            // (out-of-bounds, or pointing at an unrelated file once the slot is
-            // reused) until the next full `rebuild()`.
+            // stripped the *removed* file's hash (which usually differs from the
+            // moved file's), so we must explicitly remove the stale `last_idx`
+            // from the moved file's own buckets before adding `pos`. Without
+            // this, `hash_map` accumulates dangling indices (out-of-bounds, or
+            // pointing at an unrelated file once the slot is reused) until the
+            // next full `rebuild()`.
             self.path_map.insert(normalize_path_key(&moved_path), pos);
             if !moved_hash.is_empty() {
                 let v = self.hash_map.entry(moved_hash).or_default();
@@ -577,29 +574,45 @@ impl LocalIndex {
                 v.retain(|&i| i != last_idx && i != pos);
                 v.push(pos);
             }
-            for token in moved_tokens {
-                let v = self.name_tokens.entry(token).or_default();
-                v.retain(|&i| i != last_idx && i != pos);
-                v.push(pos);
-            }
         }
 
         Some(removed)
     }
 
-    pub fn update_alltime_stats(
-        &mut self,
-        hash: &str,
-        alltime_requests: u32,
-        alltime_accepted: u32,
-        alltime_transferred: u64,
-    ) {
-        if let Some(indices) = self.hash_map.get(hash).cloned() {
-            for idx in indices {
-                if let Some(file) = self.files.get_mut(idx) {
-                    file.alltime_requests = alltime_requests;
-                    file.alltime_accepted = alltime_accepted;
-                    file.alltime_transferred = alltime_transferred;
+    /// Merge all-time upload counters for many files in one pass.
+    ///
+    /// The periodic cache refresh applies these for every known file while
+    /// holding the index write lock, which blocks every IPC reader of the
+    /// library. Calling [`Self::update_alltime_stats`] per file paid a fresh
+    /// `hex::encode` allocation for the key plus a `Vec<usize>` clone of the
+    /// hash's index list on each one — hundreds of thousands of allocations
+    /// inside that critical section for a large share. This reuses one key
+    /// buffer and borrows the index list in place.
+    pub fn update_alltime_stats_bulk(&mut self, stats: &[([u8; 16], u32, u32, u64)]) {
+        let files = &mut self.files;
+        let hash_map = &self.hash_map;
+        // `hex::encode_to_slice` into a fixed stack buffer rather than 16
+        // `write!` calls per record: at a full library that was ~2.2M
+        // formatter invocations per pass, all of it inside the index write
+        // lock this function already holds.
+        let mut key_buf = [0u8; 32];
+        for (file_hash, requests, accepted, transferred) in stats {
+            if hex::encode_to_slice(file_hash, &mut key_buf).is_err() {
+                continue;
+            }
+            // Always valid ASCII by construction; `continue` keeps this
+            // panic-free without asserting that.
+            let Ok(key) = std::str::from_utf8(&key_buf) else {
+                continue;
+            };
+            let Some(indices) = hash_map.get(key) else {
+                continue;
+            };
+            for &idx in indices {
+                if let Some(file) = files.get_mut(idx) {
+                    file.alltime_requests = *requests;
+                    file.alltime_accepted = *accepted;
+                    file.alltime_transferred = *transferred;
                 }
             }
         }
@@ -1060,26 +1073,17 @@ impl LocalIndex {
                 }
             }
         }
-        for token in tokenize(&file.name.to_lowercase()) {
-            if let Some(v) = self.name_tokens.get_mut(&token) {
-                v.retain(|&i| i != pos);
-                if v.is_empty() {
-                    self.name_tokens.remove(&token);
-                }
-            }
-        }
     }
 
     /// Add the map contributions for the file at `pos` (derived from
     /// `self.files[pos]`).
     fn add_index_entries(&mut self, pos: usize) {
-        let (path_key, hash, id, name_lower) = {
+        let (path_key, hash, id) = {
             let file = &self.files[pos];
             (
                 normalize_path_key(&file.path),
                 file.hash.clone(),
                 file.id.clone(),
-                file.name.to_lowercase(),
             )
         };
         self.path_map.insert(path_key, pos);
@@ -1089,16 +1093,12 @@ impl LocalIndex {
         if !id.is_empty() {
             self.id_map.entry(id).or_default().push(pos);
         }
-        for token in tokenize(&name_lower) {
-            self.name_tokens.entry(token).or_default().push(pos);
-        }
     }
 
     fn rebuild_indices(&mut self) {
         self.path_map.clear();
         self.hash_map.clear();
         self.id_map.clear();
-        self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {
             self.path_map.insert(normalize_path_key(&file.path), idx);
             if !file.hash.is_empty() {
@@ -1109,10 +1109,6 @@ impl LocalIndex {
             }
             if !file.id.is_empty() {
                 self.id_map.entry(file.id.clone()).or_default().push(idx);
-            }
-            let name_lower = file.name.to_lowercase();
-            for token in tokenize(&name_lower) {
-                self.name_tokens.entry(token).or_default().push(idx);
             }
         }
     }
@@ -1138,13 +1134,6 @@ fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
     // restriction reappears at the next restart, which makes the exposure
     // intermittent and near-invisible rather than obvious.
     file.friends_only = existing.friends_only;
-}
-
-fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .collect()
 }
 
 /// Categorize a file by its extension, matching eMule's g_aED2KFileTypes table
@@ -1285,6 +1274,51 @@ mod local_index_tests {
     use crate::types::FileInfo;
     use std::collections::HashSet;
 
+    /// The bulk merge builds its lookup key by hand into a reused buffer
+    /// instead of calling `hex::encode` per row. If that spelling ever drifts
+    /// from what `hash_map` is keyed on, nothing breaks loudly — every lookup
+    /// simply misses and the all-time columns quietly stop advancing, on a
+    /// path that only runs on a 5s timer.
+    #[test]
+    fn bulk_alltime_merge_finds_rows_by_the_same_key_hex_encode_produces() {
+        let raw: [u8; 16] = [
+            0x00, 0x0f, 0x10, 0xa0, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe,
+            0x0a, 0xb0,
+        ];
+        let hash = hex::encode(raw);
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file("A/one.bin", &hash, true, "normal")]);
+
+        index.update_alltime_stats_bulk(&[(raw, 7, 3, 4096)]);
+
+        let row = index.get_by_hash(&hash).expect("row resolves by hex key");
+        assert_eq!(row.alltime_requests, 7);
+        assert_eq!(row.alltime_accepted, 3);
+        assert_eq!(row.alltime_transferred, 4096);
+    }
+
+    /// The key buffer is reused across rows, so a short-lived bug in the
+    /// clear-then-rebuild would leave one row's key prefixed onto the next.
+    #[test]
+    fn bulk_alltime_merge_does_not_bleed_keys_between_rows() {
+        let a: [u8; 16] = [0xaa; 16];
+        let b: [u8; 16] = [0xbb; 16];
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/a.bin", &hex::encode(a), true, "normal"),
+            file("A/b.bin", &hex::encode(b), true, "normal"),
+        ]);
+
+        index.update_alltime_stats_bulk(&[(a, 1, 1, 10), (b, 2, 2, 20)]);
+
+        assert_eq!(index.get_by_hash(&hex::encode(a)).unwrap().alltime_requests, 1);
+        assert_eq!(index.get_by_hash(&hex::encode(b)).unwrap().alltime_requests, 2);
+        // A hash nobody shares is skipped rather than mis-applied.
+        index.update_alltime_stats_bulk(&[([0xcc; 16], 9, 9, 9)]);
+        assert_eq!(index.get_by_hash(&hex::encode(a)).unwrap().alltime_requests, 1);
+        assert_eq!(index.get_by_hash(&hex::encode(b)).unwrap().alltime_requests, 2);
+    }
+
     fn file(path: &str, hash: &str, shared: bool, priority: &str) -> FileInfo {
         FileInfo {
             id: hash.to_string(),
@@ -1328,10 +1362,21 @@ mod local_index_tests {
         ]);
 
         // Second batch: one path already indexed (with a new hash), one new.
-        // Casing differs on the known path, which must still match it rather
-        // than push a duplicate.
+        //
+        // The known path is re-stated in a different casing on Windows only.
+        // `normalize_path_key` folds case there and nowhere else, because that
+        // is where the filesystem does — on Linux `a/ONE.bin` and `A/one.bin`
+        // are two different files, and matching them would be the bug. Asking
+        // for the fold unconditionally is what made this test fail on Linux:
+        // it counted 4 rows, which was the correct answer to the wrong
+        // question.
+        let known_path = if cfg!(windows) {
+            "a/ONE.bin"
+        } else {
+            "A/one.bin"
+        };
         index.add_files(vec![
-            file("a/ONE.bin", &"c".repeat(32), true, "high"),
+            file(known_path, &"c".repeat(32), true, "high"),
             file("A/three.bin", &"d".repeat(32), true, "normal"),
         ]);
 
@@ -1339,7 +1384,7 @@ mod local_index_tests {
         // Replaced in place, and reachable under its new hash but not its old.
         assert_eq!(
             index.get_by_hash(&"c".repeat(32)).map(|f| f.path.clone()),
-            Some("a/ONE.bin".to_string())
+            Some(known_path.to_string())
         );
         assert!(index.get_by_hash(&"a".repeat(32)).is_none());
         assert!(index.get_by_hash(&"d".repeat(32)).is_some());

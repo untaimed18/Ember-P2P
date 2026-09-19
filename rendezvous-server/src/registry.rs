@@ -9,6 +9,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +35,26 @@ pub const USERNAME_IDLE_SECS: i64 = 365 * 24 * 60 * 60;
 /// a room has actually changed hands.
 pub const CLAIM_AFTER_DAYS_MIN: u32 = 7;
 pub const CLAIM_AFTER_DAYS_MAX: u32 = 365;
+
+/// Hard ceilings on the registry maps, in the spirit of `MAX_STORE_ENTRIES`
+/// and friends in `main.rs`.
+///
+/// Every other shared map on this server is bounded; these were not, and two
+/// endpoints write into them from unauthenticated requests whose only cost is
+/// generating a throwaway keypair. A username claim is retained for
+/// [`USERNAME_IDLE_SECS`] and a tombstone is retained forever, so unbounded
+/// growth here is permanent: it does not recover when the flood stops, and
+/// because [`ChannelRegistry::persist`] rewrites the whole document, every
+/// later request pays for the accumulated size.
+///
+/// Refusing past the cap rather than evicting is deliberate. Evicting a
+/// username hands someone else's handle to whoever asks next, and evicting a
+/// tombstone un-deletes a room its owner destroyed — both worse than refusing
+/// a claim. The rate limits on the two writing endpoints are what keep an
+/// honest deployment from ever reaching these numbers.
+pub const MAX_USERNAMES: usize = 100_000;
+pub const MAX_CHANNEL_NAMES: usize = 100_000;
+pub const MAX_DELETED: usize = 100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelNameRecord {
@@ -80,6 +104,26 @@ struct RegistryFile {
     username_activity: HashMap<String, i64>,
 }
 
+/// Borrowed mirror of [`RegistryFile`] used for writing.
+///
+/// `persist` runs on every claim, nomination, delete and reap, and building an
+/// owned `RegistryFile` copied all four maps each time — including `deleted`,
+/// which is a permanent tombstone set that only ever grows, so the cost of a
+/// save climbed with the server's whole deletion history. Serde emits an
+/// identical document either way.
+///
+/// The tombstones themselves are deliberately kept forever: only an owner can
+/// destroy a room, and `owner_delete_keeps_the_name_retired` pins that such a
+/// name must never become claimable again. Expiring them would be a policy
+/// change, not a leak fix.
+#[derive(Serialize)]
+struct RegistryFileRef<'a> {
+    usernames: &'a HashMap<String, String>,
+    names: &'a HashMap<String, ChannelNameRecord>,
+    deleted: &'a HashSet<String>,
+    username_activity: &'a HashMap<String, i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChannelRegistry {
     path: Option<PathBuf>,
@@ -88,6 +132,36 @@ pub struct ChannelRegistry {
     names: HashMap<String, ChannelNameRecord>,
     deleted: HashSet<String>,
     username_activity: HashMap<String, i64>,
+    /// Ticket dispenser and completion gate for [`Self::persist`]. See
+    /// [`PersistGate`].
+    persist_gate: Arc<PersistGate>,
+}
+
+/// Serialises the registry's disk writes and keeps them off the request path.
+///
+/// `persist` runs while the caller holds the `channels_registry` write lock,
+/// and the write itself is `create` + `write_all` + `sync_all` + one or two
+/// renames. Performed inline that parked a Tokio worker on an fsync and
+/// blocked every other channel endpoint for its duration. The write now goes
+/// to `spawn_blocking`, which means two of them can be in flight at once, so
+/// ordering has to be enforced explicitly: each write takes a monotonic
+/// ticket, and a write whose ticket is older than what has already landed is
+/// dropped rather than rewinding the file to stale content.
+#[derive(Debug)]
+struct PersistGate {
+    next_ticket: AtomicU64,
+    /// Highest ticket already written. Guarded by a blocking mutex because it
+    /// is only ever touched from inside `spawn_blocking`.
+    written: Mutex<u64>,
+}
+
+impl PersistGate {
+    fn new() -> Self {
+        Self {
+            next_ticket: AtomicU64::new(0),
+            written: Mutex::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +169,10 @@ pub enum RegistryError {
     InvalidName,
     Taken,
     Forbidden,
+    /// A registry map is at its hard ceiling. Distinct from `Taken` so the
+    /// handler can answer 503 rather than 409: nothing is wrong with the name
+    /// the caller asked for, the server simply has no room to record it.
+    Full,
 }
 
 impl ChannelRegistry {
@@ -106,6 +184,7 @@ impl ChannelRegistry {
             names: HashMap::new(),
             deleted: HashSet::new(),
             username_activity: HashMap::new(),
+            persist_gate: Arc::new(PersistGate::new()),
         }
     }
 
@@ -113,6 +192,10 @@ impl ChannelRegistry {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // A previous run may have been interrupted between moving the old
+        // registry aside and renaming the new one into place. Reading that as
+        // a first run would silently release every claim on record.
+        recover_interrupted_write(&path);
         let parsed = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RegistryFile>(&bytes).ok())
@@ -128,6 +211,7 @@ impl ChannelRegistry {
             names: parsed.names,
             deleted: parsed.deleted,
             username_activity: parsed.username_activity,
+            persist_gate: Arc::new(PersistGate::new()),
         };
         if reg.grandfather_legacy_timestamps(unix_now()) {
             reg.persist();
@@ -139,18 +223,28 @@ impl ChannelRegistry {
         let Some(path) = &self.path else {
             return;
         };
-        let file = RegistryFile {
-            usernames: self.usernames.clone(),
-            names: self.names.clone(),
-            deleted: self.deleted.clone(),
-            username_activity: self.username_activity.clone(),
+        let file = RegistryFileRef {
+            usernames: &self.usernames,
+            names: &self.names,
+            deleted: &self.deleted,
+            username_activity: &self.username_activity,
         };
         let Ok(json) = serde_json::to_vec_pretty(&file) else {
             return;
         };
-        let tmp = path.with_extension("json.tmp");
-        if atomic_write(&tmp, path, &json).is_err() {
-            tracing::warn!(path = %path.display(), "could not persist the channels registry");
+        let path = path.clone();
+        let gate = self.persist_gate.clone();
+        // Ticket taken here, under the registry write lock the caller holds,
+        // so tickets are issued in the same order the mutations happened.
+        let ticket = gate.next_ticket.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // `load` runs before the server is serving and may not be inside a
+        // runtime, so fall back to writing inline there.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || write_registry(&gate, ticket, &path, &json));
+            }
+            Err(_) => write_registry(&gate, ticket, &path, &json),
         }
     }
 
@@ -181,11 +275,36 @@ impl ChannelRegistry {
         if let Some(old) = self.by_pubkey.remove(&pk) {
             self.usernames.remove(&old);
         }
+        // Checked after the rename path above, which is net-neutral on size,
+        // and after `reap_stale` has had its chance to free an idle handle.
+        if self.usernames.len() >= MAX_USERNAMES {
+            tracing::warn!(
+                usernames = self.usernames.len(),
+                "channel username registry is at its cap; refusing new claims"
+            );
+            return Err(RegistryError::Full);
+        }
         self.usernames.insert(normalized.clone(), pk.clone());
         self.by_pubkey.insert(pk.clone(), normalized);
         self.username_activity.insert(pk, now);
         self.persist();
         Ok(())
+    }
+
+    /// Whether this pubkey already holds this username.
+    ///
+    /// The username counterpart to [`Self::has_channel`], and there for the
+    /// same reason: the creation budget should charge for taking a *new*
+    /// handle, not for the periodic re-claim that keeps an existing one from
+    /// ageing out after [`USERNAME_IDLE_SECS`]. Charging the refresh would
+    /// eventually free the handle of a user who is still active.
+    pub fn holds_username(&self, pubkey_hex: &str, name: &str) -> bool {
+        let Some(normalized) = normalize_username(name) else {
+            return false;
+        };
+        self.usernames
+            .get(&normalized)
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(pubkey_hex))
     }
 
     /// Whether this room already holds a name here.
@@ -243,6 +362,25 @@ impl ChannelRegistry {
             }
             break;
         }
+        // Reject a name that merely *looks* like one already on record. Scoped
+        // to other rooms, so an owner refreshing or re-casing its own claim
+        // still passes, and skipped when the exact key already exists because
+        // the block below handles that case with the owner check it needs.
+        if !self.names.contains_key(&normalized) {
+            let candidate = confusable_key(&normalized);
+            // Tombstones count. The exact-key path below refuses a
+            // owner-deleted name permanently, so exempting those rows here
+            // would have left a homoglyph of a retired name claimable while
+            // the name itself never comes back — the impersonation this check
+            // exists to stop, aimed at a room that no longer has an owner to
+            // notice.
+            if self.names.iter().any(|(existing_name, rec)| {
+                !rec.channel_id.eq_ignore_ascii_case(&id)
+                    && confusable_key(existing_name) == candidate
+            }) {
+                return Err(RegistryError::Taken);
+            }
+        }
         if let Some(existing) = self.names.get_mut(&normalized) {
             if existing.deleted {
                 return Err(RegistryError::Taken);
@@ -257,6 +395,16 @@ impl ChannelRegistry {
                 return Ok(());
             }
             return Err(RegistryError::Taken);
+        }
+        // Only reached when this is a genuinely new name — every refresh and
+        // re-case path above returns before here — so the cap cannot lock an
+        // existing room out of keeping its own claim alive.
+        if self.names.len() >= MAX_CHANNEL_NAMES {
+            tracing::warn!(
+                names = self.names.len(),
+                "channel name registry is at its cap; refusing new claims"
+            );
+            return Err(RegistryError::Full);
         }
         self.names.insert(
             normalized,
@@ -407,6 +555,20 @@ impl ChannelRegistry {
         if !found && self.deleted.contains(&id) {
             return Ok(());
         }
+        // Tombstones are kept forever by policy (see `RegistryFileRef`), which
+        // makes this the one map an attacker can grow permanently — a delete
+        // for an id that never had a name claim is accepted on the strength of
+        // a freshly generated keypair. Bound it. A room that *does* hold a
+        // name is still tombstoned below even at the cap, because its record
+        // is already marked deleted and refusing would leave the two
+        // disagreeing.
+        if !found && self.deleted.len() >= MAX_DELETED {
+            tracing::warn!(
+                deleted = self.deleted.len(),
+                "channel tombstone set is at its cap; refusing to record an unknown id"
+            );
+            return Err(RegistryError::Full);
+        }
         if !found {
             // Owner can tombstone an id even if the name claim never landed,
             // so Discover cannot keep serving a room they have destroyed.
@@ -528,6 +690,93 @@ impl ChannelRegistry {
         ids.dedup();
         ids
     }
+
+    /// Whether this channel id is already tombstoned.
+    ///
+    /// Lets `delete_channel_v4` tell a first deletion from an idempotent
+    /// repeat without cloning the whole tombstone set.
+    pub fn is_deleted(&self, channel_id: &str) -> bool {
+        let id = channel_id.to_ascii_lowercase();
+        if self.deleted.contains(&id) {
+            return true;
+        }
+        self.names
+            .values()
+            .any(|rec| rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+    }
+
+    /// One page of [`Self::deleted_ids`], starting after `after`.
+    ///
+    /// `deleted_ids` clones, sorts and dedups the entire tombstone set on every
+    /// call, and `/v4/channels/deleted` is unauthenticated and polled by every
+    /// client — so a ~200-byte request bought an unbounded response plus
+    /// O(n log n) work. The list is sorted, so a plain "greater than the last
+    /// id you saw" cursor pages it without holding any server-side state.
+    pub fn deleted_ids_page(&self, after: Option<&str>, limit: usize) -> Vec<String> {
+        let all = self.deleted_ids();
+        let start = match after {
+            Some(cursor) => all.partition_point(|id| id.as_str() <= cursor),
+            None => 0,
+        };
+        all.into_iter().skip(start).take(limit).collect()
+    }
+}
+
+/// Where [`atomic_write`] parks the previous copy while it swaps in a new one.
+fn backup_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    dest.with_file_name(name)
+}
+
+/// Restore a registry left behind by an interrupted [`atomic_write`].
+///
+/// Only ever fires on Windows, and only for the narrow window in which the
+/// destination has been moved aside but the replacement has not landed. A
+/// backup sitting next to a destination that already exists is ordinary
+/// leftover and is cleaned up rather than restored.
+pub(crate) fn recover_interrupted_write(dest: &Path) {
+    let backup = backup_path(dest);
+    if !backup.exists() {
+        return;
+    }
+    if dest.exists() {
+        let _ = fs::remove_file(&backup);
+        return;
+    }
+    if fs::rename(&backup, dest).is_ok() {
+        tracing::warn!(
+            path = %dest.display(),
+            "restored the channels registry from its backup after an interrupted write"
+        );
+    }
+}
+
+/// Write one registry snapshot, skipping it if a newer one already landed.
+///
+/// The mutex also serialises concurrent writers, which matters beyond
+/// ordering: `atomic_write` on Windows moves the destination aside before
+/// renaming, and two of those interleaving would fight over the same backup
+/// path.
+fn write_registry(gate: &PersistGate, ticket: u64, dest: &Path, bytes: &[u8]) {
+    let mut written = match gate.written.lock() {
+        Ok(guard) => guard,
+        // Another writer panicked mid-write. The file is still consistent —
+        // `atomic_write` only ever renames a fully-synced temp into place — so
+        // take the lock back and continue rather than leaving the registry
+        // unwritable for the life of the process.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *written >= ticket {
+        // A newer snapshot is already on disk; this one would rewind it.
+        return;
+    }
+    let tmp = dest.with_extension("json.tmp");
+    if atomic_write(&tmp, dest, bytes).is_err() {
+        tracing::warn!(path = %dest.display(), "could not persist the channels registry");
+        return;
+    }
+    *written = ticket;
 }
 
 fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -536,15 +785,54 @@ fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    // Windows cannot rename over an existing file. On Unix, rename replaces
-    // atomically — deleting first opens a window where a crash loses the
-    // registry.
-    #[cfg(windows)]
-    if dest.exists() {
-        fs::remove_file(dest)?;
+
+    // On Unix, `rename` replaces atomically and there is nothing to arrange.
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, dest)?;
+        Ok(())
     }
-    fs::rename(tmp, dest)?;
-    Ok(())
+
+    // Windows cannot rename over an existing file. Deleting the destination
+    // first is the obvious workaround and the dangerous one: if the rename
+    // then fails — a scanner or backup agent holding a handle, a transient
+    // sharing violation, the process dying inside the window — the
+    // destination is already gone and the new content is still parked under
+    // the temp name. The server comes back with no registry at all, which
+    // releases every username and channel-name claim for anyone to re-take.
+    //
+    // So move the old copy aside instead of destroying it: at every point
+    // between here and the end of the function, the previous registry exists
+    // under either `dest` or `backup`, and `recover_interrupted_write` picks
+    // it up on the next load.
+    #[cfg(windows)]
+    {
+        let backup = backup_path(dest);
+        let parked = if dest.exists() {
+            let _ = fs::remove_file(&backup);
+            fs::rename(dest, &backup)?;
+            true
+        } else {
+            false
+        };
+        match fs::rename(tmp, dest) {
+            Ok(()) => {
+                if parked {
+                    let _ = fs::remove_file(&backup);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Put the original back rather than leaving nothing at `dest`.
+                // If even this fails the backup stays put, which is exactly
+                // what the recovery path on next load looks for.
+                if parked {
+                    let _ = fs::rename(&backup, dest);
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 pub fn normalize_username(raw: &str) -> Option<String> {
@@ -572,6 +860,30 @@ pub fn normalize_channel_name(raw: &str) -> Option<String> {
     Some(cleaned.to_lowercase())
 }
 
+/// Fold a channel name to its Unicode confusable skeleton (UTS #39), for
+/// deciding whether two names would look the same to a user.
+///
+/// [`normalize_channel_name`] case-folds and nothing else, so `"Lobby"` and
+/// `"Lοbby"` — the second with a Greek omicron — are distinct keys and both
+/// claimable. Since creating a room is unprivileged, anyone could register a
+/// name visually identical to an established one, have it served to every
+/// client's Discover directory, and (because the directory sorts by name) land
+/// it directly beside the room it mimics. Usernames were never exposed to
+/// this: `normalize_username` requires `is_ascii_alphanumeric`, which removes
+/// the homoglyph primitive outright.
+///
+/// This is deliberately kept *separate* from the map key rather than replacing
+/// it. Re-keying would strand every name already on record under its old key —
+/// making each one look unclaimed and therefore re-claimable, which is a far
+/// worse version of the problem being fixed — and the skeleton is a matching
+/// form, not a display form: it maps `l`, `1` and `I` onto one representative,
+/// so a legacy record with no stored `display` would render as mojibake in the
+/// directory's fallback path.
+fn confusable_key(name: &str) -> String {
+    use unicode_security::confusable_detection::skeleton;
+    skeleton(&name.to_lowercase()).collect()
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +891,7 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn strip_invisible(raw: &str) -> String {
+pub(crate) fn strip_invisible(raw: &str) -> String {
     raw.chars()
         .filter(|c| !c.is_control() && *c != '\0' && !is_bidi_or_zero_width(*c))
         .collect::<String>()
@@ -614,6 +926,118 @@ fn is_bidi_or_zero_width(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The username map is one of two an unauthenticated caller can grow, and
+    /// entries are held for a year. Refusing at the cap — rather than evicting
+    /// — matters: eviction would hand someone else's handle to whoever asked
+    /// next.
+    #[test]
+    fn the_username_map_refuses_new_claims_at_its_cap() {
+        let mut reg = ChannelRegistry::in_memory();
+        // Filled directly rather than through `claim_username`: every claim
+        // runs `reap_stale` over the whole map, so seeding the cap through the
+        // public path would be quadratic.
+        let now = unix_now();
+        for i in 0..MAX_USERNAMES {
+            let pk = format!("{i:064x}");
+            let name = format!("u{i:x}");
+            reg.usernames.insert(name.clone(), pk.clone());
+            reg.by_pubkey.insert(pk.clone(), name);
+            reg.username_activity.insert(pk, now);
+        }
+
+        let overflow = format!("{:064x}", MAX_USERNAMES + 1);
+        assert_eq!(
+            reg.claim_username(&overflow, "onemore"),
+            Err(RegistryError::Full)
+        );
+
+        // An existing holder refreshing its own handle is the keep-alive path
+        // and must not be refused, or the cap would start expiring live users.
+        let existing = format!("{:064x}", 0);
+        assert!(reg.claim_username(&existing, "u0").is_ok());
+
+        // Nor may a holder be blocked from renaming: that swap is net-neutral
+        // on map size, so the cap has no reason to reject it.
+        assert!(reg.claim_username(&existing, "renamed").is_ok());
+    }
+
+    /// Tombstones are kept forever by policy, so an id that never held a name
+    /// is the one unbounded write on the server. A known room is still
+    /// tombstoned at the cap — its record is already marked deleted, and
+    /// refusing would leave the two halves disagreeing.
+    #[test]
+    fn the_tombstone_set_refuses_unknown_ids_at_its_cap() {
+        let mut reg = ChannelRegistry::in_memory();
+        for i in 0..MAX_DELETED {
+            reg.deleted.insert(format!("{i:032x}"));
+        }
+        let unknown_pk = "cc".repeat(32);
+        let unknown_id = format!("{:032x}", MAX_DELETED + 1);
+        assert_eq!(
+            reg.delete_channel(&unknown_id, &unknown_pk),
+            Err(RegistryError::Full)
+        );
+
+        let owner = ed25519_test_pubkey();
+        let owned_id = "ab".repeat(16);
+        assert!(reg.claim_channel_name(&owned_id, &owner, "lobby", false).is_ok());
+        assert!(
+            reg.delete_channel(&owned_id, &owner).is_ok(),
+            "an owner must still be able to destroy a room they actually hold"
+        );
+    }
+
+    /// `is_deleted` is what decides whether a delete costs creation budget, so
+    /// a repeat of an already-tombstoned id has to read as deleted through
+    /// both the tombstone set and a name record marked deleted.
+    #[test]
+    fn is_deleted_sees_both_tombstones_and_deleted_name_records() {
+        let mut reg = ChannelRegistry::in_memory();
+        let owner = ed25519_test_pubkey();
+        let id = "ab".repeat(16);
+        assert!(!reg.is_deleted(&id));
+        assert!(reg.claim_channel_name(&id, &owner, "lobby", false).is_ok());
+        assert!(!reg.is_deleted(&id));
+        assert!(reg.delete_channel(&id, &owner).is_ok());
+        assert!(reg.is_deleted(&id), "a destroyed room reads as deleted");
+        assert!(
+            reg.is_deleted(&id.to_uppercase()),
+            "ids are compared case-insensitively"
+        );
+    }
+
+    /// Paging has to cover the whole set exactly once, in order and without
+    /// gaps, or a client would silently keep a room its owner destroyed.
+    #[test]
+    fn deleted_ids_page_walks_the_whole_set_once() {
+        let mut reg = ChannelRegistry::in_memory();
+        for i in 0..25 {
+            reg.deleted.insert(format!("{i:032x}"));
+        }
+        let expected = reg.deleted_ids();
+        assert_eq!(expected.len(), 25);
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = reg.deleted_ids_page(cursor.as_deref(), 10);
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            walked.extend(page);
+        }
+        assert_eq!(walked, expected, "paging must reproduce the full list in order");
+
+        // A cursor past the end yields nothing rather than wrapping.
+        assert!(reg.deleted_ids_page(Some(&"f".repeat(32)), 10).is_empty());
+    }
+
+    fn ed25519_test_pubkey() -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        hex::encode(key.verifying_key().to_bytes())
+    }
 
     #[test]
     fn username_first_write_wins_and_rename_releases_the_old_name() {
@@ -651,6 +1075,165 @@ mod tests {
         assert_eq!(
             reg.claim_channel_name(&other, &other_pk, "lobby", false),
             Err(RegistryError::Taken)
+        );
+    }
+
+    /// A name that merely looks like one already taken must be refused, or
+    /// anyone can stand up a visually identical room beside an established one
+    /// in Discover.
+    #[test]
+    fn a_confusable_channel_name_cannot_be_claimed() {
+        let mut reg = ChannelRegistry::in_memory();
+        assert!(reg
+            .claim_channel_name(&"11".repeat(16), &"22".repeat(32), "Lobby", false)
+            .is_ok());
+
+        // Greek omicron (U+03BF) for the Latin "o".
+        assert_eq!(
+            reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), "L\u{03BF}bby", false),
+            Err(RegistryError::Taken),
+            "a homoglyph of a taken name must not be claimable"
+        );
+        // Cyrillic small "о" (U+043E).
+        assert_eq!(
+            reg.claim_channel_name(&"55".repeat(16), &"66".repeat(32), "L\u{043E}bby", false),
+            Err(RegistryError::Taken)
+        );
+        // A genuinely different name is unaffected.
+        assert!(reg
+            .claim_channel_name(&"77".repeat(16), &"88".repeat(32), "Lounge", false)
+            .is_ok());
+    }
+
+    /// `persist` writes through a borrowed mirror of `RegistryFile` to avoid
+    /// cloning four maps — one of them the permanent tombstone set — on every
+    /// claim, nomination, delete and reap. The two must serialise identically
+    /// or the next load reads a different file than the one that was written.
+    #[test]
+    fn the_borrowed_write_form_serialises_exactly_like_the_owned_one() {
+        let mut reg = ChannelRegistry::in_memory();
+        assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg
+            .set_channel_nominee(&id, &pk, &"bb".repeat(32), 7)
+            .is_ok());
+        let gone = "33".repeat(16);
+        let gone_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&gone, &gone_pk, "Gone", false).is_ok());
+        assert!(reg.delete_channel(&gone, &gone_pk).is_ok());
+
+        let borrowed = serde_json::to_vec_pretty(&RegistryFileRef {
+            usernames: &reg.usernames,
+            names: &reg.names,
+            deleted: &reg.deleted,
+            username_activity: &reg.username_activity,
+        })
+        .expect("borrowed form serialises");
+        let owned = serde_json::to_vec_pretty(&RegistryFile {
+            usernames: reg.usernames.clone(),
+            names: reg.names.clone(),
+            deleted: reg.deleted.clone(),
+            username_activity: reg.username_activity.clone(),
+        })
+        .expect("owned form serialises");
+
+        assert_eq!(
+            String::from_utf8(borrowed).unwrap(),
+            String::from_utf8(owned).unwrap()
+        );
+    }
+
+    /// A handoff moves the name's record rather than re-claiming it, so it
+    /// must not be exposed to the confusable scan — the successor is taking
+    /// the *same* name, which necessarily collides with itself. Pinned because
+    /// the scan and the handover live in different functions and nothing else
+    /// would notice if handover started routing through the claim path.
+    #[test]
+    fn a_handover_keeps_the_name_and_is_not_blocked_by_the_confusable_scan() {
+        let mut reg = ChannelRegistry::in_memory();
+        let old_id = "11".repeat(16);
+        let old_pk = "22".repeat(32);
+        let new_id = "33".repeat(16);
+        let new_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&old_id, &old_pk, "Lobby", false).is_ok());
+
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &old_pk, unix_now())
+            .is_ok());
+
+        let listing = reg.public_directory();
+        assert_eq!(listing.len(), 1, "the name moved rather than duplicating");
+        assert_eq!(listing[0].channel_id, new_id);
+        assert_eq!(listing[0].name, "Lobby");
+
+        // And the successor, now the holder, can still refresh its own claim —
+        // the scan skips same-channel rows, so its own name is not a lookalike
+        // of itself.
+        assert!(reg
+            .claim_channel_name(&new_id, &new_pk, "Lobby", false)
+            .is_ok());
+    }
+
+    /// The predecessor's record is gone after a handoff, so a successor that
+    /// wants a *different* name is judged against every other room and not
+    /// against the room it replaced.
+    #[test]
+    fn a_successor_can_take_a_different_name_after_a_handover() {
+        let mut reg = ChannelRegistry::in_memory();
+        let old_id = "11".repeat(16);
+        let old_pk = "22".repeat(32);
+        let new_id = "33".repeat(16);
+        let new_pk = "44".repeat(32);
+        assert!(reg.claim_channel_name(&old_id, &old_pk, "Lobby", false).is_ok());
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &old_pk, unix_now())
+            .is_ok());
+
+        // One name per room, so the successor must release "Lobby" first; that
+        // is the pre-existing rule, not something the confusable scan added.
+        assert_eq!(
+            reg.claim_channel_name(&new_id, &new_pk, "Lounge", false),
+            Err(RegistryError::Taken)
+        );
+        assert!(reg.delete_channel(&new_id, &new_pk).is_ok());
+    }
+
+    /// An owner-deleted name never comes back, so a lookalike of one must not
+    /// either — otherwise the retirement just moves the name one homoglyph
+    /// away, to a room whose owner is gone and cannot object.
+    #[test]
+    fn a_confusable_of_a_retired_name_is_also_refused() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg.delete_channel(&id, &pk).is_ok());
+
+        assert_eq!(
+            reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), "Lobby", false),
+            Err(RegistryError::Taken),
+            "the exact retired name stays retired"
+        );
+        assert_eq!(
+            reg.claim_channel_name(&"55".repeat(16), &"66".repeat(32), "L\u{03BF}bby", false),
+            Err(RegistryError::Taken),
+            "and so does a homoglyph of it"
+        );
+    }
+
+    /// The confusable check is scoped to *other* rooms, so an owner refreshing
+    /// or re-casing its own claim still succeeds.
+    #[test]
+    fn an_owner_can_still_refresh_its_own_name() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(
+            reg.claim_channel_name(&id, &pk, "LOBBY", false).is_ok(),
+            "re-casing is a refresh of the same normalised key"
         );
     }
 
