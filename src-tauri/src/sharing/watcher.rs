@@ -45,6 +45,43 @@ pub struct SharedFoldersWatcher {
 /// disappeared mid-session and took its OS watch with it.
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// True when this event's paths could name a file the Library would ever show.
+///
+/// [`event_should_rescan`] answers "did something change"; this answers "could
+/// the thing that changed ever be shared". Discovery refuses `.part`,
+/// `.part.met`, `.met.tmp` and the rest of
+/// [`is_excluded_share_file_name`](crate::sharing::indexer::is_excluded_share_file_name)
+/// outright, so a write to one cannot alter the shared set however many of them
+/// arrive — and an active download writes to nothing else. Without this check a
+/// user whose incomplete-download folder sits inside a shared folder had every
+/// block scheduling a full walk of the library, on a fixed cadence for as long
+/// as anything was downloading: the coalescing loop below only stops waiting at
+/// `MAX_COALESCE_WINDOW`, and a steady write stream never lets it time out
+/// early, so the interval is that constant rather than anything about the
+/// files. One reporter's log held 7,688 of them in a day, against 46,599 files
+/// on external drives, every one guaranteed to find nothing.
+///
+/// A single shareable path is enough. A finishing download renames its `.part`
+/// to the real name, and that event carries both, so the file still reaches the
+/// Library on the next rescan exactly as before.
+///
+/// An event with no paths is assumed to matter. `notify` emits those for
+/// backend-level notices such as an inotify queue overflow, which means events
+/// were dropped — the one case where sitting still is worst.
+pub(crate) fn event_paths_can_change_the_share(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|path| {
+        // Name first, and let `&&` short-circuit on it: the name rules are pure
+        // string work while `is_excluded_share_location` canonicalizes. For the
+        // case this exists for — a download writing `.part` blocks — the name
+        // rule answers and the syscall is never reached.
+        !crate::sharing::indexer::is_excluded_share_file_name(path)
+            && !crate::sharing::indexer::is_excluded_share_location(path)
+    })
+}
+
 /// True when this event means a shareable file may have appeared, vanished, or
 /// changed content. `notify` 8's Linux backend includes `OPEN` and `ATTRIB` in
 /// the default inotify mask; those fire when we walk a folder to index it, so
@@ -193,6 +230,13 @@ impl SharedFoldersWatcher {
         let watcher = match recommended_watcher(move |res: notify::Result<Event>| match res {
             Ok(event) => {
                 if !event_should_rescan(event.kind) {
+                    return;
+                }
+                // Kind alone is not enough: a download writing its `.part` file
+                // produces a genuine `Modify(Data)` on a path the scan is
+                // required to ignore, so every block scheduled a walk that
+                // could not find anything.
+                if !event_paths_can_change_the_share(&event.paths) {
                     return;
                 }
                 debug!("FS watcher: reload-worthy event ({:?})", event.kind);
@@ -393,12 +437,65 @@ impl SharedFoldersWatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::event_should_rescan;
+    use super::{event_paths_can_change_the_share, event_should_rescan};
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,
     };
     use notify::EventKind;
+    use std::path::PathBuf;
+
+    /// The reported case. A download writes its `.part` and `.part.met` for as
+    /// long as it runs, and if the incomplete folder is inside a shared folder
+    /// every one of those writes used to schedule a full rescan of the library
+    /// — a walk that cannot find anything, because discovery refuses these
+    /// names. The kind is a real `Modify(Data)`, so only the path can tell
+    /// them apart.
+    #[test]
+    fn an_active_download_writing_its_part_file_does_not_rescan() {
+        for name in [
+            "a1b2c3.part",
+            "a1b2c3.part.met",
+            "known.met.tmp",
+            "library.emberbackup",
+            "archive.partial",
+        ] {
+            let path = PathBuf::from(format!("/home/u/Shared/Incomplete/{name}"));
+            assert!(
+                !event_paths_can_change_the_share(std::slice::from_ref(&path)),
+                "{name} can never be shared, so it must not schedule a rescan"
+            );
+        }
+    }
+
+    /// The other half: the pass must not go quiet on anything that really does
+    /// change what the Library holds, or files stop appearing until a manual
+    /// reload. A finishing download is the one that matters — it renames the
+    /// `.part` to the real name, and that event carries both paths.
+    #[test]
+    fn a_real_file_still_rescans_including_the_rename_off_a_part() {
+        let ordinary = PathBuf::from("/home/u/Shared/Movies/film.mkv");
+        assert!(event_paths_can_change_the_share(std::slice::from_ref(
+            &ordinary
+        )));
+
+        let completed = [
+            PathBuf::from("/home/u/Shared/Incomplete/a1b2c3.part"),
+            PathBuf::from("/home/u/Shared/Movies/film.mkv"),
+        ];
+        assert!(
+            event_paths_can_change_the_share(&completed),
+            "a download finishing must still reach the Library"
+        );
+    }
+
+    /// `notify` emits a pathless event for backend notices such as an inotify
+    /// queue overflow, which means events were dropped. That is the worst
+    /// possible moment to decide nothing happened.
+    #[test]
+    fn an_event_with_no_paths_is_assumed_to_matter() {
+        assert!(event_paths_can_change_the_share(&[]));
+    }
 
     #[test]
     fn linux_scan_side_effects_do_not_rescan() {
