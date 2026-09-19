@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.6.6</h3>
+      <h3>Get Ember 1.6.7</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage.</p>
       <span class="download-meta">Windows installer &middot; Linux <code>.deb</code> / AppImage &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1851,6 +1851,67 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-7">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.7" target="_blank" rel="noopener">Ember v1.6.7</a></h3>
+        <time class="release-date" datetime="2026-09-19">September 19, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.7" target="_blank" rel="noopener"><code>v1.6.7</code></a></p>
+      <div class="release-notes">
+        <p>Two reports came back from 1.6.6. A Reload that still would not settle &mdash; the same library of 46,541 files, still rescanning hours after it should have finished &mdash; and an upload speed that still read higher than the router agreed with. Both were real, and both were the shape the last release was mostly about: work nobody asked for, or work counted twice. The Reload was a download quietly asking the Library to rescan every time it wrote to its own <code>.part</code> file. The speed was compression &mdash; we were reporting the size of what we read off the disk rather than the size of what went out the socket. Chasing the second one properly meant reading eMule&rsquo;s source beside ours for the whole upload path, then the download path, then the wire format, then every timer and constant. Four passes. Most of what follows is what they found, and the verdict was better than the length suggests: every opcode, the framing, the credit formula and the queue arithmetic were already right. These are the places they were not.</p>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.6.7, 1.6.6, 1.6.5, 1.6.4, 1.6.3, 1.6.2, 1.6.1 and 1.6.0 all see each other on the overlay normally. This is a compatible update; anything older than 1.6.0 is still invisible to all eight</li>
+          <li><strong>Your upload speed will read lower than it did in 1.6.6, and this time it is the true number.</strong> When a peer accepts compressed transfers &mdash; most do &mdash; Ember sends the compressed bytes but was counting the uncompressed ones, so anything compressible read high. Text, documents and already-loose archives could overstate by a wide margin; video and music, which barely compress, were close to honest all along. The limiter was always charged the real figure, which is why the cap held while the number above it disagreed</li>
+          <li><strong>A few peers will move up your upload queue.</strong> Credits were being awarded on the same inflated figure, and because a peer&rsquo;s standing is a ratio of what it gave you over what it took, over-counting what it took pushed it <em>down</em> the queue. Anyone who had been taking compressible data from you was being quietly penalised for it</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>The Library</h5>
+        <ul>
+          <li><strong>An active download made the Library rescan itself, over and over.</strong> Ember watches your shared folders so a file you drop in appears without being asked; the watcher decided whether an event mattered by looking at what kind of event it was, and never at which file it concerned. A download writing into a shared folder therefore queued a rescan on every write to its own <code>.part</code> file &mdash; a file Ember will never share, checking a folder whose contents had not changed. One download was enough to keep a large library rescanning indefinitely, which is the Reload that ran for six hours and then kept going</li>
+          <li><strong>A multi-part file with no recovery hash still held up the scan.</strong> 1.6.6 drew the line between &ldquo;the Library is incomplete&rdquo; and &ldquo;the Library could be slightly better&rdquo; and moved the whole-file digest to a background pass. The AICH root was left on the blocking side, though it is the same kind of thing: a file without one is complete by every measure, is served and searched normally, and only loses the ability to repair a corrupt 180&nbsp;KB block without re-fetching the 9.28&nbsp;MB part around it. It fills in from the same background pass now</li>
+          <li><strong>Only the first page of a large library ever queued its background work.</strong> Records are loaded a page at a time on startup, and the check that asks &ldquo;does this row still want a hash filled in?&rdquo; ran on the first page alone &mdash; so on a library of tens of thousands of files, everything past the first few hundred waited for a full Reload it should never have needed</li>
+          <li><strong>A reconcile could erase part hashes it had no reason to touch.</strong> When file metadata drifts, the two hashes beside it are preserved if they are still good; the part-hash list was overwritten unconditionally, so a drift that missed its cache dropped a list that was perfectly valid. The asymmetry with its two neighbours was accidental</li>
+        </ul>
+
+        <h5>Uploads</h5>
+        <ul>
+          <li><strong>Upload speed counted the bytes before compression rather than the bytes that were sent,</strong> which is the report above. Payload and wire are separate counters now: your session allowance is still measured in payload, as eMule measures it, while the speed, the totals and the credits are measured in what actually left the machine</li>
+          <li><strong>A transfer was interrupted every 9.75&nbsp;MB even when a slot was standing empty.</strong> Rotation is meant to give a waiting peer a turn, but eMule only rotates when it cannot simply open another slot &mdash; with one free it opens it and leaves the running transfer alone. Ember rotated on the mere existence of a waiter, so an under-loaded node repeatedly told a peer to go away and come back, and the peer re-handshaked for a slot it already had. Ember&rsquo;s own leecher detector had been seeing those forced returns and needed a rule to forgive them</li>
+          <li><strong>Ember could earn a two-hour ban from a well-behaved eMule by following its own timer.</strong> The minimum gap between asking a peer about a file is ten minutes; ours was set to 590 seconds, and eMule counts a strike at anything under 600 &mdash; four strikes is a ban. Our own redial floor <em>is</em> this constant, so every dial on that path landed just inside the window. This is the second time the same bug has been fixed: the comment above it records a 60-second floor that &ldquo;got Ember banned by its own peers&rdquo;, and the fix for that landed on a number close enough that nobody checked it again</li>
+          <li><strong>Compression was set to a level worth paying for.</strong> eMule uses zlib level 1 and says why in its own source &mdash; about 4% more compression for 1.5 to 2.5 times the time. Ember was paying level 6 on the serving hot path for a few percent that the uplink, not the compressor, is the limit on anyway</li>
+        </ul>
+
+        <h5>Talking to eMule and aMule</h5>
+        <ul>
+          <li><strong>&ldquo;View shared files&rdquo; from an eMule or aMule never answered.</strong> There are two opcodes for browsing someone&rsquo;s shares, and a client picks between them on whether it thinks it is talking to another mule. Because we identify ourselves as one, a stock eMule <em>always</em> asked with the one Ember had not implemented &mdash; so the request went unanswered and the window hung, and the entire browse responder, including the polite refusal when sharing is off, was unreachable for every client it was written for. Folder names are sent as the bare folder name, never the path it sits at</li>
+          <li><strong>A peer you dropped from your upload queue was stranded for half an hour.</strong> Asked over UDP about a queue place it no longer had, Ember replied with a position of 65535 as a way of saying &ldquo;not queued&rdquo;. To the peer that is simply a very large position: it records it, believes it holds a place, and will not reconnect for another twenty-nine minutes, whereupon it does the same again. eMule stays silent precisely to force the peer to reconnect over TCP, and so do we now</li>
+          <li><strong>Roughly one obfuscated connection in a hundred was dropped for no visible reason.</strong> Obfuscation begins with a random byte, and a handful of values are excluded because they would be ambiguous with a plain header. Ember excluded five where eMule excludes three, so two perfectly legal obfuscated connections in every 256 were read as plaintext, mis-parsed and closed &mdash; an intermittent failure with no pattern to it</li>
+          <li><strong>Every vanilla eMule was recorded as not supporting Preview,</strong> because the capability was read from the wrong bit. Similarly, a peer using the compact form of the handshake tags &mdash; mods and non-eMule stacks do &mdash; desynchronised our reader, which then abandoned the rest of the packet and left the session believing that peer supported no compression, no source exchange and no extended requests. It failed silently, as a downgrade rather than an error</li>
+          <li><strong>Ember promised secure identification it could not always perform.</strong> The level is meant to be declared as zero when no usable key exists &mdash; a state Ember already detects and reports in Settings &mdash; but we declared support unconditionally, so a peer would ask for a key, get nothing, and we would forfeit the credits the claim was meant to earn</li>
+          <li><strong>The queue-position packet went to clients that cannot read it,</strong> including plain eDonkey clients that never claimed to speak the extended protocol, and it was sent with a position of zero to peers that were not on the queue at all. Both are things eMule explicitly refuses to send</li>
+        </ul>
+
+        <h5>Downloads</h5>
+        <ul>
+          <li><strong>Rarest-first could not see the peers that had everything.</strong> A client sharing a completed file announces it in a compact form that Ember distrusts for choosing parts, for a good reason involving an old aMule quirk &mdash; but it was also being withheld from the table that counts how scarce each part is. On a healthy swarm most sources look like that, so the count sat near zero, every part scored as desperately rare, and rarest-first stopped telling parts apart for the rest of the download. Those peers count toward scarcity now, while still being distrusted for selection</li>
+          <li><strong>A source that got faster was given a shallower pipeline.</strong> The number of blocks kept in flight is meant to rise with speed and did not: one band handed out fewer requests than the band below it, and a source with no measured speed yet &mdash; every source, at the start &mdash; took the slowest path. Small files were affected worst, asking for 540&nbsp;KB of blocks to cover the last kilobyte of a gap</li>
+          <li><strong>Preview could outrank a part nobody else had.</strong> Asking for the beginning and end of a video first is right, but not ahead of a part the swarm is nearly out of &mdash; if that part disappears the file cannot finish at all. Preview is now a band just below &ldquo;very rare&rdquo;, which is where eMule puts it</li>
+          <li><strong>Ember asked each peer for more sources four times as often as it should,</strong> with no ceiling on a well-seeded file and no stop once it had plenty. The extra requests achieved nothing &mdash; the peer applies the same rule when answering and discards them &mdash; but they are exactly what anti-leech mods score you on</li>
+          <li><strong>A friend on a restricted connection took the head of your upload queue and held it.</strong> Friends get priority high enough to outrank everything else, which is intended; but a peer behind a restricted connection cannot be called when a slot frees, so the front of the queue was reserved for someone who had to turn up on their own. Friends still have priority, and a friend you can reach still gets the next slot</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.6.6...v1.6.7" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.6.6...v1.6.7</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-6">
       <div class="release-header">
