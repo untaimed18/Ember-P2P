@@ -1044,6 +1044,18 @@ impl TransferManager {
             if source.user_hash.is_some() {
                 existing.user_hash = source.user_hash;
             }
+            // Same never-downgrade rule as the identity above: the live worker
+            // path can report a source whose origin it could not look up, and
+            // that must not erase what discovery recorded.
+            if source.origin.is_some() {
+                existing.origin = source.origin;
+            }
+            // Overwritten outright, unlike the fields above. This one is not a
+            // fact we accumulate about the peer but a statement about the row's
+            // current standing, and the newest writer is the one that knows:
+            // a worker event means we are in contact, which is precisely what
+            // stops the row being a placeholder.
+            existing.placeholder = source.placeholder;
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {
@@ -1089,14 +1101,20 @@ impl TransferManager {
             .unwrap_or_default()
     }
 
+    /// A row we seeded from a discovery answer and have not contacted yet.
+    ///
+    /// This used to sniff `client_software` for the three labels the discovery
+    /// sites wrote into it. That worked but coupled the predicate to a display
+    /// string, and it had already drifted: the Ember callback site writes
+    /// "Ember Callback", which was never in the list, so Ember placeholders
+    /// were not recognised and survived alongside the live row that replaced
+    /// them. `SourceInfo::placeholder` is set by every one of those sites,
+    /// Ember included, so the two cannot come apart again.
     fn is_callback_placeholder_row(s: &crate::types::SourceInfo) -> bool {
         matches!(
             s.status,
             crate::types::SourceStatus::Connecting | crate::types::SourceStatus::WaitCallback
-        ) && matches!(
-            s.client_software.as_str(),
-            "KAD Callback" | "KAD Direct Callback" | "Low ID (Server Relay)"
-        )
+        ) && s.placeholder
     }
 
     /// True if `transfer_id` has any source-detail row for `peer_ip`,
@@ -1905,7 +1923,84 @@ mod tests {
             total_parts: None,
             country_code: None,
             user_hash: None,
+            origin: None,
+            placeholder: false,
         }
+    }
+
+    #[test]
+    fn source_detail_merge_keeps_a_known_origin_and_clears_placeholder_on_contact() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        // Discovery seeds the row: we know which network named the peer, and
+        // we have not spoken to it, so it carries no client software.
+        let mut seeded = src("198.51.100.7", SourceStatus::WaitCallback);
+        seeded.origin = Some(SourceOrigin::Kad);
+        seeded.placeholder = true;
+        manager.update_source_detail("a", seeded);
+
+        // The worker reaches the peer. It reports what the peer runs but may
+        // not have resolved an origin — that must not blank the one we have.
+        let mut live = src("198.51.100.7", SourceStatus::Transferring);
+        live.client_software = "eMule 0.60a".to_string();
+        live.origin = None;
+        live.placeholder = false;
+        manager.update_source_detail("a", live);
+
+        let row = &manager.get_source_details("a")[0];
+        assert_eq!(
+            row.origin,
+            Some(SourceOrigin::Kad),
+            "a worker event with no origin must not erase what discovery recorded"
+        );
+        assert!(
+            !row.placeholder,
+            "being in contact with the peer is what stops the row being a placeholder"
+        );
+        assert_eq!(row.client_software, "eMule 0.60a");
+    }
+
+    #[test]
+    fn ember_callback_placeholders_are_superseded_like_the_others() {
+        use crate::types::SourceOrigin;
+        // Regression: the predicate used to match three hard-coded strings in
+        // `client_software`, and the Ember callback site wrote a fourth that
+        // was never in the list — so an Ember placeholder outlived the live
+        // row that replaced it and the peer showed up twice.
+        //
+        // Both rows deliberately carry *no* user hash. `supersede_duplicate_
+        // peer_rows` removes on `same_peer_by_hash || labeled_callback_
+        // placeholder`, so giving them a matching identity would let the hash
+        // branch do the work and the test would pass whether or not the
+        // placeholder predicate recognises Ember at all.
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        let mut placeholder = src("198.51.100.8", SourceStatus::WaitCallback);
+        placeholder.origin = Some(SourceOrigin::Ember);
+        placeholder.placeholder = true;
+        manager.update_source_detail("a", placeholder);
+
+        // A contacted peer at the same IP, which must survive: it is a real
+        // row, not a placeholder standing in for one.
+        let mut neighbour = src("198.51.100.8", SourceStatus::Transferring);
+        neighbour.port = 4663;
+        manager.update_source_detail("a", neighbour);
+
+        // The callback lands on the peer's ephemeral port: a different key.
+        let removed = manager.supersede_duplicate_peer_rows("a", "198.51.100.8", 51000, None);
+        assert_eq!(
+            removed,
+            vec![("198.51.100.8".to_string(), 4662)],
+            "the Ember placeholder should be superseded, and only it"
+        );
+        assert_eq!(
+            manager.get_source_details("a").len(),
+            1,
+            "the contacted peer at the same IP must survive"
+        );
     }
 
     #[test]
@@ -2180,6 +2275,8 @@ mod tests {
                 total_parts: None,
                 country_code: None,
                 user_hash: None,
+                origin: None,
+                placeholder: false,
             },
         );
         assert!(

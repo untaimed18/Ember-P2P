@@ -5129,10 +5129,12 @@ async fn download_parts_from_source(
             };
 
             // Register this source with the source manager (idempotent).
+            // No origin: we are dialling a peer we already decided to dial, so
+            // whichever network produced it has already said so.
             if let Some(sm) = &source_mgr {
                 if let std::net::IpAddr::V4(v4) = addr.ip() {
                     let mut sm = sm.write().await;
-                    sm.register_source(*file_hash, v4, addr.port());
+                    sm.register_source(*file_hash, v4, addr.port(), None);
                 }
             }
 
@@ -9004,6 +9006,10 @@ async fn download_parts_from_source(
                                                 entry.server_port,
                                                 uh,
                                                 co,
+                                                // Another peer passed this on;
+                                                // the server address is only how
+                                                // the callback gets relayed.
+                                                Some(crate::types::SourceOrigin::Exchange),
                                             );
                                         }
                                         sx_count += 1;
@@ -9026,6 +9032,13 @@ async fn download_parts_from_source(
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer handed us this
+                                            // address. `entry.server_ip` names
+                                            // the server *that peer* uses, not
+                                            // who told us — mistaking the two
+                                            // is what made the first version of
+                                            // this column unreliable.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_entries.push(super::transfer::SourceExchangeEntry {
@@ -9099,6 +9112,10 @@ async fn download_parts_from_source(
                                                 entry.server_port,
                                                 uh,
                                                 co,
+                                                // Another peer passed this on;
+                                                // the server address is only how
+                                                // the callback gets relayed.
+                                                Some(crate::types::SourceOrigin::Exchange),
                                             );
                                         }
                                         sx_count += 1;
@@ -9127,6 +9144,13 @@ async fn download_parts_from_source(
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer handed us this
+                                            // address. `entry.server_ip` names
+                                            // the server *that peer* uses, not
+                                            // who told us — mistaking the two
+                                            // is what made the first version of
+                                            // this column unreliable.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_entries.push(super::transfer::SourceExchangeEntry {

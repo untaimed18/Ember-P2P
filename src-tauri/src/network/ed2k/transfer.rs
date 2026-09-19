@@ -4189,6 +4189,10 @@ impl Ed2kDownload {
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer passed this on; the
+                                            // server address is only how the
+                                            // callback gets relayed.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_count += 1;
@@ -4211,6 +4215,10 @@ impl Ed2kDownload {
                                         entry.server_port,
                                         uh,
                                         co,
+                                        // Another peer handed us this address;
+                                        // `entry.server_ip` is the server that
+                                        // peer uses, not who told us.
+                                        Some(crate::types::SourceOrigin::Exchange),
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {
@@ -4278,6 +4286,10 @@ impl Ed2kDownload {
                                             entry.server_port,
                                             uh,
                                             co,
+                                            // Another peer passed this on; the
+                                            // server address is only how the
+                                            // callback gets relayed.
+                                            Some(crate::types::SourceOrigin::Exchange),
                                         );
                                     }
                                     sx_count += 1;
@@ -4306,6 +4318,10 @@ impl Ed2kDownload {
                                         entry.server_port,
                                         uh,
                                         co,
+                                        // Another peer handed us this address;
+                                        // `entry.server_ip` is the server that
+                                        // peer uses, not who told us.
+                                        Some(crate::types::SourceOrigin::Exchange),
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {

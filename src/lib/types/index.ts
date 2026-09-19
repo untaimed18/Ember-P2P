@@ -193,7 +193,20 @@ export interface SourceInfo {
    *  its advertised listening port and the ephemeral port of an adopted
    *  inbound connection. */
   user_hash?: number[];
+  /** Which network first told us about this peer, for the sources list's
+   *  Origin column — the backend's `SourceOrigin`, set once at discovery.
+   *
+   *  Absent is a real and expected state, not a gap to paper over: sources
+   *  reloaded from `sources.met` arrive without one (the file has nowhere to
+   *  keep it), as do peers the A4AF swapper moved across files. Render those
+   *  as unknown rather than guessing a network for them. */
+  origin?: SourceOrigin;
 }
+
+/** The networks a download source can be discovered through. Mirrors the Rust
+ *  enum of the same name; see its doc comment for why source exchange is one
+ *  value and why there is no passive equivalent. */
+export type SourceOrigin = 'server' | 'kad' | 'ember' | 'exchange';
 
 /** Media metadata for a search hit (eMule `FT_MEDIA_*` tags). */
 export interface MediaMetadata {

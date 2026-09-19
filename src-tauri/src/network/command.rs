@@ -1154,16 +1154,26 @@ async fn handle_command_inner(
                                         0,
                                         uh,
                                         0,
+                                        // This branch is reached only for a
+                                        // friend transfer, which is the Ember
+                                        // overlay by definition.
+                                        Some(crate::types::SourceOrigin::Ember),
                                     );
                                 }
                                 None => {
-                                    sm.register_source(hash_bytes, v4, source_addr.port());
+                                    // The address a StartDownload was issued
+                                    // with. It came from a search hit, and
+                                    // which network produced that hit is not
+                                    // carried this far — so claim nothing and
+                                    // let the first network to re-announce
+                                    // this peer name itself.
+                                    sm.register_source(hash_bytes, v4, source_addr.port(), None);
                                 }
                             }
                         }
                     }
                     for (parsed_ip, extra_port, _) in &validated_extras {
-                        sm.register_source(hash_bytes, *parsed_ip, *extra_port);
+                        sm.register_source(hash_bytes, *parsed_ip, *extra_port, None);
                     }
                 }
 
@@ -1338,7 +1348,11 @@ async fn handle_command_inner(
                         if !seen_addrs.insert((ip, port)) {
                             continue;
                         }
-                        sm.register_source_full(hash_bytes, ip, port, udp_port, [0u8; 16]);
+                        // `per_file_sources` is a mixed pool — EPX peers sit in
+                        // it beside ones some other network found — so this
+                        // asserts nothing and leaves the origin to whichever
+                        // path actually discovered each peer.
+                        sm.register_source_full(hash_bytes, ip, port, udp_port, [0u8; 16], None);
                         validated_extras.push((ip, port, ip.to_string()));
                     }
                 }

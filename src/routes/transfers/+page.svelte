@@ -75,6 +75,20 @@
     return ax < bx ? -1 : 1;
   }
 
+  /** Order two source origins, unknown last on an ascending sort.
+   *
+   *  Compares the rendered labels, not the wire values, so the rows group the
+   *  way the column reads in whatever locale is active. Same blank-last rule as
+   *  `cmpCountry`, and for the same reason: an absent origin is routine — every
+   *  source restored from `sources.met` has one — so it belongs at the end
+   *  rather than heading the list. */
+  function cmpOrigin(a: SourceInfo['origin'], b: SourceInfo['origin']): number {
+    if (a === b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+    return sortCollator.compare(sourceOriginLabel(a), sourceOriginLabel(b));
+  }
+
   let sourceUnlisten: UnlistenFn | null = null;
   let searchUnlisten: UnlistenFn | null = null;
   let showAdvancedDlCols = $state(true);
@@ -227,6 +241,7 @@
     { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client', sortField: 'peer_name' },
     { key: 'country', get label() { return m.transfers_col_country(); }, width: 88, minWidth: 72, className: 'col-c-flag', sortField: 'country' },
     { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft', sortField: 'client_software' },
+    { key: 'origin', get label() { return m.transfers_col_origin(); }, get title() { return m.transfers_col_origin_hint(); }, width: 84, minWidth: 64, className: 'col-c-origin', sortField: 'origin' },
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
     { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed', sortField: 'speed' },
     { key: 'downloaded', get label() { return m.transfers_col_downloaded(); }, width: 65, minWidth: 65, className: 'col-c-down', sortField: 'downloaded' },
@@ -362,6 +377,7 @@
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
       available_parts?: number; total_parts?: number; country_code?: string;
+      origin?: SourceInfo['origin'];
     }>('transfer-source-detail', (event) => {
       if (!mounted) return;
       const d = event.payload;
@@ -391,7 +407,7 @@
           // tier until the next ranked event put it back.
           const queue_rank =
             d.queue_rank ?? (status === 'queued' ? s.queue_rank : undefined);
-          const updated: SourceInfo = { ...s, status, queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
+          const updated: SourceInfo = { ...s, status, queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code, origin: d.origin ?? s.origin };
           expandedSources[idx] = updated;
           expandedSources = [...expandedSources];
         }
@@ -417,7 +433,7 @@
           next.splice(victim, 1);
           expandedSources = next;
         }
-        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
+        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code, origin: d.origin } as SourceInfo];
       }
     }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch(() => { /* backend may not be up yet; the store also listens for the same event */ });
 
@@ -700,6 +716,34 @@
     }
   }
 
+  /// Short label for the Origin column — which network told us about a source.
+  ///
+  /// `undefined` is a genuine answer, not a hole to fill. A source reloaded
+  /// from `sources.met` has no recorded origin (the file cannot carry one) and
+  /// neither does one the A4AF swapper moved between files, so those read as
+  /// unknown until some network mentions the peer again — which resume-time
+  /// discovery normally does within a cycle or so.
+  function sourceOriginLabel(origin: SourceInfo['origin']): string {
+    switch (origin) {
+      case 'server': return m.transfers_origin_server();
+      case 'kad': return m.transfers_origin_kad();
+      case 'ember': return m.transfers_origin_ember();
+      case 'exchange': return m.transfers_origin_exchange();
+      default: return '\u2014';
+    }
+  }
+
+  function sourceOriginTitle(origin: SourceInfo['origin']): string {
+    return origin ? m.transfers_origin_title({ origin: sourceOriginLabel(origin) }) : m.transfers_origin_unknown();
+  }
+
+  /// What the peer says it runs. Empty until its Hello handshake lands, which
+  /// is why a not-yet-contacted source shows a dash here rather than the name
+  /// of the network that found it — the two used to share this field.
+  function sourceClientLabel(s: SourceInfo): string {
+    return s.client_software || '\u2014';
+  }
+
   // Source-list ordering: transferring rises to the top (most useful
   // info: who's actively sending us bytes), queued comes next (the
   // ones we're waiting on, ordered by closest-to-top-of-queue), then
@@ -805,6 +849,12 @@
           break;
         case 'client_software':
           cmp = sortCollator.compare(a.client_software || '', b.client_software || '');
+          break;
+        // Sorted by the label the user can see rather than the wire value, so
+        // the grouping matches the column in every locale. Unknown sorts last
+        // on ascending, like Country above.
+        case 'origin':
+          cmp = cmpOrigin(a.origin, b.origin);
           break;
         case 'speed':
           cmp = a.speed - b.speed;
@@ -1573,12 +1623,12 @@
   type KnSortField = 'country' | 'user_hash' | 'peer_name' | 'client_software' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
   // No `file_name`: that column shows the parent download's name, which is the
   // same string on every row here, so sorting by it would do nothing.
-  type ClSortField = 'country' | 'peer_name' | 'client_software' | 'speed' | 'downloaded' | 'parts' | 'status';
+  type ClSortField = 'country' | 'peer_name' | 'client_software' | 'origin' | 'speed' | 'downloaded' | 'parts' | 'status';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
   const UL_SORT_FIELDS: UlSortField[] = ['country', 'peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
   const QU_SORT_FIELDS: QuSortField[] = ['country', 'peer_name', 'user_name', 'client_software', 'file_name', 'wait_time', 'queue_rank', 'credit_ratio', 'transfer_history', 'ident_state'];
   const KN_SORT_FIELDS: KnSortField[] = ['country', 'user_hash', 'peer_name', 'client_software', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
-  const CL_SORT_FIELDS: ClSortField[] = ['country', 'peer_name', 'client_software', 'speed', 'downloaded', 'parts', 'status'];
+  const CL_SORT_FIELDS: ClSortField[] = ['country', 'peer_name', 'client_software', 'origin', 'speed', 'downloaded', 'parts', 'status'];
   // localStorage can throw in private mode / on quota-exceeded, and
   // `loadStoredColumnWidths` runs during mount — an escaped throw there
   // aborted page initialization. The sort and column-setup persistence below
@@ -1673,7 +1723,7 @@
       clSortField = field;
       // Text columns read best A-Z; numbers and status read best largest- /
       // most-active-first, matching the Known Clients table.
-      clSortAsc = field === 'country' || field === 'peer_name' || field === 'client_software';
+      clSortAsc = field === 'country' || field === 'peer_name' || field === 'client_software' || field === 'origin';
     } else if (clSortAsc) {
       clSortAsc = false;
     } else {
@@ -4327,7 +4377,13 @@
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
-                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}><bdi dir="auto">{src.peer_name || src.client_software || m.transfers_unknown_client()}</bdi></span>
+                        <span class="source-origin src-origin-{src.origin ?? 'unknown'}" title={sourceOriginTitle(src.origin)}>{sourceOriginLabel(src.origin)}</span>
+                        <!-- No longer falls back to `client_software`: that is
+                             its own field now, and while a peer was still
+                             uncontacted the fallback put the name of the
+                             network that found it where its nickname goes. -->
+                        <span class="source-client" title={src.peer_name || m.transfers_unknown_client()}><bdi dir="auto">{src.peer_name || m.transfers_unknown_client()}</bdi></span>
+                        <span class="source-software" title={src.client_software}><bdi dir="auto">{sourceClientLabel(src)}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
                         <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
@@ -5216,6 +5272,10 @@
                       <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
                       <td title={src.client_software}><bdi dir="auto">{src.client_software || '\u2014'}</bdi></td>
+                    {:else if column.key === 'origin'}
+                      <td class="origin-cell" title={sourceOriginTitle(src.origin)}>
+                        <span class="source-origin src-origin-{src.origin ?? 'unknown'}">{sourceOriginLabel(src.origin)}</span>
+                      </td>
                     {:else if column.key === 'file_name'}
                       <td class="name-cell" title={clientParent?.file_name || ''}><bdi dir="auto">{clientParent?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
@@ -7214,6 +7274,49 @@
     object-fit: cover;
     vertical-align: middle;
   }
+  /* Which network found this source. Reuses the network hues the Library's
+     published-to badges already use, so "KAD" means the same thing and looks
+     the same in both places — but the network is always spelled out too, never
+     carried by colour alone (WCAG "use of color"). Fixed width so the labels
+     line up into a scannable column down the drawer. */
+  .source-origin {
+    flex-shrink: 0;
+    min-width: 52px;
+    text-align: center;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    line-height: 1.5;
+    padding: 1px 5px;
+    border-radius: var(--radius-pill);
+    border: 1px solid transparent;
+  }
+  .src-origin-server {
+    color: var(--ed2k-color);
+    background: color-mix(in srgb, var(--ed2k-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
+  }
+  .src-origin-kad {
+    color: var(--kad-color);
+    background: color-mix(in srgb, var(--kad-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--kad-color) 30%, transparent);
+  }
+  .src-origin-ember {
+    color: var(--ember-color);
+    background: color-mix(in srgb, var(--ember-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--ember-color) 30%, transparent);
+  }
+  .src-origin-exchange {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--text-secondary) 26%, transparent);
+  }
+  /* Deliberately flat: an unknown origin is a fact about our records, not a
+     network, so it must not look like one more category. */
+  .src-origin-unknown {
+    color: var(--text-disabled);
+  }
   .source-client {
     color: var(--text-primary);
     font-weight: 600;
@@ -7221,6 +7324,21 @@
     max-width: 200px;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* In the Download Clients table the chip sits in a real cell, so it keeps its
+     natural width instead of the drawer's alignment minimum. */
+  .origin-cell .source-origin {
+    min-width: 0;
+  }
+  /* The peer's self-reported software, beside but distinct from its nickname:
+     lighter weight so the name still leads the row. */
+  .source-software {
+    color: var(--text-muted);
+    font-size: 10px;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 0;
   }
   .source-sep {
     width: 1px;

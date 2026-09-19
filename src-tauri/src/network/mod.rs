@@ -2404,7 +2404,15 @@ async fn handle_epx_sources(
             // reseed from SM (PFS-only peers were previously lost).
             if stats.injected > 0 || stats.persisted > 0 {
                 let mut sm = source_manager.write().await;
-                sm.register_source_full(*file_hash, ip, port, udp_port, [0u8; 16]);
+                sm.register_source_full(
+                    *file_hash,
+                    ip,
+                    port,
+                    udp_port,
+                    [0u8; 16],
+                    // Ember Peer Exchange: another peer passed it on.
+                    Some(crate::types::SourceOrigin::Exchange),
+                );
             }
             // Only count sources that were actually new injections
             // against the per-event ceiling. The earlier behaviour
@@ -4635,6 +4643,10 @@ async fn maybe_escalate_to_friend_transfer(
                 total_parts: None,
                 country_code: None,
                 user_hash: None,
+                // Parking an existing row, not discovering a source: the merge
+                // in `update_source_detail` keeps whatever origin it has.
+                origin: None,
+                placeholder: false,
             },
         );
         transferred
@@ -5908,6 +5920,9 @@ async fn release_friend_connect_sources(
                     total_parts: None,
                     country_code: None,
                     user_hash: None,
+                    // Releasing an existing row — see the parking site.
+                    origin: None,
+                    placeholder: false,
                 },
             );
             released_bytes.push((*ip, *port, transferred));
@@ -25142,7 +25157,7 @@ async fn try_start_pending_download_from_known_sources(
         let mut sm = source_manager.write().await;
         for (ip, port) in &live_sources {
             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                sm.register_source(hash_bytes, v4, *port);
+                sm.register_source(hash_bytes, v4, *port, None);
             }
         }
     }
@@ -33619,6 +33634,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     ds.udp_port,
                                     ds.source_user_hash.unwrap_or([0u8; 16]),
                                     ds.connect_options,
+                                    Some(crate::types::SourceOrigin::Kad),
                                 );
                             }
                         }
@@ -34270,6 +34286,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     ds.udp_port,
                                     ds.source_user_hash.unwrap_or([0u8; 16]),
                                     ds.connect_options,
+                                    Some(crate::types::SourceOrigin::Kad),
                                 );
                             }
                         }
@@ -34290,6 +34307,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         ls.ed2k_server_port,
                                         ls.source_user_hash.unwrap_or([0u8; 16]),
                                         ls.connect_options,
+                                        // A KAD answer that happens to name the
+                                        // server the peer is registered on. KAD
+                                        // found it; the server is only the route.
+                                        Some(crate::types::SourceOrigin::Kad),
                                     );
                                 }
                                 info!(
@@ -34373,12 +34394,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                // Empty, not "KAD Callback":
+                                                // we have not spoken to this
+                                                // peer yet, so we do not know
+                                                // what it runs. The two facts
+                                                // that string used to stand in
+                                                // for now have fields of their
+                                                // own.
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(cb_src.ip)),
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -34406,12 +34436,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(dc_src.ip)),
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -34434,12 +34466,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     queue_rank: None,
                                                     speed: 0,
                                                     transferred: 0,
-                                                    client_software: "Low ID (Server Relay)".to_string(),
+                                                    client_software: String::new(),
                                                     peer_name: String::new(),
                                                     available_parts: None,
                                                     total_parts: None,
                                                     country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
                                                     user_hash: ls.source_user_hash,
+                                                    // A LowID peer only reachable
+                                                    // because a server will relay
+                                                    // our callback to it.
+                                                    origin: Some(crate::types::SourceOrigin::Server),
+                                                    placeholder: true,
                                                 },
                                             );
                                             state.callback_row_pending_since.insert(
@@ -34517,6 +34554,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: None,
+                                                // `sources` here is the KAD
+                                                // search's own answer list.
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: false,
                                             },
                                         );
                                     }
@@ -34579,12 +34620,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -34615,12 +34658,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -34658,7 +34703,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "Low ID (Server Relay)".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
@@ -34666,6 +34711,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     &geoip, std::net::IpAddr::V4(ls.ip),
                                                 ),
                                                 user_hash: ls.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Server),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -34760,7 +34807,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         let mut sm = source_manager.write().await;
                                         for (ip, port) in &sources {
                                             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                                                sm.register_source(hash_bytes, v4, *port);
+                                                sm.register_source(hash_bytes, v4, *port, None);
                                             }
                                         }
                                     }
@@ -34957,12 +35004,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: cb_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -34993,12 +35042,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "KAD Direct Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
                                                 user_hash: dc_src.source_user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Kad),
+                                                placeholder: true,
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -39612,6 +39663,22 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 .map(|(ip, port)| (ip.to_string(), port))
                                 .collect())
                             .unwrap_or_default();
+                        // Captured while the source lock is still held. The row
+                        // writes below happen under the transfer lock, and the
+                        // canonical order (transfer before source, see the
+                        // comment there) forbids reaching back for this then.
+                        // These sources come from the accumulated per-file pool,
+                        // so they are a mix of everything that ever found this
+                        // file — there is no single origin to stamp them with.
+                        let ready_origins: std::collections::HashMap<(String, u16), crate::types::SourceOrigin> =
+                            ready_sources
+                                .iter()
+                                .filter_map(|(ip, port)| {
+                                    let v4 = ip.parse::<Ipv4Addr>().ok()?;
+                                    let origin = sm_guard2.get_source_origin(&hash_bytes, v4, *port)?;
+                                    Some(((ip.clone(), *port), origin))
+                                })
+                                .collect();
                         drop(a4af_snap);
                         drop(sm_guard2);
                         if ready_sources.is_empty() {
@@ -39690,6 +39757,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         total_parts: None,
                                         country_code: cc,
                                         user_hash: None,
+                                        origin: ready_origins.get(&(ip_s.clone(), *port)).copied(),
+                                        placeholder: false,
                                     },
                                 );
                             }
@@ -39801,9 +39870,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        let sm_sources = {
+                        // Origins are read in the same guard as the addresses:
+                        // the rows below are written under the transfer lock,
+                        // and the canonical order forbids taking the source
+                        // lock underneath it. This is the persistent pool, so
+                        // each source keeps whichever network found it.
+                        let (sm_sources, sm_origins) = {
                             let sm = source_manager.read().await;
-                            sm.get_sources(&hash_bytes)
+                            let sources = sm.get_sources(&hash_bytes);
+                            let origins: std::collections::HashMap<(String, u16), crate::types::SourceOrigin> =
+                                sources
+                                    .iter()
+                                    .filter_map(|(ip, port)| {
+                                        let origin = sm.get_source_origin(&hash_bytes, *ip, *port)?;
+                                        Some(((ip.to_string(), *port), origin))
+                                    })
+                                    .collect();
+                            (sources, origins)
                         };
                         let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
                             .filter(|(ip, port)| {
@@ -39883,6 +39966,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         total_parts: None,
                                         country_code: cc,
                                         user_hash: None,
+                                        origin: sm_origins.get(&(ip_s.clone(), *port)).copied(),
+                                        placeholder: false,
                                     },
                                 );
                             }
@@ -39920,7 +40005,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let mut sm = source_manager.write().await;
                             for (ip, port) in &live_sources {
                                 if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                                    sm.register_source(hash_bytes, v4, *port);
+                                    sm.register_source(hash_bytes, v4, *port, None);
                                 }
                             }
                         }
@@ -41166,6 +41251,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         moved_connect_options,
                                     );
                                 } else if let Some(user_hash) = moved_user_hash {
+                                    // A4AF: the peer itself told us, mid-session,
+                                    // that it also holds the target file. That is
+                                    // not something any of the four networks
+                                    // said, and copying the origin it carries for
+                                    // the file it was found for would attribute
+                                    // this one to a network that never mentioned
+                                    // it. So: no origin.
                                     sm.register_source_full_opts(
                                         swap.to_file,
                                         v4,
@@ -41173,6 +41265,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         moved_udp_port,
                                         user_hash,
                                         moved_connect_options,
+                                        None,
                                     );
                                 } else {
                                     sm.register_source_full(
@@ -41181,6 +41274,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         port,
                                         moved_udp_port,
                                         [0u8; 16],
+                                        None,
                                     );
                                 }
                             }
@@ -41687,6 +41781,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                         server_port,
                                                         src.user_hash.unwrap_or([0u8; 16]),
                                                         src.crypt_options.unwrap_or(0),
+                                                        // OP_FOUNDSOURCES, from
+                                                        // the server we are on.
+                                                        Some(crate::types::SourceOrigin::Server),
                                                     );
                                                 }
                                             } else if !state.low_id {
@@ -41698,6 +41795,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     server_port,
                                                     src.user_hash.unwrap_or([0u8; 16]),
                                                     src.crypt_options.unwrap_or(0),
+                                                    // OP_FOUNDSOURCES: here the
+                                                    // server really is the finder.
+                                                    Some(crate::types::SourceOrigin::Server),
                                                 );
                                             } else {
                                                 // We are LowID too, so this source is a dead end:
@@ -41834,6 +41934,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                             total_parts: None,
                                                             country_code: cc,
                                                             user_hash: None,
+                                                            // Straight from the
+                                                            // server's answer.
+                                                            origin: Some(crate::types::SourceOrigin::Server),
+                                                            placeholder: false,
                                                         },
                                                     );
                                                 }
@@ -41957,6 +42061,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 cb_server_port,
                                                 user_hash.unwrap_or([0u8; 16]),
                                                 crypt_options.unwrap_or(0),
+                                                // Reached us through the
+                                                // server's callback relay.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         }
                                         drop(sm);
@@ -42697,6 +42804,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 udp_server_port,
                                                 [0u8; 16],
                                                 0,
+                                                // UDP OP_GLOBFOUNDSOURCES.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         } else {
                                             // HighID source — apply
@@ -42731,6 +42840,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 file_hash, *ip, *port, 0,
                                                 udp_server_ip, udp_server_port,
                                                 [0u8; 16], 0,
+                                                // UDP OP_GLOBFOUNDSOURCES.
+                                                Some(crate::types::SourceOrigin::Server),
                                             );
                                         }
                                     }
@@ -42846,6 +42957,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                             total_parts: None,
                                                             country_code: cc.clone(),
                                                             user_hash: None,
+                                                            // UDP global search
+                                                            // answer from a server.
+                                                            origin: Some(crate::types::SourceOrigin::Server),
+                                                            placeholder: false,
                                                         },
                                                     );
                                                 }
@@ -43651,7 +43766,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                                 {
                                     let mut sm = source_manager.write().await;
-                                    sm.register_source(file_hash, dest_ip, dest_port);
+                                    // A buddy callback answers a request we
+                                    // made for a peer some network already
+                                    // told us about, so it names no origin of
+                                    // its own.
+                                    sm.register_source(file_hash, dest_ip, dest_port, None);
                                 }
                                 {
                                     let pfs = state
@@ -43792,7 +43911,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             } else {
                                 {
                                     let mut sm = source_manager.write().await;
-                                    sm.register_source(file_hash, dest_ip, dest_port);
+                                    // A buddy callback answers a request we
+                                    // made for a peer some network already
+                                    // told us about, so it names no origin of
+                                    // its own.
+                                    sm.register_source(file_hash, dest_ip, dest_port, None);
                                 }
                                 let source = DownloadSource {
                                     peer_ip: dest_ip.to_string(),
@@ -46259,6 +46382,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     src.udp_port,
                                     src.user_hash.unwrap_or([0u8; 16]),
                                     connect_options,
+                                    Some(crate::types::SourceOrigin::Ember),
                                 );
                             }
                         }
@@ -46390,7 +46514,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
-                                                client_software: "Ember Callback".to_string(),
+                                                client_software: String::new(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
@@ -46399,6 +46523,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     std::net::IpAddr::V4(src.ip),
                                                 ),
                                                 user_hash: src.user_hash,
+                                                origin: Some(crate::types::SourceOrigin::Ember),
+                                                placeholder: true,
                                             },
                                         );
                                     }
@@ -57846,13 +57972,30 @@ async fn handle_download_event(
             // `None` when the IP maps to more than one identity, so we never
             // mis-attribute a live connection or merge distinct peers behind one
             // NAT; callback placeholders at that IP are still cleaned up by
-            // label inside `supersede_duplicate_peer_rows`.
-            let live_hash = if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+            // their `placeholder` flag inside `supersede_duplicate_peer_rows`.
+            //
+            // The origin rides along on the same lookup. A worker event is the
+            // only thing that ever writes a row for a source nobody seeded a
+            // placeholder for, so without reading it back here those rows would
+            // be the ones with no Origin to show — and they are exactly the
+            // sources that are actually working.
+            let (live_hash, live_origin) = if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                // Provenance is recorded per file, so the lookup needs this
+                // transfer's hash. Read under its own guard, released before the
+                // source lock is taken, so the two are never held at once.
+                let file_hash_bytes = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id)
+                        .and_then(|t| parse_ed2k_hash16(&t.file_hash))
+                };
                 let sm = source_manager.read().await;
-                sm.get_user_hash_by_addr(v4, port)
-                    .or_else(|| sm.unique_user_hash_for_ip(v4))
+                (
+                    sm.get_user_hash_by_addr(v4, port)
+                        .or_else(|| sm.unique_user_hash_for_ip(v4)),
+                    file_hash_bytes.and_then(|fh| sm.get_source_origin(&fh, v4, port)),
+                )
             } else {
-                None
+                (None, None)
             };
             let (placeholder_removed, source_payload) = {
                 let mut mgr = transfer_manager.write().await;
@@ -57880,6 +58023,10 @@ async fn handle_download_event(
                         total_parts,
                         country_code: country_code.clone(),
                         user_hash: live_hash,
+                        origin: live_origin,
+                        // We are in contact with this peer, so whatever row is
+                        // here stops being a not-yet-contacted placeholder.
+                        placeholder: false,
                     },
                 );
                 // This row just changed a peer's state, which is exactly what
@@ -57960,6 +58107,10 @@ async fn handle_download_event(
                     "available_parts": available_parts,
                     "total_parts": total_parts,
                     "country_code": country_code,
+                    // Carried so a row this event creates (a source no
+                    // discovery placeholder was seeded for) shows its Origin
+                    // straight away, rather than blank until the next snapshot.
+                    "origin": live_origin,
                 }),
             );
             if let Some(payload) = source_payload {

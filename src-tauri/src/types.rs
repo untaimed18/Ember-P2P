@@ -381,6 +381,62 @@ pub struct SourceInfo {
     /// push-grant) connection. `None` when the identity isn't known yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_hash: Option<[u8; 16]>,
+    /// Which network told us about this peer. `None` while unknown — see
+    /// [`SourceOrigin`] for why that is a state we are willing to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SourceOrigin>,
+    /// True for a row we seeded from a discovery answer that we have not
+    /// contacted yet — a KAD/Ember callback request or a LowID server relay.
+    ///
+    /// These used to be marked by writing the label into `client_software`
+    /// ("KAD Callback", "Ember Callback", "Low ID (Server Relay)"), which
+    /// `TransferManager::is_callback_placeholder_row` then string-matched.
+    /// That made the software field say where the peer came from rather than
+    /// what it runs, so neither fact could be shown on its own. The provenance
+    /// now lives in `origin` and the placeholder-ness lives here, leaving
+    /// `client_software` free to mean only what the peer's Hello said.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub placeholder: bool,
+}
+
+/// Where a source was first learned from — eMule's `CUpDownClient::m_nSourceFrom`
+/// (`SF_SERVER` / `SF_KADEMLIA` / `SF_SOURCE_EXCHANGE` …), widened to cover the
+/// Ember overlay, which eMule has no equivalent of.
+///
+/// There is deliberately no `Passive` here, though eMule has `SF_PASSIVE`.
+/// eMule sets it when a stranger connects to *us* and turns out to want a file
+/// we are also downloading; Ember never adds a source that way. Every inbound
+/// adoption it performs (`register_inbound_callback_ports`) is a callback or
+/// push-grant we asked for, for a peer some other network already told us
+/// about — so the variant could never be produced, and a column value that
+/// cannot occur is its own kind of lie.
+///
+/// Recorded once, when the source is first registered, and never revised. That
+/// matters: a peer learned from KAD is routinely re-announced later over source
+/// exchange or by a server, and an origin that tracked the most recent mention
+/// would drift to whichever network gossiped most. eMule sets `m_nSourceFrom`
+/// at construction for the same reason.
+///
+/// An earlier version of this feature (removed in 97489faf) had no field at all
+/// and instead inferred the origin at read time from whether `SourceEntry`
+/// carried a server IP. That was wrong in both directions: `server_ip` is
+/// back-filled onto an existing row by any later announcement that supplies one,
+/// so a KAD source re-announced over SX began reporting itself as an eD2K one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOrigin {
+    /// An eD2K server answered with it (`OP_FOUNDSOURCES`, or the UDP global
+    /// `OP_GLOBFOUNDSOURCES`), including the LowID callback relay.
+    Server,
+    /// A KAD source search or publish — eMule's `SF_KADEMLIA`.
+    Kad,
+    /// The Ember overlay: an Ember DHT source answer, or a friend session.
+    Ember,
+    /// Peer exchange: eD2K source exchange (`OP_ANSWERSOURCES`) or its Ember
+    /// counterpart (EPX). One value rather than two because both mean the same
+    /// thing to someone reading the column — another peer, not a network,
+    /// passed this address along.
+    Exchange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
