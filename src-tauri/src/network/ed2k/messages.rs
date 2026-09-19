@@ -564,6 +564,16 @@ pub struct PeerCapabilities {
     pub version_update: u8,
     pub mod_version: String,
     pub peer_name: String,
+    /// eMule's `m_bEmuleProtocol` / `ExtProtocolAvailable()`
+    /// (`UpdownClient.h:127`): the peer has proven it speaks the eMule
+    /// extended protocol, so `OP_EMULEPROT` packets are safe to send it.
+    ///
+    /// Set in exactly the two places eMule sets it (`BaseClient.cpp:663`,
+    /// `:884`): a Hello carrying `CT_EMULE_VERSION`, or a parsed EmuleInfo.
+    /// Notably *not* implied by the MISCOPTIONS bitfields — a plain eDonkey
+    /// client sends none of these, and anything we send it on `OP_EMULEPROT`
+    /// is a packet it has no case for.
+    pub ext_protocol: bool,
     /// Ember peer — set only from `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`
     /// (never from MISCOPTIONS2; that legacy in-band signal was removed).
     pub is_ember: bool,
@@ -1374,6 +1384,11 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
     if payload.len() < 6 {
         return caps;
     }
+    // Receiving this packet at all is the other half of eMule's
+    // `m_bEmuleProtocol` (`BaseClient.cpp:884`, the tail of
+    // `ProcessMuleInfoPacket`) — a client that sends an EmuleInfo speaks the
+    // extended protocol whatever its tags turn out to say.
+    caps.ext_protocol = true;
     let mut cursor = Cursor::new(payload);
     let _version = cursor.read_u8().unwrap_or(0);
     let protocol_or_tag_count_byte = cursor.read_u8().unwrap_or(0);
@@ -1753,6 +1768,11 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 caps.requires_crypt_layer &= caps.requests_crypt_layer;
             }
             0xFB => {
+                // eMule's test for "this is a mule" is the presence of this
+                // one tag and nothing else — `bIsMule = (dwEmuleTags & 0x04)`
+                // (`BaseClient.cpp:661-664`), where every other eMule tag is
+                // explicitly optional.
+                caps.ext_protocol = true;
                 caps.compatible_client = (int_val >> 24) as u8;
                 caps.version_major = ((int_val >> 17) & 0x7F) as u8;
                 caps.emule_version_min = ((int_val >> 10) & 0x7F) as u8;
@@ -2263,6 +2283,9 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     base.secure_ident_level = base.secure_ident_level.max(update.secure_ident_level);
     base.supports_preview |= update.supports_preview;
     base.supports_multi_packet |= update.supports_multi_packet;
+    // Latches on, like eMule's flag: Hello and EmuleInfo arrive in either
+    // order and each is sufficient on its own.
+    base.ext_protocol |= update.ext_protocol;
     if update.compatible_client != 0 {
         base.compatible_client = update.compatible_client;
     }
@@ -3718,6 +3741,56 @@ mod tests {
         // Invalid UTF-8 misses rather than being lossily mangled into a name
         // that might match a different directory.
         assert_eq!(read_ed2k_string(&[2, 0, 0xFF, 0xFE]), None);
+    }
+
+    /// eMule sets `m_bEmuleProtocol` in exactly two places: a Hello carrying
+    /// `CT_EMULE_VERSION` (`BaseClient.cpp:661-664`, where that one tag *is*
+    /// the test and every other eMule tag is optional) and a parsed EmuleInfo
+    /// (`:884`). Everything sent on `OP_EMULEPROT` is gated on the result, so
+    /// a false positive here means talking extended protocol at a client that
+    /// cannot read it.
+    #[test]
+    fn ext_protocol_is_claimed_only_where_emule_claims_it() {
+        let user_hash = [0x11u8; 16];
+        let hello = build_hello_with_buddy_opts(
+            &user_hash,
+            0x1234_5678,
+            4662,
+            "ember",
+            None,
+            &HelloOptions::default_for_udp_port(4672),
+        );
+        let (_, caps) = parse_hello_packet(&hello).unwrap();
+        assert!(
+            caps.ext_protocol,
+            "our own Hello carries CT_EMULE_VERSION, so a peer must read us as a mule"
+        );
+
+        // A bare eDonkey Hello: user hash, client id, port, zero tags, then
+        // the trailing server address. No CT_EMULE_VERSION anywhere.
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&user_hash);
+        plain.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        plain.extend_from_slice(&4662u16.to_le_bytes());
+        plain.extend_from_slice(&0u32.to_le_bytes());
+        plain.extend_from_slice(&0u32.to_le_bytes());
+        plain.extend_from_slice(&0u16.to_le_bytes());
+        let (_, plain_caps) = parse_hello_answer(&plain).unwrap();
+        assert!(
+            !plain_caps.ext_protocol,
+            "a Hello with no CT_EMULE_VERSION is eMule's `bIsMule == false`"
+        );
+
+        // Receiving an EmuleInfo at all is the other half, whatever its tags
+        // turn out to say.
+        let info = build_emule_info(4672, true, None, None);
+        assert!(parse_emule_info(&info).ext_protocol);
+
+        // Either packet alone is enough, and the flag latches through a merge
+        // in whichever order the two arrive.
+        let mut merged = plain_caps.clone();
+        merge_caps(&mut merged, parse_emule_info(&info));
+        assert!(merged.ext_protocol);
     }
 
     #[test]

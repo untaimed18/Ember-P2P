@@ -1713,6 +1713,49 @@ fn peer_is_high_id_for_queue(hello_caps: &PeerCapabilities, peer_addr: SocketAdd
         }
 }
 
+/// eMule's two guards at the top of `SendRankingInfo`
+/// (`UploadClient.cpp:561-565`).
+///
+/// `OP_QUEUERANKING` rides on `OP_EMULEPROT`, so a peer that never proved it
+/// speaks the extended protocol has no case for the opcode: eMule returns
+/// before building the packet rather than leaving the peer to decide what an
+/// unknown extended opcode means. Ember sent it to everyone, which is a packet
+/// a plain eDonkey client can only discard or disconnect over — and the
+/// session-teardown path already carries a note about peers hanging up on "an
+/// unexpected `OP_QUEUERANKING`".
+///
+/// Rank 0 is the other guard. It is what `GetWaitingPosition` returns for a
+/// peer that is *not* on the waiting list, and a receiver reading it as a
+/// position would be told it is ahead of everyone.
+fn should_send_queue_ranking(hello_caps: &PeerCapabilities, rank: u16) -> bool {
+    hello_caps.ext_protocol && rank != 0
+}
+
+/// eMule's friend-slot branch of `GetScore` (`UploadClient.cpp:197`):
+/// `IsFriend() && GetFriendSlot() && !HasLowID()` returns `0x0FFFFFFF`.
+///
+/// Ember keeps the first half deliberately wider than eMule's: eMule's friend
+/// slot is a manual, exclusive toggle (`RemoveAllFriendSlots()` runs before
+/// each grant, so a user has at most one), where every verified friend gets
+/// the override here. That is a product decision, not an oversight — friend
+/// priority is the point — and it is invisible on the wire either way, since
+/// queue scoring is entirely local policy.
+///
+/// The `!HasLowID()` half is not optional, though, and was missing. The
+/// override is `268_435_455`, set high enough to dwarf any credit-ratio
+/// differential, so it decides who gets the next free slot outright. Awarding
+/// it to a peer we cannot dial parks the head of the queue on someone
+/// unreachable: `AddUpNextClient` can only call out to HighID peers, so a
+/// LowID friend has to arrive under its own steam anyway, and until it does
+/// every peer behind it waits on a slot that will not be taken.
+fn friend_slot_takes_priority(
+    is_verified_friend: bool,
+    hello_caps: &PeerCapabilities,
+    peer_addr: SocketAddr,
+) -> bool {
+    is_verified_friend && peer_is_high_id_for_queue(hello_caps, peer_addr)
+}
+
 /// Build a queue entry snapshot from the current session Hello capabilities.
 fn queue_entry_from_hello(
     identity: QueueIdentity,
@@ -7802,12 +7845,16 @@ impl UploadHandler {
                             // Re-send OP_QUEUERANKING if rank changed, rate-limited to once per 5 min
                             if last_rank_resend.elapsed().as_secs() >= 300 {
                                 last_rank_resend = std::time::Instant::now();
-                                let is_verified_friend = live_secure_friend_member(
-                                    &self.friend_hashes,
-                                    peer_ember_hash,
-                                    secure_v2_authenticated,
-                                )
-                                .await;
+                                let friend_slot_priority = friend_slot_takes_priority(
+                                    live_secure_friend_member(
+                                        &self.friend_hashes,
+                                        peer_ember_hash,
+                                        secure_v2_authenticated,
+                                    )
+                                    .await,
+                                    &hello_caps,
+                                    peer_addr,
+                                );
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
                                 let queue = self.upload_queue.lock().await;
@@ -7826,7 +7873,7 @@ impl UploadHandler {
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time.elapsed().as_secs(),
                                     Some(peer_addr), hello_caps.emule_version_min,
-                                    is_verified_friend,
+                                    friend_slot_priority,
                                     hello_caps.ember_pubkey.as_ref(), ember_verified,
                                 );
                                 let rank = compute_queue_rank(
@@ -7836,7 +7883,9 @@ impl UploadHandler {
                                 drop(queue);
                                 drop(idx_snap);
                                 drop(cm);
-                                if last_rank_sent != Some(rank) {
+                                if last_rank_sent != Some(rank)
+                                    && should_send_queue_ranking(&hello_caps, rank)
+                                {
                                     last_rank_sent = Some(rank);
                                     let mut qr_payload = Vec::with_capacity(12);
                                     qr_payload.extend_from_slice(&rank.to_le_bytes());
@@ -8679,6 +8728,11 @@ impl UploadHandler {
                             secure_v2_authenticated,
                         )
                         .await;
+                        // The admission gate below stays on plain friendship,
+                        // matching eMule: only the score override carries the
+                        // HighID requirement.
+                        let friend_slot_priority =
+                            friend_slot_takes_priority(is_verified_friend, &hello_caps, peer_addr);
                         // Global scoring lock order: credit manager → local
                         // index → upload queue. Every scoring path follows this
                         // order so concurrent rank/admission work cannot form an
@@ -8761,7 +8815,7 @@ impl UploadHandler {
                             // change already reset it to `false` above, so
                             // this can only re-arm from this session's own
                             // live verification state.
-                            if is_verified_friend {
+                            if friend_slot_priority {
                                 queue[pos].is_friend_slot = true;
                             }
                             let ember_verified = secure_v2_authenticated;
@@ -8776,7 +8830,7 @@ impl UploadHandler {
                                 current_file_hash.unwrap_or([0u8; 16]),
                                 queue[pos].join_time.elapsed().as_secs(),
                                 Some(peer_addr), hello_caps.emule_version_min,
-                                is_verified_friend,
+                                friend_slot_priority,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
                             
@@ -8865,7 +8919,7 @@ impl UploadHandler {
                                     0,
                                     Some(peer_addr),
                                     hello_caps.emule_version_min,
-                                    is_verified_friend,
+                                    friend_slot_priority,
                                     hello_caps.ember_pubkey.as_ref(),
                                     ember_verified,
                                 );
@@ -8899,7 +8953,7 @@ impl UploadHandler {
                                     new_fh,
                                     join_time,
                                     &hello_caps,
-                                    is_verified_friend,
+                                    friend_slot_priority,
                                     ember_verified,
                                 ));
                                 rank_val
@@ -8923,13 +8977,13 @@ impl UploadHandler {
                                 new_fh,
                                 join_time,
                                 &hello_caps,
-                                is_verified_friend,
+                                friend_slot_priority,
                                 ember_verified,
                             ));
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_min,
-                                is_verified_friend,
+                                friend_slot_priority,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
                             
@@ -8942,17 +8996,25 @@ impl UploadHandler {
                         drop(idx_snap);
                         drop(cm);
                         // eMule OP_QUEUERANKING (UploadClient.cpp:633): 12 bytes = rank(u16) + 10 zeros
-                        let mut qr_payload = Vec::with_capacity(12);
-                        qr_payload.extend_from_slice(&rank.to_le_bytes());
-                        qr_payload.resize(12, 0);
-                        write_packet_async(
-                            &mut writer,
-                            OP_EMULEPROT,
-                            OP_QUEUERANKING,
-                            &qr_payload,
-                        )
-                        .await?;
-                        last_rank_sent = Some(rank);
+                        //
+                        // Only the packet is gated: the peer is on our queue
+                        // either way, so `queued_identity` is still recorded
+                        // below and it is still served in turn. It simply
+                        // learns its position from the ordinary re-ask cycle
+                        // rather than from an opcode it cannot read.
+                        if should_send_queue_ranking(&hello_caps, rank) {
+                            let mut qr_payload = Vec::with_capacity(12);
+                            qr_payload.extend_from_slice(&rank.to_le_bytes());
+                            qr_payload.resize(12, 0);
+                            write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_QUEUERANKING,
+                                &qr_payload,
+                            )
+                            .await?;
+                            last_rank_sent = Some(rank);
+                        }
                         queued_identity = Some(queue_identity.clone());
                         continue;
                     }
@@ -10155,7 +10217,12 @@ impl UploadHandler {
                                     session_start.map(|t| t.elapsed()),
                                 ),
                                 Some(peer_addr),
-                                hello_caps.emule_version_min, is_verified_friend,
+                                hello_caps.emule_version_min,
+                                friend_slot_takes_priority(
+                                    is_verified_friend,
+                                    &hello_caps,
+                                    peer_addr,
+                                ),
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
 
@@ -10307,6 +10374,13 @@ impl UploadHandler {
                                 secure_v2_authenticated,
                             )
                             .await;
+                            // As at the insertion site above: admission stays
+                            // on plain friendship, the score override does not.
+                            let friend_slot_priority = friend_slot_takes_priority(
+                                is_verified_friend,
+                                &hello_caps,
+                                peer_addr,
+                            );
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let mut queue = self.upload_queue.lock().await;
@@ -10349,7 +10423,7 @@ impl UploadHandler {
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
                                 entry.peer_name = hello_caps.peer_name.clone();
                                 entry.client_software = client_software_from_caps(&hello_caps);
-                                if is_verified_friend {
+                                if friend_slot_priority {
                                     entry.is_friend_slot = true;
                                 }
                                 // Re-entry after session end: refresh
@@ -10380,7 +10454,7 @@ impl UploadHandler {
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time,
                                     &hello_caps,
-                                    is_verified_friend,
+                                    friend_slot_priority,
                                     secure_v2_authenticated,
                                 ));
                                 true
@@ -10431,7 +10505,7 @@ impl UploadHandler {
                                         new_fh,
                                         queue_join_time,
                                         &hello_caps,
-                                        is_verified_friend,
+                                        friend_slot_priority,
                                         ember_verified,
                                     ));
                                     true
@@ -13593,6 +13667,77 @@ mod scoring_tests {
 
         let lan: SocketAddr = "192.168.1.2:4662".parse().unwrap();
         assert!(!peer_is_high_id_for_queue(&caps, lan));
+    }
+
+    /// eMule's friend-slot override is `IsFriend() && GetFriendSlot() &&
+    /// !HasLowID()` (`UploadClient.cpp:197`). Ember had the first part and not
+    /// the third, so a LowID friend took the head of the queue and held it:
+    /// the override outranks every credit ratio, and a LowID peer cannot be
+    /// dialled when the slot it is first in line for comes free.
+    #[test]
+    fn a_low_id_friend_does_not_take_the_head_of_the_queue() {
+        let addr: SocketAddr = "8.8.8.8:4662".parse().unwrap();
+        let high_id = PeerCapabilities {
+            tcp_port: 4662,
+            client_id: crate::network::ed2k::server::LOWID_THRESHOLD,
+            ..PeerCapabilities::default()
+        };
+        let low_id = PeerCapabilities {
+            tcp_port: 4662,
+            client_id: 12345,
+            ..PeerCapabilities::default()
+        };
+
+        assert!(friend_slot_takes_priority(true, &high_id, addr));
+        assert!(
+            !friend_slot_takes_priority(true, &low_id, addr),
+            "a friend we cannot dial must not be handed the override"
+        );
+        // Friendship is still the first term: a HighID stranger gets nothing.
+        assert!(!friend_slot_takes_priority(false, &high_id, addr));
+
+        // And the override is what is actually at stake — the constant dwarfs
+        // any credit differential, so this is the whole queue order.
+        let cm = CreditManager::new();
+        let idx = LocalIndex::new();
+        let scored = |friend_slot| {
+            score_queue_entry(
+                &cm,
+                &idx,
+                &[0xEEu8; 16],
+                [1u8; 16],
+                0,
+                Some(addr),
+                0,
+                friend_slot,
+                None,
+                false,
+            )
+        };
+        assert_eq!(scored(true), 268_435_455.0);
+        assert!(scored(false) < 268_435_455.0);
+    }
+
+    /// eMule refuses to send `OP_QUEUERANKING` to a client that never proved it
+    /// speaks the extended protocol, and refuses to send rank 0 at all
+    /// (`UploadClient.cpp:561-565`). Ember sent both to everyone.
+    #[test]
+    fn queue_ranking_is_withheld_from_clients_that_cannot_read_it() {
+        let mule = PeerCapabilities {
+            ext_protocol: true,
+            ..PeerCapabilities::default()
+        };
+        let donkey = PeerCapabilities::default();
+
+        assert!(should_send_queue_ranking(&mule, 1));
+        assert!(
+            !should_send_queue_ranking(&donkey, 1),
+            "OP_QUEUERANKING rides on OP_EMULEPROT; a plain eDonkey client has no case for it"
+        );
+        assert!(
+            !should_send_queue_ranking(&mule, 0),
+            "rank 0 is eMule's 'not on the waiting list', not a position"
+        );
     }
 }
 
