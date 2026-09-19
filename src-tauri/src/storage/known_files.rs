@@ -1057,7 +1057,34 @@ impl KnownFileList {
             // canonical copy. Keep that canonical metadata when another
             // duplicate is reconciled and update fields that are genuinely
             // content-wide or newly available.
-            existing.part_hashes = record.part_hashes;
+            //
+            // Part hashes follow the same "newly available" rule as the AICH
+            // root and the Ember digest below, and for the same reason: an
+            // empty incoming value means "not computed this pass", not "this
+            // file has none". The reconcile says so itself — it hands back the
+            // stored list when it is intact, a freshly computed one when the
+            // hash pass left one behind, and an empty vector only when it has
+            // nothing to offer, logging that the read is "deferred ... until
+            // the next hash pass". Taking that vector unconditionally turned
+            // "nothing to offer" into an erasure, which is the one outcome
+            // none of the three callers wanted.
+            //
+            // The exception is a stored list that does not describe the file
+            // sitting beside it. `known.met` is what answers
+            // `OP_HASHSETREQUEST`, so a wrong-length hashset is worse than no
+            // hashset: it cannot verify, and a peer that trusts it re-fetches
+            // on every part. Judged against `existing.file_size` rather than
+            // the incoming record's, because those two are the pair that has
+            // to be self-consistent — the incoming size belongs to whichever
+            // copy is being reconciled, which for a duplicate is not the copy
+            // these hashes were computed from.
+            if !record.part_hashes.is_empty() {
+                existing.part_hashes = record.part_hashes;
+            } else if existing.part_hashes.len()
+                != crate::network::ed2k::hash::ed2k_known_met_part_hash_count(existing.file_size)
+            {
+                existing.part_hashes.clear();
+            }
             if !record.aich_hash.is_empty() {
                 existing.aich_hash = record.aich_hash;
             }
@@ -1689,10 +1716,20 @@ impl KnownFileList {
 ///
 /// MUST run before any `known.met` consumer loads the file (the shared-file
 /// index, the indexer/hashing task, and the network task) so they all pick up
-/// the cleared roots — the invalidated files are then recomputed via the
-/// normal startup hashing pass (which yields the same ed2k hash and the
-/// corrected AICH root, preserved into `known.met` by the `SharedFilesChanged`
-/// reconcile with existing counters intact).
+/// the cleared roots.
+///
+/// The invalidated files are then recomputed by the background top-up pass,
+/// which is what a row missing only its AICH root now qualifies for: it
+/// recovers the root and hands it to the `SharedFilesChanged` reconcile, which
+/// rewrites the record with its existing counters intact. That pass recomputes
+/// the ed2k in passing and refuses the file if it disagrees with the stored
+/// one — which is exactly right here, because what this migration invalidates
+/// is the root, never the id, so a mismatch would mean the file itself changed
+/// rather than that the old root was computed wrong.
+///
+/// Interrupting it is safe and needs no marker of its own: a row whose root is
+/// still empty is offered again by the next scan, so the work resumes even
+/// though this migration has already retired itself.
 pub fn migrate_aich_v2(data_dir: &Path) {
     let marker = data_dir.join(".aich_root_v2_migrated");
     if marker.exists() {
@@ -2224,6 +2261,86 @@ mod tests {
             ),
             "once applied, the same discovery must stop reporting drift",
         );
+    }
+
+    /// Part hashes answer `OP_HASHSETREQUEST`, and the reconcile hands over an
+    /// empty vector whenever it has nothing fresh to offer — it says so in its
+    /// own log line. Taking that unconditionally erased a perfectly good
+    /// hashset, and the only thing that refilled it was a full re-read of the
+    /// file on some later pass.
+    #[test]
+    fn add_or_update_keeps_part_hashes_when_the_reconcile_has_none() {
+        use crate::network::ed2k::hash::PARTSIZE;
+        let mut kf = KnownFileList::new();
+        let mut original = sample_record();
+        original.file_size = PARTSIZE * 2;
+        original.part_hashes = vec![[0x11; 16], [0x22; 16], [0x33; 16]];
+        let hash = original.file_hash;
+        let kept = original.part_hashes.clone();
+        assert_eq!(
+            kept.len(),
+            crate::network::ed2k::hash::ed2k_known_met_part_hash_count(PARTSIZE * 2),
+            "the fixture has to be a well-formed hashset or the test proves nothing"
+        );
+        kf.add_or_update(original);
+
+        let mut bare = sample_record();
+        bare.file_size = PARTSIZE * 2;
+        bare.part_hashes = Vec::new();
+        kf.add_or_update(bare);
+
+        assert_eq!(
+            kf.find_by_hash(&hash).unwrap().part_hashes,
+            kept,
+            "an empty reconcile means 'not computed this pass', never 'this file has none'"
+        );
+    }
+
+    /// The other half of that rule, and the reason it is not a bare non-empty
+    /// guard: a stored list that does not describe the file beside it cannot
+    /// verify anything, so serving it is worse than serving nothing. That one
+    /// is still cleared.
+    #[test]
+    fn add_or_update_clears_part_hashes_that_do_not_describe_the_file() {
+        use crate::network::ed2k::hash::PARTSIZE;
+        let mut kf = KnownFileList::new();
+        let mut original = sample_record();
+        original.file_size = PARTSIZE * 2;
+        // One hash for a file that needs three.
+        original.part_hashes = vec![[0x11; 16]];
+        let hash = original.file_hash;
+        kf.add_or_update(original);
+
+        let mut bare = sample_record();
+        bare.file_size = PARTSIZE * 2;
+        bare.part_hashes = Vec::new();
+        kf.add_or_update(bare);
+
+        assert!(
+            kf.find_by_hash(&hash).unwrap().part_hashes.is_empty(),
+            "a hashset that cannot verify the file must not survive to be served"
+        );
+    }
+
+    /// And a freshly computed set still wins, which is what the hash pass
+    /// relies on to resolve either of the two cases above.
+    #[test]
+    fn add_or_update_takes_freshly_computed_part_hashes() {
+        use crate::network::ed2k::hash::PARTSIZE;
+        let mut kf = KnownFileList::new();
+        let mut original = sample_record();
+        original.file_size = PARTSIZE * 2;
+        original.part_hashes = vec![[0x11; 16]];
+        let hash = original.file_hash;
+        kf.add_or_update(original);
+
+        let fresh = vec![[0xaa; 16], [0xbb; 16], [0xcc; 16]];
+        let mut refreshed = sample_record();
+        refreshed.file_size = PARTSIZE * 2;
+        refreshed.part_hashes = fresh.clone();
+        kf.add_or_update(refreshed);
+
+        assert_eq!(kf.find_by_hash(&hash).unwrap().part_hashes, fresh);
     }
 
     /// An existing digest must not be cleared by a later reconcile whose

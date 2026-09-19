@@ -21,8 +21,8 @@ pub struct LocalIndex {
 /// they cannot be served, searched or published.
 pub const PENDING_ID_PREFIX: &str = "pending:";
 
-/// Temporary id for an *already hashed* row queued for a one-time digest
-/// top-up (the AICH or Ember BLAKE3 migration passes).
+/// Temporary id for an *already hashed* row queued for a one-time top-up in
+/// the foreground.
 ///
 /// A separate prefix because the two have opposite cancellation semantics and
 /// sharing one wiped the Library. On the first launch after the digest
@@ -31,15 +31,15 @@ pub const PENDING_ID_PREFIX: &str = "pending:";
 /// "drop the unhashed rows", then deleted the entire library the moment the
 /// user pressed Stop. Those rows have a valid eD2K hash and full metadata and
 /// lack only an optional digest, so they must survive.
+///
+/// No production path mints one of these any more: both one-time repairs — the
+/// AICH root and the Ember digest — now go to the background top-up pass, and
+/// the scan is once again only ever about files that cannot be served at all.
+/// The prefix and the guards keyed on it stay because they are what keep that
+/// separation safe if a foreground repair is ever reintroduced, and because
+/// `HashProgressEmitter` still asks the question in order to answer "none",
+/// which is now a measured answer rather than an assumed one.
 pub const REHASH_ID_PREFIX: &str = "rehash:";
-
-/// Path-unique temp id for a row awaiting a digest top-up. Path-unique rather
-/// than content-keyed because `finalize_pending_hash` and `remove_file_by_id`
-/// both take the first match, so a shared content hash let one copy's outcome
-/// land on a different, healthy copy.
-pub fn rehash_id(path: &str) -> String {
-    format!("{REHASH_ID_PREFIX}{path}")
-}
 
 /// Result of applying a hash-wide share-state change. `hashes` contains each
 /// complete file identity once for `known.met` persistence; `changed_paths`
@@ -811,6 +811,29 @@ impl LocalIndex {
         changed
     }
 
+    /// The same, for an AICH root recovered by the background top-up pass.
+    ///
+    /// Keyed by content hash for the same reason its sibling is: the root is
+    /// derived from the bytes, so every copy of this content has the same one
+    /// and the pass only ever reads a single copy.
+    ///
+    /// Never clears: an empty argument means the pass did not ask for AICH on
+    /// this file, not that the file has no root. Overwriting a stored root with
+    /// nothing would withdraw recovery data the record already had.
+    pub fn set_aich_hash_by_hash(&mut self, hash: &str, aich_hash: &str) -> bool {
+        if hash.is_empty() || aich_hash.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for file in &mut self.files {
+            if file.hash == hash && file.aich_hash != aich_hash {
+                file.aich_hash = aich_hash.to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> ShareMutation {
         let key = normalize_path_key(path);
         let Some(selected) = self
@@ -1270,7 +1293,15 @@ mod tests {
 
 #[cfg(test)]
 mod local_index_tests {
-    use super::{rehash_id, LocalIndex};
+    use super::{LocalIndex, REHASH_ID_PREFIX};
+
+    /// Path-unique, matching what the foreground repair used to mint: both
+    /// `finalize_pending_hash` and `remove_file_by_id` take the first match, so
+    /// a content-keyed id let one copy's outcome land on a different, healthy
+    /// copy.
+    fn rehash_id(path: &str) -> String {
+        format!("{REHASH_ID_PREFIX}{path}")
+    }
     use crate::types::FileInfo;
     use std::collections::HashSet;
 

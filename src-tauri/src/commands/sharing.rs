@@ -129,30 +129,74 @@ pub(crate) fn release_in_flight_hash(path: &str, claim: u64) {
 /// What a single queued file's hash pass produces.
 type HashPassResult = anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)>;
 
-/// The ed2k hash and AICH root to carry forward when a queued file needs only
-/// its Ember digest computed, or `None` when it needs the full pass.
+/// Which one-time repairs a row still wants, given what `known.met` supplied.
 ///
-/// Keyed on what the row actually has rather than on how it was queued. The
-/// three conditions are: we already hold the ed2k hash, the Ember digest is the
-/// thing missing, and AICH is not *also* missing where the file is big enough
-/// to need one. Only that last case obliges us to re-read with MD4 and SHA-1
-/// running; otherwise BLAKE3 alone is the whole job.
+/// Both are top-ups to a record that is already complete enough to serve: the
+/// file has an ed2k id and its part hashes, so it is shared, searchable and
+/// downloadable whether or not either of these is ever filled in.
+///
+/// A single-part file legitimately has no AICH root, so an empty one there is
+/// the stored answer rather than a gap to fill.
+fn wanted_top_up(file: &FileInfo) -> crate::network::ed2k::hash::WantedDigests {
+    crate::network::ed2k::hash::WantedDigests {
+        aich: file.aich_hash.is_empty() && file.size > crate::network::ed2k::hash::PARTSIZE,
+        ember: file.ember_file_hash.is_empty(),
+    }
+}
+
+/// Whether a row has nothing left to top up.
+fn top_up_complete(want: crate::network::ed2k::hash::WantedDigests) -> bool {
+    !want.aich && !want.ember
+}
+
+/// Whether a row still wants one of the background repairs.
+///
+/// The startup path in `lib.rs` resolves `known.met` itself rather than going
+/// through [`resolve_from_known`], so it needs the same question answered by
+/// the same code — the two classifications drifting apart is how a file ends up
+/// queued in one place and skipped in the other.
+pub(crate) fn wants_hash_top_up(file: &FileInfo) -> bool {
+    !file.hash.is_empty() && !top_up_complete(wanted_top_up(file))
+}
+
+/// The ed2k hash and AICH root to carry forward for a row that needs only a
+/// top-up, with what to compute, or `None` when it needs the full pass.
+///
+/// Keyed on what the row actually has rather than on how it was queued: we hold
+/// the ed2k hash, and at least one of the two top-ups is outstanding. A row with
+/// no ed2k hash has never been hashed and needs everything; a row with nothing
+/// outstanding is here for some other reason and takes the full pass rather
+/// than a whole-file read that would compute nothing.
 ///
 /// This deliberately does not look at the id. It used to require the `rehash:`
 /// prefix, which was true of every caller at the time and silently wrong once
-/// the background backfill started passing rows under their real content-hash
+/// the background pass started passing rows under their real content-hash
 /// ids — they would have taken the full three-algorithm pass for want of a
 /// prefix, on exactly the libraries where the saving matters most.
-fn digest_only_inputs(file: &FileInfo) -> Option<(String, String)> {
-    if file.hash.is_empty() || !file.ember_file_hash.is_empty() {
+fn top_up_inputs(
+    file: &FileInfo,
+) -> Option<(
+    String,
+    String,
+    String,
+    crate::network::ed2k::hash::WantedDigests,
+)> {
+    if file.hash.is_empty() {
         return None;
     }
-    // A single-part file legitimately has no AICH root, so an empty one there
-    // is the stored answer rather than a gap to fill.
-    if file.aich_hash.is_empty() && file.size > crate::network::ed2k::hash::PARTSIZE {
+    let want = wanted_top_up(file);
+    if top_up_complete(want) {
         return None;
     }
-    Some((file.hash.clone(), file.aich_hash.clone()))
+    // All three stored values travel, including the ones being recomputed:
+    // whatever the pass is not asked for is handed back unchanged rather than
+    // blank, because the caller assigns the result onto the row.
+    Some((
+        file.hash.clone(),
+        file.aich_hash.clone(),
+        file.ember_file_hash.clone(),
+        want,
+    ))
 }
 
 /// What the look-ahead has for the consumer right now.
@@ -428,12 +472,12 @@ impl<'a> HashLookahead<'a> {
             };
             let path = file.path.clone();
             let cancel = self.cancel.clone();
-            let digest_only = digest_only_inputs(file);
+            let top_up = top_up_inputs(file);
             let task = tokio::task::spawn_blocking(move || {
                 let path = std::path::Path::new(&path);
-                match digest_only {
-                    Some((ed2k, aich)) => FileIndexer::hash_file_digest_only_cancellable(
-                        path, ed2k, aich, &cancel,
+                match top_up {
+                    Some((ed2k, aich, ember, want)) => FileIndexer::hash_file_top_up_cancellable(
+                        path, ed2k, aich, ember, want, &cancel,
                     ),
                     None => FileIndexer::hash_file_cancellable(path, &cancel),
                 }
@@ -1445,19 +1489,20 @@ async fn delete_file_with_retry(
 ///
 /// The split is the whole point: a file with no usable `known.met` record
 /// cannot be served, searched or published until it is hashed, so the scan has
-/// to wait for it. A file that is missing only its Ember digest is already
-/// complete by every eD2k measure and is servable right now — the digest buys
-/// downloaders an extra end-to-end check, and nothing else. Making the scan
-/// wait for those conflated "the Library is incomplete" with "the Library
-/// could be slightly better", and on a large library it is the second list
-/// that takes days.
+/// to wait for it. A file that is merely missing an AICH root or an Ember
+/// digest already has its ed2k id and its part hashes and is servable right
+/// now — those two buy a downloader cheaper corruption recovery and an extra
+/// end-to-end check respectively, and nothing else. Making the scan wait for
+/// either conflated "the Library is incomplete" with "the Library could be
+/// slightly better", and on a large library it is the second list that takes
+/// days.
 #[derive(Default)]
 struct ResolvedWork {
     /// Cannot be served until hashed. The scan blocks on these.
     needs_hashing: Vec<FileInfo>,
-    /// Servable already; wants only the Ember digest. Backfilled in the
-    /// background, at whatever pace the drives can spare.
-    needs_digest: Vec<FileInfo>,
+    /// Servable already; wants an AICH root, an Ember digest, or both. Topped
+    /// up in the background, at whatever pace the drives can spare.
+    needs_top_up: Vec<FileInfo>,
 }
 
 fn resolve_from_known(files: &mut [FileInfo], known: &KnownFileList) -> ResolvedWork {
@@ -1494,43 +1539,37 @@ fn resolve_from_known(files: &mut [FileInfo], known: &KnownFileList) -> Resolved
             // Restore the last-known Peers count so the UI doesn't flash
             // back to 0 until the next 60s source-count sync completes.
             file.complete_sources = record.complete_sources;
-            // Two one-time repairs, scheduled apart by how much is at stake.
-            // Kept in step with the startup path in `lib.rs`.
+            // Both one-time repairs go to the same background pass. Kept in
+            // step with the startup path in `lib.rs`.
             //
-            // A missing AICH root on a multi-part file is eD2k protocol data:
-            // without it a corrupt chunk cannot be pinpointed or re-fetched, so
-            // the scan waits for it. This case reached the full pass by
-            // accident before — every ember-less row was queued for a rehash,
-            // and `digest_only_inputs` then declined to shortcut the ones that
-            // also lacked AICH. Now that ember-less rows leave the scan
-            // entirely, it has to be asked for on purpose, or the AICH root
-            // would be computed and thrown away by a pass that persists only
-            // the digest.
+            // The scan's dividing line is whether a file can be served at all,
+            // and neither of these crosses it. A row matched here has its ed2k
+            // id and its part hashes, so it stays shared, searchable,
+            // publishable and uploadable throughout — which is why it keeps its
+            // content-hash id and enters the index as an ordinary entry rather
+            // than a placeholder.
+            //
+            // A missing AICH root used to hold the scan up, on the grounds that
+            // it is eD2k protocol data rather than an Ember extra. That is true
+            // of its value and not of its urgency: without it a corrupt chunk
+            // costs a downloader a re-fetch of the whole 9500 KiB part instead
+            // of one 180 KiB block, which is what every client did before eMule
+            // 0.44 and only costs anything once corruption actually happens.
+            // The wait, meanwhile, was certain — a library whose previous scan
+            // never finished has no roots for most of it, so blocking on them
+            // re-read the entire share in the foreground at the
+            // three-algorithm rate, while the digest pass sat behind
+            // `scanning_count` waiting its turn to read every byte a second
+            // time. Merged, it is one read per file for both.
             //
             // A missing Ember digest is an Ember-only extra that buys the
-            // downloader a whole-file check. The row is complete and servable
-            // without it, so it keeps its content-hash id, goes into the index
-            // as a normal entry, and the digest is filled in the background.
-            // Queueing these into the scan is what made a Reload re-read every
-            // byte of the library — days, on a large share spread over external
-            // drives, against the minutes the same reload takes in aMule, which
-            // has no digest to migrate and so never re-reads at all.
-            let needs_aich =
-                file.aich_hash.is_empty() && file.size > crate::network::ed2k::hash::PARTSIZE;
-            if needs_aich {
-                // Path-unique id for the duration of the rehash; `file.id` was
-                // just set to the content hash, which every duplicate shares,
-                // and both `finalize_pending_hash` and `remove_file_by_id`
-                // resolve by first match — so a hash failure on one copy took
-                // a different, healthy copy out of the Library.
-                //
-                // `rehash:`, not `pending:`: the row is already servable, so
-                // cancellation must leave it alone. See
-                // [`crate::search::index::REHASH_ID_PREFIX`].
-                file.id = crate::search::index::rehash_id(&file.path);
-                needs_hashing.push(file.clone());
-            } else if file.ember_file_hash.is_empty() {
-                work.needs_digest.push(file.clone());
+            // downloader a whole-file check. Queueing these into the scan is
+            // what made a Reload re-read every byte of the library — days, on a
+            // large share spread over external drives, against the minutes the
+            // same reload takes in aMule, which has no digest to migrate and so
+            // never re-reads at all.
+            if wants_hash_top_up(file) {
+                work.needs_top_up.push(file.clone());
             }
         } else {
             needs_hashing.push(file.clone());
@@ -1550,13 +1589,12 @@ const BACKFILL_DUTY_CYCLE: f64 = 0.8;
 /// pass to sleep for minutes.
 const BACKFILL_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// State of the one background digest pass, which is global because the work
+/// State of the one background top-up pass, which is global because the work
 /// is: it is keyed on the library, not on whichever scan happened to notice.
-static DIGEST_BACKFILL: std::sync::OnceLock<tokio::sync::Mutex<DigestBackfill>> =
-    std::sync::OnceLock::new();
+static HASH_TOP_UP: std::sync::OnceLock<tokio::sync::Mutex<HashTopUp>> = std::sync::OnceLock::new();
 
 #[derive(Default)]
-struct DigestBackfill {
+struct HashTopUp {
     running: bool,
     cancel: Option<Arc<AtomicBool>>,
     /// Paths already queued or done this session, so overlapping scans of the
@@ -1564,32 +1602,34 @@ struct DigestBackfill {
     seen: HashSet<String>,
     /// Content hashes this pass already has a file queued for.
     ///
-    /// One digest covers every copy of the same content —
-    /// `set_ember_file_hash_by_hash` stamps it onto every index row sharing the
-    /// hash — so reading the other copies is a whole file read each for an
+    /// Both repairs are derived from the bytes, so one answer covers every copy
+    /// of the same content — `set_ember_file_hash_by_hash` and
+    /// `set_aich_hash_by_hash` each stamp onto every index row sharing the
+    /// hash — and reading the other copies is a whole file read each for an
     /// answer already in hand, on a pass written to be gentle with the drives.
     ///
     /// Deliberately not folded into `seen`: a skipped copy's *path* stays
     /// unseen, so if the copy that was queued fails, the next scan offers the
-    /// others again. And if it succeeded, their index rows now carry the
-    /// digest and `queue_digest_backfill`'s `ember_file_hash` check drops them
-    /// without a read. Cleared when the pass ends, alongside `running`.
+    /// others again. And if it succeeded, their index rows now carry both, and
+    /// `queue_hash_top_up`'s `wants_hash_top_up` check drops them without a
+    /// read. Cleared when the pass ends, alongside `running`.
     queued_hashes: HashSet<String>,
     queued: Vec<FileInfo>,
     done: usize,
     total: usize,
 }
 
-fn digest_backfill() -> &'static tokio::sync::Mutex<DigestBackfill> {
-    DIGEST_BACKFILL.get_or_init(Default::default)
+fn hash_top_up() -> &'static tokio::sync::Mutex<HashTopUp> {
+    HASH_TOP_UP.get_or_init(Default::default)
 }
 
-/// Hand a scan's digest leftovers to the background pass.
+/// Hand a scan's one-time repairs — missing AICH roots, missing Ember
+/// digests — to the background pass.
 ///
 /// Additive: a second scan while one is running appends to the same queue
 /// rather than starting a competing pass, which is what keeps the per-device
 /// read limits meaningful.
-pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<FileInfo>) {
+pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: Vec<FileInfo>) {
     if files.is_empty() {
         return;
     }
@@ -1605,9 +1645,12 @@ pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<File
     {
         return;
     }
-    let mut state = digest_backfill().lock().await;
+    let mut state = hash_top_up().lock().await;
     for file in files {
-        if file.hash.is_empty() || !file.ember_file_hash.is_empty() {
+        // A row with no ed2k hash has never been hashed and belongs to the
+        // scan, not here; a row with both top-ups already present would be a
+        // whole-file read that computes nothing.
+        if !wants_hash_top_up(&file) {
             continue;
         }
         let path_key = crate::search::index::normalize_path_key(&file.path);
@@ -1639,36 +1682,44 @@ pub(crate) async fn queue_digest_backfill(app: tauri::AppHandle, files: Vec<File
     // race `await_background_scans` was added to close; detaching it here left
     // it outside that fence.
     let app_for_registry = app.clone();
-    let handle = tokio::spawn(async move { run_digest_backfill(app, cancel).await });
+    let handle = tokio::spawn(async move { run_hash_top_up(app, cancel).await });
     app_for_registry
         .state::<AppState>()
         .register_background_scan(handle)
         .await;
 }
 
-/// Stop the background pass. Nothing is lost: a file whose digest was never
-/// computed is simply still missing one, and the next launch finds it again.
-pub(crate) async fn cancel_digest_backfill() {
-    let state = digest_backfill().lock().await;
+/// Stop the background pass. Nothing is lost: a file whose root or digest was
+/// never computed is simply still missing one, and the next launch finds it
+/// again.
+pub(crate) async fn cancel_hash_top_up() {
+    let state = hash_top_up().lock().await;
     if let Some(cancel) = state.cancel.as_ref() {
         cancel.store(true, Ordering::Relaxed);
     }
 }
 
 /// `(done, total)` for the Library's status line, or `None` when idle.
-pub(crate) async fn digest_backfill_progress() -> Option<(usize, usize)> {
-    let state = digest_backfill().lock().await;
+pub(crate) async fn hash_top_up_progress() -> Option<(usize, usize)> {
+    let state = hash_top_up().lock().await;
     state.running.then_some((state.done, state.total))
 }
 
-/// Fill in missing Ember digests, quietly, for as long as it takes.
+/// Fill in missing AICH roots and Ember digests, quietly, for as long as it
+/// takes.
+///
+/// Both in one pass, and one read per file: a row can be missing either or
+/// both, and asking for them separately would walk the same bytes twice. That
+/// is not hypothetical — while the AICH half ran in the foreground, this pass
+/// waited on `scanning_count` and then re-read every file the scan had just
+/// finished reading.
 ///
 /// Deliberately unlike the scan loop it replaces. Nothing here is a
 /// placeholder: every row is already in the index under its real content hash
 /// and is served throughout, so there is no pending id to finalize, nothing to
 /// abandon on failure, and cancelling costs only the work not yet done. A file
 /// that fails, or that changed underneath us, is just left for next time.
-async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
+async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
     let state = app.state::<AppState>();
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
@@ -1680,20 +1731,20 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
     let finished: (usize, usize);
     loop {
         // Taking the next batch and deciding to stop happen under one lock,
-        // because `queue_digest_backfill` declines to start a second worker
+        // because `queue_hash_top_up` declines to start a second worker
         // while `running` is set. Clearing that flag outside this critical
         // section would let a scan queue work into the gap, see a worker that
         // is still nominally running, and have its files sit there until some
         // later scan happened to queue more.
         let batch = {
-            let mut backfill = digest_backfill().lock().await;
+            let mut backfill = hash_top_up().lock().await;
             let batch = std::mem::take(&mut backfill.queued);
             if batch.is_empty() || cancel.load(Ordering::Relaxed) {
                 // Cancelled with work still queued — put it back rather than
                 // dropping it. `seen` would otherwise keep the next scan from
                 // re-offering the same files, so discarding here would lose
                 // them until a restart. Clearing `running` under this same lock
-                // means the next `queue_digest_backfill` starts a fresh worker,
+                // means the next `queue_hash_top_up` starts a fresh worker,
                 // with a fresh cancel flag, that picks this up where it stopped.
                 backfill.queued = batch;
                 backfill.running = false;
@@ -1721,7 +1772,7 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         };
 
         let mut pipeline = HashLookahead::new(&batch, cancel.clone());
-        pipeline.log_plan("Backfilling Ember digests for", batch.len());
+        pipeline.log_plan("Topping up AICH roots and Ember digests for", batch.len());
         loop {
             // Stand aside for any real scan. A scan is hashing files the
             // Library cannot show until it finishes; this is topping up an
@@ -1762,7 +1813,7 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
             let Ok(outcome) =
                 tokio::time::timeout(std::time::Duration::from_secs(300), &mut task).await
             else {
-                warn!("Digest backfill timed out on {}", file.name);
+                warn!("Hash top-up timed out on {}", file.name);
                 pipeline.drain_started(StartedHash {
                     index: started.index,
                     device: started.device,
@@ -1771,37 +1822,47 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
                 });
                 // Counted as dealt with. It is not retried this pass, and a
                 // progress line that can never reach its total reads as stuck.
-                digest_backfill().lock().await.done += 1;
+                hash_top_up().lock().await.done += 1;
                 continue;
             };
             release_in_flight_hash(&file.path, started.claim);
 
             match outcome {
-                Ok(Ok((_, _, _, ember_file_hash, hashed_size, hashed_modified_at))) => {
+                Ok(Ok((_, aich_hash, _, ember_file_hash, hashed_size, hashed_modified_at))) => {
                     // The file must still be the one known.met described. A
                     // digest-only pass carries the stored ed2k forward rather
                     // than recomputing it, so size and mtime are the only
                     // evidence that the bytes we just read are the bytes that
                     // hash belongs to. Anything else is a file edited since
-                    // discovery, and attaching this digest to its old hash
-                    // would publish a digest that verifies nothing.
+                    // discovery, and attaching these to its old hash would
+                    // record repair data that verifies nothing. The AICH route
+                    // has already made the stronger check — it recomputes the
+                    // ed2k and fails the file outright on a mismatch — but this
+                    // still has to run for the digest-only route, which never
+                    // recomputes the MD4.
                     if hashed_size != file.size || hashed_modified_at != file.modified_at {
-                        debug!("Skipping digest for {}: changed since discovery", file.name);
-                    } else if ember_file_hash.is_empty() {
-                        debug!("Digest pass produced nothing for {}", file.name);
+                        debug!("Skipping top-up for {}: changed since discovery", file.name);
+                    } else if aich_hash.is_empty() && ember_file_hash.is_empty() {
+                        debug!("Top-up pass produced nothing for {}", file.name);
                     } else {
+                        // Both setters ignore an empty value rather than
+                        // clearing it, so whichever repair was not asked for on
+                        // this file leaves the stored value alone.
                         let mut index = local_index.write().await;
-                        if index.set_ember_file_hash_by_hash(&file.hash, &ember_file_hash) {
+                        let mut changed =
+                            index.set_ember_file_hash_by_hash(&file.hash, &ember_file_hash);
+                        changed |= index.set_aich_hash_by_hash(&file.hash, &aich_hash);
+                        if changed {
                             updated_since_reconcile += 1;
                         }
                     }
                 }
-                Ok(Err(e)) => debug!("Digest backfill failed for {}: {e}", file.name),
-                Err(e) => warn!("Digest backfill task panicked for {}: {e}", file.name),
+                Ok(Err(e)) => debug!("Hash top-up failed for {}: {e}", file.name),
+                Err(e) => warn!("Hash top-up task panicked for {}: {e}", file.name),
             }
 
             {
-                let mut backfill = digest_backfill().lock().await;
+                let mut backfill = hash_top_up().lock().await;
                 backfill.done += 1;
             }
 
@@ -1851,7 +1912,7 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         // the timeout branch above guards against.
         let skipped = pipeline.skipped();
         if !unstarted.is_empty() || skipped > 0 {
-            let mut backfill = digest_backfill().lock().await;
+            let mut backfill = hash_top_up().lock().await;
             backfill.done = backfill.done.saturating_add(skipped);
             for index in unstarted {
                 backfill.queued.push(batch[index].clone());
@@ -1864,7 +1925,7 @@ async fn run_digest_backfill(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         reconcile_shared_files_best_effort(&network_tx).await;
     }
     let (done, total) = finished;
-    info!("Ember digest backfill finished: {done}/{total}");
+    info!("Hash top-up finished: {done}/{total}");
 }
 
 /// After hashing, restore share-intent and friends-only from known.met by
@@ -2447,7 +2508,7 @@ pub async fn add_shared_folder(
         let known_list = load_known_files();
         let ResolvedWork {
             needs_hashing: mut files_to_hash,
-            needs_digest,
+            needs_top_up,
         } = resolve_from_known(&mut discovered, &known_list);
         let (folder_priorities, pending_share_states, pending_file_priorities) = {
             let cfg = config.read().await;
@@ -2748,9 +2809,9 @@ pub async fn add_shared_folder(
             let app_state = app.state::<AppState>();
             prune_pending_intents_for_hashed(&app_state).await;
             // Only now, with every file that could not be served already
-            // hashed, hand the optional digests to the background. Cancelling
+            // hashed, hand the optional repairs to the background. Cancelling
             // the scan skips this too: Stop means leave the disks alone.
-            queue_digest_backfill(app.clone(), needs_digest).await;
+            queue_hash_top_up(app.clone(), needs_top_up).await;
         }
         remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
@@ -4066,7 +4127,7 @@ async fn reload_shared_files_page(
         let known_list = load_known_files();
         let ResolvedWork {
             needs_hashing: mut files_to_hash,
-            needs_digest,
+            needs_top_up,
         } = resolve_from_known(&mut discovered, &known_list);
         let (folder_priorities, pending_share_states, pending_file_priorities) = {
             let cfg = config.read().await;
@@ -4364,9 +4425,9 @@ async fn reload_shared_files_page(
             let app_state = app.state::<AppState>();
             prune_pending_intents_for_hashed(&app_state).await;
             // Only now, with every file that could not be served already
-            // hashed, hand the optional digests to the background. Cancelling
+            // hashed, hand the optional repairs to the background. Cancelling
             // the reload skips this too: Stop means leave the disks alone.
-            queue_digest_backfill(app.clone(), needs_digest).await;
+            queue_hash_top_up(app.clone(), needs_top_up).await;
         }
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
@@ -4503,20 +4564,20 @@ pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<Strin
     // Stop means stop reading from the drives, and the background digest pass
     // is reading from them too. It is not represented in `hash_cancel_flags`
     // because it deliberately outlives the scan that queued it.
-    cancel_digest_backfill().await;
+    cancel_hash_top_up().await;
     info!("Stop hashing requested, cancelled {count} active tasks");
     Ok(result)
 }
 
-/// How far along the background digest backfill is, or `None` when it is not
+/// How far along the background hash top-up is, or `None` when it is not
 /// running.
 ///
 /// Polled rather than pushed: it is a quiet, hours-long background pass, and an
 /// event per file would be thousands of webview wakeups to move a number the
 /// user is not watching.
 #[tauri::command]
-pub async fn digest_backfill_status() -> Result<Option<(usize, usize)>, String> {
-    Ok(digest_backfill_progress().await)
+pub async fn hash_top_up_status() -> Result<Option<(usize, usize)>, String> {
+    Ok(hash_top_up_progress().await)
 }
 
 #[tauri::command]
@@ -5129,7 +5190,7 @@ mod tests {
             work.needs_hashing.is_empty(),
             "nothing here blocks the Library from being complete"
         );
-        assert_eq!(work.needs_digest.len(), 1, "the digest is still wanted");
+        assert_eq!(work.needs_top_up.len(), 1, "the digest is still wanted");
         // And the row itself stays a first-class, servable entry: no placeholder
         // id, and the real ed2k hash in place.
         assert_eq!(discovered[0].hash, hex::encode([0x11; 16]));
@@ -5151,20 +5212,25 @@ mod tests {
         let mut discovered = vec![indexed_file("C:/L/new.bin", "")];
         let work = resolve_from_known(&mut discovered, &known);
         assert_eq!(work.needs_hashing.len(), 1);
-        assert!(work.needs_digest.is_empty());
+        assert!(work.needs_top_up.is_empty());
     }
 
-    /// The one thing the background pass must *not* swallow. A multi-part file
-    /// with no AICH root needs one to survive a corrupt chunk, and the backfill
-    /// persists only the digest — so this has to stay in the foreground, where
-    /// the full pass computes and stores it. It used to qualify by accident,
-    /// because every digest-less row went to the scan and `digest_only_inputs`
-    /// declined to shortcut this one; once digest-less rows stopped going there
-    /// nothing was left asking for it.
+    /// A multi-part file with no AICH root is a one-time repair like the
+    /// digest, and goes to the same background pass.
+    ///
+    /// It used to block the scan, on the grounds that AICH is eD2k recovery
+    /// data rather than an Ember extra. That is a statement about its value and
+    /// not about its urgency: the row already has its ed2k id and part hashes,
+    /// so it serves, searches and publishes throughout, and what a missing root
+    /// costs is a downloader re-fetching a whole part instead of one block —
+    /// and only once something is actually corrupt. Against that, blocking
+    /// meant a library whose previous scan never finished re-read its entire
+    /// share in the foreground at the three-algorithm rate, and the digest pass
+    /// then read every byte a second time because it waits on `scanning_count`.
     #[test]
-    fn a_multi_part_file_missing_its_aich_root_still_blocks_the_scan() {
+    fn a_multi_part_file_missing_its_aich_root_goes_to_the_background() {
         let mut known = KnownFileList::new();
-        let mut record = known_record("C:/L/big.bin", [0x33; 16], "");
+        let mut record = known_record("C:/L/big.bin", [0x33; 16], &"ab".repeat(32));
         record.aich_hash = String::new();
         record.file_size = crate::network::ed2k::hash::PARTSIZE * 2;
         known.add_or_update(record);
@@ -5174,18 +5240,79 @@ mod tests {
         discovered[0].modified_at = 0;
         let work = resolve_from_known(&mut discovered, &known);
 
-        assert_eq!(
-            work.needs_hashing.len(),
-            1,
-            "AICH is eD2k recovery data, not an optional extra"
-        );
         assert!(
-            work.needs_digest.is_empty(),
-            "the foreground pass computes both; queueing it twice would re-read it twice"
+            work.needs_hashing.is_empty(),
+            "a servable file must not hold up the Library"
         );
-        assert!(discovered[0]
+        assert_eq!(work.needs_top_up.len(), 1, "the root is still wanted");
+        // The digest is already present here, so this row proves the pass is
+        // reached for AICH alone rather than riding on a missing digest.
+        assert_eq!(
+            wanted_top_up(&work.needs_top_up[0]),
+            crate::network::ed2k::hash::WantedDigests {
+                aich: true,
+                ember: false
+            }
+        );
+        // And it stays a first-class entry rather than a placeholder, so Stop
+        // cannot take it out of the Library.
+        assert_eq!(discovered[0].id, hex::encode([0x33; 16]));
+        assert!(!discovered[0]
             .id
             .starts_with(crate::search::index::REHASH_ID_PREFIX));
+    }
+
+    /// A single-part file has no AICH root by design, so an empty one there is
+    /// the stored answer and not a gap. Getting this wrong queues every small
+    /// file in the library for a whole-file read that can never satisfy it.
+    #[test]
+    fn a_single_part_file_is_not_asked_for_an_aich_root() {
+        let mut known = KnownFileList::new();
+        let mut record = known_record("C:/L/small.bin", [0x44; 16], &"ab".repeat(32));
+        record.aich_hash = String::new();
+        record.file_size = crate::network::ed2k::hash::PARTSIZE - 1;
+        known.add_or_update(record);
+
+        let mut discovered = vec![indexed_file("C:/L/small.bin", "")];
+        discovered[0].size = crate::network::ed2k::hash::PARTSIZE - 1;
+        discovered[0].modified_at = 0;
+        let work = resolve_from_known(&mut discovered, &known);
+
+        assert!(work.needs_hashing.is_empty());
+        assert!(
+            work.needs_top_up.is_empty(),
+            "a single-part file is complete without a root"
+        );
+    }
+
+    /// Both repairs outstanding on one file must be one read, not two passes
+    /// over the same bytes — which is the whole reason they were merged.
+    #[test]
+    fn a_file_missing_both_repairs_asks_for_them_together() {
+        let mut known = KnownFileList::new();
+        let mut record = known_record("C:/L/both.bin", [0x55; 16], "");
+        record.aich_hash = String::new();
+        record.file_size = crate::network::ed2k::hash::PARTSIZE * 3;
+        known.add_or_update(record);
+
+        let mut discovered = vec![indexed_file("C:/L/both.bin", "")];
+        discovered[0].size = crate::network::ed2k::hash::PARTSIZE * 3;
+        discovered[0].modified_at = 0;
+        let work = resolve_from_known(&mut discovered, &known);
+
+        assert_eq!(work.needs_top_up.len(), 1);
+        assert_eq!(
+            wanted_top_up(&work.needs_top_up[0]),
+            crate::network::ed2k::hash::WantedDigests {
+                aich: true,
+                ember: true
+            },
+            "one pass has to be asked for both, or the file is read twice"
+        );
+        let (ed2k, _, _, want) =
+            top_up_inputs(&work.needs_top_up[0]).expect("a matched row takes the top-up route");
+        assert_eq!(ed2k, hex::encode([0x55; 16]), "the stored ed2k is reused");
+        assert!(want.aich && want.ember);
     }
 
     /// A record that already carries its digest wants nothing at all — the
@@ -5202,7 +5329,7 @@ mod tests {
         let work = resolve_from_known(&mut discovered, &known);
 
         assert!(work.needs_hashing.is_empty());
-        assert!(work.needs_digest.is_empty());
+        assert!(work.needs_top_up.is_empty());
     }
 
     /// No device may ever have more reads outstanding than its own limit,
@@ -5447,21 +5574,26 @@ mod tests {
         }
     }
 
-    /// Only a digest top-up may skip the ed2k and AICH passes, and only when
-    /// `known.met` really supplied both. Getting this wrong in the permissive
+    /// A top-up may skip only what `known.met` really supplied, and must ask
+    /// for exactly what is missing. Getting this wrong in the permissive
     /// direction writes a made-up ed2k hash into the index; in the restrictive
-    /// direction it just costs the speed-up.
+    /// direction it just costs the speed-up. Asking for too little is the one
+    /// that reads a file and records nothing.
     #[test]
-    fn only_a_complete_record_missing_its_digest_skips_the_full_pass() {
+    fn a_top_up_asks_for_what_is_missing_and_carries_the_rest_forward() {
         let hash = "ab".repeat(16);
         let aich = "cd".repeat(20);
+        let digest_only = crate::network::ed2k::hash::WantedDigests {
+            aich: false,
+            ember: true,
+        };
 
         let mut migration = indexed_file("C:/A/file.bin", &hash);
         migration.aich_hash = aich.clone();
         migration.size = crate::network::ed2k::hash::PARTSIZE * 2;
         assert_eq!(
-            digest_only_inputs(&migration),
-            Some((hash.clone(), aich.clone())),
+            top_up_inputs(&migration),
+            Some((hash.clone(), aich.clone(), String::new(), digest_only)),
             "an otherwise complete record needs only its BLAKE3"
         );
 
@@ -5471,8 +5603,8 @@ mod tests {
         let mut backfilled = migration.clone();
         backfilled.id = hash.clone();
         assert_eq!(
-            digest_only_inputs(&backfilled),
-            Some((hash.clone(), aich.clone())),
+            top_up_inputs(&backfilled),
+            Some((hash.clone(), aich.clone(), String::new(), digest_only)),
             "how the row was queued must not decide how much of it is hashed"
         );
 
@@ -5482,32 +5614,60 @@ mod tests {
         single_part.aich_hash = String::new();
         single_part.size = 1;
         assert_eq!(
-            digest_only_inputs(&single_part),
-            Some((hash.clone(), String::new())),
+            top_up_inputs(&single_part),
+            Some((hash.clone(), String::new(), String::new(), digest_only)),
         );
 
-        // Old enough to predate AICH as well: nothing to carry forward.
+        // Old enough to predate AICH as well. This used to fall through to the
+        // full three-algorithm pass in the foreground; it is now a top-up that
+        // asks for both and still carries the stored ed2k forward.
         let mut no_aich = migration.clone();
         no_aich.aich_hash = String::new();
-        assert_eq!(digest_only_inputs(&no_aich), None);
+        assert_eq!(
+            top_up_inputs(&no_aich),
+            Some((
+                hash.clone(),
+                String::new(),
+                String::new(),
+                crate::network::ed2k::hash::WantedDigests {
+                    aich: true,
+                    ember: true
+                }
+            )),
+        );
 
-        // Already has a digest — should not have been queued at all, and
-        // certainly must not be short-cut.
-        let mut has_digest = migration.clone();
-        has_digest.ember_file_hash = "ef".repeat(32);
-        assert_eq!(digest_only_inputs(&has_digest), None);
+        // A row wanting only its root still carries the digest it already has,
+        // because the caller assigns the whole tuple onto the index row and a
+        // blank field there reads as an erasure rather than as "not asked for".
+        let mut has_digest_wants_root = migration.clone();
+        has_digest_wants_root.aich_hash = String::new();
+        has_digest_wants_root.ember_file_hash = "ef".repeat(32);
+        assert_eq!(
+            top_up_inputs(&has_digest_wants_root),
+            Some((
+                hash.clone(),
+                String::new(),
+                "ef".repeat(32),
+                crate::network::ed2k::hash::WantedDigests {
+                    aich: true,
+                    ember: false
+                }
+            )),
+        );
 
-        // A genuinely new file has no hash to carry forward.
+        // A genuinely new file has no hash to carry forward, so there is
+        // nothing to top up and it takes the full pass.
         let mut fresh = indexed_file("C:/A/new.bin", "");
         fresh.id = format!("{}C:/A/new.bin", crate::search::index::PENDING_ID_PREFIX);
         fresh.aich_hash = aich;
-        assert_eq!(digest_only_inputs(&fresh), None);
+        assert_eq!(top_up_inputs(&fresh), None);
 
-        // A row that already has its digest wants nothing — the condition that
-        // now decides this, in place of the old id-prefix check.
+        // A row with both repairs already present must not be handed a
+        // whole-file read that would compute nothing.
         let mut complete = indexed_file("C:/A/file.bin", &hash);
         complete.ember_file_hash = "ef".repeat(32);
-        assert_eq!(digest_only_inputs(&complete), None);
+        assert_eq!(top_up_inputs(&complete), None);
+        assert!(!wants_hash_top_up(&complete));
     }
 
     #[test]
@@ -5546,10 +5706,8 @@ mod tests {
 
         // Neither survivor is on the open network, so neither should be holding
         // the other copy's Ember records alive.
-        let mut candidates = hashes_no_longer_offered(
-            &index,
-            &[unshared.clone(), restricted.clone()],
-        );
+        let mut candidates =
+            hashes_no_longer_offered(&index, &[unshared.clone(), restricted.clone()]);
         candidates.sort();
         assert_eq!(candidates, vec![unshared, restricted]);
     }

@@ -10,7 +10,7 @@
     getLibraryScanTruncated,
     stopHashing,
     previewStopHashing,
-    digestBackfillStatus,
+    hashTopUpStatus,
     resumeHashing,
     setFilePriority,
     unshareFile,
@@ -88,7 +88,7 @@
    *  `scanning`: every file it touches is already shared and searchable, so the
    *  Library is complete whether or not this is going. It is shown only so that
    *  busy drives have a visible explanation. */
-  let digestBackfill = $state<[number, number] | null>(null);
+  let hashTopUp = $state<[number, number] | null>(null);
   let scanTruncated = $state(false);
   let error: string | null = $state(null);
   // Tracks the message last shown by a failed `refresh()` so we can clear
@@ -1112,7 +1112,7 @@
       // the only thing that ever writes this, so a note left standing here
       // would keep claiming background disk work was running, at a frozen
       // count, until Resume / Reload / Add folder or a revisit.
-      digestBackfill = null;
+      hashTopUp = null;
       stoppedByUser = true;
       // Keep `stoppedByUser` true: it's exactly what gates the "Resume
       // hashing" banner. Clearing it here (the old behaviour) meant the
@@ -2604,12 +2604,12 @@
       try {
         // Same tick as the scan poll rather than a timer of its own: this
         // moves slowly and nothing depends on it being fresh.
-        const [isScanning, backfill] = await Promise.all([
+        const [isScanning, topUp] = await Promise.all([
           getScanStatus(),
-          digestBackfillStatus().catch(() => null),
+          hashTopUpStatus().catch(() => null),
         ]);
         if (!mounted) return;
-        digestBackfill = backfill;
+        hashTopUp = topUp;
         scanPollFailures = 0;
         if (scanning && !isScanning) {
           scanning = false;
@@ -3402,13 +3402,14 @@
           <div class="hash-progress-fill" style="width:{Math.min(100, Math.round((hashProgress.current / hashProgress.total) * 100))}%"></div>
         </div>
       {/if}
-    {:else if digestBackfill}
+    {:else if hashTopUp}
       <!-- Deliberately not the scan banner: no spinner, no Stop button, and it
            does not claim the Library is incomplete. Every file counted here is
            already shared, searchable and downloadable; what is being added is
-           an extra end-to-end check for whoever downloads it. -->
+           an AICH root, an Ember digest, or both — repair and verification data
+           for whoever downloads it, never a condition of serving it. -->
       <div class="backfill-note">
-        {m.library_digest_backfill({ current: digestBackfill[0], total: digestBackfill[1] })}
+        {m.library_digest_backfill({ current: hashTopUp[0], total: hashTopUp[1] })}
       </div>
     {/if}
     {#if stopConfirmVisible}
