@@ -16,12 +16,30 @@ const MAGICVALUE_SYNC: u32 = 0x835E6FC4;
 const ENM_OBFUSCATION: u8 = 0x00;
 const RC4_DROP_BYTES: usize = 1024;
 
-const PLAIN_PROTOCOL_MARKERS: [u8; 5] = [
+/// The lead bytes that mean "this connection is not obfuscated".
+///
+/// Exactly the three eMule tests for, and the list is not ours to extend.
+/// `CEncryptedStreamSocket::Receive` breaks out as a "normal header" on
+/// `OP_EDONKEYPROT`, `OP_PACKEDPROT` and `OP_EMULEPROT` and treats every other
+/// value as the start of a negotiation (`EncryptedStreamSocket.cpp:240-246`),
+/// and `GetSemiRandomNotProtocolMarker` excludes the same three when choosing
+/// its own lead byte (`:731-739`).
+///
+/// This used to also list `OP_ED2KV2HEADER` (0xF4) and `OP_ED2KV2PACKEDPROT`
+/// (0xF5), which reads sensibly and is wrong: because eMule does not exclude
+/// them, they are legal obfuscation markers, and roughly two inbound
+/// obfuscated connections in 253 open with one. Those were read as a plaintext
+/// eD2K frame, so the next four bytes became a nonsense length and the
+/// connection was dropped — an intermittent handshake failure with no pattern
+/// to it.
+///
+/// Also used to pick our own marker, where a longer list would merely have
+/// been a subset of what eMule accepts. Keeping one list means the two answers
+/// cannot disagree about what "not a protocol byte" means.
+const PLAIN_PROTOCOL_MARKERS: [u8; 3] = [
     0xE3, // OP_EDONKEYHEADER
     0xC5, // OP_EMULEPROT
     0xD4, // OP_PACKEDPROT
-    0xF4, // OP_ED2KV2HEADER
-    0xF5, // OP_ED2KV2PACKEDPROT
 ];
 
 /// RC4 obfuscation key material needs to be unpredictable to peers observing

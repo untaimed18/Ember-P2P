@@ -34,6 +34,37 @@ pub const OP_ASKSHAREDFILESANSWER: u8 = 0x4B;
 /// UI shows "Access denied" rather than timing out). No payload.
 pub const OP_ASKSHAREDDENIEDANS: u8 = 0x61;
 
+/// The directory-based browse, which is what eMule actually asks with.
+///
+/// `SendSharedDirectories` is selected by `m_fSharedDirectories`
+/// (`BaseClient.cpp:1570-1571`), and that flag is set the moment a
+/// `CT_EMULE_VERSION` tag appears in the Hello (`:540`) or the EmuleInfo
+/// version byte is at least 0x28 (`:769`). Ember sends both, so a stock eMule
+/// or aMule peer *always* takes this path and never sends
+/// [`OP_ASKSHAREDFILES`] — which is why the flat responder, and the polite
+/// denial beside it, were unreachable for every client they were written for:
+/// eMule's handler for an opcode it has no case for just logs and returns
+/// (`ListenSocket.cpp:825-828`), so "View shared files" hung forever.
+///
+/// Empty payload; answered with [`OP_ASKSHAREDDIRSANS`].
+pub const OP_ASKSHAREDDIRS: u8 = 0x5D;
+/// Follow-up asking for the files in one directory named by
+/// [`OP_ASKSHAREDDIRSANS`]. Payload is a single ed2k string.
+pub const OP_ASKSHAREDFILESDIR: u8 = 0x5E;
+/// Reply to [`OP_ASKSHAREDDIRS`]: `<count 4>(<string>)[count]`
+/// (`BaseClient.cpp:2943-2946`).
+pub const OP_ASKSHAREDDIRSANS: u8 = 0x5F;
+/// Reply to [`OP_ASKSHAREDFILESDIR`]: the requested directory string echoed
+/// back, then the same `<count 4>(entry)[count]` body as
+/// [`OP_ASKSHAREDFILESANSWER`] (`ListenSocket.cpp:750-756`). eMule answers
+/// even when the directory holds nothing, because it advertises every shared
+/// directory whether or not it has files in it.
+pub const OP_ASKSHAREDFILESDIRANS: u8 = 0x60;
+
+/// eMule's pseudo-directory for files that are not under any shared folder
+/// (`Opcodes.h:241`). Sent verbatim, so it must not be translated.
+pub const OP_OTHER_SHARED_FILES: &str = "!Other";
+
 // Extended opcodes (OP_EMULEPROT)
 pub const OP_EMULEINFO: u8 = 0x01;
 pub const OP_EMULEINFOANSWER: u8 = 0x02;
@@ -342,12 +373,22 @@ pub fn source_exchange_hybrid_id(version: u8, source_id: u32) -> u32 {
     }
 }
 
+/// A tag value in eMule's *old* wire form, which is the only form
+/// [`write_ed2k_tag`] emits.
+///
+/// Deliberately has no narrow integer variants. `WriteTagToFile`
+/// (`Packets.cpp:667-681`) writes whatever type the `CTag` holds and a full
+/// four-byte value; the width-shrinking that produces `TAGTYPE_UINT8` and
+/// `TAGTYPE_UINT16` lives only in `WriteNewEd2kTag` (`:575-583`), which builds
+/// the compact form with a one-byte inline name and is a different encoder
+/// entirely. Offering `Uint8`/`Uint16` here invited a narrow value into the
+/// wide encoder, which is how the EmuleInfo packet ended up 42 bytes where
+/// eMule's is 62 while still claiming to be byte-identical. The decoder still
+/// accepts every width, because peers legitimately send them.
 #[derive(Debug, Clone)]
 pub enum Ed2kTagValue {
     String(String),
     Uint32(u32),
-    Uint16(u16),
-    Uint8(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,11 +674,56 @@ const MO2_SUPPORTS_CRYPT_LAYER: u32 = 7;
 const MO2_EXT_MULTI_PACKET: u32 = 5;
 const MO2_SUPPORT_LARGE_FILES: u32 = 4;
 
-/// `ET_FEATURES` (0x27) layout: bits 0-1 SecureIdent level, bit 2 preview,
-/// bit 3 SupportsCryptLayer, bit 4 RequestsCryptLayer, bit 5 RequiresCryptLayer.
-/// The level is a value in bits 0-1, not a flag, hence no shift.
+/// `ET_FEATURES` (0x27) layout. eMule defines exactly two fields
+/// (`BaseClient.cpp:847-853`, whose own comment is the authority here):
+/// bits 0-1 are the SecureIdent level — a value, not a flag, hence no shift —
+/// and **bit 7** is preview. Everything between is "0 - reserved".
+///
+/// Bits 3-5 are Ember's, not eMule's. eMule touches `ET_FEATURES` in exactly
+/// two places — the write at `:723-725` and the read above — and neither knows
+/// about a crypt layer here; it carries those in `CT_EMULE_MISCOPTIONS2`
+/// instead. eMule masks the bits it wants and ignores the rest, so occupying
+/// reserved space costs nothing today, but it is an extension sitting inside a
+/// standard tag rather than a namespaced one, and it is recorded as such.
 const ET_FEATURES_SEC_IDENT_LEVEL: u8 = 3;
+const ET_FEATURES_PREVIEW: u32 = 7;
 const ET_FEATURES_SUPPORTS_CRYPT_LAYER: u32 = 3;
+
+/// Whether a SecureIdent keypair is actually usable this session.
+///
+/// eMule advertises the level as `CryptoAvailable() ? 3 : 0` in both places it
+/// states it — `CT_EMULE_MISCOPTIONS1` (`BaseClient.cpp:966`) and `ET_FEATURES`
+/// (`:722`) — because the claim is a promise it has to keep: a peer that reads
+/// level 3 sends `OP_SECIDENTSTATE` and expects a key back.
+///
+/// Ember used to write 3 unconditionally, including when `cryptkey.dat` exists
+/// but cannot be read — a state it detects, reports as `"broken"` and logs as
+/// "SecIdent remains disabled". The peer's `InfoPacketsReceived` then asks,
+/// never gets an answer, leaves us at `IS_NOTAVAILABLE`, and we forfeit the
+/// cross-session credits the claim was supposed to earn. "Claims SecIdent,
+/// never completes it" is also a pattern anti-leech mods score against.
+///
+/// A process-global rather than a parameter: `build_emule_info` has seventeen
+/// call sites across six modules and most have no reason to hold a credit
+/// manager. Same shape as `GLOBAL_PREVIEW_PRIORITY` in `sharing::manager` —
+/// written once as the keypair loads, read on the handshake path.
+static SECIDENT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the SecureIdent keypair loaded. Called once from network
+/// startup, after `load_or_create_keypair`.
+pub fn set_secident_available(available: bool) {
+    SECIDENT_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// eMule's `CryptoAvailable()`: the level to advertise, 3 or 0.
+fn secident_level() -> u8 {
+    if SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        ET_FEATURES_SEC_IDENT_LEVEL
+    } else {
+        0
+    }
+}
 const ET_FEATURES_REQUESTS_CRYPT_LAYER: u32 = 4;
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
@@ -661,7 +747,7 @@ fn misc_options1_with(no_view_shared_files: bool) -> u32 {
         | (1u32 << MO1_UNICODE_SUPPORT)
         | (4u32 << MO1_UDP_VER)
         | (1u32 << MO1_DATA_COMP_VER)
-        | (3u32 << MO1_SUPPORT_SEC_IDENT)
+        | ((secident_level() as u32) << MO1_SUPPORT_SEC_IDENT)
         | (4u32 << MO1_SOURCE_EXCHANGE_VER)
         | (2u32 << MO1_EXTENDED_REQUESTS_VER)
         | (1u32 << MO1_ACCEPT_COMMENT_VER)
@@ -720,6 +806,19 @@ fn build_hello_inner(
     // Tag 3: CT_EMULE_UDPPORTS (0xF9) = (kadPort << 16) | udpPort
     let udp_ports: u32 = ((options.kad_port as u32) << 16) | (options.udp_port as u32);
     write_ed2k_tag(&mut buf, 0xF9, &Ed2kTagValue::Uint32(udp_ports));
+    // Buddy tags, if any, sit here — between CT_EMULE_UDPPORTS and
+    // CT_EMULE_MISCOPTIONS1 — because that is where eMule writes them
+    // (`BaseClient.cpp:955-961`). They used to go last, after
+    // CT_EMULE_VERSION. eMule's reader is a `switch` in a loop so ordering
+    // means nothing to vanilla, but every other tag in this packet is in
+    // eMule's exact order for the anti-leech reason the CT_EMULE_VERSION
+    // comment below sets out, and these two only appear when we are
+    // firewalled with a KAD buddy — the moment we can least afford a peer to
+    // find our handshake unusual.
+    if let Some(ref bi) = buddy {
+        write_ed2k_tag(&mut buf, 0xFC, &Ed2kTagValue::Uint32(bi.buddy_ip));
+        write_ed2k_tag(&mut buf, 0xFD, &Ed2kTagValue::Uint32(bi.buddy_port as u32));
+    }
     // Tag 4: CT_EMULE_MISCOPTIONS1 (0xFA)
     write_ed2k_tag(&mut buf, 0xFA, &Ed2kTagValue::Uint32(build_misc_options1()));
     // Tag 5: CT_EMULE_MISCOPTIONS2 (0xFE)
@@ -743,16 +842,46 @@ fn build_hello_inner(
     let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
-    // Optional buddy tags
-    if let Some(ref bi) = buddy {
-        write_ed2k_tag(&mut buf, 0xFC, &Ed2kTagValue::Uint32(bi.buddy_ip));
-        write_ed2k_tag(&mut buf, 0xFD, &Ed2kTagValue::Uint32(bi.buddy_port as u32));
-    }
-
     buf.write_u32::<LittleEndian>(options.server_ip).unwrap();
     buf.write_u16::<LittleEndian>(options.server_port).unwrap();
 
     buf
+}
+
+/// Write an ed2k bare string: `u16` byte length then UTF-8 bytes.
+///
+/// eMule's `CSafeMemFile::WriteString` with `utf8strRaw` — the same shape the
+/// tag encoder uses for its value, but with no tag header around it. Used by
+/// the directory browse, where the payload is a string on its own.
+///
+/// Truncated at `u16::MAX` on a character boundary rather than by byte count,
+/// so a clipped name is still valid UTF-8 for the receiver.
+pub(super) fn write_ed2k_string(buf: &mut Vec<u8>, value: &str) {
+    let mut bytes = value.as_bytes();
+    if bytes.len() > u16::MAX as usize {
+        let mut end = u16::MAX as usize;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        bytes = &value.as_bytes()[..end];
+    }
+    buf.write_u16::<LittleEndian>(bytes.len() as u16).unwrap();
+    buf.write_all(bytes).unwrap();
+}
+
+/// Read an ed2k bare string written by [`write_ed2k_string`].
+///
+/// Returns `None` when the payload is truncated or the bytes are not UTF-8,
+/// rather than lossily converting: the value names a directory we are about to
+/// match against, and a mangled name should miss rather than match something
+/// adjacent.
+pub(super) fn read_ed2k_string(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let bytes = payload.get(2..2 + len)?;
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
 /// Write a single ed2k tag in old format (type, name_len=1, name_id, value).
@@ -775,18 +904,6 @@ pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValu
             buf.write_u16::<LittleEndian>(1).unwrap();
             buf.write_u8(name_id).unwrap();
             buf.write_u32::<LittleEndian>(*v).unwrap();
-        }
-        Ed2kTagValue::Uint16(v) => {
-            buf.write_u8(0x08).unwrap();
-            buf.write_u16::<LittleEndian>(1).unwrap();
-            buf.write_u8(name_id).unwrap();
-            buf.write_u16::<LittleEndian>(*v).unwrap();
-        }
-        Ed2kTagValue::Uint8(v) => {
-            buf.write_u8(0x09).unwrap();
-            buf.write_u16::<LittleEndian>(1).unwrap();
-            buf.write_u8(name_id).unwrap();
-            buf.write_u8(*v).unwrap();
         }
     }
 }
@@ -839,26 +956,45 @@ pub fn build_emule_info(
     let tag_count: u32 = 7;
     buf.write_u32::<LittleEndian>(tag_count).unwrap();
 
+    // Every tag is a u32, which is what "byte-for-byte" above requires.
+    // eMule builds all seven as `CTag(uint8, uint64, bInt64 = false)`, which
+    // sets `TAGTYPE_UINT32` (`Packets.cpp:331-339`), and `WriteTagToFile`
+    // writes that type and a full 4-byte value with no narrowing
+    // (`Packets.cpp:667-681`) — the width-shrinking lives only in
+    // `WriteNewEd2kTag`, which this packet never uses. Writing `Uint8`/`Uint16`
+    // here made the payload 42 bytes where eMule's is 62. eMule's reader
+    // widens both back (`Packets.cpp:471-478`) so it never broke interop, but
+    // the packet was not the byte-identical eMule handshake the comment above
+    // claims, and being byte-identical is the entire anti-leech argument.
+    //
     // ET_COMPRESSION (0x20) = 1
-    write_ed2k_tag(&mut buf, 0x20, &Ed2kTagValue::Uint8(1));
+    write_ed2k_tag(&mut buf, 0x20, &Ed2kTagValue::Uint32(1));
     // ET_UDPVER (0x22) = 4 (must match MISCOPTIONS1 UDP ver to avoid downgrade)
-    write_ed2k_tag(&mut buf, 0x22, &Ed2kTagValue::Uint8(4));
+    write_ed2k_tag(&mut buf, 0x22, &Ed2kTagValue::Uint32(4));
     // ET_UDPPORT (0x21) = udp_port
-    write_ed2k_tag(&mut buf, 0x21, &Ed2kTagValue::Uint16(udp_port));
+    write_ed2k_tag(&mut buf, 0x21, &Ed2kTagValue::Uint32(udp_port as u32));
     // ET_SOURCEEXCHANGE (0x23) = 4 — must match MISCOPTIONS1 SX version
-    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint8(4));
+    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint32(4));
     // ET_COMMENTS (0x24) = 1
-    write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint8(1));
+    write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint32(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
-    write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint8(2));
+    write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint32(2));
     // ET_FEATURES (0x27). Named like the MISCOPTIONS shifts above and for the
-    // same reason: bit 2 (preview) and bit 5 (RequiresCryptLayer) are left
+    // same reason: bit 7 (preview) and bit 5 (RequiresCryptLayer) are left
     // clear, and the labels for those two once slid onto the neighbouring
     // fields when the zero terms were removed.
-    let features: u8 = ET_FEATURES_SEC_IDENT_LEVEL
-        | ((obfuscation_enabled as u8) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
-        | ((obfuscation_enabled as u8) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
-    write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint8(features));
+    //
+    // Preview stays clear deliberately rather than by omission. eMule sets it
+    // only when `CanSeeShares() != vsfaNobody` (`BaseClient.cpp:723`), tying
+    // the offer to whether shares are browsable at all — and Ember's browse
+    // responder is currently unreachable from stock eMule, which asks with
+    // `OP_ASKSHAREDDIRS` (0x5D) rather than `OP_ASKSHAREDFILES`. Advertising
+    // preview before that is answered would promise a capability the peer
+    // cannot reach.
+    let features: u32 = secident_level() as u32
+        | ((obfuscation_enabled as u32) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
+        | ((obfuscation_enabled as u32) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
+    write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint32(features));
 
     buf
 }
@@ -1257,25 +1393,48 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
             break;
         }
 
-        let tag_type = cursor.read_u8().unwrap_or(0);
-        let name_len = match cursor.read_u16::<LittleEndian>() {
-            Ok(n) => n as usize,
-            Err(_) => break,
+        // Both tag encodings, because eMule reads both here. `CTag::CTag`
+        // (`Packets.cpp:437-443`) takes the high bit as "the name is one byte,
+        // inline" and otherwise reads a u16 length — and it is the *same*
+        // reader for Hello and EmuleInfo, so a peer may use either form in
+        // either packet.
+        //
+        // This used to read the length unconditionally, which desynchronised on
+        // the first compact tag: the type byte was consumed, the next two bytes
+        // were read as a name length, and the `MAX_TAG_NAME_LEN` guard then
+        // broke the loop with default capabilities — compression 0, source
+        // exchange 0, extended requests 0, UDP port 0. That silently downgrades
+        // the whole session to the least capable request path rather than
+        // failing visibly. Vanilla eMule writes the old form here so it never
+        // tripped; mods and other stacks that use `WriteNewEd2kTag` did.
+        let tag_type_raw = cursor.read_u8().unwrap_or(0);
+        let (tag_type, name_id) = if tag_type_raw & 0x80 != 0 {
+            let nid = match cursor.read_u8() {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            (tag_type_raw & 0x7F, nid)
+        } else {
+            let name_len = match cursor.read_u16::<LittleEndian>() {
+                Ok(n) => n as usize,
+                Err(_) => break,
+            };
+            if pos + 3 + name_len > payload.len() {
+                break;
+            }
+            // Tag names in eMule are single-byte identifiers; cap defensively
+            // to avoid amplifying a malicious payload into megabytes of
+            // allocations.
+            const MAX_TAG_NAME_LEN: usize = 256;
+            if name_len > MAX_TAG_NAME_LEN {
+                break;
+            }
+            let mut name_buf = vec![0u8; name_len];
+            if cursor.read_exact(&mut name_buf).is_err() {
+                break;
+            }
+            (tag_type_raw, if name_len == 1 { name_buf[0] } else { 0 })
         };
-        if pos + 3 + name_len > payload.len() {
-            break;
-        }
-        // Tag names in eMule are single-byte identifiers; cap defensively
-        // to avoid amplifying a malicious payload into megabytes of allocations.
-        const MAX_TAG_NAME_LEN: usize = 256;
-        if name_len > MAX_TAG_NAME_LEN {
-            break;
-        }
-        let mut name_buf = vec![0u8; name_len];
-        if cursor.read_exact(&mut name_buf).is_err() {
-            break;
-        }
-        let name_id = if name_len == 1 { name_buf[0] } else { 0 };
 
         let int_val = match tag_type {
             0x03 => cursor.read_u32::<LittleEndian>().unwrap_or(0),
@@ -1389,8 +1548,13 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 // ET_FEATURES
                 caps.secure_ident_level = (int_val & 0x03) as u8;
                 caps.supports_secure_ident = caps.secure_ident_level != 0;
-                // eMule BaseClient.cpp: bit 2 = preview, bits 3-5 = crypt layer
-                caps.supports_preview = (int_val & 0x04) != 0;
+                // Bit 7, not bit 2. eMule's own layout comment is explicit —
+                // "Bit 7: Preview / Bit 6-0: secure identification" — and it
+                // reads `(temptag.GetInt() >> 7) & 1` (`BaseClient.cpp:847-853`)
+                // against a writer that sets `dwTagValue |= 0x80` (`:723-724`).
+                // Reading bit 2 meant a vanilla eMule advertising preview was
+                // always recorded as not supporting it.
+                caps.supports_preview = (int_val & (1 << ET_FEATURES_PREVIEW)) != 0;
                 caps.supports_crypt_layer |= (int_val & 0x08) != 0;
                 caps.requests_crypt_layer |= (int_val & 0x10) != 0;
                 caps.requires_crypt_layer |= (int_val & 0x20) != 0;
@@ -2899,11 +3063,30 @@ mod tests {
     /// Cross-check against `emulesource/BaseClient.cpp:980-1024`.
     #[test]
     fn misc_options_match_emule_hello_layout() {
+        // SecIdent is `CryptoAvailable() ? 3 : 0` (`BaseClient.cpp:966`), and
+        // the golden values below are the with-a-key form. The flag is a
+        // process-global and the suite runs in parallel, so this restores
+        // whatever it found rather than assuming a starting state.
+        let restore = SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed);
+        set_secident_available(true);
+
         // AICH 1<<29 | Unicode 1<<28 | UDPv4 4<<24 | Comp 1<<20 | SecIdent 3<<16
         // | SourceExch 4<<12 | ExtReq 2<<8 | AcceptComment 1<<4 | MultiPacket 1<<1
         assert_eq!(misc_options1_with(false), 0x3413_4212);
         // Same, plus NoViewSharedFiles at bit 2.
         assert_eq!(misc_options1_with(true), 0x3413_4216);
+
+        // Without a usable keypair the level is 0 and *only* that field moves.
+        // Promising SecIdent we cannot perform costs the credits it was meant
+        // to earn and reads as a spoof to anti-leech mods.
+        set_secident_available(false);
+        assert_eq!(
+            misc_options1_with(false),
+            0x3413_4212 & !(3 << MO1_SUPPORT_SEC_IDENT),
+            "only the SecIdent field may change when no keypair is available"
+        );
+
+        set_secident_available(restore);
         assert_eq!(
             build_misc_options1(),
             misc_options1_with(!share_browsing_allowed())
@@ -3493,6 +3676,48 @@ mod tests {
         assert_eq!(ed2k_wire_part_count(PARTSIZE + 1), 2);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2), 3);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2 + 1), 3);
+    }
+
+    /// The opcodes a stock eMule actually browses with. Getting any of these
+    /// numbers wrong is indistinguishable from not implementing them: eMule's
+    /// dispatcher logs and returns for an opcode it has no case for, so the
+    /// asker simply waits forever.
+    #[test]
+    fn shared_directory_browse_opcodes_match_emule() {
+        assert_eq!(OP_ASKSHAREDDIRS, 0x5D);
+        assert_eq!(OP_ASKSHAREDFILESDIR, 0x5E);
+        assert_eq!(OP_ASKSHAREDDIRSANS, 0x5F);
+        assert_eq!(OP_ASKSHAREDFILESDIRANS, 0x60);
+        // Sent verbatim on the wire, so it is a protocol constant rather than
+        // a label (`Opcodes.h:241`).
+        assert_eq!(OP_OTHER_SHARED_FILES, "!Other");
+    }
+
+    /// A directory name is a bare ed2k string — `u16` length then bytes — and
+    /// the answer echoes back exactly what the asker sent, which is what it
+    /// keys its pending request on.
+    #[test]
+    fn ed2k_strings_round_trip_and_reject_truncation() {
+        let mut buf = Vec::new();
+        write_ed2k_string(&mut buf, "Movies");
+        assert_eq!(&buf[..2], &6u16.to_le_bytes());
+        assert_eq!(read_ed2k_string(&buf).as_deref(), Some("Movies"));
+
+        // Non-ASCII survives, since folder names routinely are.
+        let mut utf8 = Vec::new();
+        write_ed2k_string(&mut utf8, "Música");
+        assert_eq!(read_ed2k_string(&utf8).as_deref(), Some("Música"));
+
+        // A length that runs past the payload must not read adjacent bytes.
+        let mut short = Vec::new();
+        write_ed2k_string(&mut short, "Movies");
+        short.truncate(5);
+        assert_eq!(read_ed2k_string(&short), None);
+        assert_eq!(read_ed2k_string(&[]), None);
+
+        // Invalid UTF-8 misses rather than being lossily mangled into a name
+        // that might match a different directory.
+        assert_eq!(read_ed2k_string(&[2, 0, 0xFF, 0xFE]), None);
     }
 
     #[test]

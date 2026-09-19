@@ -1079,7 +1079,17 @@ const RESERVED_PORT_TEST_CONNECTIONS: usize = 4;
 /// tenth of one. eMule pays the same shape in `GetWaitingPosition` and
 /// `CUploadQueue::Process`, and the per-IP cap plus the soft-zone gate still
 /// bound who gets in.
-const MAX_UPLOAD_QUEUE_SIZE: usize = 5000;
+pub(crate) const MAX_UPLOAD_QUEUE_SIZE: usize = 5000;
+
+/// How close to [`MAX_UPLOAD_QUEUE_SIZE`] the waiting list has to be before a
+/// UDP re-ask from a peer we have no row for is answered with `OP_QUEUEFULL`
+/// rather than with silence.
+///
+/// eMule's figure, from the same comparison:
+/// `GetWaitingUserCount() + 50 > GetQueueSize()` (`ClientUDPSocket.cpp:298`).
+/// Below that it says nothing at all, because silence is what times the peer's
+/// UDP ask out and sends it back to TCP where it can re-enter the queue.
+pub(crate) const QUEUE_FULL_HEADROOM: usize = 50;
 /// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
@@ -1175,12 +1185,15 @@ const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
 const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
 
 /// eMule-style per-file request frequency tracker for detecting aggressive leechers.
-/// MIN_REQUESTTIME (eMule) is 590 seconds. After BADCLIENTBAN infractions, ban the client.
+/// `MIN_REQUESTTIME` (`opcodes.h:116`) is 600 seconds. After `BADCLIENTBAN`
+/// infractions inside that window, ban the client.
 ///
 /// Shared with the download side rather than re-declared: our own downloader
 /// re-asking faster than this is exactly what this tracker bans, so the two
-/// must not drift. A 60 s download-side reask floor against this 590 s ban
-/// threshold is what got Ember banned by its own peers.
+/// must not drift. A 60 s download-side reask floor against this ban threshold
+/// is what got Ember banned by its own peers — and the fix for that left the
+/// constant at 590, ten seconds inside the window it exists to clear, which is
+/// the same bug at a scale small enough to go unnoticed.
 const MIN_REQUESTTIME_SECS: u64 = super::dead_sources::MIN_REQUESTTIME_SECS as u64;
 /// eMule `BADCLIENTBAN` (`Opcodes.h:115`): strikes inside
 /// [`MIN_REQUESTTIME_SECS`] before a peer is banned.
@@ -4443,6 +4456,103 @@ impl UploadHandler {
         encode_shared_files_answer(&files, client_id, self.advertised_tcp_port())
     }
 
+    /// The browsable set, with the folder each file sits in.
+    ///
+    /// Shared with [`Self::build_shared_files_answer`]'s filter deliberately:
+    /// the directory browse must disclose exactly what the flat browse already
+    /// does and nothing more, so both derive from one predicate rather than two
+    /// that could drift apart. A friends-only file that the flat answer hides
+    /// must not become visible just because eMule asked the other way.
+    async fn browsable_files_by_folder(&self) -> Vec<(String, (String, String, u64, String))> {
+        const MAX_BROWSE_ANSWER_FILES: usize = 50_000;
+        let snapshot_ready = friends_only_snapshot_ready(&self.friends_only_hashes);
+        let index = self.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .filter(|f| {
+                if !f.is_friend_visible() {
+                    return false;
+                }
+                let snapshot_hit = crate::network::parse_ed2k_hash16(&f.hash)
+                    .is_some_and(|h| friends_only_snapshot_contains(&self.friends_only_hashes, &h));
+                !friends_only_from_sources(snapshot_hit, snapshot_ready, Some(f.friends_only))
+            })
+            .take(MAX_BROWSE_ANSWER_FILES)
+            .map(|f| {
+                (
+                    f.folder.clone(),
+                    (f.hash.clone(), f.name.clone(), f.size, f.extension.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// The directory name a peer sees for a file's folder.
+    ///
+    /// The *basename*, never the full path. eMule solves the same problem with
+    /// a generated pseudonym and a lookup table (`GetPseudoDirName`), for the
+    /// reason the table exists: the real path is `C:\Users\<name>\...` and
+    /// handing it to an anonymous peer discloses the account name and the
+    /// library's layout. A basename is recognisable to the person browsing and
+    /// carries none of that.
+    ///
+    /// Stateless, where eMule's is not: two shared folders with the same
+    /// basename collapse into one listing rather than being told apart. That is
+    /// a cosmetic merge in a browse, and it buys away an entire table of
+    /// per-connection state that would have to be reset, bounded and expired.
+    fn browse_dir_label(folder: &str) -> String {
+        std::path::Path::new(folder)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| super::messages::OP_OTHER_SHARED_FILES.to_string())
+    }
+
+    /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
+    async fn build_shared_dirs_answer(&self) -> Vec<u8> {
+        let mut labels: Vec<String> = Vec::new();
+        for (folder, _) in self.browsable_files_by_folder().await {
+            let label = Self::browse_dir_label(&folder);
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        // Only directories that actually have something browsable in them.
+        // eMule sends every shared directory including empty ones and says so
+        // in a TODO; there is no reason to copy a listing entry that resolves
+        // to nothing.
+        let mut buf = Vec::with_capacity(4 + labels.len() * 24);
+        buf.extend_from_slice(&(labels.len() as u32).to_le_bytes());
+        for label in &labels {
+            super::messages::write_ed2k_string(&mut buf, label);
+        }
+        buf
+    }
+
+    /// `OP_ASKSHAREDFILESDIRANS`: the requested directory echoed back, then the
+    /// same body as the flat answer.
+    async fn build_shared_files_dir_answer(&self, requested: &str, client_id: u32) -> Vec<u8> {
+        let files: Vec<(String, String, u64, String)> = self
+            .browsable_files_by_folder()
+            .await
+            .into_iter()
+            .filter(|(folder, _)| Self::browse_dir_label(folder) == requested)
+            .map(|(_, entry)| entry)
+            .collect();
+
+        let mut buf = Vec::new();
+        // Echoed verbatim, as eMule does with `strOrgReqDir` — the asker keys
+        // its pending request on the exact string it sent.
+        super::messages::write_ed2k_string(&mut buf, requested);
+        buf.extend_from_slice(&encode_shared_files_answer(
+            &files,
+            client_id,
+            self.advertised_tcp_port(),
+        ));
+        buf
+    }
+
     /// Periodic eMule-style queue maintenance: evict waiting peers whose
     /// requested file we no longer offer.
     ///
@@ -6888,10 +6998,13 @@ impl UploadHandler {
         // which counts the payload those bytes represent.
         //
         // The two differ by the compression ratio on the `OP_COMPRESSEDPART`
-        // path, and eMule keeps them apart for the same reason: payload is what
-        // a peer is credited for and what the statistics count, while
-        // `m_nTransferredUp` — the datarate and the Transferred column — is
-        // what went down the wire.
+        // path, and eMule keeps them apart — but the split is not the obvious
+        // one. `UpdateUploadingStatisticsData` (`UploadClient.cpp:433-441`)
+        // gives the *wire* figure to `m_nTransferredUp`, to `credits->
+        // AddUploaded` and to the datarate; the payload figure it reads
+        // separately goes only to `m_nCurQueueSessionPayloadUp`, which drives
+        // `SESSIONMAXTRANS`, and to the per-file statistics. So payload buys a
+        // peer its session allowance, and wire is what it is charged for.
         //
         // Conflating them is issue 115. The bandwidth limiter is charged the
         // compressed length, so the configured cap and the status-bar total are
@@ -9537,8 +9650,20 @@ impl UploadHandler {
                         let (data, compressed_opt): (Vec<u8>, Option<Vec<u8>>) =
                             if use_compression {
                                 tokio::task::spawn_blocking(move || {
+                                    // Level 1, as eMule uses, with eMule's
+                                    // measurement behind it: for the ~10 KiB
+                                    // blocks this path sends, "compressed size
+                                    // difference is usually small enough (~4%
+                                    // for .exe, .avi, .pdf and 12% for .c
+                                    // text)" while "time was 1.5-2.5 better"
+                                    // (`UploadDiskIOThread.cpp:422-427`).
+                                    // `Compression::default()` is level 6 and
+                                    // was paying that CPU on the serve hot path
+                                    // for a few percent of a saving the
+                                    // uplink — not the compressor — is the
+                                    // bottleneck on anyway.
                                     let mut encoder =
-                                        ZlibEncoder::new(Vec::new(), Compression::default());
+                                        ZlibEncoder::new(Vec::new(), Compression::new(1));
                                     let compressed = match encoder.write_all(&data) {
                                         // Only keep the compressed copy if it
                                         // actually saves space.
@@ -9644,9 +9769,23 @@ impl UploadHandler {
                                 // limiter above was charged and therefore what
                                 // the cap and the status-bar total count.
                                 uploaded_wire += chunk_len as u64;
-                                rate_tracker.record_send(share);
+                                // Credits and the slot's measured rate are both
+                                // wire figures in eMule:
+                                // `UpdateUploadingStatisticsData` sums the
+                                // socket's sent-byte counters into
+                                // `sentBytesFile` and hands *that* to
+                                // `credits->AddUploaded` and `m_nTransferredUp`
+                                // (`UploadClient.cpp:433-441`), while the
+                                // payload figure it reads separately goes only
+                                // to the session cap and per-file statistics.
+                                // Crediting the payload instead charges a peer
+                                // up to the compression ratio more than it
+                                // received, which lowers its score ratio and
+                                // sinks it in our own queue for the crime of
+                                // taking compressible data.
+                                rate_tracker.record_send(chunk_len as u64);
                                 batch_credited_bytes =
-                                    batch_credited_bytes.saturating_add(share);
+                                    batch_credited_bytes.saturating_add(chunk_len as u64);
 
                                 if let Some(tid) = &transfer_id {
                                     let should_emit = match last_progress_emit {
@@ -9941,10 +10080,32 @@ impl UploadHandler {
 
                     // Enforce eMule session limits + score-based preemption.
                     // eMule CheckForTimeOver: don't rotate if nobody is waiting.
+                    // eMule's condition is `!ForceNewClient()`
+                    // (`UploadQueue.cpp:789`, `:798`), not "somebody is
+                    // waiting". `ForceNewClient` (`:411-461`) is true only when
+                    // the waiting list is non-empty *and* the bandwidth
+                    // arithmetic says another slot can be opened — so when a
+                    // slot is free eMule **adds** one rather than rotating, and
+                    // the peer already downloading is left alone.
+                    //
+                    // Rotating on waiters alone meant that on an under-loaded
+                    // node — one active slot, spare uplink, one waiter — a
+                    // healthy transfer was interrupted with `OP_OUTOFPARTREQS`
+                    // every 9.75 MB, forcing the peer to re-send
+                    // `OP_STARTUPLOADREQ` and wait for a fresh
+                    // `OP_ACCEPTUPLOADREQ` before data resumed. Ember was
+                    // already treating the symptom: `forgive_requeue` below
+                    // exists because these self-inflicted rotations were
+                    // tripping our own leecher detector.
                     let queue_has_waiters = {
                         let q = self.upload_queue.lock().await;
                         !q.is_empty()
                     };
+                    let can_open_another_slot = self
+                        .active_count
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        < self.compute_dynamic_slot_count();
+                    let must_rotate_to_serve_waiter = queue_has_waiters && !can_open_another_slot;
                     // eMule CheckForTimeOver (UploadQueue.cpp:773) returns false
                     // for a friend slot: a verified friend is NEVER rotated out,
                     // neither by the per-session byte cap (SESSIONMAXTRANS) nor the
@@ -9962,7 +10123,7 @@ impl UploadHandler {
                         secure_v2_authenticated,
                     )
                     .await;
-                    let session_expired = queue_has_waiters
+                    let session_expired = must_rotate_to_serve_waiter
                         && !is_verified_friend
                         && (uploaded >= SESSIONMAXTRANS
                             || session_start
@@ -10425,6 +10586,93 @@ impl UploadHandler {
                         .await?;
                         debug!("Denied OP_ASKSHAREDFILES from {peer_addr} (browsing disabled)");
                     }
+                }
+
+                // The directory browse, which is the one a stock eMule or aMule
+                // actually sends — see `OP_ASKSHAREDDIRS` in `messages.rs` for
+                // why the flat opcode above never reaches them. Same gate, same
+                // throttle and the same polite denial, because it is the same
+                // disclosure asked for in two packets instead of one.
+                (OP_EDONKEYHEADER, OP_ASKSHAREDDIRS) => {
+                    if self
+                        .share_browsing_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if last_browse.is_some_and(|t: std::time::Instant| {
+                            t.elapsed() < MIN_BROWSE_INTERVAL
+                        }) {
+                            debug!("Ignoring repeat OP_ASKSHAREDDIRS from {peer_addr}");
+                            self.note_abusive_request(peer_addr.ip()).await;
+                            continue;
+                        }
+                        last_browse = Some(std::time::Instant::now());
+                        let resp = self.build_shared_dirs_answer().await;
+                        self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                            .await?;
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ASKSHAREDDIRSANS,
+                            &resp,
+                        )
+                        .await?;
+                        debug!("Answered OP_ASKSHAREDDIRS from {peer_addr}");
+                    } else {
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ASKSHAREDDENIEDANS,
+                            &[],
+                        )
+                        .await?;
+                        debug!("Denied OP_ASKSHAREDDIRS from {peer_addr} (browsing disabled)");
+                    }
+                }
+
+                (OP_EDONKEYHEADER, OP_ASKSHAREDFILESDIR) => {
+                    if !self
+                        .share_browsing_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ASKSHAREDDENIEDANS,
+                            &[],
+                        )
+                        .await?;
+                        debug!(
+                            "Denied OP_ASKSHAREDFILESDIR from {peer_addr} (browsing disabled)"
+                        );
+                        continue;
+                    }
+                    let Some(requested) = super::messages::read_ed2k_string(&payload) else {
+                        debug!("Malformed OP_ASKSHAREDFILESDIR from {peer_addr}");
+                        continue;
+                    };
+                    // Deliberately not charged to `last_browse`. The directory
+                    // list the peer is working through is one browse, and it
+                    // legitimately sends one of these per directory back to
+                    // back; the per-request cost is bounded by the answer being
+                    // a subset of the flat listing, which `MIN_BROWSE_INTERVAL`
+                    // already rate-limits at the `OP_ASKSHAREDDIRS` that
+                    // started it. Still metered against the upload cap.
+                    let client_id = self
+                        .external_ip_shared
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let resp = self
+                        .build_shared_files_dir_answer(&requested, client_id)
+                        .await;
+                    self.acquire_upload_bandwidth((6 + resp.len()) as u64)
+                        .await?;
+                    write_packet_async(
+                        &mut writer,
+                        OP_EDONKEYHEADER,
+                        OP_ASKSHAREDFILESDIRANS,
+                        &resp,
+                    )
+                    .await?;
+                    debug!("Answered OP_ASKSHAREDFILESDIR({requested}) from {peer_addr}");
                 }
 
                 (OP_EDONKEYHEADER, OP_HASHSETREQ) if payload.len() >= 16 => {

@@ -6259,6 +6259,11 @@ async fn download_parts_from_source(
     let mut got_status = single_part;
     let mut got_filename = false;
     let mut peer_file_status: Option<Vec<bool>> = None;
+    // Set when a multi-part `OP_FILESTATUS` arrived with `part_count == 0` —
+    // eMule's complete-source sentinel. Kept apart from `peer_file_status`
+    // because the two answers are used for different decisions: this one
+    // counts toward rarity, and only the bitmap decides what we ask for.
+    let mut claimed_complete_multipart = false;
     let mut last_fswait_pkt: Option<(u8, u8, usize)> = None;
     for fswait_round in 0..12u32 {
         let (proto, opcode, _payload) = if let Some(pkt) = deferred_packet.take() {
@@ -6835,8 +6840,28 @@ async fn download_parts_from_source(
                         );
                         peer_file_status = Some(vec![true; part_count]);
                     } else {
+                        // Distrusted for *selection*, still counted for
+                        // *rarity*. Withholding it from both is what made this
+                        // a scheduling bug rather than a cautious guess:
+                        // `part_count == 0` is what stock eMule sends for every
+                        // completed file it shares, of any size
+                        // (`ListenSocket.cpp:387-390`, `WriteUInt16(0)` when the
+                        // file is not a part file), so on a healthy popular
+                        // swarm most sources arrive this way. Leaving
+                        // `peer_file_status` as `None` also skipped the
+                        // `part_frequency` / `total_sources` contribution below,
+                        // so seeders — the peers that hold *every* part and
+                        // should raise the frequency of all of them — added
+                        // nothing at all. `total_sources` then sat near zero,
+                        // the zone limit collapsed to its `max(.., 3)` floor,
+                        // every part scored in the "very rare" band, and
+                        // rarest-first stopped discriminating between parts for
+                        // the rest of the download. That is the same drift
+                        // `chunk_selection`'s own doc warns about for unpaired
+                        // removes, arrived at from the other direction.
+                        claimed_complete_multipart = true;
                         debug!(
-                            "Source {} file status: part_count=0 for multi-part file ({} parts) — treating as unverified (leaving availability unknown)",
+                            "Source {} file status: part_count=0 for multi-part file ({} parts) — counting for rarity, leaving per-part availability unknown",
                             _src_idx, part_count
                         );
                     }
@@ -7122,7 +7147,20 @@ async fn download_parts_from_source(
     // Held for the rest of the function so the contribution is undone however
     // this source ends, not only on the clean return at the bottom.
     let _wire_avail_guard: Option<WireAvailabilityGuard> = if !had_preexisting_availability {
-        match (&peer_file_status, &chunk_sel) {
+        // A peer that answered `part_count == 0` on a multi-part file told us
+        // it holds everything. We decline to act on that when choosing which
+        // part to ask it for — see the `claimed_complete_multipart` comment —
+        // but it is still evidence about how rare each part is in the swarm,
+        // and rarity is the one judgement that gets worse the fewer sources it
+        // can see. Synthesised rather than assigned to `peer_file_status` so
+        // the two decisions stay separate, and handed to the guard so it is
+        // undone by the same path as any other contribution.
+        let rarity_avail = match &peer_file_status {
+            Some(pfs) => Some(pfs.clone()),
+            None if claimed_complete_multipart => Some(vec![true; part_count]),
+            None => None,
+        };
+        match (rarity_avail, &chunk_sel) {
             (Some(pfs), Some(cs)) => {
                 {
                     let mut cs = cs.write().await;
@@ -7135,7 +7173,7 @@ async fn download_parts_from_source(
                 }
                 Some(WireAvailabilityGuard {
                     chunk_sel: Some(cs.clone()),
-                    avail: Some(pfs.clone()),
+                    avail: Some(pfs),
                     drop_tx: drop_tx.clone(),
                 })
             }
@@ -10849,21 +10887,24 @@ fn outstanding_blocks_for_speed_ms(
     // has no hard queue cap, and their `StartCreateNextBlockPackage`
     // BIGBUFFER limit of 900 KiB naturally absorbs up to 5 blocks before
     // back-pressuring disk reads.
-    let mut blocks = if remaining_parts <= 4 {
-        if speed < 600 {
+    // The endgame branch used to run its own ladder, and that ladder was not
+    // monotonic: 0.6-1.2 KB/s got 2 blocks while 1.2-4 KB/s got 1, so a source
+    // that *sped up* had its pipeline halved and delivered in stutters. It also
+    // sent `speed == 0` — the cold start the comment above is entirely about —
+    // down the `< 600` arm to a single block, contradicting that reasoning for
+    // every file of four parts or fewer, which is permanently in this branch.
+    //
+    // There is no eMule counterpart to any of it. eMule's ladder
+    // (`DownloadClient.cpp:804-810`) is monotonic and has no endgame variant at
+    // all; what limits the endgame here is the `min` clamp further down, which
+    // already says so. So this branch now only adds the sub-eMule tiers that
+    // exist to keep a trickle slot inside its uploader's send timeout, and then
+    // falls through to the shared ladder.
+    let mut blocks = if remaining_parts <= 4 && speed > 0 && speed < 4 * 1024 {
+        if speed < 1200 {
             1
-        } else if speed < 1200 {
-            2
-        } else if speed < 4 * 1024 {
-            1
-        } else if speed < 9 * 1024 {
-            2
-        } else if speed < 75 * 1024 {
-            3
-        } else if speed < 150 * 1024 {
-            6
         } else {
-            9
+            2
         }
     } else if speed == 0 {
         6
@@ -10887,6 +10928,16 @@ fn outstanding_blocks_for_speed_ms(
     } else if remaining_parts <= 4 || remaining_gap_bytes <= PARTSIZE.saturating_mul(3) {
         blocks = blocks.min(6);
     }
+    // And never ask for more blocks than there is gap left to put them in.
+    // The clamps above are in whole parts, which is far too coarse at the very
+    // end: a thousand bytes outstanding still reads as "<= 2 parts" and bought
+    // three blocks, 540 KiB of request for 1 KiB of need. It went unnoticed
+    // because the speed ladder happened to return 1 for the slowest tier, so
+    // the tail of a small download was held down by the *speed* branch rather
+    // than by how little was left — which is also why making that branch
+    // monotonic surfaced it.
+    let gap_blocks = remaining_gap_bytes.div_ceil(super::messages::EMBLOCKSIZE);
+    blocks = blocks.min(gap_blocks.max(1) as usize);
     blocks.max(1)
 }
 
@@ -11831,6 +11882,38 @@ mod tests {
             blocks, 1,
             "endgame with tiny gap should keep a single block pending, got {blocks}",
         );
+    }
+
+    /// Going faster must never shrink the pipeline. The endgame branch used to
+    /// run its own ladder in which 1.2-4 KB/s got fewer blocks than
+    /// 0.6-1.2 KB/s, so a source that picked up speed had its request depth
+    /// halved and delivered in stutters. eMule's ladder
+    /// (`DownloadClient.cpp:804-810`) is monotonic and has no endgame variant;
+    /// what limits the endgame here is the clamp, not the speed tiers.
+    #[test]
+    fn a_faster_source_is_never_given_a_shallower_pipeline() {
+        for &remaining_parts in &[1usize, 2, 3, 4, 8, 100] {
+            // Enough gap that the endgame clamps are not what is under test.
+            let gap = u64::from(u32::MAX);
+            let mut previous = 0usize;
+            for speed in [
+                0u64, 1, 599, 600, 1_199, 1_200, 4_095, 4_096, 9_215, 9_216, 76_799, 76_800,
+                153_599, 153_600, 307_200, 1_048_576, 4_194_304,
+            ] {
+                // The documented cold-start case is deliberately optimistic and
+                // is not part of the ordering.
+                if speed == 0 {
+                    continue;
+                }
+                let blocks = outstanding_blocks_for_speed_ms(speed, remaining_parts, gap);
+                assert!(
+                    blocks >= previous,
+                    "{remaining_parts} parts left: {speed} B/s got {blocks} blocks, \
+                     fewer than the slower tier's {previous}",
+                );
+                previous = blocks;
+            }
+        }
     }
 
     /// The budget is a *block* count, and on a trickle slot it has to actually
