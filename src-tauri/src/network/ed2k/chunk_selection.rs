@@ -122,17 +122,17 @@ impl ChunkSelector {
     ) -> Option<usize> {
         let part_count = self.part_frequency.len();
 
-        if preview_priority && part_count > 0 {
-            let last = part_count - 1;
-            for &target in &[0, last] {
-                if !completed.get(target).copied().unwrap_or(false)
-                    && !in_progress.get(target).copied().unwrap_or(false)
-                    && source_available.get(target).copied().unwrap_or(false)
-                {
-                    return Some(target);
-                }
-            }
-        }
+        // Which parts preview wants first, if it is on at all.
+        //
+        // eMule's set also includes the second-to-last part when the tail is
+        // shorter than a third of a part (`PartFile.cpp:4707-4711`), so the
+        // player reaches enough of the container's trailing index to start.
+        // That case is not reproduced here: it needs the file size, which this
+        // selector does not carry, and the ranking fix below is what actually
+        // mattered. Recorded rather than silently omitted.
+        let is_preview_target = |i: usize| {
+            preview_priority && part_count > 0 && (i == 0 || i == part_count - 1)
+        };
 
         let s = self.total_sources as u32;
         // eMule: limit = max((source_count + 9) / 10, 3)
@@ -169,14 +169,28 @@ impl ChunkSelector {
             // two zones (`PartFile.cpp:4816`, `:4829`, `:4838`). With strict
             // `<`, a part sitting exactly on a boundary was scored one zone
             // *less* rare than eMule would score it.
+            // Preview is a band, not an override. It used to return the first
+            // or last part immediately, before rarity was computed at all — so
+            // with preview on, a part the swarm was starved of lost to one the
+            // user might watch sooner, and stayed rare for longer.
+            //
+            // eMule ranks it below very-rare and above everything else: its
+            // `else if` chain tests `frequency <= veryRareBound` first
+            // (`PartFile.cpp:4816`) and only then `critPreview` (`:4824`), and
+            // the base ranks say the same thing numerically — 3000/3001 for
+            // very rare against 10000/20000 for preview. So preview sits
+            // between zone 0 and zone 1, which is what this half-step does
+            // while leaving the existing zone numbering alone.
             let zone = if freq <= t1 {
-                0 // very rare
+                0 // very rare — beats preview, as in eMule
+            } else if is_preview_target(i) {
+                1 // preview
             } else if freq <= t2 {
-                1 // rare
+                2 // rare
             } else if freq <= t3 {
-                2 // almost rare
+                3 // almost rare
             } else {
-                3 // common
+                4 // common
             };
 
             let not_active = u8::from(!active_parts.contains(&i));
@@ -228,9 +242,42 @@ mod tests {
 
     #[test]
     fn preview_priority_prefers_first_part() {
+        // Nothing here is very rare (t1 floors at 3, every part is at 10), so
+        // preview is the highest band in play and takes the first part. The
+        // last part is marked done so the only preview candidate left is 0 and
+        // the random tie-break cannot pick the other one.
         let selector = ChunkSelector {
-            part_frequency: vec![5, 1, 1],
-            total_sources: 5,
+            part_frequency: vec![10, 10, 10],
+            total_sources: 10,
+        };
+
+        let selected = selector.select_part(
+            &[false, false, true],
+            &[false, false, false],
+            &[true, true, true],
+            &[],
+            &[],
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(0));
+    }
+
+    /// Preview is a band, not an override. eMule tests
+    /// `frequency <= veryRareBound` *before* `critPreview`
+    /// (`PartFile.cpp:4816` against `:4824`) and ranks them 3000/3001 against
+    /// 10000/20000, so a part the swarm is starved of always outranks one the
+    /// user might watch sooner. Ember used to return the first or last part
+    /// immediately, before rarity was computed at all, which left rare parts
+    /// rare for longer on exactly the files most likely to have preview on.
+    #[test]
+    fn a_very_rare_part_outranks_a_preview_part() {
+        // t1 = max((9 + 9) / 10, 3) = 3, so part 1 is very rare and parts 0
+        // and 2 — the preview targets — are not.
+        let selector = ChunkSelector {
+            part_frequency: vec![9, 1, 9],
+            total_sources: 9,
         };
 
         let selected = selector.select_part(
@@ -243,7 +290,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(selected, Some(0));
+        assert_eq!(
+            selected,
+            Some(1),
+            "the scarcest part must still win when preview priority is on"
+        );
     }
 
     /// The shape that deadlocked a download at 0%: five parts, and every source

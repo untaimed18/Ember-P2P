@@ -9,6 +9,16 @@ use super::messages::build_answer_sources1_versioned;
 use super::transfer::is_filtered_source_ip;
 
 const MAX_SOURCES_PER_FILE: usize = 500;
+
+/// eMule `RARE_FILE` (`Opcodes.h:114`): at or below this many known sources a
+/// file counts as rare, and source exchange is allowed to ask more often.
+const RARE_FILE_SOURCES: usize = 50;
+/// eMule `SOURCECLIENTREASKF` (`Opcodes.h:69`, `MIN2MS(5)`): the floor between
+/// source-exchange requests for one *file*, whichever peer they go to.
+const SOURCECLIENTREASKF_I64: i64 = 300;
+/// eMule `MINCOMMONPENALTY` (`Opcodes.h:89`): multiplier applied to both
+/// source-exchange intervals once a file is no longer rare.
+const MINCOMMONPENALTY: i64 = 4;
 const SOURCE_EXPIRY_SECS: i64 = 3600;
 const MAX_SOURCES_IN_RESPONSE: usize = 500;
 const MAX_TRACKED_FILES: usize = 500;
@@ -2093,17 +2103,95 @@ impl SourceManager {
         }
     }
 
-    /// Check if enough time has passed since the last SX request to this source
-    /// (eMule SOURCECLIENTREASKS = 40 min).
+    /// Whether we may send `OP_REQUESTSOURCES` to this source for this file.
+    ///
+    /// eMule's `IsSourceRequestAllowed` (`DownloadClient.cpp:229-253`) applies
+    /// five conditions; this used to apply one — the 40-minute per-source
+    /// interval — and nothing else. The three that matter here are the soft
+    /// source cap, a per-*file* floor, and a four-fold penalty once a file
+    /// stops being rare:
+    ///
+    /// ```text
+    /// GetMaxSourcePerFileSoft() > uSources
+    /// && ( rare   && nTimePassedClient > SOURCECLIENTREASKS
+    ///    || rarer && nTimePassedClient > SOURCECLIENTREASKS
+    ///              && nTimePassedFile  > SOURCECLIENTREASKF
+    ///    ||          nTimePassedClient > SOURCECLIENTREASKS * MINCOMMONPENALTY
+    ///              && nTimePassedFile  > SOURCECLIENTREASKF  * MINCOMMONPENALTY )
+    /// ```
+    ///
+    /// On a well-seeded file the difference is four-fold and unbounded: every
+    /// source asked every 40 minutes with no ceiling, against eMule's 160
+    /// minutes and a stop at the soft cap. The sources still arrive either way
+    /// — eMule's *answering* side applies the same 160-minute rule
+    /// (`ListenSocket.cpp:986-996`) and silently discards the earlier asks — so
+    /// what this buys back is three wasted request packets per source per
+    /// cycle, and not looking like a source-exchange flooder to the anti-leech
+    /// mods that score exactly that.
+    ///
+    /// Both clocks come from the entries already held, so this stays a `&self`
+    /// read: the per-file clock is the newest per-source stamp, which is when
+    /// we last asked *anyone* about this file.
+    ///
+    /// One deliberate omission: eMule gates its two rare branches on
+    /// `!m_bCompleteSource`, pushing a complete source onto the common branch
+    /// even for a rare file. `SourceManager` does not know whether a peer holds
+    /// the whole file, so that condition is dropped rather than guessed. It
+    /// only loosens the rare case, where the source count is under fifty by
+    /// definition and the traffic is correspondingly small.
     pub fn can_request_sources_for(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> bool {
         let now = chrono::Utc::now().timestamp();
-        if let Some(entries) = self.sources.get(file_hash) {
-            if let Some(entry) = entries.iter().find(|e| e.ip == ip && e.tcp_port == port) {
-                return entry.last_sx_sent == 0
-                    || (now - entry.last_sx_sent) >= SOURCECLIENTREASKS_I64;
+        let Some(entries) = self.sources.get(file_hash) else {
+            return true;
+        };
+        let Some(entry) = entries.iter().find(|e| e.ip == ip && e.tcp_port == port) else {
+            return true;
+        };
+
+        // eMule: `GetMaxSourcePerFileSoft()` is `maxsourceperfile * 9 / 10`
+        // (`PartFile.cpp:5359-5362`). Past it, a file has enough sources and
+        // asking for more is pure overhead.
+        let known = entries.len();
+        if known >= self.max_per_file.saturating_mul(9) / 10 {
+            return false;
+        }
+
+        let since_source = if entry.last_sx_sent == 0 {
+            i64::MAX
+        } else {
+            now - entry.last_sx_sent
+        };
+        let since_file = entries
+            .iter()
+            .map(|e| e.last_sx_sent)
+            .max()
+            .filter(|stamp| *stamp != 0)
+            .map_or(i64::MAX, |stamp| now - stamp);
+
+        if known <= RARE_FILE_SOURCES {
+            // Rare: the per-source interval alone, plus the per-file floor once
+            // it is no longer *very* rare.
+            since_source >= SOURCECLIENTREASKS_I64
+                && (known <= RARE_FILE_SOURCES / 5 || since_file >= SOURCECLIENTREASKF_I64)
+        } else {
+            since_source >= SOURCECLIENTREASKS_I64.saturating_mul(MINCOMMONPENALTY)
+                && since_file >= SOURCECLIENTREASKF_I64.saturating_mul(MINCOMMONPENALTY)
+        }
+    }
+
+    /// Test seam for the source-exchange gates: backdate a source's last
+    /// request so the intervals can be exercised without sleeping through
+    /// forty minutes of them.
+    #[cfg(test)]
+    fn backdate_sx(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16, secs_ago: i64) {
+        let when = chrono::Utc::now().timestamp() - secs_ago;
+        if let Some(entries) = self.sources.get_mut(file_hash) {
+            for entry in entries.iter_mut() {
+                if entry.ip == ip && entry.tcp_port == port {
+                    entry.last_sx_sent = when;
+                }
             }
         }
-        true
     }
 
     /// Record that an SX request was sent to this source.
@@ -2930,6 +3018,71 @@ impl SourceManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// eMule's source-exchange gates, which Ember applied one of. A file past
+    /// `RARE_FILE` sources is asked on a four-fold interval, and one past the
+    /// soft cap is not asked at all — the difference between 40 minutes with no
+    /// ceiling and eMule's 160 with one.
+    #[test]
+    fn source_exchange_backs_off_once_a_file_stops_being_rare() {
+        let hash = [0xA1u8; 16];
+        let mut sm = SourceManager::new();
+        let peer = Ipv4Addr::new(10, 0, 0, 1);
+
+        // A rare file: one source, never asked. Always allowed.
+        sm.register_source(hash, peer, 4662, None);
+        assert!(sm.can_request_sources_for(&hash, peer, 4662));
+
+        // Asked recently — the per-source interval holds it off either way.
+        sm.backdate_sx(&hash, peer, 4662, 60);
+        assert!(!sm.can_request_sources_for(&hash, peer, 4662));
+
+        // Past the per-source interval, still rare, so it may ask again.
+        sm.backdate_sx(&hash, peer, 4662, SOURCECLIENTREASKS_I64 + 1);
+        assert!(
+            sm.can_request_sources_for(&hash, peer, 4662),
+            "a rare file may re-ask on the plain 40-minute interval"
+        );
+
+        // Now make the file common. The same elapsed time is no longer enough:
+        // `MINCOMMONPENALTY` multiplies both clocks.
+        for i in 0..RARE_FILE_SOURCES as u32 {
+            sm.register_source(hash, Ipv4Addr::from(0x0B00_0000 + i), 4662, None);
+        }
+        sm.backdate_sx(&hash, peer, 4662, SOURCECLIENTREASKS_I64 + 1);
+        assert!(
+            !sm.can_request_sources_for(&hash, peer, 4662),
+            "a common file must wait SOURCECLIENTREASKS * MINCOMMONPENALTY"
+        );
+        sm.backdate_sx(
+            &hash,
+            peer,
+            4662,
+            SOURCECLIENTREASKS_I64 * MINCOMMONPENALTY + 1,
+        );
+        assert!(sm.can_request_sources_for(&hash, peer, 4662));
+    }
+
+    /// The other half: past the soft cap a file has enough sources and asking
+    /// for more is pure overhead, so the answer is no regardless of timing.
+    #[test]
+    fn source_exchange_stops_at_the_soft_cap() {
+        let hash = [0xA2u8; 16];
+        let mut sm = SourceManager::new();
+        sm.set_max_per_file(400);
+        let peer = Ipv4Addr::new(10, 0, 0, 1);
+        sm.register_source(hash, peer, 4662, None);
+
+        // Fill past `max_per_file * 9 / 10`.
+        let soft_cap = 400usize * 9 / 10;
+        for i in 0..soft_cap as u32 {
+            sm.register_source(hash, Ipv4Addr::from(0x0C00_0000 + i), 4662, None);
+        }
+        assert!(
+            !sm.can_request_sources_for(&hash, peer, 4662),
+            "past the soft cap eMule stops asking entirely"
+        );
+    }
 
     /// Fixed unix "now" for the reask-expiry checks, with an endorsement that
     /// outlives it by a wide margin so tests unrelated to expiry are unaffected.

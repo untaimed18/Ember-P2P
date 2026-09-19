@@ -14,11 +14,24 @@ const BLOCKTIME_PER_FILE_SECS: i64 = 2700;
 const BLOCKTIME_TRANSIENT_SECS: i64 = 600;
 /// eMule: FILEREASKTIME — minimum time between file re-asks (29 minutes)
 pub const FILEREASKTIME_SECS: i64 = 1740;
-/// eMule `MIN_REQUESTTIME` (~10 minutes). Uploaders treat a second
-/// `OP_STARTUPLOADREQ` / reconnect faster than this as a bad client and
-/// ban the user hash. Hello/connect failures must cool at least this
-/// long or we look like a bot and the next dial is RST'd immediately.
-pub const MIN_REQUESTTIME_SECS: i64 = 590;
+/// eMule `MIN_REQUESTTIME` (`opcodes.h:116`, `MIN2MS(10)`). Uploaders treat a
+/// second `OP_STARTUPLOADREQ` / reconnect faster than this as a bad client and
+/// ban the user hash. Hello/connect failures must cool at least this long or we
+/// look like a bot and the next dial is RST'd immediately.
+///
+/// Exactly 600, not a round-down. This was 590, which is inside the window it
+/// is meant to stay clear of: `UploadClient.cpp:604` charges a strike when
+/// `curTick < lastasked + MIN_REQUESTTIME`, and `BADCLIENTBAN` strikes is a
+/// two-hour ban. Ember's own redial floor is this constant
+/// (`HELLO_FAIL_COOLDOWN_SECS`), so ten seconds short meant every dial on that
+/// path landed one strike inside a real eMule's counter — the same class of
+/// mistake as the 60 s floor that got Ember banned by its peers, just small
+/// enough to survive the fix that found that one.
+///
+/// Shared with the uploader, where it is the threshold *we* ban on. Raising it
+/// to eMule's value makes our own banning marginally more lenient, which is the
+/// safe direction for a constant that has to serve both roles.
+pub const MIN_REQUESTTIME_SECS: i64 = 600;
 /// How long the upload listener remembers an expected inbound KAD callback.
 /// Matches [`FILEREASKTIME_SECS`] so a slow buddy relay is not dropped while
 /// we are still within the normal reask window.
@@ -375,7 +388,11 @@ mod tests {
     /// than a confirmed queue slot, which cools for the full reask interval.
     #[test]
     fn hello_fail_cooldown_is_emule_min_request_time() {
-        assert_eq!(MIN_REQUESTTIME_SECS, 590);
+        // `opcodes.h:116` is `MIN2MS(10)`. Not 590: the comparison it has to
+        // clear is `curTick < lastasked + MIN_REQUESTTIME`
+        // (`UploadClient.cpp:604`), so anything under 600 lands inside the
+        // window and charges a strike rather than avoiding one.
+        assert_eq!(MIN_REQUESTTIME_SECS, 600);
         const { assert!(MIN_REQUESTTIME_SECS < FILEREASKTIME_SECS) };
     }
 }

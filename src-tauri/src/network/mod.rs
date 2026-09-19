@@ -27910,6 +27910,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     };
 
     state.stats.secident_status = secident_status.to_string();
+    // What the handshake may promise. eMule states the level as
+    // `CryptoAvailable() ? 3 : 0` in both the Hello and EmuleInfo, because a
+    // peer reading level 3 will ask for a key. `"broken"` is a real state here
+    // — `cryptkey.dat` present but unreadable — and claiming SecIdent through
+    // it earns nothing and looks like a spoof.
+    ed2k::messages::set_secident_available(secident_status == "available");
     if crypto_unreadable {
         let _ = app_handle.emit("secident-key-unreadable", ());
     }
@@ -54844,7 +54850,7 @@ async fn handle_udp_packet_inner(
                 let file_state = local_file.or(partial_file);
 
                 if let Some((file_size, available_parts)) = file_state {
-                    let rank = ed2k::upload::udp_queue_rank_for_peer(
+                    let queue_rank = ed2k::upload::udp_queue_rank_for_peer(
                         upload_queue,
                         credit_manager,
                         local_index,
@@ -54852,8 +54858,44 @@ async fn handle_udp_packet_inner(
                         from.port(),
                         &file_hash,
                     )
-                    .await
-                    .unwrap_or(u16::MAX);
+                    .await;
+                    // No row for this peer means it is not on our queue — it was
+                    // purged at `MAX_PURGEQUEUETIME`, refused at the per-IP cap,
+                    // or never admitted. eMule answers that case with silence,
+                    // and the silence is load-bearing: `ClientUDPSocket.cpp:295`
+                    // says "Don't answer him ... Force him to establish a TCP
+                    // connection", because the peer's UDP ask timing out is the
+                    // only thing that sends it back to TCP where it can re-enter
+                    // the queue.
+                    //
+                    // Answering anyway with a rank was the bug. `u16::MAX` is
+                    // not a "not queued" sentinel to the peer — `UDPReaskACK`
+                    // (`DownloadClient.cpp:1302`) clears its pending flag,
+                    // stores 65535 as a real position and stamps
+                    // `SetLastAskedTime()`, so a stock eMule parks in
+                    // `DS_ONQUEUE` believing it holds a place and will not
+                    // reconnect for another `FILEREASKTIME` — 29 minutes, then
+                    // the same again, forever. eMule never encodes "not queued"
+                    // as a rank in either direction: `GetWaitingPosition`
+                    // returns 0 for an absent client and `SendRankingInfo`
+                    // refuses to transmit a zero rank.
+                    let Some(rank) = queue_rank else {
+                        // The one thing eMule does say, and only when its queue
+                        // is nearly full, so the peer learns not to keep asking.
+                        if upload_queue.lock().await.len() + ed2k::upload::QUEUE_FULL_HEADROOM
+                            > ed2k::upload::MAX_UPLOAD_QUEUE_SIZE
+                        {
+                            let resp = vec![OP_EMULEPROT, ed2k::messages::OP_QUEUEFULL_UDP];
+                            let _ = socket.send_to(&resp, from).await;
+                            debug!("UDP reask from {from} for {hash_hex}: not queued, queue full");
+                        } else {
+                            debug!(
+                                "UDP reask from {from} for {hash_hex}: not on our queue; \
+                                 staying silent so it reconnects over TCP"
+                            );
+                        }
+                        return;
+                    };
                     let enhanced = reask.completed_parts.is_some();
                     let Some(ack_payload) = ed2k::messages::build_reask_ack(
                         file_size,
