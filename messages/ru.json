@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "Остановка",
   "kad_search_cancel_title": "Отменить этот поиск",
   "kad_search_cancel_aria": "Отменить поиск {id}",
+  "kad_search_columns_title": "Столбцы поисков",
   "search_bar_placeholder": "Поиск...",
   "search_bar_aria": "Искать файлы",
   "search_bar_clear": "Очистить поиск",

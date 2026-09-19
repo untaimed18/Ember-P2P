@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "Wird gestoppt",
   "kad_search_cancel_title": "Diese Suche abbrechen",
   "kad_search_cancel_aria": "Suche {id} abbrechen",
+  "kad_search_columns_title": "Suchspalten",
   "search_bar_placeholder": "Suchen...",
   "search_bar_aria": "Dateien suchen",
   "search_bar_clear": "Suche löschen",

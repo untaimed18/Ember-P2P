@@ -14,6 +14,7 @@
   import { networkError, networkStats, serverStatus } from '$lib/stores/network';
   import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
   import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -84,6 +85,7 @@
   onMount(() => {
     mounted = true;
     refreshInProgress = false;
+    loadSearchColumnState();
     const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
     loading = connected;
     // K26: the $effect below is the single owner of the refresh timer.
@@ -104,6 +106,9 @@
       refreshTimer = undefined;
       if (recheckTimer) { clearTimeout(recheckTimer); recheckTimer = undefined; }
       if (contactFilterTimer) { clearTimeout(contactFilterTimer); contactFilterTimer = undefined; }
+      // Navigating away mid-drag would otherwise leave the whole app stuck
+      // in the col-resize cursor with text selection disabled.
+      searchResizeCleanup?.();
     };
   });
 
@@ -589,6 +594,218 @@
     return asc ? ' \u25B2' : ' \u25BC';
   }
 
+  /* --- Searches table columns ------------------------------------------
+   *
+   * The Searches table was the last one outside the column system the
+   * transfers and library tables use, and it showed in two ways. Its header
+   * had no `contextmenu` handler, so right-clicking it fell through to the
+   * webview's own Back/Forward/Stop/Reload menu — and there is no app-wide
+   * suppression to catch that. And with neither `table-layout: fixed` nor a
+   * `<colgroup>`, the browser re-derived every width from the widest cell on
+   * each 5s refresh, so the columns slid sideways whenever a packet counter
+   * gained a digit or a search name changed length.
+   *
+   * Every column here sorts, and its `key` is the sort key `sortedSearches`
+   * switches on, so the two cannot drift apart.
+   */
+  type KadSearchColumn = {
+    key: string;
+    /** A getter, so switching locale re-renders the header and the menu. */
+    readonly label: string;
+    width: number;
+    minWidth: number;
+  };
+
+  const SEARCH_COLUMNS: KadSearchColumn[] = [
+    // '#' is a symbol rather than prose, so it carries no message key.
+    { key: 'id', label: '#', width: 44, minWidth: 34 },
+    { key: 'target', get label() { return m.kad_search_col_key(); }, width: 150, minWidth: 80 },
+    { key: 'type', get label() { return m.kad_search_col_type(); }, width: 96, minWidth: 60 },
+    { key: 'name', get label() { return m.kad_search_col_name(); }, width: 130, minWidth: 70 },
+    { key: 'status', get label() { return m.kad_search_col_status(); }, width: 88, minWidth: 66 },
+    { key: 'load', get label() { return m.kad_search_col_load(); }, width: 100, minWidth: 60 },
+    { key: 'packets_sent', get label() { return m.kad_search_col_packets(); }, width: 88, minWidth: 60 },
+    { key: 'responses', get label() { return m.kad_search_col_responses(); }, width: 88, minWidth: 60 },
+    { key: 'started_at', get label() { return m.kad_search_col_age(); }, width: 80, minWidth: 60 },
+  ];
+
+  /** Never hideable, so the header can't be emptied to the point where there
+   *  is nothing left to right-click to get the other columns back. */
+  const SEARCH_FIXED_COL = 'id';
+  /** Reserved for the trailing Cancel button column. */
+  const SEARCH_ACTIONS_WIDTH = 34;
+  const SEARCH_WIDTHS_KEY = 'kad-search-col-widths';
+  const SEARCH_HIDDEN_KEY = 'kad-search-col-hidden';
+
+  // localStorage throws in private mode and on quota-exceeded.
+  // `loadSearchColumnState` runs during mount, where an escaped throw would
+  // abort page initialization, and `persistSearchWidths` runs from the resize
+  // mouseup, where one would strand the drag with the body still in
+  // `col-resize`.
+  function safeGetItem(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
+  function safeSetItem(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* ignore */ } }
+  function safeRemoveItem(key: string) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
+
+  let searchColWidths = $state<Record<string, number>>(
+    Object.fromEntries(SEARCH_COLUMNS.map((c) => [c.key, c.width])),
+  );
+  let searchColHidden = $state<Record<string, boolean>>(
+    Object.fromEntries(SEARCH_COLUMNS.map((c) => [c.key, false])),
+  );
+
+  function searchColWidth(key: string): number {
+    return searchColWidths[key] ?? SEARCH_COLUMNS.find((c) => c.key === key)?.width ?? 80;
+  }
+
+  let visibleSearchColumns = $derived(
+    SEARCH_COLUMNS.filter((c) => c.key === SEARCH_FIXED_COL || !searchColHidden[c.key]),
+  );
+
+  let searchTableWidth = $derived(
+    visibleSearchColumns.reduce((sum, c) => sum + searchColWidth(c.key), 0) + SEARCH_ACTIONS_WIDTH,
+  );
+
+  function persistSearchWidths() {
+    safeSetItem(SEARCH_WIDTHS_KEY, JSON.stringify(searchColWidths));
+  }
+
+  function persistSearchHidden() {
+    safeSetItem(
+      SEARCH_HIDDEN_KEY,
+      JSON.stringify(SEARCH_COLUMNS.filter((c) => searchColHidden[c.key]).map((c) => c.key)),
+    );
+  }
+
+  function loadSearchColumnState() {
+    const savedWidths = safeGetItem(SEARCH_WIDTHS_KEY);
+    if (savedWidths) {
+      try {
+        const parsed = JSON.parse(savedWidths) as Record<string, unknown>;
+        for (const col of SEARCH_COLUMNS) {
+          const w = parsed[col.key];
+          if (typeof w === 'number' && Number.isFinite(w)) {
+            // Clamping up to `minWidth` on the way in also migrates anyone
+            // whose stored width predates a column's minimum going up.
+            searchColWidths[col.key] = Math.max(col.minWidth, Math.round(w));
+          }
+        }
+      } catch { safeRemoveItem(SEARCH_WIDTHS_KEY); }
+    }
+
+    const savedHidden = safeGetItem(SEARCH_HIDDEN_KEY);
+    if (savedHidden) {
+      try {
+        const parsed = JSON.parse(savedHidden);
+        if (Array.isArray(parsed)) {
+          searchColHidden = Object.fromEntries(
+            SEARCH_COLUMNS.map((c) => [
+              c.key,
+              c.key !== SEARCH_FIXED_COL && parsed.includes(c.key),
+            ]),
+          );
+        }
+      } catch { safeRemoveItem(SEARCH_HIDDEN_KEY); }
+    }
+  }
+
+  let searchColMenu: { x: number; y: number } | null = $state(null);
+
+  function openSearchColumnMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    searchColMenu = { x: e.clientX, y: e.clientY };
+  }
+
+  function closeSearchColumnMenu() {
+    searchColMenu = null;
+  }
+
+  function toggleSearchColumn(key: string) {
+    if (key === SEARCH_FIXED_COL) return;
+    searchColHidden[key] = !searchColHidden[key];
+    persistSearchHidden();
+  }
+
+  function resetSearchColumns() {
+    searchColWidths = Object.fromEntries(SEARCH_COLUMNS.map((c) => [c.key, c.width]));
+    searchColHidden = Object.fromEntries(SEARCH_COLUMNS.map((c) => [c.key, false]));
+    persistSearchWidths();
+    persistSearchHidden();
+  }
+
+  let searchTableEl: HTMLTableElement | undefined = $state();
+  let searchResizeKey: string | null = $state(null);
+  let searchResizeCleanup: (() => void) | null = null;
+
+  function beginSearchResize(event: MouseEvent, key: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    searchResizeCleanup?.();
+
+    const startX = event.clientX;
+    const startWidth = searchColWidth(key);
+    const minWidth = SEARCH_COLUMNS.find((c) => c.key === key)?.minWidth ?? 40;
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    searchResizeKey = key;
+
+    const onMove = (e: MouseEvent) => {
+      searchColWidths[key] = Math.max(minWidth, Math.round(startWidth + (e.clientX - startX)));
+    };
+    const onUp = () => {
+      // Unwind the drag before persisting, so the body can never be left in
+      // `col-resize` by a storage failure.
+      endSearchResize();
+      persistSearchWidths();
+    };
+    // Hoisted, so `onUp` can close over it; only ever called once both exist.
+    function endSearchResize() {
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
+      searchResizeCleanup = null;
+      searchResizeKey = null;
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
+    searchResizeCleanup = endSearchResize;
+  }
+
+  /** Double-clicking the handle fits the column to its widest rendered cell. */
+  function autoSizeSearchColumn(event: MouseEvent, key: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const index = visibleSearchColumns.findIndex((c) => c.key === key);
+    if (!searchTableEl || index < 0) return;
+
+    let best = SEARCH_COLUMNS.find((c) => c.key === key)?.minWidth ?? 40;
+    const headerCell = searchTableEl.tHead?.rows.item(0)?.cells.item(index);
+    if (headerCell instanceof HTMLElement) {
+      best = Math.max(best, Math.ceil(headerCell.scrollWidth + 12));
+    }
+    for (const body of Array.from(searchTableEl.tBodies)) {
+      for (const row of Array.from(body.rows)) {
+        const cell = row.cells.item(index);
+        if (cell instanceof HTMLElement) best = Math.max(best, Math.ceil(cell.scrollWidth + 12));
+      }
+    }
+
+    searchColWidths[key] = best;
+    persistSearchWidths();
+  }
+
+  /** The handle sits inside the header cell, whose click sorts the table. */
+  function swallowResizeClick(event: MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   let isConnected = $derived($networkStats.status === 'connected');
 
   /** Sitting out KAD is a supported runtime choice, but with no eD2K server
@@ -636,6 +853,19 @@
     }
   });
 </script>
+
+<!-- Dismissal for the Searches column menu. Guarded on the menu being open so
+     this never competes with the bootstrap modal's own Escape handling. -->
+<svelte:document
+  onclick={closeSearchColumnMenu}
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && searchColMenu) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeSearchColumnMenu();
+    }
+  }}
+/>
 
 <div class="page-header">
   <!-- Subtitle, like the Ember page: this is a table of DHT peers, and it used
@@ -1106,55 +1336,82 @@
           <p class="sub">{m.kad_searches_empty_sub()}</p>
         </div>
       {:else}
-        <table class="compact-table">
-          <thead>
+        <table
+          class="compact-table searches-table"
+          bind:this={searchTableEl}
+          style={`width: max(100%, ${searchTableWidth}px);`}
+        >
+          <colgroup>
+            {#each visibleSearchColumns as column (column.key)}
+              <col style={`width: ${searchColWidth(column.key)}px;`} />
+            {/each}
+            <!-- Deliberately unsized. Under a fixed layout the one column
+                 without a width soaks up however much wider the panel is than
+                 the rest put together, so the data columns keep exactly the
+                 width they were dragged to instead of being stretched with
+                 the window. -->
+            <col />
+          </colgroup>
+          <thead oncontextmenu={openSearchColumnMenu}>
             <tr>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'id' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('id')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('id'))}>
-                #{getSortArrow(searchSortCol, 'id', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'target' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('target')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('target'))}>
-                {m.kad_search_col_key()}{getSortArrow(searchSortCol, 'target', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'type' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('type')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('type'))}>
-                {m.kad_search_col_type()}{getSortArrow(searchSortCol, 'type', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'name' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('name')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('name'))}>
-                {m.kad_search_col_name()}{getSortArrow(searchSortCol, 'name', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'status' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('status')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('status'))}>
-                {m.kad_search_col_status()}{getSortArrow(searchSortCol, 'status', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'load' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('load')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('load'))}>
-                {m.kad_search_col_load()}{getSortArrow(searchSortCol, 'load', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'packets_sent' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('packets_sent')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('packets_sent'))}>
-                {m.kad_search_col_packets()}{getSortArrow(searchSortCol, 'packets_sent', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'responses' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('responses')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('responses'))}>
-                {m.kad_search_col_responses()}{getSortArrow(searchSortCol, 'responses', searchSortAsc)}
-              </th>
-              <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'started_at' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('started_at')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('started_at'))}>
-                {m.kad_search_col_age()}{getSortArrow(searchSortCol, 'started_at', searchSortAsc)}
-              </th>
+              {#each visibleSearchColumns as column (column.key)}
+                <th
+                  class="sortable"
+                  class:resizing={searchResizeKey === column.key}
+                  tabindex="0"
+                  role="columnheader"
+                  aria-sort={searchSortCol === column.key ? (searchSortAsc ? 'ascending' : 'descending') : 'none'}
+                  onclick={() => sortSearches(column.key)}
+                  onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches(column.key))}
+                >
+                  <span class="header-content">
+                    {column.label}{getSortArrow(searchSortCol, column.key, searchSortAsc)}
+                  </span>
+                  <button
+                    type="button"
+                    class="col-resize-handle"
+                    tabindex="-1"
+                    aria-label={m.transfers_resize_column({ name: column.label })}
+                    onmousedown={(e) => beginSearchResize(e, column.key)}
+                    ondblclick={(e) => autoSizeSearchColumn(e, column.key)}
+                    onclick={swallowResizeClick}
+                  ></button>
+                </th>
+              {/each}
               <th aria-label={m.servers_col_actions()}></th>
             </tr>
           </thead>
           <tbody>
             {#each sortedSearches as search (search.id)}
               <tr>
-                <td>{search.id}</td>
-                <td class="contact-id" title={search.target}>{search.target.length > 16 ? search.target.slice(0, 16) + '…' : search.target}</td>
-                <td>{kadSearchTypeLabel(search.type)}</td>
-                <td>{kadSearchNameLabel(search.name) || '—'}</td>
-                <td>
-                  <span class="badge {search.status}">
-                    {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}
-                  </span>
-                </td>
-                <td>{search.load} ({search.load_response}/{search.load_total})</td>
-                <td>{search.packets_sent} / {search.request_answer}</td>
-                <td>{search.responses}</td>
-                <td title={new Date(search.started_at * 1000).toLocaleString()}>{formatSearchAge(search.started_at)}</td>
+                {#each visibleSearchColumns as column (column.key)}
+                  {#if column.key === 'id'}
+                    <td>{search.id}</td>
+                  {:else if column.key === 'target'}
+                    <!-- Truncation is the cell's ellipsis rather than a slice
+                         of the string, so widening the column shows more of
+                         the key instead of the same 16 characters. -->
+                    <td class="contact-id" title={search.target}>{search.target}</td>
+                  {:else if column.key === 'type'}
+                    <td>{kadSearchTypeLabel(search.type)}</td>
+                  {:else if column.key === 'name'}
+                    <td>{kadSearchNameLabel(search.name) || '—'}</td>
+                  {:else if column.key === 'status'}
+                    <td>
+                      <span class="badge {search.status}">
+                        {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}
+                      </span>
+                    </td>
+                  {:else if column.key === 'load'}
+                    <td>{search.load} ({search.load_response}/{search.load_total})</td>
+                  {:else if column.key === 'packets_sent'}
+                    <td>{search.packets_sent} / {search.request_answer}</td>
+                  {:else if column.key === 'responses'}
+                    <td>{search.responses}</td>
+                  {:else if column.key === 'started_at'}
+                    <td title={new Date(search.started_at * 1000).toLocaleString()}>{formatSearchAge(search.started_at)}</td>
+                  {/if}
+                {/each}
                 <td>
                   {#if search.status === 'active'}
                     <button
@@ -1177,6 +1434,26 @@
   </div>
 
 </div>
+
+{#if searchColMenu}
+  {@const menu = searchColMenu}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: menu.x, y: menu.y }} onclick={(e) => e.stopPropagation()}>
+    <div class="ctx-label" role="presentation">{m.kad_search_columns_title()}</div>
+    {#each SEARCH_COLUMNS.filter((c) => c.key !== SEARCH_FIXED_COL) as column (column.key)}
+      <button
+        class="ctx-item"
+        role="menuitemcheckbox"
+        aria-checked={!searchColHidden[column.key]}
+        onclick={() => toggleSearchColumn(column.key)}
+      >{column.label}</button>
+    {/each}
+    <div class="ctx-sep" role="separator"></div>
+    <!-- Borrowed from the transfers menu, as this page already borrows
+         `servers_col_actions`: the wording is generic and translated. -->
+    <button class="ctx-item" role="menuitem" onclick={resetSearchColumns}>{m.transfers_reset_columns()}</button>
+  </div>
+{/if}
 
 <style>
   .header-actions {
@@ -1673,6 +1950,73 @@
   .compact-table tbody tr.row-alt td,
   .compact-table tbody tr:nth-child(even):not(.virtual-row):not(.spacer-row) td {
     background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-primary));
+  }
+
+  /*
+   * The fixed layout is the half of the resizable-columns work that CSS owns:
+   * without it the browser keeps sizing each column from its widest cell, and
+   * the `<colgroup>` the Svelte side emits is ignored — which is what had the
+   * columns sliding sideways every time a counter gained a digit. The table
+   * carries a definite inline `width` (summed from the column widths) for the
+   * same reason; an intrinsic keyword like `max-content` would hand sizing
+   * back to the content.
+   */
+  .searches-table {
+    table-layout: fixed;
+  }
+
+  /* `.compact-table th` is already `position: sticky`, which is what gives the
+     absolutely-positioned handle below something to anchor to. */
+  .searches-table th {
+    overflow: hidden;
+    padding-right: 14px;
+  }
+
+  .searches-table th.resizing {
+    color: var(--text-primary);
+  }
+
+  .header-content {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .col-resize-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 10px;
+    height: 100%;
+    border: none;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    cursor: col-resize;
+  }
+
+  .col-resize-handle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 50%;
+    width: 1px;
+    transform: translateX(-50%);
+    background: transparent;
+    transition: background 0.12s ease;
+  }
+
+  .searches-table th:hover .col-resize-handle::after,
+  .searches-table th.resizing .col-resize-handle::after,
+  .col-resize-handle:hover::after,
+  .col-resize-handle:active::after {
+    background: var(--accent);
+  }
+
+  .col-resize-handle:focus {
+    outline: none;
   }
 
   /*

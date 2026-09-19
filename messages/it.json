@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "Interruzione in corso",
   "kad_search_cancel_title": "Annulla questa ricerca",
   "kad_search_cancel_aria": "Annulla ricerca {id}",
+  "kad_search_columns_title": "Colonne ricerche",
   "search_bar_placeholder": "Cerca...",
   "search_bar_aria": "Cerca file",
   "search_bar_clear": "Cancella ricerca",

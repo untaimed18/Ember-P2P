@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "Parando",
   "kad_search_cancel_title": "Cancelar esta busca",
   "kad_search_cancel_aria": "Cancelar busca {id}",
+  "kad_search_columns_title": "Colunas de Buscas",
   "search_bar_placeholder": "Buscar...",
   "search_bar_aria": "Buscar arquivos",
   "search_bar_clear": "Limpar busca",

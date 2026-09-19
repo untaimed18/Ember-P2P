@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "停止中",
   "kad_search_cancel_title": "取消此搜尋",
   "kad_search_cancel_aria": "取消搜尋 {id}",
+  "kad_search_columns_title": "搜尋列",
   "search_bar_placeholder": "搜尋…",
   "search_bar_aria": "搜尋檔案",
   "search_bar_clear": "清除搜尋",

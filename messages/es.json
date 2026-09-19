@@ -974,6 +974,7 @@
   "kad_search_status_stopping": "Deteniendo",
   "kad_search_cancel_title": "Cancelar esta búsqueda",
   "kad_search_cancel_aria": "Cancelar búsqueda {id}",
+  "kad_search_columns_title": "Columnas de búsquedas",
   "search_bar_placeholder": "Buscar...",
   "search_bar_aria": "Buscar archivos",
   "search_bar_clear": "Borrar búsqueda",
