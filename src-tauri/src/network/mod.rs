@@ -58446,6 +58446,7 @@ async fn handle_upload_event(
         }
         UploadEventKind::Progress {
             uploaded,
+            uploaded_wire,
             unique_uploaded,
             total,
             part_status,
@@ -58470,11 +58471,21 @@ async fn handle_upload_event(
             };
             let (speed, upload_time_ms) = {
                 let mut mgr = transfer_manager.write().await;
-                // Raw session wire bytes, not unique coverage. Speed is
+                // Wire bytes, not unique coverage and not payload. Speed is
                 // bytes_delta over a rolling window; unique coverage can
-                // stall (peer re-requesting a part we already served)
-                // while the wire is still moving.
-                mgr.update_progress(&event.transfer_id, uploaded, Some(unique_capped));
+                // stall (peer re-requesting a part we already served) while
+                // the wire is still moving, and payload runs ahead of the wire
+                // by the compression ratio on `OP_COMPRESSEDPART`.
+                //
+                // This line said "raw session wire bytes" while passing the
+                // payload counter, which is issue 115: the limiter is charged
+                // the compressed length, so the cap and the status-bar total
+                // are wire figures, and a row derived from payload read high
+                // by the compression ratio. Slots then summed above a cap they
+                // had not breached, with the total sitting correctly below
+                // them. `uploaded` still drives credits and the all-time
+                // statistics further down, which is the counter those want.
+                mgr.update_progress(&event.transfer_id, uploaded_wire, Some(unique_capped));
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
                 let ut = t

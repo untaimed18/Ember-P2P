@@ -1831,6 +1831,7 @@ fn unique_served_bytes(served: &[u64], total_size: u64) -> u64 {
 /// file this peer has uniquely received, not re-requested wire bytes.
 fn upload_progress_kind(
     uploaded: u64,
+    uploaded_wire: u64,
     total_size: u64,
     served: &[u64],
     peer_part_status: Option<String>,
@@ -1838,6 +1839,7 @@ fn upload_progress_kind(
     let (part_status, part_count) = build_up_part_status(served, total_size);
     UploadEventKind::Progress {
         uploaded,
+        uploaded_wire,
         unique_uploaded: unique_served_bytes(served, total_size),
         total: total_size,
         part_status,
@@ -1881,7 +1883,14 @@ pub enum UploadEventKind {
         peer_name: String,
     },
     Progress {
+        /// Payload bytes this session has delivered: what the peer is credited
+        /// for and what the all-time statistics count. On the compressed path
+        /// this exceeds what was actually sent.
         uploaded: u64,
+        /// Bytes written to the socket. The limiter is charged this, so it is
+        /// the only figure that can be compared against the configured cap or
+        /// added up against the status-bar total. See issue 115.
+        uploaded_wire: u64,
         /// Unique per-part coverage this session (`unique_served_bytes`).
         /// Drives the row's progress % and `completed_size`; `uploaded` is
         /// cumulative wire bytes and can exceed `total`.
@@ -6875,6 +6884,22 @@ impl UploadHandler {
         // Now handle file requests in a loop
         let mut current_file_hash: Option<[u8; 16]> = None;
         let mut uploaded: u64 = 0;
+        // Bytes actually written to the socket, as distinct from `uploaded`,
+        // which counts the payload those bytes represent.
+        //
+        // The two differ by the compression ratio on the `OP_COMPRESSEDPART`
+        // path, and eMule keeps them apart for the same reason: payload is what
+        // a peer is credited for and what the statistics count, while
+        // `m_nTransferredUp` — the datarate and the Transferred column — is
+        // what went down the wire.
+        //
+        // Conflating them is issue 115. The bandwidth limiter is charged the
+        // compressed length, so the configured cap and the status-bar total are
+        // both wire figures, while the row's speed was derived from the payload
+        // counter — so every slot serving compressible data read high by the
+        // compression ratio, the slots summed to more than a cap they had never
+        // breached, and the total sat honestly below them.
+        let mut uploaded_wire: u64 = 0;
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
         // eMule-style served-parts tally backing the chunked "Up Status"
@@ -9615,6 +9640,10 @@ impl UploadHandler {
                                 };
                                 uncompressed_accounted += share;
                                 uploaded += share;
+                                // The compressed length, which is what the
+                                // limiter above was charged and therefore what
+                                // the cap and the status-bar total count.
+                                uploaded_wire += chunk_len as u64;
                                 rate_tracker.record_send(share);
                                 batch_credited_bytes =
                                     batch_credited_bytes.saturating_add(share);
@@ -9638,6 +9667,7 @@ impl UploadHandler {
                                             transfer_id: tid.clone(),
                                             kind: upload_progress_kind(
                                                 uploaded,
+                                                uploaded_wire,
                                                 total_size,
                                                 &served_bytes_per_part,
                                                 peer_part,
@@ -9727,6 +9757,11 @@ impl UploadHandler {
                             }
 
                             uploaded += chunk_len as u64;
+                            // Uncompressed: payload and wire are the same
+                            // bytes, but both counters still have to move or a
+                            // session that sends some blocks each way reports a
+                            // rate for only part of what it sent.
+                            uploaded_wire += chunk_len as u64;
                             rate_tracker.record_send(chunk_len as u64);
                             batch_credited_bytes =
                                 batch_credited_bytes.saturating_add(chunk_len as u64);
@@ -9747,6 +9782,7 @@ impl UploadHandler {
                                         transfer_id: tid.clone(),
                                         kind: upload_progress_kind(
                                             uploaded,
+                                            uploaded_wire,
                                             total_size,
                                             &served_bytes_per_part,
                                             peer_part,
@@ -9849,6 +9885,7 @@ impl UploadHandler {
                                 transfer_id: tid.clone(),
                                 kind: upload_progress_kind(
                                     uploaded,
+                                    uploaded_wire,
                                     total_size,
                                     &served_bytes_per_part,
                                     peer_part,
@@ -12656,6 +12693,42 @@ mod unique_served_tests {
     fn unique_served_bytes_empty_or_unknown_size_is_zero() {
         assert_eq!(unique_served_bytes(&[PARTSIZE], 0), 0);
         assert_eq!(unique_served_bytes(&[], PARTSIZE), 0);
+    }
+
+    /// Issue 115. A compressed block credits the peer with the payload it
+    /// represents while the socket, and therefore the bandwidth limiter, only
+    /// carries the compressed bytes. Both figures have to reach the consumer
+    /// intact and unswapped: the row's speed is compared against the configured
+    /// cap and added up against the status-bar total, which are wire figures,
+    /// while credits and the all-time statistics want the payload.
+    ///
+    /// Deliberately asymmetric values — passing the same counter twice, which
+    /// is what the bug was, cannot satisfy this.
+    #[test]
+    fn a_progress_event_keeps_payload_and_wire_bytes_apart() {
+        let payload: u64 = 1_000_000;
+        let wire: u64 = 400_000;
+        let kind = upload_progress_kind(payload, wire, PARTSIZE, &[payload], None);
+
+        let UploadEventKind::Progress {
+            uploaded,
+            uploaded_wire,
+            ..
+        } = kind
+        else {
+            panic!("upload_progress_kind must build a Progress event");
+        };
+        assert_eq!(uploaded, payload, "credits and statistics want the payload");
+        assert_eq!(
+            uploaded_wire, wire,
+            "the displayed rate must come from what the limiter was charged"
+        );
+        assert!(
+            uploaded_wire < uploaded,
+            "a compressed block sends fewer bytes than it delivers — if these \
+             are ever equal the caller has passed one counter twice, which is \
+             the bug this pins"
+        );
     }
 
     #[test]
