@@ -23,9 +23,17 @@ use crate::types::*;
 /// means rows lead it through a change instead of trailing above it, so what
 /// divergence is left puts the sum under the total rather than over — the
 /// direction that does not look like the limit being breached.
+///
+/// This is also the *floor* the displayed rate is divided by, not only the
+/// ceiling the history is pruned to, and the two being one number is the whole
+/// point. They were separate — a three-second window against a one-second
+/// floor — and a row therefore answered on the window's timescale only once it
+/// had three seconds of history. For its first three seconds it was three
+/// times more responsive than the total, which is exactly the moment a slot
+/// handover creates a fresh row: the departing slot's bytes left the total to
+/// dip while the arriving slot divided a token-bucket burst by one second and
+/// printed several times the configured limit.
 const SPEED_WINDOW_MS: u128 = 3_000;
-/// Shortest span a displayed rate may be divided by. See `update_progress`.
-const MIN_SPEED_WINDOW_MS: u128 = 1_000;
 /// How long a row keeps its last rate with no progress event before decaying to
 /// zero, and how long an active download may be quiet and still read healthy.
 ///
@@ -36,10 +44,6 @@ const MIN_SPEED_WINDOW_MS: u128 = 1_000;
 const SPEED_IDLE_MS: u128 = 10_000;
 // Both relations are between constants, so state them where they are decided
 // and let a bad edit fail the build rather than a test run.
-const _: () = assert!(
-    MIN_SPEED_WINDOW_MS <= SPEED_WINDOW_MS,
-    "the divisor floor cannot exceed the window it floors",
-);
 const _: () = assert!(
     SPEED_IDLE_MS > SPEED_WINDOW_MS,
     "a transfer quiet for less than one averaging window has not stopped",
@@ -678,29 +682,33 @@ impl TransferManager {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
                 let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
                 let bytes_delta = transferred.saturating_sub(*oldest_bytes);
-                // Divide by at least one second. A window is short whenever it
-                // has just been created — a new transfer, a new upload slot
-                // after a rotation, or a history dropped by the idle decay in
-                // `refresh_health` — and dividing by the 200 ms between the
-                // first two progress events reported several times the real
-                // rate. The upload token bucket holds up to 2x the cap, so a
-                // slot starting with a full bucket really does move that many
-                // bytes; it just did not move them in 200 ms. That is what put
-                // individual upload slots above the configured limit, and it
-                // showed up around slot changes because that is when a fresh
-                // window is most likely.
+                // Divide by the whole window even when the row has not lived
+                // that long, treating the time before it existed as time it
+                // moved nothing. A window is short whenever it has just been
+                // created — a new transfer, a new upload slot after a rotation,
+                // or a history dropped by the idle decay in `refresh_health` —
+                // and the bytes that arrive in it are not a short window's
+                // worth: the upload token bucket holds up to twice the cap, so
+                // a slot starting against a full bucket really does move that
+                // many bytes. It just did not earn them in the 200 ms between
+                // its first two progress events.
                 //
-                // One second is also the basis the status-bar total is computed
-                // on (`BandwidthLimiter::update_speeds` samples once a second),
-                // so a row and the total are no longer measured over windows
-                // two orders of magnitude apart.
+                // Flooring at one second was not enough, and the reason is the
+                // number it was compared against. The status-bar total is
+                // *sampled* every second but *smoothed*, so it answers on a
+                // ~3.3 s timescale; a row flooring at one second is three times
+                // quicker than that, and three times quicker is precisely what
+                // a burst needs to print above the cap. A row that always
+                // divides by the window is never more responsive than the
+                // total it is being added up against — which is the property
+                // the Uploads tab actually needs, since a user reads the rows
+                // as a breakdown of it.
                 //
-                // Flooring the divisor rather than reporting nothing until the
-                // window fills lets a starting slot ramp up instead of sitting
-                // at zero for a second. It also means the divisor is never 0,
-                // which is what the old `checked_div` guarded — its fallback
-                // carried the previous speed forward instead.
-                let divisor = elapsed_ms.max(MIN_SPEED_WINDOW_MS);
+                // Flooring rather than reporting nothing until the window fills
+                // lets a starting slot ramp up instead of sitting at zero, and
+                // it means the divisor is never 0 — what the old `checked_div`
+                // guarded, whose fallback carried the previous speed forward.
+                let divisor = elapsed_ms.max(SPEED_WINDOW_MS);
                 ((bytes_delta as u128 * 1000) / divisor) as u64
             } else {
                 0
@@ -2382,23 +2390,27 @@ mod tests {
     /// empty window.
     ///
     /// The sleep is what makes this meaningful: it puts a real, non-zero span
-    /// between the two samples that is still well under the one-second floor,
-    /// which is exactly the case that used to inflate. A slow machine that
-    /// overshoots the floor only makes the reported rate smaller, so the
-    /// assertion holds either way.
+    /// between the two samples that is still well under the window floor, which
+    /// is exactly the case that used to inflate. Its sibling above covers the
+    /// degenerate end, where the two samples land in the same instant. A slow
+    /// machine that overshoots the floor only makes the reported rate smaller,
+    /// so the assertion holds either way.
     #[test]
     fn a_fresh_speed_window_cannot_report_more_than_the_bytes_that_moved() {
         let mut manager = TransferManager::new(1);
         assert!(manager.enqueue(download("a")));
 
+        let moved: u64 = 400_000;
         manager.update_progress("a", 0, Some(0));
         std::thread::sleep(std::time::Duration::from_millis(250));
-        manager.update_progress("a", 400_000, Some(400_000));
+        manager.update_progress("a", moved, Some(moved));
 
         let speed = manager.active.get("a").expect("row is active").speed;
+        let window_rate = (moved as u128 * 1000 / SPEED_WINDOW_MS) as u64;
         assert!(
-            speed <= 400_000,
-            "400 kB moved in under a second reported as {speed} B/s"
+            speed <= window_rate,
+            "400 kB moved inside the window reported as {speed} B/s, above the \
+             {window_rate} B/s the window justifies"
         );
         assert!(
             speed > 0,
@@ -2435,6 +2447,36 @@ mod tests {
             manager.speed_history["a"].len(),
             2,
             "the prune must leave a prior sample to measure against"
+        );
+    }
+
+    /// Issue 115, which 1.6.6 narrowed without closing. A slot handover makes a
+    /// fresh row, and the token bucket hands it up to twice the cap the moment
+    /// it starts; dividing that by anything shorter than the window prints a
+    /// rate the limiter never allowed. With the reporter's figures — a 200 kB/s
+    /// cap and a slot appearing with a full bucket — the row read 350 kB/s
+    /// against a total that was dipping at the same instant.
+    ///
+    /// Asserted as a relation to the window rather than a fixed number, so it
+    /// keeps holding if the window is retuned.
+    #[test]
+    fn a_burst_into_a_fresh_window_cannot_outrun_the_window() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+
+        // Two events back to back, which is what the first 200 ms of a new slot
+        // looks like: the window is empty and a bucket's worth of bytes lands.
+        let burst: u64 = 600_000;
+        manager.update_progress("a", 0, Some(0));
+        manager.update_progress("a", burst, Some(burst));
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        let window_rate = (burst as u128 * 1000 / SPEED_WINDOW_MS) as u64;
+        assert!(
+            speed <= window_rate,
+            "a fresh row reported {speed} B/s for a {burst}-byte burst — the \
+             window only justifies {window_rate} B/s, and the difference is \
+             what printed above the configured upload limit"
         );
     }
 

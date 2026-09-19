@@ -180,13 +180,13 @@ pub(crate) async fn run_graceful_shutdown(
         }
     }
 
-    // The digest backfill deliberately outlives the scan that queued it, so it
+    // The hash top-up deliberately outlives the scan that queued it, so it
     // is not in `hash_cancel_flags` and the loop above does not reach it. It
     // reads whole files and it takes `local_index.write()`, which makes it
     // exactly the kind of task the join below exists to fence — being absent
     // from both sets meant it kept reading the user's drives through exit and
     // could still be mid-update during the authoritative flush.
-    crate::commands::sharing::cancel_digest_backfill().await;
+    crate::commands::sharing::cancel_hash_top_up().await;
 
     // Cancelling a hasher only asks it to stop; the task still has to unwind,
     // and dropping its `JoinHandle` detaches it rather than aborting it. Join
@@ -1149,7 +1149,7 @@ pub fn run() {
                 // out of `files_to_hash` so a cold start is not a full re-read
                 // of the library; handed to the background pass once the scan
                 // has finished with the drives.
-                let mut startup_digest_backfill: Vec<crate::types::FileInfo> = Vec::new();
+                let mut startup_hash_top_up: Vec<crate::types::FileInfo> = Vec::new();
                 // Paths with no known.met record at all — genuinely new to
                 // this library, as opposed to a previously-shared file that's
                 // merely being rediscovered. Only these should inherit a
@@ -1185,43 +1185,28 @@ pub fn run() {
                         // Restore the last-known Peers count so the Library
                         // doesn't show 0 until the next 60s source-count sync.
                         file.complete_sources = record.complete_sources;
-                        // A matched record short-circuits hashing unless we
-                        // still need a one-time repair pass. The two repairs
-                        // are not equally urgent, and are scheduled apart:
+                        // A matched record short-circuits hashing unless it
+                        // still wants a one-time repair, and both repairs go to
+                        // the same background pass. Kept in step with
+                        // `resolve_from_known`, which documents the reasoning:
                         //
                         // - empty AICH on multi-part (v2 migration / missing
-                        //   root) is eD2k protocol data. Without it a corrupt
-                        //   chunk cannot be identified or recovered, so it is
-                        //   worth making the scan wait. Single-part empty AICH
-                        //   is left as-is (roots never straddled a part
-                        //   boundary).
+                        //   root) is eD2k recovery data. Valuable, but it costs
+                        //   a downloader one re-fetched part rather than one
+                        //   re-fetched block, and only once something is
+                        //   actually corrupt — not worth blocking a scan that
+                        //   would otherwise re-read the whole share. Single-part
+                        //   empty AICH is left as-is (roots never straddled a
+                        //   part boundary).
                         // - empty ember_file_hash is an Ember-only extra that
-                        //   lets a downloader double-check the whole file. The
-                        //   row is fully servable without it, so it is filled
-                        //   in the background rather than holding up a scan
-                        //   that would otherwise take days on a large library.
+                        //   lets a downloader double-check the whole file.
                         //
-                        // ed2k comes out identical either way; only the
-                        // missing digests are filled.
-                        let needs_aich = file.aich_hash.is_empty()
-                            && file.size > crate::network::ed2k::hash::PARTSIZE;
-                        if needs_aich {
-                            // Path-unique id while this copy is queued for
-                            // re-hashing. `file.id` is the content hash,
-                            // which every duplicate of the same content
-                            // shares, and `finalize_pending_hash` /
-                            // `remove_file_by_id` both take the first match —
-                            // so a hash failure on one copy dropped a
-                            // different, healthy copy from the Library.
-                            //
-                            // `rehash:`, not `pending:`: the row is already
-                            // hashed and servable and only wants an optional
-                            // digest, so a cancelled pass must not discard it.
-                            // See [`crate::search::index::REHASH_ID_PREFIX`].
-                            file.id = crate::search::index::rehash_id(&file.path);
-                            files_to_hash.push(file.clone());
-                        } else if file.ember_file_hash.is_empty() {
-                            startup_digest_backfill.push(file.clone());
+                        // The row is fully servable without either, so it keeps
+                        // its content-hash id and enters the index as an
+                        // ordinary entry. ed2k comes out identical either way;
+                        // only the missing digests are filled.
+                        if commands::sharing::wants_hash_top_up(file) {
+                            startup_hash_top_up.push(file.clone());
                         }
                     } else {
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
@@ -1327,7 +1312,7 @@ pub fn run() {
                             .parent()
                             .map(|parent| parent.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        all_discovered.push(crate::types::FileInfo {
+                        let hydrated = crate::types::FileInfo {
                             id: hash.clone(),
                             name: record.file_name.clone(),
                             path: record.file_path.clone(),
@@ -1357,7 +1342,29 @@ pub fn run() {
                             shared_kad: false,
                             shared_ed2k: false,
                             shared_ember: false,
-                        });
+                        };
+                        // A hydrated row is a full member of the index — it is
+                        // served, searched and published like any other — so it
+                        // wants the same one-time repairs, and the discovery
+                        // loop above never saw it to ask. Leaving it out made a
+                        // paginated library's migration stall at page one: the
+                        // rows the cursor had not reached kept their empty AICH
+                        // root or digest until the user happened to trigger
+                        // enough reloads to cycle them back into a discovery
+                        // page, which on a library large enough to paginate is
+                        // exactly the user least likely to be doing that by
+                        // hand.
+                        //
+                        // Handing the whole library to the pass rather than one
+                        // page of it is affordable because the pass is not
+                        // paginated in the first place: it works at a duty
+                        // cycle, stands aside for real scans, persists every
+                        // 256 files and resumes where it stopped. Its cost is
+                        // set by the drives, not by how much is queued.
+                        if commands::sharing::wants_hash_top_up(&hydrated) {
+                            startup_hash_top_up.push(hydrated.clone());
+                        }
+                        all_discovered.push(hydrated);
                     }
                 }
 
@@ -1722,9 +1729,9 @@ pub fn run() {
                 }
                 if !was_cancelled {
                     // Last, and only once the scan has let go of the drives.
-                    commands::sharing::queue_digest_backfill(
+                    commands::sharing::queue_hash_top_up(
                         startup_app.clone(),
-                        startup_digest_backfill,
+                        startup_hash_top_up,
                     )
                     .await;
                 }
@@ -1956,7 +1963,7 @@ pub fn run() {
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
             commands::sharing::preview_stop_hashing,
-            commands::sharing::digest_backfill_status,
+            commands::sharing::hash_top_up_status,
             commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
             commands::sharing::resolve_media_asset_path,

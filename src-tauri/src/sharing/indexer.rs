@@ -450,27 +450,58 @@ impl FileIndexer {
         Ok((ed2k, aich, part_hashes, ember, after.len(), modified_at))
     }
 
-    /// Compute only the Ember BLAKE3 digest, carrying forward an ed2k hash and
-    /// AICH root that `known.met` already holds.
+    /// Compute only the digests a record is actually missing, carrying forward
+    /// the ed2k hash — and, when it is not the thing being recovered, the AICH
+    /// root — that `known.met` already holds.
     ///
     /// Same shape and same guarantees as [`Self::hash_file_cancellable`] — the
     /// symlink refusal and the size/mtime check on both sides of the read are
     /// identical — so callers can swap between them per file.
     ///
-    /// The returned part-hash list is empty, which is correct rather than
-    /// lossy: a record that already carries an ed2k hash already carries its
-    /// part hashes, and `fresh_part_hash_handoff` treats an empty list as
+    /// Two routes, because the cheap one cannot answer for AICH:
+    ///
+    /// - Digest only. BLAKE3 alone, which runs several times faster than a
+    ///   pass that also drives MD4 and SHA-1 (measured at 5.6 GB/s against
+    ///   618 MB/s), so a library whose records are otherwise complete is
+    ///   limited by the drive rather than the CPU.
+    /// - Anything involving AICH. The leaf hashes only exist as a by-product of
+    ///   a pass that walks the file in blocks, so this takes the shared
+    ///   single-pass reader and asks it for exactly what is missing. It costs
+    ///   the ed2k MD4 whether or not we need it, which buys something back:
+    ///   see the cross-check below.
+    ///
+    /// The returned part-hash list is empty in both cases, which is correct
+    /// rather than lossy: a record that already carries an ed2k hash already
+    /// carries its part hashes, and on the AICH route the cross-check has just
+    /// proved the two agree. `fresh_part_hash_handoff` reads an empty list as
     /// "nothing new to hand over" rather than as an erasure.
     ///
-    /// What this gives up is that the full pass would have recomputed the MD4
-    /// and noticed a file whose contents changed without its size or mtime
-    /// moving. That is not a protection being removed so much as one that was
-    /// never offered: every file this scan *doesn't* queue is accepted on the
-    /// strength of the same path+size+mtime match, by `resolve_from_known`.
-    pub fn hash_file_digest_only_cancellable(
+    /// What the digest-only route gives up is that the full pass would have
+    /// recomputed the MD4 and noticed a file whose contents changed without its
+    /// size or mtime moving. That is not a protection being removed so much as
+    /// one that was never offered: every file this scan *doesn't* queue is
+    /// accepted on the strength of the same path+size+mtime match, by
+    /// `resolve_from_known`.
+    ///
+    /// The AICH route does not get to make that trade, and must not. Its output
+    /// is served to peers as recovery data for bytes they got from us, so a root
+    /// computed over contents that no longer match the id it is filed under
+    /// would be worse than no root at all — it would point a downloader's repair
+    /// at the wrong bytes. Since the MD4 is already running, the recomputed ed2k
+    /// is compared against the stored one and a mismatch fails the file rather
+    /// than recording anything. The caller leaves it for next time.
+    ///
+    /// Every digest it does not compute is carried forward from the record,
+    /// never returned empty. The caller assigns this tuple straight onto an
+    /// index row — `updated_file.ember_file_hash = ember_file_hash` — so a
+    /// field left blank because it was not asked for would read as an erasure
+    /// and withdraw a digest the record already had.
+    pub fn hash_file_top_up_cancellable(
         path: &Path,
         known_ed2k: String,
         known_aich: String,
+        known_ember: String,
+        want: crate::network::ed2k::hash::WantedDigests,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)> {
         let before = std::fs::symlink_metadata(path)?;
@@ -478,7 +509,31 @@ impl FileIndexer {
             anyhow::bail!("refusing to hash symlink: {}", path.display());
         }
         let before_modified = before.modified().ok();
-        let ember = crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled)?;
+
+        let (aich, ember) = if want.aich {
+            let mut file = std::fs::File::open(path)?;
+            let digests = crate::network::ed2k::hash::hash_open_file_digests_cancellable(
+                &mut file, want, cancelled,
+            )?;
+            if digests.ed2k != known_ed2k {
+                anyhow::bail!(
+                    "refusing to record an AICH root for {}: contents hash to {} but known.met has {}",
+                    path.display(),
+                    digests.ed2k,
+                    known_ed2k
+                );
+            }
+            (
+                digests.aich.map(hex::encode).unwrap_or(known_aich),
+                digests.ember.map(hex::encode).unwrap_or(known_ember),
+            )
+        } else {
+            (
+                known_aich,
+                crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled)?,
+            )
+        };
+
         let after = std::fs::symlink_metadata(path)?;
         let after_modified = after.modified().ok();
         if before.len() != after.len() || before_modified != after_modified {
@@ -490,7 +545,7 @@ impl FileIndexer {
             .unwrap_or(0);
         Ok((
             known_ed2k,
-            known_aich,
+            aich,
             Vec::new(),
             ember,
             after.len(),
@@ -535,10 +590,15 @@ mod tests {
         assert!(!parts.is_empty(), "a multi-part file has part hashes");
 
         let (short_ed2k, short_aich, short_parts, short_ember, short_size, short_mtime) =
-            FileIndexer::hash_file_digest_only_cancellable(
+            FileIndexer::hash_file_top_up_cancellable(
                 &path,
                 ed2k.clone(),
                 aich.clone(),
+                String::new(),
+                crate::network::ed2k::hash::WantedDigests {
+                    aich: false,
+                    ember: true,
+                },
                 &flag,
             )
             .expect("digest-only pass");
@@ -553,13 +613,79 @@ mod tests {
             "part hashes stay on the known.met record rather than being recomputed"
         );
 
+        // The AICH route is the one whose output is served to peers as repair
+        // data, so it has to agree with the full pass too — and it recomputes
+        // the ed2k in passing, which is what lets it refuse a file whose
+        // contents no longer match the id they are filed under.
+        let (aich_ed2k, recovered_aich, aich_parts, aich_ember, _, _) =
+            FileIndexer::hash_file_top_up_cancellable(
+                &path,
+                ed2k.clone(),
+                String::new(),
+                String::new(),
+                crate::network::ed2k::hash::WantedDigests {
+                    aich: true,
+                    ember: true,
+                },
+                &flag,
+            )
+            .expect("aich top-up pass");
+        assert_eq!(
+            recovered_aich, aich,
+            "a recovered root must match the one the full pass computes"
+        );
+        assert_eq!(aich_ember, ember, "one read still answers for both");
+        assert_eq!(aich_ed2k, ed2k);
+        assert!(aich_parts.is_empty());
+
+        // Filed under the wrong id, the root would point a downloader's repair
+        // at the wrong bytes, so the mismatch fails the file rather than
+        // recording anything.
+        let wrong_id = "00".repeat(16);
+        let refused = FileIndexer::hash_file_top_up_cancellable(
+            &path,
+            wrong_id,
+            String::new(),
+            String::new(),
+            crate::network::ed2k::hash::WantedDigests {
+                aich: true,
+                ember: false,
+            },
+            &flag,
+        );
+        assert!(
+            refused.is_err(),
+            "an AICH root must never be recorded against contents that hash to something else"
+        );
+
+        // A root recovered on its own must hand the stored digest back
+        // untouched, not blank it. The scan consumer assigns this tuple
+        // straight onto the row.
+        let (_, _, _, carried_ember, _, _) = FileIndexer::hash_file_top_up_cancellable(
+            &path,
+            ed2k.clone(),
+            String::new(),
+            ember.clone(),
+            crate::network::ed2k::hash::WantedDigests {
+                aich: true,
+                ember: false,
+            },
+            &flag,
+        )
+        .expect("aich-only top-up");
+        assert_eq!(
+            carried_ember, ember,
+            "a digest that was not asked for must be carried forward, never returned empty"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Stopping a scan has to stop this pass too, mid-file, the same way the
-    /// full one stops.
+    /// full one stops — on both routes, since they read the file by different
+    /// paths and only one of them was ever exercised here.
     #[test]
-    fn the_digest_only_pass_honours_cancellation() {
+    fn the_top_up_pass_honours_cancellation() {
         let dir = std::env::temp_dir().join(format!(
             "ember-digest-cancel-{}-{:?}",
             std::process::id(),
@@ -570,13 +696,29 @@ mod tests {
         std::fs::write(&path, vec![7u8; 4 * 1024 * 1024]).expect("write sample");
 
         let flag = AtomicBool::new(true);
-        let result = FileIndexer::hash_file_digest_only_cancellable(
-            &path,
-            "ab".repeat(16),
-            "cd".repeat(20),
-            &flag,
-        );
-        assert!(result.is_err(), "an already-cancelled pass must not return a digest");
+        for want in [
+            crate::network::ed2k::hash::WantedDigests {
+                aich: false,
+                ember: true,
+            },
+            crate::network::ed2k::hash::WantedDigests {
+                aich: true,
+                ember: true,
+            },
+        ] {
+            let result = FileIndexer::hash_file_top_up_cancellable(
+                &path,
+                "ab".repeat(16),
+                "cd".repeat(20),
+                String::new(),
+                want,
+                &flag,
+            );
+            assert!(
+                result.is_err(),
+                "{want:?}: an already-cancelled pass must not return a digest"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
