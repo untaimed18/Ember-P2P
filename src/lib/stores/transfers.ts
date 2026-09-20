@@ -144,7 +144,13 @@ function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): numbe
   if (IDLE_STATUSES.has(status as Transfer['status'])) {
     return 0;
   }
-  return Math.max(apiSpeed ?? 0, eventSpeed ?? 0);
+  // Snapshot and events write the same rolling-window field, so the snapshot
+  // wins outright. Taking the max kept a slot's burst reading long after the
+  // window had settled, which is how issue 115 survived a poll: the high event
+  // value outranked the cap-clamped snapshot, and nothing could ever lower it.
+  // A 0 here is a reading, not a gap — the backend zeroes the field on idle
+  // decay, and `liveSpeed` is what decides whether to smooth over it.
+  return apiSpeed ?? eventSpeed ?? 0;
 }
 
 function countServedPartBits(hex: string | undefined, partCount: number): number {

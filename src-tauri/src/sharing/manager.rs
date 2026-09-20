@@ -744,6 +744,25 @@ impl TransferManager {
         }
     }
 
+    /// Clamp one active row's displayed rate to `cap` (0 = unlimited).
+    ///
+    /// Issue 115: a fresh slot can still print a windowed rate above the
+    /// configured limit — the token bucket holds twice the cap, and the
+    /// frontend used to keep the higher of that burst and the later settled
+    /// snapshot. The upload progress path caps here so the figure the row,
+    /// the poll, and the status-bar comparison all see cannot exceed what
+    /// the limiter is allowed to spend.
+    pub fn cap_active_speed(&mut self, id: &str, cap: u64) {
+        if cap == 0 {
+            return;
+        }
+        if let Some(transfer) = self.active.get_mut(id) {
+            if transfer.speed > cap {
+                transfer.speed = cap;
+            }
+        }
+    }
+
     /// Record the actual on-disk destination of a finished download so the
     /// Open/Reveal commands can target it directly. Call this while the row is
     /// still in `active`/`queue` (before [`complete`](Self::complete) moves it).
@@ -1230,6 +1249,43 @@ impl TransferManager {
             });
         }
         removed
+    }
+
+    /// Origin recorded on a row that represents the same peer as `ip` /
+    /// `live_user_hash`, for the live `SourceDetail` path to inherit before
+    /// [`Self::supersede_duplicate_peer_rows`] drops that row.
+    ///
+    /// A callback placeholder is seeded with the network that named the peer
+    /// (KAD / server / Ember). The live connection then lands on the peer's
+    /// ephemeral port — a different `(ip, port)` key — and the worker event
+    /// often cannot look the origin up (the ephemeral row never carried one,
+    /// and a source restored from `sources.met` may not yet). Without copying
+    /// the placeholder's origin onto the live row, the Origin column goes
+    /// blank for exactly the sources that are actually working (issue 121).
+    /// Prefer the same user hash, then a placeholder at this IP, then any
+    /// other row at this IP — never a different peer behind the same NAT
+    /// when a hash match exists.
+    pub fn inherited_source_origin(
+        &self,
+        transfer_id: &str,
+        ip: &str,
+        live_user_hash: Option<[u8; 16]>,
+    ) -> Option<crate::types::SourceOrigin> {
+        let rows = self.source_details.get(transfer_id)?;
+        let uh = live_user_hash.filter(|h| *h != [0u8; 16]);
+        rows.iter()
+            .find_map(|s| {
+                let same_hash = matches!((uh, s.user_hash), (Some(a), Some(b)) if a == b);
+                same_hash.then_some(s.origin).flatten()
+            })
+            .or_else(|| {
+                rows.iter()
+                    .find_map(|s| (s.ip == ip && s.placeholder).then_some(s.origin).flatten())
+            })
+            .or_else(|| {
+                rows.iter()
+                    .find_map(|s| (s.ip == ip).then_some(s.origin).flatten())
+            })
     }
 
     /// Collapse duplicate rows for the peer whose *live* connection is
@@ -1971,6 +2027,70 @@ mod tests {
     }
 
     #[test]
+    fn live_source_detail_inherits_origin_from_the_placeholder_it_replaces() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        let mut placeholder = src("198.51.100.9", SourceStatus::WaitCallback);
+        placeholder.origin = Some(SourceOrigin::Server);
+        placeholder.placeholder = true;
+        placeholder.port = 4662;
+        manager.update_source_detail("a", placeholder);
+
+        // The live connection lands on the ephemeral port. Harvest origin
+        // *before* supersede drops the placeholder — the same order the
+        // SourceDetail handler uses.
+        let inherited = manager.inherited_source_origin("a", "198.51.100.9", None);
+        assert_eq!(inherited, Some(SourceOrigin::Server));
+        let _ = manager.supersede_duplicate_peer_rows("a", "198.51.100.9", 51000, None);
+
+        let mut live = src("198.51.100.9", SourceStatus::Transferring);
+        live.port = 51000;
+        live.origin = inherited;
+        manager.update_source_detail("a", live);
+
+        let row = manager
+            .get_source_details("a")
+            .into_iter()
+            .find(|s| s.port == 51000)
+            .expect("live row");
+        assert_eq!(
+            row.origin,
+            Some(SourceOrigin::Server),
+            "replacing a placeholder must not blank the Origin column"
+        );
+    }
+
+    #[test]
+    fn inherited_origin_prefers_the_same_user_hash_over_another_peer_at_this_ip() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        let mut neighbour = src("198.51.100.10", SourceStatus::Queued);
+        neighbour.origin = Some(SourceOrigin::Kad);
+        neighbour.port = 4662;
+        neighbour.user_hash = Some([0x11; 16]);
+        manager.update_source_detail("a", neighbour);
+
+        let mut ours = src("203.0.113.5", SourceStatus::WaitCallback);
+        ours.origin = Some(SourceOrigin::Ember);
+        ours.port = 4662;
+        ours.user_hash = Some([0x22; 16]);
+        ours.placeholder = true;
+        manager.update_source_detail("a", ours);
+
+        let inherited =
+            manager.inherited_source_origin("a", "198.51.100.10", Some([0x22; 16]));
+        assert_eq!(
+            inherited,
+            Some(SourceOrigin::Ember),
+            "a live session must keep its own provenance, not a neighbour's at another IP"
+        );
+    }
+
+    #[test]
     fn ember_callback_placeholders_are_superseded_like_the_others() {
         use crate::types::SourceOrigin;
         // Regression: the predicate used to match three hard-coded strings in
@@ -2477,6 +2597,29 @@ mod tests {
             "a fresh row reported {speed} B/s for a {burst}-byte burst — the \
              window only justifies {window_rate} B/s, and the difference is \
              what printed above the configured upload limit"
+        );
+    }
+
+    /// Issue 115: even after the window floor, a slot can still print above
+    /// the configured cap (token bucket burst / compression / poll merge).
+    /// The upload path then clamps the displayed rate so one row cannot read
+    /// higher than the limiter is allowed to spend.
+    #[test]
+    fn an_upload_row_cannot_print_above_the_configured_cap() {
+        let mut manager = TransferManager::new(1);
+        let mut upload = download("a");
+        upload.direction = TransferDirection::Upload;
+        assert!(manager.enqueue(upload));
+
+        let cap: u64 = 200_000;
+        manager.update_progress("a", 0, Some(0));
+        manager.update_progress("a", cap.saturating_mul(4), Some(cap));
+        manager.cap_active_speed("a", cap);
+
+        let speed = manager.active.get("a").expect("row is active").speed;
+        assert!(
+            speed <= cap,
+            "displayed {speed} B/s above the {cap} B/s cap"
         );
     }
 

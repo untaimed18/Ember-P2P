@@ -1381,12 +1381,10 @@ pub struct SourceEntry {
     /// Which network first told us about this source, for the UI's Origin
     /// column. Write-once: see [`crate::types::SourceOrigin`].
     ///
-    /// Not persisted to `sources.met` — that format is a fixed 43-byte record
-    /// whose loader rejects any version but 1, so carrying this across a
-    /// restart would mean a format bump that older builds could not read. A
-    /// source restored from disk therefore reports no origin until some
-    /// network mentions it again, which is honest: we genuinely no longer
-    /// know where it came from.
+    /// Persisted in a trailing `EORG` section of `sources.met` so a restart
+    /// does not blank the Origin column for every restored source. Version-1
+    /// records are unchanged, so older builds still read the file (they just
+    /// ignore the trailer).
     pub origin: Option<crate::types::SourceOrigin>,
 }
 
@@ -1422,6 +1420,25 @@ fn source_eviction_index(entries: &[SourceEntry]) -> usize {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         })
+}
+
+fn origin_to_persist_byte(origin: crate::types::SourceOrigin) -> u8 {
+    match origin {
+        crate::types::SourceOrigin::Server => 1,
+        crate::types::SourceOrigin::Kad => 2,
+        crate::types::SourceOrigin::Ember => 3,
+        crate::types::SourceOrigin::Exchange => 4,
+    }
+}
+
+fn origin_from_persist_byte(tag: u8) -> Option<crate::types::SourceOrigin> {
+    match tag {
+        1 => Some(crate::types::SourceOrigin::Server),
+        2 => Some(crate::types::SourceOrigin::Kad),
+        3 => Some(crate::types::SourceOrigin::Ember),
+        4 => Some(crate::types::SourceOrigin::Exchange),
+        _ => None,
+    }
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
@@ -1527,9 +1544,10 @@ impl SourceManager {
         user_hash: [u8; 16],
         connect_options: u8,
     ) {
-        // No origin: this is the ephemeral port of a callback we requested for
-        // a peer some other network already told us about, so the row that
-        // matters already carries the real provenance.
+        // Carry the provenance of the row discovery created onto this one, so a
+        // lookup by the live port still names the network that found the peer
+        // (issue 121). Same-file only: see `get_source_origin`.
+        let origin = self.origin_in_file(&file_hash, ip, tcp_port);
         self.register_source_full_server_ex(
             file_hash,
             ip,
@@ -1540,7 +1558,7 @@ impl SourceManager {
             user_hash,
             connect_options,
             true,
-            None,
+            origin,
         );
     }
 
@@ -1576,6 +1594,10 @@ impl SourceManager {
         // only a session-only row.
         if peer_is_highid && listening_port > 0 {
             if listening_port != ephemeral_port {
+                // Same peer, second port — see `register_live_session_port`.
+                // The same-IP fallback inside `origin_in_file` already covers
+                // the ephemeral row this callback arrived on.
+                let origin = self.origin_in_file(&file_hash, ip, listening_port);
                 self.register_source_full_opts(
                     file_hash,
                     ip,
@@ -1583,8 +1605,7 @@ impl SourceManager {
                     0,
                     user_hash,
                     connect_options,
-                    // Same peer, second port — see `register_live_session_port`.
-                    None,
+                    origin,
                 );
             } else if ephemeral_port > 0 {
                 // Same port: clear the session flag by registering as
@@ -2370,15 +2391,48 @@ impl SourceManager {
         ip: Ipv4Addr,
         port: u16,
     ) -> Option<crate::types::SourceOrigin> {
+        self.origin_in_file(file_hash, ip, port)
+            // Last resort: the same listening endpoint on another file. A
+            // source restored from disk, or one A4AF moved, may only have
+            // provenance recorded against a different hash. Prefer a label
+            // over a dash (issue 121). Never overrides a value this file
+            // already has — that stays per-file, so a peer found via KAD
+            // for one download and a server for another still shows both.
+            //
+            // Read-time only: the registration paths use `origin_in_file` so
+            // this inference is never written onto a row (and from there into
+            // `sources.met`), where write-once would freeze a guess in place of
+            // the authoritative answer a later announcement carries.
+            .or_else(|| {
+                self.sources.iter().find_map(|(fh, other)| {
+                    if fh == file_hash {
+                        return None;
+                    }
+                    other
+                        .iter()
+                        .find(|e| e.ip == ip && e.tcp_port == port)
+                        .and_then(|e| e.origin)
+                })
+            })
+    }
+
+    /// The per-file half of [`Self::get_source_origin`]: this file's answer for
+    /// `ip:port`, or for the same IP on one of its other ports.
+    fn origin_in_file(
+        &self,
+        file_hash: &[u8; 16],
+        ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<crate::types::SourceOrigin> {
         let entries = self.sources.get(file_hash)?;
         entries
             .iter()
             .find(|e| e.ip == ip && e.tcp_port == port)
             .and_then(|e| e.origin)
             // A callback/push-grant lands on the peer's ephemeral port, which
-            // is a different row from the one discovery created and never
-            // carries an origin of its own. Fall back to any other row for the
-            // same IP *in this file*, which is where that provenance lives.
+            // is a different row from the one discovery created. Fall back to
+            // any other row for the same IP *in this file*, which is where
+            // that provenance lives.
             .or_else(|| entries.iter().find_map(|e| (e.ip == ip).then_some(e.origin)?))
     }
 
@@ -2407,6 +2461,10 @@ impl SourceManager {
     /// `u32` file count, and per file a 16-byte hash, `u16` source count and a
     /// fixed 43-byte record per source (4 ip + 2 tcp + 2 udp + 4 server ip +
     /// 2 server port + 16 user hash + 1 options + 4 client id + 8 last_seen).
+    ///
+    /// After the version-1 body, a trailing `EORG` / version `1` section may
+    /// list one origin tag per persisted source (16 hash + 4 ip + 2 port +
+    /// 1 tag). Older builds stop after the v1 records and ignore it.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<usize> {
         const PERSIST_PER_FILE: usize = 200;
         let now = chrono::Utc::now().timestamp();
@@ -2443,6 +2501,7 @@ impl SourceManager {
 
         buf.extend_from_slice(&(file_records.len() as u32).to_le_bytes());
         let mut total = 0usize;
+        let mut origin_records: Vec<([u8; 16], Ipv4Addr, u16, u8)> = Vec::new();
         for (fh, entries) in &file_records {
             buf.extend_from_slice(*fh);
             buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
@@ -2456,7 +2515,21 @@ impl SourceManager {
                 buf.push(e.connect_options);
                 buf.extend_from_slice(&e.client_id.to_le_bytes());
                 buf.extend_from_slice(&e.last_seen.to_le_bytes());
+                if let Some(origin) = e.origin {
+                    origin_records.push((**fh, e.ip, e.tcp_port, origin_to_persist_byte(origin)));
+                }
                 total += 1;
+            }
+        }
+        if !origin_records.is_empty() {
+            buf.extend_from_slice(b"EORG");
+            buf.push(1u8);
+            buf.extend_from_slice(&(origin_records.len() as u32).to_le_bytes());
+            for (fh, ip, port, tag) in origin_records {
+                buf.extend_from_slice(&fh);
+                buf.extend_from_slice(&ip.octets());
+                buf.extend_from_slice(&port.to_le_bytes());
+                buf.push(tag);
             }
         }
 
@@ -2588,12 +2661,42 @@ impl SourceManager {
                     last_sx_sent: 0,
                     last_callback_at: 0,
                     not_for_reconnect: false,
-                    // `sources.met` has nowhere to put it — see the field's
-                    // doc comment. Re-learned the next time any network
-                    // mentions this peer.
+                    // Filled from the trailing `EORG` section after every v1
+                    // record is in, so a v1-only file still loads.
                     origin: None,
                 });
                 loaded += 1;
+            }
+        }
+        // Trailing origin section. Optional, so a v1 file written by an older
+        // build still loads; tags only fill rows that have no origin yet.
+        if pos + 9 <= data.len() && &data[pos..pos + 4] == b"EORG" && data[pos + 4] == 1 {
+            pos += 5;
+            let origin_count = read_u32(&data, pos);
+            pos += 4;
+            for _ in 0..origin_count {
+                if pos + 23 > data.len() {
+                    break;
+                }
+                let mut fh = [0u8; 16];
+                fh.copy_from_slice(&data[pos..pos + 16]);
+                let ip = Ipv4Addr::new(data[pos + 16], data[pos + 17], data[pos + 18], data[pos + 19]);
+                let tcp_port = read_u16(&data, pos + 20);
+                let tag = data[pos + 22];
+                pos += 23;
+                let Some(origin) = origin_from_persist_byte(tag) else {
+                    continue;
+                };
+                if let Some(entries) = self.sources.get_mut(&fh) {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|e| e.ip == ip && e.tcp_port == tcp_port)
+                    {
+                        if existing.origin.is_none() {
+                            existing.origin = Some(origin);
+                        }
+                    }
+                }
             }
         }
         // Collapse legacy dual-port rows that older builds persisted for the
@@ -3957,8 +4060,8 @@ mod tests {
         assert_eq!(sm.get_source_origin(&server_file, ip, 4662), Some(SourceOrigin::Server));
 
         // A callback arrives on the peer's ephemeral port, which is its own
-        // row and carries no origin. The answer has to come from the row
-        // discovery created, or every firewalled source would read as unknown.
+        // row. Provenance is copied from the discovery row so a later lookup
+        // by the live port still names the network that found the peer.
         sm.register_live_session_port(kad_file, ip, 51000, [0u8; 16], 0);
         assert_eq!(
             sm.get_source_origin(&kad_file, ip, 51000),
@@ -3968,6 +4071,127 @@ mod tests {
 
         // A peer we have no row for at all is unknown, not defaulted.
         assert_eq!(sm.get_source_origin(&kad_file, Ipv4Addr::new(10, 0, 0, 9), 4662), None);
+    }
+
+    #[test]
+    fn source_origin_falls_back_across_files_only_when_this_file_has_none() {
+        use crate::types::SourceOrigin;
+        let known = [0x71; 16];
+        let unknown = [0x72; 16];
+        let ip = Ipv4Addr::new(10, 0, 0, 11);
+        let mut sm = SourceManager::new();
+        sm.register_source(known, ip, 4662, Some(SourceOrigin::Kad));
+        sm.register_source(unknown, ip, 4662, None);
+        assert_eq!(
+            sm.get_source_origin(&unknown, ip, 4662),
+            Some(SourceOrigin::Kad),
+            "a restored/A4AF row with no origin of its own should still label"
+        );
+        assert_eq!(
+            sm.get_source_origin(&known, ip, 4662),
+            Some(SourceOrigin::Kad),
+            "a file that already has an origin must not pick up another file's"
+        );
+
+        let never_seen = [0x75; 16];
+        assert_eq!(
+            sm.get_source_origin(&never_seen, ip, 4662),
+            Some(SourceOrigin::Kad),
+            "a file with no source rows yet should still label from another file"
+        );
+    }
+
+    /// The cross-file answer is a read-time guess, so it must not be written
+    /// onto a row: `origin` is write-once *and* persisted, so a stored guess
+    /// would outrank the authoritative answer a later announcement carries and
+    /// would keep outranking it across every restart.
+    #[test]
+    fn a_cross_file_origin_guess_is_never_stored_on_the_row() {
+        use crate::types::SourceOrigin;
+        let other_file = [0x76; 16];
+        let this_file = [0x77; 16];
+        let ip = Ipv4Addr::new(9, 8, 7, 21);
+        let mut sm = SourceManager::new();
+        sm.register_source(other_file, ip, 4662, Some(SourceOrigin::Kad));
+        sm.register_source(this_file, ip, 4662, None);
+
+        // The column may borrow the other file's answer rather than show a dash.
+        assert_eq!(
+            sm.get_source_origin(&this_file, ip, 4662),
+            Some(SourceOrigin::Kad),
+            "a row with no provenance of its own should still label (issue 121)"
+        );
+
+        // A registration may not. This path looks an origin up to copy onto the
+        // peer's listening port, and whatever it writes is what gets persisted.
+        sm.register_inbound_callback_ports(this_file, ip, 51000, 4662, [0x12; 16], 0, true);
+        let stored = sm.sources[&this_file]
+            .iter()
+            .find(|e| e.tcp_port == 4662)
+            .expect("the listening row exists")
+            .origin;
+        assert_eq!(stored, None, "a read-time guess must not be stored as fact");
+
+        // So the network that really found this peer for this file still wins.
+        sm.register_source(this_file, ip, 4662, Some(SourceOrigin::Server));
+        assert_eq!(
+            sm.get_source_origin(&this_file, ip, 4662),
+            Some(SourceOrigin::Server),
+            "the authoritative per-file answer must outrank the borrowed one"
+        );
+    }
+
+    #[test]
+    fn source_origin_survives_sources_met_round_trip() {
+        use crate::types::SourceOrigin;
+        let dir = std::env::temp_dir().join(format!("ember_sources_origin_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sources_origin.met");
+
+        let hash = [0x73; 16];
+        let peer = [0x74; 16];
+        // Public unicast — load_from_disk drops special-use IPs (TEST-NET
+        // included), which would make the round-trip look like EORG failed.
+        let ip = Ipv4Addr::new(9, 8, 7, 20);
+        let mut sm = SourceManager::new();
+        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 1, Some(SourceOrigin::Ember));
+
+        sm.save_to_disk(&path).unwrap();
+        let mut sm2 = SourceManager::new();
+        sm2.load_from_disk(&path).unwrap();
+        assert_eq!(
+            sm2.get_source_origin(&hash, ip, 4662),
+            Some(SourceOrigin::Ember),
+            "Origin column must survive a restart"
+        );
+
+        // A v1-only file (no EORG trailer) still loads, origin stays unknown.
+        let v1 = dir.join("sources_v1.met");
+        {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"ESRC");
+            buf.push(1u8);
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&hash);
+            buf.extend_from_slice(&1u16.to_le_bytes());
+            buf.extend_from_slice(&ip.octets());
+            buf.extend_from_slice(&4662u16.to_le_bytes());
+            buf.extend_from_slice(&4672u16.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&peer);
+            buf.push(1u8);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&chrono::Utc::now().timestamp().to_le_bytes());
+            std::fs::write(&v1, buf).unwrap();
+        }
+        let mut sm3 = SourceManager::new();
+        assert_eq!(sm3.load_from_disk(&v1).unwrap(), 1);
+        assert_eq!(sm3.get_source_origin(&hash, ip, 4662), None);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&v1);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
