@@ -26,8 +26,31 @@ import { unreadCounts } from '$lib/stores/friends';
  * looks the same as a clean launch.
  */
 export interface ChatTab {
+  /**
+   * Friend hash, or `ch:<channel id>` for a room.
+   *
+   * The same key the draft map uses, and the same key `ChatConversation`
+   * derives for a room — so a room tab's hash is already its conversation
+   * identity rather than a second thing to keep in step with it.
+   */
   hash: string;
   name: string;
+}
+
+/** Prefix marking a tab (and its draft) as a room rather than a friend. */
+export const ROOM_TAB_PREFIX = 'ch:';
+
+export function isRoomTab(hash: string): boolean {
+  return hash.startsWith(ROOM_TAB_PREFIX);
+}
+
+/** The channel id behind a room tab, or null for a friend tab. */
+export function roomTabChannelId(hash: string): string | null {
+  return isRoomTab(hash) ? hash.slice(ROOM_TAB_PREFIX.length) : null;
+}
+
+export function roomTabKey(channelId: string): string {
+  return `${ROOM_TAB_PREFIX}${channelId.toLowerCase()}`;
 }
 
 const STORAGE_KEY = 'ember.chatTabs.v1';
@@ -275,15 +298,48 @@ export function removeChatForFriend(hash: string) {
   closeTab(hash.toLowerCase());
 }
 
-/** Drop persisted tabs whose identities are no longer friends. */
+/**
+ * Drop persisted tabs whose identities are no longer friends.
+ *
+ * Room tabs are left alone: this is handed the friend list, which says nothing
+ * about rooms, so filtering on it would close every room tab at startup.
+ * {@link retainRoomTabs} is the matching sweep for those.
+ */
 export function retainChatTabs(friendHashes: Iterable<string>) {
   const allow = new Set([...friendHashes].map((h) => h.toLowerCase()));
   const tabs = get(chatTabs);
-  const next = tabs.filter((t) => allow.has(t.hash.toLowerCase()));
+  const next = tabs.filter((t) => isRoomTab(t.hash) || allow.has(t.hash.toLowerCase()));
   if (next.length === tabs.length) return;
   chatTabs.set(next);
   const active = get(activeChatTab);
   if (active && !next.some((t) => t.hash.toLowerCase() === active.toLowerCase())) {
+    activeChatTab.set(next[0]?.hash ?? null);
+    if (next.length === 0) chatDockOpen.set(false);
+  }
+}
+
+/**
+ * Drop room tabs for rooms this device is no longer in.
+ *
+ * The mirror of {@link retainChatTabs}: leaving, being removed from, or
+ * deleting a room should take its tab with it, and a tab restored from
+ * `localStorage` for a room that is gone would otherwise sit there opening a
+ * conversation that cannot load.
+ */
+export function retainRoomTabs(channelIds: Iterable<string>) {
+  const allow = new Set([...channelIds].map((id) => id.toLowerCase()));
+  const tabs = get(chatTabs);
+  const next = tabs.filter((t) => {
+    const room = roomTabChannelId(t.hash);
+    return room === null || allow.has(room);
+  });
+  if (next.length === tabs.length) return;
+  for (const gone of tabs) {
+    if (!next.includes(gone)) chatDrafts.delete(gone.hash);
+  }
+  chatTabs.set(next);
+  const active = get(activeChatTab);
+  if (active && !next.some((t) => t.hash === active)) {
     activeChatTab.set(next[0]?.hash ?? null);
     if (next.length === 0) chatDockOpen.set(false);
   }

@@ -11,6 +11,8 @@
     closeDock,
     cycleTab,
     openChat,
+    isRoomTab,
+    roomTabChannelId,
   } from '$lib/stores/chatTabs';
   import {
     unreadCounts,
@@ -24,8 +26,18 @@
   import {
     awaitingChannelOfferList,
     channels as channelsStore,
+    ignoredKeysForChannel,
+    ignoredMembers,
     respondToChannelOffer,
   } from '$lib/stores/channels';
+  import {
+    channelRosters,
+    loadChannelRoster,
+    memberLabelsFrom,
+    membersIn,
+    mentionCandidatesFrom,
+    rosterOf,
+  } from '$lib/stores/channelRoster';
   import { appSettings } from '$lib/stores/settings';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { formatBytes } from '$lib/utils';
@@ -197,6 +209,36 @@
     $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
   );
 
+  /** The room behind the active tab, or null when it is a friend. */
+  let activeRoomId = $derived(activeTab ? roomTabChannelId(activeTab.hash) : null);
+  let activeRoom = $derived(
+    activeRoomId ? $channelsStore.find((c) => c.channel_id === activeRoomId) ?? null : null,
+  );
+  /**
+   * The roster for the room on screen, so a conversation in the dock names
+   * people the way the Channels page does rather than by key fragment.
+   *
+   * Read through the store the page also reads, which is the whole reason a
+   * room can be drawn here at all — the member list used to be that page's own
+   * component state.
+   */
+  let activeRoomMembers = $derived(membersIn($channelRosters, activeRoomId));
+  let activeRoomLabels = $derived(memberLabelsFrom(activeRoomMembers));
+  let activeRoomMentions = $derived(mentionCandidatesFrom(activeRoomMembers));
+  let activeRoomIgnored = $derived(ignoredKeysForChannel($ignoredMembers, activeRoomId));
+
+  // A room tab can be restored from localStorage or activated while the user
+  // is nowhere near Channels, so the dock has to fetch its own roster rather
+  // than rely on that page having been open.
+  $effect(() => {
+    const id = activeRoomId;
+    if (!id) return;
+    if (rosterOf(id).members.length > 0) return;
+    void loadChannelRoster(id).catch((e) =>
+      console.warn('ChatDock: could not load the room roster', e),
+    );
+  });
+
   function isTypingTarget(t: EventTarget | null): boolean {
     if (!(t instanceof HTMLElement)) return false;
     const tag = t.tagName;
@@ -287,10 +329,16 @@
   });
 
   function unreadFor(hash: string): number {
+    const room = roomTabChannelId(hash);
+    if (room !== null) {
+      return $channelsStore.find((c) => c.channel_id === room)?.unread ?? 0;
+    }
     return $unreadCounts.get(hash) ?? 0;
   }
 
+  /** Rooms have no presence of their own, so their tab carries no dot. */
   function isOnline(hash: string): boolean {
+    if (isRoomTab(hash)) return false;
     return $onlineFriends.has(hash.toLowerCase());
   }
 
@@ -461,13 +509,20 @@
             onclick={() => setActiveTab(tab.hash)}
             onkeydown={(e) => onTabKeydown(e, tab.hash)}
           >
-            <!-- Named, not decorative: the tab says nothing else about whether
-                 the friend is reachable, so hiding the dot hides the state. -->
-            <span
-              class="dock-tab-presence"
-              role="img"
-              aria-label={isOnline(tab.hash) ? m.chat_online_label() : m.chat_offline_label()}
-            ></span>
+            {#if isRoomTab(tab.hash)}
+              <!-- A room is not online or offline, so it gets the mark that
+                   says which kind of conversation this is instead of a dot
+                   that would have to claim one. -->
+              <span class="dock-tab-room" role="img" aria-label={m.chat_dock_room_tab()}>#</span>
+            {:else}
+              <!-- Named, not decorative: the tab says nothing else about whether
+                   the friend is reachable, so hiding the dot hides the state. -->
+              <span
+                class="dock-tab-presence"
+                role="img"
+                aria-label={isOnline(tab.hash) ? m.chat_online_label() : m.chat_offline_label()}
+              ></span>
+            {/if}
             <span class="dock-tab-name"><bdi dir="auto">{tab.name}</bdi></span>
             {#if unreadFor(tab.hash) > 0}
               <span
@@ -620,7 +675,23 @@
           {/each}
         </div>
       {/if}
-      {#if activeTab}
+      {#if activeTab && activeRoomId}
+        <!-- Everything a room conversation needs beyond the roster already
+             lives on the channels store, so the dock reads the same row the
+             Channels page draws from rather than a copy of it. -->
+        <ChatConversation
+          friendHash=""
+          friendName={activeRoom?.name ?? activeTab.name}
+          channelId={activeRoomId}
+          youAreBanned={activeRoom?.you_are_banned ?? false}
+          youAreKeyBehind={activeRoom?.key_behind ?? false}
+          slowModeSecs={activeRoom?.slow_mode_secs ?? 0}
+          memberNames={activeRoomLabels}
+          ignoredSenders={activeRoomIgnored}
+          mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
+          mentionCandidates={activeRoomMentions}
+        />
+      {:else if activeTab}
         <ChatConversation friendHash={activeTab.hash} friendName={activeTab.name} />
       {:else}
         <div class="dock-empty-state">
@@ -785,6 +856,19 @@
     background: var(--text-muted);
     flex-shrink: 0;
     transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .dock-tab-room {
+    width: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .dock-tab.active .dock-tab-room {
+    color: var(--accent);
   }
 
   .dock-tab.online .dock-tab-presence,

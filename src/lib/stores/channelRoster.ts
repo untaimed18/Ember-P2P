@@ -13,7 +13,7 @@
  * only applied deltas to the room it had selected; a room open in the dock
  * while the user is on Library has to keep its dots moving as well.
  */
-import { derived, get, writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   channelPresenceConfig,
@@ -118,10 +118,28 @@ export function rosterOf(channelId: string): RosterState {
   return get(channelRosters)[channelId.toLowerCase()] ?? EMPTY;
 }
 
+/** The roster of one room out of a snapshot of them all.
+ *
+ *  Taking the map rather than reading the store is what lets a component
+ *  derive from it: a helper that calls `get()` internally has no dependency
+ *  for Svelte to track, so the labels would never refresh when the roster
+ *  loaded. */
+export function membersIn(
+  rosters: Record<string, RosterState>,
+  channelId: string | null | undefined,
+): ChannelMemberInfo[] {
+  if (!channelId) return [];
+  return rosters[channelId.toLowerCase()]?.members ?? [];
+}
+
+/** Member pubkey → display label, from a roster already in hand. */
+export function memberLabelsFrom(roster: ChannelMemberInfo[]): Record<string, string> {
+  return Object.fromEntries(roster.map((mem) => [mem.member_pubkey, memberLabel(mem, roster)]));
+}
+
 /** Member pubkey → display label, for one room. */
 export function memberLabelsFor(channelId: string): Record<string, string> {
-  const roster = rosterOf(channelId).members;
-  return Object.fromEntries(roster.map((mem) => [mem.member_pubkey, memberLabel(mem, roster)]));
+  return memberLabelsFrom(rosterOf(channelId).members);
 }
 
 /**
@@ -133,19 +151,18 @@ export function memberLabelsFor(channelId: string): Record<string, string> {
  * address yourself, and naming someone the room has evicted only invites a
  * reply that will not arrive.
  */
-export function mentionCandidatesFor(channelId: string): string[] {
+export function mentionCandidatesFrom(roster: ChannelMemberInfo[]): string[] {
   return [
     ...new Set(
-      rosterOf(channelId)
-        .members.filter((mem) => !mem.is_self && !mem.banned && mem.nickname.trim().length > 0)
+      roster
+        .filter((mem) => !mem.is_self && !mem.banned && mem.nickname.trim().length > 0)
         .map((mem) => mem.nickname.trim()),
     ),
   ].sort((a, b) => a.localeCompare(b));
 }
 
-/** Reactive form of {@link memberLabelsFor}, for components that hold a room id. */
-export function memberLabelStore(channelId: () => string) {
-  return derived(channelRosters, () => memberLabelsFor(channelId()));
+export function mentionCandidatesFor(channelId: string): string[] {
+  return mentionCandidatesFrom(rosterOf(channelId).members);
 }
 
 function patch(channelId: string, next: Partial<RosterState>): void {

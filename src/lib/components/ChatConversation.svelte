@@ -10,7 +10,7 @@
     type ChannelMessageInfo,
   } from '$lib/api/channels';
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
-  import { clearChannelUnread } from '$lib/stores/channels';
+  import { clearChannelUnread, noteChannelOnScreen } from '$lib/stores/channels';
   import {
     editChannelMessage,
     getChannelReactions,
@@ -218,6 +218,8 @@
   const TYPING_REFRESH_MS = 2000;
   const TYPING_HOLD_MS = 5000;
   let removingMessage = $state<number | null>(null);
+  /** Undo for this component's "room is on screen" claim. */
+  let releaseChannelOnScreen: (() => void) | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
   // Delivery events can beat the IPC response that appends an optimistic
@@ -496,7 +498,14 @@
       // Channel unread is cleared only after `markAsRead` succeeds. Clearing
       // the badge here raced a `refreshChannels` that still saw unread rows
       // and put the count back — or hid a room that was never actually marked.
-      if (!channel) {
+      if (channel) {
+        // Say which room is on screen, so a line arriving in it does not raise
+        // a badge or a toast for something the reader is looking at. The page
+        // and the dock can both be showing it, which is why this counts rather
+        // than sets.
+        releaseChannelOnScreen?.();
+        releaseChannelOnScreen = noteChannelOnScreen(channel);
+      } else {
         activeChatHash.set(friend);
       }
       const gen = ++loadGen;
@@ -546,6 +555,8 @@
       if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       if (key) setDraft(key, inputText);
+      releaseChannelOnScreen?.();
+      releaseChannelOnScreen = null;
       if (!channel) {
         if (lastTypingSentOn) {
           lastTypingSentOn = false;

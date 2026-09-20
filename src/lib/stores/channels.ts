@@ -501,7 +501,9 @@ function scheduleXferClear(xferId: string, epoch: number): void {
 }
 
 function toastXferOffer(channelId: string, peerPubkey?: string): void {
-  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  if (isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId)) {
+    return;
+  }
   if (get(mutedChannels).includes(channelId)) return;
   if (peerPubkey && isMemberIgnored(get(ignoredMembers), peerPubkey, channelId)) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
@@ -613,7 +615,39 @@ export function clearChannelUnread(channelId: string): void {
   });
 }
 
+/**
+ * Rooms currently drawn on screen, by channel id.
+ *
+ * `activeChannelId` is the Channels page's *selection*, which is not the same
+ * question once a room can also be open in the dock while the user is on
+ * Library. Each mounted `ChatConversation` adds itself here, so "is the reader
+ * looking at this room" has one answer however many surfaces can show it.
+ */
+const visibleChannels = new Map<string, number>();
+
+/** Mark a room as on screen. Returns the undo, so a caller can hand it
+ *  straight to an effect's cleanup. */
+export function noteChannelOnScreen(channelId: string): () => void {
+  const id = channelId.toLowerCase();
+  // Counted rather than a set: the page and the dock can legitimately show
+  // the same room at once, and the first to unmount must not speak for both.
+  visibleChannels.set(id, (visibleChannels.get(id) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (visibleChannels.get(id) ?? 1) - 1;
+    if (left > 0) visibleChannels.set(id, left);
+    else visibleChannels.delete(id);
+  };
+}
+
+function channelIsOnScreen(channelId: string): boolean {
+  return visibleChannels.has(channelId.toLowerCase());
+}
+
 export function bumpChannelUnread(channelId: string): void {
+  if (isAppVisible() && channelIsOnScreen(channelId)) return;
   if (isAppVisible() && get(activeChannelId) === channelId) return;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
@@ -645,7 +679,8 @@ function maybeToastChannelMessage(channelId: string, message: string, senderPubk
   // loosely for that — a window sitting behind an editor counts as watched,
   // which is precisely when a desktop notification is the point. `notify`
   // applies its own visible-*and*-focused test.
-  const roomOnScreen = isAppVisible() && get(activeChannelId) === channelId;
+  const roomOnScreen =
+    isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId);
   if (get(mutedChannels).includes(channelId)) return;
   // Ignoring somebody is presentational, and a toast quoting them is the least
   // ignorable presentation there is: it interrupts whatever page the user is on
@@ -785,6 +820,7 @@ export function cleanupChannelsStore() {
   unreadRevision = 0;
   refreshGen = 0;
   unreadDirty.clear();
+  visibleChannels.clear();
   lastToastAt.clear();
   lastOpenedChannelId = null;
   for (const timer of xferClearTimers.values()) clearTimeout(timer);

@@ -58,7 +58,14 @@
   } from '$lib/api/channels';
   import { addFriend } from '$lib/api/friends';
   import { friendsList, friendRequests, refreshFriendsList } from '$lib/stores/friends';
-  import { clearDraft } from '$lib/stores/chatTabs';
+  import {
+    chatTabs,
+    clearDraft,
+    closeTab,
+    openChat,
+    retainRoomTabs,
+    roomTabKey,
+  } from '$lib/stores/chatTabs';
   import {
     activeChannelId,
     channels as channelsStore,
@@ -88,6 +95,14 @@
   } from '$lib/stores/channels';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
+  // A tab for a room this device has left (or that was deleted) would open a
+  // conversation that cannot load, and tabs outlive this page — including
+  // across a restart, where they are restored from localStorage.
+  $effect(() => {
+    retainRoomTabs(
+      $channelsStore.filter((c) => c.in_room && !c.deleted).map((c) => c.channel_id),
+    );
+  });
   let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
   let selectedId = $derived($activeChannelId);
   let members: ChannelMemberInfo[] = $state([]);
@@ -1517,6 +1532,22 @@
     return byHash;
   });
 
+  /** Whether the room on screen is also pinned to the chat dock. */
+  let roomIsDocked = $derived(
+    !!selectedChannelId && $chatTabs.some((t) => t.hash === roomTabKey(selectedChannelId)),
+  );
+
+  function toggleRoomInDock() {
+    const id = selectedChannelId;
+    if (!id) return;
+    const key = roomTabKey(id);
+    if (roomIsDocked) {
+      closeTab(key);
+      return;
+    }
+    openChat(key, selected?.name ?? m.nav_channels());
+  }
+
   function memberFriendRelation(mem: ChannelMemberInfo): 'none' | 'mutual' | 'listed' | 'incoming' {
     const hash = (mem.ember_hash || '').toLowerCase();
     if (!hash) return 'none';
@@ -2106,6 +2137,23 @@
                     <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
                     <circle cx="11.5" cy="6.5" r="1.7"/>
                     <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
+                  </svg>
+                </button>
+                <!-- Keeping a room open is what makes it reachable from
+                     anywhere: the conversation lives on this page, so leaving
+                     the page used to end it. The dock already outlives
+                     navigation for friends. -->
+                <button
+                  class="icon-btn"
+                  class:on={roomIsDocked}
+                  onclick={toggleRoomInDock}
+                  title={roomIsDocked ? m.channels_undock_room() : m.channels_dock_room()}
+                  aria-pressed={roomIsDocked}
+                  aria-label={roomIsDocked ? m.channels_undock_room() : m.channels_dock_room()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1.5" y="3" width="13" height="10" rx="1.6"/>
+                    <line x1="10" y1="3" x2="10" y2="13"/>
                   </svg>
                 </button>
                 <button
