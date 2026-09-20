@@ -1317,7 +1317,10 @@ impl Drop for WriteReservation {
         }
         let to_release = std::mem::take(&mut self.reserved);
         if let Some(tx) = &self.drop_tx {
-            if tx.send(DropReleaseOp::WriteRanges(to_release.clone())).is_ok() {
+            if tx
+                .send(DropReleaseOp::WriteRanges(to_release.clone()))
+                .is_ok()
+            {
                 return;
             }
         }
@@ -1357,13 +1360,8 @@ async fn write_gap_subranges_ms(
     drop_tx: Option<&DropReleaseTx>,
 ) -> GapWriteOutcome {
     let end = start.saturating_add(data.len() as u64);
-    let mut reservation = WriteReservation::acquire_with_release(
-        tracker,
-        start,
-        end,
-        drop_tx.cloned(),
-    )
-    .await;
+    let mut reservation =
+        WriteReservation::acquire_with_release(tracker, start, end, drop_tx.cloned()).await;
     let mut written_subranges = Vec::with_capacity(reservation.ranges().len());
     let mut write_ok = true;
     let mut disk_full = None;
@@ -2220,6 +2218,7 @@ impl MultiSourceDownload {
             let mut last_total: u32 = agg_total.load(Ordering::Relaxed);
             let mut pending_progress = false;
             let mut last_emitted_bytes: u64 = 0;
+            let mut last_emitted_wire: u64 = 0;
             let mut interval = tokio::time::interval(EMIT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick so we don't emit before any
@@ -2259,7 +2258,14 @@ impl MultiSourceDownload {
                             // negative correction that landed at the same
                             // total). Saves a UI round-trip when sources
                             // are flapping but bytes are static.
-                            if pending_progress && capped != last_emitted_bytes {
+                            //
+                            // Wire bytes count too: overlapping / duplicate
+                            // blocks do not move `progress_bytes`, and skipping
+                            // those left `last_received` stale so a live
+                            // download flashed Stalled every health tick.
+                            if pending_progress
+                                && (capped != last_emitted_bytes || wire_total != last_emitted_wire)
+                            {
                                 let _ = event_tx_clone
                                     .send(DownloadEvent::Progress {
                                         transfer_id: transfer_id.clone(),
@@ -2269,6 +2275,7 @@ impl MultiSourceDownload {
                                     })
                                     .await;
                                 last_emitted_bytes = capped;
+                                last_emitted_wire = wire_total;
                             }
                             pending_progress = false;
 
@@ -2298,7 +2305,7 @@ impl MultiSourceDownload {
                 );
                 (t.progress_bytes().min(file_size), t.transferred())
             };
-            if capped != last_emitted_bytes {
+            if capped != last_emitted_bytes || wire_total != last_emitted_wire {
                 let _ = event_tx_clone
                     .send(DownloadEvent::Progress {
                         transfer_id: transfer_id.clone(),
@@ -3740,22 +3747,27 @@ impl MultiSourceDownload {
                             }
                         }
                         if super::transfer::should_emit_source_failed(&err_str) {
-                            warn!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
-                            let _ = fail_etx.send(DownloadEvent::SourceDetail {
-                                transfer_id: fail_tid,
-                                ip: fail_ip,
-                                port: fail_port,
-                                status: "failed".to_string(),
-                                queue_rank: None,
-                                speed: 0,
-                                transferred: 0,
-                                client_software: String::new(),
-                                peer_name: String::new(),
-                                failure_kind: Some(super::transfer::classify_error(&err_str)),
-                                available_parts: None,
-                                total_parts: None,
-                                country_code: None,
-                            }).await;
+                            warn!(
+                                "Adopted callback source {} ({}) failed: {e:#}",
+                                src_idx, fail_ip
+                            );
+                            let _ = fail_etx
+                                .send(DownloadEvent::SourceDetail {
+                                    transfer_id: fail_tid,
+                                    ip: fail_ip,
+                                    port: fail_port,
+                                    status: "failed".to_string(),
+                                    queue_rank: None,
+                                    speed: 0,
+                                    transferred: 0,
+                                    client_software: String::new(),
+                                    peer_name: String::new(),
+                                    failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                    available_parts: None,
+                                    total_parts: None,
+                                    country_code: None,
+                                })
+                                .await;
                         }
                     }
                 });
@@ -4259,21 +4271,23 @@ impl MultiSourceDownload {
                                 src_idx, r_src_ip, SOURCE_RETRY_COOLDOWN_SECS,
                             );
                         } else {
-                            let _ = rfail_etx.send(DownloadEvent::SourceDetail {
-                                transfer_id: rfail_tid,
-                                ip: rfail_ip,
-                                port: rfail_port,
-                                status: "failed".to_string(),
-                                queue_rank: None,
-                                speed: 0,
-                                transferred: 0,
-                                client_software: String::new(),
-                                peer_name: String::new(),
-                                failure_kind: Some(super::transfer::classify_error(&err_str)),
-                                available_parts: None,
-                                total_parts: None,
-                                country_code: None,
-                            }).await;
+                            let _ = rfail_etx
+                                .send(DownloadEvent::SourceDetail {
+                                    transfer_id: rfail_tid,
+                                    ip: rfail_ip,
+                                    port: rfail_port,
+                                    status: "failed".to_string(),
+                                    queue_rank: None,
+                                    speed: 0,
+                                    transferred: 0,
+                                    client_software: String::new(),
+                                    peer_name: String::new(),
+                                    failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                    available_parts: None,
+                                    total_parts: None,
+                                    country_code: None,
+                                })
+                                .await;
                             warn!("Retry source {} failed: {e:#}", src_idx);
                         }
                     }
@@ -5048,7 +5062,8 @@ async fn download_parts_from_source(
             supports_crypt_layer: obfuscation_enabled,
             requests_crypt_layer: obfuscation_enabled,
             requires_crypt_layer: false,
-            supports_direct_udp_callback: crate::network::kad::firewall::advertised_direct_udp_callback(),
+            supports_direct_udp_callback:
+                crate::network::kad::firewall::advertised_direct_udp_callback(),
             supports_captcha: false,
             server_ip,
             server_port,
@@ -6528,10 +6543,7 @@ async fn download_parts_from_source(
                         pubkey: hello_caps.ember_pubkey,
                         nickname: nick,
                         peer_ip: addr.ip().to_string(),
-                        peer_port: super::advertised_listen_port(
-                            hello_caps.tcp_port,
-                            addr.port(),
-                        ),
+                        peer_port: super::advertised_listen_port(hello_caps.tcp_port, addr.port()),
                         verified,
                     })
                     .await;
@@ -7587,6 +7599,15 @@ async fn download_parts_from_source(
     let mut measured_speed: u64 = 0;
     let mut speed_start = std::time::Instant::now();
     let mut speed_bytes: u64 = 0;
+    // Has this peer ever sent us a byte on this connection? Status display only.
+    // The per-part `got_any_data` below resets at every part boundary, and
+    // driving the source row off that made it flash Stalled for two seconds at
+    // the start of each new part even though the peer had been sending all
+    // along. Deliberately separate from the per-part flag rather than replacing
+    // it: the part-local answer is what the read-timeout and re-assert policy
+    // must key off, because "this peer has sent nothing *for the part we just
+    // asked for*" is the condition those branches were written to recover from.
+    let mut conn_got_any_data = false;
 
     // Build dynamic part queue: start with pre-assigned parts, add more dynamically
     let mut part_queue: Vec<usize> = parts.to_vec();
@@ -7802,13 +7823,7 @@ async fn download_parts_from_source(
                         .collect();
                     let needs_large_offsets =
                         all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                    (
-                        all_blocks,
-                        batches,
-                        0,
-                        needs_large_offsets,
-                        Vec::new(),
-                    )
+                    (all_blocks, batches, 0, needs_large_offsets, Vec::new())
                 };
 
             // Checked for both paths, not just the freshly computed one.
@@ -7945,7 +7960,6 @@ async fn download_parts_from_source(
             let mut consecutive_bad_blocks: u32 = 0;
             const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
             let mut data_loop_start = std::time::Instant::now();
-            let mut got_any_data = false;
             // Trickle-source rotation: timestamp since which this source has been
             // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
             // recovers. See the rotation check at the top of the receive loop.
@@ -7965,6 +7979,15 @@ async fn download_parts_from_source(
             // configured queue-wait budget, before finally disconnecting.
             let mut no_data_reasserts: u32 = 0;
             const MAX_NO_DATA_REASSERTS: u32 = 5;
+            // Per-part, and it has to stay that way: it selects the read
+            // timeout, decides re-assert versus disconnect, and classifies a
+            // FIN as "peer dropped on this part". A fresh `OP_REQUESTPARTS` at
+            // a part boundary can be dropped or race the uploader's own slot
+            // rotation exactly as the first one can, so the part that has just
+            // been asked for is the thing those branches need to know about.
+            // `conn_got_any_data` carries the connection-wide answer for the
+            // status badge.
+            let mut got_any_data = false;
             let mut last_epx_resend = std::time::Instant::now();
             // Use the generation we sent at handshake time as the resend
             // baseline so any rebuild that happened during file-status / queue
@@ -8159,144 +8182,150 @@ async fn download_parts_from_source(
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
                 let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
-                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> =
-                    if let Some(packet) = auth_deferred.pop_front() {
-                        Ok(Ok(packet))
-                    } else {
-                        let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
-                        let mut stall_check =
-                            tokio::time::interval(std::time::Duration::from_secs(2));
-                        stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        // Consume the immediate first tick so the first real
-                        // stall-check fires 2s after we start waiting, not
-                        // instantly (which would spam an emit on every
-                        // packet).
-                        stall_check.tick().await;
+                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = if let Some(
+                    packet,
+                ) =
+                    auth_deferred.pop_front()
+                {
+                    Ok(Ok(packet))
+                } else {
+                    let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
+                    let mut stall_check = tokio::time::interval(std::time::Duration::from_secs(2));
+                    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // Consume the immediate first tick so the first real
+                    // stall-check fires 2s after we start waiting, not
+                    // instantly (which would spam an emit on every
+                    // packet).
+                    stall_check.tick().await;
 
-                        loop {
-                            tokio::select! {
-                                biased;
-                                // User Stop/Cancel (or a network disconnect) landed
-                                // while we're actively downloading from this source.
-                                // Mirror eMule's CPartFile::PauseFile, which sends
-                                // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
-                                // uploader frees our slot immediately rather than
-                                // waiting to notice the dropped TCP socket. Best-effort
-                                // + time-boxed so a wedged socket can't delay the stop,
-                                // then bail (the outer task `select!` grace window lets
-                                // this finish before it would force-drop the future).
-                                // Fires on Pause too: eMule's PauseFile notifies every
-                                // DS_DOWNLOADING source, so a paused active transfer
-                                // also frees the uploader's slot (the transfer's source
-                                // knowledge is kept by `PauseDownload` for fast resume).
-                                _ = control.wait_cancel_or_pause() => {
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_millis(400),
-                                        write_packet_async_ms(
-                                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                        ),
-                                    ).await;
-                                    anyhow::bail!("cancelled by user");
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // User Stop/Cancel (or a network disconnect) landed
+                            // while we're actively downloading from this source.
+                            // Mirror eMule's CPartFile::PauseFile, which sends
+                            // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
+                            // uploader frees our slot immediately rather than
+                            // waiting to notice the dropped TCP socket. Best-effort
+                            // + time-boxed so a wedged socket can't delay the stop,
+                            // then bail (the outer task `select!` grace window lets
+                            // this finish before it would force-drop the future).
+                            // Fires on Pause too: eMule's PauseFile notifies every
+                            // DS_DOWNLOADING source, so a paused active transfer
+                            // also frees the uploader's slot (the transfer's source
+                            // knowledge is kept by `PauseDownload` for fast resume).
+                            _ = control.wait_cancel_or_pause() => {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(400),
+                                    write_packet_async_ms(
+                                        &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                    ),
+                                ).await;
+                                anyhow::bail!("cancelled by user");
+                            }
+                            // `read_packet_async_ms` returns `Result<_, io::Error>`;
+                            // hoist into `anyhow::Error` here so the outer
+                            // match arms stay aligned with the error-kind
+                            // classification that the rest of the receive
+                            // loop uses.
+                            res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
+                            _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
+                            _ = stall_check.tick() => {
+                                // Another source may have closed the
+                                // last gap while we were blocked here.
+                                // See the receive-loop comment above.
+                                {
+                                    let t = tracker.read().await;
+                                    if t.all_complete() {
+                                        break Err(());
+                                    }
                                 }
-                                // `read_packet_async_ms` returns `Result<_, io::Error>`;
-                                // hoist into `anyhow::Error` here so the outer
-                                // match arms stay aligned with the error-kind
-                                // classification that the rest of the receive
-                                // loop uses.
-                                res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                                _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
-                                _ = stall_check.tick() => {
-                                    // Another source may have closed the
-                                    // last gap while we were blocked here.
-                                    // See the receive-loop comment above.
+                                // Emit a fresh `transferring` update
+                                // with recalculated speed (which will
+                                // trend toward 0 as the byte window
+                                // ages out). The same logic that runs
+                                // after packet processing below — just
+                                // triggered on a timer so the UI gets
+                                // updates during silence.
+                                let elapsed = speed_start.elapsed();
+                                if elapsed.as_millis() >= 2000 {
+                                    measured_speed =
+                                        (speed_bytes as u128 * 1000
+                                            / elapsed.as_millis().max(1))
+                                            as u64;
+                                    speed_bytes = 0;
+                                    speed_start = std::time::Instant::now();
+                                    emit_source!(
+                                        if conn_got_any_data {
+                                            "transferring"
+                                        } else {
+                                            "stalled"
+                                        },
+                                        None,
+                                        measured_speed
+                                    );
+                                }
+                                let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                                if let Some(pending) = pipelined_next.as_mut() {
+                                    let _ = expire_outstanding_ranges(
+                                        &mut pending.outstanding_ranges,
+                                    );
+                                }
+                                if expired > 0 {
+                                    let mut sent_any = false;
+                                    while sent_idx < batches.len()
+                                        && outstanding_ranges.len() < max_outstanding_blocks
                                     {
-                                        let t = tracker.read().await;
-                                        if t.all_complete() {
-                                            break Err(());
-                                        }
-                                    }
-                                    // Emit a fresh `transferring` update
-                                    // with recalculated speed (which will
-                                    // trend toward 0 as the byte window
-                                    // ages out). The same logic that runs
-                                    // after packet processing below — just
-                                    // triggered on a timer so the UI gets
-                                    // updates during silence.
-                                    let elapsed = speed_start.elapsed();
-                                    if elapsed.as_millis() >= 2000 {
-                                        measured_speed =
-                                            (speed_bytes as u128 * 1000
-                                                / elapsed.as_millis().max(1))
-                                                as u64;
-                                        speed_bytes = 0;
-                                        speed_start = std::time::Instant::now();
-                                        emit_source!(
-                                            if got_any_data { "transferring" } else { "stalled" },
-                                            None,
-                                            measured_speed
-                                        );
-                                    }
-                                    let expired = expire_outstanding_ranges(&mut outstanding_ranges);
-                                    if let Some(pending) = pipelined_next.as_mut() {
-                                        let _ = expire_outstanding_ranges(
-                                            &mut pending.outstanding_ranges,
-                                        );
-                                    }
-                                    if expired > 0 {
-                                        let mut sent_any = false;
-                                        while sent_idx < batches.len()
-                                            && outstanding_ranges.len() < max_outstanding_blocks
-                                        {
-                                            let batch =
-                                                drop_filled_blocks(&tracker, &batches[sent_idx])
-                                                    .await;
-                                            sent_idx += 1;
-                                            if batch.is_empty() {
-                                                continue;
-                                            }
-                                            if write_part_request_batch(
-                                                &mut *writer,
-                                                file_hash,
-                                                &batch,
-                                                needs_i64,
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                anyhow::bail!(
-                                                    "connection lost while refilling expired request"
-                                                );
-                                            }
-                                            push_outstanding_batch(
-                                                &mut outstanding_ranges,
-                                                &batch,
-                                            );
-                                            sent_any = true;
-                                        }
-                                        // Keyed on a request actually going out,
-                                        // not on `sent_idx` moving: skipping a
-                                        // batch whose bytes another worker
-                                        // already landed advances the index
-                                        // without extending the deadline, so a
-                                        // worker whose whole tail went stale
-                                        // still falls through to the exit below.
-                                        if sent_any {
-                                            hard_deadline =
-                                                tokio::time::Instant::now() + read_timeout;
-                                            ip_guard
-                                                .publish_in_flight(&outstanding_ranges)
+                                        let batch =
+                                            drop_filled_blocks(&tracker, &batches[sent_idx])
                                                 .await;
-                                        } else if outstanding_ranges.is_empty()
-                                            && sent_idx >= batches.len()
-                                        {
-                                            break Err(());
+                                        sent_idx += 1;
+                                        if batch.is_empty() {
+                                            continue;
                                         }
+                                        if write_part_request_batch(
+                                            &mut *writer,
+                                            file_hash,
+                                            &batch,
+                                            needs_i64,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            anyhow::bail!(
+                                                "connection lost while refilling expired request"
+                                            );
+                                        }
+                                        push_outstanding_batch(
+                                            &mut outstanding_ranges,
+                                            &batch,
+                                        );
+                                        sent_any = true;
                                     }
-                                    continue;
+                                    // Keyed on a request actually going out,
+                                    // not on `sent_idx` moving: skipping a
+                                    // batch whose bytes another worker
+                                    // already landed advances the index
+                                    // without extending the deadline, so a
+                                    // worker whose whole tail went stale
+                                    // still falls through to the exit below.
+                                    if sent_any {
+                                        hard_deadline =
+                                            tokio::time::Instant::now() + read_timeout;
+                                        ip_guard
+                                            .publish_in_flight(&outstanding_ranges)
+                                            .await;
+                                    } else if outstanding_ranges.is_empty()
+                                        && sent_idx >= batches.len()
+                                    {
+                                        break Err(());
+                                    }
                                 }
+                                continue;
                             }
                         }
-                    };
+                    }
+                };
 
                 let (proto, opcode, payload) = match read_result {
                     Ok(Ok(pkt)) => {
@@ -8560,7 +8589,8 @@ async fn download_parts_from_source(
                         // Lock-free: this fires on every packet, and the tracker's
                         // write lock serialises every reader including the network
                         // event loop.
-                        wire_bytes_counter.fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
+                        wire_bytes_counter
+                            .fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
 
                         // D21: never overwrite bytes we already have. With several
                         // sources in flight (and cross-part pipelining), source B
@@ -8590,17 +8620,16 @@ async fn download_parts_from_source(
                         // us overwrite its bytes and claim duplicate credit) —
                         // see `WriteReservation` for why the guard can no
                         // longer span the write itself.
-                        let gap_write =
-                            write_gap_subranges_ms(
-                                &tracker,
-                                &output,
-                                start,
-                                data,
-                                _src_idx,
-                                "",
-                                drop_tx.as_ref(),
-                            )
-                                .await;
+                        let gap_write = write_gap_subranges_ms(
+                            &tracker,
+                            &output,
+                            start,
+                            data,
+                            _src_idx,
+                            "",
+                            drop_tx.as_ref(),
+                        )
+                        .await;
                         if let Some(ref e) = gap_write.disk_full {
                             anyhow::bail!("stage:insufficient_disk disk write failed: {e}");
                         }
@@ -8659,6 +8688,7 @@ async fn download_parts_from_source(
                                 _src_idx, addr, part_idx, piece_len
                             );
                             got_any_data = true;
+                            conn_got_any_data = true;
                             // First real byte: now it's genuinely transferring.
                             // Flip the status immediately (the periodic speed emit
                             // below only fires every 2s, too laggy for the badge).
@@ -8725,8 +8755,10 @@ async fn download_parts_from_source(
                         // the counter "includes compressed packets" — and it counts
                         // every packet, whereas Ember reaches the write only once
                         // enough has inflated to be worth one.
-                        wire_bytes_counter
-                            .fetch_add(compressed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        wire_bytes_counter.fetch_add(
+                            compressed.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
 
                         let requested_end = outstanding_ranges
                             .iter()
@@ -8740,13 +8772,11 @@ async fn download_parts_from_source(
                                 })
                             })
                             .or_else(|| {
-                                batches
-                                    .iter()
-                                    .take(sent_idx)
-                                    .flatten()
-                                    .find_map(|(requested_start, requested_end)| {
+                                batches.iter().take(sent_idx).flatten().find_map(
+                                    |(requested_start, requested_end)| {
                                         (*requested_start == start).then_some(*requested_end)
-                                    })
+                                    },
+                                )
                             })
                             .or_else(|| {
                                 (resumed
@@ -8789,10 +8819,7 @@ async fn download_parts_from_source(
                         else {
                             refresh_outstanding_range(&mut outstanding_ranges, start);
                             if let Some(pending) = pipelined_next.as_mut() {
-                                refresh_outstanding_range(
-                                    &mut pending.outstanding_ranges,
-                                    start,
-                                );
+                                refresh_outstanding_range(&mut pending.outstanding_ranges, start);
                             }
                             continue;
                         };
@@ -8905,6 +8932,7 @@ async fn download_parts_from_source(
                         if !got_any_data {
                             info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                             got_any_data = true;
+                            conn_got_any_data = true;
                         }
                         // Contribution, not wire bytes — see the uncompressed
                         // path above.
@@ -9683,7 +9711,7 @@ async fn download_parts_from_source(
                     speed_bytes = 0;
                     speed_start = std::time::Instant::now();
                     emit_source!(
-                        if got_any_data {
+                        if conn_got_any_data {
                             "transferring"
                         } else {
                             "stalled"
@@ -10836,9 +10864,8 @@ async fn compute_part_blocks_ms(
     if !busy.is_empty() {
         // Stable partition, so blocks keep their ascending order within each
         // group and a part is still filled front-to-back.
-        all_blocks.sort_by_key(|&(bs, be)| {
-            u8::from(busy.iter().any(|&(rs, re)| rs < be && re > bs))
-        });
+        all_blocks
+            .sort_by_key(|&(bs, be)| u8::from(busy.iter().any(|&(rs, re)| rs < be && re > bs)));
     }
     (all_blocks, part_start, part_end)
 }
@@ -10900,8 +10927,21 @@ fn outstanding_blocks_for_speed_ms(
     // already says so. So this branch now only adds the sub-eMule tiers that
     // exist to keep a trickle slot inside its uploader's send timeout, and then
     // falls through to the shared ladder.
-    let mut blocks = if remaining_parts <= 4 && speed > 0 && speed < 4 * 1024 {
-        if speed < 1200 {
+    //
+    // The cold start is deliberately *not* optimistic on a small file. This
+    // budget is computed once per part (see the call site) and never revised
+    // inside the receive loop, so on a file of four parts or fewer the guess
+    // made at `speed == 0` is the depth for effectively the whole transfer —
+    // there is no second part to re-measure on. Handing a trickle uploader six
+    // blocks, or even the clamped three, is 540 KiB outstanding, which at
+    // 4 KB/s is over two minutes of data and puts us back past the send timeout
+    // that the sub-eMule tiers exist to keep us inside. Two blocks is 360 KiB,
+    // inside that timeout even on the slowest slot, and costs a fast peer only a
+    // slightly shorter sliding window — the window refills as blocks land, so a
+    // smaller one means more round trips, not a stalled pipe. A file with more
+    // parts keeps the optimistic default, because its next part corrects it.
+    let mut blocks = if remaining_parts <= 4 && speed < 4 * 1024 {
+        if speed > 0 && speed < 1200 {
             1
         } else {
             2
@@ -11362,7 +11402,10 @@ mod tests {
             .publish_in_flight_requests(0, held.clone());
 
         let (blocks, _, _) = compute_part_blocks_ms(&tracker, 0, 1).await;
-        assert!(blocks.len() > held.len(), "part 0 has more blocks than this");
+        assert!(
+            blocks.len() > held.len(),
+            "part 0 has more blocks than this"
+        );
         for (i, held_range) in held.iter().enumerate() {
             assert_ne!(
                 blocks[i], *held_range,
@@ -11401,7 +11444,10 @@ mod tests {
             "nothing is on disk yet, so every block is still worth asking for"
         );
 
-        tracker.write().await.fill_range(EMBLOCKSIZE, EMBLOCKSIZE * 2);
+        tracker
+            .write()
+            .await
+            .fill_range(EMBLOCKSIZE, EMBLOCKSIZE * 2);
         assert_eq!(
             drop_filled_blocks(&tracker, &batch).await,
             vec![batch[0], batch[2]],
@@ -11870,18 +11916,33 @@ mod tests {
     }
 
     /// ...but small-file / endgame cases (remaining_parts <= 4) must stay
-    /// conservative — the inner clamp at the bottom of the function
-    /// caps to 3 blocks when remaining_parts <= 2, and to 6 when
-    /// <= 4, so the unknown-speed branch shouldn't leak the larger
-    /// `blocks = 6` default in there and start over-requesting the tail
-    /// of a small file.
+    /// conservative. The budget is chosen once per part and never revised, so on
+    /// a file this small the unknown-speed guess is the depth for the whole
+    /// transfer — if it leaks the optimistic default in here, a trickle uploader
+    /// is handed minutes of outstanding data and drops us on its send timeout.
+    ///
+    /// Asserted with a gap large enough that the trailing gap clamp is not what
+    /// produces the answer. That clamp is why the previous version of this test
+    /// passed while the branch it names was in fact leaking: it asked for
+    /// `(0, 2, 1024)`, and 1024 bytes of gap floors any budget to a single block
+    /// no matter what the ladder said.
     #[test]
     fn outstanding_requests_cold_start_respects_small_file_clamp() {
-        let blocks = outstanding_blocks_for_speed_ms(0, 2, 1024);
-        assert_eq!(
-            blocks, 1,
-            "endgame with tiny gap should keep a single block pending, got {blocks}",
+        for &remaining_parts in &[1usize, 2, 3, 4] {
+            let blocks = outstanding_blocks_for_speed_ms(0, remaining_parts, u64::from(u32::MAX));
+            assert!(
+                blocks <= 2,
+                "cold start on a {remaining_parts}-part file must stay inside a \
+                 trickle uploader's send timeout, got {blocks}",
+            );
+        }
+        // A file with more parts still gets the optimistic default, because its
+        // next part re-measures and corrects it.
+        assert!(
+            outstanding_blocks_for_speed_ms(0, 100, u64::from(u32::MAX)) > MAX_BLOCKS_PER_REQUEST,
         );
+        // The gap clamp still has the final say when there is almost nothing left.
+        assert_eq!(outstanding_blocks_for_speed_ms(0, 2, 1024), 1);
     }
 
     /// Going faster must never shrink the pipeline. The endgame branch used to

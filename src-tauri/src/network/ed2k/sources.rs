@@ -2172,7 +2172,17 @@ impl SourceManager {
         // eMule: `GetMaxSourcePerFileSoft()` is `maxsourceperfile * 9 / 10`
         // (`PartFile.cpp:5359-5362`). Past it, a file has enough sources and
         // asking for more is pure overhead.
-        let known = entries.len();
+        //
+        // Live sources, not `entries.len()`. The map deliberately keeps expired
+        // rows for user-hash / crypt lookups and stores one peer twice when it
+        // is known at both a listening and an ephemeral port, and nothing prunes
+        // it on a timer — so the raw length climbs with dead rows on a
+        // long-running download. Counting it here let those dead rows push the
+        // file onto the common branch (asking each source 4x less often) and
+        // eventually past the soft cap, switching source exchange off for a file
+        // that may have almost no live peers. This is the same over-count
+        // `source_count` was written to stop; see its doc comment.
+        let known = self.source_count(file_hash);
         if known >= self.max_per_file.saturating_mul(9) / 10 {
             return false;
         }

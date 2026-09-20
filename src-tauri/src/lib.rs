@@ -1358,9 +1358,21 @@ pub fn run() {
                         // Handing the whole library to the pass rather than one
                         // page of it is affordable because the pass is not
                         // paginated in the first place: it works at a duty
-                        // cycle, stands aside for real scans, persists every
-                        // 256 files and resumes where it stopped. Its cost is
-                        // set by the drives, not by how much is queued.
+                        // cycle, stands aside for real scans, checkpoints as it
+                        // goes and resumes where it stopped. Its cost is set by
+                        // the drives, not by how much is queued.
+                        //
+                        // That argument is about drive time, and there is a
+                        // second cost it does not cover: this clone means every
+                        // row wanting a repair is resident twice until the pass
+                        // drains it, plus a `seen` entry per path. On the run
+                        // where it matters most — a first launch after upgrade,
+                        // where the whole library wants a digest, and a library
+                        // big enough to have paginated to get here — that is the
+                        // full set duplicated. Bounded and transient, but if it
+                        // ever needs to come down, the fix is for the queue to
+                        // hold the few fields the pass reads rather than a whole
+                        // `FileInfo`.
                         if commands::sharing::wants_hash_top_up(&hydrated) {
                             startup_hash_top_up.push(hydrated.clone());
                         }

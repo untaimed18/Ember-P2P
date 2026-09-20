@@ -35,8 +35,13 @@ describe('computeRowWindow', () => {
     // scrollport stays where it was.
     const window = computeRowWindow({ ...base, total: 12, bodyTop: -3400 });
 
-    expect(window.start).toBeLessThanOrEqual(window.end);
     expect(window.end).toBeLessThanOrEqual(12);
+    // Non-empty, not merely ordered. `{ start: 12, end: 12 }` satisfied both
+    // `start <= end` and `end <= 12`, and that is exactly the window this used
+    // to return — twelve rows behind a 408px spacer, with nothing that would
+    // re-measure until the user scrolled.
+    expect(window.end).toBeGreaterThan(window.start);
+    expect(window.start).toBeLessThan(12);
   });
 
   it('renders nothing for an empty list', () => {
@@ -55,7 +60,10 @@ describe('computeRowWindow', () => {
     for (const rowHeight of [0, -34, Number.NaN, Number.POSITIVE_INFINITY]) {
       const window = computeRowWindow({ ...base, rowHeight });
       expect(window.start).toBeGreaterThanOrEqual(0);
-      expect(window.end).toBeGreaterThanOrEqual(window.start);
+      // A non-empty list always renders something, which is the promise the
+      // module doc makes: an empty window cannot correct itself, because the row
+      // height it would need is measured from a rendered row.
+      expect(window.end).toBeGreaterThan(window.start);
       expect(window.end).toBeLessThanOrEqual(base.total);
     }
     expect(computeRowWindow({ ...base, bodyTop: Number.NaN }).start).toBe(0);

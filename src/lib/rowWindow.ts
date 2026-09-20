@@ -61,10 +61,17 @@ export function computeRowWindow({
 
   const firstVisible = Math.floor(above / height);
   const fits = Math.ceil(visible / height);
-  // Clamped to `total` on both ends and ordered, so a stale scroll position —
-  // the list shrank under the user, which "Hide spam" does on every mark —
-  // asks for a slice that exists rather than an inverted one.
-  const start = Math.max(0, Math.min(firstVisible - pad, total));
-  const end = Math.max(start, Math.min(total, firstVisible + fits + pad));
+  // `start` is clamped to the last row that exists, not to `total`, and `end` to
+  // at least one row past it. A stale scroll position — the list shrank under
+  // the user, which "Hide spam" does on every mark — otherwise asked for a slice
+  // beginning at or past the end: `{ total: 12, bodyTop: -3400 }` returned
+  // `{ start: 12, end: 12 }`, which renders no rows at all behind a spacer as
+  // tall as the list used to be. Nothing here recovers from that on its own, and
+  // the caller cannot either: the row height is measured from a rendered row, and
+  // the only event that would re-run this is a scroll the user has no reason to
+  // make. Whether it healed came down to whether the browser happened to clamp
+  // `scrollTop` and fire a scroll event for it.
+  const start = Math.max(0, Math.min(firstVisible - pad, total - 1));
+  const end = Math.min(total, Math.max(start + 1, firstVisible + fits + pad));
   return { start, end };
 }

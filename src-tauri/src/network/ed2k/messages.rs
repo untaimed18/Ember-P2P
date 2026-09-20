@@ -994,13 +994,18 @@ pub fn build_emule_info(
     // clear, and the labels for those two once slid onto the neighbouring
     // fields when the zero terms were removed.
     //
-    // Preview stays clear deliberately rather than by omission. eMule sets it
-    // only when `CanSeeShares() != vsfaNobody` (`BaseClient.cpp:723`), tying
-    // the offer to whether shares are browsable at all — and Ember's browse
-    // responder is currently unreachable from stock eMule, which asks with
-    // `OP_ASKSHAREDDIRS` (0x5D) rather than `OP_ASKSHAREDFILES`. Advertising
-    // preview before that is answered would promise a capability the peer
-    // cannot reach.
+    // Preview stays clear deliberately rather than by omission, but not for the
+    // reason this comment used to give. It said Ember's browse responder was
+    // unreachable from stock eMule, which asks with `OP_ASKSHAREDDIRS` (0x5D);
+    // that opcode is answered now, so browsability is no longer the blocker and
+    // `share_browsing_allowed()` would be the flag to gate on — eMule sets the
+    // bit when `CanSeeShares() != vsfaNobody` (`BaseClient.cpp:723`).
+    //
+    // What is still missing is the protocol itself: there is no
+    // `OP_REQUESTPREVIEW` handler anywhere in this crate, so a peer that read
+    // the bit and asked would get silence. Claiming a capability and then not
+    // answering it is worse than not claiming it, which is the whole argument
+    // behind the SecIdent level above. Set this only alongside a responder.
     let features: u32 = secident_level() as u32
         | ((obfuscation_enabled as u32) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
         | ((obfuscation_enabled as u32) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
@@ -3084,14 +3089,51 @@ mod tests {
     /// capability — no parse error, no wire-format mismatch, just peers that
     /// stop offering us comments or obfuscation. Only a golden value catches it.
     /// Cross-check against `emulesource/BaseClient.cpp:980-1024`.
+    /// Serialises every test that reads or writes the `SECIDENT_AVAILABLE`
+    /// process-global, and puts it back even if the test panics.
+    ///
+    /// The suite runs in parallel threads against one global, so a test that
+    /// overrides it could be observed mid-flight by any other test that builds
+    /// a Hello or EmuleInfo — and restoring at the end of a test body does not
+    /// run when an assertion fails, which would leak the override into whatever
+    /// happened to run next. Both problems are the guard's job, not the
+    /// individual test's.
+    static SECIDENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SecIdentOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: bool,
+    }
+
+    impl SecIdentOverride {
+        /// Take the lock without disturbing the value, for readers.
+        fn hold() -> Self {
+            let guard = SECIDENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed);
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+
+        fn set(available: bool) -> Self {
+            let held = Self::hold();
+            set_secident_available(available);
+            held
+        }
+    }
+
+    impl Drop for SecIdentOverride {
+        fn drop(&mut self) {
+            set_secident_available(self.previous);
+        }
+    }
+
     #[test]
     fn misc_options_match_emule_hello_layout() {
         // SecIdent is `CryptoAvailable() ? 3 : 0` (`BaseClient.cpp:966`), and
-        // the golden values below are the with-a-key form. The flag is a
-        // process-global and the suite runs in parallel, so this restores
-        // whatever it found rather than assuming a starting state.
-        let restore = SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed);
-        set_secident_available(true);
+        // the golden values below are the with-a-key form.
+        let _secident = SecIdentOverride::set(true);
 
         // AICH 1<<29 | Unicode 1<<28 | UDPv4 4<<24 | Comp 1<<20 | SecIdent 3<<16
         // | SourceExch 4<<12 | ExtReq 2<<8 | AcceptComment 1<<4 | MultiPacket 1<<1
@@ -3109,7 +3151,6 @@ mod tests {
             "only the SecIdent field may change when no keypair is available"
         );
 
-        set_secident_available(restore);
         assert_eq!(
             build_misc_options1(),
             misc_options1_with(!share_browsing_allowed())
@@ -3383,6 +3424,9 @@ mod tests {
 
     #[test]
     fn parse_emule_info_roundtrip_preserves_flags() {
+        // Reads the SecIdent global through `build_emule_info`; hold it steady
+        // against the test that overrides it.
+        let _secident = SecIdentOverride::hold();
         let caps = parse_emule_info(&build_emule_info(4672, true, None, None));
 
         assert_eq!(caps.udp_port, 4672);
@@ -3666,6 +3710,7 @@ mod tests {
     /// us look like a third-party client to anti-leecher mods.
     #[test]
     fn emule_info_has_exactly_seven_tags() {
+        let _secident = SecIdentOverride::hold();
         let payload = build_emule_info(4672, true, None, None);
         // Layout: version(1) + protocol(1) + tag_count(u32) + tags
         assert_eq!(
@@ -3751,6 +3796,7 @@ mod tests {
     /// cannot read it.
     #[test]
     fn ext_protocol_is_claimed_only_where_emule_claims_it() {
+        let _secident = SecIdentOverride::hold();
         let user_hash = [0x11u8; 16];
         let hello = build_hello_with_buddy_opts(
             &user_hash,

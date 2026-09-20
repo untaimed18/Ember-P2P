@@ -823,7 +823,7 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
-    /// Send OP_OFFERFILES to the server, capping each packet at the server's
+    /// Send OP_OFFERFILES to the server, capping the list at the server's
     /// soft per-client file limit exactly like eMule's
     /// `CSharedFileList::SendListToServer`:
     ///
@@ -831,29 +831,24 @@ impl Ed2kServerConnection {
     /// limit = GetSoftFiles(); if (limit == 0 || limit > 200) limit = 200;
     /// ```
     ///
-    /// A strict server can ignore/penalize a client that offers more files
-    /// than its limit in one packet (which then withholds source replies), so
-    /// we chunk the offer into ≤`limit`-file `OP_OFFERFILES` packets rather
-    /// than blasting all shares at once.
+    /// eMule truncates to that many files in a single packet. Sending the
+    /// rest as extra `OP_OFFERFILES` packets looks like republishing to
+    /// Lugdunum, which answers "Too many files republished by your client
+    /// software. Please upgrade it." and can blacklist the client.
     pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
         let limit = self.offer_files_chunk_limit();
         if files.is_empty() {
             // Preserve the empty (count=0) offer some callers may rely on.
             return self.offer_files_chunk(files, tcp_port).await;
         }
-        let total = files.len();
-        if total > limit {
+        let offered = files.len().min(limit);
+        if files.len() > limit {
             info!(
-                "OP_OFFERFILES: {total} files exceeds server soft limit {limit}; sending in {} chunks",
-                (total + limit - 1) / limit
+                "OP_OFFERFILES: offering {offered} of {} files (eMule SendListToServer cap {limit})",
+                files.len()
             );
         }
-        for chunk in files.chunks(limit) {
-            self.offer_files_chunk(chunk, tcp_port).await?;
-            // Let the network task service UI IPC between large offer batches.
-            tokio::task::yield_now().await;
-        }
-        Ok(())
+        self.offer_files_chunk(&files[..offered], tcp_port).await
     }
 
     /// Soft per-packet file cap used by `offer_files` / deferred chunk sends.

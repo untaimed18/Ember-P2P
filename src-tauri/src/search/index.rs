@@ -822,22 +822,40 @@ impl LocalIndex {
         changed
     }
 
-    /// The same, for an AICH root recovered by the background top-up pass.
+    /// Both top-up results in one pass over the index.
     ///
-    /// Keyed by content hash for the same reason its sibling is: the root is
-    /// derived from the bytes, so every copy of this content has the same one
-    /// and the pass only ever reads a single copy.
+    /// This replaced a pair of setters that each walked every row, called back
+    /// to back under a single `write()` — so each repaired file held the index's
+    /// write lock for two full scans, once per file across a pass that runs for
+    /// hours, against the lock search and the Library UI contend on.
     ///
-    /// Never clears: an empty argument means the pass did not ask for AICH on
-    /// this file, not that the file has no root. Overwriting a stored root with
-    /// nothing would withdraw recovery data the record already had.
-    pub fn set_aich_hash_by_hash(&mut self, hash: &str, aich_hash: &str) -> bool {
-        if hash.is_empty() || aich_hash.is_empty() {
+    /// Keyed by content hash for the same reason its sibling above is: both
+    /// digests are derived from the bytes, so every copy of this content has the
+    /// same answer and the pass only ever reads a single copy.
+    ///
+    /// Never clears: an empty argument means the pass did not ask for that
+    /// digest on this file, not that the file has none. Overwriting a stored
+    /// AICH root with nothing would withdraw recovery data the record already
+    /// had.
+    pub fn set_top_up_digests_by_hash(
+        &mut self,
+        hash: &str,
+        ember_file_hash: &str,
+        aich_hash: &str,
+    ) -> bool {
+        if hash.is_empty() || (ember_file_hash.is_empty() && aich_hash.is_empty()) {
             return false;
         }
         let mut changed = false;
         for file in &mut self.files {
-            if file.hash == hash && file.aich_hash != aich_hash {
+            if file.hash != hash {
+                continue;
+            }
+            if !ember_file_hash.is_empty() && file.ember_file_hash != ember_file_hash {
+                file.ember_file_hash = ember_file_hash.to_string();
+                changed = true;
+            }
+            if !aich_hash.is_empty() && file.aich_hash != aich_hash {
                 file.aich_hash = aich_hash.to_string();
                 changed = true;
             }

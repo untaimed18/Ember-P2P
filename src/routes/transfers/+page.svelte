@@ -982,14 +982,18 @@
   });
   let activeUploads = $derived(uploadPartition.active);
   // Scale displayed upload-slot speeds so their sum cannot exceed the
-  // configured cap or the status-bar total (issue 115). A slot handover
-  // otherwise left the remaining rows at their pre-handover window rates
-  // while a fresh slot added a burst, so the column sum read above both
-  // the limit and the dipping total. The arithmetic lives in `$lib/uploadSpeed`
-  // so it can be tested; the rows excluded here are the ones rendered idle.
+  // configured cap (issue 115). A slot handover otherwise left the remaining
+  // rows at their pre-handover window rates while a fresh slot added a burst,
+  // so the column sum read above the limit the user had set. Deliberately not
+  // bounded by `$networkStats.upload_speed` as well: that figure is sampled
+  // every 3 s (and not at all while the window is hidden) and is itself a ~3 s
+  // EWMA, so dividing 200 ms-fresh row rates by it understated every slot for
+  // the whole ramp-up — see `uploadSumBound`. The arithmetic lives in
+  // `$lib/uploadSpeed` so it can be tested; the rows excluded here are the ones
+  // rendered idle.
   let uploadSpeedScale = $derived.by(() =>
     uploadScaleFactor(
-      uploadSumBound($appSettings?.max_upload_speed ?? 0, $networkStats.upload_speed),
+      uploadSumBound($appSettings?.max_upload_speed ?? 0),
       activeUploads.filter((t) => !IDLE_STATUSES.has(t.status)).map((t) => t.speed),
     ),
   );
@@ -1833,7 +1837,7 @@
       // against the time since the row appeared, which is how a fresh slot
       // printed 350 kB/s against a 200 kB/s cap (issue 115). Scale the
       // backend rates so the visible slot sum cannot exceed the configured
-      // limit or the status-bar total.
+      // limit.
       if (t.speed <= 0) return 0;
       const scaled = t.speed * uploadSpeedScale;
       const cap = $appSettings?.max_upload_speed ?? 0;
@@ -2104,14 +2108,21 @@
   let selectedStoppableCount = $derived(selectedBatchTransfers.filter((t) => canStop(t)).length);
   let selectedCancellableCount = $derived(selectedBatchTransfers.filter((t) => !isFinished(t)).length);
   let selectedFinishedCount = $derived(selectedBatchTransfers.filter((t) => isFinished(t)).length);
-  // Helper that prefers the EWMA-smoothed `liveSpeed` rate used for row
-  // cells, falling back to the raw `t.speed` value from the backend. Sort
-  // and totals need to agree with what the user sees in each row; using
-  // `t.speed` alone diverges when the backend reports 0 but bytes are
-  // still flowing (very common during brief scheduling gaps).
+  // The rate a row's Speed cell actually prints, for the sorts and counts that
+  // have to agree with it. `liveSpeed` already prefers the backend rate and
+  // falls back to the EWMA only where that is right, so this is that function
+  // and nothing else.
+  //
+  // It used to add `live > 0 ? live : (t.speed > 0 ? t.speed : 0)`, which looked
+  // like a safety net and was the opposite: the only rows for which `liveSpeed`
+  // returns 0 while `t.speed` is positive are the `IDLE_STATUSES` ones it
+  // deliberately zeroes, so the fall-back reinstated exactly the stale rate that
+  // guard exists to suppress. The Uploads table sorted its Speed column through
+  // here while rendering it through `liveSpeed`, so a paused or stopped slot
+  // sorted by a number the column showed as "—", and the "Active" chip counted
+  // downloads that had stopped moving bytes.
   function displaySpeed(t: Transfer): number {
-    const live = liveSpeed(t);
-    return live > 0 ? live : (t.speed > 0 ? t.speed : 0);
+    return liveSpeed(t);
   }
   // Match eMule-style behavior: show rate when transfer data is actually flowing.
   let transferringDownloads = $derived(activeDownloads.filter((t) => displaySpeed(t) > 0).length);

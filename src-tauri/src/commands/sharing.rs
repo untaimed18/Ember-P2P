@@ -136,10 +136,14 @@ type HashPassResult = anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64
 /// downloadable whether or not either of these is ever filled in.
 ///
 /// A single-part file legitimately has no AICH root, so an empty one there is
-/// the stored answer rather than a gap to fill.
+/// the stored answer rather than a gap to fill. "Single part" has to be the
+/// hasher's own boundary — `file_size < PARTSIZE` — because a file of exactly
+/// `PARTSIZE` is two parts to it (one of data, one empty) and it does compute a
+/// root. Asking with `>` instead left that one size unable to recover a missing
+/// root through any route, since this is what decides whether it is computed.
 fn wanted_top_up(file: &FileInfo) -> crate::network::ed2k::hash::WantedDigests {
     crate::network::ed2k::hash::WantedDigests {
-        aich: file.aich_hash.is_empty() && file.size > crate::network::ed2k::hash::PARTSIZE,
+        aich: file.aich_hash.is_empty() && file.size >= crate::network::ed2k::hash::PARTSIZE,
         ember: file.ember_file_hash.is_empty(),
     }
 }
@@ -525,11 +529,19 @@ impl<'a> HashLookahead<'a> {
     /// Let go of everything still queued. Cancelling breaks out of the consumer
     /// loop with the look-ahead window still full, and every file in it is
     /// claimed.
-    pub(crate) fn abandon(&mut self) {
+    ///
+    /// Returns the indices it detached. These reads were already running, so
+    /// unlike [`Self::unstarted`] their results are genuinely lost — and a
+    /// caller that tracks which files it has already offered needs to know
+    /// that, or it will go on believing they were handled.
+    pub(crate) fn abandon(&mut self) -> Vec<usize> {
         let pending: Vec<StartedHash> = self.inflight.drain(..).collect();
+        let mut abandoned = Vec::with_capacity(pending.len());
         for started in pending {
+            abandoned.push(started.index);
             self.drain_started(started);
         }
+        abandoned
     }
 
     /// Indices still queued behind the look-ahead window, in device order.
@@ -1603,9 +1615,9 @@ struct HashTopUp {
     /// Content hashes this pass already has a file queued for.
     ///
     /// Both repairs are derived from the bytes, so one answer covers every copy
-    /// of the same content — `set_ember_file_hash_by_hash` and
-    /// `set_aich_hash_by_hash` each stamp onto every index row sharing the
-    /// hash — and reading the other copies is a whole file read each for an
+    /// of the same content — `set_top_up_digests_by_hash` stamps onto every
+    /// index row sharing the hash — and reading the other copies is a whole
+    /// file read each for an
     /// answer already in hand, on a pass written to be gentle with the drives.
     ///
     /// Deliberately not folded into `seen`: a skipped copy's *path* stays
@@ -1726,6 +1738,7 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
     let mut updated_since_reconcile = 0usize;
+    let mut last_checkpoint = std::time::Instant::now();
 
     // Assigned by the single `break` below, which is the loop's only exit.
     let finished: (usize, usize);
@@ -1845,13 +1858,17 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
                     } else if aich_hash.is_empty() && ember_file_hash.is_empty() {
                         debug!("Top-up pass produced nothing for {}", file.name);
                     } else {
-                        // Both setters ignore an empty value rather than
-                        // clearing it, so whichever repair was not asked for on
-                        // this file leaves the stored value alone.
+                        // One walk of the index, not one per digest: this runs
+                        // per repaired file under the write lock that search and
+                        // the Library UI contend on. Empty values are ignored
+                        // rather than cleared, so whichever repair was not asked
+                        // for on this file leaves the stored value alone.
                         let mut index = local_index.write().await;
-                        let mut changed =
-                            index.set_ember_file_hash_by_hash(&file.hash, &ember_file_hash);
-                        changed |= index.set_aich_hash_by_hash(&file.hash, &aich_hash);
+                        let changed = index.set_top_up_digests_by_hash(
+                            &file.hash,
+                            &ember_file_hash,
+                            &aich_hash,
+                        );
                         if changed {
                             updated_since_reconcile += 1;
                         }
@@ -1869,8 +1886,22 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
             // Every so often, push what we have into known.met, so a pass that
             // runs for hours and is then interrupted keeps its progress instead
             // of starting over on the next launch.
-            if updated_since_reconcile >= 256 {
+            //
+            // Bounded by elapsed time as well as by count. On a count alone, a
+            // library of large files on slow external drives can spend a long
+            // while short of 256 repairs, and all of it is lost on exit: the
+            // shutdown path cancels this pass and then gives background scans a
+            // 3 s grace, while the final flush below can need up to 2 s to send
+            // plus a 15 s ack. Whole-file reads are far too expensive to redo,
+            // so cap the exposure at a wall-clock window rather than at a file
+            // count that says nothing about how long they took.
+            const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+            if updated_since_reconcile > 0
+                && (updated_since_reconcile >= 256
+                    || last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL)
+            {
                 updated_since_reconcile = 0;
+                last_checkpoint = std::time::Instant::now();
                 refresh_file_cache(&local_index, &file_cache).await;
                 reconcile_shared_files_best_effort(&network_tx).await;
             }
@@ -1897,7 +1928,7 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         // still-running reads. Same reason the scan loops do this: dropping
         // them strands each claim until its 15-minute lease expires, and
         // nothing may hash those paths in the meantime.
-        pipeline.abandon();
+        let abandoned = pipeline.abandon();
         // Everything the window never reached goes back on the queue. The
         // top-of-loop cancel branch can only return `batch` — which
         // `mem::take` emptied — so without this the rest of the batch was
@@ -1911,9 +1942,34 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
         // same "a progress line that can never reach its total reads as stuck"
         // the timeout branch above guards against.
         let skipped = pipeline.skipped();
-        if !unstarted.is_empty() || skipped > 0 {
+        if !unstarted.is_empty() || skipped > 0 || !abandoned.is_empty() {
             let mut backfill = hash_top_up().lock().await;
-            backfill.done = backfill.done.saturating_add(skipped);
+            // Abandoned reads were detached mid-file, so they produced nothing —
+            // but their paths are in `seen`, which is never cleared, so
+            // `queue_hash_top_up` would skip them for the life of the process
+            // and the repair would not happen until the next launch. Forget the
+            // path so a later scan can offer it again. Not re-queued directly:
+            // the detached task still holds this path's in-flight claim until it
+            // settles, and going back through `queue_hash_top_up` is what takes a
+            // fresh one.
+            //
+            // Counted as done for the same reason `skipped` is — they are not
+            // coming back in *this* pass, and a progress line that can never
+            // reach its total reads as stuck.
+            backfill.done = backfill
+                .done
+                .saturating_add(skipped)
+                .saturating_add(abandoned.len());
+            for index in abandoned {
+                if let Some(file) = batch.get(index) {
+                    backfill
+                        .seen
+                        .remove(&crate::search::index::normalize_path_key(&file.path));
+                    backfill
+                        .queued_hashes
+                        .remove(&file.hash.to_ascii_lowercase());
+                }
+            }
             for index in unstarted {
                 backfill.queued.push(batch[index].clone());
             }

@@ -78,13 +78,6 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
 }
 
-/**
- * Reconcile the speed shown after merging an event row with a fresh API
- * snapshot. Idle/terminal rows always read 0. Otherwise take the larger of the
- * two sources: the event speed can decay to 0 between progress events while the
- * API snapshot (read live from the transfer manager) still carries a positive
- * rate — and vice-versa — so the higher value is the freshest truth.
- */
 /** Statuses that are definitionally not moving bytes, so their displayed rate
  *  must read zero rather than whatever the last progress event left behind.
  *
@@ -140,7 +133,45 @@ function mergeHealthDetail(
   };
 }
 
-function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): number {
+/**
+ * Prefer the API health snapshot, except when a live progress tick has already
+ * moved bytes past that snapshot while marking the row healthy. The 3 s poll
+ * otherwise paints Stalled or Idle over a transfer that is still receiving data.
+ */
+function mergeHealth(
+  apiItem: Transfer,
+  eventItem: Transfer,
+): Pick<Transfer, 'health' | 'health_reason' | 'health_code' | 'stalled_since'> {
+  const apiHealth = apiItem.health ?? eventItem.health;
+  // Wire bytes only. `completed_size` is the on-disk figure, and it *rewinds*
+  // when a failed part is re-opened — the same comparison `mergeProgressCounters`
+  // reads as a rewind below. Testing it here made a genuinely degraded download
+  // flash healthy for one poll on the tick that discarded a corrupt part, with
+  // the two halves of this merge disagreeing about the same number. `transferred`
+  // is cumulative and never goes backwards, and the backend updates it before it
+  // emits, so this stays a real "the snapshot was already in flight" check.
+  const eventAhead = (eventItem.transferred || 0) > (apiItem.transferred || 0);
+  // Same race as Stalled: a 3 s poll can still carry Idle/Degraded after a
+  // progress tick already moved bytes and painted the row healthy.
+  if (
+    (apiHealth === 'stalled' || apiHealth === 'degraded') &&
+    eventItem.health === 'healthy' &&
+    eventAhead
+  ) {
+    return {
+      health: 'healthy',
+      health_reason: undefined,
+      health_code: undefined,
+      stalled_since: undefined,
+    };
+  }
+  return {
+    health: apiHealth,
+    ...mergeHealthDetail(apiItem, eventItem),
+  };
+}
+
+function mergeSpeed(status: string, apiSpeed: number): number {
   if (IDLE_STATUSES.has(status as Transfer['status'])) {
     return 0;
   }
@@ -150,7 +181,13 @@ function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): numbe
   // value outranked the cap-clamped snapshot, and nothing could ever lower it.
   // A 0 here is a reading, not a gap — the backend zeroes the field on idle
   // decay, and `liveSpeed` is what decides whether to smooth over it.
-  return apiSpeed ?? eventSpeed ?? 0;
+  //
+  // There is deliberately no fall-back to the stored event row's speed. This
+  // read `apiSpeed ?? eventSpeed ?? 0` and took an event parameter to feed it,
+  // but `Transfer['speed']` is a required `number` and the Rust snapshot always
+  // serializes it, so neither `??` could ever fire — the parameter was dead, and
+  // reading the signature suggested a fall-back that does not exist.
+  return apiSpeed;
 }
 
 function countServedPartBits(hex: string | undefined, partCount: number): number {
@@ -518,7 +555,12 @@ function flushProgress() {
         ? (p.completed_size != null ? p.completed_size : existing.completed_size || 0)
         : Math.max(p.completed_size ?? 0, existing.completed_size || 0);
       const bytesMoved = transferred > (existing.transferred || 0);
-      const clearStaleHealth = bytesMoved || existing.health === 'stalled';
+      const completedMoved = !isUpload && completedSize > (existing.completed_size || 0);
+      // Only recover from a stale stall when this payload actually moved
+      // bytes. Clearing on `health === 'stalled'` alone fought the 3 s poll:
+      // a progress tick painted the row healthy, the next snapshot painted
+      // it red again, and the bar flashed Stalled every few seconds.
+      const clearStaleHealth = bytesMoved || completedMoved;
       list[idx] = {
         ...existing,
         transferred,
@@ -1037,12 +1079,9 @@ export async function initTransferStore() {
           return snapCompletedDownload({
             ...apiItem,
             status,
-            speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
+            speed: mergeSpeed(status, apiItem.speed),
             ...mergeProgressCounters(apiItem, eventItem),
-            // Prefer API health: events often omit/stale-carry `health`, and a
-            // prior `degraded` on the event row would otherwise stick forever.
-            health: apiItem.health ?? eventItem.health,
-            ...mergeHealthDetail(apiItem, eventItem),
+            ...mergeHealth(apiItem, eventItem),
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_code: eventItem.failure_code ?? apiItem.failure_code,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
@@ -1320,10 +1359,8 @@ export function startTransferPoll() {
               ...apiItem,
               status,
               ...mergeProgressCounters(apiItem, eventItem),
-              speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
-              // Prefer API health over a possibly-stale event value.
-              health: apiItem.health ?? eventItem.health,
-              ...mergeHealthDetail(apiItem, eventItem),
+              speed: mergeSpeed(status, apiItem.speed),
+              ...mergeHealth(apiItem, eventItem),
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_code: eventItem.failure_code ?? apiItem.failure_code,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,

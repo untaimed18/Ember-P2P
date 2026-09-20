@@ -3076,7 +3076,16 @@ fn note_ed2k_search_results(
             ),
         };
         let new_contrib = ed2k_result_source_contribution(new_avail);
-        if !skip_count && new_contrib > old_contrib {
+        // Untracked hashes must not advance the stop counters either. With no
+        // stored previous value, `old_contrib` is 0 on *every* sighting, so a
+        // past-the-cap file re-listed by each server in a global sweep added its
+        // whole slice again each time instead of a delta. That inflates
+        // `udp_found_sources` against `MAX_UDP_SEARCH_SOURCES` and ends the
+        // sweep early — truncating the very results the sweep was asked for.
+        // A number that cannot be computed correctly is better left out than
+        // counted wrong: past 20,000 distinct files the sweep's other bounds
+        // govern, and erring toward running the full course loses nothing.
+        if !skip_count && tracked && new_contrib > old_contrib {
             let delta = new_contrib - old_contrib;
             active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(delta);
             // Only a UDP reply advances the sweep's own backstop.
@@ -8599,6 +8608,23 @@ mod tests {
             active.ed2k_noted_availability.get("hash0"),
             Some(&6),
             "an already-tracked hash must keep summing past the cap"
+        );
+
+        // An untracked hash has no stored previous value, so counting it would
+        // add its whole slice on every sighting rather than a delta — which ends
+        // a global sweep early against `MAX_UDP_SEARCH_SOURCES`.
+        let before = active.udp_found_sources;
+        for _ in 0..5 {
+            let repeat = SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+                availability: 4,
+                ..sample_search_result("past-the-cap")
+            };
+            note_ed2k_search_results(&mut active, &[repeat], &none);
+        }
+        assert_eq!(
+            active.udp_found_sources, before,
+            "a hash the cap refused to track must not advance the stop counter"
         );
     }
 
@@ -23049,6 +23075,29 @@ fn offer_files_signature(files: &[ed2k::server::OfferFile]) -> (usize, u64) {
     (files.len(), fold)
 }
 
+/// Files we have not yet published this server session, capped at eMule's
+/// `SendListToServer` total (`min(soft_files, 200)`).
+///
+/// Lugdunum answers a full-list republish — the same hashes sent again when
+/// a scan finishes or a download starts — with "Too many files republished
+/// by your client software. Please upgrade it." aMule bug 303 was the same
+/// shape: incremental publishing, never the whole library twice.
+fn incremental_ed2k_offers(
+    desired: Vec<ed2k::server::OfferFile>,
+    already_offered: &HashSet<[u8; 16]>,
+    session_limit: usize,
+) -> Vec<ed2k::server::OfferFile> {
+    let remaining = session_limit.saturating_sub(already_offered.len());
+    if remaining == 0 {
+        return Vec::new();
+    }
+    desired
+        .into_iter()
+        .filter(|file| !already_offered.contains(&file.hash))
+        .take(remaining)
+        .collect()
+}
+
 fn parse_ed2k_hash16(hash_hex: &str) -> Option<[u8; 16]> {
     let bytes = hex::decode(hash_hex).ok()?;
     if bytes.len() < 16 {
@@ -23405,9 +23454,62 @@ fn record_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::O
     }
 }
 
-fn replace_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::OfferFile]) {
-    state.offered_ed2k_hashes.clear();
-    record_offered_ed2k_hashes(state, files);
+#[cfg(test)]
+mod incremental_ed2k_offer_tests {
+    use super::*;
+
+    fn offer(n: u8, complete: bool) -> ed2k::server::OfferFile {
+        ed2k::server::OfferFile {
+            hash: [n; 16],
+            name: format!("f{n}"),
+            size: u64::from(n) * 100,
+            is_complete: complete,
+            file_type: String::new(),
+        }
+    }
+
+    #[test]
+    fn opening_dump_takes_the_emule_session_cap() {
+        let desired: Vec<_> = (1..=5).map(|n| offer(n, true)).collect();
+        let already = HashSet::new();
+        let sent = incremental_ed2k_offers(desired, &already, 2);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].hash, [1; 16]);
+        assert_eq!(sent[1].hash, [2; 16]);
+    }
+
+    #[test]
+    fn later_changes_send_only_new_hashes() {
+        let desired: Vec<_> = (1..=4).map(|n| offer(n, true)).collect();
+        let already = HashSet::from([[1; 16], [2; 16]]);
+        let sent = incremental_ed2k_offers(desired, &already, 4);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].hash, [3; 16]);
+        assert_eq!(sent[1].hash, [4; 16]);
+    }
+
+    #[test]
+    fn a_full_session_does_not_republish() {
+        let desired: Vec<_> = (1..=5).map(|n| offer(n, true)).collect();
+        let already = HashSet::from([[1; 16], [2; 16]]);
+        let sent = incremental_ed2k_offers(desired, &already, 2);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn leftover_hashes_would_skip_a_new_server_opening_dump() {
+        let leftover = HashSet::from([[1; 16], [2; 16], [3; 16]]);
+        assert!(
+            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &leftover, 3)
+                .is_empty(),
+            "hashes from a previous session must not count against a new server"
+        );
+        assert_eq!(
+            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &HashSet::new(), 3)
+                .len(),
+            3
+        );
+    }
 }
 
 /// Filter search results by client constraints (type / size / extension /
@@ -29581,11 +29683,36 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         });
                     }
                 }
-                // Fresh offer drain replaces the offered-hash set so
-                // removed shares do not keep a stale "offered" badge.
-                state.offered_ed2k_hashes.clear();
-                pending_offer_signature = Some(offer_files_signature(&offer_files));
-                pending_offer_files = Some(offer_files);
+                let signature = offer_files_signature(&offer_files);
+                let limit = state
+                    .server_connection
+                    .as_ref()
+                    .map(|c| c.offer_files_chunk_limit())
+                    .unwrap_or(200);
+                if offer_files.is_empty() {
+                    pending_offer_signature = Some(signature);
+                    if state.offered_ed2k_hashes.is_empty() {
+                        state.last_offer_files_signature = Some(signature);
+                        pending_offer_files = None;
+                    } else {
+                        // Tell the server we no longer share anything. Do not
+                        // republish the old list on the way out.
+                        pending_offer_files = Some(Vec::new());
+                    }
+                } else {
+                    let incremental = incremental_ed2k_offers(
+                        offer_files,
+                        &state.offered_ed2k_hashes,
+                        limit,
+                    );
+                    pending_offer_signature = Some(signature);
+                    if incremental.is_empty() {
+                        state.last_offer_files_signature = Some(signature);
+                        pending_offer_files = None;
+                    } else {
+                        pending_offer_files = Some(incremental);
+                    }
+                }
             }
         }
         if let Some(files) = pending_offer_files.as_mut() {
@@ -29635,6 +29762,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
                             Ok(()) => {
                                 pending_offer_files = None;
+                                state.offered_ed2k_hashes.clear();
                                 if let Some(sig) = pending_offer_signature.take() {
                                     state.last_offer_files_signature = Some(sig);
                                 }
@@ -30134,7 +30262,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             || hash16_is_friends_only(file_hash, &index, &known_files)
                     };
                     if !restricted {
-                    if state.server_connected {
+                    // Skip if this hash already went out in the login dump or
+                    // an earlier incremental offer. Re-sending it is a
+                    // one-file republish; Lugdunum's penalty is for republish,
+                    // not for a later new file (eMule SendFileToServer).
+                    if state.server_connected && !state.offered_ed2k_hashes.contains(file_hash) {
                         let offer = vec![ed2k::server::OfferFile {
                             hash: *file_hash,
                             name: file_name.clone(),
@@ -43621,15 +43753,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 pending_offer_files = None;
                                 pending_offer_signature = None;
                             } else {
-                                info!(
-                                    "Queuing {} files to offer to server (chunked)",
-                                    offer_files.len()
-                                );
-                                // Fresh login offer replaces prior offered
-                                // hashes so badges match the current share set.
+                                // This TCP session has never published to this
+                                // server. Leftover hashes from a disconnect that
+                                // skipped `reset_ed2k_server_session` would make
+                                // incremental skip the opening dump entirely.
                                 state.offered_ed2k_hashes.clear();
-                                pending_offer_signature = Some(offer_files_signature(&offer_files));
-                                pending_offer_files = Some(offer_files);
+                                let limit = conn.offer_files_chunk_limit();
+                                let signature = offer_files_signature(&offer_files);
+                                let incremental = incremental_ed2k_offers(
+                                    offer_files,
+                                    &state.offered_ed2k_hashes,
+                                    limit,
+                                );
+                                info!(
+                                    "Queuing {} files to offer to server (session cap {limit})",
+                                    incremental.len()
+                                );
+                                pending_offer_signature = Some(signature);
+                                pending_offer_files = if incremental.is_empty() {
+                                    state.last_offer_files_signature = Some(signature);
+                                    None
+                                } else {
+                                    Some(incremental)
+                                };
                             }
                         }
 

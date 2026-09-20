@@ -226,12 +226,12 @@ async fn handle_command_inner(
                 .as_ref()
                 .and_then(|c| c.session.as_ref())
                 .map(|s| s.server_flags);
-            let co_share_term = if related_hashes.is_empty() || !server_supports_related_search(state)
-            {
-                None
-            } else {
-                crate::search::related::co_share_term(&related_hashes)
-            };
+            let co_share_term =
+                if related_hashes.is_empty() || !server_supports_related_search(state) {
+                    None
+                } else {
+                    crate::search::related::co_share_term(&related_hashes)
+                };
             // Which of the two questions a related search is about to ask, and
             // on whose authority. Without this the log could not tell a
             // co-share request from the keyword fallback — both appear as one
@@ -1546,18 +1546,16 @@ async fn handle_command_inner(
                                             if idle {
                                                 break;
                                             }
-                                            tokio::time::sleep(
-                                                std::time::Duration::from_millis(20),
-                                            )
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                20,
+                                            ))
                                             .await;
                                         }
                                     },
                                 )
                                 .await;
                             }
-                            debug!(
-                                "Previous download worker for {teardown_tid} finished teardown"
-                            );
+                            debug!("Previous download worker for {teardown_tid} finished teardown");
                         });
                     }
                     let handle = tokio::spawn(async move {
@@ -1654,9 +1652,7 @@ async fn handle_command_inner(
                     let seq = clock.next_seq();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
-                            apply_transfer_status_write(
-                                &clock, &db_ref, &tid, "searching", seq,
-                            );
+                            apply_transfer_status_write(&clock, &db_ref, &tid, "searching", seq);
                         } else {
                             let db_transfer = Transfer {
                                 id: tid,
@@ -1778,7 +1774,9 @@ async fn handle_command_inner(
                         let idx = local_index.read().await;
                         idx.get_by_hash(&file_hash.to_ascii_lowercase())
                             .is_some_and(|f| f.friends_only)
-                            || known_files.find_by_hash(&raw).is_some_and(|r| r.friends_only)
+                            || known_files
+                                .find_by_hash(&raw)
+                                .is_some_and(|r| r.friends_only)
                             || !known_files.is_authoritative()
                     };
                     if !restricted {
@@ -2063,9 +2061,7 @@ async fn handle_command_inner(
                     let persisted = tokio::task::spawn_blocking(move || {
                         for ip in ban_ips {
                             if let Err(e) = ban_db.add_banned_peer_address(&ban_peer, ip) {
-                                warn!(
-                                    "Failed to persist banned IP {ip} for peer {ban_peer}: {e}"
-                                );
+                                warn!("Failed to persist banned IP {ip} for peer {ban_peer}: {e}");
                             }
                         }
                     })
@@ -3081,10 +3077,7 @@ async fn handle_command_inner(
             ) else {
                 // Only reachable if the member's key is not a usable Ed25519
                 // point, which membership records should already have caught.
-                let _ = tx.send(Err(coded(
-                    "channels_member_invalid",
-                    "Invalid member key",
-                )));
+                let _ = tx.send(Err(coded("channels_member_invalid", "Invalid member key")));
                 return;
             };
             state.xfer_send.insert(
@@ -3329,8 +3322,14 @@ async fn handle_command_inner(
         NetworkCommand::CancelChannelTransfer { xfer_id, tx } => {
             let me = state.local_ed25519_pubkey;
             #[allow(clippy::type_complexity)]
-            let mut target: Option<([u8; 16], [u8; 32], [u8; 32], String, u64, &'static str)> =
-                None;
+            let mut target: Option<(
+                [u8; 16],
+                [u8; 32],
+                [u8; 32],
+                String,
+                u64,
+                &'static str,
+            )> = None;
             if let Some(offer) = state.xfer_pending.remove(&xfer_id) {
                 target = Some((
                     offer.channel_id,
@@ -3872,13 +3871,7 @@ async fn handle_command_inner(
                         state.ip_filter.range_count(),
                     );
                     if settings.filter_servers_by_ip {
-                        apply_server_ip_filter(
-                            state,
-                            shared_server_addr,
-                            app_handle,
-                            true,
-                        )
-                        .await;
+                        apply_server_ip_filter(state, shared_server_addr, app_handle, true).await;
                     }
                     Ok(())
                 }
@@ -3907,13 +3900,11 @@ async fn handle_command_inner(
             tx,
         } => {
             state.ip_filter.collect_shared_hits(&state.shared_ip_filter);
-            let _ = tx.send(state.ip_filter.query_stats(
-                &query,
-                &sort,
-                sort_asc,
-                offset,
-                limit,
-            ));
+            let _ = tx.send(
+                state
+                    .ip_filter
+                    .query_stats(&query, &sort, sort_asc, offset, limit),
+            );
         }
 
         NetworkCommand::AddIpRange {
@@ -4272,9 +4263,10 @@ async fn handle_command_inner(
             // invalidating any in-flight STUN/TCP-hold cycle from before this
             // disconnect — see its doc comment.)
             reset_stun_keepalive_session(state);
-            state
-                .firewalled_shared
-                .store(surviving_highid.is_none(), std::sync::atomic::Ordering::Relaxed);
+            state.firewalled_shared.store(
+                surviving_highid.is_none(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             state.firewall_checks_sent = 0;
             state.firewall_checker = FirewallChecker::new();
             // Hand the fresh checker back the one report that is still true.
@@ -4535,9 +4527,10 @@ async fn handle_command_inner(
             let server_session_survives = state.server_connected
                 || state.server_connection.is_some()
                 || state.pending_server_connect.is_some();
-            state
-                .user_offline
-                .store(!server_session_survives, std::sync::atomic::Ordering::Relaxed);
+            state.user_offline.store(
+                !server_session_survives,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -5096,9 +5089,7 @@ async fn handle_command_inner(
                     // rollback.
                     let strays: Vec<([u8; 16], bool)> = allows
                         .iter()
-                        .filter(|(hash, _)| {
-                            !before.find_by_hash(hash).is_some_and(|r| r.is_shared)
-                        })
+                        .filter(|(hash, _)| !before.find_by_hash(hash).is_some_and(|r| r.is_shared))
                         .map(|(hash, _)| (*hash, false))
                         .collect();
                     if !strays.is_empty() {
@@ -5118,28 +5109,28 @@ async fn handle_command_inner(
                 }
                 if !denies.is_empty() {
                     if let Err(e) = crate::storage::share_intent::set_explicit_batch(&denies) {
-                    *known_files = before.clone();
-                    let ownership = state.known_met_save_lock.clone().lock_owned().await;
-                    let known_path = state.data_dir.join("known.met");
-                    let mut rollback = before;
-                    let rollback_result = tokio::task::spawn_blocking(move || {
-                        let _ownership = ownership;
-                        rollback.save(&known_path)
-                    })
-                    .await;
-                    let detail = match rollback_result {
-                        Ok(Ok(())) => e.to_string(),
-                        Ok(Err(rollback_error)) => {
-                            format!("{e}; known.met rollback failed: {rollback_error}")
-                        }
-                        Err(rollback_error) => {
-                            format!("{e}; known.met rollback task failed: {rollback_error}")
-                        }
-                    };
-                    let _ = tx.send(Err(format!(
-                        "Failed to persist independent share intent: {detail}"
-                    )));
-                    return;
+                        *known_files = before.clone();
+                        let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                        let known_path = state.data_dir.join("known.met");
+                        let mut rollback = before;
+                        let rollback_result = tokio::task::spawn_blocking(move || {
+                            let _ownership = ownership;
+                            rollback.save(&known_path)
+                        })
+                        .await;
+                        let detail = match rollback_result {
+                            Ok(Ok(())) => e.to_string(),
+                            Ok(Err(rollback_error)) => {
+                                format!("{e}; known.met rollback failed: {rollback_error}")
+                            }
+                            Err(rollback_error) => {
+                                format!("{e}; known.met rollback task failed: {rollback_error}")
+                            }
+                        };
+                        let _ = tx.send(Err(format!(
+                            "Failed to persist independent share intent: {detail}"
+                        )));
+                        return;
                     }
                 }
             }
@@ -5513,9 +5504,7 @@ async fn handle_command_inner(
                                 // carry the probe result rather than making the
                                 // publisher read the file again.
                                 media: existing.as_ref().and_then(|r| r.media.clone()),
-                                media_scanned: existing
-                                    .as_ref()
-                                    .is_some_and(|r| r.media_scanned),
+                                media_scanned: existing.as_ref().is_some_and(|r| r.media_scanned),
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
                             // drop publish timers so the next tick advertises
@@ -5550,160 +5539,55 @@ async fn handle_command_inner(
             // first-publish that landed in the same session — and queue an
             // empty OP_OFFERFILES that tells the server we share nothing.
             if !known_files.is_authoritative() {
-                info!(
-                    "Skipping KAD/eD2K advertise reconcile until known.met is absorbed"
-                );
+                info!("Skipping KAD/eD2K advertise reconcile until known.met is absorbed");
             } else {
-            let mut seen_hashes = std::collections::HashSet::new();
-            let files: Vec<PublishableFile> = all_index_files
-                .iter()
-                .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
-                .filter_map(|f| {
-                    if f.hash.is_empty() || !seen_hashes.insert(f.hash.clone()) {
-                        return None;
-                    }
-                    let hash_bytes = hex::decode(&f.hash).ok()?;
-                    if hash_bytes.len() < 16 {
-                        return None;
-                    }
-                    Some(PublishableFile {
-                        file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
-                        file_name: f.name.clone(),
-                        file_size: f.size,
-                        file_type: crate::search::index::infer_file_type(&f.extension),
-                        complete_sources: f.complete_sources,
-                        keyword_publishable: true,
-                        last_source_publish: {
-                            let mut raw = [0u8; 16];
-                            raw.copy_from_slice(&hash_bytes[..16]);
-                            known_files
-                                .find_by_hash(&raw)
-                                .map(|r| r.last_publish_src as i64)
-                                .unwrap_or(0)
-                        },
-                    })
-                })
-                .collect();
-            let shared_count = files.len();
-            // Reconcile rather than wipe. The old `clear_all()` here threw
-            // away every in-memory keyword publish timestamp on each
-            // shared-file change; since keyword times (unlike source times)
-            // are not persisted to known.met, that re-queued the whole
-            // keyword set and keyword publishing never settled to its 24h
-            // interval. `add_files_batch` updates file metadata while
-            // keeping existing keyword timestamps (`or_insert`); the
-            // `retain_files` call after the partials loop then evicts
-            // anything no longer shared. `desired` accumulates every hash
-            // we re-register so retain knows what to keep.
-            let mut desired: std::collections::HashSet<KadId> =
-                files.iter().map(|f| f.file_hash).collect();
-            state.publish_manager.add_files_batch(files);
-
-            // Re-add active partial downloads to KAD publish.
-            let mut partial_count = 0u32;
-            {
-                let mgr = transfer_manager.read().await;
-                for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                    if transfer.direction != TransferDirection::Download {
-                        continue;
-                    }
-                    if matches!(
-                        transfer.status,
-                        TransferStatus::Completed | TransferStatus::Failed
-                    ) {
-                        continue;
-                    }
-                    if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
-                        continue;
-                    }
-                    if transfer.file_hash.is_empty()
-                        || !seen_hashes.insert(transfer.file_hash.clone())
-                    {
-                        continue;
-                    }
-                    let hash_bytes = match hex::decode(&transfer.file_hash) {
-                        Ok(bytes) if bytes.len() >= 16 => bytes,
-                        _ => continue,
-                    };
-                    let ext = std::path::Path::new(&transfer.file_name)
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let partial_hash = md4_bytes_to_kad_id(&hash_bytes[..16]);
-                    desired.insert(partial_hash);
-                    state.publish_manager.add_file(PublishableFile {
-                        file_hash: partial_hash,
-                        file_name: transfer.file_name.clone(),
-                        file_size: transfer.total_size,
-                        file_type: crate::search::index::infer_file_type(&ext),
-                        complete_sources: 0,
-                        keyword_publishable: false,
-                        last_source_publish: {
-                            let mut raw = [0u8; 16];
-                            raw.copy_from_slice(&hash_bytes[..16]);
-                            known_files
-                                .find_by_hash(&raw)
-                                .map(|r| r.last_publish_src as i64)
-                                .unwrap_or(0)
-                        },
-                    });
-                    partial_count += 1;
-                }
-            }
-            // Evict publish records for files no longer shared/downloading
-            // and drop their source-ack counters; orphaned keyword targets
-            // are pruned inside `retain_files`. Retained files keep their
-            // source and keyword publish timestamps, so already-published
-            // work is not needlessly repeated.
-            state.publish_manager.retain_files(&desired);
-            // The rendezvous advert is deliberately not a library file, so it
-            // is never in `desired`. Dropping its counter mid-publish made the
-            // completion handler read zero acks, conclude the advert had not
-            // been stored, and re-advertise on the next tick — every time a
-            // library change happened to overlap a rendezvous publish.
-            let rendezvous_key = kad::publish::ember_rendezvous_key();
-            state
-                .source_publish_acks
-                .retain(|hash, _| desired.contains(hash) || *hash == rendezvous_key);
-            // Same eviction for the Ember badge set. Ember publishes only
-            // complete, publicly listable files (no partials), so unsharing
-            // one must darken its badge exactly as it does for KAD.
-            let ember_keep: HashSet<[u8; 16]> = all_index_files
-                .iter()
-                .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
-                .filter_map(|f| parse_ed2k_hash16(&f.hash))
-                .collect();
-            state
-                .ember_published_sources
-                .retain(|hash| ember_keep.contains(hash));
-            info!("Re-populated publish manager with {shared_count} shared + {partial_count} partial downloads after change");
-
-            // eMule: re-send OP_OFFERFILES to the server when shared files change
-            if state.server_connected {
-                let mut seen_offer_hashes = std::collections::HashSet::new();
-                let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
+                let mut seen_hashes = std::collections::HashSet::new();
+                let files: Vec<PublishableFile> = all_index_files
                     .iter()
                     .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
                     .filter_map(|f| {
-                        if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
+                        if f.hash.is_empty() || !seen_hashes.insert(f.hash.clone()) {
                             return None;
                         }
                         let hash_bytes = hex::decode(&f.hash).ok()?;
                         if hash_bytes.len() < 16 {
                             return None;
                         }
-                        let mut h = [0u8; 16];
-                        h.copy_from_slice(&hash_bytes[..16]);
-                        Some(ed2k::server::OfferFile {
-                            hash: h,
-                            name: f.name.clone(),
-                            size: f.size,
-                            is_complete: true,
-                            file_type: String::new(),
+                        Some(PublishableFile {
+                            file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                            file_name: f.name.clone(),
+                            file_size: f.size,
+                            file_type: crate::search::index::infer_file_type(&f.extension),
+                            complete_sources: f.complete_sources,
+                            keyword_publishable: true,
+                            last_source_publish: {
+                                let mut raw = [0u8; 16];
+                                raw.copy_from_slice(&hash_bytes[..16]);
+                                known_files
+                                    .find_by_hash(&raw)
+                                    .map(|r| r.last_publish_src as i64)
+                                    .unwrap_or(0)
+                            },
                         })
                     })
                     .collect();
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                let shared_count = files.len();
+                // Reconcile rather than wipe. The old `clear_all()` here threw
+                // away every in-memory keyword publish timestamp on each
+                // shared-file change; since keyword times (unlike source times)
+                // are not persisted to known.met, that re-queued the whole
+                // keyword set and keyword publishing never settled to its 24h
+                // interval. `add_files_batch` updates file metadata while
+                // keeping existing keyword timestamps (`or_insert`); the
+                // `retain_files` call after the partials loop then evicts
+                // anything no longer shared. `desired` accumulates every hash
+                // we re-register so retain knows what to keep.
+                let mut desired: std::collections::HashSet<KadId> =
+                    files.iter().map(|f| f.file_hash).collect();
+                state.publish_manager.add_files_batch(files);
+
+                // Re-add active partial downloads to KAD publish.
+                let mut partial_count = 0u32;
                 {
                     let mgr = transfer_manager.read().await;
                     for transfer in mgr.active.values().chain(mgr.queue.iter()) {
@@ -5721,7 +5605,7 @@ async fn handle_command_inner(
                             continue;
                         }
                         if transfer.file_hash.is_empty()
-                            || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                            || !seen_hashes.insert(transfer.file_hash.clone())
                         {
                             continue;
                         }
@@ -5729,34 +5613,143 @@ async fn handle_command_inner(
                             Ok(bytes) if bytes.len() >= 16 => bytes,
                             _ => continue,
                         };
-                        let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                        if !part_path.exists() {
-                            continue;
-                        }
-                        let mut h = [0u8; 16];
-                        h.copy_from_slice(&hash_bytes[..16]);
-                        offer_files.push(ed2k::server::OfferFile {
-                            hash: h,
-                            name: transfer.file_name.clone(),
-                            size: transfer.total_size,
-                            is_complete: false,
-                            file_type: String::new(),
+                        let ext = std::path::Path::new(&transfer.file_name)
+                            .extension()
+                            .map(|e| e.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let partial_hash = md4_bytes_to_kad_id(&hash_bytes[..16]);
+                        desired.insert(partial_hash);
+                        state.publish_manager.add_file(PublishableFile {
+                            file_hash: partial_hash,
+                            file_name: transfer.file_name.clone(),
+                            file_size: transfer.total_size,
+                            file_type: crate::search::index::infer_file_type(&ext),
+                            complete_sources: 0,
+                            keyword_publishable: false,
+                            last_source_publish: {
+                                let mut raw = [0u8; 16];
+                                raw.copy_from_slice(&hash_bytes[..16]);
+                                known_files
+                                    .find_by_hash(&raw)
+                                    .map(|r| r.last_publish_src as i64)
+                                    .unwrap_or(0)
+                            },
                         });
+                        partial_count += 1;
                     }
                 }
-                let signature = offer_files_signature(&offer_files);
-                if state.last_offer_files_signature == Some(signature) {
-                    debug!(
-                        "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
-                        offer_files.len()
-                    );
-                    replace_offered_ed2k_hashes(state, &offer_files);
-                } else {
-                    // Defer the actual send to the main loop's chunked drain so
-                    // this Ack returns immediately and does not block IPC.
-                    state.request_offer_files = true;
+                // Evict publish records for files no longer shared/downloading
+                // and drop their source-ack counters; orphaned keyword targets
+                // are pruned inside `retain_files`. Retained files keep their
+                // source and keyword publish timestamps, so already-published
+                // work is not needlessly repeated.
+                state.publish_manager.retain_files(&desired);
+                // The rendezvous advert is deliberately not a library file, so it
+                // is never in `desired`. Dropping its counter mid-publish made the
+                // completion handler read zero acks, conclude the advert had not
+                // been stored, and re-advertise on the next tick — every time a
+                // library change happened to overlap a rendezvous publish.
+                let rendezvous_key = kad::publish::ember_rendezvous_key();
+                state
+                    .source_publish_acks
+                    .retain(|hash, _| desired.contains(hash) || *hash == rendezvous_key);
+                // Same eviction for the Ember badge set. Ember publishes only
+                // complete, publicly listable files (no partials), so unsharing
+                // one must darken its badge exactly as it does for KAD.
+                let ember_keep: HashSet<[u8; 16]> = all_index_files
+                    .iter()
+                    .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
+                    .filter_map(|f| parse_ed2k_hash16(&f.hash))
+                    .collect();
+                state
+                    .ember_published_sources
+                    .retain(|hash| ember_keep.contains(hash));
+                info!("Re-populated publish manager with {shared_count} shared + {partial_count} partial downloads after change");
+
+                // eMule: re-send OP_OFFERFILES to the server when shared files change
+                if state.server_connected {
+                    let mut seen_offer_hashes = std::collections::HashSet::new();
+                    let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
+                        .iter()
+                        .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
+                        .filter_map(|f| {
+                            if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
+                                return None;
+                            }
+                            let hash_bytes = hex::decode(&f.hash).ok()?;
+                            if hash_bytes.len() < 16 {
+                                return None;
+                            }
+                            let mut h = [0u8; 16];
+                            h.copy_from_slice(&hash_bytes[..16]);
+                            Some(ed2k::server::OfferFile {
+                                hash: h,
+                                name: f.name.clone(),
+                                size: f.size,
+                                is_complete: true,
+                                file_type: String::new(),
+                            })
+                        })
+                        .collect();
+                    let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                    {
+                        let mgr = transfer_manager.read().await;
+                        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+                            if transfer.direction != TransferDirection::Download {
+                                continue;
+                            }
+                            if matches!(
+                                transfer.status,
+                                TransferStatus::Completed | TransferStatus::Failed
+                            ) {
+                                continue;
+                            }
+                            if !kad_may_advertise_partial(
+                                known_files,
+                                &restricted,
+                                &transfer.file_hash,
+                            ) {
+                                continue;
+                            }
+                            if transfer.file_hash.is_empty()
+                                || !seen_offer_hashes.insert(transfer.file_hash.clone())
+                            {
+                                continue;
+                            }
+                            let hash_bytes = match hex::decode(&transfer.file_hash) {
+                                Ok(bytes) if bytes.len() >= 16 => bytes,
+                                _ => continue,
+                            };
+                            let part_path = temp_dir.join(format!("{}.part", transfer.id));
+                            if !part_path.exists() {
+                                continue;
+                            }
+                            let mut h = [0u8; 16];
+                            h.copy_from_slice(&hash_bytes[..16]);
+                            offer_files.push(ed2k::server::OfferFile {
+                                hash: h,
+                                name: transfer.file_name.clone(),
+                                size: transfer.total_size,
+                                is_complete: false,
+                                file_type: String::new(),
+                            });
+                        }
+                    }
+                    let signature = offer_files_signature(&offer_files);
+                    if state.last_offer_files_signature == Some(signature) {
+                        debug!(
+                            "Skipping OP_OFFERFILES resend: offer set unchanged ({} files)",
+                            offer_files.len()
+                        );
+                    } else {
+                        // Defer the actual send to the main loop's incremental drain so
+                        // this Ack returns immediately and does not block IPC. The
+                        // drain publishes only hashes this session has not offered;
+                        // re-sending the whole list is what Lugdunum answers with
+                        // "Too many files republished by your client software."
+                        state.request_offer_files = true;
+                    }
                 }
-            }
             }
             let _ = reconcile_ack.send(Ok(()));
         }
@@ -6359,9 +6352,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             typing,
         } => {
-            if settings.friend_chat_disabled
-                || !friend_hashes.read().await.contains(&friend_eh)
-            {
+            if settings.friend_chat_disabled || !friend_hashes.read().await.contains(&friend_eh) {
                 return;
             }
             let _ = send_encrypted_chat_ext(
@@ -6431,7 +6422,8 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Can only browse friends".into()));
             } else if !mutual_friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err(
-                    "Browse is only available after both of you have accepted the friendship".into(),
+                    "Browse is only available after both of you have accepted the friendship"
+                        .into(),
                 ));
             } else {
                 // `friend_browse_disabled` only refuses *inbound* listing
@@ -6799,16 +6791,15 @@ async fn handle_command_inner(
             // same transaction that deleted the friend, so by the time this
             // runs the address here is the only copy left.
             let db_lookup = db.clone();
-            let queued = tokio::task::spawn_blocking(move || {
-                db_lookup.pending_friend_request_retractions()
-            })
-            .await
-            .ok()
-            .and_then(|rows| rows.ok())
-            .and_then(|rows| {
-                rows.into_iter()
-                    .find(|(hash, ..)| hash == &hex::encode(retract_hash))
-            });
+            let queued =
+                tokio::task::spawn_blocking(move || db_lookup.pending_friend_request_retractions())
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.ok())
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .find(|(hash, ..)| hash == &hex::encode(retract_hash))
+                    });
             let Some((hash_hex, last_ip, last_port)) = queued else {
                 debug!(
                     "No friend-request withdrawal owed to {}",
@@ -6878,7 +6869,9 @@ async fn handle_command_inner(
                     "FindFriendAndConnect: {} already online/connected, skipping",
                     hex::encode(target_hash),
                 );
-            } else if let std::collections::hash_map::Entry::Vacant(e) = state.outbound_session_tasks.entry(target_hash) {
+            } else if let std::collections::hash_map::Entry::Vacant(e) =
+                state.outbound_session_tasks.entry(target_hash)
+            {
                 e.insert(std::time::Instant::now());
                 let _ = app_handle.emit(
                     "ember:friend-searching",

@@ -2390,6 +2390,20 @@ const MAX_PART_HASH_CACHE_ENTRIES: usize = 50;
 /// A human clicking "View Files" asks once; anything faster is a loop.
 const MIN_BROWSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Directory listings one connection may be served before the stream is treated
+/// as a loop.
+///
+/// `OP_ASKSHAREDFILESDIR` is deliberately not charged to `MIN_BROWSE_INTERVAL`:
+/// one browse legitimately sends one of these per shared directory, back to
+/// back, so spacing them a minute apart would break the feature. That left it
+/// with no bound at all, and it is an independent match arm — a peer can send it
+/// in a tight loop having never sent the `OP_ASKSHAREDDIRS` that supposedly
+/// throttles it. Each answer walks the index under its read lock (the same lock
+/// every scoring and admission path takes) and spends real upload tokens from the
+/// shared bucket that feeds part sends. A per-session ceiling keeps the honest
+/// burst free while stopping the loop; set far above any real share layout.
+const MAX_DIR_BROWSE_ANSWERS_PER_SESSION: u32 = 256;
+
 /// Uncached whole-file hash computations one connection may trigger per window.
 const MAX_UNCACHED_HASH_JOBS: u32 = 4;
 /// Window over which [`MAX_UNCACHED_HASH_JOBS`] is measured.
@@ -3264,6 +3278,7 @@ fn encode_shared_files_answer(
     files: &[(String, String, u64, String)],
     client_id: u32,
     tcp_port: u16,
+    peer_supports_large_files: bool,
 ) -> Vec<u8> {
     // Independent of the caller's `MAX_BROWSE_ANSWER_FILES` entry-count cap
     // (which alone still allows a multi-MB payload for a large library),
@@ -3289,6 +3304,17 @@ fn encode_shared_files_answer(
     for (hash_hex, name, size, extension) in files {
         if entries.len() >= MAX_ANSWER_BYTES {
             break;
+        }
+        // eMule omits a large file from the listing entirely for a peer that
+        // cannot represent one — `(!pFile->IsLargeFile() || client->
+        // SupportsLargeFiles())` (`ListenSocket.cpp:723`). Listing it anyway
+        // would hand that peer `FT_FILESIZE` alone, and the low 32 bits of a
+        // >4 GiB size read as a plausible small file: it would show a wrong
+        // size and request ranges that do not exist. Omitting is the only
+        // honest answer, since the tag that carries the rest is one the peer
+        // has told us it does not understand.
+        if !peer_supports_large_files && *size > OLD_MAX_EMULE_FILE_SIZE {
+            continue;
         }
         let hash_bytes = match hex::decode(hash_hex) {
             Ok(b) if b.len() >= 16 => b,
@@ -4459,7 +4485,11 @@ impl UploadHandler {
     /// identity (not the server's magic compression IDs): this answer goes
     /// straight to the peer that already has our real address, so there's
     /// nothing to obscure.
-    async fn build_shared_files_answer(&self, client_id: u32) -> Vec<u8> {
+    async fn build_shared_files_answer(
+        &self,
+        client_id: u32,
+        peer_supports_large_files: bool,
+    ) -> Vec<u8> {
         // Real libraries rarely exceed a few hundred thousand files; this
         // bounds the worst case (huge or pathological index) so a single
         // browse request can't force us to build and hold an unbounded
@@ -4496,7 +4526,12 @@ impl UploadHandler {
                 .collect()
         };
 
-        encode_shared_files_answer(&files, client_id, self.advertised_tcp_port())
+        encode_shared_files_answer(
+            &files,
+            client_id,
+            self.advertised_tcp_port(),
+            peer_supports_large_files,
+        )
     }
 
     /// The browsable set, with the folder each file sits in.
@@ -4575,7 +4610,12 @@ impl UploadHandler {
 
     /// `OP_ASKSHAREDFILESDIRANS`: the requested directory echoed back, then the
     /// same body as the flat answer.
-    async fn build_shared_files_dir_answer(&self, requested: &str, client_id: u32) -> Vec<u8> {
+    async fn build_shared_files_dir_answer(
+        &self,
+        requested: &str,
+        client_id: u32,
+        peer_supports_large_files: bool,
+    ) -> Vec<u8> {
         let files: Vec<(String, String, u64, String)> = self
             .browsable_files_by_folder()
             .await
@@ -4592,6 +4632,7 @@ impl UploadHandler {
             &files,
             client_id,
             self.advertised_tcp_port(),
+            peer_supports_large_files,
         ));
         buf
     }
@@ -7088,6 +7129,10 @@ impl UploadHandler {
         let mut hash_answers_served: u32 = 0;
         // When this connection last received a full shared-file listing.
         let mut last_browse: Option<std::time::Instant> = None;
+        // Per-directory listings served on this connection; see
+        // `MAX_DIR_BROWSE_ANSWERS_PER_SESSION` for why these are counted rather
+        // than spaced.
+        let mut dir_browse_answers_served: u32 = 0;
         // eMule `m_abyUpPartStatus`: the parts the downloader told us it
         // already has, captured from the `OP_REQUESTFILENAME` extended-info
         // block and shaded dark on the parts bar. Keyed by file hash so a
@@ -10167,6 +10212,17 @@ impl UploadHandler {
                         .active_count
                         .load(std::sync::atomic::Ordering::Relaxed)
                         < self.compute_dynamic_slot_count();
+                    // Note what this makes the real floor. `compute_dynamic_slot_count`
+                    // never returns less than `ADMISSION_FLOOR_SLOTS` (4), so
+                    // `can_open_another_slot` is unconditionally true below four
+                    // active slots and the caps below cannot fire there no matter
+                    // how deep the queue is. That is the intended polarity — with
+                    // a slot available eMule adds one rather than rotating, and
+                    // the waiter is served by `try_add_up_next_client` and the
+                    // read-timeout promotion rather than by interrupting someone —
+                    // but the reach is three slots against an arbitrarily deep
+                    // queue, not the "one active slot, one waiter" case that
+                    // motivated it.
                     let must_rotate_to_serve_waiter = queue_has_waiters && !can_open_another_slot;
                     // eMule CheckForTimeOver (UploadQueue.cpp:773) returns false
                     // for a friend slot: a verified friend is NEVER rotated out,
@@ -10194,7 +10250,22 @@ impl UploadHandler {
 
                     // eMule-style score-based preemption: every ~10 seconds, check
                     // if a queued peer has a significantly higher score than us.
+                    //
+                    // Exempt for the same reason the byte and time caps above
+                    // are: eMule returns false from `CheckForTimeOver` for a
+                    // friend slot before it ever reaches the score comparison
+                    // (`UploadQueue.cpp:773`), with no LowID condition. A friend
+                    // used to be covered here only as a side effect of the
+                    // `268_435_455` score override, and `friend_slot_takes_priority`
+                    // now withholds that from LowID peers — so without this a LowID
+                    // friend was exempt from the caps but still evictable by score,
+                    // which is the interrupted-transfer stall that exemption exists
+                    // to prevent. Withholding the override is about who gets the
+                    // *next* slot, since a LowID peer cannot be dialled to hand it
+                    // one; it says nothing about a friend already connected and
+                    // actively uploading.
                     let preempted = if !session_expired
+                        && !is_verified_friend
                         && slot_guard.is_active()
                         && last_preempt_check.elapsed().as_secs() >= 10
                     {
@@ -10634,7 +10705,12 @@ impl UploadHandler {
                         let client_id = self
                             .external_ip_shared
                             .load(std::sync::atomic::Ordering::Relaxed);
-                        let resp = self.build_shared_files_answer(client_id).await;
+                        let resp = self
+                            .build_shared_files_answer(
+                                client_id,
+                                hello_caps.supports_large_files,
+                            )
+                            .await;
                         // A full shared-file listing can reach ~500 KiB from a
                         // 6-byte request. `MIN_BROWSE_INTERVAL` bounds the rate
                         // per connection, but writing it unmetered still pushed
@@ -10724,18 +10800,28 @@ impl UploadHandler {
                         debug!("Malformed OP_ASKSHAREDFILESDIR from {peer_addr}");
                         continue;
                     };
-                    // Deliberately not charged to `last_browse`. The directory
+                    // Deliberately not charged to `last_browse`: the directory
                     // list the peer is working through is one browse, and it
                     // legitimately sends one of these per directory back to
-                    // back; the per-request cost is bounded by the answer being
-                    // a subset of the flat listing, which `MIN_BROWSE_INTERVAL`
-                    // already rate-limits at the `OP_ASKSHAREDDIRS` that
-                    // started it. Still metered against the upload cap.
+                    // back. Counted instead, because nothing else bounds it —
+                    // this arm is reachable without the `OP_ASKSHAREDDIRS` whose
+                    // throttle it was assumed to inherit. Still metered against
+                    // the upload cap.
+                    if dir_browse_answers_served >= MAX_DIR_BROWSE_ANSWERS_PER_SESSION {
+                        debug!("Ignoring excess OP_ASKSHAREDFILESDIR from {peer_addr}");
+                        self.note_abusive_request(peer_addr.ip()).await;
+                        continue;
+                    }
+                    dir_browse_answers_served += 1;
                     let client_id = self
                         .external_ip_shared
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let resp = self
-                        .build_shared_files_dir_answer(&requested, client_id)
+                        .build_shared_files_dir_answer(
+                            &requested,
+                            client_id,
+                            hello_caps.supports_large_files,
+                        )
                         .await;
                     self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                         .await?;
@@ -13765,7 +13851,7 @@ mod browse_answer_tests {
         )];
 
         let payload =
-            encode_shared_files_answer(&files, 0x0100A8C0 /* 192.168.0.1 LE */, 4662);
+            encode_shared_files_answer(&files, 0x0100A8C0 /* 192.168.0.1 LE */, 4662, true);
 
         let mut pos = 0usize;
         let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
@@ -13836,12 +13922,24 @@ mod browse_answer_tests {
         let big_size = OLD_MAX_EMULE_FILE_SIZE + (5u64 << 32) + 42;
         let files = vec![(hash_hex, "big.iso".to_string(), big_size, "iso".to_string())];
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
 
         // count(4) + hash(16) + id(4) + port(2) + tag_count(4)
         let tag_count = u32::from_le_bytes(payload[26..30].try_into().unwrap());
         // FT_FILENAME + FT_FILESIZE + FT_FILESIZE_HI + FT_FILETYPE (iso -> "Iso")
         assert_eq!(tag_count, 4);
+
+        // A peer that never told us it understands large files is not sent the
+        // file at all, the way eMule filters it out of the listing. The low 32
+        // bits on their own would read as a plausible small file and have it
+        // ask for ranges that do not exist.
+        let small_only = encode_shared_files_answer(&files, 0, 4662, false);
+        assert_eq!(
+            u32::from_le_bytes(small_only[0..4].try_into().unwrap()),
+            0,
+            "a large file must be omitted for a peer without large-file support"
+        );
+        assert_eq!(small_only.len(), 4, "omitted means no entry, not a stub");
 
         // FT_FILESIZE_HI tag header: type=0x03 (uint32), name_len=1 (LE u16:
         // 0x01, 0x00), name_id=0x3A — scan for that exact 4-byte header
@@ -13877,7 +13975,7 @@ mod browse_answer_tests {
             ),
         ];
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
         let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         assert_eq!(
             count, 1,
@@ -13895,7 +13993,7 @@ mod browse_answer_tests {
     /// treating "nothing shared" as a denial.
     #[test]
     fn empty_share_list_encodes_zero_count() {
-        let payload = encode_shared_files_answer(&[], 0, 4662);
+        let payload = encode_shared_files_answer(&[], 0, 4662, true);
         assert_eq!(payload.len(), 4);
         assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 0);
     }
@@ -13922,7 +14020,7 @@ mod browse_answer_tests {
             })
             .collect();
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
 
         assert!(
             payload.len() < 512 * 1024,

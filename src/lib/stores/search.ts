@@ -10,6 +10,8 @@ import {
   SEARCH_STORAGE_KEY,
   buildPersistPayload,
   parsePersistedSearch,
+  trimPersistPayload,
+  type PersistedSearch,
 } from '$lib/searchPersistence';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
@@ -58,22 +60,47 @@ export type SearchTab = {
  * and a tab can hold thousands of rows, so serialising on each update would
  * cost far more than the one write that actually matters.
  */
+/**
+ * Whether anything has changed since the last write that landed.
+ *
+ * `visibilitychange`→hidden fires on every app switch, and building the payload
+ * is not cheap — the row shed behind `forPersist` is several O(n log n) passes
+ * over up to `PERSIST_MAX_TABS` tabs of up to `MAX_TAB_RESULTS` rows, all of it
+ * synchronous on the thread that draws the window. Alt-tabbing away from a page
+ * whose results have not moved since the last write now costs nothing.
+ *
+ * Every write to what gets persisted goes through `searchTabs` or
+ * `activeSearchTabId`, so subscribing to both covers the whole surface. Cleared
+ * only once `setItem` has actually succeeded: a write refused at every limit in
+ * `PERSIST_RETRY_LIMITS` has to stay pending, or the quota that refused it would
+ * cost the user the rest of the session's results as well.
+ */
+let persistDirty = true;
+
 function persistSearch() {
   if (typeof sessionStorage === 'undefined') return;
+  if (!persistDirty) return;
   const tabs = get(searchTabs);
   if (tabs.length === 0) {
     try {
       sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+      persistDirty = false;
     } catch {
       /* nothing to lose */
     }
     return;
   }
   const activeId = get(activeSearchTabId);
+  // Built once at the largest limit and then trimmed down, rather than rebuilt
+  // from the live tabs per limit — see `trimPersistPayload`.
+  let payload: PersistedSearch | null = null;
   for (const limit of PERSIST_RETRY_LIMITS) {
+    payload = payload === null
+      ? buildPersistPayload(tabs, activeId, limit)
+      : trimPersistPayload(payload, limit);
     try {
-      const payload = buildPersistPayload(tabs, activeId, limit);
       sessionStorage.setItem(SEARCH_STORAGE_KEY, JSON.stringify(payload));
+      persistDirty = false;
       return;
     } catch {
       // Quota, or a value that would not serialise. Try a smaller payload.
@@ -108,6 +135,15 @@ if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', persistSearch);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') persistSearch();
+  });
+  // See `persistDirty`. Both fire once on subscribe, which leaves the first
+  // persist after a restore to write the restored payload straight back — one
+  // wasted write, and the safe direction to be wrong in.
+  searchTabs.subscribe(() => {
+    persistDirty = true;
+  });
+  activeSearchTabId.subscribe(() => {
+    persistDirty = true;
   });
 }
 /** Bumped when learned spam data is wiped so the search page can drop
@@ -233,8 +269,38 @@ function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: numbe
 }
 
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
- * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
+ * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup,
+ * and bounded by `SPAM_OVERRIDE_MAX` in between. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
+type SpamOverride = NonNullable<ReturnType<typeof spamUserOverrides.get>>;
+
+/**
+ * Ceiling on the override table, the same bound and the same treatment
+ * `SPAM_CACHE_MAX` gives the search page's tooltip cache — and for the same
+ * reason, that nothing else prunes it. This was emptied only by
+ * `notifySpamFilterReset` and store teardown, so a long session spent marking
+ * spam grew it for as long as the window stayed open.
+ *
+ * Set far above any plausible number of marks in flight at once, which is what
+ * makes eviction safe here: `handleMarkSpam` reverts a failed IPC through the
+ * entry this holds, so dropping one a request is still waiting on would lose the
+ * revert. Reaching that would take 500 marks issued before the first came back.
+ */
+const SPAM_OVERRIDE_MAX = 500;
+
+function setSpamOverride(hash: string, override: SpamOverride): void {
+  // Deleted before it is set, so a re-mark moves the hash to the back of the
+  // insertion order the eviction below reads: what gets dropped is then the mark
+  // the user touched longest ago rather than whichever they happened to make
+  // first, and never the one just written.
+  spamUserOverrides.delete(hash);
+  spamUserOverrides.set(hash, override);
+  while (spamUserOverrides.size > SPAM_OVERRIDE_MAX) {
+    const oldest = spamUserOverrides.keys().next().value;
+    if (oldest === undefined) break;
+    spamUserOverrides.delete(oldest);
+  }
+}
 
 /** Ranking ceiling for peer-reported counts, matching MAX_PLAUSIBLE_SOURCES in
  * merge.rs (pinned by `scripts/fixtures/merge-contract.json`). ed2k carries this
@@ -246,6 +312,12 @@ const MAX_PLAUSIBLE_SOURCES = 65535;
  * is 64, and the network task seeds at most 49); addresses beyond that were kept
  * and shipped over IPC only to be dropped on arrival. */
 const MAX_SOURCE_ADDRS = 64;
+
+/** Whether a row carries anything that explains a spam verdict — the prose list
+ *  or the coded one, since `spamReasonTexts` renders from either. */
+function hasSpamExplanation(row: SearchResult): boolean {
+  return !!(row.spam_reasons?.length || row.spam_reason_details?.length);
+}
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])])).slice(0, MAX_SOURCE_ADDRS);
@@ -303,16 +375,34 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     !!incoming.is_spam,
     incoming.spam_rating ?? 0,
   );
-  // An empty incoming list is adopted too, which is the point: if the verdict
-  // came from the incoming row, so does its explanation, and "no reasons
-  // given" is a truthful one. Falling back to the other side's list whenever
-  // this one was empty is what the rule above exists to prevent, and it was
-  // also the one place this still disagreed with `merge_into`.
+  // An empty list from the winning side is normally adopted as-is, which is the
+  // point: if the verdict came from that row, so does its explanation, and
+  // "flagged, no reasons given" is a truthful one. Falling back to the other
+  // side's list whenever this one is empty is the mix-and-match the rule above
+  // exists to prevent.
+  //
+  // The exception is a *flagged* row that neither list explains, which is the
+  // one outcome a user cannot read at all: the badge says spam, the tooltip is
+  // blank, and `spam_rating` — merged with max, so it can come from the side that
+  // was overruled — shows a score nothing on screen justifies. A verdict from
+  // `existing.is_spam` with `existing.spam_reasons` absent, which is what a
+  // channel that classifies without reporting signal detail sends, landed there
+  // every time. So a flagged row keeps whichever side actually has an
+  // explanation; only an unflagged row, or one both sides leave unexplained,
+  // ends up with nothing.
+  //
+  // A deliberate divergence from `merge_into`, alongside the availability,
+  // filename and address-cap ones the module header lists, and deliberately not
+  // in `merge-contract.json` for the same reason they are not: Rust merges rows
+  // for the wire, where an unexplained flag costs nothing, while this copy is the
+  // one feeding the tooltip the badge promises.
+  const preferredSignals = takeIncomingSignals ? incoming : existing;
+  const otherSignals = takeIncomingSignals ? existing : incoming;
   const spamSignals = override?.reasons
     ? { spam_reasons: override.reasons, spam_reason_details: undefined }
-    : takeIncomingSignals
-      ? incoming
-      : existing;
+    : is_spam && !hasSpamExplanation(preferredSignals) && hasSpamExplanation(otherSignals)
+      ? otherSignals
+      : preferredSignals;
   return {
     ...existing,
     ...incoming,
@@ -510,7 +600,7 @@ export function patchSpamFlagByHash(
   if (!fileHash) return () => {};
   const hadOverride = spamUserOverrides.has(fileHash);
   const previousOverride = spamUserOverrides.get(fileHash);
-  spamUserOverrides.set(fileHash, { isSpam, spamRating, reasons });
+  setSpamOverride(fileHash, { isSpam, spamRating, reasons });
   // Keyed by tab id rather than by row position: the undo runs after an IPC
   // round-trip, by which time a streaming merge may have grown the tab.
   const undoRows: { tabId: string; fields: ReturnType<typeof spamFieldsOf> }[] = [];
@@ -551,7 +641,7 @@ export function patchSpamFlagByHash(
   // would publish the signal ahead of the rows it is signalling.
   if (patched) searchRowPatchEpoch.update((n) => n + 1);
   return () => {
-    if (hadOverride) spamUserOverrides.set(fileHash, previousOverride!);
+    if (hadOverride) setSpamOverride(fileHash, previousOverride!);
     else spamUserOverrides.delete(fileHash);
     if (undoRows.length === 0) return;
     let restored = false;
@@ -925,9 +1015,18 @@ async function runSpamMarkRescore(pending: {
   const tab = get(searchTabs).find((t) => t.id === pending.tabId);
   if (!tab || tab.results.length === 0) return;
   const { expectHigher, expectLower } = pending;
-  const candidates = tab.results.filter(
-    (r) => !(r.is_spam && expectHigher) && !(!r.is_spam && expectLower),
-  );
+  // Marks in both directions coalesced into this pass, so nothing is safely
+  // skippable and the whole list is re-scored. Running the filter below on both
+  // expectations at once excluded *every* row instead — a flagged row fails the
+  // first test, an unflagged row fails the second — so the re-rating this
+  // function exists for silently did nothing whenever a mark was followed by a
+  // correcting unmark.
+  const candidates =
+    expectHigher && expectLower
+      ? tab.results
+      : tab.results.filter(
+          (r) => !(r.is_spam && expectHigher) && !(!r.is_spam && expectLower),
+        );
   if (candidates.length === 0) return;
   try {
     await rescoreRowsIntoTab(tab.id, tab.query, candidates);

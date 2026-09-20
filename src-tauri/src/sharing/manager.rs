@@ -434,8 +434,19 @@ impl TransferManager {
                 if transfer.speed > 0 && idle_secs < (SPEED_IDLE_MS / 1000) as i64 {
                     return (TransferHealth::Healthy, None);
                 }
+                // A granted download slot is still a live transfer. eMule keeps
+                // the file on Downloading and parks Stalled on the source row;
+                // flipping the file red here made the bar flash every few
+                // seconds while blocks were still arriving (progress events
+                // cleared the overlay, then the next health tick put it back).
+                if transfer.active_sources > 0 {
+                    if idle_secs >= ACTIVE_DEGRADED_SECS {
+                        return (TransferHealth::Degraded, Some(TransferHealthCode::Idle));
+                    }
+                    return (TransferHealth::Healthy, None);
+                }
                 if idle_secs >= ACTIVE_STALLED_SECS {
-                    let code = if transfer.active_sources == 0 && transfer.queued_sources > 0 {
+                    let code = if transfer.queued_sources > 0 {
                         TransferHealthCode::QueuedSources
                     } else if transfer.sources == 0 {
                         TransferHealthCode::WaitingSources
@@ -461,7 +472,10 @@ impl TransferManager {
             }
             TransferStatus::Queued => {
                 if transfer.sources == 0 {
-                    return (TransferHealth::Degraded, Some(TransferHealthCode::NoSources));
+                    return (
+                        TransferHealth::Degraded,
+                        Some(TransferHealthCode::NoSources),
+                    );
                 }
                 let age_secs = now.saturating_sub(transfer.started_at);
                 if age_secs >= QUEUED_DEGRADED_SECS {
@@ -646,10 +660,7 @@ impl TransferManager {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
 
-            let history = self
-                .speed_history
-                .entry(id.to_string())
-                .or_default();
+            let history = self.speed_history.entry(id.to_string()).or_default();
 
             history.push_back((transferred, now));
 
@@ -1006,13 +1017,13 @@ impl TransferManager {
                         | TransferStatus::Failed
                 )
             }) && rows.iter().any(|s| {
-                    s.ip == needle
-                        && matches!(
-                            s.status,
-                            crate::types::SourceStatus::Transferring
-                                | crate::types::SourceStatus::Stalled
-                        )
-                })
+                s.ip == needle
+                    && matches!(
+                        s.status,
+                        crate::types::SourceStatus::Transferring
+                            | crate::types::SourceStatus::Stalled
+                    )
+            })
         })
     }
 
@@ -1790,7 +1801,9 @@ mod tests {
             "the {{reason}} placeholder was left unfilled"
         );
         assert!(
-            TransferHealthCode::RetryingAfter.message().contains("{reason}"),
+            TransferHealthCode::RetryingAfter
+                .message()
+                .contains("{reason}"),
             "the template must keep a slot for the failure, or the UI has nothing to fill"
         );
     }
@@ -1819,18 +1832,51 @@ mod tests {
         assert_eq!(
             stalled(|t| {
                 t.sources = 3;
-                t.active_sources = 1;
+                t.active_sources = 0;
+                t.queued_sources = 0;
             }),
             Some(TransferHealthCode::NoData)
+        );
+        // A live slot is idle, not stalled — the file row must not go red
+        // while a source is still in DS_DOWNLOADING.
+        assert_eq!(
+            stalled(|t| {
+                t.sources = 3;
+                t.active_sources = 1;
+            }),
+            Some(TransferHealthCode::Idle)
         );
 
         let mut active = download("i");
         active.status = TransferStatus::Active;
         active.last_received = Some(active.started_at);
         assert_eq!(
-            TransferManager::compute_health_state(&active, active.started_at + ACTIVE_DEGRADED_SECS)
-                .1,
+            TransferManager::compute_health_state(
+                &active,
+                active.started_at + ACTIVE_DEGRADED_SECS
+            )
+            .1,
             Some(TransferHealthCode::Idle)
+        );
+
+        let mut live_slot = download("live-slot");
+        live_slot.status = TransferStatus::Active;
+        live_slot.last_received = Some(live_slot.started_at);
+        live_slot.sources = 2;
+        live_slot.active_sources = 1;
+        assert_eq!(
+            TransferManager::compute_health_state(
+                &live_slot,
+                live_slot.started_at + ACTIVE_STALLED_SECS,
+            ),
+            (TransferHealth::Degraded, Some(TransferHealthCode::Idle))
+        );
+        assert_eq!(
+            TransferManager::compute_health_state(
+                &live_slot,
+                live_slot.started_at + ACTIVE_DEGRADED_SECS - 1,
+            ),
+            (TransferHealth::Healthy, None)
         );
 
         let mut searching = download("j");
@@ -1854,8 +1900,11 @@ mod tests {
         );
         queued.sources = 4;
         assert_eq!(
-            TransferManager::compute_health_state(&queued, queued.started_at + QUEUED_DEGRADED_SECS)
-                .1,
+            TransferManager::compute_health_state(
+                &queued,
+                queued.started_at + QUEUED_DEGRADED_SECS
+            )
+            .1,
             Some(TransferHealthCode::WaitingSlot)
         );
 
@@ -2081,8 +2130,7 @@ mod tests {
         ours.placeholder = true;
         manager.update_source_detail("a", ours);
 
-        let inherited =
-            manager.inherited_source_origin("a", "198.51.100.10", Some([0x22; 16]));
+        let inherited = manager.inherited_source_origin("a", "198.51.100.10", Some([0x22; 16]));
         assert_eq!(
             inherited,
             Some(SourceOrigin::Ember),
@@ -2170,7 +2218,10 @@ mod tests {
     #[test]
     fn completing_a_download_frees_its_slot_for_the_next_queued_one() {
         let mut manager = TransferManager::new(1);
-        assert!(manager.enqueue(sourced("a", 3)), "the first row fits the cap");
+        assert!(
+            manager.enqueue(sourced("a", 3)),
+            "the first row fits the cap"
+        );
         assert!(
             !manager.enqueue(sourced("b", 3)),
             "the second row must wait for the slot"
@@ -2219,7 +2270,10 @@ mod tests {
             promoted.is_empty(),
             "the running download's slot was never freed"
         );
-        assert!(manager.active.contains_key("a"), "the running row is untouched");
+        assert!(
+            manager.active.contains_key("a"),
+            "the running row is untouched"
+        );
         assert_eq!(manager.active.len(), 1);
 
         let promoted = manager
@@ -2270,7 +2324,8 @@ mod tests {
 
         assert_eq!(manager.completed.len(), 1000, "the ring must cap at 1000");
         assert_eq!(
-            manager.completed.first().unwrap().id, "t0005",
+            manager.completed.first().unwrap().id,
+            "t0005",
             "the five oldest rows are the ones that go"
         );
         assert_eq!(manager.completed.last().unwrap().id, "t1004");
@@ -2312,7 +2367,11 @@ mod tests {
             ["c"],
             "the longest-queued row of equal priority goes first"
         );
-        assert_eq!(manager.active.len(), 2, "no slot leaked, none oversubscribed");
+        assert_eq!(
+            manager.active.len(),
+            2,
+            "no slot leaked, none oversubscribed"
+        );
         assert!(!manager.active.contains_key("a"));
         assert!(
             !manager.queue.iter().any(|t| t.id == "c"),
@@ -2637,9 +2696,8 @@ mod tests {
 
         // Retaining `1 - new` of the previous value each second settles over
         // about `1 / (1 - retained)` seconds.
-        let retained =
-            (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
-                / SPEED_SMOOTHING_DENOMINATOR as f64;
+        let retained = (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
+            / SPEED_SMOOTHING_DENOMINATOR as f64;
         let settle_ms = 1_000.0 / (1.0 - retained);
         assert!(
             (SPEED_WINDOW_MS as f64) <= settle_ms,

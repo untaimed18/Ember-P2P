@@ -8,31 +8,32 @@
  *
  * The backend already clamps each row to the rate the limiter is allowed to
  * spend (`TransferManager::cap_active_speed`). This is the second half of that:
- * clamping rows one at a time bounds no *sum*, and the Uploads tab invites
- * adding the column up and comparing it to the status-bar total.
+ * clamping rows one at a time bounds no *sum*, so a slot handover that briefly
+ * overlaps two rows could still print a column adding up to more than the
+ * configured limit.
  */
 
 /**
  * The ceiling the visible slot rates are allowed to add up to.
  *
- * The tighter of the configured cap and the status-bar total, because a user
- * reads the column as a breakdown of that total and neither number may be
- * exceeded. Returns 0 for "nothing to bound against" — unlimited uploads with no
- * total sampled yet — which callers treat as "print the rows as measured".
+ * The configured upload cap, or 0 for "nothing to bound against" — uploads
+ * unlimited — which callers treat as "print the rows as measured".
  *
- * Bounding by the total as well as the cap is deliberate, and the direction
- * matters: during a slot handover the total dips first (it is smoothed over
- * ~3.3 s) while the remaining rows still carry their pre-handover window rates,
- * so the rows are pulled down to meet it rather than being left summing above
- * it. That trades a transient understatement for never looking like the upload
- * limit has been breached — the same preference `SPEED_WINDOW_MS` is documented
- * with on the Rust side.
+ * The status-bar total used to bound this as well, on the reasoning that a user
+ * reads the column as a breakdown of that total. It cannot be used that way, and
+ * this is why: the numerator refreshes from `transfer-progress` every ~200 ms,
+ * while `networkStats.upload_speed` is sampled by a 3 s interval that also
+ * returns early while the window is hidden, and the figure it carries is already
+ * the backend's ~3 s-settling EWMA. A fresh numerator over a divisor several
+ * seconds behind it made every slot print far below its real rate through the
+ * whole ramp-up — roughly 30% of it one second in — and with uploads unlimited
+ * the stale total was the *only* bound, so that understatement bought no
+ * protection at all. Issue 115 was a row printing ABOVE the configured cap, and
+ * the cap is the only figure that bounds that; a total that lags the rows it is
+ * meant to describe cannot be allowed to shrink them.
  */
-export function uploadSumBound(cap: number, statusBarTotal: number): number {
-  if (cap > 0 && statusBarTotal > 0) {
-    return Math.min(cap, statusBarTotal);
-  }
-  return Math.max(cap, statusBarTotal, 0);
+export function uploadSumBound(cap: number): number {
+  return cap > 0 ? cap : 0;
 }
 
 /**

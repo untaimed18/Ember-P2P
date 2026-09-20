@@ -154,6 +154,30 @@
   // Per-hash sequence for optimistic mark/unmark so out-of-order IPC
   // completions cannot desync the UI from the latest user action.
   const spamToggleGen = new Map<string, number>();
+  /** Ceiling on that sequence table. Nothing pruned it — a hash entered on the
+   *  first mark and stayed for the session — so it gets the same bound as
+   *  `SPAM_CACHE_MAX` below. Eviction is only safe because it is far above the
+   *  number of marks that can be in flight at once: the handlers read the entry
+   *  back to decide whether their IPC was superseded, and an evicted entry reads
+   *  as superseded, which would skip the revert on a failed mark. */
+  const SPAM_TOGGLE_MAX = 500;
+
+  /** Claim the next generation for a hash, evicting the least-recently-marked
+   *  hashes once the table is over budget. */
+  function nextSpamToggleGen(hash: string): number {
+    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
+    // Re-inserted rather than overwritten so the hash moves to the back of the
+    // insertion order eviction reads from, which keeps the entry a request is
+    // waiting on out of reach of it.
+    spamToggleGen.delete(hash);
+    spamToggleGen.set(hash, gen);
+    while (spamToggleGen.size > SPAM_TOGGLE_MAX) {
+      const oldest = spamToggleGen.keys().next().value;
+      if (oldest === undefined) break;
+      spamToggleGen.delete(oldest);
+    }
+    return gen;
+  }
   // Per-hash "last applied generation". `getDownloadHistory` IPC
   // round-trips can resolve out of order (cold DB vs warm cache),
   // and the previous merge happily let an older batch overwrite a
@@ -1699,7 +1723,14 @@
   $effect(() => {
     const el = resultsScrollEl;
     if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => updateRowWindow());
+    // Through the scheduler, not straight into `updateRowWindow`. Measuring
+    // synchronously from inside the observer callback forced three layout reads
+    // and wrote `$state` per observation, and it can feed itself: a new row
+    // window changes the content height, which can bring a scrollbar in or out
+    // and so change the `clientHeight` this reads — the observation that
+    // re-observes. The rAF coalescing is what stops that becoming a loop, and it
+    // is the same path the scroll handler already takes.
+    const ro = new ResizeObserver(() => scheduleRowWindowUpdate());
     ro.observe(el);
     return () => ro.disconnect();
   });
@@ -2786,8 +2817,7 @@
     // is not one, so there is nothing to record for a hashless row. The menu
     // item is disabled for those; this is the guard behind it.
     if (!hash) return;
-    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
-    spamToggleGen.set(hash, gen);
+    const gen = nextSpamToggleGen(hash);
     // The tab the row belongs to, captured before the IPC: eMule re-rates
     // `pSpamFile->GetSearchID()`, not whatever search is on screen when the
     // call comes back.
@@ -2827,8 +2857,7 @@
   async function handleMarkNotSpam(result: SearchResult) {
     const hash = result.file.hash;
     if (!hash) return;
-    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
-    spamToggleGen.set(hash, gen);
+    const gen = nextSpamToggleGen(hash);
     const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
@@ -3783,9 +3812,18 @@
         {/if}
       </div>
     {/if}
-    <table class="search-results-table">
+    <!-- The rows in the DOM are a ~28-row window over `filteredResults`, and the
+         spacers standing in for the rest stay `aria-hidden` — their cells are
+         empty, so anything that announced them would read out a run of blank
+         rows. That left a screen reader being told the table's entire contents
+         were the mounted slice: "row 4 of 28" on a search holding nine thousand
+         hits, and no way to tell that scrolling would bring more. `aria-rowcount`
+         with a per-row `aria-rowindex` is what the spec provides for a grid whose
+         DOM holds only part of its rows. Both count the header row, which is why
+         the data rows start at 2. -->
+    <table class="search-results-table" aria-rowcount={filteredResults.length + 1}>
       <thead oncontextmenu={openColumnMenuFromHeader}>
-        <tr>
+        <tr aria-rowindex="1">
           <th class="col-check">
             <input
               type="checkbox"
@@ -3875,6 +3913,7 @@
           {@const spamExplain = spamExplainFor(result)}
           <tr
             class="result-row {dlRowClass(dlTransfer)}"
+            aria-rowindex={idx + 2}
             class:row-alt={(idx & 1) === 1}
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}

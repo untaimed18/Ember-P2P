@@ -136,6 +136,24 @@ fn is_sensitive_share_name_variant(name: &str, base: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'))
 }
 
+/// Our own data directory, canonicalized once per process.
+///
+/// `is_excluded_share_location` runs inside the filesystem-watcher callback,
+/// which is the thread draining `ReadDirectoryChangesW`. That buffer is a fixed
+/// size and a slow handler is how its events get dropped — which would leave
+/// files copied into a shared folder unindexed, and so unservable, until a
+/// manual reload. Resolving the directory per event put a known-folder lookup
+/// and a second `canonicalize` in front of every one. The path is fixed for the
+/// life of the process: the env override is read at startup and the OS
+/// per-user location does not move.
+fn canonical_data_dir() -> &'static Path {
+    static CANONICAL: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    CANONICAL.get_or_init(|| {
+        let dir = crate::storage::paths::resolve_data_dir();
+        dir.canonicalize().unwrap_or(dir)
+    })
+}
+
 /// True when any component of `path` is a directory discovery refuses to
 /// descend into, or the path lives under our own data directory.
 pub fn is_excluded_share_location(path: &Path) -> bool {
@@ -146,10 +164,9 @@ pub fn is_excluded_share_location(path: &Path) -> bool {
             }
         }
     }
-    let data_dir = crate::storage::paths::resolve_data_dir();
-    let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
+    let data_canon = canonical_data_dir();
     if let Ok(canonical) = path.canonicalize() {
-        if canonical == data_canon || canonical.starts_with(&data_canon) {
+        if canonical == data_canon || canonical.starts_with(data_canon) {
             return true;
         }
     }
@@ -470,11 +487,19 @@ impl FileIndexer {
     ///   the ed2k MD4 whether or not we need it, which buys something back:
     ///   see the cross-check below.
     ///
-    /// The returned part-hash list is empty in both cases, which is correct
-    /// rather than lossy: a record that already carries an ed2k hash already
-    /// carries its part hashes, and on the AICH route the cross-check has just
-    /// proved the two agree. `fresh_part_hash_handoff` reads an empty list as
-    /// "nothing new to hand over" rather than as an erasure.
+    /// The AICH route returns the part hashes it computed. A record carrying an
+    /// ed2k hash does *not* imply it carries them: the reconcile writes an empty
+    /// list rather than re-read a file on the network task, and `known.met`
+    /// clears a stored list whose length stopped describing the file. Since
+    /// `resolve_from_known` sends every matched record here rather than to the
+    /// full pass, this is the only pass that opens these files, and the list is
+    /// a by-product of the MD4 it runs anyway — so dropping it would strand
+    /// those records with no hashset for `OP_HASHSETREQUEST`. The cross-check
+    /// below has already proved the list describes the id it is filed under.
+    ///
+    /// The digest-only route returns an empty list because it computes no MD4 to
+    /// derive one from. `fresh_part_hash_handoff` reads empty as "nothing new to
+    /// hand over" rather than as an erasure.
     ///
     /// What the digest-only route gives up is that the full pass would have
     /// recomputed the MD4 and noticed a file whose contents changed without its
@@ -510,7 +535,7 @@ impl FileIndexer {
         }
         let before_modified = before.modified().ok();
 
-        let (aich, ember) = if want.aich {
+        let (aich, ember, part_hashes) = if want.aich {
             let mut file = std::fs::File::open(path)?;
             let digests = crate::network::ed2k::hash::hash_open_file_digests_cancellable(
                 &mut file, want, cancelled,
@@ -526,11 +551,13 @@ impl FileIndexer {
             (
                 digests.aich.map(hex::encode).unwrap_or(known_aich),
                 digests.ember.map(hex::encode).unwrap_or(known_ember),
+                digests.part_hashes,
             )
         } else {
             (
                 known_aich,
                 crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled)?,
+                Vec::new(),
             )
         };
 
@@ -546,7 +573,7 @@ impl FileIndexer {
         Ok((
             known_ed2k,
             aich,
-            Vec::new(),
+            part_hashes,
             ember,
             after.len(),
             modified_at,
@@ -561,8 +588,10 @@ mod tests {
     /// The digest the migration writes is what a download later verifies
     /// against, so the short-cut pass has to agree with the full one byte for
     /// byte. Everything else it returns is carried through from `known.met`
-    /// unchanged, and the part-hash list is empty because the record already
-    /// has one.
+    /// unchanged. The digest-only route computes no part hashes; the AICH route
+    /// runs the MD4 anyway, so it must hand back the same list the full pass
+    /// produces — it is the only pass that reopens a record whose hashset was
+    /// left empty.
     #[test]
     fn the_digest_only_pass_agrees_with_the_full_one() {
         let dir = std::env::temp_dir().join(format!(
@@ -636,7 +665,12 @@ mod tests {
         );
         assert_eq!(aich_ember, ember, "one read still answers for both");
         assert_eq!(aich_ed2k, ed2k);
-        assert!(aich_parts.is_empty());
+        assert_eq!(
+            aich_parts, parts,
+            "the AICH route is the only pass that reopens a record left without \
+             a hashset, and it computes these anyway — dropping them leaves \
+             OP_HASHSETREQUEST with nothing to answer from"
+        );
 
         // Filed under the wrong id, the root would point a downloader's repair
         // at the wrong bytes, so the mismatch fails the file rather than

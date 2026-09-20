@@ -84,6 +84,13 @@ function usableRow(row: unknown): row is SearchResult {
  * itself uses when it overflows, so a restore now keeps what an overflowing
  * tab would have kept: the best-sourced rows of each network, spam last.
  *
+ * Only when they don't all fit, which is the part that matters for what this
+ * costs: the shed is three O(n log n) passes, and this runs on the
+ * `visibilitychange`→hidden handler — every time the user switches apps — across
+ * up to `PERSIST_MAX_TABS` tabs of up to `MAX_TAB_RESULTS` rows each. A tab
+ * already inside the budget is stored as-is, the way the plain `.slice()` this
+ * replaced was.
+ *
  * `filter` has already copied, so the in-place shed cannot touch the live tab.
  */
 function rowsWorthStoring(raw: unknown, limit: number): SearchResult[] {
@@ -120,6 +127,36 @@ export function buildPersistPayload(
   return {
     tabs: tabs.slice(-PERSIST_MAX_TABS).map((t) => forPersist(t, limit)),
     activeId,
+  };
+}
+
+/**
+ * Re-trim a payload that has already been built, for the next-smaller limit in
+ * `PERSIST_RETRY_LIMITS`.
+ *
+ * The retry used to call `buildPersistPayload` again, which re-ran the
+ * `usableRow` filter and `shedWeakestRows` over every tab's *live* row array —
+ * up to `MAX_TAB_RESULTS` rows apiece — once per limit, so a quota failure cost
+ * three full passes over everything the user had searched for. The rows here
+ * have already been through both, so re-shedding them is a sort over at most
+ * `PERSIST_MAX_RESULTS`.
+ *
+ * It reaches the same answer as re-shedding from the live tab would. The shed
+ * ranks rows within each origin class and keeps the strongest, and what this is
+ * handed is precisely the strongest `PERSIST_MAX_RESULTS` under that same
+ * ranking — so the strongest 100 of them are the strongest 100 of the tab.
+ */
+export function trimPersistPayload(payload: PersistedSearch, limit: number): PersistedSearch {
+  return {
+    activeId: payload.activeId,
+    tabs: payload.tabs.map((tab) => {
+      if (tab.results.length <= limit) return tab;
+      // Copied rather than shed in place: the caller still holds the payload
+      // this came from, and the attempt that failed may not be the last one.
+      const results = tab.results.slice();
+      shedWeakestRows(results, limit);
+      return { ...tab, results };
+    }),
   };
 }
 

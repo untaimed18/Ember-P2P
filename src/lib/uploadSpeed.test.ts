@@ -12,22 +12,15 @@ function sumOf(speeds: readonly number[], factor: number): number {
 }
 
 describe('uploadSumBound', () => {
-  it('takes the tighter of the cap and the status-bar total', () => {
-    expect(uploadSumBound(200 * KB, 500 * KB)).toBe(200 * KB);
-    // A slot handover dips the total below the cap; that is the binding figure,
-    // so the rows follow it down instead of summing above it.
-    expect(uploadSumBound(200 * KB, 120 * KB)).toBe(120 * KB);
+  it('binds the column to the configured cap', () => {
+    expect(uploadSumBound(200 * KB)).toBe(200 * KB);
   });
 
-  it('falls back to whichever figure it has', () => {
-    // Unlimited uploads: the total is still something the column adds up to.
-    expect(uploadSumBound(0, 500 * KB)).toBe(500 * KB);
-    // No total sampled yet (first paint, stats not polled): the cap still binds.
-    expect(uploadSumBound(200 * KB, 0)).toBe(200 * KB);
-  });
-
-  it('reports no bound when neither figure is known', () => {
-    expect(uploadSumBound(0, 0)).toBe(0);
+  it('reports no bound when uploads are unlimited', () => {
+    expect(uploadSumBound(0)).toBe(0);
+    // A settings value that should never reach here is still not a bound.
+    expect(uploadSumBound(-1)).toBe(0);
+    expect(uploadSumBound(Number.NaN)).toBe(0);
   });
 });
 
@@ -55,10 +48,20 @@ describe('uploadScaleFactor', () => {
     }
   });
 
-  it('holds the sum to a dipping total, not just the cap', () => {
-    const bound = uploadSumBound(REPORTED_CAP, 120 * KB);
-    const factor = uploadScaleFactor(bound, REPORTED_SLOTS);
-    expect(sumOf(REPORTED_SLOTS, factor)).toBeCloseTo(120 * KB, 6);
+  it('is not pulled down by a stale status-bar total', () => {
+    // The case that made bounding by `networkStats.upload_speed` untenable: two
+    // slots ramping to 300 kB/s each while the status bar still reads the 180
+    // kB/s it sampled up to three seconds ago (and longer if the window was
+    // hidden). Bounding by that figure printed each row at ~30% of its measured
+    // rate. With uploads unlimited there is nothing to bound against at all…
+    const ramping = [300 * KB, 300 * KB];
+    const staleTotal = 180 * KB;
+    expect(uploadScaleFactor(uploadSumBound(0), ramping)).toBe(1);
+    // …and with a cap set, only the cap may tighten the column: the stale total
+    // must never scale a row below the share of the cap it is entitled to.
+    const factor = uploadScaleFactor(uploadSumBound(REPORTED_CAP), ramping);
+    expect(sumOf(ramping, factor)).toBeCloseTo(REPORTED_CAP, 6);
+    expect(sumOf(ramping, factor)).toBeGreaterThan(staleTotal);
   });
 
   it('is not diluted by rows that are printing nothing', () => {
