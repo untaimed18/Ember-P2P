@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "未選擇對話",
   "chat_dock_empty_hint": "從「好友」頁面發起聊天后，會在此處以標籤頁顯示。",
   "chat_dock_empty_cta": "前往好友",
+  "chat_dock_resize": "調整聊天面板大小",
+  "chat_dock_resize_title": "拖動以調整大小。雙擊重設，或使用方向鍵。",
   "chat_input_placeholder": "輸入訊息…（Enter 傳送，Shift+Enter 換行）",
   "chat_load_older": "載入更早的訊息",
   "chat_slow_mode_wait": "慢速模式 — {seconds} 秒",

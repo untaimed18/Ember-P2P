@@ -15,6 +15,93 @@
   import * as m from '$lib/paraglide/messages';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
+  import {
+    clampDockWidth,
+    maxDockWidth,
+    DOCK_WIDTH_DEFAULT,
+    DOCK_WIDTH_MIN,
+  } from '$lib/dockWidth';
+
+  /**
+   * How wide the dock is, in pixels, remembered per device.
+   *
+   * It used to be `min(420px, 40vw)` and nothing else — a fixed panel on every
+   * window, at a size chosen for a glance at one line rather than for the
+   * thing people actually do in it, with no way to change it.
+   */
+  const DOCK_WIDTH_KEY = 'ember.chatDock.width.v1';
+
+  /** The window as the clamp needs to see it. Zero before the DOM exists,
+   *  which `maxDockWidth` treats as "no measurement" rather than "no room". */
+  function viewport(): number {
+    return typeof window === 'undefined' ? 0 : window.innerWidth;
+  }
+
+  function loadDockWidth(): number {
+    if (typeof localStorage === 'undefined') return DOCK_WIDTH_DEFAULT;
+    try {
+      const raw = localStorage.getItem(DOCK_WIDTH_KEY);
+      if (!raw) return DOCK_WIDTH_DEFAULT;
+      return clampDockWidth(Number.parseInt(raw, 10), viewport());
+    } catch {
+      return DOCK_WIDTH_DEFAULT;
+    }
+  }
+
+  let dockWidth = $state(loadDockWidth());
+  let dockWidthMax = $state(maxDockWidth(viewport()));
+  let resizing = $state(false);
+
+  /** `persist` is false mid-drag: writing on every pointer move would put a
+   *  synchronous `localStorage` write inside the frame doing the resizing. */
+  function setDockWidth(px: number, persist = true) {
+    dockWidth = clampDockWidth(px, viewport());
+    if (!persist || typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(DOCK_WIDTH_KEY, String(dockWidth));
+    } catch {
+      // Quota exceeded / private mode. The width holds for this session.
+    }
+  }
+
+  function onResizeStart(e: PointerEvent) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    resizing = true;
+    // Or the drag selects the transcript it is dragging across.
+    e.preventDefault();
+  }
+
+  function onResizeMove(e: PointerEvent) {
+    if (!resizing) return;
+    // The dock is anchored to the right edge, so its width is simply how far
+    // the pointer is from that edge — no need to track where the drag began.
+    setDockWidth(window.innerWidth - e.clientX, false);
+  }
+
+  function onResizeEnd(e: PointerEvent) {
+    if (!resizing) return;
+    resizing = false;
+    const handle = e.currentTarget as HTMLElement;
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+    // The drag wrote nothing; this is the one write it makes.
+    setDockWidth(dockWidth);
+  }
+
+  /** The separator is focusable, so it answers the keys a separator should:
+   *  arrows nudge, Home/End go to the extremes, Enter restores the default. */
+  function onResizeKeydown(e: KeyboardEvent) {
+    const step = e.shiftKey ? 64 : 16;
+    // Left grows it, because the dock opens leftwards from the right edge.
+    if (e.key === 'ArrowLeft') setDockWidth(dockWidth + step);
+    else if (e.key === 'ArrowRight') setDockWidth(dockWidth - step);
+    else if (e.key === 'Home') setDockWidth(dockWidthMax);
+    else if (e.key === 'End') setDockWidth(DOCK_WIDTH_MIN);
+    else if (e.key === 'Enter' || e.key === ' ') setDockWidth(DOCK_WIDTH_DEFAULT);
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
@@ -103,9 +190,21 @@
     }
   }
 
+  // A window narrowed past the stored width would otherwise leave the dock
+  // covering the app with no way back except widening the window again.
+  function onWindowResize() {
+    dockWidthMax = maxDockWidth(viewport());
+    if (dockWidth > dockWidthMax) setDockWidth(dockWidthMax);
+  }
+
   onMount(() => {
     window.addEventListener('keydown', onKeydown);
-    return () => window.removeEventListener('keydown', onKeydown);
+    window.addEventListener('resize', onWindowResize);
+    onWindowResize();
+    return () => {
+      window.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('resize', onWindowResize);
+    };
   });
 
   function unreadFor(hash: string): number {
@@ -197,12 +296,41 @@
   -->
   <div
     class="chat-dock"
+    class:resizing
+    style="width: {dockWidth}px"
     bind:this={panelEl}
     role="complementary"
     aria-label={m.chat_dock_aria_label()}
     aria-keyshortcuts={`Escape ${shortcutModAria()}+/`}
     tabindex="-1"
   >
+    <!--
+      A real separator rather than a decorative grip: it is focusable and
+      answers arrows, so the panel can be sized without a pointer at all.
+      `touch-action: none` in the stylesheet is what stops a touch drag here
+      scrolling the page instead of resizing.
+    -->
+    <!-- A focusable `separator` carrying `aria-value*` is the WAI-ARIA window
+         splitter, which *is* a widget — the rules below assume `separator`
+         is always the decorative kind and cannot tell the two apart. -->
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+    <div
+      class="dock-resize"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={m.chat_dock_resize()}
+      aria-valuenow={dockWidth}
+      aria-valuemin={DOCK_WIDTH_MIN}
+      aria-valuemax={dockWidthMax}
+      title={m.chat_dock_resize_title()}
+      tabindex="0"
+      onpointerdown={onResizeStart}
+      onpointermove={onResizeMove}
+      onpointerup={onResizeEnd}
+      onpointercancel={onResizeEnd}
+      ondblclick={() => setDockWidth(DOCK_WIDTH_DEFAULT)}
+      onkeydown={onResizeKeydown}
+    ></div>
     <div class="dock-tabs" role="tablist" aria-label={m.chat_dock_tablist_aria()}>
       {#if $chatTabs.length === 0}
         <div class="dock-empty-tabs">{m.chat_dock_no_open()}</div>
@@ -301,7 +429,10 @@
     top: 0;
     right: 0;
     bottom: var(--statusbar-height);
-    width: min(420px, 40vw);
+    /* Width is an inline style so it can be dragged; this is only the floor
+       and the ceiling the drag is clamped to, restated for a first paint that
+       happens before the mount handler has measured the window. */
+    min-width: 320px;
     max-width: 100vw;
     background: var(--bg-primary);
     border-left: 1px solid var(--border);
@@ -310,6 +441,38 @@
     flex-direction: column;
     box-shadow: var(--shadow-panel-left);
     outline: none;
+  }
+
+  /* Mid-drag the pointer is captured by the handle, but the press began over
+     the panel — without this the transcript selects as the pointer crosses it. */
+  .chat-dock.resizing {
+    user-select: none;
+  }
+
+  .dock-resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    /* Straddles the border rather than sitting inside it, so the target is
+       where the edge looks like it is. */
+    left: -3px;
+    width: 7px;
+    z-index: 2;
+    cursor: col-resize;
+    background: transparent;
+    /* A touch drag here resizes; without this the gesture scrolls the page. */
+    touch-action: none;
+    transition: background var(--transition-fast);
+  }
+
+  .dock-resize:hover,
+  .dock-resize:focus-visible {
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+    outline: none;
+  }
+
+  .chat-dock.resizing .dock-resize {
+    background: var(--accent);
   }
 
   .dock-tabs {

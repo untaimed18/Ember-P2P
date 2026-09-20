@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "Беседа не выбрана",
   "chat_dock_empty_hint": "Начните чат на странице «Друзья» — он появится здесь во вкладке.",
   "chat_dock_empty_cta": "Перейти к друзьям",
+  "chat_dock_resize": "Изменить размер панели чата",
+  "chat_dock_resize_title": "Перетащите, чтобы изменить размер. Двойной щелчок — сброс, или стрелки.",
   "chat_input_placeholder": "Введите сообщение... (Enter — отправить, Shift+Enter — новая строка)",
   "chat_load_older": "Загрузить более ранние сообщения",
   "chat_slow_mode_wait": "Медленный режим — {seconds} с",

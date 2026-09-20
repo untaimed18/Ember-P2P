@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "Aucune conversation sélectionnée",
   "chat_dock_empty_hint": "Démarrez un chat depuis la page Amis ; il apparaîtra ici en onglet.",
   "chat_dock_empty_cta": "Aller aux Amis",
+  "chat_dock_resize": "Redimensionner le panneau de discussion",
+  "chat_dock_resize_title": "Faites glisser pour redimensionner. Double-cliquez pour réinitialiser, ou utilisez les flèches.",
   "chat_input_placeholder": "Écrire un message... (Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne)",
   "chat_load_older": "Charger les messages plus anciens",
   "chat_slow_mode_wait": "Mode lent — {seconds} s",

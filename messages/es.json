@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "Ninguna conversación seleccionada",
   "chat_dock_empty_hint": "Inicia un chat desde la página de Amigos y aparecerá aquí como pestaña.",
   "chat_dock_empty_cta": "Ir a Amigos",
+  "chat_dock_resize": "Cambiar el tamaño del panel de chat",
+  "chat_dock_resize_title": "Arrastra para cambiar el tamaño. Doble clic para restablecer, o usa las flechas.",
   "chat_input_placeholder": "Escribe un mensaje... (Intro para enviar, Mayús+Intro para nueva línea)",
   "chat_load_older": "Cargar mensajes anteriores",
   "chat_slow_mode_wait": "Modo lento: {seconds} s",

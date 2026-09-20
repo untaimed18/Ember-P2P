@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "Keine Unterhaltung ausgewählt",
   "chat_dock_empty_hint": "Starten Sie einen Chat über die Freundeseite. Er wird dann hier als Tab angezeigt.",
   "chat_dock_empty_cta": "Zu Freunde wechseln",
+  "chat_dock_resize": "Chat-Bereich anpassen",
+  "chat_dock_resize_title": "Zum Anpassen ziehen. Doppelklick setzt zurück, oder die Pfeiltasten verwenden.",
   "chat_input_placeholder": "Nachricht eingeben... (Enter zum Senden, Umschalt+Enter für neue Zeile)",
   "chat_load_older": "Ältere Nachrichten laden",
   "chat_slow_mode_wait": "Langsamer Modus – {seconds}s",

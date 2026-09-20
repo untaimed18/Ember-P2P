@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "No conversation selected",
   "chat_dock_empty_hint": "Start a chat from the Friends page, then it'll show up here as a tab.",
   "chat_dock_empty_cta": "Go to Friends",
+  "chat_dock_resize": "Resize the chat panel",
+  "chat_dock_resize_title": "Drag to resize. Double-click to reset, or use the arrow keys.",
   "chat_input_placeholder": "Type a message... (Enter to send, Shift+Enter for newline)",
   "chat_load_older": "Load older messages",
   "chat_slow_mode_wait": "Slow mode — {seconds}s",

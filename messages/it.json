@@ -257,6 +257,8 @@
   "chat_dock_empty_title": "Nessuna conversazione selezionata",
   "chat_dock_empty_hint": "Avvia una chat dalla pagina Amici: comparirà qui come scheda.",
   "chat_dock_empty_cta": "Vai ad Amici",
+  "chat_dock_resize": "Ridimensiona il pannello chat",
+  "chat_dock_resize_title": "Trascina per ridimensionare. Doppio clic per ripristinare, o usa le frecce.",
   "chat_input_placeholder": "Scrivi un messaggio... (Invio per inviare, Maiusc+Invio per andare a capo)",
   "chat_load_older": "Carica messaggi precedenti",
   "chat_slow_mode_wait": "Modalità lenta — {seconds} s",
