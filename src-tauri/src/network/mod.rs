@@ -16771,11 +16771,11 @@ async fn apply_channel_presence_beacons(
 ///
 /// Split from the collection below so the rule can be tested without a
 /// `Database`, which has no constructor outside a real store.
-fn select_rendezvous_rooms<'a>(
-    roster: &'a [crate::storage::database::StoredChannel],
+fn select_rendezvous_rooms(
+    roster: &[crate::storage::database::StoredChannel],
     focused: Option<[u8; 16]>,
     beat: u64,
-) -> Vec<&'a crate::storage::database::StoredChannel> {
+) -> Vec<&crate::storage::database::StoredChannel> {
     let focused_hex = focused.map(hex::encode);
     let mut selected: Vec<&crate::storage::database::StoredChannel> = Vec::new();
     if let Some(ref id) = focused_hex {
