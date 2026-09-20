@@ -4587,11 +4587,39 @@ impl UploadHandler {
             .unwrap_or_else(|| super::messages::OP_OTHER_SHARED_FILES.to_string())
     }
 
+    /// The directory label to send a peer that never claimed Unicode support.
+    ///
+    /// eMule picks the encoding per peer: `GetUnicodeSupport()` feeds
+    /// `CFileDataIO::WriteString`, which writes raw UTF-8 only for a Unicode
+    /// peer and the local ANSI codepage otherwise (`SafeFile.cpp:170-192`).
+    /// Ember writes UTF-8 unconditionally, and copying eMule properly would mean
+    /// picking a codepage for a peer whose locale we do not know — guess wrong
+    /// and the name is corrupted for a peer that would otherwise have read it.
+    ///
+    /// ASCII sidesteps the question entirely, because it is a subset of every
+    /// ANSI codepage: a folded label decodes to the same characters whatever the
+    /// peer assumes it is reading. So a non-ASCII folder name is degraded rather
+    /// than turned into mojibake, and only for a peer that told us it cannot
+    /// read anything else. eMule's own ANSI conversion substitutes for an
+    /// unmappable character in the same way.
+    fn browse_label_for_peer(label: &str, peer_supports_unicode: bool) -> String {
+        if peer_supports_unicode || label.is_ascii() {
+            return label.to_string();
+        }
+        label
+            .chars()
+            .map(|c| if c.is_ascii() { c } else { '_' })
+            .collect()
+    }
+
     /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
-    async fn build_shared_dirs_answer(&self) -> Vec<u8> {
+    async fn build_shared_dirs_answer(&self, peer_supports_unicode: bool) -> Vec<u8> {
         let mut labels: Vec<String> = Vec::new();
         for (folder, _) in self.browsable_files_by_folder().await {
-            let label = Self::browse_dir_label(&folder);
+            let label = Self::browse_label_for_peer(
+                &Self::browse_dir_label(&folder),
+                peer_supports_unicode,
+            );
             if !labels.contains(&label) {
                 labels.push(label);
             }
@@ -4615,12 +4643,23 @@ impl UploadHandler {
         requested: &str,
         client_id: u32,
         peer_supports_large_files: bool,
+        peer_supports_unicode: bool,
     ) -> Vec<u8> {
         let files: Vec<(String, String, u64, String)> = self
             .browsable_files_by_folder()
             .await
             .into_iter()
-            .filter(|(folder, _)| Self::browse_dir_label(folder) == requested)
+            // A peer echoes back the label we sent it, so a peer that was sent a
+            // folded label asks for the folded one. Only consulted for a peer
+            // without Unicode support: folding on a Unicode peer's behalf could
+            // let its exact request match a *different* folder whose name folds
+            // onto the same ASCII.
+            .filter(|(folder, _)| {
+                let label = Self::browse_dir_label(folder);
+                label == requested
+                    || (!peer_supports_unicode
+                        && Self::browse_label_for_peer(&label, false) == requested)
+            })
             .map(|(_, entry)| entry)
             .collect();
 
@@ -10756,7 +10795,9 @@ impl UploadHandler {
                             continue;
                         }
                         last_browse = Some(std::time::Instant::now());
-                        let resp = self.build_shared_dirs_answer().await;
+                        let resp = self
+                            .build_shared_dirs_answer(hello_caps.supports_unicode)
+                            .await;
                         self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                             .await?;
                         write_packet_async(
@@ -10821,6 +10862,7 @@ impl UploadHandler {
                             &requested,
                             client_id,
                             hello_caps.supports_large_files,
+                            hello_caps.supports_unicode,
                         )
                         .await;
                     self.acquire_upload_bandwidth((6 + resp.len()) as u64)
@@ -13137,6 +13179,43 @@ mod unique_served_tests {
              are ever equal the caller has passed one counter twice, which is \
              the bug this pins"
         );
+    }
+
+    /// A peer that never claimed Unicode support gets a label it can actually
+    /// decode, and the request it echoes back still resolves to the folder.
+    ///
+    /// The round trip is the point: the label we send is the only string the
+    /// peer has to ask with, so folding the answer without also accepting the
+    /// folded form in `OP_ASKSHAREDFILESDIR` would leave the directory visible
+    /// and permanently un-openable.
+    #[test]
+    fn a_non_unicode_peer_gets_a_label_it_can_decode() {
+        type Server = UploadHandler;
+        let folder = "Música";
+
+        let unicode = Server::browse_label_for_peer(folder, true);
+        assert_eq!(unicode, folder, "a Unicode peer gets the name unchanged");
+
+        let folded = Server::browse_label_for_peer(folder, false);
+        assert!(folded.is_ascii(), "ASCII decodes the same in every codepage");
+        assert_eq!(folded, "M_sica");
+        assert_eq!(
+            folded.chars().count(),
+            folder.chars().count(),
+            "one substitute per character, as eMule's ANSI conversion does"
+        );
+
+        // Folding is applied to the label, not the path, so it is the same
+        // string on both sides of the exchange.
+        assert_eq!(
+            Server::browse_label_for_peer(&folded, false),
+            folded,
+            "already-ASCII labels are left alone, so the match is stable"
+        );
+
+        // An ASCII folder is untouched either way — the common case pays nothing.
+        assert_eq!(Server::browse_label_for_peer("Videos", false), "Videos");
+        assert_eq!(Server::browse_label_for_peer("Videos", true), "Videos");
     }
 
     #[test]

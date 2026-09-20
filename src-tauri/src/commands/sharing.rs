@@ -141,11 +141,22 @@ type HashPassResult = anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64
 /// `PARTSIZE` is two parts to it (one of data, one empty) and it does compute a
 /// root. Asking with `>` instead left that one size unable to recover a missing
 /// root through any route, since this is what decides whether it is computed.
-fn wanted_top_up(file: &FileInfo) -> crate::network::ed2k::hash::WantedDigests {
+/// Taken apart from `FileInfo` so the narrow [`TopUpRow`] answers it with the
+/// same code rather than a copy of the rule — the drift `wants_hash_top_up`
+/// warns about, one layer down.
+fn wanted_digests(
+    aich_hash: &str,
+    ember_file_hash: &str,
+    size: u64,
+) -> crate::network::ed2k::hash::WantedDigests {
     crate::network::ed2k::hash::WantedDigests {
-        aich: file.aich_hash.is_empty() && file.size >= crate::network::ed2k::hash::PARTSIZE,
-        ember: file.ember_file_hash.is_empty(),
+        aich: aich_hash.is_empty() && size >= crate::network::ed2k::hash::PARTSIZE,
+        ember: ember_file_hash.is_empty(),
     }
+}
+
+fn wanted_top_up(file: &FileInfo) -> crate::network::ed2k::hash::WantedDigests {
+    wanted_digests(&file.aich_hash, &file.ember_file_hash, file.size)
 }
 
 /// Whether a row has nothing left to top up.
@@ -177,14 +188,114 @@ pub(crate) fn wants_hash_top_up(file: &FileInfo) -> bool {
 /// the background pass started passing rows under their real content-hash
 /// ids — they would have taken the full three-algorithm pass for want of a
 /// prefix, on exactly the libraries where the saving matters most.
-fn top_up_inputs(
-    file: &FileInfo,
-) -> Option<(
+/// What the hash pipeline needs from a row, so it can schedule work for either
+/// the scan's `FileInfo` rows or the top-up's narrow ones.
+///
+/// It reads three things and nothing else — where the file is, what to call it
+/// in a log, and which digests to ask for — which is what lets the background
+/// pass queue something far smaller than a whole `FileInfo`.
+pub(crate) trait HashCandidate {
+    fn path(&self) -> &str;
+    fn name(&self) -> &str;
+    fn top_up(&self) -> Option<TopUpInputs>;
+}
+
+/// The stored digests handed to a top-up read, plus which of them to recompute.
+/// All three travel even when only one is wanted: whatever the pass is not asked
+/// for is handed back unchanged rather than blank, because the caller assigns
+/// the result onto the row.
+pub(crate) type TopUpInputs = (
     String,
     String,
     String,
     crate::network::ed2k::hash::WantedDigests,
-)> {
+);
+
+/// The columns the background top-up pass reads, and nothing else.
+///
+/// The queue used to hold whole `FileInfo` rows. It is fed from the startup
+/// hydration, where on the run that matters most — a first launch after an
+/// upgrade, on a library big enough to have paginated — that is every shared
+/// file, resident twice until the pass drains it. `FileInfo` carries nine
+/// `String` fields and a dozen counters; the pass reads five and two. Nothing
+/// here is a copy of state that can change underneath it either: the size and
+/// mtime are the ones discovery recorded, which is exactly what the
+/// changed-since-discovery check wants to compare against.
+#[derive(Clone)]
+pub(crate) struct TopUpRow {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) hash: String,
+    pub(crate) aich_hash: String,
+    pub(crate) ember_file_hash: String,
+    pub(crate) size: u64,
+    pub(crate) modified_at: i64,
+}
+
+impl TopUpRow {
+    /// `None` when the row has nothing to top up, so the queue never holds a
+    /// file it would immediately skip.
+    fn from_file(file: &FileInfo) -> Option<Self> {
+        if !wants_hash_top_up(file) {
+            return None;
+        }
+        Some(Self {
+            path: file.path.clone(),
+            name: file.name.clone(),
+            hash: file.hash.clone(),
+            aich_hash: file.aich_hash.clone(),
+            ember_file_hash: file.ember_file_hash.clone(),
+            size: file.size,
+            modified_at: file.modified_at,
+        })
+    }
+
+    fn wanted(&self) -> crate::network::ed2k::hash::WantedDigests {
+        wanted_digests(&self.aich_hash, &self.ember_file_hash, self.size)
+    }
+}
+
+impl HashCandidate for TopUpRow {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn top_up(&self) -> Option<TopUpInputs> {
+        if self.hash.is_empty() {
+            return None;
+        }
+        let want = self.wanted();
+        if top_up_complete(want) {
+            return None;
+        }
+        Some((
+            self.hash.clone(),
+            self.aich_hash.clone(),
+            self.ember_file_hash.clone(),
+            want,
+        ))
+    }
+}
+
+impl HashCandidate for FileInfo {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn top_up(&self) -> Option<TopUpInputs> {
+        top_up_inputs(self)
+    }
+}
+
+fn top_up_inputs(file: &FileInfo) -> Option<TopUpInputs> {
     if file.hash.is_empty() {
         return None;
     }
@@ -254,8 +365,8 @@ pub(crate) struct StartedHash {
 /// into head travel, but one read each on four drives is four drives working
 /// instead of three sitting idle. A library on a single mechanical disk still
 /// reads exactly one file at a time.
-pub(crate) struct HashLookahead<'a> {
-    files: &'a [FileInfo],
+pub(crate) struct HashLookahead<'a, T: HashCandidate> {
+    files: &'a [T],
     /// One queue per distinct device, each holding its files in discovery
     /// order, plus how many of its reads may be in flight at once.
     devices: Vec<DeviceQueue>,
@@ -290,8 +401,8 @@ struct DeviceQueue {
     pending: std::collections::VecDeque<usize>,
 }
 
-impl<'a> HashLookahead<'a> {
-    pub(crate) fn new(files: &'a [FileInfo], cancel: Arc<AtomicBool>) -> Self {
+impl<'a, T: HashCandidate> HashLookahead<'a, T> {
+    pub(crate) fn new(files: &'a [T], cancel: Arc<AtomicBool>) -> Self {
         // Group by physical device. Memoised on the parent directory because a
         // file and its directory are always on the same device, and resolving
         // one costs a syscall per path on Linux — tens of thousands of them on
@@ -306,7 +417,7 @@ impl<'a> HashLookahead<'a> {
             HashMap::new();
         let mut devices: Vec<DeviceQueue> = Vec::new();
         for (index, file) in files.iter().enumerate() {
-            let path = std::path::Path::new(&file.path);
+            let path = std::path::Path::new(file.path());
             let parent = path
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -466,17 +577,17 @@ impl<'a> HashLookahead<'a> {
                 break;
             };
             let file = &self.files[index];
-            let Some(claim) = try_claim_in_flight_hash(&file.path) else {
+            let Some(claim) = try_claim_in_flight_hash(file.path()) else {
                 warn!(
                     "Skipping hash of {} — a previous timed-out hash is still running",
-                    file.name
+                    file.name()
                 );
                 self.skipped += 1;
                 continue;
             };
-            let path = file.path.clone();
+            let path = file.path().to_string();
             let cancel = self.cancel.clone();
-            let top_up = top_up_inputs(file);
+            let top_up = file.top_up();
             let task = tokio::task::spawn_blocking(move || {
                 let path = std::path::Path::new(&path);
                 match top_up {
@@ -505,7 +616,7 @@ impl<'a> HashLookahead<'a> {
     /// would refuse to touch that file. Same drain the per-file timeout branch
     /// performs, for the same reason.
     pub(crate) fn drain_started(&self, started: StartedHash) {
-        let path = self.files[started.index].path.clone();
+        let path = self.files[started.index].path().to_string();
         tokio::spawn(async move {
             let _ = started.task.await;
             release_in_flight_hash(&path, started.claim);
@@ -1626,7 +1737,7 @@ struct HashTopUp {
     /// `queue_hash_top_up`'s `wants_hash_top_up` check drops them without a
     /// read. Cleared when the pass ends, alongside `running`.
     queued_hashes: HashSet<String>,
-    queued: Vec<FileInfo>,
+    queued: Vec<TopUpRow>,
     done: usize,
     total: usize,
 }
@@ -1641,7 +1752,7 @@ fn hash_top_up() -> &'static tokio::sync::Mutex<HashTopUp> {
 /// Additive: a second scan while one is running appends to the same queue
 /// rather than starting a competing pass, which is what keeps the per-device
 /// read limits meaningful.
-pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: Vec<FileInfo>) {
+pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: &[FileInfo]) {
     if files.is_empty() {
         return;
     }
@@ -1661,11 +1772,12 @@ pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: Vec<FileInfo
     for file in files {
         // A row with no ed2k hash has never been hashed and belongs to the
         // scan, not here; a row with both top-ups already present would be a
-        // whole-file read that computes nothing.
-        if !wants_hash_top_up(&file) {
+        // whole-file read that computes nothing. Narrowed here rather than by
+        // the caller, so nothing upstream has to clone a whole row to ask.
+        let Some(row) = TopUpRow::from_file(file) else {
             continue;
-        }
-        let path_key = crate::search::index::normalize_path_key(&file.path);
+        };
+        let path_key = crate::search::index::normalize_path_key(&row.path);
         // Path first, and without recording anything: this row is already
         // queued or done, so it must not consume the content reservation
         // below on behalf of a copy it is not.
@@ -1675,12 +1787,12 @@ pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: Vec<FileInfo
         // One copy per content hash. A skipped copy's path stays out of
         // `seen`, so a later scan can offer it if the copy we kept never
         // produces a digest. See `queued_hashes`.
-        if !state.queued_hashes.insert(file.hash.to_ascii_lowercase()) {
+        if !state.queued_hashes.insert(row.hash.to_ascii_lowercase()) {
             continue;
         }
         state.seen.insert(path_key);
         state.total += 1;
-        state.queued.push(file);
+        state.queued.push(row);
     }
     if state.running || state.queued.is_empty() {
         return;
@@ -2867,7 +2979,7 @@ pub async fn add_shared_folder(
             // Only now, with every file that could not be served already
             // hashed, hand the optional repairs to the background. Cancelling
             // the scan skips this too: Stop means leave the disks alone.
-            queue_hash_top_up(app.clone(), needs_top_up).await;
+            queue_hash_top_up(app.clone(), &needs_top_up).await;
         }
         remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
 
@@ -4483,7 +4595,7 @@ async fn reload_shared_files_page(
             // Only now, with every file that could not be served already
             // hashed, hand the optional repairs to the background. Cancelling
             // the reload skips this too: Stop means leave the disks alone.
-            queue_hash_top_up(app.clone(), needs_top_up).await;
+            queue_hash_top_up(app.clone(), &needs_top_up).await;
         }
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
@@ -5194,6 +5306,53 @@ mod tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    /// The narrow queue row has to reach the same verdict as the full row it
+    /// was built from, for every combination of what is already stored.
+    ///
+    /// It exists to keep a whole `FileInfo` per queued file out of memory, and
+    /// the way that goes wrong is silently: a row that `wants_hash_top_up`
+    /// accepts but `TopUpRow` declines is a repair that never happens, with
+    /// nothing to show for it. Both sides answer through `wanted_digests` for
+    /// exactly this reason — this pins that they still do.
+    #[test]
+    fn the_narrow_queue_row_decides_what_the_full_row_would() {
+        let multi_part = crate::network::ed2k::hash::PARTSIZE;
+        for (aich, ember, size) in [
+            ("", "", multi_part),          // both wanted
+            ("", "", 1),                   // single part: ember only
+            ("aich", "", multi_part),      // ember only
+            ("", "ember", multi_part),     // aich only
+            ("aich", "ember", multi_part), // nothing wanted
+            ("aich", "ember", 1),
+        ] {
+            let mut file = indexed_file("C:/s/f.bin", "ab".repeat(16).as_str());
+            file.aich_hash = aich.to_string();
+            file.ember_file_hash = ember.to_string();
+            file.size = size;
+
+            let row = TopUpRow::from_file(&file);
+            assert_eq!(
+                row.is_some(),
+                wants_hash_top_up(&file),
+                "queued-or-not disagreed for aich={aich:?} ember={ember:?} size={size}"
+            );
+            if let Some(row) = row {
+                assert_eq!(
+                    row.top_up().map(|(_, _, _, want)| want),
+                    top_up_inputs(&file).map(|(_, _, _, want)| want),
+                    "asked for different digests for aich={aich:?} ember={ember:?} size={size}"
+                );
+            }
+        }
+
+        // A row that was never hashed belongs to the scan, not here, whichever
+        // side is asked.
+        let mut unhashed = indexed_file("C:/s/new.bin", "");
+        unhashed.hash = String::new();
+        assert!(TopUpRow::from_file(&unhashed).is_none());
+        assert!(!wants_hash_top_up(&unhashed));
     }
 
     fn known_record(

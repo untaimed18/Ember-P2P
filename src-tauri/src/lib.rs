@@ -1145,11 +1145,20 @@ pub fn run() {
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
-                // Already-servable rows wanting only the Ember digest. Kept
-                // out of `files_to_hash` so a cold start is not a full re-read
-                // of the library; handed to the background pass once the scan
-                // has finished with the drives.
-                let mut startup_hash_top_up: Vec<crate::types::FileInfo> = Vec::new();
+                // Rows wanting only a digest repair are deliberately *not*
+                // accumulated here. They are already servable, so they stay out
+                // of `files_to_hash` — a cold start is not a full re-read of the
+                // library — and the background pass is handed `all_discovered`
+                // itself once the scan has finished with the drives. Collecting
+                // them separately meant cloning a whole `FileInfo` per row and
+                // holding both copies until the pass drained, which on the run
+                // that matters most (first launch after an upgrade, library big
+                // enough to paginate) is the entire share resident twice.
+                // `queue_hash_top_up` applies the same `wants_hash_top_up`
+                // predicate and narrows to the few columns the pass reads, so
+                // the list it builds is the same one — minus the rows the
+                // shared-folder retain below drops, which have no business
+                // costing a whole-file read.
                 // Paths with no known.met record at all — genuinely new to
                 // this library, as opposed to a previously-shared file that's
                 // merely being rediscovered. Only these should inherit a
@@ -1205,9 +1214,6 @@ pub fn run() {
                         // its content-hash id and enters the index as an
                         // ordinary entry. ed2k comes out identical either way;
                         // only the missing digests are filled.
-                        if commands::sharing::wants_hash_top_up(file) {
-                            startup_hash_top_up.push(file.clone());
-                        }
                     } else {
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
                         files_to_hash.push(file.clone());
@@ -1361,21 +1367,6 @@ pub fn run() {
                         // cycle, stands aside for real scans, checkpoints as it
                         // goes and resumes where it stopped. Its cost is set by
                         // the drives, not by how much is queued.
-                        //
-                        // That argument is about drive time, and there is a
-                        // second cost it does not cover: this clone means every
-                        // row wanting a repair is resident twice until the pass
-                        // drains it, plus a `seen` entry per path. On the run
-                        // where it matters most — a first launch after upgrade,
-                        // where the whole library wants a digest, and a library
-                        // big enough to have paginated to get here — that is the
-                        // full set duplicated. Bounded and transient, but if it
-                        // ever needs to come down, the fix is for the queue to
-                        // hold the few fields the pass reads rather than a whole
-                        // `FileInfo`.
-                        if commands::sharing::wants_hash_top_up(&hydrated) {
-                            startup_hash_top_up.push(hydrated.clone());
-                        }
                         all_discovered.push(hydrated);
                     }
                 }
@@ -1743,7 +1734,7 @@ pub fn run() {
                     // Last, and only once the scan has let go of the drives.
                     commands::sharing::queue_hash_top_up(
                         startup_app.clone(),
-                        startup_hash_top_up,
+                        &all_discovered,
                     )
                     .await;
                 }
