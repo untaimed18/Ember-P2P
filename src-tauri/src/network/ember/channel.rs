@@ -155,7 +155,27 @@ pub const MODERATION_REPUBLISH_SECS: i64 = 6 * 60 * 60;
 /// does not free it after a year of silence.
 pub const USERNAME_REFRESH_SECS: i64 = 24 * 60 * 60;
 /// Cap on rooms whose XOR-neighbors we register at rendezvous per heartbeat.
+///
+/// A wire budget, not a comfort setting. Each selected room registers
+/// [`CHANNEL_NEIGHBOR_COUNT`] capabilities as one HTTP POST apiece, on top of
+/// the intro and one per friend, and the server admits 60 requests a minute
+/// from an address. Four rooms is already 32 of those in a burst; raising it
+/// is how a user with a normal friend list starts being rate-limited off
+/// presence entirely.
 pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
+/// How many heartbeats a registration outlives, and so how far the room
+/// selection may rotate without letting an entry lapse.
+///
+/// The server expires presence after 300s and we heartbeat every 120s, so an
+/// entry written on this beat is still live on the next one and gone before
+/// the one after. Rotating the non-focused slots across two beats therefore
+/// keeps twice as many rooms reachable for the same number of POSTs — which
+/// is the only way to widen coverage, since the cap above is fixed by a limit
+/// on the other end.
+pub const CHANNEL_RENDEZVOUS_ROTATION_DEPTH: usize = 2;
+/// Rooms that can hold a live rendezvous registration at once.
+pub const CHANNEL_RENDEZVOUS_COVERAGE: usize =
+    CHANNEL_RENDEZVOUS_MAX_CHANNELS * CHANNEL_RENDEZVOUS_ROTATION_DEPTH;
 /// Deterministic gossip degree: XOR-closest members to self.
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.

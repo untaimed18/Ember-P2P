@@ -1,6 +1,12 @@
 import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { listChannels, listChannelTransfers, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
+import {
+  listChannels,
+  listChannelTransfers,
+  respondChannelTransfer,
+  type ChannelInfo,
+  type ChannelTransferInfo,
+} from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
 import { toast } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
@@ -439,13 +445,28 @@ export function mergeChannelUnreadFromSnapshot(
 export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
 
 /** Incoming Ember Transfer offers still waiting for a decision. */
-export const awaitingChannelOffers = derived(
-  channelTransfers,
-  (xfers) =>
-    Object.values(xfers).filter(
-      (xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting',
-    ).length,
+export const awaitingChannelOfferList = derived(channelTransfers, (xfers) =>
+  Object.values(xfers)
+    .filter((xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting')
+    // Stable, so a row does not jump while the user is reaching for it.
+    .sort((a, b) => a.xfer_id.localeCompare(b.xfer_id)),
 );
+
+export const awaitingChannelOffers = derived(
+  awaitingChannelOfferList,
+  (offers) => offers.length,
+);
+
+/**
+ * Answer a room file offer from outside the room it arrived in.
+ *
+ * The Channels page calls the command directly because it also tracks which
+ * row is busy across the whole transfer strip; this is the same command for
+ * the dock, which only ever sees offers still waiting on a decision.
+ */
+export async function respondToChannelOffer(xferId: string, accept: boolean): Promise<void> {
+  await respondChannelTransfer(xferId, accept);
+}
 
 const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'complete',

@@ -77,6 +77,10 @@ export interface ChannelPresenceDelta {
   members: { member_pubkey: string; last_seen: number }[];
 }
 
+/** Whether an originated room line reached anybody. Received lines are always
+ *  `delivered` — we have it, which is the whole claim. */
+export type ChannelDelivery = 'delivered' | 'queued' | 'failed';
+
 export interface ChannelMessageInfo {
   id: number;
   sender_pubkey: string;
@@ -92,6 +96,7 @@ export interface ChannelMessageInfo {
    * meaningless to the peer that sent it — so the UI needs this to match them up.
    */
   msg_id: string;
+  delivery: ChannelDelivery;
 }
 
 /** Wire values for a reaction. `None` withdraws one. */

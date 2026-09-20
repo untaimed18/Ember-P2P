@@ -6801,6 +6801,60 @@ async fn handle_command_inner(
             let _ = tx.send(());
         }
 
+        NetworkCommand::DeclineFriendRequest {
+            ember_hash: decline_hash,
+        } => {
+            // The queued row is the authority on whether a refusal is owed and
+            // where the sender was last seen. `reject_and_queue_friend_decline`
+            // wrote it in the same transaction that deleted the request, so by
+            // the time this runs the address here is the only copy left.
+            let db_lookup = db.clone();
+            let queued =
+                tokio::task::spawn_blocking(move || db_lookup.pending_friend_request_declines())
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.ok())
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .find(|(hash, ..)| hash == &hex::encode(decline_hash))
+                    });
+            let Some((hash_hex, last_ip, last_port)) = queued else {
+                debug!(
+                    "No friend-request decline owed to {}",
+                    hex::encode(decline_hash)
+                );
+                return;
+            };
+            let stored = last_ip
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .filter(|_| last_port > 0)
+                .map(|ip| std::net::SocketAddr::new(ip, last_port));
+            // Same delivery path the retry sweep uses, so a rejection gets the
+            // rendezvous fallback too rather than only the stored address. The
+            // row stays queued if this attempt fails.
+            tokio::spawn(crate::network::deliver_friend_request_verdict(
+                crate::network::FriendRequestVerdict::Decline,
+                db.clone(),
+                settings.rendezvous_url.clone(),
+                hash_hex,
+                decline_hash,
+                stored,
+                state.user_hash,
+                ember_hash,
+                settings.nickname.clone(),
+                state
+                    .external_ip
+                    .map(|eip| u32::from_le_bytes(eip.octets()))
+                    .unwrap_or(0),
+                advertised_tcp_port(state),
+                advertised_udp_port(state),
+                settings.friend_session_encryption,
+                ed25519_pubkey,
+                ed25519_secret_key,
+            ));
+        }
+
         NetworkCommand::RetractFriendRequest {
             ember_hash: retract_hash,
         } => {
@@ -6842,7 +6896,8 @@ async fn handle_command_inner(
             // Same delivery path the retry sweep uses, so cancelling gets the
             // rendezvous fallback too rather than only the stored address. The
             // row stays queued if this attempt fails.
-            tokio::spawn(crate::network::deliver_friend_request_retraction(
+            tokio::spawn(crate::network::deliver_friend_request_verdict(
+                crate::network::FriendRequestVerdict::Withdraw,
                 db.clone(),
                 settings.rendezvous_url.clone(),
                 hash_hex,

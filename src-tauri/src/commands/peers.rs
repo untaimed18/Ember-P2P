@@ -1149,19 +1149,39 @@ pub async fn reject_friend_request(
     // hash is rejected before it reaches the database. The DB path
     // uses bound parameters and is safe today, but consistency makes
     // the contract obvious and protects against future refactors.
-    parse_user_hash(&sender_hash)?;
+    let hash = parse_user_hash(&sender_hash)?;
     let canonical = sender_hash.to_lowercase();
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.remove_friend_request(&canonical))
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| {
-            coded_ctx(
-                "peers_failed_reject_friend_request",
-                "Failed to reject friend request",
-                e,
-            )
-        })
+    // Deletes the request and copies its address into the decline queue in one
+    // transaction, for the reason the withdrawal queue exists: the request row
+    // holds the only address we have for somebody who is not a friend, so it
+    // has to be taken at the moment of removal or the courier has nowhere to
+    // dial. `false` means we have no usable address — the rejection still
+    // stands locally, it simply cannot be delivered.
+    let owes_decline = tokio::task::spawn_blocking(move || {
+        db.reject_and_queue_friend_decline(&canonical)
+    })
+    .await
+    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+    .map_err(|e| {
+        coded_ctx(
+            "peers_failed_reject_friend_request",
+            "Failed to reject friend request",
+            e,
+        )
+    })?;
+
+    // Dropping this on a full channel is safe: the queued row is what
+    // guarantees delivery, and the retry sweep picks it up.
+    if owes_decline {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::DeclineFriendRequest { ember_hash: hash })
+        {
+            tracing::debug!("Friend-request decline deferred to the retry sweep (channel full): {e}");
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

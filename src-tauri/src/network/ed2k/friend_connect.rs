@@ -138,6 +138,79 @@ pub async fn send_friend_request_retraction(
     ed25519_pubkey: Option<[u8; 32]>,
     ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
+    send_friend_request_verdict(
+        addr,
+        EMBER_EXT_FRIEND_RETRACT,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname,
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+}
+
+/// Tell `expected_ember_hash` that the friend request *they* sent is refused.
+///
+/// The same courier as the withdrawal above and for the same reasons — they
+/// are not a friend, so a friend session would refuse the dial, and neither
+/// message is worth loosening that guard for. Only the sub-type differs.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_friend_request_decline(
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    send_friend_request_verdict(
+        addr,
+        EMBER_EXT_FRIEND_DECLINE,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname,
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+}
+
+/// The shared dial behind a withdrawal and a decline.
+///
+/// `ext_type` is the only thing that differs between them: both are one
+/// body-less `OP_EMBER_EXT` frame delivered to somebody who is not a friend,
+/// and both depend on the same handshake to prove who is saying it.
+#[allow(clippy::too_many_arguments)]
+async fn send_friend_request_verdict(
+    addr: SocketAddr,
+    ext_type: u8,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
     let our_pk =
         ed25519_pubkey.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
     let our_sk =
@@ -210,10 +283,10 @@ pub async fn send_friend_request_retraction(
         &mut writer,
         OP_EMULEPROT,
         OP_EMBER_EXT,
-        &build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]),
+        &build_ember_ext(ext_type, &[]),
     )
     .await
-    .context("failed to send friend-request withdrawal")?;
+    .context("failed to send the friend-request verdict")?;
 
     // This connection has said everything it was opened to say, but it is the
     // peer that has to hang up first. TCP delivers in order, so the peer
@@ -248,7 +321,12 @@ pub async fn send_friend_request_retraction(
         }
     }
     info!(
-        "Withdrew friend request at {} ({})",
+        "Delivered friend-request {} at {} ({})",
+        if ext_type == EMBER_EXT_FRIEND_DECLINE {
+            "decline"
+        } else {
+            "withdrawal"
+        },
         addr,
         crate::security::short_hash(&expected_ember_hash)
     );
@@ -814,6 +892,23 @@ pub async fn run_friend_session_over_transport(
                                             let _ = session_ul_event_tx.send(UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: UploadEventKind::EmberFriendRetract {
+                                                    ember_hash: peer_ember_hash,
+                                                },
+                                            }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_FRIEND_DECLINE, _)) => {
+                                            // They are refusing a request we
+                                            // sent. Same proof of possession as
+                                            // the retraction above, and the
+                                            // handler only ever clears a row we
+                                            // have not had accepted.
+                                            debug!(
+                                                "Friend {} declined our friend request",
+                                                crate::security::short_hash(&peer_ember_hash)
+                                            );
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendDecline {
                                                     ember_hash: peer_ember_hash,
                                                 },
                                             }).await;

@@ -2667,6 +2667,135 @@ fn server_search_age_limit(search_timeout_secs: u64) -> u32 {
 }
 
 #[cfg(test)]
+mod rendezvous_room_selection_tests {
+    use super::select_rendezvous_rooms;
+    use crate::network::ember;
+    use crate::storage::database::StoredChannel;
+
+    fn room(tag: u8, in_room: bool) -> StoredChannel {
+        StoredChannel {
+            channel_id: hex::encode([tag; 16]),
+            pubkey: String::new(),
+            name: String::new(),
+            visibility: "public".into(),
+            is_owner: false,
+            topic: String::new(),
+            welcome: String::new(),
+            joined_at: 0,
+            last_active: 0,
+            member_count: 0,
+            unread: 0,
+            successor_id: String::new(),
+            predecessor_id: String::new(),
+            owner_pubkey: String::new(),
+            key_epoch: 0,
+            successor_nominee: String::new(),
+            claim_after_days: 0,
+            key_epoch_wanted: 0,
+            moderation_updated_at: 0,
+            moderation_checked_at: 0,
+            in_room,
+            deleted: false,
+            invites_owner_only: false,
+            slow_mode_secs: 0,
+        }
+    }
+
+    fn ids(rooms: &[&StoredChannel]) -> Vec<String> {
+        rooms.iter().map(|ch| ch.channel_id.clone()).collect()
+    }
+
+    const MAX: usize = ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS;
+
+    #[test]
+    fn a_roster_inside_the_cap_is_taken_whole_and_does_not_rotate() {
+        let roster: Vec<StoredChannel> = (0..MAX as u8).map(|i| room(i, true)).collect();
+        let first = ids(&select_rendezvous_rooms(&roster, None, 0));
+        // Churning registrations beat after beat for a member who already fits
+        // would cost POSTs and gain nothing.
+        for beat in 0..5 {
+            assert_eq!(ids(&select_rendezvous_rooms(&roster, None, beat)), first);
+        }
+        assert_eq!(first.len(), MAX);
+    }
+
+    #[test]
+    fn rooms_past_the_cap_are_reached_on_a_later_beat() {
+        let roster: Vec<StoredChannel> = (0..(MAX as u8 + 3)).map(|i| room(i, true)).collect();
+        let mut seen: Vec<String> = Vec::new();
+        for beat in 0..ember::channel::CHANNEL_RENDEZVOUS_ROTATION_DEPTH as u64 {
+            for id in ids(&select_rendezvous_rooms(&roster, None, beat)) {
+                if !seen.contains(&id) {
+                    seen.push(id);
+                }
+            }
+        }
+        // The whole point of the rotation: a fifth room used to be registered
+        // never, however long the session ran.
+        assert!(
+            seen.len() > MAX,
+            "rotation should reach past one beat's budget, saw {}",
+            seen.len()
+        );
+        for ch in &roster {
+            assert!(seen.contains(&ch.channel_id), "{} was never reached", ch.channel_id);
+        }
+    }
+
+    #[test]
+    fn never_registers_more_than_one_beats_budget() {
+        let roster: Vec<StoredChannel> = (0..40u8).map(|i| room(i, true)).collect();
+        for beat in 0..12 {
+            let picked = select_rendezvous_rooms(&roster, None, beat);
+            assert!(picked.len() <= MAX, "beat {beat} picked {}", picked.len());
+            let unique: std::collections::HashSet<String> = ids(&picked).into_iter().collect();
+            assert_eq!(unique.len(), picked.len(), "beat {beat} picked a room twice");
+        }
+    }
+
+    #[test]
+    fn the_focused_room_holds_a_slot_on_every_beat() {
+        let roster: Vec<StoredChannel> = (0..20u8).map(|i| room(i, true)).collect();
+        let focused = [7u8; 16];
+        let focused_hex = hex::encode(focused);
+        for beat in 0..12 {
+            let picked = ids(&select_rendezvous_rooms(&roster, Some(focused), beat));
+            assert_eq!(
+                picked.first().map(String::as_str),
+                Some(focused_hex.as_str()),
+                "beat {beat} dropped the room on screen"
+            );
+            assert!(picked.len() <= MAX);
+            let unique: std::collections::HashSet<&String> = picked.iter().collect();
+            assert_eq!(unique.len(), picked.len(), "beat {beat} picked a room twice");
+        }
+    }
+
+    #[test]
+    fn a_room_we_have_left_is_never_selected() {
+        let mut roster: Vec<StoredChannel> = (0..8u8).map(|i| room(i, true)).collect();
+        roster[2].in_room = false;
+        roster[5].deleted = true;
+        let gone = [roster[2].channel_id.clone(), roster[5].channel_id.clone()];
+        for beat in 0..8 {
+            for id in ids(&select_rendezvous_rooms(&roster, None, beat)) {
+                assert!(!gone.contains(&id), "beat {beat} selected a room we are not in");
+            }
+        }
+    }
+
+    #[test]
+    fn focus_on_a_room_we_have_left_does_not_cost_a_slot() {
+        let mut roster: Vec<StoredChannel> = (0..8u8).map(|i| room(i, true)).collect();
+        roster[3].in_room = false;
+        let focused = <[u8; 16]>::try_from(hex::decode(&roster[3].channel_id).unwrap()).unwrap();
+        let picked = select_rendezvous_rooms(&roster, Some(focused), 0);
+        assert_eq!(picked.len(), MAX);
+        assert!(!ids(&picked).contains(&roster[3].channel_id));
+    }
+}
+
+#[cfg(test)]
 mod channel_view_cache_tests {
     use super::{
         make_room_in_channel_view_cache, CachedChannelView, CHANNEL_VIEW_CACHE_MAX,
@@ -6937,17 +7066,57 @@ async fn process_inbound_friend_request(
     }
 }
 
-/// Deliver one queued friend-request withdrawal, clearing its row once it lands.
+/// Which verdict on a friend request a queued courier dial is carrying.
+///
+/// The two queues are separate tables and opposite directions of the same
+/// pair, but everything between reading a row and clearing it is identical:
+/// try the stored address, fall back to rendezvous, re-read the row in case
+/// the user countermanded it, dial, clear on success.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FriendRequestVerdict {
+    /// We sent them a request and are taking it back.
+    Withdraw,
+    /// They sent us a request and we are refusing it.
+    Decline,
+}
+
+impl FriendRequestVerdict {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Withdraw => "withdrawal",
+            Self::Decline => "decline",
+        }
+    }
+
+    fn still_owed(self, db: &Database, hash_hex: &str) -> bool {
+        let rows = match self {
+            Self::Withdraw => db.pending_friend_request_retractions(),
+            Self::Decline => db.pending_friend_request_declines(),
+        };
+        rows.map(|rows| rows.iter().any(|(hash, ..)| hash == hash_hex))
+            .unwrap_or(false)
+    }
+
+    fn clear(self, db: &Database, hash_hex: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Withdraw => db.clear_friend_request_retraction(hash_hex),
+            Self::Decline => db.clear_friend_request_decline(hash_hex),
+        }
+    }
+}
+
+/// Deliver one queued friend-request verdict, clearing its row once it lands.
 ///
 /// The stored address is where the peer answered when the request itself was
 /// delivered, so it is worth trying first and costs nothing when it still holds.
 /// The rendezvous fallback is what makes the queue worth keeping though: a peer
 /// on a dynamic address, or one we never had an address for, would otherwise sit
-/// in the queue until it expired and keep the withdrawn request on their screen
+/// in the queue until it expired and keep the stale request on their screen
 /// for good. The lookup is keyed by identity alone and does not consult the
-/// friend list, which matters because by now they are not a friend.
+/// friend list, which matters because in both directions they are not a friend.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_friend_request_retraction(
+pub(crate) async fn deliver_friend_request_verdict(
+    verdict: FriendRequestVerdict,
     db: Arc<Database>,
     rendezvous_url: String,
     hash_hex: String,
@@ -6963,6 +7132,7 @@ async fn deliver_friend_request_retraction(
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
 ) {
+    let noun = verdict.noun();
     let mut already_tried: Option<SocketAddr> = None;
     for use_rendezvous in [false, true] {
         let addr = if use_rendezvous {
@@ -6977,11 +7147,11 @@ async fn deliver_friend_request_retraction(
             {
                 Ok(Some((ip, port))) => Some(SocketAddr::new(ip.into(), port)),
                 Ok(None) => {
-                    debug!("Rendezvous has no address for {hash_hex} to withdraw at");
+                    debug!("Rendezvous has no address to deliver the {noun} to {hash_hex}");
                     None
                 }
                 Err(e) => {
-                    debug!("Rendezvous lookup for withdrawal to {hash_hex} failed: {e}");
+                    debug!("Rendezvous lookup for the {noun} to {hash_hex} failed: {e}");
                     None
                 }
             }
@@ -6999,42 +7169,58 @@ async fn deliver_friend_request_retraction(
         // re-add would otherwise land afterwards and retract the request the
         // new add had just sent.
         let db_check = db.clone();
+        let hash_for_check = hash_hex.clone();
         let still_owed = tokio::task::spawn_blocking(move || {
-            db_check.pending_friend_request_retractions()
+            verdict.still_owed(&db_check, &hash_for_check)
         })
         .await
-        .ok()
-        .and_then(|rows| rows.ok())
-        .map(|rows| rows.iter().any(|(hash, ..)| hash == &hash_hex))
         .unwrap_or(false);
         if !still_owed {
-            debug!("Withdrawal to {hash_hex} was countermanded before it was sent");
+            debug!("The {noun} to {hash_hex} was countermanded before it was sent");
             return;
         }
-        match ed2k::friend_connect::send_friend_request_retraction(
-            addr,
-            target,
-            our_user_hash,
-            our_ember_hash,
-            our_nickname.clone(),
-            our_client_id,
-            tcp_port,
-            udp_port,
-            obfuscate,
-            Some(ed25519_pubkey),
-            Some(ed25519_secret_key),
-        )
-        .await
-        {
+        let sent = match verdict {
+            FriendRequestVerdict::Withdraw => {
+                ed2k::friend_connect::send_friend_request_retraction(
+                    addr,
+                    target,
+                    our_user_hash,
+                    our_ember_hash,
+                    our_nickname.clone(),
+                    our_client_id,
+                    tcp_port,
+                    udp_port,
+                    obfuscate,
+                    Some(ed25519_pubkey),
+                    Some(ed25519_secret_key),
+                )
+                .await
+            }
+            FriendRequestVerdict::Decline => {
+                ed2k::friend_connect::send_friend_request_decline(
+                    addr,
+                    target,
+                    our_user_hash,
+                    our_ember_hash,
+                    our_nickname.clone(),
+                    our_client_id,
+                    tcp_port,
+                    udp_port,
+                    obfuscate,
+                    Some(ed25519_pubkey),
+                    Some(ed25519_secret_key),
+                )
+                .await
+            }
+        };
+        match sent {
             Ok(()) => {
-                let _ = tokio::task::spawn_blocking(move || {
-                    db.clear_friend_request_retraction(&hash_hex)
-                })
-                .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || verdict.clear(&db, &hash_hex)).await;
                 return;
             }
             Err(e) => {
-                debug!("Withdrawal to {hash_hex} at {addr} did not land: {e}");
+                debug!("The {noun} to {hash_hex} at {addr} did not land: {e}");
             }
         }
     }
@@ -12751,6 +12937,13 @@ pub enum NetworkCommand {
     RetractFriendRequest {
         ember_hash: [u8; 16],
     },
+    /// Tell somebody the request they sent has been refused. Fire-and-forget
+    /// for the same reason as the withdrawal above: the row in
+    /// `friend_request_declines` is what guarantees delivery, so rejecting
+    /// never waits on the sender being reachable this second.
+    DeclineFriendRequest {
+        ember_hash: [u8; 16],
+    },
     FindFriendAndConnect {
         ember_hash: [u8; 16],
     },
@@ -15028,6 +15221,10 @@ struct NetworkState {
     /// Originated gossip that had no neighbor (or hit the local send budget)
     /// and is waiting to be tried again.
     channel_origin_retry: VecDeque<(std::time::Instant, Vec<u8>)>,
+    /// Delivery verdicts for originated lines — `(channel_id, msg_id,
+    /// delivery)` — buffered until the tick that can persist and emit them.
+    /// See [`note_channel_delivery`].
+    channel_delivery_notes: VecDeque<([u8; 16], [u8; 16], i64)>,
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Room row plus derived content keys, memoised for the packet paths.
@@ -15543,6 +15740,75 @@ fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
     );
 }
 
+/// Most delivery verdicts held between ticks.
+///
+/// A ceiling rather than a queue that can grow: the drain runs once a second
+/// and one verdict is 33 bytes, so this only fills if something is originating
+/// faster than the tick — in which case the newest verdicts are the ones worth
+/// keeping, and every one of them is refreshed by the row it describes anyway.
+const CHANNEL_DELIVERY_NOTE_CAP: usize = 256;
+
+/// Note what became of an originated line, for the tick to persist and emit.
+///
+/// Buffered rather than written here because the fanout path holds neither the
+/// `AppHandle` the event needs nor a place to await a blocking write — and
+/// threading both through every caller of `fanout_channel_gossip_retry` to
+/// record one integer would be a far larger change than the fact deserves.
+fn note_channel_delivery(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    msg_id: [u8; 16],
+    delivery: i64,
+) {
+    while state.channel_delivery_notes.len() >= CHANNEL_DELIVERY_NOTE_CAP {
+        state.channel_delivery_notes.pop_front();
+    }
+    state
+        .channel_delivery_notes
+        .push_back((channel_id, msg_id, delivery));
+}
+
+/// Persist buffered delivery verdicts and tell the UI about the ones that moved.
+async fn flush_channel_delivery_notes(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+) {
+    if state.channel_delivery_notes.is_empty() {
+        return;
+    }
+    let notes: Vec<([u8; 16], [u8; 16], i64)> =
+        std::mem::take(&mut state.channel_delivery_notes).into();
+    let db_write = db.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        let mut moved = Vec::new();
+        for (channel_id, msg_id, delivery) in notes {
+            let channel_hex = hex::encode(channel_id);
+            match db_write.set_channel_delivery(&channel_hex, &hex::encode(msg_id), delivery) {
+                // `None` is the ordinary case for a line already in that
+                // state, or one the user has since removed locally.
+                Ok(Some(row_id)) => moved.push((channel_hex, row_id, delivery)),
+                Ok(None) => {}
+                Err(e) => warn!("Could not record channel delivery in {channel_hex}: {e}"),
+            }
+        }
+        moved
+    })
+    .await
+    .unwrap_or_default();
+    for (channel_id, id, delivery) in written {
+        let label = crate::storage::database::Database::delivery_label(delivery);
+        let _ = app_handle.emit(
+            "ember:channel-delivery",
+            serde_json::json!({
+                "channel_id": channel_id,
+                "id": id,
+                "delivery": label,
+            }),
+        );
+    }
+}
+
 fn queue_channel_origin_retry(
     state: &mut NetworkState,
     body: Vec<u8>,
@@ -15569,6 +15835,16 @@ async fn drain_channel_origin_retry(
     let ttl = std::time::Duration::from_secs(ember::channel::CHANNEL_ORIGIN_RETRY_SECS);
     for (queued_at, body) in pending {
         if now.saturating_duration_since(queued_at) >= ttl {
+            // Ten minutes of finding nobody. This is the state that used to
+            // vanish silently, leaving the sender a line their room never had.
+            if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+                note_channel_delivery(
+                    state,
+                    gossip.channel_id,
+                    gossip.msg_id,
+                    crate::storage::database::CHAT_FAILED,
+                );
+            }
             continue;
         }
         fanout_channel_gossip_retry(socket, state, db, body, None, Some(queued_at)).await;
@@ -16484,14 +16760,22 @@ async fn apply_channel_presence_beacons(
     }
 }
 
-/// `roster` comes from [`channels_lite_cached`] so this shares the caller's
-/// read rather than running its own `channels` scan on the event loop.
-fn collect_channel_neighbor_caps(
-    db: &Database,
-    roster: &[crate::storage::database::StoredChannel],
-    our_pubkey: &[u8; 32],
+/// Which rooms this heartbeat registers neighbors for.
+///
+/// The room on screen always takes a slot: it is the one whose reachability
+/// the user is about to need. The rest of the budget is a window that walks
+/// the joined rooms by `beat`, so a room past the cap is registered on a later
+/// heartbeat rather than never — the whole of what the fixed cap used to cost
+/// a member of five or more rooms. `CHANNEL_RENDEZVOUS_ROTATION_DEPTH` bounds
+/// how far that walk may travel before the first room's entry would expire.
+///
+/// Split from the collection below so the rule can be tested without a
+/// `Database`, which has no constructor outside a real store.
+fn select_rendezvous_rooms<'a>(
+    roster: &'a [crate::storage::database::StoredChannel],
     focused: Option<[u8; 16]>,
-) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
+    beat: u64,
+) -> Vec<&'a crate::storage::database::StoredChannel> {
     let focused_hex = focused.map(hex::encode);
     let mut selected: Vec<&crate::storage::database::StoredChannel> = Vec::new();
     if let Some(ref id) = focused_hex {
@@ -16502,28 +16786,52 @@ fn collect_channel_neighbor_caps(
             selected.push(ch);
         }
     }
-    for ch in roster {
-        if selected.len() >= ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS {
-            break;
-        }
-        if !ch.in_room_now() {
-            continue;
-        }
-        if focused_hex
-            .as_ref()
-            .is_some_and(|id| ch.channel_id.eq_ignore_ascii_case(id))
-        {
-            continue;
-        }
-        selected.push(ch);
+    // Ordered by `last_active` already, so the window walks from the busiest
+    // room outwards and a quiet room is reached within the rotation depth.
+    let rest: Vec<&crate::storage::database::StoredChannel> = roster
+        .iter()
+        .filter(|ch| ch.in_room_now())
+        .filter(|ch| {
+            !focused_hex
+                .as_ref()
+                .is_some_and(|id| ch.channel_id.eq_ignore_ascii_case(id))
+        })
+        .collect();
+    if rest.is_empty() {
+        return selected;
     }
+    let slots = ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS.saturating_sub(selected.len());
+    // Only rooms we could not fit rotate. Staying put while everything already
+    // fits keeps a settled member's registrations at the same addresses beat
+    // after beat rather than churning them for nothing.
+    let reachable = rest.len().min(ember::channel::CHANNEL_RENDEZVOUS_COVERAGE);
+    let start = if reachable > slots && slots > 0 {
+        ((beat as usize).saturating_mul(slots)) % reachable
+    } else {
+        0
+    };
+    for step in 0..slots.min(reachable) {
+        selected.push(rest[(start + step) % reachable]);
+    }
+    selected
+}
+
+/// `roster` comes from [`channels_lite_cached`] so this shares the caller's
+/// read rather than running its own `channels` scan on the event loop.
+fn collect_channel_neighbor_caps(
+    db: &Database,
+    roster: &[crate::storage::database::StoredChannel],
+    our_pubkey: &[u8; 32],
+    focused: Option<[u8; 16]>,
+    beat: u64,
+) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
+    let selected = select_rendezvous_rooms(roster, focused, beat);
     let mut members_by_channel = Vec::new();
     for ch in selected {
-        // `rendezvous_neighbor_targets` keeps the first
-        // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
-        // the rest, so stopping here is what that cap already means — and it
-        // is the difference between one roster query per *selected* room and
-        // one per *joined* room. Joining is deliberately uncapped.
+        // One roster query per *selected* room rather than one per *joined*
+        // room. Joining is deliberately uncapped, and this runs on paths that
+        // fire every second, so the selection above is what keeps a member of
+        // twenty rooms from paying twenty blocking queries a tick.
         let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
             continue;
         };
@@ -16544,6 +16852,7 @@ async fn load_rendezvous_register_targets(
     db: &Arc<Database>,
     our_pubkey: [u8; 32],
     focused: Option<[u8; 16]>,
+    beat: u64,
 ) -> (
     Vec<([u8; 16], [u8; 32])>,
     Vec<([u8; 16], [u8; 32])>,
@@ -16554,8 +16863,8 @@ async fn load_rendezvous_register_targets(
         // Already off the reactor, so this reads its own roster rather than
         // taking a turn on the shared cache.
         let roster = db.list_channels_lite().unwrap_or_default();
-        let neighbors =
-            collect_channel_neighbor_caps(&db, &roster, &our_pubkey, focused).unwrap_or_default();
+        let neighbors = collect_channel_neighbor_caps(&db, &roster, &our_pubkey, focused, beat)
+            .unwrap_or_default();
         (friends, neighbors)
     })
     .await
@@ -17886,7 +18195,11 @@ async fn maybe_dial_channel_neighbors(
     let Some(roster) = channels_lite_cached(state, db) else {
         return;
     };
-    let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey, state.channel_focused)
+    // Same beat the registration used, so we dial neighbors in the rooms this
+    // heartbeat actually published us for rather than a different slice.
+    let beat = state.rendezvous_register_generation;
+    let Ok(neighbors) =
+        collect_channel_neighbor_caps(db, &roster, &our_pubkey, state.channel_focused, beat)
     else {
         return;
     };
@@ -18548,6 +18861,18 @@ async fn fanout_channel_gossip_retry(
     let in_room = cached_channel_view(state, db, gossip.channel_id)
         .is_some_and(|view| view.row.in_room_now());
     if !in_room {
+        // Dropped with no retry entry, so nothing downstream will ever settle
+        // it — a line written queued and then abandoned here would read as
+        // sending for the rest of the session. Leaving the room is a definite
+        // answer, not a pending one.
+        if local_origin {
+            note_channel_delivery(
+                state,
+                gossip.channel_id,
+                gossip.msg_id,
+                crate::storage::database::CHAT_FAILED,
+            );
+        }
         return;
     }
     let members = channel_member_pubkeys(db, &channel_id_hex);
@@ -18670,6 +18995,15 @@ async fn fanout_channel_gossip_retry(
     // wait; the mesh will carry those again from somewhere else.
     if local_origin && !delivered {
         queue_channel_origin_retry(state, body, retry_at);
+    } else if local_origin {
+        // Somebody took it, so the line is as sent as this node can make it.
+        // The row was written queued; this is what settles it.
+        note_channel_delivery(
+            state,
+            gossip.channel_id,
+            gossip.msg_id,
+            crate::storage::database::CHAT_DELIVERED,
+        );
     }
 }
 
@@ -26650,6 +26984,9 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_history_sync_at.clear();
     state.channel_history_sync_mark.clear();
     state.channel_origin_retry.clear();
+    // Nothing left to deliver, so nothing left to report. The rows stay queued
+    // and the startup sweep settles them the next time Ember comes up.
+    state.channel_delivery_notes.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -27659,6 +27996,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_sent_times: VecDeque::new(),
         channel_gossip_local_times: VecDeque::new(),
         channel_origin_retry: VecDeque::new(),
+        channel_delivery_notes: VecDeque::new(),
         channel_gossip_from_times: HashMap::new(),
         channel_view_cache: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
@@ -28456,6 +28794,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // `None` so the first cleanup tick sweeps, clearing anything left queued by
     // a previous run before the user has a chance to look at it.
     let mut last_chat_expiry_sweep: Option<std::time::Instant> = None;
+    // Once per run: rows left queued by a previous process, settled before the
+    // user can look at them. Later queued rows belong to this run's retry.
+    let mut channel_queue_settled = false;
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     small_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule main loop calls Kademlia::Process very frequently; ~100ms matches typical tick cadence.
@@ -32547,6 +32888,47 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
+                if let UploadEventKind::EmberFriendDecline { ember_hash: decline_hash } = event.kind {
+                    let hash_hex = hex::encode(decline_hash);
+                    // Only a row they have never accepted. `decline_friend_request`
+                    // is written to refuse a mutual friendship outright, so this
+                    // cannot become a way to remove yourself from somebody
+                    // else's friend list — and if they accepted a moment ago,
+                    // there is nothing one-sided left to delete.
+                    let db_decline = db.clone();
+                    let h_decline = hash_hex.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_decline.decline_friend_request(&h_decline)
+                    })
+                    .await
+                    {
+                        Ok(Ok(true)) => {
+                            info!("Friend request to {hash_hex} was declined");
+                            // We added them, which granted them friend access
+                            // to this node; their refusal ends that. Dropping
+                            // the hash alone leaves any stream they already
+                            // hold authenticated, so the grant has to be
+                            // revoked the same way removal revokes it.
+                            friend_hashes.write().await.remove(&decline_hash);
+                            ed2k::upload::revoke_all_secure_sessions(decline_hash);
+                            let _ = app_handle.emit(
+                                "ember:friend-request-declined",
+                                serde_json::json!({
+                                    "user_hash": hash_hex,
+                                }),
+                            );
+                        }
+                        // Nothing one-sided on file: they accepted first, or we
+                        // had already removed them. Either way the decline has
+                        // nothing to act on and is not worth telling anyone.
+                        Ok(Ok(false)) => {
+                            debug!("Ignoring a decline from {hash_hex} with no pending request")
+                        }
+                        Ok(Err(e)) => warn!("Failed to clear declined request to {hash_hex}: {e}"),
+                        Err(e) => warn!("Declined-request task failed for {hash_hex}: {e}"),
+                    }
+                }
+
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
                     if !friend_hashes.read().await.contains(&chat_eh) {
                         debug!("Dropping secure chat event after friend removal");
@@ -36499,8 +36881,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
                         let (rv_friends, rv_channel_neighbors) =
-                            load_rendezvous_register_targets(&db, rv_pubkey, state.channel_focused)
-                                .await;
+                            load_rendezvous_register_targets(
+                                &db,
+                                rv_pubkey,
+                                state.channel_focused,
+                                state.rendezvous_register_generation,
+                            )
+                            .await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -36567,8 +36954,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
                         let (rv_friends, rv_channel_neighbors) =
-                            load_rendezvous_register_targets(&db, rv_pubkey, state.channel_focused)
-                                .await;
+                            load_rendezvous_register_targets(
+                                &db,
+                                rv_pubkey,
+                                state.channel_focused,
+                                state.rendezvous_register_generation,
+                            )
+                            .await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -38031,6 +38423,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // Same cadence, same reason: the ceiling is in days, and a
                     // withdrawal nobody can deliver is holding the address of
                     // someone the user removed.
+                    // A room line still queued when this first runs was left
+                    // mid-flight by a previous run: the retry that would have
+                    // settled it lived in memory and went with the process, so
+                    // nothing else will ever move it off "sending".
+                    if !channel_queue_settled {
+                        channel_queue_settled = true;
+                        let db_channel = db.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            db_channel.fail_stale_queued_channel_messages()
+                        })
+                        .await
+                        {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(n)) => {
+                                debug!("Marked {n} room line(s) left sending by a previous run")
+                            }
+                            Ok(Err(e)) => debug!("Stale channel-send sweep failed: {e}"),
+                            Err(e) => debug!("Stale channel-send sweep panicked: {e}"),
+                        }
+                    }
+
                     let db_retract = db.clone();
                     match tokio::task::spawn_blocking(move || {
                         db_retract.expire_stale_friend_request_retractions()
@@ -38043,6 +38456,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ),
                         Ok(Err(e)) => debug!("Withdrawal expiry sweep failed: {e}"),
                         Err(e) => debug!("Withdrawal expiry sweep panicked: {e}"),
+                    }
+
+                    // And the other direction, on the same ceiling: a refusal
+                    // nobody can deliver is holding the address of someone the
+                    // user declined to know.
+                    let db_decline = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_decline.expire_stale_friend_request_declines()
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(dropped)) => {
+                            debug!("Gave up on {dropped} undelivered friend-request decline(s)")
+                        }
+                        Ok(Err(e)) => debug!("Decline expiry sweep failed: {e}"),
+                        Err(e) => debug!("Decline expiry sweep panicked: {e}"),
                     }
                 }
 
@@ -38078,7 +38508,58 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     for (hash_hex, target, stored) in
                         deliverable.take(MAX_RETRACTION_RETRIES_PER_SWEEP)
                     {
-                        tokio::spawn(deliver_friend_request_retraction(
+                        tokio::spawn(deliver_friend_request_verdict(
+                            FriendRequestVerdict::Withdraw,
+                            db.clone(),
+                            settings.rendezvous_url.clone(),
+                            hash_hex,
+                            target,
+                            stored,
+                            state.user_hash,
+                            ember_hash,
+                            settings.nickname.clone(),
+                            state
+                                .external_ip
+                                .map(|eip| u32::from_le_bytes(eip.octets()))
+                                .unwrap_or(0),
+                            advertised_tcp_port(&state),
+                            advertised_udp_port(&state),
+                            settings.friend_session_encryption,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
+                        ));
+                    }
+                }
+
+                // The same retry for refusals. A request the user rejected
+                // while its sender happened to be offline would otherwise stay
+                // on that sender's screen for good, which is the state this
+                // whole path exists to end.
+                {
+                    let db_pending = db.clone();
+                    let pending = tokio::task::spawn_blocking(move || {
+                        db_pending.pending_friend_request_declines()
+                    })
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.ok())
+                    .unwrap_or_default();
+                    let deliverable = pending.into_iter().filter_map(|(hash_hex, ip, port)| {
+                        let target = hex::decode(&hash_hex)
+                            .ok()
+                            .and_then(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())?;
+                        let stored = ip
+                            .parse::<std::net::IpAddr>()
+                            .ok()
+                            .filter(|_| port > 0)
+                            .map(|ip| SocketAddr::new(ip, port));
+                        Some((hash_hex, target, stored))
+                    });
+                    for (hash_hex, target, stored) in
+                        deliverable.take(MAX_RETRACTION_RETRIES_PER_SWEEP)
+                    {
+                        tokio::spawn(deliver_friend_request_verdict(
+                            FriendRequestVerdict::Decline,
                             db.clone(),
                             settings.rendezvous_url.clone(),
                             hash_hex,
@@ -45653,6 +46134,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     emit_channel_presence_deltas(&mut state, &app_handle);
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                     drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
+                    // After the drain, so a verdict reached on this tick is
+                    // reported on this tick rather than the next.
+                    flush_channel_delivery_notes(&mut state, &db, &app_handle).await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
@@ -59009,7 +59493,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberDhtContacts { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
         | UploadEventKind::EmberFriendRequest { .. }
-        | UploadEventKind::EmberFriendRetract { .. } => {
+        | UploadEventKind::EmberFriendRetract { .. }
+        | UploadEventKind::EmberFriendDecline { .. } => {
             // Handled directly in the network event loop.
         }
     }

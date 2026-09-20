@@ -237,6 +237,15 @@ pub struct ChannelMessageInfo {
     /// the message this way, and the local row id means nothing to the peer that
     /// sent it — so the UI needs it to match the two up.
     pub msg_id: String,
+    /// `delivered` / `queued` / `failed`, the same vocabulary friend chat uses.
+    /// Received lines are always delivered. A sent line is queued until the
+    /// flood reaches somebody, and failed once the retry gives up.
+    pub delivery: String,
+}
+
+/// The stored `delivery` integer as the UI names it.
+fn channel_delivery_label(delivery: i64) -> String {
+    crate::storage::database::Database::delivery_label(delivery).to_string()
 }
 
 impl From<crate::storage::database::ChannelMessageRow> for ChannelMessageInfo {
@@ -250,6 +259,7 @@ impl From<crate::storage::database::ChannelMessageRow> for ChannelMessageInfo {
             read: row.read,
             edited_at: row.edited_at,
             msg_id: row.msg_id,
+            delivery: channel_delivery_label(row.delivery),
         }
     }
 }
@@ -1790,6 +1800,11 @@ pub async fn edit_channel_message(
         timestamp: target.timestamp,
         read: true,
         edited_at,
+        // A revision only reaches this point for a line already on the wire,
+        // and the bubble it replaces carries that line's own state. Reporting
+        // an edit as anything but delivered would re-open a question the
+        // original already answered.
+        delivery: channel_delivery_label(crate::storage::database::CHAT_DELIVERED),
         msg_id: target.msg_id,
     })
 }
@@ -2127,6 +2142,11 @@ pub async fn send_channel_message(
             &author_sig_hex,
             true,
         )?;
+        // Queued until the flood finds somebody. The network task flips it to
+        // delivered on the same tick in the ordinary case, and to failed when
+        // the ten-minute retry gives up — which is the state that used to be
+        // invisible, leaving a line nobody received looking sent.
+        let _ = db.set_channel_delivery(&id, &msg_id_hex, crate::storage::database::CHAT_QUEUED);
         // We are present: keep our own last_seen in step with the line, so
         // gossip-neighbor freshness and the empty-room poll do not treat a
         // talking member as gone until the next DHT announce.
@@ -2183,6 +2203,7 @@ pub async fn send_channel_message(
         read: true,
         edited_at: 0,
         msg_id: hex::encode(msg_id),
+        delivery: channel_delivery_label(crate::storage::database::CHAT_QUEUED),
     })
 }
 

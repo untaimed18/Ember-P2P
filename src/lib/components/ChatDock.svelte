@@ -21,6 +21,11 @@
     acceptIncomingFileOffer,
     clearFileOffer,
   } from '$lib/stores/friends';
+  import {
+    awaitingChannelOfferList,
+    channels as channelsStore,
+    respondToChannelOffer,
+  } from '$lib/stores/channels';
   import { appSettings } from '$lib/stores/settings';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { formatBytes } from '$lib/utils';
@@ -125,6 +130,29 @@
   let acceptingOffer: string | null = $state(null);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let pendingOffers = $derived($fileOffers);
+  /** Room offers waiting on an answer, wherever the user happens to be. They
+   *  expire, and until now the only place to answer one was inside the room
+   *  it arrived in. */
+  let roomOffers = $derived($awaitingChannelOfferList);
+  let respondingXfer: string | null = $state(null);
+
+  function roomNameFor(channelId: string): string {
+    return (
+      $channelsStore.find((c) => c.channel_id === channelId)?.name ?? m.nav_channels()
+    );
+  }
+
+  async function answerRoomOffer(xferId: string, accept: boolean) {
+    if (respondingXfer) return;
+    respondingXfer = xferId;
+    try {
+      await respondToChannelOffer(xferId, accept);
+    } catch (e) {
+      toastError(translateError(e));
+    } finally {
+      respondingXfer = null;
+    }
+  }
   let pickerFriends = $derived(
     [...$friendsList].sort((a, b) => {
       const ao = $onlineFriends.has(a.user_hash.toLowerCase()) ? 0 : 1;
@@ -527,6 +555,39 @@
     {/if}
 
     <div class="dock-body">
+      {#if roomOffers.length > 0}
+        <div class="dock-offers" role="region" aria-label={m.chat_dock_room_offers_title()}>
+          <div class="dock-offers-title">{m.chat_dock_room_offers_title()}</div>
+          {#each roomOffers as offer (offer.xfer_id)}
+            <div class="dock-offer">
+              <div class="dock-offer-info">
+                <span class="dock-offer-name"><bdi dir="auto">{offer.name}</bdi></span>
+                <span class="dock-offer-meta">
+                  {m.chat_dock_room_offer_from({ room: roomNameFor(offer.channel_id) })}
+                  {#if offer.size}&nbsp;·&nbsp;{formatBytes(offer.size)}{/if}
+                </span>
+              </div>
+              <div class="dock-offer-actions">
+                <button
+                  type="button"
+                  class="dock-offer-accept"
+                  disabled={respondingXfer !== null}
+                  onclick={() => void answerRoomOffer(offer.xfer_id, true)}
+                >{m.channels_xfer_accept()}</button>
+                <!-- Both answers are the same guarded round trip, so neither
+                     may look available while one is in flight — unlike the
+                     friend dismiss below, which only edits a local store. -->
+                <button
+                  type="button"
+                  class="dock-offer-dismiss"
+                  disabled={respondingXfer !== null}
+                  onclick={() => void answerRoomOffer(offer.xfer_id, false)}
+                >{m.channels_xfer_decline()}</button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
       {#if pendingOffers.length > 0}
         <div class="dock-offers" role="region" aria-label={m.chat_dock_offers_title()}>
           <div class="dock-offers-title">{m.chat_dock_offers_title()}</div>

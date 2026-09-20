@@ -256,7 +256,11 @@
       message: row.message,
       timestamp: row.timestamp,
       read: row.read,
-      delivery: 'delivered',
+      // The backend's verdict, not an assumption. A room line is queued until
+      // the flood finds somebody and failed once the retry gives up, and
+      // reporting all three as delivered is what let a line nobody received
+      // sit in the sender's transcript looking sent.
+      delivery: row.delivery ?? 'delivered',
       seen: false,
       sender_pubkey: row.sender_pubkey,
       edited_at: row.edited_at,
@@ -606,6 +610,30 @@
       }
       if (gen !== loadGen) { fn(); return false; }
       unlisten = fn;
+      // Its own registration, after the message listener is already stored:
+      // sharing the `try` above meant a failure here returned without ever
+      // unlistening the one that had already succeeded. Non-fatal for the same
+      // reason the friend pane's delivery listener is — bubbles keep the state
+      // they loaded with until the pane is reopened.
+      try {
+        const deliveryFn = await listen<{
+          channel_id: string;
+          id: number;
+          delivery: string;
+        }>('ember:channel-delivery', (event) => {
+          if (gen !== loadGen) return;
+          if (event.payload.channel_id !== channel) return;
+          const delivery = event.payload.delivery;
+          if (delivery !== 'delivered' && delivery !== 'queued' && delivery !== 'failed') return;
+          messages = messages.map((message) =>
+            message.id === event.payload.id ? { ...message, delivery } : message,
+          );
+        });
+        if (gen !== loadGen) deliveryFn();
+        else unlistenDelivery = deliveryFn;
+      } catch (e) {
+        console.warn('ChatConversation: failed to register channel delivery listener', e);
+      }
       return true;
     }
     let fn: UnlistenFn;
@@ -1184,6 +1212,36 @@
   let resendingId = $state<number | null>(null);
 
   /**
+   * How long a room line may sit unconfirmed before the bubble says so.
+   *
+   * A send is written queued and the flood usually settles it within a tick,
+   * so captioning that moment would put "Sending…" under every message the
+   * user writes and make the normal case look like a fault. Past this, the
+   * line really is waiting on somebody to carry it, which is worth saying.
+   * The failed caption is not delayed — that one is already the slow path.
+   */
+  const CHANNEL_PENDING_GRACE_MS = 2000;
+  let pendingClockNow = $state(Date.now());
+
+  $effect(() => {
+    if (!isChannel) return;
+    // Only ticks while something is actually unconfirmed, so a settled room
+    // costs nothing.
+    if (!messages.some((msg) => msg.direction === 'sent' && msg.delivery === 'queued')) return;
+    const timer = setInterval(() => {
+      pendingClockNow = Date.now();
+    }, 500);
+    return () => clearInterval(timer);
+  });
+
+  /** Whether an unconfirmed line has waited long enough to be worth reporting. */
+  function sendLooksStuck(msg: ConvMessage): boolean {
+    if (msg.delivery !== 'queued' || msg.direction !== 'sent') return false;
+    if (msg.timestamp <= 0) return true;
+    return pendingClockNow - msg.timestamp * 1000 >= CHANNEL_PENDING_GRACE_MS;
+  }
+
+  /**
    * Send a message the delivery queue gave up on again.
    *
    * The failed bubble is dropped rather than revived, because each attempt is a
@@ -1205,6 +1263,51 @@
       await deliverToFriend(h, restore.message);
     } catch (e: unknown) {
       if (h === friendHash) {
+        const next = [...messages];
+        next.splice(Math.min(at, next.length), 0, restore);
+        messages = next;
+        sendError = translateError(e, m.chat_failed_to_send());
+      }
+    } finally {
+      resendingId = null;
+    }
+  }
+
+  /**
+   * Send a room line the flood never placed again.
+   *
+   * Safe to mint a fresh `msg_id` — which `sendChannelMessage` does — only
+   * because "failed" here means no rung took it: no neighbour, no overlay hop,
+   * no relay. Nobody holds the original, so there is no copy for a new id to
+   * duplicate. The local row goes first for the same reason the friend path
+   * drops its bubble: each attempt is a new row, and keeping both would show
+   * the same sentence twice.
+   */
+  async function resendChannelMessage(msg: ConvMessage) {
+    const channel = channelId;
+    if (!channel || sending || resendingId !== null) return;
+    if (youAreBanned || youAreKeyBehind) return;
+    const at = messages.findIndex((message) => message.id === msg.id);
+    if (at === -1) return;
+    const restore = messages[at];
+    resendingId = msg.id;
+    sendError = null;
+    messages = messages.filter((message) => message.id !== msg.id);
+    try {
+      // Send before dropping the old row, not after. The other order lost the
+      // user's text outright when the retry also failed: the bubble was put
+      // back on screen against a row already deleted, so reloading the
+      // transcript dropped it. A delete that fails after a successful send
+      // leaves a visible duplicate instead, which is recoverable.
+      const sent = await sendChannelMessage(channel, restore.message);
+      await deleteChannelMessage(channel, msg.id).catch((e) =>
+        console.warn('ChatConversation: could not drop the abandoned room line', e),
+      );
+      if (channel === channelId) {
+        commitLiveMessages([...messages, fromChannelRow(sent)], true);
+      }
+    } catch (e: unknown) {
+      if (channel === channelId) {
         const next = [...messages];
         next.splice(Math.min(at, next.length), 0, restore);
         messages = next;
@@ -1790,6 +1893,7 @@
         {/if}
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
+        {@const slowSend = sendLooksStuck(row.msg)}
         {@const showSeen = row.msg.direction === 'sent' && row.msg.seen && showReadReceipts && row.msg.id === lastSeenSentId}
         {@const showSent = row.msg.direction === 'sent' && row.msg.delivery === 'delivered' && row.msg.id === lastDeliveredSentId && !showSeen}
         <div
@@ -1973,7 +2077,28 @@
             </div>
           {/if}
         </div>
-        {#if !isChannel && (pending || failed || showSeen || showSent)}
+        <!-- Room lines carry the first two states only: nobody in a room sends
+             a read receipt, and "Sent" on every bubble in a busy transcript is
+             noise the friend pane can afford and this one cannot. -->
+        {#if isChannel && (slowSend || failed)}
+          <div class="bubble-status">
+            {#if slowSend}
+              <span title={m.channels_delivery_sending_title()}>{m.chat_delivery_queued()}</span>
+            {:else}
+              <span class="failed" title={m.channels_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+              <button
+                class="bubble-resend"
+                type="button"
+                disabled={resendingId !== null || sending || youAreBanned || youAreKeyBehind}
+                onclick={() => resendChannelMessage(row.msg)}
+                title={m.chat_resend()}
+                aria-label={m.chat_resend()}
+              >
+                {resendingId === row.msg.id ? m.chat_loading_short() : m.chat_resend()}
+              </button>
+            {/if}
+          </div>
+        {:else if !isChannel && (pending || failed || showSeen || showSent)}
           <div class="bubble-status">
             {#if pending}
               <span title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>

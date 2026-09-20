@@ -258,6 +258,25 @@ pub const EMBER_EXT_DHT_CONTACT_REQ: u8 = 0x05;
 /// guarantee gossip over the DHT wire gets.
 pub const EMBER_EXT_DHT_CONTACTS: u8 = 0x06;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is refusing a friend request the
+/// recipient sent them, so the requester stops waiting on an answer that is
+/// never coming.
+///
+/// The mirror image of [`EMBER_EXT_FRIEND_RETRACT`]: that one is the *sender*
+/// taking their request back, this one is the *recipient* turning it down.
+/// Carries no body for the same reason — the only thing it has to say is who
+/// refused, and that is the authenticated session identity.
+///
+/// Acting on it may only ever delete a one-sided `friends` row we have not had
+/// accepted, never a friendship. A peer cannot use this to unfriend anybody:
+/// once a friendship is mutual their own row is the one that would have to go,
+/// and they can already do that by removing us.
+///
+/// Older builds log and ignore an unknown sub-type, so declining a request
+/// from a peer that predates this costs nothing beyond them not learning of
+/// it — which is exactly the behaviour before it existed.
+pub const EMBER_EXT_FRIEND_DECLINE: u8 = 0x07;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -3211,6 +3230,19 @@ mod tests {
         );
     }
 
+    /// The decline is the other body-less sub-type, and it travels the same
+    /// courier as the retraction — so a dispatcher that told the two apart by
+    /// anything other than the sub-type byte would act on the wrong one.
+    #[test]
+    fn ember_ext_friend_decline_is_body_less_and_distinct_from_retract() {
+        let payload = build_ember_ext(EMBER_EXT_FRIEND_DECLINE, &[]);
+        assert_eq!(
+            parse_ember_ext(&payload),
+            Some((EMBER_EXT_FRIEND_DECLINE, &[][..]))
+        );
+        assert_ne!(EMBER_EXT_FRIEND_DECLINE, EMBER_EXT_FRIEND_RETRACT);
+    }
+
     #[test]
     fn ember_ext_frame_carries_the_sub_type() {
         let frame = build_ember_ext_frame(EMBER_EXT_CHAT_TYPING, b"env");
@@ -3233,6 +3265,7 @@ mod tests {
             EMBER_EXT_CHAT_READ,
             EMBER_EXT_DHT_CONTACT_REQ,
             EMBER_EXT_DHT_CONTACTS,
+            EMBER_EXT_FRIEND_DECLINE,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

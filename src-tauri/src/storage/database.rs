@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 47;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 49;
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -60,6 +60,10 @@ pub struct ChannelMessageRow {
     pub edited_at: i64,
     /// Wire identity, needed to address reactions and revisions across devices.
     pub msg_id: String,
+    /// [`CHAT_DELIVERED`] / [`CHAT_QUEUED`] / [`CHAT_FAILED`], reusing the
+    /// friend-chat vocabulary because it means the same three things. Received
+    /// rows are always delivered — we have it, which is the whole claim.
+    pub delivery: i64,
 }
 
 /// One line as it goes back on the wire for a member catching up.
@@ -2291,6 +2295,59 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 48 {
+            // Refusals owed to somebody whose request the user rejected.
+            //
+            // Its own table rather than a `kind` column on
+            // `friend_request_retractions`: that one is keyed by `user_hash`
+            // alone, and the two can both be owed to the same identity — they
+            // are opposite directions of the same pair — so sharing it would
+            // need the primary key rebuilt to hold both. A second table with
+            // the same four columns costs one sweep and no migration risk to
+            // the queue that already works.
+            //
+            // Only the hash and last address, for the reason the retraction
+            // queue gives: the handshake learns the peer's key and checks it
+            // against the hash, so storing the key would keep more about
+            // somebody the user has just declined than delivery needs.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS friend_request_declines (
+                    user_hash TEXT PRIMARY KEY,
+                    last_ip TEXT NOT NULL DEFAULT '',
+                    last_port INTEGER NOT NULL DEFAULT 0,
+                    queued_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 48)?;
+            tx.commit()?;
+        }
+
+        if version < 49 {
+            // Whether an originated room line actually reached anybody.
+            //
+            // The network task has always known — a flood that found no
+            // neighbour, no overlay hop and no relay is retried for ten
+            // minutes and then dropped — but that lived only in memory, so a
+            // line nobody received sat in the sender's own history looking
+            // delivered, and a restart forgot even that. Same three values as
+            // `chat_messages.delivery` because they mean the same things.
+            //
+            // Defaults to 0 (delivered), which is right for every row already
+            // on disk: received lines are delivered by definition, and a sent
+            // line old enough to be here has long since had whatever fate it
+            // was going to have.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "delivery",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 49)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -3818,6 +3875,13 @@ impl Database {
             "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
             params![user_hash],
         )?;
+        // And an undelivered refusal of *their* request: adding them is the
+        // opposite answer, so telling them no afterwards would contradict the
+        // request this add is sending.
+        tx.execute(
+            "DELETE FROM friend_request_declines WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
         tx.commit()?;
         Ok(Some(mutual))
     }
@@ -3917,6 +3981,199 @@ impl Database {
         Ok(pending.is_some())
     }
 
+    /// Record what became of an originated room line, by its wire identity.
+    ///
+    /// Keyed by `(channel_id, msg_id)` rather than the row id because the
+    /// network task works in gossip frames and never learns the row id — and
+    /// that pair is the dedup index, so the lookup is already paid for.
+    ///
+    /// Only ever moves a `sent` row: a received line is delivered by
+    /// definition, and a replayed frame naming somebody else's message must
+    /// not be able to mark their history failed. Returns the row id when a row
+    /// actually moved, so the caller can name it in an event and stay quiet
+    /// when nothing changed.
+    pub fn set_channel_delivery(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        delivery: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        // One transaction, so the row the id names is the row that moved. Read
+        // and write apart, a concurrent verdict for the same line could settle
+        // between them and this would report a change it did not make.
+        let tx = conn.unchecked_transaction()?;
+        let row: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM channel_messages \
+                 WHERE channel_id = ?1 AND msg_id = ?2 AND direction = 'sent' AND delivery != ?3",
+                params![channel_id, msg_id, delivery],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE channel_messages SET delivery = ?2 WHERE id = ?1",
+            params![id, delivery],
+        )?;
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    /// How the UI names a stored `delivery` value.
+    ///
+    /// Here rather than beside either caller because both the load path and
+    /// the live event have to agree on the word, and two matches on the same
+    /// three constants is exactly the pair that drifts.
+    pub fn delivery_label(delivery: i64) -> &'static str {
+        match delivery {
+            CHAT_QUEUED => "queued",
+            CHAT_FAILED => "failed",
+            _ => "delivered",
+        }
+    }
+
+    /// Sent room lines still marked queued at startup.
+    ///
+    /// The retry queue that would have resolved them lives in memory, so a
+    /// restart mid-flight would otherwise leave a bubble reading "sending"
+    /// for the life of the database with nothing left to move it.
+    pub fn fail_stale_queued_channel_messages(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE channel_messages SET delivery = ?1 WHERE direction = 'sent' AND delivery = ?2",
+            params![CHAT_FAILED, CHAT_QUEUED],
+        )?;
+        Ok(changed)
+    }
+
+    /// Act on a peer's refusal of a request we sent them.
+    ///
+    /// Deletes only a `friends` row they have never accepted. `mutual = 0` is
+    /// the whole of the guard: once a friendship is established their refusal
+    /// of a request that no longer exists must not be able to end it, and the
+    /// wire message carries nothing but an identity, so the row's own state is
+    /// the only thing that can decide whether it is still refusable.
+    ///
+    /// `Ok(false)` when there was nothing pending — they accepted first, or we
+    /// removed them in the meantime.
+    pub fn decline_friend_request(&self, user_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM friends WHERE user_hash = ?1 AND mutual = 0",
+            params![user_hash],
+        )?;
+        if removed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        // Our own outbound queue for this identity is moot now: a withdrawal
+        // of the request they have just refused would dial them to take back
+        // something already gone.
+        tx.execute(
+            "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Queue a refusal of `user_hash`'s request for delivery.
+    ///
+    /// Written in the transaction that deletes the request, for the reason the
+    /// retraction queue exists: the request row holds the only address we have
+    /// for somebody who is not a friend, so the address has to be copied out
+    /// at the moment of removal or the courier has nowhere to dial.
+    ///
+    /// `Ok(false)` when there was no request to refuse.
+    pub fn reject_and_queue_friend_decline(&self, user_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let pending: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT COALESCE(sender_ip, ''), COALESCE(sender_port, 0) FROM friend_requests \
+                 WHERE sender_hash = ?1",
+                params![user_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((last_ip, last_port)) = pending else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![user_hash],
+        )?;
+        // Only worth a courier if we know where to send it. A request that
+        // arrived without a usable address is still rejected locally — the
+        // queue is about delivery, not about the decision.
+        if !last_ip.is_empty() && last_port > 0 {
+            tx.execute(
+                "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(user_hash) DO UPDATE SET last_ip = excluded.last_ip, \
+                     last_port = excluded.last_port",
+                params![
+                    user_hash,
+                    last_ip,
+                    last_port,
+                    chrono::Utc::now().timestamp()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(!last_ip.is_empty() && last_port > 0)
+    }
+
+    /// Refusals not yet delivered, as `(user_hash, last_ip, last_port)`.
+    pub fn pending_friend_request_declines(&self) -> anyhow::Result<Vec<(String, String, u16)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, last_ip, last_port FROM friend_request_declines \
+             ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget a queued refusal — delivered, or no longer wanted because the
+    /// user added or blocked that identity in the meantime.
+    pub fn clear_friend_request_decline(&self, user_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM friend_request_declines WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Drop refusals we have failed to deliver for
+    /// [`RETRACTION_QUEUE_MAX_AGE_SECS`] — the same ceiling and the same
+    /// reason as the withdrawal queue, since the row likewise holds the
+    /// address of somebody the user has declined to know.
+    pub fn expire_stale_friend_request_declines(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now().timestamp() - RETRACTION_QUEUE_MAX_AGE_SECS;
+        let removed = conn.execute(
+            "DELETE FROM friend_request_declines WHERE queued_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed)
+    }
+
     /// Friend requests withdrawn but not yet delivered, as
     /// `(user_hash, last_ip, last_port)`.
     pub fn pending_friend_request_retractions(
@@ -4013,11 +4270,15 @@ impl Database {
             "DELETE FROM friend_requests WHERE sender_hash = ?1",
             params![user_hash],
         )?;
-        // Blocking means no further contact in either direction, so a queued
-        // withdrawal must not keep dialling them. Their copy of the request
-        // becomes moot anyway: accepting it cannot reach us through the block.
+        // Blocking means no further contact in either direction, so neither
+        // queue may keep dialling them. Their copy of the request becomes moot
+        // anyway: accepting it cannot reach us through the block.
         tx.execute(
             "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friend_request_declines WHERE user_hash = ?1",
             params![user_hash],
         )?;
         tx.commit()?;
@@ -6819,6 +7080,9 @@ impl Database {
                     read,
                     edited_at,
                     msg_id,
+                    // Search results are a jump target, not a transcript, so
+                    // they carry no bubble status of their own.
+                    delivery: CHAT_DELIVERED,
                 });
             }
         }
@@ -6915,7 +7179,7 @@ impl Database {
         limit: i64,
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<ChannelMessageRow>> {
-        let rows: Vec<(i64, String, String, String, i64, bool, i64, String)> = {
+        let rows: Vec<(i64, String, String, String, i64, bool, i64, String, i64)> = {
             let conn = self.conn.lock();
             let read_row = |row: &rusqlite::Row<'_>| {
                 Ok((
@@ -6927,11 +7191,12 @@ impl Database {
                     row.get::<_, i64>(5)? != 0,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             };
             if let Some(bid) = before_id {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery
                      FROM channel_messages WHERE channel_id = ?1 AND id < ?2
                      ORDER BY id DESC LIMIT ?3",
                 )?;
@@ -6939,7 +7204,7 @@ impl Database {
                 mapped.collect::<Result<Vec<_>, _>>()?
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery
                      FROM channel_messages WHERE channel_id = ?1
                      ORDER BY id DESC LIMIT ?2",
                 )?;
@@ -6951,7 +7216,7 @@ impl Database {
             return Ok(rows
                 .into_iter()
                 .map(
-                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id)| {
+                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id, delivery)| {
                         ChannelMessageRow {
                             id,
                             sender_pubkey: sender,
@@ -6961,13 +7226,14 @@ impl Database {
                             read,
                             edited_at,
                             msg_id,
+                            delivery,
                         }
                     },
                 )
                 .collect());
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id) in rows {
+        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id, delivery) in rows {
             let message = match Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
@@ -6986,6 +7252,7 @@ impl Database {
                 read,
                 edited_at,
                 msg_id,
+                delivery,
             });
         }
         Ok(messages)
@@ -7661,6 +7928,12 @@ mod tests {
                 last_ip TEXT NOT NULL DEFAULT '',
                 last_port INTEGER NOT NULL DEFAULT 0,
                 queued_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE friend_request_declines (
+                user_hash TEXT PRIMARY KEY,
+                last_ip TEXT NOT NULL DEFAULT '',
+                last_port INTEGER NOT NULL DEFAULT 0,
+                queued_at INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -8127,6 +8400,203 @@ mod tests {
             (queued[0].1.as_str(), queued[0].2),
             ("1.2.3.4", 4662),
             "the address must survive the friend row it came from"
+        );
+    }
+
+    /// The network task names a line by its wire identity, which is something
+    /// every member of the room can choose. Letting that reach a received row
+    /// would let anyone mark somebody else's history failed.
+    #[test]
+    fn a_delivery_verdict_only_ever_moves_our_own_sent_line() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-delivery-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        let me = "cd".repeat(32);
+        let them = "ef".repeat(32);
+        db.insert_channel(&channel_id, &me, "Lobby", "public", true, None, None)
+            .expect("insert channel");
+        db.insert_channel_message(&channel_id, &me, "sent", "mine", "s1", 100, "", true)
+            .expect("sent row");
+        db.insert_channel_message(&channel_id, &them, "received", "theirs", "r1", 200, "", true)
+            .expect("received row");
+
+        assert!(db
+            .set_channel_delivery(&channel_id, "s1", CHAT_FAILED)
+            .expect("mark ours")
+            .is_some());
+        assert!(
+            db.set_channel_delivery(&channel_id, "r1", CHAT_FAILED)
+                .expect("mark theirs")
+                .is_none(),
+            "a received line is delivered by definition and must not be movable"
+        );
+
+        // Idempotent: the same verdict twice reports no second change, so the
+        // tick cannot emit an event for a row that did not move.
+        assert!(db
+            .set_channel_delivery(&channel_id, "s1", CHAT_FAILED)
+            .expect("same verdict")
+            .is_none());
+
+        let rows = db.get_channel_messages(&channel_id, 10, None).expect("read");
+        let ours = rows.iter().find(|r| r.msg_id == "s1").expect("ours");
+        let theirs = rows.iter().find(|r| r.msg_id == "r1").expect("theirs");
+        assert_eq!(ours.delivery, CHAT_FAILED);
+        assert_eq!(theirs.delivery, CHAT_DELIVERED);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The retry that settles a queued line lives in memory, so a restart
+    /// leaves the row with nothing left to move it off "sending".
+    #[test]
+    fn a_restart_settles_room_lines_left_sending() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-restart-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        let me = "cd".repeat(32);
+        db.insert_channel(&channel_id, &me, "Lobby", "public", true, None, None)
+            .expect("insert channel");
+        db.insert_channel_message(&channel_id, &me, "sent", "mid-flight", "s1", 100, "", true)
+            .expect("sent row");
+        db.set_channel_delivery(&channel_id, "s1", CHAT_QUEUED)
+            .expect("queue it");
+
+        assert_eq!(db.fail_stale_queued_channel_messages().expect("sweep"), 1);
+        let rows = db.get_channel_messages(&channel_id, 10, None).expect("read");
+        assert_eq!(rows[0].delivery, CHAT_FAILED);
+        // Idempotent, so the once-per-run guard is a cost saving rather than a
+        // correctness requirement.
+        assert_eq!(db.fail_stale_queued_channel_messages().expect("again"), 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The decline arrives as an identity and nothing else, so the row's own
+    /// state is the only thing that can decide whether it is still refusable.
+    /// If it could reach a mutual row, anyone could unfriend themselves from
+    /// someone else's list by declining a request that no longer exists.
+    #[test]
+    fn a_decline_clears_a_pending_row_and_never_a_friendship() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute_batch(
+                "INSERT INTO friends (user_hash, nickname, mutual) VALUES ('11', 'Pending', 0);
+                 INSERT INTO friends (user_hash, nickname, mutual) VALUES ('22', 'Established', 1);",
+            )
+            .expect("seed");
+
+        assert!(db.decline_friend_request("11").expect("decline pending"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friends WHERE user_hash = '11'"),
+            0
+        );
+
+        assert!(
+            !db.decline_friend_request("22").expect("decline mutual"),
+            "a mutual friendship must not be endable by a decline"
+        );
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friends WHERE user_hash = '22'"),
+            1
+        );
+
+        // Nothing on file at all is the accepted-first case, and is not an error.
+        assert!(!db.decline_friend_request("33").expect("decline unknown"));
+    }
+
+    /// The request row holds the only address we have for somebody who is not
+    /// a friend, so rejecting has to copy it out in the same transaction that
+    /// deletes it or the courier has nowhere to dial.
+    #[test]
+    fn rejecting_a_request_queues_the_decline_with_its_address() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port) \
+                 VALUES ('44', 'Asker', '203.0.113.9', 4662)",
+                [],
+            )
+            .expect("seed request");
+
+        assert!(db.reject_and_queue_friend_decline("44").expect("reject"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = '44'"),
+            0,
+            "the request is gone whether or not we can reach them"
+        );
+        let queued = db.pending_friend_request_declines().expect("list");
+        assert_eq!(queued.len(), 1);
+        assert_eq!((queued[0].1.as_str(), queued[0].2), ("203.0.113.9", 4662));
+    }
+
+    /// A request that arrived without a usable address is still rejected — the
+    /// queue is about delivery, not about the decision — but queuing a dial to
+    /// nowhere would hold a row until it expired for no possible gain.
+    #[test]
+    fn rejecting_an_addressless_request_still_removes_it() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_requests (sender_hash, sender_nickname) VALUES ('55', 'Ghost')",
+                [],
+            )
+            .expect("seed request");
+
+        assert!(!db.reject_and_queue_friend_decline("55").expect("reject"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = '55'"),
+            0
+        );
+        assert!(db.pending_friend_request_declines().expect("list").is_empty());
+        // And a request that was never there is not an error either.
+        assert!(!db.reject_and_queue_friend_decline("66").expect("reject none"));
+    }
+
+    /// Adding somebody is the opposite answer to declining them, so an
+    /// undelivered refusal must not survive it and contradict the request the
+    /// add has just sent.
+    #[test]
+    fn adding_someone_countermands_an_undelivered_decline() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
+                 VALUES ('77', '203.0.113.9', 4662, 0)",
+                [],
+            )
+            .expect("seed decline");
+
+        db.add_friend("77", "Reconsidered", None).expect("add");
+        assert!(
+            db.pending_friend_request_declines().expect("list").is_empty(),
+            "the queued refusal must go when the user changes their mind"
         );
     }
 

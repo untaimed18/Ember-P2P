@@ -12,7 +12,7 @@ import {
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
-import { toastError, toastSuccess } from '$lib/stores/toast';
+import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
 
@@ -480,6 +480,27 @@ export async function initFriendsStore() {
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
         scheduleFriendsListRefresh();
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string }>('ember:friend-request-declined', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        // The backend has already dropped the one-sided row, so this is the
+        // sentence that closes it: the card said "waiting for them to accept"
+        // and would otherwise have said so for good.
+        const name = friendDisplayName(hash);
+        clearUnread(hash);
+        clearFriendSearch(hash);
+        clearFileOffersForFriend(hash);
+        scheduleFriendsListRefresh();
+        // Imported here rather than at the top: `chatTabs` reads `unreadCounts`
+        // from this module, so a static import would close a cycle between the
+        // two for the sake of one call.
+        void import('$lib/stores/chatTabs')
+          .then(({ removeChatForFriend }) => removeChatForFriend(hash))
+          .catch((e) => console.warn('friends: could not close the declined chat tab', e));
+        toast(m.friends_request_declined({ name }));
       }),
     );
     registered.push(

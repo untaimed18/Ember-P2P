@@ -2020,6 +2020,12 @@ pub enum UploadEventKind {
     EmberFriendRetract {
         ember_hash: [u8; 16],
     },
+    /// The peer is refusing a friend request we sent them. Only ever clears a
+    /// one-sided `friends` row we have not had accepted — never a friendship —
+    /// so an accept that beat it to the punch makes this a no-op.
+    EmberFriendDecline {
+        ember_hash: [u8; 16],
+    },
     /// An Ember friend was seen on an incoming connection (EmuleInfo exchange completed).
     FriendSeen {
         ember_hash: [u8; 16],
@@ -11952,6 +11958,35 @@ impl UploadHandler {
                             .send(UploadEvent {
                                 transfer_id: String::new(),
                                 kind: UploadEventKind::EmberFriendRetract { ember_hash: eh },
+                            })
+                            .await;
+                    }
+                }
+
+                // Refusal of a request we sent. Ahead of the general
+                // `OP_EMBER_EXT` arm for the mirror of the reason above: the
+                // peer refusing is someone we added and they did not, so they
+                // hold no friend privileges here either.
+                //
+                // Proof of possession alone again. The handler only ever
+                // deletes a one-sided row, so the worst a replay can do is
+                // clear a request the user could send again — where binding
+                // alone would let anyone who has seen a public key suppress
+                // requests on that identity's behalf.
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if secure_v2_authenticated
+                        && matches!(
+                            super::messages::parse_ember_ext(&payload),
+                            Some((super::messages::EMBER_EXT_FRIEND_DECLINE, _))
+                        ) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        debug!("Peer {peer_addr} declined our friend request ({})", hex::encode(eh));
+                        let _ = self
+                            .upload_event_tx
+                            .send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberFriendDecline { ember_hash: eh },
                             })
                             .await;
                     }
