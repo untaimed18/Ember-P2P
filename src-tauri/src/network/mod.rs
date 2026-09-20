@@ -3041,6 +3041,21 @@ fn note_ed2k_search_results(
             continue;
         }
         let skip_count = skip_hashes.contains(&r.file.hash);
+        // Bounded exactly as `streamed_hashes` and `dht_noted_availability`
+        // are, and for the reason they are: a global sweep of every server in
+        // the list can answer with far more distinct hashes than any user will
+        // look at, and these two maps were the only per-hash state in a search
+        // with nothing above them. A file already being tracked keeps
+        // accumulating; a new one past the cap simply goes untracked and
+        // carries its own slice, which beats abandoning the totals outright.
+        //
+        // One gate for both maps: every row writes to each of them, so their
+        // key sets are the same and splitting the decision could only let them
+        // disagree about a hash.
+        let tracked = active.ed2k_noted_availability.len() < MAX_STREAMED_HASHES_SOFT_CAP
+            || active
+                .ed2k_noted_availability
+                .contains_key(&r.file.hash);
         let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
         // A UDP reply is a different server than the last one that reported this
         // file, so its sources add; a TCP "More" re-list is the same server
@@ -3069,9 +3084,11 @@ fn note_ed2k_search_results(
                 active.udp_found_sources = active.udp_found_sources.saturating_add(delta);
             }
         }
-        active
-            .ed2k_noted_availability
-            .insert(r.file.hash.clone(), new_avail);
+        if tracked {
+            active
+                .ed2k_noted_availability
+                .insert(r.file.hash.clone(), new_avail);
+        }
 
         // Complete sources ride along on the same rule, and deliberately do not
         // feed `ed2k_found_sources`: the result cap counts sources, and a
@@ -3084,9 +3101,11 @@ fn note_ed2k_search_results(
             }),
             None => crate::search::merge::clamp_source_count(r.file.complete_sources),
         };
-        active
-            .ed2k_noted_complete_sources
-            .insert(r.file.hash.clone(), new_complete);
+        if tracked {
+            active
+                .ed2k_noted_complete_sources
+                .insert(r.file.hash.clone(), new_complete);
+        }
     }
     active.udp_found_sources > MAX_UDP_SEARCH_SOURCES
 }
@@ -8535,6 +8554,54 @@ mod tests {
         assert_eq!(active.ed2k_found_sources, 5); // spam-capped at 5
     }
 
+    /// The per-hash ed2k totals are bounded like every other per-hash map a
+    /// search keeps. They were the only ones that were not, so a global sweep
+    /// of every server in the list could grow them for as long as it ran.
+    /// Past the cap a file already being tracked must still accumulate — the
+    /// rows on screen are the ones that need their running total.
+    #[test]
+    fn ed2k_noted_totals_stop_growing_at_the_soft_cap() {
+        let mut active = sample_active_search_request(1);
+        let none = HashSet::new();
+        let batch: Vec<SearchResult> = (0..MAX_STREAMED_HASHES_SOFT_CAP)
+            .map(|i| SearchResult {
+                result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+                availability: 1,
+                ..sample_search_result(&format!("hash{i}"))
+            })
+            .collect();
+        note_ed2k_search_results(&mut active, &batch, &none);
+        assert_eq!(
+            active.ed2k_noted_availability.len(),
+            MAX_STREAMED_HASHES_SOFT_CAP
+        );
+
+        let fresh = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 4,
+            ..sample_search_result("past-the-cap")
+        };
+        note_ed2k_search_results(&mut active, &[fresh], &none);
+        assert_eq!(
+            active.ed2k_noted_availability.len(),
+            MAX_STREAMED_HASHES_SOFT_CAP,
+            "a hash first seen past the cap must not grow the map"
+        );
+        assert!(active.ed2k_noted_complete_sources.len() <= MAX_STREAMED_HASHES_SOFT_CAP);
+
+        let resight = SearchResult {
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            availability: 5,
+            ..sample_search_result("hash0")
+        };
+        note_ed2k_search_results(&mut active, &[resight], &none);
+        assert_eq!(
+            active.ed2k_noted_availability.get("hash0"),
+            Some(&6),
+            "an already-tracked hash must keep summing past the cap"
+        );
+    }
+
     /// eMule `AddResultCount`: shared/downloading hashes update the noted
     /// availability map (UI) but must not advance `ed2k_found_sources`.
     #[test]
@@ -13654,6 +13721,15 @@ const MAX_KAD_AVAILABILITY: u32 = 5_000;
 /// deduped against a later repeat of itself). That's strictly better than
 /// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
+
+/// Rows the `search_files` oneshot carries back.
+///
+/// The reply is a second channel, not the main one: every row it holds that
+/// the UI can use has either been streamed already or is a local hit, and the
+/// ones left are whatever the KAD leg gathered but never emitted. Bounded
+/// because it is serialized across IPC in one go, and sorted by availability
+/// first so the cut falls on the least-sourced rows.
+const SEARCH_INVOKE_REPLY_MAX: usize = 2000;
 
 /// Move the request's cross-packet spam context out for one enrichment pass,
 /// leaving an empty one in its place.
@@ -33838,7 +33914,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                         local_results
                             .sort_by_key(|r| std::cmp::Reverse(r.availability));
-                        local_results.truncate(2000);
+                        if local_results.len() > SEARCH_INVOKE_REPLY_MAX {
+                            // Not a loss of results — these are the rows that
+                            // were never streamed, and the ones dropped here
+                            // are the least-sourced of them — but it is the
+                            // one place a hit can leave the search without
+                            // ever having been shown, so it is on the record.
+                            debug!(
+                                "search {} reply holds {} unstreamed rows; returning the {} best-sourced",
+                                request_id,
+                                local_results.len(),
+                                SEARCH_INVOKE_REPLY_MAX,
+                            );
+                        }
+                        local_results.truncate(SEARCH_INVOKE_REPLY_MAX);
                         // Intentional: the `search_files` IPC call returns as soon as
                         // the KAD leg (normally the slowest, ~45-60s) finishes, rather
                         // than blocking further for the bounded TCP-server (<=30s) and

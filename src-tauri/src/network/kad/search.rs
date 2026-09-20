@@ -33,6 +33,14 @@ pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
 /// popular file.
 const SOURCE_SEARCH_STOP_THRESHOLD: usize = 300;
 const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
+/// Raw entries one search will hold before it stops accepting more.
+///
+/// Well above the stop thresholds above, which count answers rather than
+/// rows, so reaching it means a keyword so broad that the index nodes are
+/// still pouring out pages. Hitting it is logged once per search: the rows
+/// past it are dropped, and a silent drop is indistinguishable from the
+/// network having nothing more to give.
+const MAX_SEARCH_RESULT_ENTRIES: usize = 5000;
 /// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
 /// contacts queried. Both the stop-querying check and the reservation
 /// cap below must use this same value — a previous `+ 1` fudge factor
@@ -748,10 +756,18 @@ impl SearchState {
         self.store_pending_times.remove(from);
 
         let count = entries.len();
+        let before = self.results.len();
         for entry in entries {
-            if self.results.len() < 5000 {
+            if self.results.len() < MAX_SEARCH_RESULT_ENTRIES {
                 self.results.push(entry);
             }
+        }
+        if before < MAX_SEARCH_RESULT_ENTRIES && self.results.len() >= MAX_SEARCH_RESULT_ENTRIES {
+            info!(
+                "KAD search {} reached the {} entry cap; further results are dropped",
+                self.target.to_hex(),
+                MAX_SEARCH_RESULT_ENTRIES,
+            );
         }
 
         const FETCH_PAGE_SIZE: usize = 200;
@@ -767,7 +783,7 @@ impl SearchState {
         let page_complete = *page_received >= FETCH_PAGE_SIZE;
         if page_complete
             && !self.stop_querying
-            && self.results.len() < 5000
+            && self.results.len() < MAX_SEARCH_RESULT_ENTRIES
             && matches!(
                 self.search_type,
                 SearchType::FindKeyword | SearchType::FindSource { .. }

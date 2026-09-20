@@ -1486,6 +1486,7 @@
   "search_close_context_menu": "Close context menu",
   "search_mark_not_spam": "Mark as Not Spam",
   "search_mark_spam": "Mark as Spam",
+  "search_spam_requires_hash": "Only a result that carries a file hash can be marked",
   "search_ctx_download": "Download",
   "search_ctx_download_selected": "Download {count} Selected",
   "search_ctx_copy_link": "Copy eD2K Link",

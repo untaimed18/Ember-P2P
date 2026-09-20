@@ -24,6 +24,8 @@
     openSearchTab,
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
+    rescoreTabAfterSpamMark,
+    searchRowPatchEpoch,
     searchTabs,
     setActiveSearchTab,
     spamFilterEpoch,
@@ -47,6 +49,8 @@
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { computeRowWindow } from '$lib/rowWindow';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
@@ -98,6 +102,7 @@
   let resultsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let syncedTabId: string | null = null;
   let syncedLength = 0;
+  let syncedPatchEpoch = 0;
 
   function syncVisibleResults(list: SearchResult[], tabId: string | null) {
     if (resultsSyncTimer !== null) {
@@ -106,6 +111,7 @@
     }
     syncedTabId = tabId;
     syncedLength = list.length;
+    syncedPatchEpoch = get(searchRowPatchEpoch);
     resultsSyncedAt = Date.now();
     visibleResults = list;
   }
@@ -113,14 +119,21 @@
   $effect(() => {
     const list = searchResultsList;
     const tabId = $activeSearchTabId;
+    const patchEpoch = $searchRowPatchEpoch;
     const elapsed = Date.now() - resultsSyncedAt;
     // Bypass the throttle on: tab switch; a shorter list (Clear / close / cap
-    // eviction); the 400ms interval; and the first 0→N fill. Empty states read
-    // this snapshot, so delaying the first hits until after search-complete
-    // flashes "No results" on a fast Ember complete.
+    // eviction); an in-place row edit; the 400ms interval; and the first 0→N
+    // fill. Empty states read this snapshot, so delaying the first hits until
+    // after search-complete flashes "No results" on a fast Ember complete.
+    //
+    // The row-edit case is the user's own mark spam / mark not spam and the
+    // re-score behind it. Those keep the row count identical, so without the
+    // epoch they fell through to the trailing timer and the row the user just
+    // marked stayed on screen for up to the full interval.
     if (
       tabId !== syncedTabId ||
       list.length < syncedLength ||
+      patchEpoch !== syncedPatchEpoch ||
       elapsed >= RESULTS_SYNC_MIN_INTERVAL_MS ||
       (syncedLength === 0 && list.length > 0)
     ) {
@@ -1410,6 +1423,10 @@
       clearTimeout(dlMapTimer);
       dlMapTimer = null;
     }
+    if (rowWindowRaf !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(rowWindowRaf);
+      rowWindowRaf = null;
+    }
   });
 
   function getDownloadTransfer(result: SearchResult): Transfer | undefined {
@@ -1493,10 +1510,12 @@
     // proportionally to the number of active filters.
     const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
     const hasExt = ext.length > 0;
-    const minParsed = filterMinSize !== null ? filterMinSize * filterMinUnit : NaN;
-    const minBytes = Number.isFinite(minParsed) && minParsed > 0 ? minParsed : 0;
-    const maxParsed = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : NaN;
-    const maxBytes = Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : 0;
+    // `sizeToBytes`, the same conversion the wire filter uses, so a fractional
+    // size cannot mean one thing to the server and another to this table: the
+    // boxes are `step="any"`, and rounding only on the way out left rows near
+    // the boundary passing one filter and failing the other.
+    const minBytes = sizeToBytes(filterMinSize, filterMinUnit) ?? 0;
+    const maxBytes = sizeToBytes(filterMaxSize, filterMaxUnit) ?? 0;
     const minSrcParsed = filterMinSources !== null ? Math.trunc(filterMinSources) : NaN;
     const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
     const minCompleteParsed = filterMinComplete !== null ? Math.trunc(filterMinComplete) : NaN;
@@ -1513,7 +1532,12 @@
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
       if (maxBytes > 0 && r.file.size > maxBytes) continue;
-      if (minSrc > 0 && r.availability < minSrc) continue;
+      // A library-only row's source count is the placeholder `1` the backend
+      // fills in for a file that is on this disk rather than in a swarm, so it
+      // survives this filter the way an unknown complete count survives the
+      // next one. Mirrors `result_matches_client_filters` in merge.rs; a file
+      // the network also answered for carries that count and a wider origin.
+      if (minSrc > 0 && r.availability < minSrc && r.result_origin !== 'Local') continue;
       // A row whose complete count is unknown survives this filter rather than
       // being judged on a figure the column itself declines to show. eMule does
       // the same: `CSearchListCtrl::IsComplete` returns true for unknown.
@@ -1585,6 +1609,114 @@
 
   let filteredResults: SearchResult[] = $derived(filterPass.rows);
   let spamHiddenCount = $derived(filterPass.spamCount);
+
+  /* --- Row windowing ---------------------------------------------------
+   *
+   * Only the rows around the viewport are in the DOM. A tab holds up to
+   * `MAX_TAB_RESULTS` (15,000) and every row here is a real `<tr>` with a
+   * dozen cells, a download button and its own reactive `@const` block — so
+   * with the whole list mounted, anything that invalidated the list walked all
+   * of it. Marking one result as spam was the worst case and the reason this
+   * exists: with "Hide spam" on it removes a keyed row, which re-runs every
+   * surviving row's template and shifts `idx` on all of them. On a large
+   * search that froze the window for seconds per click.
+   *
+   * `content-visibility: auto` used to stand in for this. It skips layout and
+   * paint for offscreen rows, which helps scrolling and does nothing for the
+   * cost above: the nodes are still created, still keyed, still re-evaluated.
+   * The Library table windows its rows for the same reason
+   * (`LibraryVirtualTable.svelte`); this is the table-friendly form of it,
+   * two spacer rows around a slice, so the sticky header, the fixed column
+   * layout and every cell stay exactly as they were.
+   *
+   * eMule's own search list is a Win32 list control and has never had this
+   * problem — but `CSearchListCtrl::OnCommand` still wraps a spam mark in
+   * `SetRedraw(false)` and a wait cursor, for the identical reason.
+   */
+  /** Until a row has been measured. The real height is whatever the row's
+   *  tallest cell (the 26px action button plus its padding) comes to under
+   *  the user's font and zoom, so it is measured rather than assumed. */
+  const DEFAULT_ROW_HEIGHT = 34;
+  let resultsScrollEl: HTMLDivElement | undefined = $state(undefined);
+  let resultsBodyEl: HTMLTableSectionElement | undefined = $state(undefined);
+  let rowHeight = $state(DEFAULT_ROW_HEIGHT);
+  let rowWindowStart = $state(0);
+  let rowWindowEnd = $state(0);
+  let rowWindowRaf: number | null = null;
+
+  /** Columns the table is currently rendering, for the spacer rows' `colspan`.
+   *  Fixed part: checkbox, name, size, type, origin, sources, history, action. */
+  let renderedColumnCount = $derived(
+    8 + MEDIA_COLUMNS.reduce((n, c) => n + (columnVis[c.key] ? 1 : 0), 0),
+  );
+
+  function updateRowWindow() {
+    const scroller = resultsScrollEl;
+    const body = resultsBodyEl;
+    const total = filteredResults.length;
+    if (!scroller || !body || total === 0) {
+      rowWindowStart = 0;
+      rowWindowEnd = 0;
+      return;
+    }
+    // This side owns the measuring, because only this side can read the DOM;
+    // `computeRowWindow` owns the rule and is tested against it.
+    const { start, end } = computeRowWindow({
+      total,
+      bodyTop: body.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+      viewportHeight: scroller.clientHeight,
+      rowHeight,
+    });
+    rowWindowStart = start;
+    rowWindowEnd = end;
+  }
+
+  function scheduleRowWindowUpdate() {
+    if (rowWindowRaf !== null) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      updateRowWindow();
+      return;
+    }
+    rowWindowRaf = requestAnimationFrame(() => {
+      rowWindowRaf = null;
+      if (!destroyed) updateRowWindow();
+    });
+  }
+
+  let windowedResults = $derived(filteredResults.slice(rowWindowStart, rowWindowEnd));
+  let rowsBelowWindow = $derived(Math.max(0, filteredResults.length - rowWindowEnd));
+
+  $effect(() => {
+    // The list, its height or the elements changed; the scrollport did not, so
+    // this is the one path that does not go through the scroll handler.
+    void filteredResults;
+    void rowHeight;
+    void resultsScrollEl;
+    void resultsBodyEl;
+    untrack(() => updateRowWindow());
+  });
+
+  $effect(() => {
+    const el = resultsScrollEl;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => updateRowWindow());
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  // Row height comes from the rows themselves, so a different font size, a
+  // longer locale or browser zoom cannot desync the spacers from the content.
+  // Safe to read now that nothing is `content-visibility: auto`: every
+  // rendered row has real layout, including the overscan.
+  $effect(() => {
+    void windowedResults;
+    untrack(() => {
+      const row = resultsBodyEl?.querySelector<HTMLTableRowElement>('tr.result-row');
+      if (!row) return;
+      const measured = row.getBoundingClientRect().height;
+      if (measured > 0 && Math.abs(measured - rowHeight) >= 0.5) rowHeight = measured;
+    });
+  });
 
   // O(1) instead of two more full scans of `filteredResults`. The effect below
   // reconciles `checkedKeys` down to the visible set on every change, and
@@ -2649,17 +2781,22 @@
   }
 
   async function handleMarkSpam(result: SearchResult) {
-    const prevSpam = result.is_spam;
-    const prevRating = result.spam_rating ?? 0;
-    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
+    // The learned entry is keyed by hash and `mark_spam` rejects anything that
+    // is not one, so there is nothing to record for a hashless row. The menu
+    // item is disabled for those; this is the guard behind it.
+    if (!hash) return;
     const gen = (spamToggleGen.get(hash) ?? 0) + 1;
     spamToggleGen.set(hash, gen);
+    // The tab the row belongs to, captured before the IPC: eMule re-rates
+    // `pSpamFile->GetSearchID()`, not whatever search is on screen when the
+    // call comes back.
+    const markedTabId = activeTab?.id ?? null;
     // Close the menu first so the dismiss paints before filter/sort work.
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
+    const undoPatch = patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markSpam(
@@ -2674,33 +2811,39 @@
       );
       // A newer mark/unmark superseded this request — leave its optimistic state.
       if (spamToggleGen.get(hash) !== gen) return;
+      // What the mark was *for*: the backend has just learned this filename,
+      // its keyword-stripped form, its size and its sources, and every one of
+      // those is a rule about the other rows in this tab.
+      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'spam');
     } catch (e) {
       console.error('Failed to mark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
+        undoPatch();
         addToast('error', m.search_failed_mark_spam());
       }
     }
   }
 
   async function handleMarkNotSpam(result: SearchResult) {
-    const prevSpam = result.is_spam;
-    const prevRating = result.spam_rating ?? 0;
-    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
+    if (!hash) return;
     const gen = (spamToggleGen.get(hash) ?? 0) + 1;
     spamToggleGen.set(hash, gen);
+    const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
+    const undoPatch = patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markNotSpam(hash);
       if (spamToggleGen.get(hash) !== gen) return;
+      // Unmarking drops the collateral the mark taught — the filename, the
+      // size, the IPs — so rows flagged only by those are clean again.
+      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'not-spam');
     } catch (e) {
       console.error('Failed to unmark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
+        undoPatch();
         addToast('error', m.search_failed_unmark_spam());
       }
     }
@@ -3492,7 +3635,7 @@
   <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
-<div class="page-content">
+<div class="page-content" bind:this={resultsScrollEl} use:passiveScroll={scheduleRowWindowUpdate}>
   {#if emberDrivesThisSearch && emberReadinessUnknown}
     <div class="search-readiness-hint" role="status">
       {m.search_network_ember_diagnostics_hint()}
@@ -3713,8 +3856,17 @@
           <th class="col-action" aria-label={m.search_th_actions_aria()}></th>
         </tr>
       </thead>
-      <tbody title={m.search_double_click_hint()}>
-        {#each filteredResults as result, idx (resultKey(result))}
+      <tbody title={m.search_double_click_hint()} bind:this={resultsBodyEl}>
+        <!-- Scroll space for the rows above and below the window. Empty cells
+             with no padding, so each spacer is exactly the height of the rows
+             it stands in for and the scrollbar matches the full list. -->
+        {#if rowWindowStart > 0}
+          <tr class="row-spacer" aria-hidden="true" style="height:{rowWindowStart * rowHeight}px">
+            <td colspan={renderedColumnCount}></td>
+          </tr>
+        {/if}
+        {#each windowedResults as result, windowIdx (resultKey(result))}
+          {@const idx = rowWindowStart + windowIdx}
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
           {@const blockingDl = getBlockingDownloadTransfer(result)}
@@ -3722,7 +3874,8 @@
           {@const originText = originLabel(result.result_origin || '')}
           {@const spamExplain = spamExplainFor(result)}
           <tr
-            class="{dlRowClass(dlTransfer)}"
+            class="result-row {dlRowClass(dlTransfer)}"
+            class:row-alt={(idx & 1) === 1}
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
             class:in-library-row={isInLibraryOnly(result)}
@@ -3911,6 +4064,11 @@
             </td>
           </tr>
         {/each}
+        {#if rowsBelowWindow > 0}
+          <tr class="row-spacer" aria-hidden="true" style="height:{rowsBelowWindow * rowHeight}px">
+            <td colspan={renderedColumnCount}></td>
+          </tr>
+        {/if}
       </tbody>
     </table>
     {#if filteredResults.length === 0 && visibleResults.length > 0}
@@ -4006,8 +4164,23 @@
         </div>
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         <div class="ctx-sep" role="separator"></div>
-        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
+        <!-- The learned entry is keyed by file hash, so a hashless row has
+             nothing to record and `mark_spam` rejects it. Greyed out rather
+             than left to fail with a toast. -->
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!contextMenu.result.file.hash}
+          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}
+        >{m.search_mark_spam()}</button>
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!contextMenu.result.file.hash}
+          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}
+        >{m.search_mark_not_spam()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
           <div class="ctx-sep" role="separator"></div>
           <button
@@ -5072,16 +5245,18 @@
 
   .search-results-table tbody tr {
     height: 30px;
-    /*
-     * Chromium-native virtualization: skips layout/paint for rows that are
-     * offscreen, using the intrinsic-size hint to reserve scroll space.
-     * Tauri ships with WebView2 (Chromium) on Windows, so this is always
-     * available in the app; other engines gracefully fall back to normal
-     * rendering. This gives large result sets (thousands of rows) a huge
-     * scroll-perf win without fragile manual row windowing.
-     */
-    content-visibility: auto;
-    contain-intrinsic-size: auto 30px;
+  }
+
+  /*
+   * Deliberately no `content-visibility: auto` here. It skipped layout and
+   * paint for offscreen rows but still built every one of them, which is the
+   * cost that mattered — see the row-windowing block in the script. It would
+   * also lie to the measurement that sizes the spacers, since a skipped row
+   * reports its `contain-intrinsic-size` rather than its real height.
+   */
+  .row-spacer td {
+    padding: 0;
+    border: 0;
   }
 
   th.sortable {
@@ -5104,7 +5279,10 @@
     background: var(--bg-secondary);
   }
 
-  tbody tr:nth-child(even) td {
+  /* Striping follows the row's place in the whole list, not its place in the
+     DOM: the window renders a slice, and `:nth-child` would restripe the
+     table on every scroll (and count the spacer rows while doing it). */
+  tbody tr.row-alt td {
     background: color-mix(in srgb, var(--bg-secondary) 82%, var(--bg-primary));
   }
 

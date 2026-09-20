@@ -1486,6 +1486,7 @@
   "search_close_context_menu": "Закрыть контекстное меню",
   "search_mark_not_spam": "Пометить как не спам",
   "search_mark_spam": "Пометить как спам",
+  "search_spam_requires_hash": "Отметить можно только результат с хешем файла",
   "search_ctx_download": "Загрузить",
   "search_ctx_download_selected": "Загрузить выбранных: {count}",
   "search_ctx_copy_link": "Копировать eD2K-ссылку",

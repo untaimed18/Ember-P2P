@@ -1486,6 +1486,7 @@
   "search_close_context_menu": "Chiudi menu contestuale",
   "search_mark_not_spam": "Contrassegna come non spam",
   "search_mark_spam": "Contrassegna come spam",
+  "search_spam_requires_hash": "Si può contrassegnare solo un risultato con hash del file",
   "search_ctx_download": "Scarica",
   "search_ctx_download_selected": "Scarica {count} selezionati",
   "search_ctx_copy_link": "Copia link eD2K",

@@ -1486,6 +1486,7 @@
   "search_close_context_menu": "關閉上下文選單",
   "search_mark_not_spam": "標記為非垃圾資訊",
   "search_mark_spam": "標記為垃圾資訊",
+  "search_spam_requires_hash": "只有帶檔案雜湊的結果才能標記",
   "search_ctx_download": "下載",
   "search_ctx_download_selected": "下載所選 {count} 個",
   "search_ctx_copy_link": "複製 eD2K 連結",

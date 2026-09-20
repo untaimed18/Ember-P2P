@@ -268,6 +268,17 @@ impl LocalIndex {
             .collect();
         results.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
+        if results.len() > Self::LOCAL_SEARCH_MAX {
+            // Said out loud, because the rows past the cap are indistinguishable
+            // from files the library does not hold — and "my own file did not
+            // come up" is the one search failure a user can be certain about.
+            tracing::debug!(
+                "local search matched {} files; returning the {} best-scoring",
+                results.len(),
+                Self::LOCAL_SEARCH_MAX,
+            );
+        }
+
         results
             .into_iter()
             .take(Self::LOCAL_SEARCH_MAX)

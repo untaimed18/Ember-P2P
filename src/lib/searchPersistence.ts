@@ -12,6 +12,7 @@
  * test process cannot load it, and a rule with no test drifts. This one is
  * pure — the storage reads and writes stay in the store.
  */
+import { shedWeakestRows } from '$lib/searchOverflow';
 import type { SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
 
@@ -73,11 +74,29 @@ function usableRow(row: unknown): row is SearchResult {
     && !!(row as SearchResult).file;
 }
 
+/**
+ * The rows worth carrying across a reload, when they don't all fit.
+ *
+ * Taking the first `limit` kept whichever rows happened to arrive first, which
+ * is packet order — so a big search came back with a few hundred arbitrary
+ * hits and the well-sourced ones the user was actually looking at were as
+ * likely as not among the ones dropped. `shedWeakestRows` is the rule the tab
+ * itself uses when it overflows, so a restore now keeps what an overflowing
+ * tab would have kept: the best-sourced rows of each network, spam last.
+ *
+ * `filter` has already copied, so the in-place shed cannot touch the live tab.
+ */
+function rowsWorthStoring(raw: unknown, limit: number): SearchResult[] {
+  const rows = (Array.isArray(raw) ? raw : []).filter(usableRow);
+  if (rows.length > limit) shedWeakestRows(rows, limit);
+  return rows;
+}
+
 /** Strip a tab to what is worth storing, and to what survives being stored. */
 export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchTab {
   return {
     ...tab,
-    results: (Array.isArray(tab.results) ? tab.results : []).filter(usableRow).slice(0, limit),
+    results: rowsWorthStoring(tab.results, limit),
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
     resultIndex: undefined,

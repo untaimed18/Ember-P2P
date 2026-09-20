@@ -1486,6 +1486,7 @@
   "search_close_context_menu": "关闭上下文菜单",
   "search_mark_not_spam": "标记为非垃圾信息",
   "search_mark_spam": "标记为垃圾信息",
+  "search_spam_requires_hash": "只有带文件哈希的结果才能标记",
   "search_ctx_download": "下载",
   "search_ctx_download_selected": "下载所选 {count} 个",
   "search_ctx_copy_link": "复制 eD2K 链接",
