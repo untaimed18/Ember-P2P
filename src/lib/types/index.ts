@@ -194,12 +194,9 @@ export interface SourceInfo {
    *  inbound connection. */
   user_hash?: number[];
   /** Which network first told us about this peer, for the sources list's
-   *  Origin column — the backend's `SourceOrigin`, set once at discovery.
-   *
-   *  Absent is a real and expected state, not a gap to paper over: sources
-   *  reloaded from `sources.met` arrive without one (the file has nowhere to
-   *  keep it), as do peers the A4AF swapper moved across files. Render those
-   *  as unknown rather than guessing a network for them. */
+   *  Origin column — the backend's `SourceOrigin`, set once at discovery
+   *  and persisted in `sources.met`. Absent only when we genuinely never
+   *  recorded one. */
   origin?: SourceOrigin;
 }
 

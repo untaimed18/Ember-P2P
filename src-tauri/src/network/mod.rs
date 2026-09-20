@@ -32990,7 +32990,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
 
                 let mut promoted = Vec::new();
-                if let Err(p) = std::panic::AssertUnwindSafe(handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager)).catch_unwind().await {
+                if let Err(p) = std::panic::AssertUnwindSafe(handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager, bandwidth_limiter.effective_upload_rate())).catch_unwind().await {
                     error!("handle_upload_event panicked, dropping event: {}", describe_panic(&*p));
                 }
                 for t in promoted {
@@ -58039,16 +58039,16 @@ async fn handle_download_event(
             } else {
                 (None, None)
             };
-            let (placeholder_removed, source_payload) = {
+            let (placeholder_removed, source_payload, detail_origin) = {
                 let mut mgr = transfer_manager.write().await;
                 let counts_before = mgr.source_counts(&transfer_id);
-                // Drop any other row representing this same peer: one carrying
-                // the same user hash at a different port/IP-key (this coalesces
-                // the ephemeral live row with the listening/placeholder row —
-                // including a Path-B queued row, which was stamped with the
-                // hash while it was queued), plus any callback placeholder at
-                // this IP (the pre-existing callback cleanup). The live
-                // (ip, port) row is preserved and updated in place below.
+                // Harvest origin from the placeholder / listening-port row
+                // *before* supersede drops it. The live connection is often
+                // on the ephemeral port, and a worker lookup then misses —
+                // which is how working sources showed a dash (issue 121).
+                let inherited_origin =
+                    mgr.inherited_source_origin(&transfer_id, &ip, live_hash);
+                let detail_origin = live_origin.or(inherited_origin);
                 let removed = mgr.supersede_duplicate_peer_rows(&transfer_id, &ip, port, live_hash);
                 mgr.update_source_detail(
                     &transfer_id,
@@ -58065,7 +58065,7 @@ async fn handle_download_event(
                         total_parts,
                         country_code: country_code.clone(),
                         user_hash: live_hash,
-                        origin: live_origin,
+                        origin: detail_origin,
                         // We are in contact with this peer, so whatever row is
                         // here stops being a not-yet-contacted placeholder.
                         placeholder: false,
@@ -58088,7 +58088,7 @@ async fn handle_download_event(
                             queued_sources,
                         }
                     });
-                (removed, payload)
+                (removed, payload, detail_origin)
             };
             for (rem_ip, rem_port) in placeholder_removed {
                 callback_row_pending_since.remove(&(transfer_id.clone(), rem_ip.clone(), rem_port));
@@ -58152,7 +58152,7 @@ async fn handle_download_event(
                     // Carried so a row this event creates (a source no
                     // discovery placeholder was seeded for) shows its Origin
                     // straight away, rather than blank until the next snapshot.
-                    "origin": live_origin,
+                    "origin": detail_origin,
                 }),
             );
             if let Some(payload) = source_payload {
@@ -58393,6 +58393,7 @@ async fn handle_upload_event(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
+    upload_speed_limit: u64,
 ) {
     match event.kind {
         UploadEventKind::Started {
@@ -58487,7 +58488,7 @@ async fn handle_upload_event(
             }
         }
         UploadEventKind::Progress {
-            uploaded,
+            uploaded: _,
             uploaded_wire,
             unique_uploaded,
             total,
@@ -58525,9 +58526,15 @@ async fn handle_upload_event(
                 // are wire figures, and a row derived from payload read high
                 // by the compression ratio. Slots then summed above a cap they
                 // had not breached, with the total sitting correctly below
-                // them. `uploaded` still drives credits and the all-time
-                // statistics further down, which is the counter those want.
+                // them. The payload counter is not dropped: the event loop
+                // reads `uploaded` off this same event before dispatching here
+                // (`library_upload_delta`) for the all-time totals, and the
+                // upload worker credits the peer with it directly.
                 mgr.update_progress(&event.transfer_id, uploaded_wire, Some(unique_capped));
+                // A fresh slot against a full token bucket can still window
+                // above the cap; clamp so the row cannot read higher than the
+                // limiter is allowed to spend (issue 115).
+                mgr.cap_active_speed(&event.transfer_id, upload_speed_limit);
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
                 let ut = t
@@ -58562,7 +58569,11 @@ async fn handle_upload_event(
                     total,
                     progress,
                     speed,
-                    uploaded: Some(uploaded),
+                    // Wire bytes, matching the limiter and the row's speed.
+                    // Passing the payload counter here made the Transferred
+                    // column (and the frontend EWMA that reads it) run ahead
+                    // of the cap by the compression ratio — issue 115.
+                    uploaded: Some(uploaded_wire),
                     completed_size: Some(unique_capped),
                     direction: Some("upload"),
                     upload_time: Some(upload_time_ms),

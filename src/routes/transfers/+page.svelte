@@ -44,6 +44,7 @@
     transferHealthReasonText,
   } from '$lib/i18n';
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
+  import { uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -79,9 +80,8 @@
    *
    *  Compares the rendered labels, not the wire values, so the rows group the
    *  way the column reads in whatever locale is active. Same blank-last rule as
-   *  `cmpCountry`, and for the same reason: an absent origin is routine — every
-   *  source restored from `sources.met` has one — so it belongs at the end
-   *  rather than heading the list. */
+   *  `cmpCountry`. An absent origin is rare after a recorded discovery, so
+   *  it belongs at the end rather than heading the list. */
   function cmpOrigin(a: SourceInfo['origin'], b: SourceInfo['origin']): number {
     if (a === b) return 0;
     if (!a) return 1;
@@ -718,11 +718,8 @@
 
   /// Short label for the Origin column — which network told us about a source.
   ///
-  /// `undefined` is a genuine answer, not a hole to fill. A source reloaded
-  /// from `sources.met` has no recorded origin (the file cannot carry one) and
-  /// neither does one the A4AF swapper moved between files, so those read as
-  /// unknown until some network mentions the peer again — which resume-time
-  /// discovery normally does within a cycle or so.
+  /// `undefined` is a genuine answer, not a hole to fill — only when no
+  /// network has named the peer and nothing was restored from `sources.met`.
   function sourceOriginLabel(origin: SourceInfo['origin']): string {
     switch (origin) {
       case 'server': return m.transfers_origin_server();
@@ -984,6 +981,18 @@
     return { all, active, completed, failed, queued };
   });
   let activeUploads = $derived(uploadPartition.active);
+  // Scale displayed upload-slot speeds so their sum cannot exceed the
+  // configured cap or the status-bar total (issue 115). A slot handover
+  // otherwise left the remaining rows at their pre-handover window rates
+  // while a fresh slot added a burst, so the column sum read above both
+  // the limit and the dipping total. The arithmetic lives in `$lib/uploadSpeed`
+  // so it can be tested; the rows excluded here are the ones rendered idle.
+  let uploadSpeedScale = $derived.by(() =>
+    uploadScaleFactor(
+      uploadSumBound($appSettings?.max_upload_speed ?? 0, $networkStats.upload_speed),
+      activeUploads.filter((t) => !IDLE_STATUSES.has(t.status)).map((t) => t.speed),
+    ),
+  );
   // `completedUploads`, `failedUploads`, `queuedUploads` were derivations
   // for the old upload-pane "Completed"/"Failed"/"On Queue" placeholder
   // sections. With the auto-remove change (terminal upload-direction
@@ -1818,12 +1827,18 @@
     if (IDLE_STATUSES.has(t.status)) {
       return 0;
     }
-    // Prefer the backend's real-time rolling-window rate. It's pushed on every
-    // `transfer-progress` event (and zeroed via `transfer-speed-decay` on
-    // idle), so it tracks throughput live — without the extra smoothing lag and
-    // 12 s stale-linger the local EWMA adds. The EWMA is only a fallback for
-    // the brief windows where the backend reports 0 while bytes are still
-    // moving (e.g. between scheduling ticks, before the first window sample).
+    if (t.direction === 'upload') {
+      // Do not fall back to the transferred-byte EWMA for uploads: that
+      // counter used to be payload (compression-inflated) and is sampled
+      // against the time since the row appeared, which is how a fresh slot
+      // printed 350 kB/s against a 200 kB/s cap (issue 115). Scale the
+      // backend rates so the visible slot sum cannot exceed the configured
+      // limit or the status-bar total.
+      if (t.speed <= 0) return 0;
+      const scaled = t.speed * uploadSpeedScale;
+      const cap = $appSettings?.max_upload_speed ?? 0;
+      return cap > 0 ? Math.min(scaled, cap) : scaled;
+    }
     if (t.speed > 0) return t.speed;
     const entry = speedHistory.get(t.id);
     if (entry && entry.ewma > 0) return entry.ewma;

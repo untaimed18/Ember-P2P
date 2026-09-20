@@ -381,8 +381,9 @@ pub struct SourceInfo {
     /// push-grant) connection. `None` when the identity isn't known yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_hash: Option<[u8; 16]>,
-    /// Which network told us about this peer. `None` while unknown — see
-    /// [`SourceOrigin`] for why that is a state we are willing to show.
+    /// Which network told us about this peer. `None` while unknown — a source
+    /// whose origin was never recorded (and not restored from `sources.met`).
+    /// See [`SourceOrigin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SourceOrigin>,
     /// True for a row we seeded from a discovery answer that we have not
@@ -411,11 +412,22 @@ pub struct SourceInfo {
 /// about — so the variant could never be produced, and a column value that
 /// cannot occur is its own kind of lie.
 ///
+/// eMule's enum is wider in three more places, and those are the cases that
+/// still read as unknown here: `SF_LINK` (a source hint in a pasted ed2k link),
+/// `SF_SOURCE_SEEDS` (the handful it redials from a part file after a restart)
+/// and `SF_SEARCH_RESULT`. Ember's equivalents — the primary peer and the
+/// `extra_sources` of `StartDownload` — are registered with no origin, so they
+/// label themselves the first time a network does mention them (`origin` is
+/// filled when unset, so nothing has to overwrite anything) and stay blank only
+/// if none ever does. Worth a variant each if that blank turns out to be common;
+/// it was not worth inventing a network for them.
+///
 /// Recorded once, when the source is first registered, and never revised. That
 /// matters: a peer learned from KAD is routinely re-announced later over source
 /// exchange or by a server, and an origin that tracked the most recent mention
 /// would drift to whichever network gossiped most. eMule sets `m_nSourceFrom`
-/// at construction for the same reason.
+/// at construction for the same reason. The value is persisted in a trailing
+/// `EORG` section of `sources.met` so a restart does not blank the column.
 ///
 /// An earlier version of this feature (removed in 97489faf) had no field at all
 /// and instead inferred the origin at read time from whether `SourceEntry`
