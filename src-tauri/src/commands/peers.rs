@@ -971,6 +971,43 @@ pub async fn get_unread_message_counts(
         })
 }
 
+/// The newest line in each friend conversation, for the list preview.
+#[derive(serde::Serialize)]
+pub struct ChatPreviewInfo {
+    pub user_hash: String,
+    /// `sent` or `received`, so the list can say who spoke last.
+    pub direction: String,
+    pub timestamp: i64,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn get_chat_previews(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ChatPreviewInfo>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.chat_previews())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(user_hash, direction, timestamp, message)| ChatPreviewInfo {
+                    user_hash,
+                    direction,
+                    timestamp,
+                    message,
+                })
+                .collect()
+        })
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_get_chat_previews",
+                "Failed to read chat previews",
+                e,
+            )
+        })
+}
+
 #[tauri::command]
 pub async fn get_friend_requests(
     state: tauri::State<'_, AppState>,

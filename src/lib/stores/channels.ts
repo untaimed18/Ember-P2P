@@ -1,10 +1,12 @@
 import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  listChannelPreviews,
   listChannels,
   listChannelTransfers,
   respondChannelTransfer,
   type ChannelInfo,
+  type ChannelPreviewInfo,
   type ChannelTransferInfo,
 } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
@@ -444,6 +446,49 @@ export function mergeChannelUnreadFromSnapshot(
  */
 export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
 
+/**
+ * Newest line per room, keyed by channel id.
+ *
+ * Its own store rather than a field on the room row: `list_channels` runs on
+ * every refresh and feeds the whole page, and a preview is the one thing on it
+ * that has to be decrypted row by row. Kept current by the same events that
+ * move unread, so the caption does not wait for a refresh.
+ */
+export const channelPreviews = writable<Record<string, ChannelPreviewInfo>>({});
+
+export async function refreshChannelPreviews(): Promise<void> {
+  const epoch = storeEpoch;
+  try {
+    const rows = await listChannelPreviews();
+    if (epoch !== storeEpoch) return;
+    channelPreviews.set(Object.fromEntries(rows.map((row) => [row.channel_id, row])));
+  } catch (e) {
+    console.warn('Channels: could not read room previews', e);
+  }
+}
+
+/** Fold a line we have just seen into the preview, without a round trip. */
+function notePreview(
+  channelId: string,
+  sender: string,
+  direction: string,
+  message: string,
+  timestamp: number,
+): void {
+  const text = message.replace(/\s+/g, ' ').trim();
+  if (!text) return;
+  channelPreviews.update((cur) => ({
+    ...cur,
+    [channelId]: {
+      channel_id: channelId,
+      sender_pubkey: sender,
+      direction,
+      timestamp,
+      message: text.length > 120 ? text.slice(0, 120) : text,
+    },
+  }));
+}
+
 /** Incoming Ember Transfer offers still waiting for a decision. */
 export const awaitingChannelOfferList = derived(channelTransfers, (xfers) =>
   Object.values(xfers)
@@ -719,9 +764,20 @@ export async function initChannelsStore() {
         direction?: string;
         message?: string;
         sender_pubkey?: string;
+        timestamp?: number;
       }>('ember:channel-message', (event) => {
         const channelId = validChannelId(event.payload?.channel_id);
         if (!channelId) return;
+        // Ahead of the direction gate below: our own line is the newest thing
+        // in the room too, and a preview that ignored it would sit on whatever
+        // somebody else last said.
+        notePreview(
+          channelId,
+          event.payload.sender_pubkey ?? '',
+          event.payload.direction ?? 'received',
+          event.payload.message ?? '',
+          event.payload.timestamp ?? Math.floor(Date.now() / 1000),
+        );
         if (event.payload.direction && event.payload.direction !== 'received') {
           return;
         }
@@ -793,6 +849,7 @@ export async function initChannelsStore() {
     unlisteners = registered;
     await refreshChannels().catch(() => {});
     void mergeChannelTransfers();
+    void refreshChannelPreviews();
   } catch (err) {
     for (const fn of registered) {
       try {
@@ -826,6 +883,7 @@ export function cleanupChannelsStore() {
   for (const timer of xferClearTimers.values()) clearTimeout(timer);
   xferClearTimers.clear();
   channelTransfers.set({});
+  channelPreviews.set({});
   channels.set([]);
   activeChannelId.set(null);
 }

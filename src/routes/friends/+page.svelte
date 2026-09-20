@@ -29,6 +29,7 @@
     clearFileOffer,
     clearFileOffersForFriend,
     rememberFriendName,
+    chatPreviews,
     friendsList as friendsListStore,
     beginFriendsListFetch,
     commitFriendsList,
@@ -1255,6 +1256,7 @@
       {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
       {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
       {@const shortName = f.nickname || f.user_hash.slice(0, 8)}
+      {@const lastLine = $chatPreviews.get(f.user_hash.toLowerCase())}
       <div class="friend-card" class:editing={editingHash === f.user_hash}>
         <div class="card-avatar">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1325,6 +1327,16 @@
               {m.friends_status_added({ when: formatDate(f.added_at) })}
             {/if}
           </span>
+          <!-- Under the status rather than competing with it: the line above
+               answers "can I reach them", which stays the more urgent
+               question. A conversation with nothing in it simply has no
+               second line. -->
+          {#if lastLine}
+            <span class="card-preview" title={lastLine.message}>
+              {#if lastLine.direction === 'sent'}<span class="card-preview-you">{m.friends_preview_you()}</span>{/if}
+              <bdi dir="auto">{lastLine.message}</bdi>
+            </span>
+          {/if}
         </div>
 
         <div class="card-controls">
@@ -1934,6 +1946,20 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .card-preview {
+    display: block;
+    margin-top: 1px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .card-preview-you {
+    color: var(--text-muted);
   }
 
   .status-online {

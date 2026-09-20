@@ -3,12 +3,14 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { isAppVisible } from '$lib/utils';
 import {
+  getChatPreviews,
   getFriendRequests,
   getFriends,
   getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
   type FriendInfo,
+  type ChatPreviewInfo,
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
@@ -35,6 +37,15 @@ export const friendRequests = writable<FriendRequestInfo[]>([]);
  * whenever a confirmation event or the Friends page reloads the table.
  */
 export const friendsList = writable<FriendInfo[]>([]);
+/**
+ * Newest line per friend, keyed by lowercase hash.
+ *
+ * Separate from `getFriends` for the reason the unread tally is: that call
+ * feeds the whole page and a preview is the one thing on it that has to be
+ * decrypted row by row. Kept current by the chat listener, so the caption does
+ * not wait for a reload.
+ */
+export const chatPreviews = writable<Map<string, ChatPreviewInfo>>(new Map());
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
 let friendsSeedFailedToast = false;
@@ -239,6 +250,42 @@ export const activeChatHash = writable<string | null>(null);
 const recentChatSigs = new Map<string, number>();
 const CHAT_SIG_TTL_MS = 10_000;
 
+/** Longest preview worth carrying. Matches the backend's own cap, so a line
+ *  folded in live and the same line re-read from disk read identically. */
+const PREVIEW_MAX = 120;
+
+/** Fold a line we have just seen into the preview, without a round trip. */
+function noteChatPreview(
+  hash: string,
+  direction: string,
+  message: string,
+  timestamp: number,
+): void {
+  const text = message.replace(/\s+/g, ' ').trim();
+  if (!text) return;
+  chatPreviews.update((cur) => {
+    const next = new Map(cur);
+    next.set(hash, {
+      user_hash: hash,
+      direction,
+      timestamp: timestamp > 0 ? timestamp : Math.floor(Date.now() / 1000),
+      message: text.length > PREVIEW_MAX ? text.slice(0, PREVIEW_MAX) : text,
+    });
+    return next;
+  });
+}
+
+export async function refreshChatPreviews(): Promise<void> {
+  const epoch = storeEpoch;
+  try {
+    const rows = await getChatPreviews();
+    if (epoch !== storeEpoch) return;
+    chatPreviews.set(new Map(rows.map((row) => [row.user_hash.toLowerCase(), row])));
+  } catch (e) {
+    console.warn('friends: could not read chat previews', e);
+  }
+}
+
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 // Bumped by `cleanupFriendsStore`; see the matching comment in
@@ -335,6 +382,10 @@ export async function initFriendsStore() {
         const p = event.payload;
         const hash = validFriendHash(p?.user_hash);
         if (!hash) return;
+        // Ahead of the direction gate: our own line is the newest thing in the
+        // conversation too, and a preview that skipped it would sit on
+        // whatever the friend last said.
+        noteChatPreview(hash, p.direction, safeEventText(p.message), p.timestamp ?? 0);
         if (p.direction !== 'received') return;
         // Suppress backend double-emits so the unread badge counts each
         // inbound message once (see `recentChatSigs` above).
@@ -616,6 +667,27 @@ export async function initFriendsStore() {
     noteFriendsSeedFailure('getUnreadMessageCounts', e);
   }
 
+  // After the listener above, so a line that lands mid-init is not overwritten
+  // by a snapshot taken before it: the fetch is keyed per friend and only the
+  // rows it returns are replaced.
+  try {
+    const rows = await getChatPreviews();
+    if (myEpoch !== storeEpoch) return;
+    chatPreviews.update((cur) => {
+      const next = new Map(cur);
+      for (const row of rows) {
+        const key = row.user_hash.toLowerCase();
+        const live = next.get(key);
+        // A live event is newer than anything this snapshot can hold.
+        if (live && live.timestamp >= row.timestamp) continue;
+        next.set(key, { ...row, user_hash: key });
+      }
+      return next;
+    });
+  } catch (e) {
+    noteFriendsSeedFailure('getChatPreviews', e);
+  }
+
   // M6: previously `isDiscoverable` only flipped when the backend
   // emitted `ember:friend-discoverable`, which doesn't fire until
   // the rendezvous reachability check completes. On startup the
@@ -719,6 +791,7 @@ export function cleanupFriendsStore() {
   for (const t of searchTimers.values()) clearTimeout(t);
   searchTimers.clear();
   recentChatSigs.clear();
+  chatPreviews.set(new Map());
   onlineFriends.set(new Set());
   friendNames.set(new Map());
   unreadCounts.set(new Map());
