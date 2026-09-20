@@ -3648,10 +3648,22 @@
             <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
+          <div class="field">
+            <label for="max-friends">{m.settings_max_friends()}</label>
+            <input
+              id="max-friends"
+              type="number"
+              min="1"
+              max="500"
+              bind:value={settings.max_friends}
+            />
+            <span class="hint">{m.settings_max_friends_hint()}</span>
+          </div>
+
           <!-- Friend session encryption stays forced on (see handleSave /
-               applyFriendTogglesLive). Max friends + rendezvous URL remain
-               in AppSettings for config.json only — not everyday controls.
-               Channel file offers moved to the Channels section. -->
+               applyFriendTogglesLive). Rendezvous URL remains in AppSettings
+               for config.json only. Channel file offers live in the Channels
+               section. -->
 
         </div>
       </section>
@@ -3782,6 +3794,14 @@
                   <li>
                     <span class="ignored-name">
                       <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
+                      <!-- Named rooms rather than a bare count: this list is
+                           the only place a scope set inside a room the user
+                           has since left can still be read or undone. -->
+                      {#if entry.rooms}
+                        <span class="ignored-scope">{m.settings_channels_ignored_in({
+                          rooms: entry.rooms.map(channelLabel).join(', '),
+                        })}</span>
+                      {/if}
                     </span>
                     <button
                       type="button"
@@ -4971,6 +4991,15 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .ignored-scope {
+    display: block;
+    margin-top: 2px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .about-actions {

@@ -165,7 +165,7 @@ fn parse_16_byte_hash(
     Ok(hash)
 }
 
-fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>), String> {
+pub(crate) fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>), String> {
     let trimmed = value.trim();
     if let Some(rest) = trimmed
         .strip_prefix("ember2:")

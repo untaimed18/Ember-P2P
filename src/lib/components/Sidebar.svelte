@@ -7,7 +7,7 @@
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
-  import { totalChannelUnread } from '$lib/stores/channels';
+  import { awaitingChannelOffers, totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import {
@@ -197,6 +197,27 @@
   // which required navigating there to notice activity.
   let totalUnreadChats = $derived($totalUnread);
   let totalUnreadChannels = $derived($totalChannelUnread);
+  let awaitingChannelOfferCount = $derived($awaitingChannelOffers);
+  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount);
+
+  function channelInboxTitle(unread: number, offers: number): string {
+    const parts: string[] = [];
+    if (unread > 0) {
+      parts.push(
+        unread === 1
+          ? m.channels_unread_title_one()
+          : m.channels_unread_title_other({ count: unread }),
+      );
+    }
+    if (offers > 0) {
+      parts.push(
+        offers === 1
+          ? m.channels_offers_title_one()
+          : m.channels_offers_title_other({ count: offers }),
+      );
+    }
+    return parts.join(' · ');
+  }
 
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
@@ -450,13 +471,12 @@
               title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
             >{pendingFriendInboxCount}</span>
           {/if}
-          {#if item.id === 'channels' && totalUnreadChannels > 0}
+          {#if item.id === 'channels' && channelInboxCount > 0}
             <span
               class="nav-badge"
-              title={totalUnreadChannels === 1
-                ? m.channels_unread_title_one()
-                : m.channels_unread_title_other({ count: totalUnreadChannels })}
-            >{totalUnreadChannels > 99 ? '99+' : totalUnreadChannels}</span>
+              class:nav-badge-attention={awaitingChannelOfferCount > 0}
+              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount)}
+            >{channelInboxCount > 99 ? '99+' : channelInboxCount}</span>
           {/if}
         </a>
       </li>

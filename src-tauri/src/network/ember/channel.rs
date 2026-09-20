@@ -277,6 +277,36 @@ const _: () = assert!(
 pub const CHANNEL_HISTORY_SYNC_PER_MIN: usize = 2;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
+/// How soon a neighbor that is still feeding us backlog may be asked again.
+///
+/// A catch-up reply carries at most [`CHANNEL_HISTORY_SYNC_MAX`] lines, so a
+/// gap wider than that takes several rounds to walk. Waiting out
+/// [`CHANNEL_HISTORY_SYNC_SECS`] between rounds meant a room that had been
+/// quiet for a day filled in half an hour at best, which reads as a room where
+/// nobody ever spoke. Only applied while the watermark is actually advancing —
+/// a neighbor with nothing to add falls back to the idle interval — and kept
+/// above the responder's own [`CHANNEL_HISTORY_SYNC_PER_MIN`] window so the
+/// faster walk still fits inside the budget it admits.
+pub const CHANNEL_HISTORY_WALK_SECS: u64 = 31;
+// The walk is the fastest we ever ask one neighbor, and a responder admits
+// `CHANNEL_HISTORY_SYNC_PER_MIN` per minute for one room. Asking faster than
+// its share of that window would spend the allowance on refusals and stall the
+// very backlog the walk exists to drain.
+const _: () = assert!(
+    CHANNEL_HISTORY_WALK_SECS * (CHANNEL_HISTORY_SYNC_PER_MIN as u64) > 60,
+    "the walk interval must stay inside the budget a responder admits"
+);
+/// How soon opening a room may re-ask for its history ahead of that gate.
+///
+/// Focusing a room drops its catch-up stamps so the next tick asks straight
+/// away rather than waiting out the five minutes while the transcript looks
+/// empty. Dropping them on *every* focus change would be self-defeating:
+/// `maybe_sync_channel_history` runs on the one-second tick, so clicking
+/// between two rooms would re-ask the same neighbors every switch, and a
+/// responder admits only [`CHANNEL_HISTORY_SYNC_PER_MIN`] requests a minute
+/// for one room — the redundant asks would spend that allowance and get a
+/// later, genuine catch-up refused. Stamps younger than this stay.
+pub const CHANNEL_HISTORY_FOCUS_RESYNC_SECS: u64 = 60;
 /// How a catch-up reply is ordered, which decides whether a gap can close.
 ///
 /// A requester's watermark is the newest timestamp it holds, so a reply served

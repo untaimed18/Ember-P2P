@@ -169,9 +169,14 @@ export function unhideChannel(channelId: string): void {
  *
  * The only remedy a non-owner has: banning is owner-and-moderator work, so
  * without this an ordinary member has no way to deal with someone tiresome.
- * Keyed on the identity rather than on (room, identity) because the person is
- * the same person in every room, and stored locally because it is a personal
- * preference that nobody else should learn.
+ * Stored locally because it is a personal preference nobody else should learn.
+ *
+ * Scope is per entry. An entry with no rooms is global — the person is the
+ * same person everywhere, which is the right default for someone following
+ * you around. An entry naming rooms is hidden only in those: a member who is
+ * tiresome in one room may be a moderator you need to read in another, and
+ * having to choose between reading them everywhere and nowhere is what made
+ * the global-only list too blunt to use.
  *
  * Purely presentational — their messages still arrive, are still stored, and
  * still count toward unread. Nothing here is a security boundary.
@@ -182,6 +187,16 @@ const IGNORED_NAME_MAX = 64;
 export interface IgnoredMember {
   pubkey: string;
   name: string;
+  /**
+   * Lowercase channel ids this applies to, or undefined for everywhere.
+   *
+   * Undefined rather than an empty array for "global" so an entry written by
+   * a build that predates room scope keeps meaning what it meant: the key has
+   * not changed, and every stored entry was global when it was written. An
+   * empty array would be ambiguous with "scoped to nothing", so `setIgnoreRooms`
+   * drops an entry rather than storing one.
+   */
+  rooms?: string[];
 }
 
 function parseIgnoredEntry(raw: unknown): IgnoredMember | null {
@@ -193,7 +208,21 @@ function parseIgnoredEntry(raw: unknown): IgnoredMember | null {
   if (typeof pk !== 'string' || !MEMBER_PUBKEY_RE.test(pk)) return null;
   const nameRaw = (raw as { name?: unknown }).name;
   const name = typeof nameRaw === 'string' ? nameRaw.trim().slice(0, IGNORED_NAME_MAX) : '';
-  return { pubkey: pk.toLowerCase(), name };
+  const roomsRaw = (raw as { rooms?: unknown }).rooms;
+  if (!Array.isArray(roomsRaw)) return { pubkey: pk.toLowerCase(), name };
+  const rooms = [
+    ...new Set(
+      roomsRaw
+        .filter((id): id is string => typeof id === 'string' && CHANNEL_ID_RE.test(id))
+        .map((id) => id.toLowerCase()),
+    ),
+  ];
+  // A stored entry scoped to nothing would hide the member in no room at all,
+  // which is the same as not being on the list. Treat it as global rather than
+  // keeping a row that does nothing and cannot be reached from the UI.
+  return rooms.length > 0
+    ? { pubkey: pk.toLowerCase(), name, rooms }
+    : { pubkey: pk.toLowerCase(), name };
 }
 
 function loadIgnored(): IgnoredMember[] {
@@ -219,10 +248,57 @@ function loadIgnored(): IgnoredMember[] {
 
 export const ignoredMembers = writable<IgnoredMember[]>(loadIgnored());
 
-/** Pubkeys only — chat filters and member-row checks still compare hex strings. */
+/**
+ * Pubkeys ignored everywhere — chat filters and member-row checks still
+ * compare hex strings.
+ *
+ * Global entries only. Callers that know which room they are drawing should
+ * use {@link ignoredKeysForChannel} instead, or a member muted in one room
+ * would vanish from every other.
+ */
 export const ignoredMemberKeys = derived(ignoredMembers, (list) =>
-  list.map((entry) => entry.pubkey),
+  list.filter((entry) => entry.rooms === undefined).map((entry) => entry.pubkey),
 );
+
+/** Pubkeys hidden in one room: the global entries plus that room's own. */
+export function ignoredKeysForChannel(
+  list: IgnoredMember[],
+  channelId: string | null | undefined,
+): string[] {
+  const id = (channelId ?? '').toLowerCase();
+  return list
+    .filter((entry) => entry.rooms === undefined || (!!id && entry.rooms.includes(id)))
+    .map((entry) => entry.pubkey);
+}
+
+/** Whether this member is hidden in the given room (or anywhere, with no room). */
+export function isMemberIgnored(
+  list: IgnoredMember[],
+  memberPubkey: string,
+  channelId?: string | null,
+): boolean {
+  const pk = memberPubkey.toLowerCase();
+  const id = (channelId ?? '').toLowerCase();
+  return list.some(
+    (entry) =>
+      entry.pubkey === pk
+      && (entry.rooms === undefined || (!!id && entry.rooms.includes(id))),
+  );
+}
+
+/** How this member is hidden, for a menu that has to name the next action. */
+export function ignoreScopeFor(
+  list: IgnoredMember[],
+  memberPubkey: string,
+  channelId: string | null | undefined,
+): 'none' | 'room' | 'global' {
+  const pk = memberPubkey.toLowerCase();
+  const entry = list.find((row) => row.pubkey === pk);
+  if (!entry) return 'none';
+  if (entry.rooms === undefined) return 'global';
+  const id = (channelId ?? '').toLowerCase();
+  return !!id && entry.rooms.includes(id) ? 'room' : 'none';
+}
 
 ignoredMembers.subscribe((entries) => {
   if (typeof localStorage === 'undefined') return;
@@ -233,6 +309,13 @@ ignoredMembers.subscribe((entries) => {
   }
 });
 
+/**
+ * Turn ignoring on or off everywhere.
+ *
+ * Also the Settings undo, which is why it clears a room-scoped entry too:
+ * that list is the only place a scoped ignore from a room the user has since
+ * left can still be reached.
+ */
 export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
   const pk = memberPubkey.toLowerCase();
   const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
@@ -241,6 +324,56 @@ export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
       ? list.filter((entry) => entry.pubkey !== pk)
       : [...list, { pubkey: pk, name: label }],
   );
+}
+
+/**
+ * Turn ignoring on or off for one room, leaving the other rooms alone.
+ *
+ * Escalating rather than narrowing: asking to ignore someone in a room while
+ * they are already ignored everywhere is not a request to start reading them
+ * elsewhere, so a global entry is left as it is. Un-ignoring the last room
+ * drops the entry instead of storing an empty scope.
+ */
+export function toggleMemberIgnoreInChannel(
+  memberPubkey: string,
+  channelId: string,
+  name?: string,
+): void {
+  const pk = memberPubkey.toLowerCase();
+  const id = channelId.toLowerCase();
+  if (!CHANNEL_ID_RE.test(id)) return;
+  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  ignoredMembers.update((list) => {
+    const existing = list.find((entry) => entry.pubkey === pk);
+    if (!existing) return [...list, { pubkey: pk, name: label, rooms: [id] }];
+    if (existing.rooms === undefined) return list;
+    const rooms = existing.rooms.includes(id)
+      ? existing.rooms.filter((room) => room !== id)
+      : [...existing.rooms, id];
+    if (rooms.length === 0) return list.filter((entry) => entry.pubkey !== pk);
+    return list.map((entry) => (entry.pubkey === pk ? { ...entry, rooms } : entry));
+  });
+}
+
+/** Drop a deleted room from every scoped entry, so the preference list cannot
+ *  accumulate ids for rooms the user will never see again. An entry left with
+ *  no rooms goes with it. Mirrors {@link forgetChannelMute}. */
+export function forgetChannelIgnores(channelId: string): void {
+  const id = channelId.toLowerCase();
+  ignoredMembers.update((list) => {
+    let changed = false;
+    const next: IgnoredMember[] = [];
+    for (const entry of list) {
+      if (entry.rooms === undefined || !entry.rooms.includes(id)) {
+        next.push(entry);
+        continue;
+      }
+      changed = true;
+      const rooms = entry.rooms.filter((room) => room !== id);
+      if (rooms.length > 0) next.push({ ...entry, rooms });
+    }
+    return changed ? next : list;
+  });
 }
 
 /** Drop a room's mute. Used when the owner deletes it, so the preference
@@ -259,6 +392,38 @@ let unlisteners: UnlistenFn[] = [];
 /** Bumped by every local unread mutation, so `refreshChannels` can tell whether
  *  the snapshot it awaited is still the newest word on the subject. */
 let unreadRevision = 0;
+/** Rooms whose unread was changed locally since it was last taken from the
+ *  database. A global revision used to keep *every* room's local count when
+ *  any one of them moved during a refresh — so a bump in room A left room B
+ *  holding a stale badge (or hiding a new one) until the next clean fetch. */
+const unreadDirty = new Map<string, number>();
+/** Bumped at the start of every `refreshChannels`. A later start invalidates
+ *  an earlier snapshot so two overlapping fetches cannot apply out of order:
+ *  the older one would see a dirty flag the newer one already consumed and
+ *  write a stale unread back over a live bump. */
+let refreshGen = 0;
+
+function touchUnread(channelId: string): void {
+  unreadRevision++;
+  unreadDirty.set(channelId, unreadRevision);
+}
+
+/** Apply a `list_channels` snapshot, keeping live unread only on rooms that
+ *  were mutated locally while (or just before) that snapshot was in flight. */
+export function mergeChannelUnreadFromSnapshot(
+  snapshot: ChannelInfo[],
+  current: ChannelInfo[],
+  dirtyIds: Iterable<string>,
+): ChannelInfo[] {
+  const preserve = new Set(dirtyIds);
+  if (preserve.size === 0) return snapshot;
+  const local = new Map(current.map((channel) => [channel.channel_id, channel.unread]));
+  return snapshot.map((channel) =>
+    preserve.has(channel.channel_id) && local.has(channel.channel_id)
+      ? { ...channel, unread: local.get(channel.channel_id) as number }
+      : channel,
+  );
+}
 
 /**
  * Ember Transfers this session, keyed by transfer id.
@@ -272,6 +437,15 @@ let unreadRevision = 0;
  * into Channels still shows in-flight rows.
  */
 export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
+
+/** Incoming Ember Transfer offers still waiting for a decision. */
+export const awaitingChannelOffers = derived(
+  channelTransfers,
+  (xfers) =>
+    Object.values(xfers).filter(
+      (xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting',
+    ).length,
+);
 
 const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'complete',
@@ -308,7 +482,7 @@ function scheduleXferClear(xferId: string, epoch: number): void {
 function toastXferOffer(channelId: string, peerPubkey?: string): void {
   if (isAppVisible() && get(activeChannelId) === channelId) return;
   if (get(mutedChannels).includes(channelId)) return;
-  if (peerPubkey && get(ignoredMemberKeys).includes(peerPubkey.toLowerCase())) return;
+  if (peerPubkey && isMemberIgnored(get(ignoredMembers), peerPubkey, channelId)) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
   toast(
     room
@@ -334,24 +508,24 @@ export async function mergeChannelTransfers(): Promise<void> {
 }
 
 export async function refreshChannels(): Promise<void> {
-  const revision = unreadRevision;
+  const epoch = storeEpoch;
+  const startRev = unreadRevision;
+  const gen = ++refreshGen;
   const list = await listChannels();
+  // A newer refresh already started — or the store was torn down — while this
+  // snapshot was in flight. Applying it now would undo that newer merge, and
+  // if the newer pass had already dropped a dirty flag, a stale unread could
+  // land on a room the user just read or a bump that just arrived.
+  if (epoch !== storeEpoch || gen !== refreshGen) return;
   // The database is authoritative for unread, but only as of the moment it was
   // read. A message arriving — or the user opening a room — while this call was
-  // in flight moves the count *after* that snapshot was taken, and a plain
-  // `set` then rolled it back: the badge dropped the new line, or came back on
-  // a room being read. Keep whatever the local mutation left when one happened.
-  if (revision === unreadRevision) {
-    channels.set(list);
-  } else {
-    channels.update((cur) => {
-      const local = new Map(cur.map((channel) => [channel.channel_id, channel.unread]));
-      return list.map((channel) =>
-        local.has(channel.channel_id)
-          ? { ...channel, unread: local.get(channel.channel_id) as number }
-          : channel,
-      );
-    });
+  // in flight moves *that room's* count after the snapshot, and a plain `set`
+  // then rolled it back. Keep the live count only on rooms that actually
+  // moved; every other room takes the snapshot so a bump in one room cannot
+  // freeze badges everywhere else.
+  channels.update((cur) => mergeChannelUnreadFromSnapshot(list, cur, unreadDirty.keys()));
+  for (const [id, rev] of [...unreadDirty]) {
+    if (rev <= startRev) unreadDirty.delete(id);
   }
   const keep = new Set(list.filter((channel) => !channel.deleted).map((channel) => channel.channel_id));
   mutedChannels.update((ids) => {
@@ -402,7 +576,6 @@ export function setChannelMemberCount(channelId: string, count: number): void {
 }
 
 export function clearChannelUnread(channelId: string): void {
-  unreadRevision++;
   channels.update((list) => {
     // Hand back the same array when there is nothing to clear. Allocating a
     // fresh one regardless re-invalidated every `$channels` reader, and
@@ -412,6 +585,7 @@ export function clearChannelUnread(channelId: string): void {
     if (!list.some((channel) => channel.channel_id === channelId && channel.unread !== 0)) {
       return list;
     }
+    touchUnread(channelId);
     return list.map((channel) =>
       channel.channel_id === channelId ? { ...channel, unread: 0 } : channel,
     );
@@ -420,11 +594,11 @@ export function clearChannelUnread(channelId: string): void {
 
 export function bumpChannelUnread(channelId: string): void {
   if (isAppVisible() && get(activeChannelId) === channelId) return;
-  unreadRevision++;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
       return list;
     }
+    touchUnread(channelId);
     return list.map((channel) =>
       channel.channel_id === channelId
         ? { ...channel, unread: channel.unread + 1 }
@@ -455,8 +629,9 @@ function maybeToastChannelMessage(channelId: string, message: string, senderPubk
   // Ignoring somebody is presentational, and a toast quoting them is the least
   // ignorable presentation there is: it interrupts whatever page the user is on
   // with the text they asked not to see. The unread count still moves, which is
-  // the documented half of the bargain.
-  if (senderPubkey && get(ignoredMemberKeys).includes(senderPubkey.toLowerCase())) return;
+  // the documented half of the bargain. Scoped per room, so someone hidden in
+  // one room can still interrupt from another — which is the point of scoping.
+  if (senderPubkey && isMemberIgnored(get(ignoredMembers), senderPubkey, channelId)) return;
   const now = Date.now();
   const prev = lastToastAt.get(channelId) ?? 0;
   if (now - prev < TOAST_GAP_MS) return;
@@ -586,6 +761,9 @@ export function cleanupChannelsStore() {
   }
   unlisteners = [];
   initialized = false;
+  unreadRevision = 0;
+  refreshGen = 0;
+  unreadDirty.clear();
   lastToastAt.clear();
   lastOpenedChannelId = null;
   for (const timer of xferClearTimers.values()) clearTimeout(timer);

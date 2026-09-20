@@ -191,10 +191,26 @@ pub struct ChannelMemberInfo {
     pub banned: bool,
     pub is_self: bool,
     pub moderator: bool,
+    /// `BLAKE3(pubkey)[..16]` hex — the Friend ID for this member. Empty when
+    /// the stored key is not a valid Ed25519 point.
+    pub ember_hash: String,
+}
+
+fn ember_hash_for_member_pubkey(hex_pk: &str) -> String {
+    let Ok(bytes) = hex::decode(hex_pk) else {
+        return String::new();
+    };
+    let Ok(pk) = <[u8; 32]>::try_from(bytes) else {
+        return String::new();
+    };
+    crypto::node_id_from_ed25519_bytes(&pk)
+        .map(hex::encode)
+        .unwrap_or_default()
 }
 
 impl ChannelMemberInfo {
     fn from_stored(row: StoredChannelMember, is_self: bool) -> Self {
+        let ember_hash = ember_hash_for_member_pubkey(&row.member_pubkey);
         Self {
             member_pubkey: row.member_pubkey,
             nickname: row.nickname,
@@ -202,6 +218,7 @@ impl ChannelMemberInfo {
             banned: row.banned,
             is_self,
             moderator: row.moderator,
+            ember_hash,
         }
     }
 }

@@ -130,6 +130,18 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             host: Some(host),
         });
     }
+    if lower.starts_with("ember2:") {
+        let (hash_hex, _, _) = crate::commands::peers::parse_friend_code(&payload)?;
+        return Ok(DeepLinkPreview {
+            kind: "friend".into(),
+            name: None,
+            size: None,
+            hash: Some(hash_hex),
+            ember: None,
+            endpoint: None,
+            host: None,
+        });
+    }
     if lower.starts_with("ember-channel:") {
         let invite = crate::network::ember::channel::ChannelInvite::parse(&payload)
             .ok_or_else(|| coded("deeplink_terminal_invalid", "Invalid channel invite"))?;
@@ -254,12 +266,15 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
 }
 
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
-/// (including browser-encoded `ed2k://%7Cfile%7C…` forms) or a path ending
-/// in `.emulecollection`.
+/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), a path ending
+/// in `.emulecollection`, or an in-app Ember invite / friend code.
 pub fn is_deep_link_payload(arg: &str) -> bool {
     let trimmed = arg.trim();
+    let lower = trimmed.to_ascii_lowercase();
     crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
-        || trimmed.to_ascii_lowercase().ends_with(".emulecollection")
+        || lower.ends_with(".emulecollection")
+        || lower.starts_with("ember2:")
+        || lower.starts_with("ember-channel:")
 }
 
 /// Pull the deep-link payloads out of a process/instance argv.
@@ -515,6 +530,20 @@ mod tests {
         let encoded_server =
             preview_deep_link_payload("ed2k://%7Cserver%7C203.0.113.8%7C4661%7C/").unwrap();
         assert_eq!(encoded_server.endpoint.as_deref(), Some("203.0.113.8:4661"));
+    }
+
+    #[test]
+    fn previews_ember2_friend_codes_and_rejects_broken_ones() {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey).unwrap();
+        let hash_hex = hex::encode(hash);
+        let code = format!("ember2:{}:{}", hash_hex, hex::encode(pubkey));
+        let preview = preview_deep_link_payload(&code).unwrap();
+        assert_eq!(preview.kind, "friend");
+        assert_eq!(preview.hash.as_deref(), Some(hash_hex.as_str()));
+        assert!(is_deep_link_payload(&code));
+        assert!(preview_deep_link_payload("ember2:not-a-code").is_err());
     }
 
     #[test]

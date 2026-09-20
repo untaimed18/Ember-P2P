@@ -4,7 +4,9 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
   import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab, retainChatTabs } from '$lib/stores/chatTabs';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
@@ -27,14 +29,17 @@
     clearFileOffer,
     clearFileOffersForFriend,
     rememberFriendName,
-    rememberFriendNames,
+    friendsList as friendsListStore,
+    beginFriendsListFetch,
+    commitFriendsList,
+    acceptIncomingFileOffer,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
-  let friends: FriendInfo[] = $state([]);
+  let friends: FriendInfo[] = $derived($friendsListStore);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
@@ -121,24 +126,7 @@
     if (acceptingOffer) return;
     acceptingOffer = key;
     try {
-      const { startDownload } = await import('$lib/api/transfers');
-      // Seed the friend's last-known address when we have one; the backend
-      // falls back to rendezvous lookup and normal source discovery otherwise.
-      const f = friends.find(x => x.user_hash === offer.user_hash);
-      const ip = f?.last_ip?.trim() ?? '';
-      const port = f?.last_port ?? 0;
-      const res = await startDownload(
-        offer.file_hash,
-        offer.file_name,
-        offer.file_size,
-        ip && port > 0 ? ip : '',
-        ip && port > 0 ? port : 0,
-        undefined,
-        offer.ember_file_hash,
-        undefined,
-        offer.user_hash,
-      );
-      clearFileOffer(offer.user_hash, offer.file_hash);
+      const res = await acceptIncomingFileOffer(offer);
       // The backend reports an offer we already hold as `already_queued`
       // rather than an error, so saying "downloading" would claim something
       // new started when nothing did.
@@ -232,12 +220,9 @@
     // Delegate to the global multi-conversation dock. It opens the
     // dock if not already visible, adds (or focuses) a tab for this
     // friend, and lets the user keep chatting while navigating to
-    // other pages. `clearUnread` is also called inside
-    // `ChatConversation` on mount, but firing it here too keeps the
-    // friend-card badge from briefly flashing the stale count
-    // between click and tab-mount.
+    // other pages. Unread is cleared only after mark-as-read succeeds,
+    // so a failed IPC cannot hide a badge for messages that are still unread.
     openChatTab(f.user_hash, f.nickname || f.user_hash.slice(0, 8) + '\u2026');
-    clearUnread(f.user_hash);
   }
 
   function openBrowse(f: FriendInfo) {
@@ -329,8 +314,12 @@
     try {
       await rejectFriendRequest(req.sender_hash);
       friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
+      flash(m.friends_rejected_local());
+      await reloadFriendRequests();
+      await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
+      await reloadFriendRequests();
     } finally {
       endFriendRequestMutation();
       processingRequests.delete(req.sender_hash);
@@ -398,6 +387,23 @@
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
 
+  $effect(() => {
+    const addParam = $page.url.searchParams.get('add');
+    if (!addParam) return;
+    showAddForm = true;
+    newHash = addParam;
+    addError = null;
+    untrack(() => {
+      const next = new URL($page.url);
+      next.searchParams.delete('add');
+      void goto(`${next.pathname}${next.search}${next.hash}`, {
+        replaceState: true,
+        keepFocus: true,
+        noScroll: true,
+      }).catch(() => {});
+    });
+  });
+
   onMount(() => {
     destroyed = false;
     loadFriends();
@@ -405,7 +411,10 @@
     loadMyHash();
     isChatLocked()
       .then(v => { if (!destroyed) chatLocked = v; })
-      .catch((e) => console.warn('friends: failed to read chat lock state:', e));
+      .catch((e) => {
+        console.warn('friends: failed to read chat lock state:', e);
+        if (!destroyed) chatLocked = true;
+      });
     getNetworkStats()
       .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
       .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
@@ -515,18 +524,24 @@
     // or rapid events) resolving out of order and clobbering newer data with a
     // stale snapshot. Only the most recent invocation commits its result.
     const seq = ++loadFriendsSeq;
+    // The list itself now lives in the shared store, which the Transfers table
+    // and the confirm-event refresh also write. `loadFriendsSeq` only orders
+    // this page's own loads, so take a store ticket too and let the newest
+    // fetch win whichever surface started it.
+    const ticket = beginFriendsListFetch();
     loading = true;
     if (clearError) error = null;
     try {
       const list = await getFriends();
       if (destroyed || seq !== loadFriendsSeq) return;
-      friends = list;
       friendsLoaded = true;
-      retainChatTabs(list.map((f) => f.user_hash));
-      // Keep the store's name cache current for surfaces that only hold a hash
-      // — desktop notifications in particular, which have to name a friend from
-      // an event payload that carries none.
-      rememberFriendNames(list);
+      // `commitFriendsList` refreshes the store's name cache on the way in, so
+      // surfaces holding only a hash — desktop notifications in particular —
+      // can still name a friend. Skip the tab reconcile when a newer list has
+      // already landed, or this one would close a tab against stale rows.
+      if (commitFriendsList(ticket, list)) {
+        retainChatTabs(list.map((f) => f.user_hash));
+      }
     } catch (e: unknown) {
       if (destroyed || seq !== loadFriendsSeq) return;
       error = toErr(e);

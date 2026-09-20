@@ -29,6 +29,12 @@ export const onlineFriends = writable<Set<string>>(new Set());
 export const friendNames = writable<Map<string, string>>(new Map());
 export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
+/**
+ * Shared friend list so the dock picker, channel "Add friend", and the
+ * Friends page all see the same rows. Seeded during init and refreshed
+ * whenever a confirmation event or the Friends page reloads the table.
+ */
+export const friendsList = writable<FriendInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
 let friendsSeedFailedToast = false;
@@ -115,6 +121,78 @@ export function rememberFriendNames(friends: FriendInfo[]): void {
     }
     return changed ? next : names;
   });
+}
+
+/**
+ * Tickets ordering the `get_friends` fetches that land in {@link friendsList}.
+ *
+ * Three surfaces load this list — the Friends page, the Transfers known-peers
+ * table, and the confirm-event refresh below — and only the page had an
+ * ordering guard, which it applied to its own state rather than to the shared
+ * store. Without one here, a slow fetch can land on top of a newer one and
+ * put back a row the user just removed or blocked.
+ */
+let friendsFetchTicket = 0;
+let friendsFetchLanded = 0;
+
+/** Take a ticket before awaiting `getFriends`, then hand it to
+ *  {@link commitFriendsList} with the result. */
+export function beginFriendsListFetch(): number {
+  return ++friendsFetchTicket;
+}
+
+function writeFriendsList(friends: FriendInfo[]): void {
+  friendsList.set(friends);
+  rememberFriendNames(friends);
+}
+
+/** Authoritative write for the shared list and the name cache together.
+ *  Supersedes any fetch still in flight. */
+export function setFriendsList(friends: FriendInfo[]): void {
+  friendsFetchLanded = ++friendsFetchTicket;
+  writeFriendsList(friends);
+}
+
+/** Publish a fetch's result unless a newer one already landed. Returns
+ *  whether it was taken, so a caller can skip side effects (closing chat
+ *  tabs, say) it would otherwise base on a superseded list. */
+export function commitFriendsList(ticket: number, friends: FriendInfo[]): boolean {
+  if (ticket < friendsFetchLanded) return false;
+  friendsFetchLanded = ticket;
+  writeFriendsList(friends);
+  return true;
+}
+
+export async function refreshFriendsList(): Promise<void> {
+  const epoch = storeEpoch;
+  const ticket = beginFriendsListFetch();
+  try {
+    const friends = await getFriends();
+    if (epoch !== storeEpoch) return;
+    commitFriendsList(ticket, friends);
+  } catch (e) {
+    console.warn('friends: refresh list failed', e);
+  }
+}
+
+/**
+ * Coalesces a burst of confirmations into one `get_friends`.
+ *
+ * `ember:friend-confirmed` is not just the moment a friendship completes:
+ * every rediscovery sweep re-emits it for each friend that already has a live
+ * session, so a refresh per event meant one IPC round trip per friend per
+ * sweep — doubled while the Friends page is open, since it reloads on the
+ * same event. Same trailing debounce, and for the same reason, as
+ * `scheduleFriendRequestRefetch`.
+ */
+let friendsListRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleFriendsListRefresh() {
+  if (friendsListRefreshTimer !== null) return;
+  friendsListRefreshTimer = setTimeout(() => {
+    friendsListRefreshTimer = null;
+    void refreshFriendsList();
+  }, 250);
 }
 
 function clearSearchTimer(hash: string) {
@@ -401,6 +479,7 @@ export async function initFriendsStore() {
         if (!hash) return;
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
+        scheduleFriendsListRefresh();
       }),
     );
     registered.push(
@@ -427,6 +506,7 @@ export async function initFriendsStore() {
         rememberFriendName(hash, nickname);
         const name = nickname || `${hash.slice(0, 8)}\u2026`;
         toastSuccess(m.friends_auto_confirmed({ name }));
+        scheduleFriendsListRefresh();
       }),
     );
     registered.push(
@@ -544,11 +624,14 @@ export async function initFriendsStore() {
 
   // Names, so a notification raised before the user has opened /friends can
   // still say who it is about. Last of the seeds because nothing blocks on it:
-  // `friendDisplayName` degrades to a short hash until this lands.
+  // `friendDisplayName` degrades to a short hash until this lands. Ticketed
+  // like every other fetch: this one sits behind a long chain of awaits, so a
+  // page that loaded the list meanwhile must not be rolled back to it.
+  const seedTicket = beginFriendsListFetch();
   try {
     const friends = await getFriends();
     if (myEpoch !== storeEpoch) return;
-    rememberFriendNames(friends);
+    commitFriendsList(seedTicket, friends);
   } catch (e) {
     noteFriendsSeedFailure('getFriends', e);
   }
@@ -571,10 +654,13 @@ export function clearUnread(friendHash: string) {
  * the TTL timer doesn't fire later against stale state).
  */
 export function clearFriendSearch(friendHash: string) {
+  const hash = friendHash.toLowerCase();
+  clearSearchTimer(hash);
   clearSearchTimer(friendHash);
   searchingFriends.update((s) => {
-    if (!s.has(friendHash)) return s;
+    if (!s.has(hash) && !s.has(friendHash)) return s;
     const next = new Set(s);
+    next.delete(hash);
     next.delete(friendHash);
     return next;
   });
@@ -595,6 +681,16 @@ export function cleanupFriendsStore() {
     clearTimeout(friendRequestRefetchTimer);
     friendRequestRefetchTimer = null;
   }
+  if (friendsListRefreshTimer !== null) {
+    clearTimeout(friendsListRefreshTimer);
+    friendsListRefreshTimer = null;
+  }
+  // Retire every ticket outstanding at teardown without rewinding the
+  // counter. Resetting both to zero would hand the next session ticket
+  // numbers a fetch from the previous one is still holding, and the page
+  // callers commit against their own `destroyed`/`mounted` flag rather than
+  // `storeEpoch` — so a remount is exactly when a stale list could land.
+  friendsFetchLanded = friendsFetchTicket;
   friendRequestsGen++;
   friendRequestMutationInFlight = 0;
   // L19: tear down any outstanding search-TTL timers; otherwise
@@ -606,11 +702,35 @@ export function cleanupFriendsStore() {
   friendNames.set(new Map());
   unreadCounts.set(new Map());
   friendRequests.set([]);
+  friendsList.set([]);
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
   discoverabilityFailed.set(false);
   fileOffers.set([]);
   activeChatHash.set(null);
+}
+
+/** Accept an unsolicited friend file offer through the normal download path. */
+export async function acceptIncomingFileOffer(offer: IncomingFileOffer) {
+  const { startDownload } = await import('$lib/api/transfers');
+  const friend = get(friendsList).find(
+    (row) => row.user_hash.toLowerCase() === offer.user_hash.toLowerCase(),
+  );
+  const ip = friend?.last_ip?.trim() ?? '';
+  const port = friend?.last_port ?? 0;
+  const res = await startDownload(
+    offer.file_hash,
+    offer.file_name,
+    offer.file_size,
+    ip && port > 0 ? ip : '',
+    ip && port > 0 ? port : 0,
+    undefined,
+    offer.ember_file_hash,
+    undefined,
+    offer.user_hash,
+  );
+  clearFileOffer(offer.user_hash, offer.file_hash);
+  return res;
 }
 
 /** Drop an offer once the user has accepted or dismissed it. */

@@ -10,8 +10,22 @@
     setActiveTab,
     closeDock,
     cycleTab,
+    openChat,
   } from '$lib/stores/chatTabs';
-  import { unreadCounts, onlineFriends } from '$lib/stores/friends';
+  import {
+    unreadCounts,
+    onlineFriends,
+    friendsList,
+    fileOffers,
+    friendDisplayName,
+    acceptIncomingFileOffer,
+    clearFileOffer,
+  } from '$lib/stores/friends';
+  import { appSettings } from '$lib/stores/settings';
+  import { toastError, toastSuccess } from '$lib/stores/toast';
+  import { formatBytes } from '$lib/utils';
+  import { translateError } from '$lib/i18n';
+  import { menuKeydown } from '$lib/a11y';
   import * as m from '$lib/paraglide/messages';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
@@ -105,10 +119,28 @@
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
+  let pickerOpen = $state(false);
+  let pickerEl: HTMLDivElement | undefined = $state();
+  let newChatEl: HTMLButtonElement | undefined = $state();
+  let acceptingOffer: string | null = $state(null);
+  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
+  let pendingOffers = $derived($fileOffers);
+  let pickerFriends = $derived(
+    [...$friendsList].sort((a, b) => {
+      const ao = $onlineFriends.has(a.user_hash.toLowerCase()) ? 0 : 1;
+      const bo = $onlineFriends.has(b.user_hash.toLowerCase()) ? 0 : 1;
+      if (ao !== bo) return ao - bo;
+      return (a.nickname || a.user_hash).localeCompare(b.nickname || b.user_hash);
+    }),
+  );
 
   // Activate the dock as a focus context so screen readers announce
   // it as a dialog and Tab cycling stays in scope. We bail early if
   // the dock is closed so the rest of the app keeps full focus.
+  $effect(() => {
+    if (!$chatDockOpen) pickerOpen = false;
+  });
+
   $effect(() => {
     if ($chatDockOpen && panelEl) {
       const active = typeof document !== 'undefined' ? document.activeElement : null;
@@ -164,6 +196,11 @@
       // Page chrome that already handled Escape (recent-search dropdown, column
       // menus, clearing a filter) calls preventDefault. Don't also close the dock.
       if (e.defaultPrevented) return;
+      if (pickerOpen) {
+        e.preventDefault();
+        pickerOpen = false;
+        return;
+      }
       e.preventDefault();
       closeDock();
       return;
@@ -197,13 +234,27 @@
     if (dockWidth > dockWidthMax) setDockWidth(dockWidthMax);
   }
 
+  // A menu that only Escape can dismiss is a menu users leave open by
+  // accident — it sits over the tab strip and the conversation below it.
+  // `pointerdown` rather than `click` so the menu is gone before whatever
+  // was clicked underneath reacts.
+  function onPointerDown(e: PointerEvent) {
+    if (!pickerOpen) return;
+    const target = e.target;
+    if (!(target instanceof Node)) return;
+    if (pickerEl?.contains(target) || newChatEl?.contains(target)) return;
+    pickerOpen = false;
+  }
+
   onMount(() => {
     window.addEventListener('keydown', onKeydown);
     window.addEventListener('resize', onWindowResize);
+    window.addEventListener('pointerdown', onPointerDown, true);
     onWindowResize();
     return () => {
       window.removeEventListener('keydown', onKeydown);
       window.removeEventListener('resize', onWindowResize);
+      window.removeEventListener('pointerdown', onPointerDown, true);
     };
   });
 
@@ -212,7 +263,7 @@
   }
 
   function isOnline(hash: string): boolean {
-    return $onlineFriends.has(hash);
+    return $onlineFriends.has(hash.toLowerCase());
   }
 
   // Keyboard activation for the role=tab elements. Enter and Space
@@ -266,13 +317,47 @@
   }
 
   function handleNewChat() {
-    // Sending users to the Friends page is the most discoverable
-    // way to start a new conversation today: every friend card has
-    // a chat button and the existing search/filter UI helps locate
-    // the right person. We DON'T close the dock — leaving it open
-    // means the user can click the friend on /friends and see their
-    // chat appear right next to the friend list.
-    void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
+    if (chatDisabled || pickerFriends.length === 0) {
+      pickerOpen = false;
+      void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
+      return;
+    }
+    pickerOpen = !pickerOpen;
+    // Land focus inside the menu so the arrow keys `menuKeydown` handles have
+    // somewhere to start. Deferred a frame because the items do not exist
+    // until this state change renders.
+    if (pickerOpen) {
+      requestAnimationFrame(() => {
+        pickerEl?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+      });
+    }
+  }
+
+  function startChatWith(hash: string, name: string) {
+    if (chatDisabled) return;
+    pickerOpen = false;
+    openChat(hash, name || friendDisplayName(hash));
+    // Focus goes back to the control that opened the menu rather than being
+    // dropped on the body when the item it was on unmounts.
+    newChatEl?.focus();
+  }
+
+  async function acceptDockOffer(offer: (typeof pendingOffers)[number]) {
+    const key = `${offer.user_hash}:${offer.file_hash}`;
+    if (acceptingOffer) return;
+    acceptingOffer = key;
+    try {
+      const res = await acceptIncomingFileOffer(offer);
+      toastSuccess(
+        res?.already_queued
+          ? m.search_already_queued_name({ name: offer.file_name })
+          : m.friends_offer_accepted({ name: offer.file_name }),
+      );
+    } catch (e) {
+      toastError(translateError(e));
+    } finally {
+      acceptingOffer = null;
+    }
   }
 </script>
 
@@ -380,8 +465,11 @@
       <button
         type="button"
         class="dock-new"
+        bind:this={newChatEl}
         title={m.chat_dock_new_chat()}
         aria-label={m.chat_dock_new_chat()}
+        aria-expanded={pickerOpen}
+        aria-haspopup="menu"
         onclick={handleNewChat}
       >
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -402,7 +490,75 @@
       </button>
     </div>
 
+    {#if pickerOpen}
+      <!--
+        `menu`, not `listbox`: nothing here is a selected value, each row is an
+        action that opens a conversation. That also lets it reuse the same
+        arrow/Home/End handling as every other menu in the app.
+      -->
+      <div
+        class="dock-picker"
+        bind:this={pickerEl}
+        role="menu"
+        tabindex="-1"
+        aria-label={m.chat_dock_pick_friend()}
+        onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+      >
+        {#each pickerFriends as friend (friend.user_hash)}
+          <button
+            type="button"
+            role="menuitem"
+            class="dock-picker-item"
+            class:online={isOnline(friend.user_hash)}
+            disabled={chatDisabled}
+            onclick={() => startChatWith(friend.user_hash, friend.nickname || friendDisplayName(friend.user_hash))}
+          >
+            <span
+              class="dock-tab-presence"
+              role="img"
+              aria-label={isOnline(friend.user_hash) ? m.chat_online_label() : m.chat_offline_label()}
+            ></span>
+            <span class="dock-picker-name"><bdi dir="auto">{friend.nickname || friendDisplayName(friend.user_hash)}</bdi></span>
+          </button>
+        {:else}
+          <p class="dock-picker-empty">{m.chat_dock_no_friends()}</p>
+        {/each}
+      </div>
+    {/if}
+
     <div class="dock-body">
+      {#if pendingOffers.length > 0}
+        <div class="dock-offers" role="region" aria-label={m.chat_dock_offers_title()}>
+          <div class="dock-offers-title">{m.chat_dock_offers_title()}</div>
+          {#each pendingOffers as offer (`${offer.user_hash}:${offer.file_hash}`)}
+            <div class="dock-offer">
+              <div class="dock-offer-info">
+                <span class="dock-offer-name"><bdi dir="auto">{offer.file_name}</bdi></span>
+                <span class="dock-offer-meta">
+                  {m.friends_offer_from({ name: friendDisplayName(offer.user_hash) })}
+                  {#if offer.file_size}&nbsp;·&nbsp;{formatBytes(offer.file_size)}{/if}
+                </span>
+              </div>
+              <div class="dock-offer-actions">
+                <button
+                  type="button"
+                  class="dock-offer-accept"
+                  disabled={acceptingOffer !== null}
+                  onclick={() => void acceptDockOffer(offer)}
+                >{m.friends_offer_download()}</button>
+                <!-- Only the row being accepted is held: dismissing a
+                     different offer starts nothing and can go through. -->
+                <button
+                  type="button"
+                  class="dock-offer-dismiss"
+                  disabled={acceptingOffer === `${offer.user_hash}:${offer.file_hash}`}
+                  onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
+                >{m.common_dismiss()}</button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
       {#if activeTab}
         <ChatConversation friendHash={activeTab.hash} friendName={activeTab.name} />
       {:else}
@@ -415,8 +571,10 @@
             </svg>
           </div>
           <p class="empty-title">{m.chat_dock_empty_title()}</p>
-          <p class="empty-hint">{m.chat_dock_empty_hint()}</p>
-          <button type="button" class="secondary empty-cta" onclick={handleNewChat}>{m.chat_dock_empty_cta()}</button>
+          <p class="empty-hint">{pickerFriends.length ? m.chat_dock_empty_hint() : m.chat_dock_no_friends()}</p>
+          <button type="button" class="secondary empty-cta" onclick={handleNewChat}>
+            {pickerFriends.length ? m.chat_dock_pick_friend() : m.chat_dock_empty_cta()}
+          </button>
         </div>
       {/if}
     </div>
@@ -568,7 +726,8 @@
     transition: background var(--transition-fast), box-shadow var(--transition-fast);
   }
 
-  .dock-tab.online .dock-tab-presence {
+  .dock-tab.online .dock-tab-presence,
+  .dock-picker-item.online .dock-tab-presence {
     background: var(--status-connected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
   }
@@ -641,6 +800,131 @@
 
   .dock-new {
     margin-left: 4px;
+  }
+
+  .dock-picker {
+    position: absolute;
+    top: 46px;
+    right: 40px;
+    z-index: 5;
+    min-width: 220px;
+    max-width: min(320px, 80vw);
+    max-height: 280px;
+    overflow: auto;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-md);
+  }
+
+  .dock-picker-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .dock-picker-item:hover,
+  .dock-picker-item:focus-visible {
+    background: var(--bg-hover);
+  }
+
+  .dock-picker-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dock-picker-empty {
+    margin: 0;
+    padding: 10px;
+    color: var(--text-muted);
+    font-size: 12.5px;
+  }
+
+  .dock-offers {
+    flex-shrink: 0;
+    max-height: 40%;
+    overflow: auto;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+  }
+
+  .dock-offers-title {
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .dock-offer {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 0;
+  }
+
+  .dock-offer + .dock-offer {
+    border-top: 1px solid var(--border);
+  }
+
+  .dock-offer-info {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .dock-offer-name {
+    font-size: 12.5px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dock-offer-meta {
+    font-size: 11.5px;
+    color: var(--text-muted);
+  }
+
+  .dock-offer-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .dock-offer-accept,
+  .dock-offer-dismiss {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+
+  .dock-offer-accept {
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--on-accent, #fff);
+  }
+
+  .dock-offer-dismiss {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-secondary);
   }
 
   .dock-close {

@@ -57,6 +57,8 @@
     type GatheredChannelBatch,
   } from '$lib/api/channels';
   import { addFriend } from '$lib/api/friends';
+  import { friendsList, friendRequests, refreshFriendsList } from '$lib/stores/friends';
+  import { clearDraft } from '$lib/stores/chatTabs';
   import {
     activeChannelId,
     channels as channelsStore,
@@ -64,7 +66,10 @@
     forgetChannelMute,
     hiddenChannels,
     hideChannel,
-    ignoredMemberKeys,
+    ignoredMembers,
+    ignoredKeysForChannel,
+    ignoreScopeFor,
+    forgetChannelIgnores,
     mutedChannels,
     refreshChannels,
     unhideChannel,
@@ -77,6 +82,7 @@
     takeStashedChannelSelection,
     toggleChannelMute,
     toggleMemberIgnore,
+    toggleMemberIgnoreInChannel,
     channelTransfers,
     mergeChannelTransfers,
   } from '$lib/stores/channels';
@@ -390,14 +396,16 @@
         ch.topic.toLowerCase().includes(q),
     );
   });
+  /** Senders hidden in the room on screen: those ignored everywhere, plus
+   *  anyone scoped to this one. */
+  let roomIgnoredKeys = $derived(ignoredKeysForChannel($ignoredMembers, selectedId));
   /** Hits the transcript can actually show. An ignored sender's messages are
    *  drawn nowhere, so offering them here would be a dead click. */
   let visibleSearchHits = $derived(
-    $ignoredMemberKeys.length === 0
+    roomIgnoredKeys.length === 0
       ? searchHits
       : searchHits.filter(
-          (hit) =>
-            !hit.sender_pubkey || !$ignoredMemberKeys.includes(hit.sender_pubkey.toLowerCase()),
+          (hit) => !hit.sender_pubkey || !roomIgnoredKeys.includes(hit.sender_pubkey.toLowerCase()),
         ),
   );
   let sortedMembers = $derived(
@@ -1039,6 +1047,7 @@
     );
     try {
       await leaveChannel(id);
+      clearDraft(`ch:${id}`);
       void refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1178,10 +1187,12 @@
     // Discover would resurrect the room.
     hideChannel(id);
     forgetChannelMute(id);
+    forgetChannelIgnores(id);
     let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
       deleted = true;
+      clearDraft(`ch:${id}`);
       await refreshChannels();
     } catch (e) {
       if (!deleted) unhideChannel(id);
@@ -1198,12 +1209,16 @@
     try {
       await deleteOwnedChannel(id);
       forgetChannelMute(id);
+      forgetChannelIgnores(id);
       activeChannelId.set(null);
       members = [];
       membersLoading = false;
       membersError = null;
       discovered = discovered.filter((item) => item.channel_id !== id);
       resetSearch();
+      // After the conversation unmounts — its cleanup stashes the composer,
+      // and a draft for a room we just deleted should not come back.
+      clearDraft(`ch:${id}`);
       await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1480,14 +1495,57 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  /**
+   * Friend ID → how we already know that person, rebuilt only when the friend
+   * list or the request queue changes.
+   *
+   * Indexed rather than scanned because the roster reads this per member while
+   * it re-renders on every presence tick, and a linear pass over friends plus
+   * requests for each of them turns a large room into real work once a second.
+   */
+  let friendRelationByHash = $derived.by(() => {
+    const byHash = new Map<string, 'mutual' | 'listed' | 'incoming'>();
+    for (const row of $friendsList) {
+      byHash.set(row.user_hash.toLowerCase(), row.mutual ? 'mutual' : 'listed');
+    }
+    for (const req of $friendRequests) {
+      // Someone already on the list is described by that, not by a request
+      // still sitting in the queue.
+      const hash = req.sender_hash.toLowerCase();
+      if (!byHash.has(hash)) byHash.set(hash, 'incoming');
+    }
+    return byHash;
+  });
+
+  function memberFriendRelation(mem: ChannelMemberInfo): 'none' | 'mutual' | 'listed' | 'incoming' {
+    const hash = (mem.ember_hash || '').toLowerCase();
+    if (!hash) return 'none';
+    return friendRelationByHash.get(hash) ?? 'none';
+  }
+
   async function handleAddFriend(mem: ChannelMemberInfo) {
     const pk = mem.member_pubkey;
     if (addingFriend.includes(pk)) return;
+    const relation = memberFriendRelation(mem);
+    const name = roomMemberLabel(mem);
+    if (relation === 'mutual') {
+      toastSuccess(m.channels_friend_already({ name }));
+      return;
+    }
+    if (relation === 'listed') {
+      toastSuccess(m.channels_friend_already_listed({ name }));
+      return;
+    }
+    if (relation === 'incoming') {
+      toast(m.channels_friend_they_asked({ name }));
+      return;
+    }
     addingFriend = [...addingFriend, pk];
     try {
       const code = await channelMemberFriendCode(pk);
       await addFriend(code, mem.nickname || undefined);
-      toastSuccess(m.channels_friend_added({ name: roomMemberLabel(mem) }));
+      await refreshFriendsList();
+      toastSuccess(m.channels_friend_added({ name }));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -2383,7 +2441,7 @@
                 youAreKeyBehind={selectedKeyBehind}
                 slowModeSecs={selectedSlowMode}
                 memberNames={memberNames}
-                ignoredSenders={$ignoredMemberKeys}
+                ignoredSenders={roomIgnoredKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
                 mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
@@ -2436,6 +2494,8 @@
                   {@const presence = presenceOf(mem, presenceNow)}
                   {@const presenceLabel =
                     presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
+                  {@const friendRelation = memberFriendRelation(mem)}
+                  {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
                   <li
                     class:banned={mem.banned}
                     oncontextmenu={memberHasMenu(mem) ? openMemberMenu : undefined}
@@ -2466,8 +2526,10 @@
                         {#if mem.banned}
                           <span class="badge banned">{m.channels_banned_badge()}</span>
                         {/if}
-                        {#if $ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())}
-                          <span class="badge">{m.channels_ignored_badge()}</span>
+                        {#if ignoreScope !== 'none'}
+                          <span class="badge">{ignoreScope === 'room'
+                            ? m.channels_ignored_room_badge()
+                            : m.channels_ignored_badge()}</span>
                         {/if}
                         {#if presence !== 'online' && mem.last_seen > 0}
                           <span class="member-seen">
@@ -2497,16 +2559,38 @@
                           <button
                             type="button"
                             role="menuitem"
-                            disabled={addingFriend.includes(mem.member_pubkey)}
+                            disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
-                          >{m.channels_add_friend()}</button>
+                          >{friendRelation === 'mutual'
+                            ? m.channels_friend_action_already()
+                            : friendRelation === 'listed'
+                              ? m.channels_friend_action_pending()
+                              : friendRelation === 'incoming'
+                                ? m.channels_friend_action_incoming()
+                                : m.channels_add_friend()}</button>
+                          <!-- Two scopes, because the same person can be
+                               tiresome in one room and worth reading in
+                               another. A global ignore hides the per-room
+                               item: narrowing it there would read as
+                               "un-ignore", which is what the entry below is
+                               for. -->
+                          {#if ignoreScope !== 'global'}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              disabled={!selectedId}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); if (selectedId) toggleMemberIgnoreInChannel(mem.member_pubkey, selectedId, mem.nickname); }}
+                            >{ignoreScope === 'room'
+                              ? m.channels_unignore_room()
+                              : m.channels_ignore_room()}</button>
+                          {/if}
                           <button
                             type="button"
                             role="menuitem"
                             onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey, mem.nickname); }}
-                          >{$ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())
+                          >{ignoreScope === 'global'
                             ? m.channels_unignore()
-                            : m.channels_ignore()}</button>
+                            : m.channels_ignore_everywhere()}</button>
                           {#if canModerate}
                             {#if mem.banned}
                               <button

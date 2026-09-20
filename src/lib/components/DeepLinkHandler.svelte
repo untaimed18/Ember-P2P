@@ -95,6 +95,9 @@
     if (preview.kind === 'channel') {
       return `${preview.name ?? m.nav_channels()}\n${preview.hash ?? ''}`;
     }
+    if (preview.kind === 'friend') {
+      return m.deeplink_friend_confirm({ hash: preview.hash ?? '' });
+    }
     return preview.name ?? '';
   }
 
@@ -233,6 +236,11 @@
       } else if (preview.kind === 'channel') {
         await goto(`/channels?join=${encodeURIComponent(payload)}`);
         if (get(page).url.pathname !== '/channels') {
+          return 'defer';
+        }
+      } else if (preview.kind === 'friend') {
+        await goto(`/friends?add=${encodeURIComponent(payload)}`);
+        if (get(page).url.pathname !== '/friends') {
           return 'defer';
         }
       }

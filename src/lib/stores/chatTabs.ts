@@ -148,10 +148,15 @@ export function setDraft(hash: string, text: string) {
   // call would silently re-create a draft entry for a hash that no
   // longer has an open tab — exactly the "stale draft haunts a
   // reopened conversation" bug this module's doc comment says can't
-  // happen. Only persist a draft while its tab is still open;
-  // `closeTab`'s own `chatDrafts.delete` remains as a defensive
-  // belt-and-suspenders for any other future caller.
-  if (text && get(chatTabs).some((t) => t.hash === hash)) {
+  // happen. Friend drafts therefore persist only while a tab is open.
+  //
+  // Channel drafts use a `ch:` key and never appear in `chatTabs` —
+  // rooms live on `/channels`, not in the dock. Gating those the same
+  // way discarded every in-progress room line on leave. `closeTab`
+  // cannot reopen a `ch:` key, so the resurrection race does not apply.
+  const isChannelDraft = hash.startsWith('ch:');
+  const tabOpen = get(chatTabs).some((t) => t.hash === hash);
+  if (text && (isChannelDraft || tabOpen)) {
     chatDrafts.set(hash, text);
   } else {
     chatDrafts.delete(hash);

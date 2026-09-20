@@ -489,11 +489,11 @@
       sendError = null;
       sending = false;
       inputText = getDraft(key);
-      if (channel) {
-        clearChannelUnread(channel);
-      } else {
+      // Channel unread is cleared only after `markAsRead` succeeds. Clearing
+      // the badge here raced a `refreshChannels` that still saw unread rows
+      // and put the count back — or hid a room that was never actually marked.
+      if (!channel) {
         activeChatHash.set(friend);
-        clearUnread(friend);
       }
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
@@ -531,8 +531,7 @@
         // After the load, not alongside it. Both are IPC round trips, so
         // running them together raced: clearing `read` in the database first
         // meant the snapshot came back with nothing unread and the divider had
-        // nothing to sit above. The badge is still cleared synchronously above,
-        // so this ordering costs the user nothing.
+        // nothing to sit above. The badge waits for this to succeed.
         if (gen === loadGen) void markAsRead();
       })();
     }
@@ -1507,30 +1506,83 @@
     }
   });
 
+  /**
+   * The parts of a row that depend only on the message itself, cached across
+   * rebuilds of {@link rows}.
+   *
+   * `rows` recomputes whenever `visibleMessages` changes, which is every
+   * arriving line, every edit, and every ignore toggle. Moving link
+   * segmentation and the mention test off the template and into that derived
+   * stopped them running once per *render*, but they still ran once per
+   * *message* on each rebuild: at the 2000-message cap, one incoming line
+   * meant two thousand `linkifyMessage` scans and two thousand regex tests to
+   * produce output identical to the previous frame for all but one row. That,
+   * not the number of mounted bubbles, is what a busy room actually costs.
+   *
+   * Keyed by id and validated against the text and edit stamp, so a revised
+   * line — or an optimistic bubble being replaced by its durable row — still
+   * re-derives. Rebuilt into a fresh map each pass so ids that have scrolled
+   * out of the window do not accumulate.
+   */
+  type CachedRow = {
+    text: string;
+    edited: number;
+    day: number | null;
+    mentionsMe: boolean;
+    segments: ReturnType<typeof linkifyMessage>;
+  };
+  let rowCache = new Map<number, CachedRow>();
+  /** The pattern the cache was built against. A rename changes who is
+   *  mentioned, so every cached verdict is stale. */
+  let rowCachePattern: RegExp | null = null;
+
   let rows = $derived.by(() => {
     const messages = visibleMessages;
-    // Day boundaries once per message, rather than recomputed for every
-    // neighbour comparison. `null` means the row carries no usable date — a
-    // zero timestamp is "unknown", and must not produce a 1970 separator.
-    const days = messages.map((msg) => (msg.timestamp > 0 ? startOfDay(msg.timestamp) : null));
+    const pattern = mentionPattern;
+    if (pattern !== rowCachePattern) {
+      rowCache.clear();
+      rowCachePattern = pattern;
+    }
+    const prev = rowCache;
+    const next = new Map<number, CachedRow>();
+    const derivedRows = messages.map((msg) => {
+      const edited = msg.edited_at ?? 0;
+      const hit = prev.get(msg.id);
+      const row =
+        hit && hit.text === msg.message && hit.edited === edited
+          ? hit
+          : {
+              text: msg.message,
+              edited,
+              // `null` means the row carries no usable date — a zero timestamp
+              // is "unknown", and must not produce a 1970 separator.
+              day: msg.timestamp > 0 ? startOfDay(msg.timestamp) : null,
+              mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
+              segments: linkifyMessage(msg.message),
+            };
+      next.set(msg.id, row);
+      return row;
+    });
+    rowCache = next;
+    // Run and day boundaries stay outside the cache: they depend on a
+    // message's neighbours, so inserting a line can change the row above it.
+    // Both are plain comparisons rather than regex work.
     return messages.map((msg, i) => {
-      const day = days[i];
+      const { day, mentionsMe, segments } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
-      const newDay = day !== null && (i === 0 || days[i - 1] !== day);
+      const newDay = day !== null && (i === 0 || derivedRows[i - 1].day !== day);
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
       const sameAuthorAsNext = hasNext && sameChannelAuthor(messages[i + 1], msg);
       // An undated row neither opens nor closes a day, so it stays with its run.
       const sameDayAsNext =
-        hasNext && (day === null || days[i + 1] === null || days[i + 1] === day);
+        hasNext && (day === null || derivedRows[i + 1].day === null || derivedRows[i + 1].day === day);
       return {
         msg,
         daySeparator: newDay ? dayLabel(msg.timestamp) : null,
         startsRun: newDay || !sameAuthorAsPrev,
         endsRun: !sameAuthorAsNext || !sameDayAsNext,
-        // Both computed once per message here rather than per render in the
-        // template, which is where they used to be.
-        mentionsMe: msg.direction === 'received' && (mentionPattern?.test(msg.message) ?? false),
-        segments: linkifyMessage(msg.message),
+        mentionsMe,
+        segments,
       };
     });
   });
@@ -1698,7 +1750,18 @@
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0}
-      <div class="conv-empty">{chatLocked ? m.friends_chat_locked_title() : chatDisabled ? m.chat_empty_disabled() : isChannel ? m.channels_empty_chat() : m.chat_say_hello()}</div>
+      <div class="conv-empty">
+        {#if chatLocked}
+          {m.friends_chat_locked_title()}
+        {:else if chatDisabled}
+          {m.chat_empty_disabled()}
+        {:else if isChannel}
+          <p class="conv-empty-title">{m.channels_empty_chat()}</p>
+          <p class="conv-empty-hint">{m.channels_empty_chat_hint()}</p>
+        {:else}
+          {m.chat_say_hello()}
+        {/if}
+      </div>
     {:else}
       {#if hasMoreHistory}
         <div class="conv-load-older">
@@ -2184,6 +2247,18 @@
     color: var(--text-muted);
     padding: 24px;
     font-size: 13px;
+  }
+
+  .conv-empty-title,
+  .conv-empty-hint {
+    margin: 0;
+  }
+
+  .conv-empty-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    line-height: 1.45;
+    opacity: 0.85;
   }
 
   .conv-load-error {

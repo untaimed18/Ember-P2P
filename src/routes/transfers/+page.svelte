@@ -15,6 +15,7 @@
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
+  import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
   import { banPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
@@ -1281,8 +1282,12 @@
 
   async function refreshFriendHashes() {
     try {
+      const ticket = beginFriendsListFetch();
       const list = await getFriends();
       if (!mounted) return;
+      // Share the rows rather than keeping them to this page; the ticket stops
+      // a slow load here from landing on top of a newer one elsewhere.
+      commitFriendsList(ticket, list);
       const hashes = new Set<string>();
       const nicks: Record<string, string> = {};
       for (const f of list) {

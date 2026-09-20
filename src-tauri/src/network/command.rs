@@ -3025,6 +3025,24 @@ async fn handle_command_inner(
             let Some(channel_id) = channel_id else {
                 return;
             };
+            // Drop this room's catch-up stamps so the next history-sync tick
+            // asks again. Opening a fifth room used to wait out the 5-minute
+            // gate while looking empty. Only stamps past the focus interval
+            // go — see `CHANNEL_HISTORY_FOCUS_RESYNC_SECS` for why re-asking
+            // on every switch would get the honest catch-up refused.
+            let focus_gate = std::time::Duration::from_secs(
+                ember::channel::CHANNEL_HISTORY_FOCUS_RESYNC_SECS,
+            );
+            let focus_now = std::time::Instant::now();
+            state.channel_history_sync_at.retain(|(cid, _), at| {
+                *cid != channel_id || focus_now.saturating_duration_since(*at) < focus_gate
+            });
+            // A dropped stamp's watermark is meaningless on its own: the next
+            // ask records a fresh one, and leaving the old value behind would
+            // let a stale frontier decide the walk interval.
+            state
+                .channel_history_sync_mark
+                .retain(|key, _| state.channel_history_sync_at.contains_key(key));
             if !settings.ember_native_enabled || db.chat_locked() {
                 return;
             }

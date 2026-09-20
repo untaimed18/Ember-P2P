@@ -49,6 +49,8 @@ export interface ChannelMemberInfo {
   banned: boolean;
   is_self: boolean;
   moderator: boolean;
+  /** BLAKE3(pubkey)[..16] hex, same identity friends use. Empty if the key is invalid. */
+  ember_hash: string;
 }
 
 /** The windows the roster's presence dots are drawn with.

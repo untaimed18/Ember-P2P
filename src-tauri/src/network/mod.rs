@@ -15045,6 +15045,17 @@ struct NetworkState {
         HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
     /// Last history-sync request per (channel_id, neighbor pubkey).
     channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
+    /// The room's newest stored timestamp when we last asked this neighbor.
+    ///
+    /// The stamp above is written when a request is *sent*, so it cannot tell
+    /// a neighbor who had nothing to add from one that is still feeding us a
+    /// backlog — both wait the full five minutes. A reply is not a frame we
+    /// can correlate (it arrives as ordinary gossip), but its effect is
+    /// visible: the watermark moves. When it has moved past what it was at
+    /// the ask, the gap is still closing and this neighbor is worth asking
+    /// again on the shorter [`ember::channel::CHANNEL_HISTORY_WALK_SECS`]
+    /// rather than the idle interval.
+    channel_history_sync_mark: HashMap<([u8; 16], [u8; 32]), i64>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
     ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
     /// Presence blobs accumulated for a channel while any FIND_VALUE for it
@@ -16479,22 +16490,40 @@ fn collect_channel_neighbor_caps(
     db: &Database,
     roster: &[crate::storage::database::StoredChannel],
     our_pubkey: &[u8; 32],
+    focused: Option<[u8; 16]>,
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
-    let mut members_by_channel = Vec::new();
+    let focused_hex = focused.map(hex::encode);
+    let mut selected: Vec<&crate::storage::database::StoredChannel> = Vec::new();
+    if let Some(ref id) = focused_hex {
+        if let Some(ch) = roster
+            .iter()
+            .find(|c| c.channel_id.eq_ignore_ascii_case(id) && c.in_room_now())
+        {
+            selected.push(ch);
+        }
+    }
     for ch in roster {
-        // `rendezvous_neighbor_targets` keeps the first
-        // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
-        // the rest, so stopping here is what that cap already means — and it
-        // is the difference between one roster query per *selected* room and
-        // one per *joined* room. Joining is deliberately uncapped, and this
-        // runs on the network loop once a second, so the uncapped shape put a
-        // user-controlled number of synchronous queries on the reactor.
-        if members_by_channel.len() >= ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS {
+        if selected.len() >= ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS {
             break;
         }
         if !ch.in_room_now() {
             continue;
         }
+        if focused_hex
+            .as_ref()
+            .is_some_and(|id| ch.channel_id.eq_ignore_ascii_case(id))
+        {
+            continue;
+        }
+        selected.push(ch);
+    }
+    let mut members_by_channel = Vec::new();
+    for ch in selected {
+        // `rendezvous_neighbor_targets` keeps the first
+        // `CHANNEL_RENDEZVOUS_MAX_CHANNELS` entries of this list and discards
+        // the rest, so stopping here is what that cap already means — and it
+        // is the difference between one roster query per *selected* room and
+        // one per *joined* room. Joining is deliberately uncapped.
         let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
             continue;
         };
@@ -16514,6 +16543,7 @@ fn collect_channel_neighbor_caps(
 async fn load_rendezvous_register_targets(
     db: &Arc<Database>,
     our_pubkey: [u8; 32],
+    focused: Option<[u8; 16]>,
 ) -> (
     Vec<([u8; 16], [u8; 32])>,
     Vec<([u8; 16], [u8; 32])>,
@@ -16525,7 +16555,7 @@ async fn load_rendezvous_register_targets(
         // taking a turn on the shared cache.
         let roster = db.list_channels_lite().unwrap_or_default();
         let neighbors =
-            collect_channel_neighbor_caps(&db, &roster, &our_pubkey).unwrap_or_default();
+            collect_channel_neighbor_caps(&db, &roster, &our_pubkey, focused).unwrap_or_default();
         (friends, neighbors)
     })
     .await
@@ -17856,7 +17886,8 @@ async fn maybe_dial_channel_neighbors(
     let Some(roster) = channels_lite_cached(state, db) else {
         return;
     };
-    let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey) else {
+    let Ok(neighbors) = collect_channel_neighbor_caps(db, &roster, &our_pubkey, state.channel_focused)
+    else {
         return;
     };
     let mut started = 0usize;
@@ -20781,6 +20812,26 @@ async fn send_channel_reaction_batch(
     true
 }
 
+/// How long this neighbor's last ask holds before we may ask again.
+///
+/// The short walk interval while the room's frontier is ahead of where it was
+/// when we asked them — they are feeding us a backlog and the next batch is
+/// waiting — and the idle interval otherwise. Falling back to `interval` when
+/// no mark is recorded keeps a fresh stamp behaving exactly as it did before.
+fn history_sync_gate(
+    state: &NetworkState,
+    channel_id: [u8; 16],
+    peer: &[u8; 32],
+    latest: i64,
+    interval: std::time::Duration,
+    walk: std::time::Duration,
+) -> std::time::Duration {
+    match state.channel_history_sync_mark.get(&(channel_id, *peer)) {
+        Some(mark) if latest > *mark => walk,
+        _ => interval,
+    }
+}
+
 async fn maybe_sync_channel_history(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -20795,12 +20846,25 @@ async fn maybe_sync_channel_history(
     };
     let now = std::time::Instant::now();
     let interval = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_SYNC_SECS);
+    let walk = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_WALK_SECS);
     let our_pk = state.local_ed25519_pubkey;
-    let mut sent = 0usize;
-    for ch in channels.iter() {
-        if !ch.in_room_now() {
-            continue;
+    let focused_hex = state.channel_focused.map(hex::encode);
+    let mut rooms: Vec<&crate::storage::database::StoredChannel> = channels
+        .iter()
+        .filter(|ch| ch.in_room_now())
+        .collect();
+    rooms.sort_by_key(|ch| {
+        if focused_hex
+            .as_ref()
+            .is_some_and(|id| ch.channel_id.eq_ignore_ascii_case(id))
+        {
+            0
+        } else {
+            1
         }
+    });
+    let mut sent = 0usize;
+    for ch in rooms {
         if sent >= 4 {
             break;
         }
@@ -20810,14 +20874,29 @@ async fn maybe_sync_channel_history(
         let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
             continue;
         };
+        // The room's frontier, read once: it decides both the cheap gate
+        // below (has anything landed since we asked?) and the `since` the
+        // request carries.
+        let wall = chrono::Utc::now().timestamp();
+        let latest = db
+            .latest_channel_message_timestamp(&ch.channel_id)
+            .unwrap_or(0)
+            .min(wall)
+            .max(0);
         // Cheap per-room gate: if every neighbor slot was asked recently,
         // skip loading the roster. A room with fewer stamps may have grown
-        // new XOR-neighbors and still needs the member list.
+        // new XOR-neighbors and still needs the member list. A slot whose
+        // watermark has moved since the ask is not "recent" for this purpose
+        // — that neighbor is mid-walk and gets the shorter interval.
         let recent_stamps = state
             .channel_history_sync_at
             .iter()
-            .filter(|((cid, _), at)| {
-                *cid == channel_id && now.saturating_duration_since(**at) < interval
+            .filter(|((cid, pk), at)| {
+                if *cid != channel_id {
+                    return false;
+                }
+                let gate = history_sync_gate(state, channel_id, pk, latest, interval, walk);
+                now.saturating_duration_since(**at) < gate
             })
             .count();
         if recent_stamps >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
@@ -20835,10 +20914,11 @@ async fn maybe_sync_channel_history(
             .into_iter()
             .filter(|pk| {
                 let stamp_key = (channel_id, *pk);
+                let gate = history_sync_gate(state, channel_id, pk, latest, interval, walk);
                 !state
                     .channel_history_sync_at
                     .get(&stamp_key)
-                    .is_some_and(|at| now.saturating_duration_since(*at) < interval)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < gate)
             })
             .collect();
         if due.is_empty() {
@@ -20847,18 +20927,13 @@ async fn maybe_sync_channel_history(
         let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
-        let wall = chrono::Utc::now().timestamp();
-        let latest = db
-            .latest_channel_message_timestamp(&ch.channel_id)
-            .unwrap_or(0)
-            .min(wall);
         // Ask from the frontier, not from a window behind it. Asking for the
         // last six hours got the same newest 32 lines back every round: the
         // watermark is `MAX(timestamp)`, so storing that batch advanced it past
         // everything still missing underneath, and a gap wider than 32 lines
         // was never recoverable. A responder serves oldest-first for any
         // non-zero watermark, so each round now walks the hole forward instead.
-        let since = latest.max(0);
+        let since = latest;
         let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
         for pk in due {
             if sent >= 4 {
@@ -20889,6 +20964,10 @@ async fn maybe_sync_channel_history(
                 .await
             {
                 state.channel_history_sync_at.insert(stamp_key, now);
+                // The frontier as it stood when we asked. If it is ahead of
+                // this by the next pass, their reply brought lines and the
+                // walk interval applies instead of the idle one.
+                state.channel_history_sync_mark.insert(stamp_key, since);
                 sent += 1;
             }
         }
@@ -26569,6 +26648,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_gossip_from_times.clear();
     state.channel_gossip_author_times.clear();
     state.channel_history_sync_at.clear();
+    state.channel_history_sync_mark.clear();
     state.channel_origin_retry.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
@@ -27583,6 +27663,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_view_cache: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
+        channel_history_sync_mark: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
@@ -36418,7 +36499,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
                         let (rv_friends, rv_channel_neighbors) =
-                            load_rendezvous_register_targets(&db, rv_pubkey).await;
+                            load_rendezvous_register_targets(&db, rv_pubkey, state.channel_focused)
+                                .await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -36485,7 +36567,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
                         let (rv_friends, rv_channel_neighbors) =
-                            load_rendezvous_register_targets(&db, rv_pubkey).await;
+                            load_rendezvous_register_targets(&db, rv_pubkey, state.channel_focused)
+                                .await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());

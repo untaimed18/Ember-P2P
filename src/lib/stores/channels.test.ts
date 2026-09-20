@@ -1,13 +1,24 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import {
   bumpChannelUnread,
   channels,
+  cleanupChannelsStore,
   clearChannelUnread,
+  mergeChannelUnreadFromSnapshot,
   mutedChannels,
+  refreshChannels,
   totalChannelUnread,
 } from './channels';
-import type { ChannelInfo } from '$lib/api/channels';
+import { listChannels, type ChannelInfo } from '$lib/api/channels';
+
+vi.mock('$lib/api/channels', async () => {
+  const actual = await vi.importActual<typeof import('$lib/api/channels')>('$lib/api/channels');
+  return {
+    ...actual,
+    listChannels: vi.fn(),
+  };
+});
 
 function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelInfo {
   return {
@@ -43,6 +54,8 @@ const A = '11'.repeat(16);
 const B = '22'.repeat(16);
 
 beforeEach(() => {
+  cleanupChannelsStore();
+  vi.mocked(listChannels).mockReset();
   channels.set([]);
   mutedChannels.set([]);
 });
@@ -99,5 +112,43 @@ describe('unread counters', () => {
     const rooms = get(channels);
     expect(rooms.find((r) => r.channel_id === A)?.unread).toBe(1);
     expect(rooms.find((r) => r.channel_id === B)?.unread).toBe(0);
+  });
+
+  it('keeps live unread only on rooms that were touched during a refresh', () => {
+    const snapshot = [
+      room({ channel_id: A, unread: 4, name: 'Fresh A' }),
+      room({ channel_id: B, unread: 7, name: 'Fresh B' }),
+    ];
+    const current = [
+      room({ channel_id: A, unread: 1, name: 'Stale A' }),
+      room({ channel_id: B, unread: 9, name: 'Stale B' }),
+    ];
+    const merged = mergeChannelUnreadFromSnapshot(snapshot, current, [A]);
+    expect(merged.find((r) => r.channel_id === A)).toMatchObject({ unread: 1, name: 'Fresh A' });
+    expect(merged.find((r) => r.channel_id === B)).toMatchObject({ unread: 7, name: 'Fresh B' });
+  });
+
+  it('does not let a stale refresh overwrite a newer one', async () => {
+    channels.set([room({ channel_id: A, unread: 0 })]);
+    let releaseFirst!: (value: ChannelInfo[]) => void;
+    const firstSnap = new Promise<ChannelInfo[]>((resolve) => {
+      releaseFirst = resolve;
+    });
+    vi.mocked(listChannels)
+      .mockImplementationOnce(() => firstSnap)
+      .mockResolvedValueOnce([room({ channel_id: A, unread: 0, name: 'Fresh' })]);
+
+    const first = refreshChannels();
+    bumpChannelUnread(A);
+    expect(get(channels)[0].unread).toBe(1);
+
+    await refreshChannels();
+    expect(get(channels)[0].unread).toBe(1);
+    expect(get(channels)[0].name).toBe('Fresh');
+
+    releaseFirst([room({ channel_id: A, unread: 99, name: 'Stale' })]);
+    await first;
+    expect(get(channels)[0].unread).toBe(1);
+    expect(get(channels)[0].name).toBe('Fresh');
   });
 });
