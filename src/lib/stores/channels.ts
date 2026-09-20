@@ -786,10 +786,19 @@ export async function initChannelsStore() {
           // line from a room that only just appeared, and the count the fetch
           // brings back is read from the database — which already holds the
           // message that triggered this event. Adding one more counted it twice.
-          refreshChannels().catch(() => {});
-        } else {
-          bumpChannelUnread(channelId);
+          //
+          // Toasting waits for the fetch rather than racing it: the row is what
+          // carries the room's name, so announcing the message first named it
+          // "Channels" — the nav label — for the one line where the user has the
+          // least idea which room just spoke.
+          const message = event.payload.message ?? '';
+          const sender = event.payload.sender_pubkey;
+          refreshChannels()
+            .catch(() => {})
+            .then(() => maybeToastChannelMessage(channelId, message, sender));
+          return;
         }
+        bumpChannelUnread(channelId);
         maybeToastChannelMessage(
           channelId,
           event.payload.message ?? '',
@@ -797,6 +806,12 @@ export async function initChannelsStore() {
         );
       }),
     );
+    // The Channels page registers a handoff listener too, and when it is mounted
+    // both fire — two `list_channels` for one event. Kept anyway: a handoff moves
+    // rooms and ownership whether or not that page is on screen, and this is the
+    // only listener that runs when it is not, so the sidebar's unread total and the
+    // room list would otherwise sit stale until the next visit. An ownership
+    // handoff is rare; a wrong list is not worth the saving.
     registered.push(
       await listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', () => {
         refreshChannels().catch(() => {});
@@ -880,6 +895,11 @@ export function cleanupChannelsStore() {
   visibleChannels.clear();
   lastToastAt.clear();
   lastOpenedChannelId = null;
+  // Cleared with the room it refers to. Left standing, the next visit read as
+  // "the user had something open, leave their selection alone" while the room
+  // itself had just been nulled — so they arrived at an empty directory instead
+  // of the newest joined room a fresh arrival is meant to open.
+  channelSelectionStashed = false;
   for (const timer of xferClearTimers.values()) clearTimeout(timer);
   xferClearTimers.clear();
   channelTransfers.set({});

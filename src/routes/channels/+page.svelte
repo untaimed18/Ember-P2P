@@ -9,7 +9,7 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { copyToClipboard, disambiguatedMemberName, formatRelativeTime, shortPubkey } from '$lib/utils';
+  import { copyToClipboard, disambiguatedMemberName, formatBytes, formatRelativeTime, shortPubkey } from '$lib/utils';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -263,12 +263,15 @@
   let needsUsername = $derived(!($appSettings?.channel_username ?? '').trim());
   let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
   /**
-   * The one gate that has to serialise. Every owner moderation command —
-   * topic/welcome, ban, unban, promote, demote — is a read-modify-write of the
-   * whole signed snapshot on the backend (`load_banned_pubkeys` then
-   * `commit_channel_moderation`). Two in flight would build from the same base
-   * and the later would silently discard the earlier's change, so they share a
-   * gate rather than getting one each.
+   * One gate across every owner moderation command — topic/welcome, ban, unban,
+   * promote, demote, nominate.
+   *
+   * Not what keeps them correct: each is a read-modify-write of the whole signed
+   * snapshot, but the backend serialises them itself on `MODERATION_LOCK`
+   * (`src-tauri/src/commands/channels.rs`), so an overlap queues rather than
+   * losing an update. What this does is keep the UI honest — one write at a time
+   * means the controls reflect one state, and the flag is not cleared out from
+   * under an operation that is still running.
    */
   let moderationBusy = $derived(savingModeration || moderatingMember !== null);
   let transferPendingTo = $derived(
@@ -1421,7 +1424,11 @@
 
   async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS) {
     const id = selectedId;
-    if (!id) return;
+    // Takes the gate it was already setting. Writing `savingModeration` without
+    // checking it meant two of these could overlap, and whichever finished first
+    // cleared the flag the other was still relying on — re-enabling every
+    // moderation control while a write was in flight.
+    if (!id || moderationBusy) return;
     savingModeration = true;
     try {
       await setChannelSuccessorNominee(id, memberPubkey || null, memberPubkey ? days : null);
@@ -1503,12 +1510,6 @@
     e.preventDefault();
     closeCardMenus(menu);
     menu.open = true;
-  }
-
-  function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   /**

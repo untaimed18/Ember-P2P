@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 49;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 50;
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -2348,6 +2348,38 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 50 {
+            // Three sweeps that had no index to stand on.
+            //
+            // `idx_chat_messages_delivery` is `(friend_hash, delivery, id)`,
+            // which serves the per-friend flush. But `pending_chat_counts` and
+            // `expire_stale_queued_chat` are deliberately *global* — one asks
+            // "how many unsent, for every conversation", the other "which rows
+            // have waited too long, anywhere" — so neither supplies the leading
+            // `friend_hash` and neither could use that index. Both fell back to
+            // scanning `chat_messages`, which is capped per friend rather than
+            // in total and so grows with the friend list.
+            //
+            // `(delivery, direction, timestamp)`: the two equalities first, then
+            // the range the expiry sweep tests and the column it would otherwise
+            // sort. `pending_chat_counts` uses the `(delivery, direction)`
+            // prefix and reads `friend_hash` out of the table for its GROUP BY.
+            //
+            // The third is the channel-side equivalent, for the sync catch-up
+            // read: it filters one room with a `timestamp >=` range and orders by
+            // timestamp, while `idx_channel_messages_chan` is `(channel_id, id)`
+            // — so the room seek was indexed and the range and the sort were not.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_queue
+                    ON chat_messages(delivery, direction, timestamp);
+                 CREATE INDEX IF NOT EXISTS idx_channel_messages_time
+                    ON channel_messages(channel_id, timestamp);",
+            )?;
+            set_version(&tx, 50)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -4628,6 +4660,12 @@ impl Database {
                 "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), sender_pubkey \
                  FROM friend_requests WHERE sender_hash = ?1",
             )?;
+            // `optional()` rather than `.ok()`: only "no such row" means the
+            // request is gone. Swallowing every error turned an I/O failure or a
+            // corrupt page into "friend request not found", which the caller
+            // reports as a stale row and the UI answers by dropping the card —
+            // so a storage fault presented as the user's own request vanishing,
+            // and the retry that would have surfaced it never happened.
             stmt.query_row(params![sender_hash], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -4636,7 +4674,7 @@ impl Database {
                     row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })
-            .ok()
+            .optional()?
         };
 
         // Refuse to "accept" a request that no longer exists. Without this a
@@ -4951,10 +4989,17 @@ impl Database {
         }
         let cutoff = chrono::Utc::now().timestamp() - CHAT_QUEUE_MAX_AGE_SECS;
         let conn = self.conn.lock();
-        // Read the victims and update them under the same lock, so the ids
-        // reported are exactly the rows this sweep changed.
+        // Read the victims and update them in one transaction, so the ids
+        // reported are exactly the rows this sweep changed. The mutex alone was
+        // not enough: it serialises callers of this type, but the SELECT and the
+        // UPDATE were still two statements, and anything that reached the same
+        // file between them — another connection, or a crash — could leave the
+        // returned list describing rows that were never marked, which is a
+        // conversation rendering "failed" over a row on disk that still says
+        // queued.
+        let tx = conn.unchecked_transaction()?;
         let expired: Vec<(i64, String)> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id, friend_hash FROM chat_messages \
                  WHERE delivery = ?1 AND direction = 'sent' AND timestamp < ?2",
             )?;
@@ -4968,11 +5013,12 @@ impl Database {
         if expired.is_empty() {
             return Ok(expired);
         }
-        conn.execute(
+        tx.execute(
             "UPDATE chat_messages SET delivery = ?1 \
              WHERE delivery = ?2 AND direction = 'sent' AND timestamp < ?3",
             params![CHAT_FAILED, CHAT_QUEUED, cutoff],
         )?;
+        tx.commit()?;
         tracing::info!(
             "Gave up on {} chat message(s) queued longer than {} days",
             expired.len(),
@@ -5254,8 +5300,16 @@ impl Database {
 
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
+        // `direction = 'received'` for the same reason the channel tally in
+        // `list_channels` carries it: unread means "they said something I have
+        // not read", and a sent row has no business in that count. The insert
+        // path writes `read = 1` on outbound so this changes nothing today —
+        // which is precisely why it was worth stating, because the one thing
+        // that would surface the omission is a row written by some future path
+        // that forgets, and it would surface as a badge the user cannot clear.
         let mut stmt = conn.prepare(
-            "SELECT friend_hash, COUNT(*) FROM chat_messages WHERE read = 0 GROUP BY friend_hash",
+            "SELECT friend_hash, COUNT(*) FROM chat_messages \
+             WHERE read = 0 AND direction = 'received' GROUP BY friend_hash",
         )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -5594,6 +5648,15 @@ impl Database {
                 "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            // The forget-list goes too. It exists to stop a deleted line being
+            // re-inserted by the next gossip replay, and with the room itself
+            // destroyed there is no ingest path left to refuse — so every row
+            // here is unreachable, up to `CHANNEL_TOMBSTONES_PER_CHANNEL` of them,
+            // and nothing else would ever remove them.
+            tx.execute(
+                "DELETE FROM channel_message_tombstones WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             tx.execute(
                 "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
                 params![channel_id],
@@ -5666,6 +5729,12 @@ impl Database {
         )?;
         tx.execute(
             "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        // Same reasoning as `tombstone_channel`: no messages means no ingest to
+        // refuse, so the forget-list has no reader left.
+        tx.execute(
+            "DELETE FROM channel_message_tombstones WHERE channel_id = ?1",
             params![channel_id],
         )?;
         match keep_banned_member {
@@ -5928,22 +5997,12 @@ impl Database {
         Ok(())
     }
 
-    /// Record the owner's succession settings. Empty nominee or zero days
-    /// disables it, which leaves the room frozen if the owner never returns.
-    pub fn set_channel_succession(
-        &self,
-        channel_id: &str,
-        nominee: &str,
-        claim_after_days: i64,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE channels SET successor_nominee = ?2, claim_after_days = ?3
-             WHERE channel_id = ?1",
-            params![channel_id, nominee, claim_after_days],
-        )?;
-        Ok(())
-    }
+    // No `set_channel_succession`. The nominee and the claim window are part of
+    // the owner-signed moderation snapshot, so `apply_channel_moderation` is the
+    // only thing that writes them — which is what makes setting one atomic with
+    // publishing it. A second writer is how the two came apart: the column was
+    // written first and the publish could then refuse, leaving this device
+    // honouring a successor the room had never been told about.
 
     pub fn set_channel_pending_handoff(
         &self,
@@ -7667,7 +7726,8 @@ impl Database {
         sig: &str,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        let changed = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "INSERT INTO channel_message_reactions
                  (channel_id, msg_id, member_pubkey, reaction, reacted_at, sig)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -7685,8 +7745,50 @@ impl Database {
                 sig
             ],
         )?;
+        // Accepting a reaction for a line we do not hold is what makes an early
+        // one work, but it is also the one insert with no bound on it. A row
+        // whose message never arrives is swept by nothing: the message prune and
+        // the local delete both key off a line that exists, and only destroying
+        // the whole room clears the rest. So a mesh that reacts to ids it never
+        // publishes grows this table for as long as we stay in the room.
+        //
+        // Only checked when the target is genuinely absent, which is the rare
+        // case — the sweep itself has to test every reaction in the room against
+        // the message table, and that is not work to do on an ordinary reaction
+        // to a line that is sitting right there.
+        let target_present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_messages \
+             WHERE channel_id = ?1 AND msg_id = ?2)",
+            params![channel_id, msg_id],
+            |row| row.get(0),
+        )?;
+        if !target_present {
+            // Newest kept, oldest dropped: a reaction that has waited longest
+            // for its line is the one least likely to ever be matched.
+            tx.execute(
+                "DELETE FROM channel_message_reactions
+                 WHERE rowid IN (
+                     SELECT r.rowid FROM channel_message_reactions r
+                     WHERE r.channel_id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM channel_messages m
+                           WHERE m.channel_id = r.channel_id AND m.msg_id = r.msg_id
+                       )
+                     ORDER BY r.reacted_at DESC
+                     LIMIT -1 OFFSET ?2
+                 )",
+                params![channel_id, Self::CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
+
+    /// Reactions for lines this device does not hold, per room.
+    ///
+    /// Generous next to any real burst — a room sees one reaction per member per
+    /// line — and small enough that a peer inventing ids cannot spend our disk.
+    const CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL: i64 = 256;
 
     /// Every live reaction in a room, keyed by the line it belongs to.
     ///
@@ -9481,6 +9583,362 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// The v48 indexes exist for three queries that could not use the ones
+    /// already there: two global queued-chat sweeps that omit `friend_hash`, and
+    /// the channel sync read that ranges over `timestamp` while the only room
+    /// index is keyed on `id`. As with v46, asserting the plan is the only way to
+    /// know the migration did what it was added for.
+    #[test]
+    fn the_queued_chat_and_sync_sweeps_are_index_driven() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-queue-plan-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let plan_for = |sql: &str| -> String {
+            let conn = db.conn.lock();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan text");
+            rows.join(" | ")
+        };
+
+        // `pending_chat_counts`: no `friend_hash`, so the per-friend delivery
+        // index cannot serve it.
+        let counts = plan_for(
+            "SELECT friend_hash, COUNT(*) FROM chat_messages \
+             WHERE delivery = 1 AND direction = 'sent' GROUP BY friend_hash",
+        );
+        assert!(
+            counts.contains("idx_chat_messages_queue"),
+            "unsent tally is not using its index: {counts}"
+        );
+        assert!(
+            !counts.contains("SCAN chat_messages"),
+            "unsent tally still scans the table: {counts}"
+        );
+
+        // `expire_stale_queued_chat`: same two equalities plus the age range.
+        let expire = plan_for(
+            "SELECT id, friend_hash FROM chat_messages \
+             WHERE delivery = 1 AND direction = 'sent' AND timestamp < 99",
+        );
+        assert!(
+            expire.contains("idx_chat_messages_queue"),
+            "queue expiry is not using its index: {expire}"
+        );
+        assert!(
+            !expire.contains("SCAN chat_messages"),
+            "queue expiry still scans the table: {expire}"
+        );
+
+        // The sync catch-up read, which ranges and sorts on `timestamp`.
+        let sync = plan_for(
+            "SELECT id FROM channel_messages \
+             WHERE channel_id = 'x' AND timestamp >= 5 ORDER BY timestamp ASC, id ASC",
+        );
+        assert!(
+            sync.contains("idx_channel_messages_time"),
+            "channel sync read is not using its index: {sync}"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A fresh database runs every migration block, so the plan test above proves
+    /// v50 works on an empty schema but not on an *existing* one — and the
+    /// existing one that matters is a database already at 49, which is what a
+    /// device that ran the decline-queue work is sitting on. Rolling the version
+    /// back and dropping what the block creates reproduces that upgrade.
+    #[test]
+    fn the_v50_indexes_are_created_on_a_v49_database() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-v50-upgrade-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let index_count = |db: &Database| -> i64 {
+            db.conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_chat_messages_queue', 'idx_channel_messages_time')",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("index count")
+        };
+
+        let db = Database::open_at(&path).expect("open db");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(index_count(&db), 2, "fresh database gets both indexes");
+
+        // Back to a v49 profile: the version rolled back and the indexes gone,
+        // with everything v48 and v49 added left in place.
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "DROP INDEX idx_chat_messages_queue;
+                 DROP INDEX idx_channel_messages_time;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (49);",
+            )
+            .expect("roll back to v49");
+        }
+        drop(db);
+
+        let upgraded = Database::open_at(&path).expect("a v49 database must still open");
+        assert_eq!(upgraded.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(index_count(&upgraded), 2, "upgrade recreates both indexes");
+        // The earlier blocks must not have been re-run backwards over it.
+        assert!(
+            upgraded
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('channel_messages') \
+                     WHERE name = 'delivery'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .expect("column count")
+                == 1,
+            "v49's column survives the v50 step"
+        );
+
+        // Idempotent: opening again must not fail on indexes that now exist.
+        drop(upgraded);
+        let again = Database::open_at(&path).expect("reopen at the current version");
+        assert_eq!(again.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(index_count(&again), 2);
+
+        drop(again);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Unread means "they said something I have not read". A sent row that
+    /// somehow carries `read = 0` must not put a number on the badge, because
+    /// nothing in the UI can ever clear it.
+    #[test]
+    fn the_friend_unread_tally_ignores_outbound_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-unread-dir-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let friend = "ab".repeat(8);
+        db.insert_chat_message(&friend, "received", "hello")
+            .expect("inbound");
+        db.insert_chat_message(&friend, "sent", "mine")
+            .expect("outbound");
+        // The flag the insert path never sets on an outbound row, which is exactly
+        // the row the direction filter exists to ignore. Forced here because the
+        // point is what the tally does when something else has already gone wrong.
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE chat_messages SET read = 0 WHERE direction = 'sent'",
+                [],
+            )
+            .expect("clear read on the sent row");
+        }
+
+        let counts = db.unread_message_counts().expect("counts");
+        assert_eq!(
+            counts,
+            vec![(friend.clone(), 1)],
+            "only the inbound line is unread"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Destroying a room has to take its forget-list with it. The list only ever
+    /// serves the ingest path for that room, so once the room is gone every row
+    /// is unreachable and nothing else would remove them.
+    #[test]
+    fn removing_a_room_clears_its_message_tombstones() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-tombstone-sweep-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let tombstones = |db: &Database, id: &str| -> i64 {
+            db.conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM channel_message_tombstones WHERE channel_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .expect("tombstone count")
+        };
+
+        // One room we own and tombstone, one we merely forget.
+        let owned = "aa".repeat(16);
+        let joined = "bb".repeat(16);
+        for (id, is_owner) in [(&owned, true), (&joined, false)] {
+            db.insert_channel(
+                id,
+                &"cd".repeat(32),
+                "Lobby",
+                "public",
+                is_owner,
+                if is_owner { Some(&[0x11u8; 32]) } else { None },
+                Some(&[0x22u8; 32]),
+            )
+            .expect("insert channel");
+            {
+                let conn = db.conn.lock();
+                conn.execute(
+                    "INSERT INTO channel_message_tombstones (channel_id, msg_id, deleted_at) \
+                     VALUES (?1, ?2, 1)",
+                    params![id, "ff".repeat(8)],
+                )
+                .expect("record a forgotten line");
+            }
+            assert_eq!(tombstones(&db, id), 1, "the forget-list row is there");
+        }
+
+        db.tombstone_channel(&owned).expect("owner delete");
+        assert_eq!(
+            tombstones(&db, &owned),
+            0,
+            "an owner delete leaves no forget-list behind"
+        );
+
+        db.delete_channel(&joined, None).expect("forget");
+        assert_eq!(
+            tombstones(&db, &joined),
+            0,
+            "forgetting a room leaves no forget-list behind"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A reaction for a line we do not hold is kept on purpose — it may arrive
+    /// before its message — but it cannot be kept without limit, or a peer
+    /// reacting to ids it never publishes spends our disk.
+    #[test]
+    fn reactions_for_absent_lines_are_bounded() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-orphan-reactions-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel = "aa".repeat(16);
+        db.insert_channel(
+            &channel,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            false,
+            None,
+            Some(&[0x22u8; 32]),
+        )
+        .expect("insert channel");
+
+        let cap = Database::CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL;
+        let member = "ef".repeat(32);
+        // Comfortably past the cap, each against a line that will never arrive.
+        for n in 0..(cap + 64) {
+            let msg_id = format!("{:032x}", n);
+            db.set_channel_message_reaction(&channel, &msg_id, &member, 1, 1_000 + n, "sig")
+                .expect("record reaction");
+        }
+
+        let total: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM channel_message_reactions WHERE channel_id = ?1",
+                params![&channel],
+                |r| r.get(0),
+            )
+            .expect("reaction count");
+        assert!(
+            total <= cap,
+            "orphan reactions grew past the cap: {total} > {cap}"
+        );
+
+        // A reaction whose line is present is never touched by the sweep, however
+        // many orphans surround it.
+        let real_msg = "ab".repeat(8);
+        db.insert_channel_message(
+            &channel, &member, "received", "hello", &real_msg, 2_000, "", true,
+        )
+        .expect("insert message");
+        db.set_channel_message_reaction(&channel, &real_msg, &member, 1, 2_001, "sig")
+            .expect("react to a real line");
+        for n in 0..32 {
+            let msg_id = format!("{:032x}", 100_000 + n);
+            db.set_channel_message_reaction(&channel, &msg_id, &member, 1, 3_000 + n, "sig")
+                .expect("more orphans");
+        }
+        let kept: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM channel_message_reactions \
+                 WHERE channel_id = ?1 AND msg_id = ?2",
+                params![&channel, &real_msg],
+                |r| r.get(0),
+            )
+            .expect("real reaction count");
+        assert_eq!(kept, 1, "the reaction on a line we hold survives the sweep");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// `get_channel_lite` is what the packet paths read, and `list_channels`
     /// reads both membership flags for every room in one statement. Neither
     /// may disagree with the per-row queries they replaced.
@@ -11001,13 +11459,12 @@ mod tests {
             4
         );
 
-        // The owner can clear their own nomination.
-        db.set_channel_succession(&channel_id, "", 0).unwrap();
-        let row = db.get_channel(&channel_id).unwrap().unwrap();
-        assert!(row.successor_nominee.is_empty());
-        assert_eq!(row.claim_after_days, 0);
+        // Clearing a nomination locally used to have its own setter, and this is
+        // where it was exercised. It has none now: the nominee is part of the
+        // signed snapshot, so withdrawing one travels the same path as setting
+        // one and the all-zero case below is the whole of it.
 
-        // And a withdrawal has to reach members. An all-zero nominee is the
+        // A withdrawal has to reach members. An all-zero nominee is the
         // owner saying "nobody" — distinct from a record that simply omits the
         // field, which must leave what we already know alone. Without this an
         // owner could never call a nomination back.

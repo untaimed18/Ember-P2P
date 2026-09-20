@@ -132,6 +132,40 @@
 
   let unlistenError: UnlistenFn | null = null;
 
+  /**
+   * Retry the whole browse, listeners included.
+   *
+   * Not just `requestBrowse`: the error on screen may be the listener
+   * registration itself having failed, in which case nothing is attached and a
+   * bare re-request puts the dialog back on its spinner while results arrive to
+   * no handler at all. Reopening the dialog was the only way out, because that is
+   * what re-runs the effect above. This is that effect's body, on demand.
+   */
+  async function retryBrowse() {
+    const hash = friendHash;
+    if (!hash) return;
+    const gen = ++listenerGen;
+    loading = true;
+    error = null;
+    downloadError = null;
+    downloadNote = null;
+    listenerWarning = null;
+    files = [];
+    try {
+      const ok = await setupListener(gen, hash);
+      if (!ok || gen !== listenerGen || !open) {
+        if (gen === listenerGen && open) loading = false;
+        return;
+      }
+      await requestBrowse(hash);
+    } catch (e: unknown) {
+      if (gen === listenerGen && open) {
+        error = translateError(e, m.browse_failed_to_browse());
+        loading = false;
+      }
+    }
+  }
+
   /// Returns true on success, false if either listener registration
   /// failed (caller should NOT proceed to requestBrowse — without
   /// the listeners we'd never see results / errors and the user
@@ -382,7 +416,7 @@
         {:else if error}
           <div class="browse-error">
             <p>{error}</p>
-            <button type="button" class="browse-retry" onclick={() => void requestBrowse(friendHash)}>{m.common_retry()}</button>
+            <button type="button" class="browse-retry" onclick={() => void retryBrowse()}>{m.common_retry()}</button>
           </div>
         {:else if files.length === 0}
           <div class="browse-status">{m.browse_no_files()}</div>

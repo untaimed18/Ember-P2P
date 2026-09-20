@@ -3364,27 +3364,26 @@ pub async fn ban_channel_member(
         // Banning the nominee withdraws the nomination. Leaving it standing
         // would let the person we just evicted inherit the room once we went
         // quiet, which is the opposite of what a ban means.
+        //
+        // Cleared in memory, not written first. `commit_channel_moderation`
+        // builds the published tail from this row and applies the same snapshot
+        // locally, so the withdrawal travels with the ban: either both land or
+        // neither does. Writing the column up front and re-reading it meant a
+        // `rotate_and_commit` that then failed — a record that no longer fits, a
+        // rotation the key store refused — left the nomination already gone, with
+        // the ban not applied and nothing to put it back. The owner saw a failed
+        // ban and had no way to know their successor had been wiped too.
         let owned = if owned
             .row
             .successor_nominee
             .eq_ignore_ascii_case(&hex::encode(pk))
         {
-            let db = state.db.clone();
-            let id = channel_id.clone();
-            tokio::task::spawn_blocking(move || db.set_channel_succession(&id, "", 0))
-                .await
-                .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-                .map_err(|e| {
-                    coded_ctx("channels_moderation_failed", "Could not clear the nominee", e)
-                })?;
-            // Re-read, exactly as the other commands that write a column before
-            // committing do. `commit_channel_moderation` builds the published
-            // tail from this row, so handing it the pre-clear snapshot signed
-            // the withdrawn nomination straight back into the record the whole
-            // room reads — and wrote it back locally too, leaving the banned
-            // member still listed as successor.
             OwnedChannel {
-                row: load_owned_channel(&state, &channel_id).await?.row,
+                row: StoredChannel {
+                    successor_nominee: String::new(),
+                    claim_after_days: 0,
+                    ..owned.row.clone()
+                },
                 ..owned
             }
         } else {
@@ -3646,13 +3645,23 @@ pub async fn set_channel_successor_nominee(
             ));
         }
     }
-    let db = state.db.clone();
-    let id = channel_id.clone();
+    // Carried in memory rather than written first, exactly as
+    // `set_channel_invite_policy` does it. `commit_channel_moderation` builds the
+    // published tail from this row *and* applies the same snapshot locally, so
+    // passing the requested value makes the change atomic: either it publishes
+    // and is stored, or neither happens. Writing the column up front meant a
+    // commit that refused — a record that no longer fits, a stale timestamp —
+    // returned an error for a nomination the database had in fact accepted, so
+    // this device honoured a successor the room had never been told about.
     let nominee_hex = nominee.map(hex::encode).unwrap_or_default();
-    tokio::task::spawn_blocking(move || db.set_channel_succession(&id, &nominee_hex, days as i64))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not save the nominee", e))?;
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            successor_nominee: nominee_hex,
+            claim_after_days: i64::from(days),
+            ..owned.row.clone()
+        },
+        ..owned
+    };
 
     // The members learn the nomination from the moderation record below, but
     // the name registry cannot read that — so tell it separately. Without this
@@ -3680,14 +3689,12 @@ pub async fn set_channel_successor_nominee(
         }
     }
 
-    // Republish so members learn the nomination; the tail is rebuilt from the
-    // row we just wrote.
+    // Publishes the nomination and stores it, in that order and as one step.
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mods = load_moderator_pubkeys(&state, &channel_id).await?;
-    let refreshed = load_owned_channel(&state, &channel_id).await?;
     commit_channel_moderation(
         &state,
-        &refreshed,
+        &owned,
         &owned.row.topic,
         &owned.row.welcome,
         &bans,

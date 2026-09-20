@@ -1054,7 +1054,18 @@ impl ChannelInvite {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             match key {
                 "pk" => pubkey = hex_32(value),
-                "name" => name = percent_decode(value)?,
+                // Bounded before decoding, not after. The name is the one
+                // variable-length field in an invite, `percent_decode` sizes its
+                // buffer from the input, and this runs on a string the user
+                // pasted or an `ember-channel:` deep link handed us — so without
+                // a cap the parse allocates whatever arrived, before the pubkey
+                // below has established the invite is even real. Three times
+                // `CHANNEL_NAME_MAX` leaves room for a fully percent-encoded name
+                // (`%XX` per byte) and refuses anything that could not be one.
+                "name" if value.len() <= super::dht::publish::CHANNEL_NAME_MAX * 3 => {
+                    name = percent_decode(value)?
+                }
+                "name" => return None,
                 "k" => join_secret = hex_32(value),
                 // Unparseable is the same as absent: an invite is user-pasted,
                 // so a mangled epoch must not throw the whole thing away when

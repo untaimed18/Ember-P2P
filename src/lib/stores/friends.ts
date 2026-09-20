@@ -497,7 +497,11 @@ export async function initFriendsStore() {
               verified:
                 (idx >= 0 && cur[idx].verified) || verified === true,
             };
-            if (idx === -1) return [...cur, newRow];
+            // Front, not back. `get_friend_requests` returns `received_at DESC`,
+            // so appending put a just-arrived request at the bottom of the list
+            // and the debounced refetch then moved it to the top a quarter of a
+            // second later — with `animate:flip` on the cards, visibly.
+            if (idx === -1) return [newRow, ...cur];
             const next = cur.slice();
             // Preserve the original received_at on update so the
             // sort order (most-recent-first) stays stable across
@@ -786,6 +790,11 @@ export function cleanupFriendsStore() {
   friendsFetchLanded = friendsFetchTicket;
   friendRequestsGen++;
   friendRequestMutationInFlight = 0;
+  // Re-armed for the next init. Latched for the lifetime of the module, the
+  // "already said so" memo meant a second cycle that failed again — Ember turned
+  // off and on, a dev remount — loaded nothing and said nothing, leaving an empty
+  // friends list looking like an empty friends list.
+  friendsSeedFailedToast = false;
   // L19: tear down any outstanding search-TTL timers; otherwise
   // a re-init would re-arm them on top of stale state.
   for (const t of searchTimers.values()) clearTimeout(t);

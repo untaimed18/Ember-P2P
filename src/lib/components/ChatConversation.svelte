@@ -335,6 +335,14 @@
       cancelEdit();
       return;
     }
+    // Same UTF-8 byte guard `handleSend` applies, for the same reason: the
+    // textarea's `maxlength` counts characters and the backend counts bytes, so
+    // an emoji-heavy revision passed here and came back as a generic failure with
+    // nothing to tell the user which limit they had hit.
+    if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
+      editError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
+      return;
+    }
     editBusy = true;
     editError = null;
     try {
@@ -665,27 +673,32 @@
         if (direction === null) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
-          // message. Compare the content tuple against the recent tail (a
-          // small window avoids wrongly collapsing two genuinely-identical
-          // messages sent seconds apart).
-          // Inbound only. Two upload-listener routes can surface the same peer
-          // message, which is what this guard is for — but the outbound echo has
-          // a single emit site, so deduping it can only ever collapse two
-          // genuinely distinct messages that share a whole-second timestamp.
-          // `handleSend` deliberately renders nothing for a delivered message
-          // and relies on this echo, so a collapsed one is lost until reload.
+          // message. Inbound only — the outbound echo has a single emit site, so
+          // deduping it could only ever collapse two real messages.
+          //
+          // By durable row id when there is one, because it names the row: a
+          // re-emit is caught exactly and two distinct messages never collide.
+          // The content tuple below cannot manage that — its timestamp is whole
+          // seconds, so a friend sending the same word twice inside one second
+          // produced one signature and the second bubble was dropped for good.
+          // `handleSend` renders nothing for a delivered message and relies on
+          // this echo, so there was nothing to reveal it short of a reload. The
+          // tuple stays as the fallback for an emit that carries no id.
+          const durableId = event.payload.id;
+          const hasDurableId = typeof durableId === 'number' && durableId > 0;
           const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
           const isDuplicate =
             direction === 'received' &&
-            messages
-              .slice(-5)
-              .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
+            (hasDurableId
+              ? messages.some((mm) => mm.id === durableId)
+              : messages
+                  .slice(-5)
+                  .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig));
           if (isDuplicate) return;
           if (direction === 'received') setFriendTyping(false);
           const wasPinned = isPinnedToBottom();
-          const durableId = event.payload.id;
           const next = [...messages, {
-            id: typeof durableId === 'number' && durableId > 0 ? durableId : --msgIdCounter,
+            id: hasDurableId ? durableId : --msgIdCounter,
             direction,
             message: event.payload.message,
             timestamp: event.payload.timestamp,
@@ -1137,6 +1150,23 @@
         // history any more (removed locally, or trimmed by the live cap).
         if (before === null || before <= id) break;
         if (!hasMoreHistory || messages.length >= MAX_LOADED_MESSAGES) break;
+        // A page already in flight makes `loadOlderMessages` a no-op, so calling
+        // it would leave `oldestDbId` unmoved and the check below would read that
+        // as "no more history" — reporting the message missing when it was about
+        // to arrive. Wait for the page that is already running instead.
+        //
+        // Bounded, because this is the one loop here whose exit depends on a flag
+        // some other call has to clear. The conversation-switch effect resets
+        // `loadingOlder`, so it cannot currently be stranded — but a jump that
+        // gives up after a couple of seconds is a wrong answer, and one that spins
+        // is a wedged tab.
+        for (let waited = 0; loadingOlder && waited < 40; waited++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          if (gen !== loadGen) return;
+        }
+        if (messages.some((message) => message.id === id)) break;
+        if (loadingOlder) break;
+        if (oldestDbId !== before) continue;
         await loadOlderMessages();
         if (gen !== loadGen) return;
         // No progress means the page came back empty or the cap kicked in;

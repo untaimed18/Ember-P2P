@@ -32,6 +32,16 @@ pub(crate) struct PendingBrowseRequest {
 
 pub(crate) type PendingBrowseRequests = HashMap<[u8; 16], VecDeque<PendingBrowseRequest>>;
 
+/// Outstanding browse requests one friend may have queued at once.
+///
+/// A browse is one dialog against one friend, so a queue this deep already means
+/// something is retrying rather than someone is browsing. The dedup on
+/// `request_id` stops the same request being queued twice but says nothing about
+/// how many *distinct* ones can pile up, and the dispatcher walks this queue
+/// looking for a live head — so an unbounded one costs memory and lengthens
+/// every dispatch.
+const MAX_PENDING_BROWSE_PER_FRIEND: usize = 8;
+
 pub(crate) fn enqueue_browse_request(
     pending: &mut PendingBrowseRequests,
     friend: [u8; 16],
@@ -40,6 +50,9 @@ pub(crate) fn enqueue_browse_request(
 ) -> Result<(), ()> {
     let queue = pending.entry(friend).or_default();
     if queue.iter().any(|request| request.request_id == request_id) {
+        return Err(());
+    }
+    if queue.len() >= MAX_PENDING_BROWSE_PER_FRIEND {
         return Err(());
     }
     queue.push_back(PendingBrowseRequest {
