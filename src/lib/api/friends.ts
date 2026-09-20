@@ -163,18 +163,6 @@ export interface IncomingFileOffer {
   ember_file_hash?: string;
 }
 
-/** The newest line in one friend conversation, for the list preview. */
-export interface ChatPreviewInfo {
-  user_hash: string;
-  direction: 'sent' | 'received' | string;
-  timestamp: number;
-  message: string;
-}
-
-export async function getChatPreviews(): Promise<ChatPreviewInfo[]> {
-  return invoke('get_chat_previews');
-}
-
 export async function retryFriendSearch(userHashHex: string): Promise<void> {
   return invoke('retry_friend_search', { userHashHex });
 }

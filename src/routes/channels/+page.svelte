@@ -68,7 +68,6 @@
   } from '$lib/stores/chatTabs';
   import {
     activeChannelId,
-    channelPreviews,
     channels as channelsStore,
     clearChannelUnread,
     forgetChannelMute,
@@ -1534,29 +1533,6 @@
     return byHash;
   });
 
-  /**
-   * What was last said in a room, for the directory row.
-   *
-   * Empty when the last speaker is ignored on this device: the preference says
-   * their messages are not drawn, and a list is no place to make an exception.
-   * Showing an older line instead would mean carrying several per room to find
-   * one, for a caption.
-   */
-  function roomPreview(channelId: string): string {
-    const row = $channelPreviews[channelId];
-    if (!row) return '';
-    if (row.sender_pubkey && roomIgnoredFor(channelId).includes(row.sender_pubkey.toLowerCase())) {
-      return '';
-    }
-    return row.message;
-  }
-
-  /** Senders hidden in one room. Cheap enough per row: the ignore list is a
-   *  handful of entries and the directory is tens of rooms. */
-  function roomIgnoredFor(channelId: string): string[] {
-    return ignoredKeysForChannel($ignoredMembers, channelId);
-  }
-
   /** Whether the room on screen is also pinned to the chat dock. */
   let roomIsDocked = $derived(
     !!selectedChannelId && $chatTabs.some((t) => t.hash === roomTabKey(selectedChannelId)),
@@ -1952,7 +1928,6 @@
             {:else}
               {#each visibleChannels as ch (ch.channel_id)}
                 {@const memberCount = directoryMemberCount(ch)}
-                {@const roomLastLine = roomPreview(ch.channel_id)}
                 <!-- A room whose ownership moved is dimmed rather than
                      labelled: the card carries no prose now, and opening it
                      shows the successor banner that actually explains it. -->
@@ -1996,15 +1971,7 @@
                          Public/Private badge are gone: the room is identified
                          by its name, and everything else about it is one click
                          away inside. -->
-                    <!-- Name over preview rather than beside it: the row is
-                         narrow and a caption competing with the name for the
-                         same line would truncate both. -->
-                    <span class="chan-text">
-                      <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
-                      {#if roomLastLine}
-                        <span class="chan-preview" title={roomLastLine}><bdi dir="auto">{roomLastLine}</bdi></span>
-                      {/if}
-                    </span>
+                    <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
                     {#if memberCount !== null}
                       {@const count = memberCount}
                       <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
@@ -3415,26 +3382,10 @@
 
   /* The name is the only thing that gives way when the row is tight. The
      count is two glyphs, and hiding it would make a busy room look empty. */
-  .chan-text {
+  .chan-name {
     flex: 1;
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .chan-name {
-    min-width: 0;
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .chan-preview {
-    min-width: 0;
-    font-size: 11.5px;
-    color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

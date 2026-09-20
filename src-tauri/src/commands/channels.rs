@@ -4785,53 +4785,6 @@ pub async fn cancel_channel_transfer(
     Ok(())
 }
 
-/// The newest line in each room, for the directory preview.
-#[derive(serde::Serialize)]
-pub struct ChannelPreviewInfo {
-    pub channel_id: String,
-    /// Who said it, so the caller can drop a line from somebody ignored on
-    /// this device — a preference the backend has no knowledge of.
-    pub sender_pubkey: String,
-    pub direction: String,
-    pub timestamp: i64,
-    pub message: String,
-}
-
-#[tauri::command]
-pub async fn list_channel_previews(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ChannelPreviewInfo>, String> {
-    if !state.config.read().await.settings.ember_native_enabled {
-        return Ok(Vec::new());
-    }
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.channel_previews())
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map(|rows| {
-            rows.into_iter()
-                .map(
-                    |(channel_id, sender_pubkey, direction, timestamp, message)| {
-                        ChannelPreviewInfo {
-                            channel_id,
-                            sender_pubkey,
-                            direction,
-                            timestamp,
-                            message,
-                        }
-                    },
-                )
-                .collect()
-        })
-        .map_err(|e| {
-            coded_ctx(
-                "channels_failed_previews",
-                "Failed to read room previews",
-                e,
-            )
-        })
-}
-
 /// Everything currently offered, awaiting an answer, or moving.
 #[tauri::command]
 pub async fn list_channel_transfers(

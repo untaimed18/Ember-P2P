@@ -427,21 +427,6 @@ export async function cancelChannelTransfer(xferId: string): Promise<void> {
   return invoke('cancel_channel_transfer', { xferId });
 }
 
-/** The newest line in one room, for the directory preview. */
-export interface ChannelPreviewInfo {
-  channel_id: string;
-  /** Who said it, so a line from someone ignored on this device is not drawn.
-   *  The backend has no knowledge of that preference. */
-  sender_pubkey: string;
-  direction: 'sent' | 'received' | string;
-  timestamp: number;
-  message: string;
-}
-
-export async function listChannelPreviews(): Promise<ChannelPreviewInfo[]> {
-  return invoke('list_channel_previews');
-}
-
 export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
   return invoke('list_channel_transfers');
 }
