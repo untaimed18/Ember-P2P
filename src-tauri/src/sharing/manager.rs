@@ -87,6 +87,10 @@ pub struct TransferControl {
     /// mirrored from [`Transfer::priority`] so the multi-source download worker
     /// can bias global connection-slot acquisition without a manager round-trip.
     download_priority: AtomicU8,
+    /// Display name applied by Rename while a download is running. Completion
+    /// and the `.part.met` sidecar both read this so a rename sticks even on
+    /// the callback path, whose tracker is not in the shared registry.
+    pending_rename: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for TransferControl {
@@ -109,6 +113,7 @@ impl TransferControl {
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
+            pending_rename: std::sync::Mutex::new(None),
         })
     }
 
@@ -261,6 +266,20 @@ impl TransferControl {
 
     pub fn download_priority_ordinal(&self) -> u8 {
         self.download_priority.load(Ordering::Acquire)
+    }
+
+    pub fn set_pending_rename(&self, name: &str) {
+        *self
+            .pending_rename
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+    }
+
+    pub fn pending_rename(&self) -> Option<String> {
+        self.pending_rename
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1548,6 +1567,23 @@ impl TransferManager {
         }
     }
 
+    /// Change the display name of a download. The `.part` file is named by
+    /// transfer id, so this is metadata only — completion reads the same
+    /// name when it moves the file into Downloads. Finished files stay put:
+    /// renaming those would desync the completed list from the file on disk.
+    /// Failed rows live in `completed` too, but they still have a `.part`
+    /// and can be resumed, so they take the new name.
+    pub fn set_file_name(&mut self, id: &str, name: &str) -> bool {
+        let Some(transfer) = self.get_transfer_mut(id) else {
+            return false;
+        };
+        if transfer.status == TransferStatus::Completed {
+            return false;
+        }
+        transfer.file_name = name.to_string();
+        true
+    }
+
     pub fn set_preview_priority(&mut self, id: &str, enabled: bool) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.preview_priority = enabled;
@@ -2680,6 +2716,44 @@ mod tests {
             speed <= cap,
             "displayed {speed} B/s above the {cap} B/s cap"
         );
+    }
+
+    #[test]
+    fn set_file_name_updates_active_and_queued_not_completed() {
+        let mut manager = TransferManager::new(1);
+        let mut active = download("a");
+        active.status = TransferStatus::Active;
+        assert!(manager.enqueue(active));
+        let queued = download("b");
+        assert!(!manager.enqueue(queued));
+        let mut finished = download("c");
+        finished.status = TransferStatus::Completed;
+        manager.completed.push(finished);
+        let mut failed = download("d");
+        failed.status = TransferStatus::Failed;
+        manager.completed.push(failed);
+
+        assert!(manager.set_file_name("a", "renamed-a.bin"));
+        assert_eq!(
+            manager.get_transfer("a").unwrap().file_name,
+            "renamed-a.bin"
+        );
+        assert!(manager.set_file_name("b", "renamed-b.bin"));
+        assert_eq!(
+            manager.get_transfer("b").unwrap().file_name,
+            "renamed-b.bin"
+        );
+        assert!(
+            !manager.set_file_name("c", "renamed-c.bin"),
+            "a finished download keeps the name it completed under"
+        );
+        assert_eq!(manager.get_transfer("c").unwrap().file_name, "c.bin");
+        assert!(manager.set_file_name("d", "renamed-d.bin"));
+        assert_eq!(
+            manager.get_transfer("d").unwrap().file_name,
+            "renamed-d.bin"
+        );
+        assert!(!manager.set_file_name("missing", "x.bin"));
     }
 
     /// A transfer row and the status-bar total are the same bytes measured

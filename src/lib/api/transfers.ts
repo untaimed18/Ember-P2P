@@ -170,6 +170,11 @@ export async function setTransferCategory(transferId: string, category: string):
   return invoke('set_transfer_category', { transferId, category });
 }
 
+/** Rename a download while it is still in progress. Returns the sanitized name. */
+export async function renameTransfer(transferId: string, fileName: string): Promise<string> {
+  return invoke('rename_transfer', { transferId, fileName });
+}
+
 export async function setPreviewPriority(transferId: string, enabled: boolean): Promise<void> {
   return invoke('set_preview_priority', { transferId, enabled });
 }

@@ -1371,15 +1371,26 @@ pub fn run() {
                     }
                 }
 
-                let (folder_priorities, pending_share_states, pending_file_priorities) = {
+                let (
+                    folder_priorities,
+                    pending_share_states,
+                    pending_file_priorities,
+                    pending_folder_allowlists,
+                ) = {
                     let state = startup_app.state::<AppState>();
                     let cfg = state.config.read().await;
                     (
                         cfg.settings.folder_priorities.clone(),
                         cfg.settings.pending_share_states.clone(),
                         cfg.settings.pending_file_priorities.clone(),
+                        cfg.settings.pending_folder_allowlists.clone(),
                     )
                 };
+                commands::sharing::apply_folder_allowlists(
+                    &mut all_discovered,
+                    &mut files_to_hash,
+                    &pending_folder_allowlists,
+                );
                 commands::sharing::apply_pending_intents(
                     &mut all_discovered,
                     &mut files_to_hash,
@@ -1935,6 +1946,7 @@ pub fn run() {
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
             commands::transfers::set_transfer_category,
+            commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
             commands::transfers::pause_all_transfers,
             commands::transfers::resume_all_transfers,

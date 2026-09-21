@@ -24,8 +24,11 @@ export async function addSharedFolder(): Promise<SharedFolderPick> {
  *  leave the backend, because a dropped path is authorization by virtue of the
  *  OS handing it to the native window, and routing it through the renderer
  *  would throw that away. Returns how many folders were shared. */
-export async function confirmDroppedFolders(token: number): Promise<number> {
-  return invoke('confirm_dropped_folders', { token });
+export async function confirmDroppedFolders(
+  token: number,
+  onlyDroppedFiles?: boolean,
+): Promise<number> {
+  return invoke('confirm_dropped_folders', { token, onlyDroppedFiles: onlyDroppedFiles ?? null });
 }
 
 /** Discard a dropped-file prompt the user declined. */

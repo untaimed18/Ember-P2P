@@ -713,14 +713,23 @@
       ? m.library_drop_many_confirm_title()
       : m.library_drop_parent_confirm_title()}
   message={dropPromptMessage}
+  confirmLabel={dropPrompt.reason === 'files' ? m.library_drop_share_files() : m.confirm_default_button()}
+  altLabel={dropPrompt.reason === 'files' ? m.library_drop_share_folder() : undefined}
   danger={dropPrompt.reason === 'broad'}
   isolateMessage
   onconfirm={() => {
     const token = dropPrompt.token;
-    void confirmDroppedFolders(token).catch((e) =>
+    const onlyDroppedFiles = dropPrompt.reason === 'files';
+    void confirmDroppedFolders(token, onlyDroppedFiles).catch((e) =>
       toastError(translateError(e, m.error_operation_failed())),
     );
   }}
+  onalt={dropPrompt.reason === 'files' ? () => {
+    const token = dropPrompt.token;
+    void confirmDroppedFolders(token, false).catch((e) =>
+      toastError(translateError(e, m.error_operation_failed())),
+    );
+  } : undefined}
   oncancel={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
   ondismiss={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
 />

@@ -36,6 +36,9 @@ pub struct PendingDeepLink {
 pub struct PendingFolderDrop {
     pub token: u64,
     pub folders: Vec<String>,
+    /// Dropped files, kept so "share only these files" can allowlist them.
+    /// Empty when the prompt is about whole folders (bulk / broad).
+    pub files: Vec<String>,
 }
 
 /// Live shared-folder list visible to the upload server's security check.

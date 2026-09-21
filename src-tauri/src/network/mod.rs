@@ -12755,6 +12755,15 @@ pub enum NetworkCommand {
         transfer_id: String,
         tx: oneshot::Sender<crate::types::DownloadFileDetails>,
     },
+    /// Change the display name of a download in flight. The `.part` is named
+    /// by transfer id, so this is metadata: pending-download state, the live
+    /// part tracker, and the `.part.met` sidecar. Completion reads the tracker
+    /// name when it moves the file into Downloads.
+    RenameDownload {
+        transfer_id: String,
+        file_name: String,
+        tx: oneshot::Sender<()>,
+    },
     /// Snapshot of every persistent SecIdent credit record. Backs the
     /// "Known Clients" tab — this is the lifetime view from clients.met,
     /// independent of which peers are currently connected.

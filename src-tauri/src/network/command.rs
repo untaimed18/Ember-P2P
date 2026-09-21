@@ -3489,6 +3489,34 @@ async fn handle_command_inner(
             let details = download_file_details(state, &transfer_id).await;
             let _ = tx.send(details);
         }
+        NetworkCommand::RenameDownload {
+            transfer_id,
+            file_name,
+            tx,
+        } => {
+            if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                pd.file_name = file_name.clone();
+            }
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(control) = mgr.get_control(&transfer_id) {
+                    control.set_pending_rename(&file_name);
+                }
+            }
+            let tracker = state.tracker_registry.lock().get(&transfer_id).cloned();
+            if let Some(tracker) = tracker {
+                let name = file_name.clone();
+                tokio::spawn(async move {
+                    let snap = {
+                        let mut t = tracker.write().await;
+                        t.set_file_name(&name);
+                        t.snapshot_for_save()
+                    };
+                    ed2k::part_tracker::save_snapshot_async(snap).await;
+                });
+            }
+            let _ = tx.send(());
+        }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
             let snap = upload_queue_snapshot(
                 upload_queue,

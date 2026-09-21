@@ -1709,6 +1709,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_download_name_uses_tracker_then_fallback() {
+        assert_eq!(
+            completed_download_name("renamed.bin", "original.bin"),
+            "renamed.bin"
+        );
+        assert_eq!(completed_download_name("", "original.bin"), "original.bin");
+        assert_eq!(
+            completed_download_name("../evil.txt", "original.bin"),
+            "evil.txt",
+            "completion must still sanitize a renamed display name"
+        );
+    }
+
     fn build_sending_part_32(hash: [u8; 16], start: u32, end: u32, data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(24 + data.len());
         buf.extend_from_slice(&hash);
@@ -4414,9 +4428,7 @@ impl Ed2kDownload {
             .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
         };
 
-        let safe_name = crate::security::sanitize_filename(&self.file_name);
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
-        let final_path = completed_dir.join(&safe_name);
 
         let file_size = self.file_size;
         let load_path = part_path.clone();
@@ -4449,6 +4461,7 @@ impl Ed2kDownload {
 
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
+        apply_control_rename(&self.control, &mut tracker);
         if !part_hashes.is_empty() {
             tracker.set_part_hashes(part_hashes.clone());
         } else {
@@ -6207,6 +6220,11 @@ impl Ed2kDownload {
         // files that have no per-part hashset, and acts as a belt-and-braces
         // reset for multi-part files).
         tracker.mark_file_hash_verified();
+        apply_control_rename(&self.control, &mut tracker);
+        let final_path = completed_dir.join(completed_download_name(
+            tracker.file_name(),
+            &self.file_name,
+        ));
         {
             let pp = part_path.clone();
             let fp = final_path.clone();
@@ -6296,6 +6314,29 @@ fn outstanding_requests_for_speed_with_remaining(
     }
     // Convert block count to packet count (3 blocks per packet), min 1
     ((blocks + 2) / 3).max(1)
+}
+
+/// Display name used when a finished `.part` is moved into Downloads.
+///
+/// The `.part` itself is named by transfer id, so a rename while downloading
+/// is metadata: the live tracker holds the current name, and this is what
+/// completion must read. An empty tracker name (a tracker that never got
+/// `set_file_name`) falls back to the name the download task started with.
+pub(super) fn completed_download_name(tracker_name: &str, fallback: &str) -> String {
+    crate::security::sanitize_filename(if tracker_name.is_empty() {
+        fallback
+    } else {
+        tracker_name
+    })
+}
+
+pub(super) fn apply_control_rename(
+    control: &crate::sharing::manager::TransferControl,
+    tracker: &mut super::part_tracker::PartTracker,
+) {
+    if let Some(name) = control.pending_rename() {
+        tracker.set_file_name(&name);
+    }
 }
 
 /// Writes an empty `.part`, verifies ed2k hash ([`super::hash::empty_ed2k_file_md4`]), moves to Downloads.

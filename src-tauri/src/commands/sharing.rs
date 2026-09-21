@@ -2153,6 +2153,47 @@ fn apply_folder_defaults_to_new_files(
     }
 }
 
+/// Unshare newly hashed files that sit in a folder the user shared by dropping
+/// only some of its contents. Already-hashed files keep known.met; explicit
+/// pending share intents applied after this still win.
+pub(crate) fn apply_folder_allowlists(
+    discovered: &mut [FileInfo],
+    files_to_hash: &mut [FileInfo],
+    allowlists: &std::collections::HashMap<String, Vec<String>>,
+) {
+    if allowlists.is_empty() || files_to_hash.is_empty() {
+        return;
+    }
+    let lists: Vec<(String, HashSet<String>)> = allowlists
+        .iter()
+        .map(|(folder, files)| (folder.clone(), files.iter().cloned().collect::<HashSet<_>>()))
+        .collect();
+    let pending_paths = files_to_hash
+        .iter()
+        .map(|file| crate::search::index::normalize_path_key(&file.path))
+        .collect::<HashSet<_>>();
+    let apply = |file: &mut FileInfo| {
+        let Some((_, allowed)) = lists
+            .iter()
+            .filter(|(folder, _)| crate::security::path_matches_dir(&file.path, folder))
+            .max_by_key(|(folder, _)| folder.len())
+        else {
+            return;
+        };
+        let key = crate::search::index::normalize_path_key(&file.path);
+        file.shared = allowed.contains(&key);
+    };
+    for file in discovered
+        .iter_mut()
+        .filter(|file| pending_paths.contains(&crate::search::index::normalize_path_key(&file.path)))
+    {
+        apply(file);
+    }
+    for file in files_to_hash {
+        apply(file);
+    }
+}
+
 pub(crate) fn apply_pending_intents(
     discovered: &mut [FileInfo],
     files_to_hash: &mut [FileInfo],
@@ -2239,6 +2280,52 @@ async fn persist_pending_intents(
     if !share_updates.is_empty() || !priority_updates.is_empty() {
         settings.settings_revision = settings.settings_revision.saturating_add(1);
     }
+    let save_data = {
+        let config = state.config.read().await;
+        config
+            .prepare_save_settings(&settings)
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    state.config.write().await.settings = settings;
+    Ok(())
+}
+
+async fn persist_folder_allowlists(
+    state: &AppState,
+    updates: &[(String, Vec<String>)],
+    removals: &[String],
+) -> Result<(), String> {
+    if updates.is_empty() && removals.is_empty() {
+        return Ok(());
+    }
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let mut settings = {
+        let config = state.config.read().await;
+        config.settings.clone()
+    };
+    for (folder, files) in updates {
+        let folder_key = crate::search::index::normalize_path_key(folder);
+        let file_keys = files
+            .iter()
+            .map(|path| crate::search::index::normalize_path_key(path))
+            .collect::<Vec<_>>();
+        settings
+            .pending_folder_allowlists
+            .insert(folder_key, file_keys);
+    }
+    for folder in removals {
+        settings
+            .pending_folder_allowlists
+            .remove(&crate::search::index::normalize_path_key(folder));
+    }
+    settings.settings_revision = settings.settings_revision.saturating_add(1);
     let save_data = {
         let config = state.config.read().await;
         config
@@ -2678,15 +2765,26 @@ pub async fn add_shared_folder(
             needs_hashing: mut files_to_hash,
             needs_top_up,
         } = resolve_from_known(&mut discovered, &known_list);
-        let (folder_priorities, pending_share_states, pending_file_priorities) = {
+        let (
+            folder_priorities,
+            pending_share_states,
+            pending_file_priorities,
+            pending_folder_allowlists,
+        ) = {
             let cfg = config.read().await;
             (
                 cfg.settings.folder_priorities.clone(),
                 cfg.settings.pending_share_states.clone(),
                 cfg.settings.pending_file_priorities.clone(),
+                cfg.settings.pending_folder_allowlists.clone(),
             )
         };
         apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
+        apply_folder_allowlists(
+            &mut discovered,
+            &mut files_to_hash,
+            &pending_folder_allowlists,
+        );
         apply_pending_intents(
             &mut discovered,
             &mut files_to_hash,
@@ -3191,6 +3289,7 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
         let mut folders: Vec<String> = Vec::new();
         let mut broad: Vec<String> = Vec::new();
         let mut parents: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
         for path in paths {
             if path.is_dir() {
                 // Compare canonically, or a drop of `C:\Users\you\..\you` walks
@@ -3206,19 +3305,20 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
                     folders.push(path.to_string_lossy().into_owned());
                 }
             } else if path.is_file() {
+                files.push(path.to_string_lossy().into_owned());
                 if let Some(parent) = path.parent() {
                     parents.push(parent.to_string_lossy().into_owned());
                 }
             }
         }
-        for list in [&mut folders, &mut broad, &mut parents] {
+        for list in [&mut folders, &mut broad, &mut parents, &mut files] {
             list.sort();
             list.dedup();
         }
-        (folders, broad, parents)
+        (folders, broad, parents, files)
     })
     .await;
-    let Ok((folders, broad, parents)) = sorted else {
+    let Ok((folders, broad, parents, files)) = sorted else {
         return;
     };
 
@@ -3283,7 +3383,7 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
     if confirm.is_empty() {
         return;
     }
-    queue_drop_confirmation(&app, &state, confirm, reason).await;
+    queue_drop_confirmation(&app, &state, confirm, files, reason).await;
 }
 
 /// Park folders a drop cannot honour outright and ask the user about them.
@@ -3297,6 +3397,7 @@ async fn queue_drop_confirmation(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     folders: Vec<String>,
+    files: Vec<String>,
     reason: &'static str,
 ) {
     let token = rand::random::<u64>();
@@ -3309,11 +3410,16 @@ async fn queue_drop_confirmation(
                 .unwrap_or_else(|| p.clone())
         })
         .collect();
+    let kept_files = if reason == "files" { files } else { Vec::new() };
     {
         let mut pending = state.pending_folder_drop.lock().await;
         // The reason rides on the event only: it decides the wording, and the
         // answer is the same set of folders whatever prompted the question.
-        *pending = Some(crate::app_state::PendingFolderDrop { token, folders });
+        *pending = Some(crate::app_state::PendingFolderDrop {
+            token,
+            folders,
+            files: kept_files,
+        });
     }
     let _ = app.emit(
         "shared-folder-drop-pending",
@@ -3329,26 +3435,93 @@ pub async fn confirm_dropped_folders(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     token: u64,
+    only_dropped_files: Option<bool>,
 ) -> Result<usize, String> {
-    let folders = {
+    let pending = {
         let mut pending = state.pending_folder_drop.lock().await;
         match pending.as_ref() {
             // Taken, not peeked: one answer per prompt, so a replayed
             // confirmation cannot re-share after the user removed the folder.
-            Some(p) if p.token == token => pending.take().map(|p| p.folders).unwrap_or_default(),
+            Some(p) if p.token == token => pending.take(),
             _ => return Ok(0),
         }
     };
+    let Some(pending) = pending else {
+        return Ok(0);
+    };
+    let folders = pending.folders;
+    let files = pending.files;
+    let only_files = only_dropped_files == Some(true) && !files.is_empty();
+    // Folders this call wrote an allowlist for, so one that then fails to be
+    // shared can have its entry taken back out again. Pruning on folder
+    // removal would never reach it: the folder was never added.
+    let mut allowlisted: Vec<String> = Vec::new();
+    if only_files {
+        let shared = {
+            let config = state.config.read().await;
+            config.settings.shared_folders.clone()
+        };
+        let mut updates: Vec<(String, Vec<String>)> = Vec::new();
+        for folder in &folders {
+            if shared
+                .iter()
+                .any(|existing| paths_equal_ignore_case(existing, folder))
+            {
+                continue;
+            }
+            let in_folder: Vec<String> = files
+                .iter()
+                .filter(|file| crate::security::path_matches_dir(file, folder))
+                .cloned()
+                .collect();
+            if in_folder.is_empty() {
+                tracing::warn!("No dropped files matched folder {folder}; sharing the whole folder");
+                continue;
+            }
+            allowlisted.push(folder.clone());
+            updates.push((folder.clone(), in_folder));
+        }
+        persist_folder_allowlists(&state, &updates, &[]).await?;
+    }
     let mut added = 0usize;
     let mut failed = 0usize;
+    let mut orphaned: Vec<String> = Vec::new();
     for folder in folders {
         match add_shared_folder(app.clone(), state.clone(), folder.clone()).await {
             // See the folder-drop path: an already-shared folder is a success.
-            Ok(_) => added += 1,
+            Ok(FolderAddOutcome::Added) => added += 1,
+            Ok(FolderAddOutcome::AlreadyShared) => {
+                added += 1;
+                if only_files {
+                    let in_folder: Vec<String> = files
+                        .iter()
+                        .filter(|file| crate::security::path_matches_dir(file, &folder))
+                        .cloned()
+                        .collect();
+                    if !in_folder.is_empty() {
+                        if let Err(error) = batch_share(app.clone(), state.clone(), in_folder).await
+                        {
+                            tracing::warn!(
+                                "Dropped files in already-shared folder {folder} were not shared: {error}"
+                            );
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 failed += 1;
+                if allowlisted.contains(&folder) {
+                    orphaned.push(folder.clone());
+                }
                 tracing::warn!("Dropped file's folder {folder} was not shared: {error}");
             }
+        }
+    }
+    if !orphaned.is_empty() {
+        if let Err(error) = persist_folder_allowlists(&state, &[], &orphaned).await {
+            tracing::warn!(
+                "Allowlists for folders that could not be shared were left behind: {error}"
+            );
         }
     }
     emit_drop_result(&app, added, failed);
@@ -4297,15 +4470,26 @@ async fn reload_shared_files_page(
             needs_hashing: mut files_to_hash,
             needs_top_up,
         } = resolve_from_known(&mut discovered, &known_list);
-        let (folder_priorities, pending_share_states, pending_file_priorities) = {
+        let (
+            folder_priorities,
+            pending_share_states,
+            pending_file_priorities,
+            pending_folder_allowlists,
+        ) = {
             let cfg = config.read().await;
             (
                 cfg.settings.folder_priorities.clone(),
                 cfg.settings.pending_share_states.clone(),
                 cfg.settings.pending_file_priorities.clone(),
+                cfg.settings.pending_folder_allowlists.clone(),
             )
         };
         apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
+        apply_folder_allowlists(
+            &mut discovered,
+            &mut files_to_hash,
+            &pending_folder_allowlists,
+        );
         apply_pending_intents(
             &mut discovered,
             &mut files_to_hash,
@@ -5428,6 +5612,45 @@ mod tests {
         let work = resolve_from_known(&mut discovered, &known);
         assert_eq!(work.needs_hashing.len(), 1);
         assert!(work.needs_top_up.is_empty());
+    }
+
+    #[test]
+    fn folder_allowlists_unshare_new_files_not_in_the_drop() {
+        let keep = "C:/share/keep.bin";
+        let skip = "C:/share/skip.bin";
+        let other = "C:/other/file.bin";
+        let mut discovered = vec![
+            indexed_file(keep, ""),
+            indexed_file(skip, ""),
+            indexed_file(other, ""),
+        ];
+        let mut files_to_hash = discovered.clone();
+        let allowlists = std::collections::HashMap::from([(
+            crate::search::index::normalize_path_key("C:/share"),
+            vec![crate::search::index::normalize_path_key(keep)],
+        )]);
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &allowlists);
+        assert!(discovered[0].shared);
+        assert!(!discovered[1].shared);
+        assert!(
+            discovered[2].shared,
+            "files outside an allowlisted folder keep the discovery default"
+        );
+        assert_eq!(files_to_hash[0].shared, discovered[0].shared);
+        assert_eq!(files_to_hash[1].shared, discovered[1].shared);
+
+        let pending =
+            std::collections::HashMap::from([(crate::search::index::normalize_path_key(skip), true)]);
+        apply_pending_intents(
+            &mut discovered,
+            &mut files_to_hash,
+            &pending,
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            discovered[1].shared,
+            "an explicit share intent must still win over the allowlist"
+        );
     }
 
     /// A multi-part file with no AICH root is a one-time repair like the

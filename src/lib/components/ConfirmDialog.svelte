@@ -28,6 +28,11 @@
     // Reject button press (e.g. deep-link confirmations that must not
     // durable-ack on Escape).
     ondismiss,
+    // Optional third action, between Cancel and Confirm. Used when a prompt
+    // has two real answers (share only the dropped files vs the whole folder)
+    // rather than a yes/no.
+    altLabel,
+    onalt,
   }: {
     open?: boolean;
     title?: string;
@@ -40,6 +45,8 @@
     onconfirm?: () => void;
     oncancel?: () => void;
     ondismiss?: () => void;
+    altLabel?: string;
+    onalt?: () => void;
   } = $props();
 
   let confirmBtn: HTMLButtonElement | undefined = $state(undefined);
@@ -74,6 +81,13 @@
     if (actionTaken) return;
     actionTaken = true;
     oncancel?.();
+    open = false;
+  }
+
+  function handleAlt() {
+    if (actionTaken || !onalt) return;
+    actionTaken = true;
+    onalt();
     open = false;
   }
 
@@ -171,6 +185,9 @@
       <div class="dialog-actions">
         {#if !alert}
           <button bind:this={cancelBtn} class="ghost" onclick={handleCancel} disabled={actionTaken}>{cancelLabel}</button>
+        {/if}
+        {#if altLabel && onalt}
+          <button type="button" class="ghost" onclick={handleAlt} disabled={actionTaken}>{altLabel}</button>
         {/if}
         <button bind:this={confirmBtn} class={danger ? 'danger' : ''} onclick={handleConfirm} disabled={actionTaken}>{confirmLabel}</button>
       </div>

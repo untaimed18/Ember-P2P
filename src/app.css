@@ -1303,6 +1303,7 @@ button.ctx-backdrop:active {
 .confirm-dialog .dialog-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
 }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

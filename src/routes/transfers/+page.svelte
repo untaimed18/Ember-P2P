@@ -6,7 +6,7 @@
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
+    clearCompleted, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -552,6 +552,17 @@
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
   let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
+  let renameDialog: {
+    open: boolean;
+    id: string;
+    value: string;
+    error: string | null;
+    busy: boolean;
+  } = $state({ open: false, id: '', value: '', error: null, busy: false });
+  let renameInputEl: HTMLInputElement | undefined = $state();
+  let renameModalEl: HTMLDivElement | undefined = $state();
+  let renameOverlayEl: HTMLDivElement | undefined = $state();
+  let renameReturnFocusEl: HTMLElement | null = null;
   let recoveringIds: Set<string> = $state(new Set());
   // L14: persist the Completed-section collapsed state so it survives
   // navigation. Falls back to expanded on first load or invalid storage.
@@ -2373,6 +2384,19 @@
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
   }
 
+  // Not while the file is being hashed or moved: completion has already read
+  // the name it will write, so a rename accepted there would leave the row
+  // and the file on disk disagreeing. The backend refuses the same window.
+  function canRename(t: Transfer): boolean {
+    return (
+      t.direction === 'download'
+      && t.status !== 'completed'
+      && t.status !== 'verifying'
+      && t.status !== 'completing'
+      && t.status !== 'hashing'
+    );
+  }
+
   // Preview is only meaningful for downloads whose first part is downloaded +
   // MD4-verified and that are a previewable media type. The backend reports
   // this as `preview_ready`; we mirror it here to grey out the action until a
@@ -2380,6 +2404,66 @@
   function canPreview(t: Transfer): boolean {
     return t.direction === 'download' && t.preview_ready === true;
   }
+
+  function openRename(t: Transfer) {
+    if (!canRename(t)) return;
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    renameReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    renameDialog = {
+      open: true,
+      id: t.id,
+      value: t.file_name,
+      error: null,
+      busy: false,
+    };
+  }
+
+  function closeRename() {
+    if (renameDialog.busy) return;
+    renameDialog = { open: false, id: '', value: '', error: null, busy: false };
+  }
+
+  async function submitRename() {
+    if (!renameDialog.open || renameDialog.busy) return;
+    const id = renameDialog.id;
+    const value = renameDialog.value;
+    renameDialog.busy = true;
+    renameDialog.error = null;
+    try {
+      const name = await renameTransfer(id, value);
+      transfers.update((list) =>
+        list.map((t) => (t.id === id ? { ...t, file_name: name } : t)),
+      );
+      renameDialog = { open: false, id: '', value: '', error: null, busy: false };
+    } catch (e: unknown) {
+      renameDialog.busy = false;
+      renameDialog.error = toErrorMsg(e);
+    }
+  }
+
+  // Focus the field on open and hand focus back to whatever opened the dialog
+  // — the row, the context menu's anchor, or the File Details name button.
+  $effect(() => {
+    if (!renameDialog.open) return;
+    const raf = requestAnimationFrame(() => {
+      renameInputEl?.focus();
+      renameInputEl?.select();
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = renameReturnFocusEl;
+      renameReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  $effect(() => {
+    if (!renameDialog.open || !renameOverlayEl) return;
+    return inertBackground(renameOverlayEl);
+  });
 
   const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
   function isArchive(t: Transfer): boolean {
@@ -2582,10 +2666,12 @@
 
   function handleFileDetailsKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
-      // Handled here so the page-level Escape does not also fire; that one
-      // stays as the fallback for when focus is somehow outside.
       e.preventDefault();
       e.stopPropagation();
+      if (renameDialog.open) {
+        closeRename();
+        return;
+      }
       closeFileDetails();
       return;
     }
@@ -2712,6 +2798,7 @@
         case 'remove': markDownloadRemoved(t.id); await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
+        case 'rename': openRename(t); return;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
         case 'find_sources': {
           try {
@@ -4059,7 +4146,8 @@
     // The dialog handles its own Escape and stops it there; this is the
     // fallback for when focus has somehow ended up outside it, and it comes
     // first because the dialog sits above everything else.
-    if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
+    if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
+    else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
     else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
@@ -4088,7 +4176,16 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  if (e.key === 'F2') {
+    const t = [...selectedBatchTransfers].reverse().find((row) => canRename(row))
+      ?? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null);
+    if (t) {
+      e.preventDefault();
+      openRename(t);
+    }
+    return;
+  }
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -5505,6 +5602,9 @@
       {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
+      {#if canRename(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button
@@ -5610,6 +5710,9 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
+      {#if canRename(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button
@@ -5856,7 +5959,18 @@
       </div>
       <div class="modal-body">
         <div class="dl-details-hero">
-          <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          {#if canRename(t)}
+            <button
+              type="button"
+              class="dl-details-name-btn"
+              title={m.transfers_file_details_rename()}
+              onclick={() => openRename(t)}
+            >
+              <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+            </button>
+          {:else}
+            <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          {/if}
           <span class="dl-details-sub">{formatSize(t.total_size)}</span>
         </div>
 
@@ -5962,6 +6076,65 @@
   </div>
 {/if}
 
+{#if renameDialog.open}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay rename-overlay"
+    bind:this={renameOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-rename-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeRename(); }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRename();
+        return;
+      }
+      trapTabKey(e, renameModalEl);
+    }}
+  >
+    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+      <div class="modal-header">
+        <span id="dl-rename-title" class="modal-title">{m.transfers_rename_title()}</span>
+        <button
+          type="button"
+          class="modal-close"
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          disabled={renameDialog.busy}
+          onclick={closeRename}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <form
+        class="modal-body"
+        onsubmit={(e) => { e.preventDefault(); void submitRename(); }}
+      >
+        <label class="rename-label" for="dl-rename-input">{m.transfers_rename_label()}</label>
+        <input
+          id="dl-rename-input"
+          class="rename-input"
+          bind:this={renameInputEl}
+          bind:value={renameDialog.value}
+          disabled={renameDialog.busy}
+          spellcheck="false"
+        />
+        {#if renameDialog.error}
+          <p class="dl-details-note error-msg">{renameDialog.error}</p>
+        {/if}
+        <div class="modal-footer rename-actions">
+          <button type="button" class="ghost" disabled={renameDialog.busy} onclick={closeRename}>{m.common_cancel()}</button>
+          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{m.transfers_rename_save()}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 <style>
   /* --- File Details dialog ---
      Same shell as the Search page's details modal, so the two read as the same
@@ -6063,6 +6236,60 @@
     font-weight: 600;
     font-size: 13px;
     overflow-wrap: anywhere;
+  }
+
+  .dl-details-name-btn {
+    display: block;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    cursor: pointer;
+  }
+
+  .dl-details-name-btn:hover .dl-details-name,
+  .dl-details-name-btn:focus-visible .dl-details-name {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .rename-overlay {
+    z-index: 10001;
+  }
+
+  .rename-modal {
+    width: min(420px, 100%);
+  }
+
+  .rename-label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+  }
+
+  .rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font: inherit;
+  }
+
+  .rename-actions {
+    margin-top: 14px;
+    padding: 0;
+    border: 0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
   }
 
   .dl-details-sub,

@@ -167,6 +167,19 @@
     if (!createCollectionOpen || !createCollectionOverlay) return;
     return inertBackground(createCollectionOverlay);
   });
+  let addFolderOpen = $state(false);
+  let addFolderOverlay: HTMLDivElement | undefined = $state(undefined);
+  let addFolderModal: HTMLDivElement | undefined = $state(undefined);
+  $effect(() => {
+    if (!addFolderOpen || !addFolderOverlay) return;
+    return inertBackground(addFolderOverlay);
+  });
+  let addFolderBrowseBtn: HTMLButtonElement | undefined = $state(undefined);
+  $effect(() => {
+    if (!addFolderOpen) return;
+    const raf = requestAnimationFrame(() => addFolderBrowseBtn?.focus());
+    return () => cancelAnimationFrame(raf);
+  });
   let newCollName = $state('');
   let newCollAuthor = $state('');
   let selectedFileHashes: Set<string> = $state(new Set());
@@ -909,7 +922,7 @@
     }
   }
 
-  async function handleAddFolder() {
+  async function pickAndAddFolders() {
     error = null;
     try {
       const selected = await addSharedFolder();
@@ -942,6 +955,19 @@
         error = toErr(e);
       }
     }
+  }
+
+  async function handleAddFolder() {
+    if (folders.length === 0) {
+      await pickAndAddFolders();
+      return;
+    }
+    addFolderOpen = true;
+  }
+
+  async function browseFromAddFolderModal() {
+    addFolderOpen = false;
+    await pickAndAddFolders();
   }
 
   async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
@@ -2056,7 +2082,7 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -3011,6 +3037,55 @@
         {/if}
       </div>
     {/if}
+  </div>
+{/if}
+
+{#if addFolderOpen}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={addFolderOverlay}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="add-folder-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) addFolderOpen = false; }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        addFolderOpen = false;
+        return;
+      }
+      trapTabKey(e, addFolderModal);
+    }}
+  >
+    <div class="modal-content add-folder-modal" bind:this={addFolderModal}>
+      <div class="modal-header">
+        <span id="add-folder-title" class="modal-title">{m.library_add_folder_title()}</span>
+        <button type="button" class="modal-close" onclick={() => (addFolderOpen = false)} aria-label={m.common_close()}><IconX size={15} /></button>
+      </div>
+      <div class="modal-body">
+        <p class="add-folder-hint">{m.library_add_folder_hint()}</p>
+        <p class="add-folder-current-label">{m.library_add_folder_current()}</p>
+        {#if folders.length === 0}
+          <p class="add-folder-none">{m.library_add_folder_none()}</p>
+        {:else}
+          <ul class="add-folder-list">
+            {#each folders as folder}
+              <li>
+                <span class="add-folder-name"><bdi dir="auto">{folderDisplayName(folder)}</bdi></span>
+                <span class="add-folder-path" title={folder}><bdi dir="auto">{folder}</bdi></span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="ghost" onclick={() => (addFolderOpen = false)}>{m.common_cancel()}</button>
+        <button type="button" bind:this={addFolderBrowseBtn} onclick={() => void browseFromAddFolderModal()}>{m.library_add_folder_browse()}</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -5482,6 +5557,51 @@
   .create-coll-modal {
     width: min(520px, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
+  }
+  .add-folder-modal {
+    width: min(480px, calc(100vw - 2rem));
+    max-width: calc(100vw - 2rem);
+  }
+  .add-folder-hint,
+  .add-folder-none {
+    margin: 0 0 12px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .add-folder-current-label {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .add-folder-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 240px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .add-folder-list li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .add-folder-list li:last-child {
+    border-bottom: 0;
+  }
+  .add-folder-name {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .add-folder-path {
+    font-size: 11px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .modal-header {
     display: flex;

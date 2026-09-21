@@ -2009,6 +2009,111 @@ pub async fn set_transfer_category(
 }
 
 #[tauri::command]
+pub async fn rename_transfer(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return Err(coded(
+            "transfers_invalid_file_name",
+            "Enter a valid file name",
+        ));
+    }
+    let sanitized = crate::security::sanitize_filename(trimmed);
+    if sanitized.is_empty() || (sanitized == "unnamed_file" && trimmed != "unnamed_file") {
+        return Err(coded(
+            "transfers_invalid_file_name",
+            "Enter a valid file name",
+        ));
+    }
+
+    let previous = {
+        let manager = state.transfer_manager.read().await;
+        let Some(transfer) = manager.get_transfer(&transfer_id) else {
+            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        };
+        // Refused once the file is being hashed or moved as well as after it
+        // has finished: the completion path has already read the name it will
+        // move under, so a rename accepted inside that window would leave the
+        // row and the file on disk disagreeing.
+        if transfer.direction != TransferDirection::Download
+            || matches!(
+                transfer.status,
+                TransferStatus::Verifying
+                    | TransferStatus::Completing
+                    | TransferStatus::Hashing
+                    | TransferStatus::Completed
+            )
+        {
+            return Err(coded(
+                "transfers_cannot_rename",
+                "This download cannot be renamed",
+            ));
+        }
+        transfer.file_name.clone()
+    };
+
+    // Persisted first, because a failure here has to leave every copy of the
+    // name untouched — the rename simply did not happen.
+    let db = state.db.clone();
+    let tid = transfer_id.clone();
+    let name = sanitized.clone();
+    tokio::task::spawn_blocking(move || db.update_transfer_file_name(&tid, &name))
+        .await
+        .map_err(|e| coded_ctx("transfers_rename_task_failed", "Rename failed", e))?
+        .map_err(|e| coded_ctx("transfers_rename_persist_failed", "Rename failed", e))?;
+
+    // The network task sets the control flag that completion reads, so the
+    // rename reaches the file on disk only once the hand-over has actually
+    // happened. Setting it here would let a rename we then reported as failed
+    // still name the finished file.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handed_over = match state.network_tx.try_send(NetworkCommand::RenameDownload {
+        transfer_id: transfer_id.clone(),
+        file_name: sanitized.clone(),
+        tx,
+    }) {
+        Ok(()) => await_reply(rx, "transfers_rename_failed", "Failed to rename download").await,
+        Err(e) => Err(coded_ctx("network_busy", "Network busy", e)),
+    };
+    if let Err(error) = handed_over {
+        restore_transfer_file_name(&state, &transfer_id, &previous).await;
+        return Err(error);
+    }
+
+    {
+        let mut manager = state.transfer_manager.write().await;
+        if !manager.set_file_name(&transfer_id, &sanitized) {
+            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        }
+    }
+
+    Ok(sanitized)
+}
+
+/// Put the persisted name back when a rename could not be handed to the
+/// network task. Best effort: the command already reports the rename as
+/// failed, so a failure here costs only that the old name comes back on the
+/// next restart rather than immediately.
+async fn restore_transfer_file_name(state: &AppState, transfer_id: &str, previous: &str) {
+    let db = state.db.clone();
+    let tid = transfer_id.to_string();
+    let name = previous.to_string();
+    let restored = tokio::task::spawn_blocking(move || db.update_transfer_file_name(&tid, &name))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result.map_err(|e| e.to_string()));
+    if let Err(error) = restored {
+        tracing::warn!(
+            "Rename of transfer {} was not handed over and its persisted name was not rolled back: {error}",
+            transfer_id_short(transfer_id)
+        );
+    }
+}
+
+#[tauri::command]
 pub async fn set_preview_priority(
     state: tauri::State<'_, AppState>,
     transfer_id: String,

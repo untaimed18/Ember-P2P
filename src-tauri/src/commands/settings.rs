@@ -103,6 +103,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "folder_priorities",
     "pending_share_states",
     "pending_file_priorities",
+    "pending_folder_allowlists",
     "shared_folder_scan_cursors",
     // Historical one-shot marker; the overlay is now always on, but the
     // renderer still must not clear it (it would re-run the migration).
@@ -613,6 +614,9 @@ fn prune_removed_shared_folder_state(
     settings
         .pending_file_priorities
         .retain(|path, _| !is_under_removed_root(path));
+    settings
+        .pending_folder_allowlists
+        .retain(|folder, _| !is_under_removed_root(folder));
     settings
         .shared_folder_scan_cursors
         .retain(|folder, _| !is_under_removed_root(folder));
@@ -3200,6 +3204,10 @@ mod tests {
         authoritative
             .pending_file_priorities
             .insert("/trusted/share/pending.bin".into(), "release".into());
+        authoritative.pending_folder_allowlists.insert(
+            "/trusted/share".into(),
+            vec!["/trusted/share/keep.bin".into()],
+        );
         authoritative
             .shared_folder_scan_cursors
             .insert("/trusted/share".into(), "cursor-7".into());
@@ -3228,6 +3236,10 @@ mod tests {
             serde_json::json!({"/renderer/injected/file": "high"}),
         );
         object.insert(
+            "pending_folder_allowlists".into(),
+            serde_json::json!({"/renderer/injected": ["/renderer/injected/file"]}),
+        );
+        object.insert(
             "shared_folder_scan_cursors".into(),
             serde_json::json!({"/renderer/injected": "stolen"}),
         );
@@ -3247,6 +3259,10 @@ mod tests {
         assert_eq!(
             merged.pending_file_priorities,
             authoritative.pending_file_priorities
+        );
+        assert_eq!(
+            merged.pending_folder_allowlists,
+            authoritative.pending_folder_allowlists
         );
         assert_eq!(
             merged.shared_folder_scan_cursors,

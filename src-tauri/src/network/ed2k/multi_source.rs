@@ -1874,6 +1874,7 @@ impl MultiSourceDownload {
         .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         pt.set_file_hash(self.file_hash);
         pt.set_file_name(&self.file_name);
+        super::transfer::apply_control_rename(&self.control, &mut pt);
         let tracker = Arc::new(RwLock::new(pt));
 
         if let Some(ref registry) = self.tracker_registry {
@@ -1900,6 +1901,7 @@ impl MultiSourceDownload {
                     *t = PartTracker::new_empty(self.file_size, &part_path);
                     t.set_file_hash(self.file_hash);
                     t.set_file_name(&self.file_name);
+                    super::transfer::apply_control_rename(&self.control, &mut t);
                     t.snapshot_for_save()
                 };
                 spawn_save_snapshot(snap).await;
@@ -4529,11 +4531,12 @@ impl MultiSourceDownload {
                 // Mark every part verified (covers < PARTSIZE single-part
                 // files that never set per-part flags, and acts as a
                 // belt-and-braces reset for multi-part files).
-                {
+                let safe_name = {
                     let mut t = tracker.write().await;
                     t.mark_file_hash_verified();
-                }
-                let safe_name = crate::security::sanitize_filename(&self.file_name);
+                    super::transfer::apply_control_rename(&self.control, &mut t);
+                    super::transfer::completed_download_name(t.file_name(), &self.file_name)
+                };
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
                 let fp = final_path.clone();

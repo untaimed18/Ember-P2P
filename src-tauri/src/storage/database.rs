@@ -3319,6 +3319,19 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_transfer_file_name(
+        &self,
+        transfer_id: &str,
+        file_name: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE transfers SET file_name = ?1 WHERE id = ?2",
+            params![file_name, transfer_id],
+        )?;
+        Ok(())
+    }
+
     pub fn load_credits(&self) -> anyhow::Result<Vec<CreditRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(

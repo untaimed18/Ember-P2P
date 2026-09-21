@@ -1659,6 +1659,12 @@ pub struct AppSettings {
     /// separately from folder defaults because an explicit action must win.
     #[serde(default)]
     pub pending_file_priorities: std::collections::HashMap<String, String>,
+    /// Folders shared by dropping specific files: later newly-seen files in
+    /// that folder stay unshared until chosen. Keys are normalized folder
+    /// paths; values are the normalized file paths that should be shared.
+    /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
+    #[serde(default)]
+    pub pending_folder_allowlists: std::collections::HashMap<String, Vec<String>>,
     /// Resume keys for bounded shared-folder discovery pages. Each normalized
     /// folder path advances only after its page has been committed, so folders
     /// larger than the in-memory scan budget are eventually indexed in full.
@@ -2212,6 +2218,7 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
+            pending_folder_allowlists: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,

@@ -440,6 +440,10 @@ impl PartTracker {
         self.file_name = name.to_string();
     }
 
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
     pub fn set_part_hashes(&mut self, hashes: Vec<[u8; 16]>) {
         self.part_hashes = hashes;
     }
