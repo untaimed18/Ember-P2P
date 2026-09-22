@@ -154,6 +154,7 @@
       title: () => m.shortcuts_section_chat(),
       shortcuts: [
         { keys: [modifierKey, '/'], label: () => m.shortcuts_toggle_chat() },
+        { keys: [modifierKey, 'K'], label: () => m.shortcuts_chat_switcher() },
         { keys: [modifierKey, 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
         { keys: [modifierKey, 'W'], label: () => m.shortcuts_chat_close_tab() },
         { keys: ['Esc'], label: () => m.shortcuts_chat_close_dock() },

@@ -1,32 +1,36 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { get } from 'svelte/store';
+import { unreadCounts } from './friends';
 import {
   activeChatTab,
   chatDockOpen,
   chatTabs,
   closeTab,
+  focusNextUnread,
   getDraft,
-  isRoomTab,
   openChat,
   retainChatTabs,
-  retainRoomTabs,
-  roomTabChannelId,
-  roomTabKey,
   setDraft,
 } from './chatTabs';
 
 const FRIEND = 'aa'.repeat(16);
+const OTHER = 'bb'.repeat(16);
+const THIRD = 'cc'.repeat(16);
 const ROOM_ID = '11'.repeat(16);
+/** A room draft key. Rooms are not dock conversations; this prefix exists here
+ *  only because `ChatConversation` parks a half-typed room line in the same
+ *  draft map. */
 const ROOM = `ch:${ROOM_ID}`;
-const OTHER_ROOM_ID = '22'.repeat(16);
 
 beforeEach(() => {
   chatTabs.set([]);
   activeChatTab.set(null);
   chatDockOpen.set(false);
+  unreadCounts.set(new Map());
   setDraft(FRIEND, '');
+  setDraft(OTHER, '');
+  setDraft(THIRD, '');
   setDraft(ROOM, '');
-  setDraft(roomTabKey(ROOM_ID), '');
 });
 
 describe('setDraft', () => {
@@ -57,55 +61,120 @@ describe('setDraft', () => {
   });
 });
 
-// A room tab's hash is its conversation key, so the two cannot drift — but
-// that also means every helper keyed on "is this a friend" has to say so.
-describe('room tabs', () => {
-  it('round-trips a channel id through its tab key', () => {
-    const key = roomTabKey(ROOM_ID.toUpperCase());
-    expect(isRoomTab(key)).toBe(true);
-    expect(roomTabChannelId(key)).toBe(ROOM_ID);
-    expect(isRoomTab(FRIEND)).toBe(false);
-    expect(roomTabChannelId(FRIEND)).toBeNull();
-  });
-
-  it('survives the friend-list reconcile', () => {
-    openChat(roomTabKey(ROOM_ID), 'Lobby');
+describe('retainChatTabs', () => {
+  it('drops tabs for identities that are no longer friends', () => {
     openChat(FRIEND, 'Ada');
+    openChat(OTHER, 'Grace');
 
-    // `retainChatTabs` is handed the friend list, which says nothing about
-    // rooms — filtering room tabs on it would close them all at startup.
     retainChatTabs([FRIEND]);
-    expect(get(chatTabs).map((t) => t.hash)).toEqual([roomTabKey(ROOM_ID), FRIEND]);
-
-    retainChatTabs([]);
-    expect(get(chatTabs).map((t) => t.hash)).toEqual([roomTabKey(ROOM_ID)]);
-  });
-
-  it('closes a tab for a room this device has left', () => {
-    openChat(roomTabKey(ROOM_ID), 'Lobby');
-    openChat(FRIEND, 'Ada');
-    setDraft(roomTabKey(ROOM_ID), 'half a sentence');
-
-    retainRoomTabs([OTHER_ROOM_ID]);
 
     expect(get(chatTabs).map((t) => t.hash)).toEqual([FRIEND]);
-    // The draft goes with it, or it would haunt the room on a later rejoin.
-    expect(getDraft(roomTabKey(ROOM_ID))).toBe('');
   });
 
-  it('leaves friend tabs alone when sweeping rooms', () => {
+  // The dock is for friends. A previous version let the Channels page pin a
+  // room here, so a `ch:` tab can still be sitting in localStorage on the first
+  // launch after the change — the friend-list sweep is what clears it, since a
+  // room hash can never appear in the friend list.
+  it('sweeps a room tab left over from an older version', () => {
+    openChat(ROOM, 'Lobby');
+    openChat(FRIEND, 'Ada');
+
+    retainChatTabs([FRIEND]);
+
+    expect(get(chatTabs).map((t) => t.hash)).toEqual([FRIEND]);
+  });
+
+  it('collapses the dock when nothing is left to show', () => {
+    openChat(FRIEND, 'Ada');
+    expect(get(chatDockOpen)).toBe(true);
+
+    retainChatTabs([]);
+
+    expect(get(chatTabs)).toEqual([]);
+    expect(get(activeChatTab)).toBeNull();
+    expect(get(chatDockOpen)).toBe(false);
+  });
+
+  it('moves the selection off a tab it closes', () => {
+    openChat(FRIEND, 'Ada');
+    openChat(OTHER, 'Grace');
+    expect(get(activeChatTab)).toBe(OTHER);
+
+    retainChatTabs([FRIEND]);
+
+    expect(get(activeChatTab)).toBe(FRIEND);
+  });
+
+  it('leaves an untouched list alone', () => {
     openChat(FRIEND, 'Ada');
     const before = get(chatTabs);
-    retainRoomTabs([]);
+
+    retainChatTabs([FRIEND, OTHER]);
+
     expect(get(chatTabs)).toBe(before);
   });
+});
 
-  it('moves the selection off a room tab it closes', () => {
+// The dock shows one conversation at a time, so the header's "unread elsewhere"
+// count has to be able to take you to the conversation it is counting.
+describe('focusNextUnread', () => {
+  it('goes to the one conversation with unread messages', () => {
     openChat(FRIEND, 'Ada');
-    openChat(roomTabKey(ROOM_ID), 'Lobby');
-    expect(get(activeChatTab)).toBe(roomTabKey(ROOM_ID));
+    openChat(OTHER, 'Grace');
+    activeChatTab.set(FRIEND);
+    unreadCounts.set(new Map([[OTHER, 2]]));
 
-    retainRoomTabs([]);
+    expect(focusNextUnread()).toBe(true);
+    expect(get(activeChatTab)).toBe(OTHER);
+  });
+
+  it('walks every unread conversation instead of sticking on the first', () => {
+    openChat(FRIEND, 'Ada');
+    openChat(OTHER, 'Grace');
+    openChat(THIRD, 'Alan');
+    activeChatTab.set(FRIEND);
+    unreadCounts.set(
+      new Map([
+        [OTHER, 1],
+        [THIRD, 1],
+      ]),
+    );
+
+    expect(focusNextUnread()).toBe(true);
+    expect(get(activeChatTab)).toBe(OTHER);
+    expect(focusNextUnread()).toBe(true);
+    expect(get(activeChatTab)).toBe(THIRD);
+    // And wraps, rather than reporting nothing left.
+    expect(focusNextUnread()).toBe(true);
+    expect(get(activeChatTab)).toBe(OTHER);
+  });
+
+  it('considers the first tab when nothing is active yet', () => {
+    openChat(FRIEND, 'Ada');
+    openChat(OTHER, 'Grace');
+    activeChatTab.set(null);
+    unreadCounts.set(new Map([[FRIEND, 3]]));
+
+    expect(focusNextUnread()).toBe(true);
     expect(get(activeChatTab)).toBe(FRIEND);
+  });
+
+  it('reports nothing to go to when everything is read', () => {
+    openChat(FRIEND, 'Ada');
+    activeChatTab.set(FRIEND);
+
+    expect(focusNextUnread()).toBe(false);
+    expect(get(activeChatTab)).toBe(FRIEND);
+  });
+
+  it('reveals the dock when it was closed', () => {
+    openChat(FRIEND, 'Ada');
+    openChat(OTHER, 'Grace');
+    activeChatTab.set(FRIEND);
+    unreadCounts.set(new Map([[OTHER, 1]]));
+    chatDockOpen.set(false);
+
+    expect(focusNextUnread()).toBe(true);
+    expect(get(chatDockOpen)).toBe(true);
   });
 });

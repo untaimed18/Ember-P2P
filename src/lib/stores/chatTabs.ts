@@ -26,32 +26,23 @@ import { unreadCounts } from '$lib/stores/friends';
  * looks the same as a clean launch.
  */
 export interface ChatTab {
-  /**
-   * Friend hash, or `ch:<channel id>` for a room.
-   *
-   * The same key the draft map uses, and the same key `ChatConversation`
-   * derives for a room — so a room tab's hash is already its conversation
-   * identity rather than a second thing to keep in step with it.
-   */
+  /** Friend hash. The dock holds friend conversations and nothing else. */
   hash: string;
   name: string;
 }
 
-/** Prefix marking a tab (and its draft) as a room rather than a friend. */
-export const ROOM_TAB_PREFIX = 'ch:';
-
-export function isRoomTab(hash: string): boolean {
-  return hash.startsWith(ROOM_TAB_PREFIX);
-}
-
-/** The channel id behind a room tab, or null for a friend tab. */
-export function roomTabChannelId(hash: string): string | null {
-  return isRoomTab(hash) ? hash.slice(ROOM_TAB_PREFIX.length) : null;
-}
-
-export function roomTabKey(channelId: string): string {
-  return `${ROOM_TAB_PREFIX}${channelId.toLowerCase()}`;
-}
+/**
+ * Draft-key namespace for a room, which is *not* a tab namespace.
+ *
+ * Rooms live on `/channels` and only there. The draft map below is still shared
+ * with them, because `ChatConversation` keeps a half-typed line across a
+ * navigation whether it is drawing a friend or a room, and it derives its own
+ * `ch:<channel id>` key for that. So this prefix marks the one thing about a
+ * room this store knows: a draft under it has no tab and never will, which is
+ * what {@link setDraft} needs to tell it apart from a friend draft whose tab
+ * has just closed.
+ */
+const CHANNEL_DRAFT_PREFIX = 'ch:';
 
 const STORAGE_KEY = 'ember.chatTabs.v1';
 const MAX_CHAT_TABS = 50;
@@ -177,7 +168,7 @@ export function setDraft(hash: string, text: string) {
   // rooms live on `/channels`, not in the dock. Gating those the same
   // way discarded every in-progress room line on leave. `closeTab`
   // cannot reopen a `ch:` key, so the resurrection race does not apply.
-  const isChannelDraft = hash.startsWith('ch:');
+  const isChannelDraft = hash.startsWith(CHANNEL_DRAFT_PREFIX);
   const tabOpen = get(chatTabs).some((t) => t.hash === hash);
   if (text && (isChannelDraft || tabOpen)) {
     chatDrafts.set(hash, text);
@@ -290,6 +281,33 @@ export function cycleTab(direction: 1 | -1) {
 }
 
 /**
+ * Activate the next open conversation that has unread messages.
+ *
+ * The dock shows one conversation at a time, so "you have 3 unread elsewhere"
+ * needs somewhere to go or it is only a reproach. Returns whether it found one.
+ *
+ * Starts *after* the active tab and wraps, so pressing it repeatedly walks
+ * every unread conversation rather than returning to the same one — and when
+ * nothing is active it starts at the first tab instead of skipping it.
+ */
+export function focusNextUnread(): boolean {
+  const tabs = get(chatTabs);
+  if (tabs.length === 0) return false;
+  const counts = get(unreadCounts);
+  const active = get(activeChatTab);
+  const activeIdx = tabs.findIndex((t) => t.hash === active);
+  for (let step = 1; step <= tabs.length; step++) {
+    const tab = tabs[(activeIdx + step + tabs.length) % tabs.length];
+    if ((counts.get(tab.hash) ?? 0) > 0) {
+      activeChatTab.set(tab.hash);
+      chatDockOpen.set(true);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Drop a tab when its underlying friend was removed from the friend
  * list (the conversation's identity is gone, leaving the tab open
  * would be misleading). Called from the friend-removal flow.
@@ -301,45 +319,23 @@ export function removeChatForFriend(hash: string) {
 /**
  * Drop persisted tabs whose identities are no longer friends.
  *
- * Room tabs are left alone: this is handed the friend list, which says nothing
- * about rooms, so filtering on it would close every room tab at startup.
- * {@link retainRoomTabs} is the matching sweep for those.
+ * The allow-list is the friend list, and a tab is a friend conversation, so
+ * anything outside it goes. That includes the `ch:` room tabs a previous
+ * version let the Channels page pin here: rooms are not dock conversations, and
+ * this is the sweep that clears one left in `localStorage` on the first launch
+ * after the change rather than leaving it to sit there opening nothing.
  */
 export function retainChatTabs(friendHashes: Iterable<string>) {
   const allow = new Set([...friendHashes].map((h) => h.toLowerCase()));
   const tabs = get(chatTabs);
-  const next = tabs.filter((t) => isRoomTab(t.hash) || allow.has(t.hash.toLowerCase()));
-  if (next.length === tabs.length) return;
-  chatTabs.set(next);
-  const active = get(activeChatTab);
-  if (active && !next.some((t) => t.hash.toLowerCase() === active.toLowerCase())) {
-    activeChatTab.set(next[0]?.hash ?? null);
-    if (next.length === 0) chatDockOpen.set(false);
-  }
-}
-
-/**
- * Drop room tabs for rooms this device is no longer in.
- *
- * The mirror of {@link retainChatTabs}: leaving, being removed from, or
- * deleting a room should take its tab with it, and a tab restored from
- * `localStorage` for a room that is gone would otherwise sit there opening a
- * conversation that cannot load.
- */
-export function retainRoomTabs(channelIds: Iterable<string>) {
-  const allow = new Set([...channelIds].map((id) => id.toLowerCase()));
-  const tabs = get(chatTabs);
-  const next = tabs.filter((t) => {
-    const room = roomTabChannelId(t.hash);
-    return room === null || allow.has(room);
-  });
+  const next = tabs.filter((t) => allow.has(t.hash.toLowerCase()));
   if (next.length === tabs.length) return;
   for (const gone of tabs) {
     if (!next.includes(gone)) chatDrafts.delete(gone.hash);
   }
   chatTabs.set(next);
   const active = get(activeChatTab);
-  if (active && !next.some((t) => t.hash === active)) {
+  if (active && !next.some((t) => t.hash.toLowerCase() === active.toLowerCase())) {
     activeChatTab.set(next[0]?.hash ?? null);
     if (next.length === 0) chatDockOpen.set(false);
   }

@@ -11,8 +11,7 @@
     closeDock,
     cycleTab,
     openChat,
-    isRoomTab,
-    roomTabChannelId,
+    focusNextUnread,
   } from '$lib/stores/chatTabs';
   import {
     unreadCounts,
@@ -23,26 +22,10 @@
     acceptIncomingFileOffer,
     clearFileOffer,
   } from '$lib/stores/friends';
-  import {
-    awaitingChannelOfferList,
-    channels as channelsStore,
-    ignoredKeysForChannel,
-    ignoredMembers,
-    respondToChannelOffer,
-  } from '$lib/stores/channels';
-  import {
-    channelRosters,
-    loadChannelRoster,
-    memberLabelsFrom,
-    membersIn,
-    mentionCandidatesFrom,
-    rosterOf,
-  } from '$lib/stores/channelRoster';
   import { appSettings } from '$lib/stores/settings';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
-  import { menuKeydown } from '$lib/a11y';
   import * as m from '$lib/paraglide/messages';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
@@ -136,51 +119,218 @@
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
-  let pickerOpen = $state(false);
-  let pickerEl: HTMLDivElement | undefined = $state();
-  let newChatEl: HTMLButtonElement | undefined = $state();
   let acceptingOffer: string | null = $state(null);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let pendingOffers = $derived($fileOffers);
-  /** Room offers waiting on an answer, wherever the user happens to be. They
-   *  expire, and until now the only place to answer one was inside the room
-   *  it arrived in. */
-  let roomOffers = $derived($awaitingChannelOfferList);
-  let respondingXfer: string | null = $state(null);
 
-  function roomNameFor(channelId: string): string {
-    return (
-      $channelsStore.find((c) => c.channel_id === channelId)?.name ?? m.nav_channels()
-    );
+  /**
+   * The conversation switcher: search box over one flat list.
+   *
+   * It replaces a horizontal tab strip, which was the wrong shape for the
+   * number of things it had to hold. Tabs floor at 96px and the dock defaults
+   * to 420px, so about three were ever visible while the store allows fifty —
+   * and nothing brought the rest back. `Ctrl+Tab` set the active tab without
+   * scrolling the strip to it, so it switched to a conversation that was not on
+   * screen; an unread badge on tab twelve was as invisible as the tab. A
+   * vertical list is not subject to that: every conversation is reachable by
+   * scrolling, and by typing two letters of a name once there are enough of
+   * them for scrolling to be the wrong answer too.
+   */
+  let switcherOpen = $state(false);
+  let query = $state('');
+  /** Highlighted row in `rows`, or -1 for none. Mouse hover sets it too, so
+   *  nothing destructive may hang off it — see the `Delete` handler. */
+  let activeIndex = $state(-1);
+  let switcherEl: HTMLDivElement | undefined = $state();
+  let searchEl: HTMLInputElement | undefined = $state();
+  let switchBtnEl: HTMLButtonElement | undefined = $state();
+
+  const LISTBOX_ID = 'chat-dock-switcher-list';
+
+  type SwitcherRow = {
+    /** `open` rows are conversations already in the dock; `friend` rows start
+     *  a new one. The distinction drives the close button and the section. */
+    kind: 'open' | 'friend';
+    hash: string;
+    name: string;
+    online: boolean;
+    unread: number;
+  };
+
+  function isOnline(hash: string): boolean {
+    return $onlineFriends.has(hash.toLowerCase());
   }
 
-  async function answerRoomOffer(xferId: string, accept: boolean) {
-    if (respondingXfer) return;
-    respondingXfer = xferId;
-    try {
-      await respondToChannelOffer(xferId, accept);
-    } catch (e) {
-      toastError(translateError(e));
-    } finally {
-      respondingXfer = null;
-    }
-  }
-  let pickerFriends = $derived(
-    [...$friendsList].sort((a, b) => {
-      const ao = $onlineFriends.has(a.user_hash.toLowerCase()) ? 0 : 1;
-      const bo = $onlineFriends.has(b.user_hash.toLowerCase()) ? 0 : 1;
-      if (ao !== bo) return ao - bo;
-      return (a.nickname || a.user_hash).localeCompare(b.nickname || b.user_hash);
-    }),
+  let openRows = $derived<SwitcherRow[]>(
+    $chatTabs.map((tab) => ({
+      kind: 'open' as const,
+      hash: tab.hash,
+      name: tab.name,
+      online: isOnline(tab.hash),
+      unread: $unreadCounts.get(tab.hash) ?? 0,
+    })),
   );
 
-  // Activate the dock as a focus context so screen readers announce
-  // it as a dialog and Tab cycling stays in scope. We bail early if
-  // the dock is closed so the rest of the app keeps full focus.
+  /**
+   * Friends without an open conversation, so the list never offers to "start"
+   * something that is already three rows above under Open.
+   *
+   * Online first, then by name — the order the old picker used, kept because it
+   * answers the question people actually open this to ask.
+   */
+  let friendRows = $derived<SwitcherRow[]>(
+    chatDisabled
+      ? []
+      : [...$friendsList]
+          .filter(
+            (f) => !$chatTabs.some((t) => t.hash === f.user_hash.toLowerCase()),
+          )
+          .map((f) => ({
+            kind: 'friend' as const,
+            hash: f.user_hash.toLowerCase(),
+            name: f.nickname || friendDisplayName(f.user_hash),
+            online: isOnline(f.user_hash),
+            unread: 0,
+          }))
+          .sort((a, b) => {
+            if (a.online !== b.online) return a.online ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          }),
+  );
+
+  /** Match on the name and on the hash, because an unnamed friend is only ever
+   *  identified by the latter. */
+  function matches(row: SwitcherRow, needle: string): boolean {
+    if (!needle) return true;
+    return row.name.toLowerCase().includes(needle) || row.hash.includes(needle);
+  }
+
+  let needle = $derived(query.trim().toLowerCase());
+  let shownOpen = $derived(openRows.filter((r) => matches(r, needle)));
+  let shownFriends = $derived(friendRows.filter((r) => matches(r, needle)));
+  /** One index space over both sections, so the arrow keys cross the section
+   *  heading the way the eye does. */
+  let rows = $derived([...shownOpen, ...shownFriends]);
+
+  let activeTab = $derived(
+    $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
+  );
+
+  /**
+   * Unread in conversations that are open but not on screen.
+   *
+   * The dock shows one conversation at a time, so without this the only signal
+   * that another one is waiting was a badge on a tab that had usually scrolled
+   * out of the strip. Clicking it goes to that conversation rather than merely
+   * reporting the number, which is what makes it an answer instead of a nag.
+   */
+  let unreadElsewhere = $derived(
+    openRows.reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
+  );
+
+  function openSwitcher() {
+    switcherOpen = true;
+    query = '';
+    activeIndex = -1;
+    // Deferred: the input does not exist until this state change renders.
+    requestAnimationFrame(() => searchEl?.focus());
+  }
+
+  function closeSwitcher(restoreFocus = true) {
+    if (!switcherOpen) return;
+    switcherOpen = false;
+    activeIndex = -1;
+    if (restoreFocus) switchBtnEl?.focus();
+  }
+
+  function toggleSwitcher() {
+    if (switcherOpen) closeSwitcher();
+    else openSwitcher();
+  }
+
+  function activateRow(row: SwitcherRow) {
+    if (row.kind === 'open') {
+      setActiveTab(row.hash);
+    } else {
+      if (chatDisabled) return;
+      openChat(row.hash, row.name);
+    }
+    closeSwitcher();
+  }
+
+  /** Close an open conversation from inside the list, keeping the list open —
+   *  tidying up several at once is the reason to be in here. */
+  function closeRow(row: SwitcherRow) {
+    if (row.kind !== 'open') return;
+    closeTab(row.hash);
+    // The dock collapses when the last conversation goes, and a switcher over a
+    // dock that is no longer there would have nothing behind it.
+    if ($chatTabs.length === 0) closeSwitcher(false);
+    else searchEl?.focus();
+  }
+
+  function onSearchKeydown(e: KeyboardEvent) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (rows.length === 0) return;
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      // From "no highlight", Down opens at the top and Up at the bottom, which
+      // is how every other list in the app answers those keys.
+      activeIndex =
+        activeIndex === -1
+          ? step === 1
+            ? 0
+            : rows.length - 1
+          : (activeIndex + step + rows.length) % rows.length;
+      return;
+    }
+    if (e.key === 'Home' || e.key === 'End') {
+      if (rows.length === 0) return;
+      e.preventDefault();
+      activeIndex = e.key === 'Home' ? 0 : rows.length - 1;
+      return;
+    }
+    if (e.key === 'Enter') {
+      // Nothing highlighted takes the first match, so the whole gesture is
+      // "type two letters, press Enter" without an arrow key in between.
+      const row = rows[activeIndex] ?? rows[0];
+      if (!row) return;
+      e.preventDefault();
+      activateRow(row);
+      return;
+    }
+    if (e.key === 'Delete') {
+      // Delete only, never Backspace: `activeIndex` follows mouse hover, so
+      // Backspace closing a conversation would fire while someone is fixing a
+      // typo. Same reasoning as the recent-search list in `SearchBar`.
+      const row = rows[activeIndex];
+      if (!row || row.kind !== 'open') return;
+      e.preventDefault();
+      closeRow(row);
+    }
+  }
+
+  function onSearchInput() {
+    // Typing means the query is being edited, not the list navigated. Dropping
+    // the highlight also disarms Delete for a row the pointer merely passed.
+    activeIndex = -1;
+  }
+
+  function isTypingTarget(t: EventTarget | null): boolean {
+    if (!(t instanceof HTMLElement)) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (t.isContentEditable) return true;
+    return false;
+  }
+
   $effect(() => {
-    if (!$chatDockOpen) pickerOpen = false;
+    if (!$chatDockOpen) closeSwitcher(false);
   });
 
+  // Activate the dock as a focus context so screen readers announce
+  // it as a landmark and focus lands somewhere useful. We bail early if
+  // the dock is closed so the rest of the app keeps full focus.
   $effect(() => {
     if ($chatDockOpen && panelEl) {
       const active = typeof document !== 'undefined' ? document.activeElement : null;
@@ -203,55 +353,11 @@
     };
   });
 
-  // Active tab metadata, looked up once per render so the
-  // `<ChatConversation>` doesn't have to know about the tab list.
-  let activeTab = $derived(
-    $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
-  );
-
-  /** The room behind the active tab, or null when it is a friend. */
-  let activeRoomId = $derived(activeTab ? roomTabChannelId(activeTab.hash) : null);
-  let activeRoom = $derived(
-    activeRoomId ? $channelsStore.find((c) => c.channel_id === activeRoomId) ?? null : null,
-  );
-  /**
-   * The roster for the room on screen, so a conversation in the dock names
-   * people the way the Channels page does rather than by key fragment.
-   *
-   * Read through the store the page also reads, which is the whole reason a
-   * room can be drawn here at all — the member list used to be that page's own
-   * component state.
-   */
-  let activeRoomMembers = $derived(membersIn($channelRosters, activeRoomId));
-  let activeRoomLabels = $derived(memberLabelsFrom(activeRoomMembers));
-  let activeRoomMentions = $derived(mentionCandidatesFrom(activeRoomMembers));
-  let activeRoomIgnored = $derived(ignoredKeysForChannel($ignoredMembers, activeRoomId));
-
-  // A room tab can be restored from localStorage or activated while the user
-  // is nowhere near Channels, so the dock has to fetch its own roster rather
-  // than rely on that page having been open.
-  $effect(() => {
-    const id = activeRoomId;
-    if (!id) return;
-    if (rosterOf(id).members.length > 0) return;
-    void loadChannelRoster(id).catch((e) =>
-      console.warn('ChatDock: could not load the room roster', e),
-    );
-  });
-
-  function isTypingTarget(t: EventTarget | null): boolean {
-    if (!(t instanceof HTMLElement)) return false;
-    const tag = t.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
-    if (t.isContentEditable) return true;
-    return false;
-  }
-
-  // Global hotkeys, scoped to "dock is open". Esc closes the dock
-  // (preserves tabs); Ctrl+Tab / Ctrl+Shift+Tab cycles tabs without
-  // leaving the dock; Ctrl+W closes the active tab. Ctrl+Tab is
-  // intercepted only when the dock is open so it doesn't fight with
-  // the OS-level browser tab cycle in the rest of the app.
+  // Global hotkeys, scoped to "dock is open". Esc closes the switcher and then
+  // the dock (tabs are preserved either way); Ctrl+Tab cycles conversations;
+  // Ctrl+W closes the active one; Ctrl+K opens the switcher. Ctrl+Tab is
+  // intercepted only when the dock is open so it doesn't fight with the
+  // OS-level browser tab cycle in the rest of the app.
   function onKeydown(e: KeyboardEvent) {
     if (!$chatDockOpen) return;
     // Esc — close the dock. Allowed even from inputs because users
@@ -266,9 +372,9 @@
       // Page chrome that already handled Escape (recent-search dropdown, column
       // menus, clearing a filter) calls preventDefault. Don't also close the dock.
       if (e.defaultPrevented) return;
-      if (pickerOpen) {
+      if (switcherOpen) {
         e.preventDefault();
-        pickerOpen = false;
+        closeSwitcher();
         return;
       }
       e.preventDefault();
@@ -285,10 +391,18 @@
       cycleTab(e.shiftKey ? -1 : 1);
       return;
     }
+    if (e.key === 'k' || e.key === 'K') {
+      // The find-anything gesture, and the reason the list can be long: with
+      // fifty conversations allowed, typing a name has to beat scrolling to it.
+      e.preventDefault();
+      if (switcherOpen) searchEl?.focus();
+      else openSwitcher();
+      return;
+    }
     if ((e.key === 'w' || e.key === 'W') && !isTypingTarget(e.target)) {
       // Ctrl+W is "close window" in the OS, but here it's "close
-      // tab" — the dock isn't a real window so we can safely repurpose
-      // it. Disabled while typing so a user mid-message doesn't lose
+      // conversation" — the dock isn't a real window so we can safely
+      // repurpose it. Disabled while typing so a user mid-message doesn't lose
       // their conversation by reflex.
       e.preventDefault();
       const active = $activeChatTab;
@@ -304,16 +418,15 @@
     if (dockWidth > dockWidthMax) setDockWidth(dockWidthMax);
   }
 
-  // A menu that only Escape can dismiss is a menu users leave open by
-  // accident — it sits over the tab strip and the conversation below it.
-  // `pointerdown` rather than `click` so the menu is gone before whatever
-  // was clicked underneath reacts.
+  // A panel that only Escape can dismiss is one users leave open by accident —
+  // it covers the conversation behind it. `pointerdown` rather than `click` so
+  // it is gone before whatever was clicked underneath reacts.
   function onPointerDown(e: PointerEvent) {
-    if (!pickerOpen) return;
+    if (!switcherOpen) return;
     const target = e.target;
     if (!(target instanceof Node)) return;
-    if (pickerEl?.contains(target) || newChatEl?.contains(target)) return;
-    pickerOpen = false;
+    if (switcherEl?.contains(target) || switchBtnEl?.contains(target)) return;
+    closeSwitcher(false);
   }
 
   onMount(() => {
@@ -328,94 +441,19 @@
     };
   });
 
-  function unreadFor(hash: string): number {
-    const room = roomTabChannelId(hash);
-    if (room !== null) {
-      return $channelsStore.find((c) => c.channel_id === room)?.unread ?? 0;
-    }
-    return $unreadCounts.get(hash) ?? 0;
-  }
-
-  /** Rooms have no presence of their own, so their tab carries no dot. */
-  function isOnline(hash: string): boolean {
-    if (isRoomTab(hash)) return false;
-    return $onlineFriends.has(hash.toLowerCase());
-  }
-
-  // Keyboard activation for the role=tab elements. Enter and Space
-  // are the canonical keys for activating a tab in WAI-ARIA's tab
-  // pattern. The outer is a div (not a button) because we need to
-  // nest a real `<button>` for close-X and HTML disallows nesting
-  // buttons.
-  function onTabKeydown(e: KeyboardEvent, hash: string) {
-    // Activate the focused tab on Enter/Space (in case the user
-    // tab-focused into an inactive tab — they almost never can,
-    // since only the active tab has tabindex=0, but it costs
-    // nothing to support).
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      setActiveTab(hash);
-      return;
-    }
-    // WAI-ARIA tab pattern: Left/Right arrows move focus AND
-    // activate the previous/next tab. Home/End jump to first/last.
-    // Delete closes the focused tab. We don't intercept Up/Down
-    // (vertical lists aren't in play here).
-    const tabs = $chatTabs;
-    if (tabs.length === 0) return;
-    const idx = tabs.findIndex((t) => t.hash === hash);
-    if (idx === -1) return;
-    let target = -1;
-    if (e.key === 'ArrowRight') target = (idx + 1) % tabs.length;
-    else if (e.key === 'ArrowLeft') target = (idx - 1 + tabs.length) % tabs.length;
-    else if (e.key === 'Home') target = 0;
-    else if (e.key === 'End') target = tabs.length - 1;
-    else if (e.key === 'Delete') {
-      e.preventDefault();
-      closeTab(hash);
-      return;
-    }
-    if (target === -1) return;
-    e.preventDefault();
-    const targetHash = tabs[target].hash;
-    setActiveTab(targetHash);
-    // Move DOM focus to the new tab so further arrow presses
-    // advance from there. The active tab is the only one with
-    // tabindex=0, so a re-render is needed before we can focus —
-    // queue the focus on the next frame.
-    requestAnimationFrame(() => {
-      if (typeof document === 'undefined') return;
-      const next = document.querySelector<HTMLElement>(
-        `.dock-tab[data-hash="${CSS.escape(targetHash)}"]`,
-      );
-      next?.focus();
-    });
-  }
-
   function handleNewChat() {
-    if (chatDisabled || pickerFriends.length === 0) {
-      pickerOpen = false;
+    if (chatDisabled || $friendsList.length === 0) {
+      closeSwitcher(false);
       void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
       return;
     }
-    pickerOpen = !pickerOpen;
-    // Land focus inside the menu so the arrow keys `menuKeydown` handles have
-    // somewhere to start. Deferred a frame because the items do not exist
-    // until this state change renders.
-    if (pickerOpen) {
-      requestAnimationFrame(() => {
-        pickerEl?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
-      });
-    }
+    if (switcherOpen) searchEl?.focus();
+    else openSwitcher();
   }
 
-  function startChatWith(hash: string, name: string) {
-    if (chatDisabled) return;
-    pickerOpen = false;
-    openChat(hash, name || friendDisplayName(hash));
-    // Focus goes back to the control that opened the menu rather than being
-    // dropped on the body when the item it was on unmounts.
-    newChatEl?.focus();
+  function goToUnread() {
+    if (!focusNextUnread()) return;
+    closeSwitcher(false);
   }
 
   async function acceptDockOffer(offer: (typeof pendingOffers)[number]) {
@@ -492,67 +530,77 @@
       ondblclick={() => setDockWidth(DOCK_WIDTH_DEFAULT)}
       onkeydown={onResizeKeydown}
     ></div>
-    <div class="dock-tabs" role="tablist" aria-label={m.chat_dock_tablist_aria()}>
-      {#if $chatTabs.length === 0}
-        <div class="dock-empty-tabs">{m.chat_dock_no_open()}</div>
-      {:else}
-        {#each $chatTabs as tab (tab.hash)}
-          <div
-            role="tab"
-            class="dock-tab"
-            class:active={tab.hash === $activeChatTab}
-            class:online={isOnline(tab.hash)}
-            aria-selected={tab.hash === $activeChatTab}
-            tabindex={tab.hash === $activeChatTab ? 0 : -1}
-            data-hash={tab.hash}
-            title={tab.name}
-            onclick={() => setActiveTab(tab.hash)}
-            onkeydown={(e) => onTabKeydown(e, tab.hash)}
-          >
-            {#if isRoomTab(tab.hash)}
-              <!-- A room is not online or offline, so it gets the mark that
-                   says which kind of conversation this is instead of a dot
-                   that would have to claim one. -->
-              <span class="dock-tab-room" role="img" aria-label={m.chat_dock_room_tab()}>#</span>
-            {:else}
-              <!-- Named, not decorative: the tab says nothing else about whether
-                   the friend is reachable, so hiding the dot hides the state. -->
-              <span
-                class="dock-tab-presence"
-                role="img"
-                aria-label={isOnline(tab.hash) ? m.chat_online_label() : m.chat_offline_label()}
-              ></span>
-            {/if}
-            <span class="dock-tab-name"><bdi dir="auto">{tab.name}</bdi></span>
-            {#if unreadFor(tab.hash) > 0}
-              <span
-                class="dock-tab-unread"
-                aria-label={unreadFor(tab.hash) === 1
-                  ? m.chat_dock_unread_aria_one()
-                  : m.chat_dock_unread_aria_other({ count: unreadFor(tab.hash) })}
-              >{unreadFor(tab.hash) > 99 ? '99+' : unreadFor(tab.hash)}</span>
-            {/if}
-            <button
-              type="button"
-              class="dock-tab-close"
-              tabindex="-1"
-              aria-label={m.chat_dock_close_tab({ name: tab.name })}
-              title={m.chat_dock_close_tab_title()}
-              onclick={(e) => { e.stopPropagation(); closeTab(tab.hash); }}
-            >
-              <IconX size={12} />
-            </button>
-          </div>
-        {/each}
+
+    <!--
+      One header naming the conversation on screen, in place of a strip of
+      tabs. It is the switcher's trigger, so the thing that says where you are
+      is also the thing that takes you elsewhere.
+    -->
+    <div class="dock-head">
+      <button
+        type="button"
+        class="dock-current"
+        class:open={switcherOpen}
+        bind:this={switchBtnEl}
+        aria-haspopup="listbox"
+        aria-expanded={switcherOpen}
+        aria-controls={LISTBOX_ID}
+        aria-keyshortcuts={`${shortcutModAria()}+K`}
+        title={m.chat_dock_switcher_label()}
+        onclick={toggleSwitcher}
+      >
+        {#if activeTab}
+          <!-- Named, not decorative: the header says nothing else about whether
+               the friend is reachable, so hiding the dot hides the state. -->
+          <span
+            class="dock-presence"
+            class:online={isOnline(activeTab.hash)}
+            role="img"
+            aria-label={isOnline(activeTab.hash)
+              ? m.chat_online_label()
+              : m.chat_offline_label()}
+          ></span>
+          <span class="dock-current-name"><bdi dir="auto">{activeTab.name}</bdi></span>
+        {:else}
+          <span class="dock-current-name dock-current-none">{m.chat_dock_none_selected()}</span>
+        {/if}
+        <svg
+          class="dock-chevron"
+          viewBox="0 0 16 16"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M4 6.5l4 4 4-4"/>
+        </svg>
+      </button>
+
+      {#if unreadElsewhere > 0}
+        <!-- A count that goes somewhere. Without this the only report of a
+             waiting conversation was a badge on a tab that had scrolled away. -->
+        <button
+          type="button"
+          class="dock-elsewhere"
+          title={unreadElsewhere === 1
+            ? m.chat_dock_unread_elsewhere_one()
+            : m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere })}
+          aria-label={unreadElsewhere === 1
+            ? m.chat_dock_unread_elsewhere_one()
+            : m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere })}
+          onclick={goToUnread}
+        >
+          {unreadElsewhere > 99 ? '99+' : unreadElsewhere}
+        </button>
       {/if}
+
       <button
         type="button"
         class="dock-new"
-        bind:this={newChatEl}
         title={m.chat_dock_new_chat()}
         aria-label={m.chat_dock_new_chat()}
-        aria-expanded={pickerOpen}
-        aria-haspopup="menu"
         onclick={handleNewChat}
       >
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -573,76 +621,132 @@
       </button>
     </div>
 
-    {#if pickerOpen}
-      <!--
-        `menu`, not `listbox`: nothing here is a selected value, each row is an
-        action that opens a conversation. That also lets it reuse the same
-        arrow/Home/End handling as every other menu in the app.
-      -->
-      <div
-        class="dock-picker"
-        bind:this={pickerEl}
-        role="menu"
-        tabindex="-1"
-        aria-label={m.chat_dock_pick_friend()}
-        onkeydown={(e) => menuKeydown(e, e.currentTarget)}
-      >
-        {#each pickerFriends as friend (friend.user_hash)}
-          <button
-            type="button"
-            role="menuitem"
-            class="dock-picker-item"
-            class:online={isOnline(friend.user_hash)}
-            disabled={chatDisabled}
-            onclick={() => startChatWith(friend.user_hash, friend.nickname || friendDisplayName(friend.user_hash))}
-          >
-            <span
-              class="dock-tab-presence"
-              role="img"
-              aria-label={isOnline(friend.user_hash) ? m.chat_online_label() : m.chat_offline_label()}
-            ></span>
-            <span class="dock-picker-name"><bdi dir="auto">{friend.nickname || friendDisplayName(friend.user_hash)}</bdi></span>
-          </button>
-        {:else}
-          <p class="dock-picker-empty">{m.chat_dock_no_friends()}</p>
-        {/each}
-      </div>
-    {/if}
-
     <div class="dock-body">
-      {#if roomOffers.length > 0}
-        <div class="dock-offers" role="region" aria-label={m.chat_dock_room_offers_title()}>
-          <div class="dock-offers-title">{m.chat_dock_room_offers_title()}</div>
-          {#each roomOffers as offer (offer.xfer_id)}
-            <div class="dock-offer">
-              <div class="dock-offer-info">
-                <span class="dock-offer-name"><bdi dir="auto">{offer.name}</bdi></span>
-                <span class="dock-offer-meta">
-                  {m.chat_dock_room_offer_from({ room: roomNameFor(offer.channel_id) })}
-                  {#if offer.size}&nbsp;·&nbsp;{formatBytes(offer.size)}{/if}
-                </span>
-              </div>
-              <div class="dock-offer-actions">
+      {#if switcherOpen}
+        <!--
+          A filtered listbox driven from the search field, which keeps focus:
+          the rows are announced through `aria-activedescendant` rather than by
+          moving focus into them, so typing and navigating are the same gesture.
+        -->
+        <div class="dock-switcher" bind:this={switcherEl}>
+          <div class="dock-search">
+            <input
+              bind:this={searchEl}
+              bind:value={query}
+              type="text"
+              class="dock-search-input"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded="true"
+              aria-controls={LISTBOX_ID}
+              aria-activedescendant={activeIndex >= 0 && activeIndex < rows.length
+                ? `${LISTBOX_ID}-option-${activeIndex}`
+                : undefined}
+              aria-label={m.chat_dock_search_placeholder()}
+              placeholder={m.chat_dock_search_placeholder()}
+              autocomplete="off"
+              spellcheck="false"
+              oninput={onSearchInput}
+              onkeydown={onSearchKeydown}
+            />
+          </div>
+
+          <div id={LISTBOX_ID} class="dock-list" role="listbox" aria-label={m.chat_dock_switcher_aria()}>
+            {#if rows.length === 0}
+              <p class="dock-list-empty">
+                {needle
+                  ? m.chat_dock_no_matches()
+                  : chatDisabled
+                    ? m.chat_dock_chat_disabled()
+                    : m.chat_dock_no_friends()}
+              </p>
+            {/if}
+
+            {#if shownOpen.length > 0}
+              <p class="dock-list-section" id="{LISTBOX_ID}-open">{m.chat_dock_section_open()}</p>
+            {/if}
+            {#each shownOpen as row, i (row.hash)}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="dock-row"
+                class:active={i === activeIndex}
+                class:current={row.hash === $activeChatTab}
+                role="option"
+                id={`${LISTBOX_ID}-option-${i}`}
+                aria-selected={i === activeIndex}
+                tabindex="-1"
+                onclick={() => activateRow(row)}
+                onmouseenter={() => (activeIndex = i)}
+                onauxclick={(e) => {
+                  // Middle-click closes, the way it closes a tab everywhere else.
+                  if (e.button !== 1) return;
+                  e.preventDefault();
+                  closeRow(row);
+                }}
+              >
+                <span
+                  class="dock-presence"
+                  class:online={row.online}
+                  role="img"
+                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
+                ></span>
+                <span class="dock-row-name"><bdi dir="auto">{row.name}</bdi></span>
+                {#if row.unread > 0}
+                  <span
+                    class="dock-row-unread"
+                    aria-label={row.unread === 1
+                      ? m.chat_dock_unread_aria_one()
+                      : m.chat_dock_unread_aria_other({ count: row.unread })}
+                  >{row.unread > 99 ? '99+' : row.unread}</span>
+                {/if}
+                <!--
+                  Deliberately `aria-hidden` + untabbable: a `role="option"`
+                  must not contain interactive descendants, and keyboard users
+                  have Delete on the highlighted row. This adds a pointer
+                  target without breaking the listbox contract.
+                -->
                 <button
                   type="button"
-                  class="dock-offer-accept"
-                  disabled={respondingXfer !== null}
-                  onclick={() => void answerRoomOffer(offer.xfer_id, true)}
-                >{m.channels_xfer_accept()}</button>
-                <!-- Both answers are the same guarded round trip, so neither
-                     may look available while one is in flight — unlike the
-                     friend dismiss below, which only edits a local store. -->
-                <button
-                  type="button"
-                  class="dock-offer-dismiss"
-                  disabled={respondingXfer !== null}
-                  onclick={() => void answerRoomOffer(offer.xfer_id, false)}
-                >{m.channels_xfer_decline()}</button>
+                  class="dock-row-close"
+                  tabindex="-1"
+                  aria-hidden="true"
+                  title={m.chat_dock_close_tab({ name: row.name })}
+                  onclick={(e) => { e.stopPropagation(); closeRow(row); }}
+                >
+                  <IconX size={12} />
+                </button>
               </div>
-            </div>
-          {/each}
+            {/each}
+
+            {#if shownFriends.length > 0}
+              <p class="dock-list-section">{m.chat_dock_section_start()}</p>
+            {/if}
+            {#each shownFriends as row, i (row.hash)}
+              {@const idx = shownOpen.length + i}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="dock-row"
+                class:active={idx === activeIndex}
+                role="option"
+                id={`${LISTBOX_ID}-option-${idx}`}
+                aria-selected={idx === activeIndex}
+                tabindex="-1"
+                onclick={() => activateRow(row)}
+                onmouseenter={() => (activeIndex = idx)}
+              >
+                <span
+                  class="dock-presence"
+                  class:online={row.online}
+                  role="img"
+                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
+                ></span>
+                <span class="dock-row-name"><bdi dir="auto">{row.name}</bdi></span>
+              </div>
+            {/each}
+          </div>
         </div>
       {/if}
+
       {#if pendingOffers.length > 0}
         <div class="dock-offers" role="region" aria-label={m.chat_dock_offers_title()}>
           <div class="dock-offers-title">{m.chat_dock_offers_title()}</div>
@@ -675,23 +779,8 @@
           {/each}
         </div>
       {/if}
-      {#if activeTab && activeRoomId}
-        <!-- Everything a room conversation needs beyond the roster already
-             lives on the channels store, so the dock reads the same row the
-             Channels page draws from rather than a copy of it. -->
-        <ChatConversation
-          friendHash=""
-          friendName={activeRoom?.name ?? activeTab.name}
-          channelId={activeRoomId}
-          youAreBanned={activeRoom?.you_are_banned ?? false}
-          youAreKeyBehind={activeRoom?.key_behind ?? false}
-          slowModeSecs={activeRoom?.slow_mode_secs ?? 0}
-          memberNames={activeRoomLabels}
-          ignoredSenders={activeRoomIgnored}
-          mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
-          mentionCandidates={activeRoomMentions}
-        />
-      {:else if activeTab}
+
+      {#if activeTab}
         <ChatConversation friendHash={activeTab.hash} friendName={activeTab.name} />
       {:else}
         <div class="dock-empty-state">
@@ -703,9 +792,11 @@
             </svg>
           </div>
           <p class="empty-title">{m.chat_dock_empty_title()}</p>
-          <p class="empty-hint">{pickerFriends.length ? m.chat_dock_empty_hint() : m.chat_dock_no_friends()}</p>
+          <p class="empty-hint">
+            {$friendsList.length ? m.chat_dock_empty_hint() : m.chat_dock_no_friends()}
+          </p>
           <button type="button" class="secondary empty-cta" onclick={handleNewChat}>
-            {pickerFriends.length ? m.chat_dock_pick_friend() : m.chat_dock_empty_cta()}
+            {$friendsList.length ? m.chat_dock_pick_friend() : m.chat_dock_empty_cta()}
           </button>
         </div>
       {/if}
@@ -765,91 +856,68 @@
     background: var(--accent);
   }
 
-  .dock-tabs {
+  .dock-head {
     display: flex;
-    align-items: stretch;
-    gap: 2px;
-    padding: 6px 6px 0;
+    align-items: center;
+    gap: 4px;
+    padding: 6px;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
-    overflow-x: auto;
-    /* Explicit, and not merely tidiness. Setting only `overflow-x` leaves
-       `overflow-y` at `visible`, and CSS then computes `visible` to `auto`
-       whenever the other axis is not visible — so the strip grew its own
-       vertical scrollbar the moment anything inside it exceeded the box by a
-       fraction of a pixel, which the active tab's indicator did by exactly 1px. */
-    overflow-y: hidden;
-    scrollbar-width: thin;
     flex-shrink: 0;
   }
 
-  .dock-tabs::-webkit-scrollbar {
-    height: 6px;
-  }
-
-  .dock-tabs::-webkit-scrollbar-thumb {
-    background: var(--border);
-    border-radius: 3px;
-  }
-
-  .dock-empty-tabs {
+  /* Takes the slack so the controls sit hard against the right edge, and
+     ellipsizes rather than pushing them off it. */
+  .dock-current {
     display: flex;
     align-items: center;
-    padding: 0 12px;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 6px 8px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--transition-fast);
+  }
+
+  .dock-current:hover,
+  .dock-current.open {
+    background: var(--bg-hover);
+  }
+
+  .dock-current:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .dock-current-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  .dock-current-none {
     color: var(--text-muted);
-    font-size: 12px;
+    font-weight: 500;
     font-style: italic;
   }
 
-  .dock-tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 10px 8px 12px;
-    border: none;
-    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 12.5px;
-    font-family: inherit;
-    cursor: pointer;
-    /* Share the strip rather than each claiming a fixed width and pushing the
-       rest out of view. The dock is only ~420px wide, so fixed 180px tabs
-       started scrolling at three conversations; now they narrow and ellipsize
-       first, and scrolling is the last resort once they hit a width where the
-       name and controls stop being usable. */
-    flex: 1 1 auto;
-    max-width: 180px;
-    min-width: 96px;
-    position: relative;
-    transition: background var(--transition-fast), color var(--transition-fast);
+  .dock-chevron {
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+    color: var(--text-muted);
   }
 
-  .dock-tab:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .dock-tab.active {
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .dock-tab.active::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    /* Inside the box, not 1px past it. Overhanging the strip's bottom edge is
-       what pushed the container into vertical overflow, and `overflow-y: hidden`
-       would now clip half of a 2px bar anyway. */
-    bottom: 0;
-    height: 2px;
-    background: var(--accent);
-  }
-
-  .dock-tab-presence {
+  .dock-presence {
     width: 8px;
     height: 8px;
     border-radius: 50%;
@@ -858,33 +926,161 @@
     transition: background var(--transition-fast), box-shadow var(--transition-fast);
   }
 
-  .dock-tab-room {
-    width: 8px;
-    font-size: 12px;
-    font-weight: 700;
-    line-height: 1;
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  .dock-tab.active .dock-tab-room {
-    color: var(--accent);
-  }
-
-  .dock-tab.online .dock-tab-presence,
-  .dock-picker-item.online .dock-tab-presence {
+  .dock-presence.online {
     background: var(--status-connected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
   }
 
-  .dock-tab-name {
+  .dock-elsewhere {
+    flex-shrink: 0;
+    min-width: 20px;
+    padding: 2px 7px;
+    border: none;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--on-accent);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 1.4;
+    cursor: pointer;
+  }
+
+  .dock-elsewhere:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .dock-new,
+  .dock-close {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .dock-new:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .dock-close:hover {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .dock-new:focus-visible,
+  .dock-close:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .dock-new svg,
+  .dock-close svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .dock-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Over the conversation rather than beside it: the dock is a narrow column,
+     and a list that pushed the transcript aside would leave neither usable. */
+  .dock-switcher {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: var(--bg-primary);
+  }
+
+  .dock-search {
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .dock-search-input {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 12.5px;
+  }
+
+  .dock-search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .dock-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px;
+    scrollbar-width: thin;
+  }
+
+  .dock-list-section {
+    margin: 6px 0 4px;
+    padding: 0 8px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .dock-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+
+  /* One highlight, driven by `activeIndex`, which both the arrow keys and the
+     pointer write — so hover and keyboard cannot disagree about the target. */
+  .dock-row.active {
+    background: var(--bg-hover);
+  }
+
+  .dock-row.current {
+    font-weight: 600;
+  }
+
+  .dock-row-name {
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
   }
 
-  .dock-tab-unread {
+  .dock-row-unread {
     background: var(--accent);
     color: var(--on-accent);
     font-size: 10px;
@@ -897,7 +1093,7 @@
     flex-shrink: 0;
   }
 
-  .dock-tab-close {
+  .dock-row-close {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -915,86 +1111,21 @@
     transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
   }
 
-  .dock-tab:hover .dock-tab-close,
-  .dock-tab.active .dock-tab-close {
+  .dock-row.active .dock-row-close {
     opacity: 1;
   }
 
-  .dock-tab-close:hover {
+  .dock-row-close:hover {
     background: var(--danger);
     color: var(--on-danger);
   }
 
-  .dock-new,
-  .dock-close {
-    width: 32px;
-    height: 32px;
-    margin: 4px 0;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .dock-new {
-    margin-left: 4px;
-  }
-
-  .dock-picker {
-    position: absolute;
-    top: 46px;
-    right: 40px;
-    z-index: 5;
-    min-width: 220px;
-    max-width: min(320px, 80vw);
-    max-height: 280px;
-    overflow: auto;
-    padding: 6px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--bg-primary);
-    box-shadow: var(--shadow-md);
-  }
-
-  .dock-picker-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 8px 10px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-primary);
-    font: inherit;
-    font-size: 12.5px;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .dock-picker-item:hover,
-  .dock-picker-item:focus-visible {
-    background: var(--bg-hover);
-  }
-
-  .dock-picker-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .dock-picker-empty {
+  .dock-list-empty {
     margin: 0;
-    padding: 10px;
+    padding: 14px 10px;
     color: var(--text-muted);
     font-size: 12.5px;
+    text-align: center;
   }
 
   .dock-offers {
@@ -1070,40 +1201,6 @@
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text-secondary);
-  }
-
-  .dock-close {
-    margin-left: auto;
-  }
-
-  .dock-new:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .dock-close:hover {
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
-
-  .dock-new:focus-visible,
-  .dock-close:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-
-  .dock-new svg,
-  .dock-close svg {
-    width: 14px;
-    height: 14px;
-  }
-
-  .dock-body {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    overflow: hidden;
   }
 
   .dock-empty-state {
