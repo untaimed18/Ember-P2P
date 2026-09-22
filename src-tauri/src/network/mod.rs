@@ -36772,6 +36772,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                     .clone(),
                                             },
                                             bandwidth_limiter.clone(),
+                                            // Chat attachments are served on
+                                            // this endpoint too. The loop cannot
+                                            // reach `NetworkState`, so the grant
+                                            // table and our identity key travel
+                                            // to it the same way the operator's
+                                            // filter does.
+                                            Some(ember::relay::AttachServeContext {
+                                                db: db.clone(),
+                                                our_ed25519_seed: ed25519_secret_key,
+                                            }),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
 

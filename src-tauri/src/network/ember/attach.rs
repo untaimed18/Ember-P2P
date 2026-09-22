@@ -44,6 +44,15 @@
 //!    A `xfer_id` is 16 random bytes, so this is not what stops guessing — it
 //!    stops a *friend* from probing for transfers meant for someone else.
 
+// The data half of this module is live — `attach_stream::serve_attachment` runs
+// from the QUIC accept loop. The signalling half (offer, reply, cancel, and the
+// receiving side's fetch) is written and tested but not yet called from the
+// friend session, so its items have no production caller. This attribute is that
+// gap and nothing more: it comes off in the commit that wires the friend-session
+// sub-types, and until then it exists so a genuinely dead item elsewhere is not
+// lost in the noise.
+#![allow(dead_code)]
+
 use super::crypto;
 use super::transfer::{root_from_chunk_hashes, CHUNK_SIZE};
 
@@ -434,9 +443,7 @@ pub fn encode_attach_offer(offer: &AttachOffer) -> Option<Vec<u8>> {
     if name.is_empty() || name.len() > ATTACH_NAME_MAX {
         return None;
     }
-    if attach_chunk_count(offer.size).is_none() {
-        return None;
-    }
+    attach_chunk_count(offer.size)?;
     let mut out = Vec::with_capacity(1 + 16 + 8 + 32 + 2 + 1 + name.len());
     out.push(ATTACH_VERSION);
     out.extend_from_slice(&offer.xfer_id);

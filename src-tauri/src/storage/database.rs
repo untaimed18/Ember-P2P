@@ -43,7 +43,11 @@ pub struct FriendChatRow {
 }
 
 /// One chat attachment, as either side of it needs to see it.
+///
+/// Read in full by the transcript once the UI lands; for now only the grant
+/// lookup and the tests consume it, hence the allow.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ChatAttachmentRow {
     /// Hex of the 16-byte transfer id.
     pub xfer_id: String,
@@ -2494,6 +2498,10 @@ impl Database {
 
     /// Record one chat attachment, on either side of it.
     ///
+    /// Reached from the command layer once the friend-session signalling lands;
+    /// the grant reader below is already live from the QUIC accept loop.
+    #[allow(dead_code)]
+    ///
     /// `source_path` is set only by the sender and is what the grant lookup
     /// resolves to; the receiver passes `None` and fills `dest_path` when the
     /// file lands. Replaces any row with the same `xfer_id` so a re-offer of the
@@ -2581,6 +2589,7 @@ impl Database {
 
     /// Move an attachment to a new status, optionally recording progress and
     /// where the finished file went.
+    #[allow(dead_code)]
     pub fn set_chat_attachment_status(
         &self,
         xfer_id: &str,
@@ -2601,6 +2610,7 @@ impl Database {
     }
 
     /// Every attachment for one friend, newest first, for drawing the transcript.
+    #[allow(dead_code)]
     pub fn chat_attachments_for_friend(
         &self,
         friend_hash: &str,
@@ -2634,6 +2644,7 @@ impl Database {
     }
 
     /// One attachment by id, whichever side of it this node is on.
+    #[allow(dead_code)]
     pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -2666,6 +2677,7 @@ impl Database {
     /// deleted so the transcript can still say what happened to them; the grant
     /// stops resolving either way, because `chat_attachment_grant` refuses an
     /// expired row and refuses this status.
+    #[allow(dead_code)]
     pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let moved = conn.execute(

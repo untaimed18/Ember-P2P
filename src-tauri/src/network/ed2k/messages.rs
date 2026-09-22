@@ -277,6 +277,42 @@ pub const EMBER_EXT_DHT_CONTACTS: u8 = 0x06;
 /// it — which is exactly the behaviour before it existed.
 pub const EMBER_EXT_FRIEND_DECLINE: u8 = 0x07;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is offering the recipient a file in
+/// chat. Body is
+/// [`crate::network::ember::attach::encode_attach_offer`].
+///
+/// Signalling only — no file bytes ride the friend session. It names a transfer
+/// id, a size, the BLAKE3 root the content is committed to, and the port of the
+/// sender's QUIC endpoint; the recipient dials that for the data if it wants
+/// the file. Envelope rather than an opcode because `0xFF` was the last free
+/// code in the `OP_EMULEPROT` space, and a peer that predates these three
+/// sub-types ignores them — which reads to the sender as an offer nobody ever
+/// answered, and lapses on its own.
+///
+/// Allowed dead for the moment: the QUIC serve side is wired, the friend-session
+/// signalling that sends and receives these three is the next step.
+#[allow(dead_code)]
+pub const EMBER_EXT_ATTACH_OFFER: u8 = 0x08;
+
+/// [`OP_EMBER_EXT`] sub-type: the recipient's answer to
+/// [`EMBER_EXT_ATTACH_OFFER`]. Body is
+/// [`crate::network::ember::attach::encode_attach_reply`].
+///
+/// An accept is what tells the sender to keep the grant alive and expect a
+/// stream; every other answer retires it. Nothing is transferred on the
+/// strength of an offer alone.
+#[allow(dead_code)]
+pub const EMBER_EXT_ATTACH_REPLY: u8 = 0x09;
+
+/// [`OP_EMBER_EXT`] sub-type: either side is giving up on an attachment. Body
+/// is [`crate::network::ember::attach::encode_attach_cancel`].
+///
+/// Sent by a recipient that no longer wants the file and by a sender that can
+/// no longer read it, so the other end stops waiting rather than sitting on a
+/// transfer until it lapses.
+#[allow(dead_code)]
+pub const EMBER_EXT_ATTACH_CANCEL: u8 = 0x0A;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -3266,6 +3302,9 @@ mod tests {
             EMBER_EXT_DHT_CONTACT_REQ,
             EMBER_EXT_DHT_CONTACTS,
             EMBER_EXT_FRIEND_DECLINE,
+            EMBER_EXT_ATTACH_OFFER,
+            EMBER_EXT_ATTACH_REPLY,
+            EMBER_EXT_ATTACH_CANCEL,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

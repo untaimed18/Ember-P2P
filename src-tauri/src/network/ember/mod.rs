@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod attach_stream;
 pub mod broker;
 pub mod channel;
 pub mod crypto;
