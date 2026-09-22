@@ -38,7 +38,7 @@
     { key: 'priority',    label: () => m.library_col_priority(),    width: 72,  minWidth: 60,  sortField: 'priority' },
     { key: 'transferred', label: () => m.library_col_transferred(), width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
     { key: 'sources',     label: () => m.library_col_peers(),       width: 118, minWidth: 84,  sortField: 'complete_sources' },
-    { key: 'shared',      label: () => m.library_col_shared(),      width: 132, minWidth: 96 },
+    { key: 'shared',      label: () => m.library_col_published(),   width: 132, minWidth: 96 },
     { key: 'hash',        label: () => m.library_col_file_id(),     width: 120, minWidth: 80,  sortField: 'hash' },
     { key: 'requests',    label: () => m.library_col_requests(),    width: 70,  minWidth: 50,  sortField: 'requests' },
     { key: 'accepted',    label: () => m.library_col_accepted(),    width: 70,  minWidth: 50,  sortField: 'accepted' },
@@ -654,27 +654,22 @@
               {:else if col.key === 'sources'}
                 <td class="cell-num">{file.complete_sources || '\u2014'}</td>
               {:else if col.key === 'shared'}
+                <!-- Every row in the Library is a file peers can download, so
+                     a "yes" tick on all of them said nothing. What varies is
+                     where the file has actually reached. -->
                 <td class="cell-shared">
                   {#if !file.hash}
                     <span class="hashing-label">{m.common_pending()}</span>
-                  {:else if file.shared}
-                    <span class="shared-icon shared-yes" title={m.library_shared()}>&#x2713;</span>
-                    {#if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember || file.aich_hash}
-                      <span class="shared-badges">
-                        {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
-                        {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
-                        {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
-                        {#if file.shared_ember}<span class="shared-badge ember" title={m.library_published_ember()}>Ember</span>{/if}
-                        {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
-                      </span>
-                    {/if}
+                  {:else if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember || file.aich_hash}
+                    <span class="shared-badges">
+                      {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
+                      {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
+                      {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                      {#if file.shared_ember}<span class="shared-badge ember" title={m.library_published_ember()}>Ember</span>{/if}
+                      {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
+                    </span>
                   {:else}
-                    <span class="shared-icon shared-no" title={m.library_not_shared()}>&#x2715;</span>
-                    {#if file.aich_hash}
-                      <span class="shared-badges">
-                        <span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>
-                      </span>
-                    {/if}
+                    <span class="not-published" title={m.library_not_published_yet()}>&#x2014;</span>
                   {/if}
                 </td>
               {/if}
@@ -901,26 +896,8 @@
     font-size: 11px;
     font-style: italic;
   }
-  .shared-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    border-radius: var(--radius-pill);
-    font-size: 10px;
-    font-weight: 700;
-    padding: 0 6px;
-    vertical-align: middle;
-  }
-  .shared-yes {
-    background: color-mix(in srgb, var(--success) 20%, transparent);
-    color: var(--success);
-  }
-  .shared-no {
-    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+  .not-published {
     color: var(--text-muted);
-    font-size: 9px;
   }
   .shared-badges {
     display: inline-flex;

@@ -1,6 +1,5 @@
 <script lang="ts">
   import {
-    addSharedFolder,
     deleteSharedFile,
     removeSharedFolder,
     getSharedFiles,
@@ -14,12 +13,10 @@
     resumeHashing,
     setFilePriority,
     unshareFile,
-    shareFile,
     unshareFolder,
     openSharedFile as openSharedFileCommand,
     openSharedFolder as openSharedFolderCommand,
     batchSetPriority,
-    batchShare,
     batchUnshare,
     setFilesFriendsOnly,
     republishFile,
@@ -50,7 +47,13 @@
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
   import LibraryMediaPlayer from '$lib/components/LibraryMediaPlayer.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import ShareFolderBrowser from '$lib/components/ShareFolderBrowser.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import {
+    ancestorFolderPaths,
+    buildLibraryFolderTree,
+    flattenLibraryFolderTree,
+  } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -122,6 +125,7 @@
   // the DOM yet because the table is virtualized).
   let libraryTableRef: { scrollRowIntoView: (i: number) => void; openColumnMenu: (e: MouseEvent) => void } | undefined = $state(undefined);
   let filterFolder: string | null = $state(null);
+  let expandedFolders: Set<string> = $state(new Set());
   /** `upgrading` is how many files in this pass are a one-time index top-up
    *  rather than newly discovered ones — see `HashProgressEmitter` in
    *  `commands/sharing.rs`. Shown differently because it is a different thing:
@@ -168,18 +172,6 @@
     return inertBackground(createCollectionOverlay);
   });
   let addFolderOpen = $state(false);
-  let addFolderOverlay: HTMLDivElement | undefined = $state(undefined);
-  let addFolderModal: HTMLDivElement | undefined = $state(undefined);
-  $effect(() => {
-    if (!addFolderOpen || !addFolderOverlay) return;
-    return inertBackground(addFolderOverlay);
-  });
-  let addFolderBrowseBtn: HTMLButtonElement | undefined = $state(undefined);
-  $effect(() => {
-    if (!addFolderOpen) return;
-    const raf = requestAnimationFrame(() => addFolderBrowseBtn?.focus());
-    return () => cancelAnimationFrame(raf);
-  });
   let newCollName = $state('');
   let newCollAuthor = $state('');
   let selectedFileHashes: Set<string> = $state(new Set());
@@ -607,6 +599,12 @@
     return normalizePathForMatch(a) === normalizePathForMatch(b);
   }
 
+  function parentFolderName(path: string): string {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    parts.pop();
+    return parts.pop() || path;
+  }
+
   function folderDisplayName(path: string | null): string {
     if (!path) return m.library_all_folders();
     return path.split(/[\\/]/).filter(Boolean).pop() || path;
@@ -727,7 +725,10 @@
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
-      files = newFiles.map(withMatchKeys);
+      // The library is the offer list. A file that is not offered stays on
+      // disk and stays out of this view; sharing it again is the folder window.
+      const offered = newFiles.filter((f) => f.shared);
+      files = offered.map(withMatchKeys);
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
@@ -739,13 +740,13 @@
         if (error === lastLoadError) error = null;
         lastLoadError = null;
       }
-      // Drop selection entries whose file no longer exists in the library
-      // (deleted on disk, folder unshared, etc.). `newFiles` is the full
-      // library — not the filtered view — so this only prunes truly-gone
-      // paths, never rows merely hidden by an active filter. Without this the
+      // Drop selection entries whose file is no longer offered (unshared,
+      // deleted, or removed with its folder). `offered` is the library, not
+      // the filtered view, so this only prunes files that left the list.
+      // Without this the
       // bulk-bar count and later bulk ops could reference ghost paths.
       if (checkedPaths.size > 0 || selectedPath) {
-        const present = new Set(newFiles.map((f) => f.path));
+        const present = new Set(offered.map((f) => f.path));
         if (checkedPaths.size > 0) {
           let removed = false;
           const nextChecked = new Set<string>();
@@ -922,15 +923,12 @@
     }
   }
 
-  async function pickAndAddFolders() {
+  async function onFoldersPicked(selected: { added: string[]; already_shared: string[]; files_shared?: string[] }) {
     error = null;
     try {
-      const selected = await addSharedFolder();
       if (!mounted) return;
-      // The OS folder dialog shows a plain tree with no way to mark what is
-      // already shared, so picking a folder that was already in the list used
-      // to look exactly like adding one: a scanning banner, then nothing new.
-      // Say so instead — it is the only chance the user gets to find out.
+      // The in-app explorer marks already-shared folders, but the system-dialog
+      // fallback cannot, so a selection that changed nothing still needs a toast.
       if (selected.already_shared.length === 1) {
         const path = selected.already_shared[0];
         toastInfo(m.library_folder_already_shared({
@@ -941,15 +939,29 @@
           count: selected.already_shared.length.toLocaleString(),
         }));
       }
-      if (selected.added.length === 0) return;
+      const sharedFiles = selected.files_shared ?? [];
+      if (sharedFiles.length > 0) {
+        const folderNames = new Set(sharedFiles.map(parentFolderName));
+        if (folderNames.size === 1) {
+          const name = [...folderNames][0];
+          toastSuccess(sharedFiles.length === 1
+            ? m.library_shared_from_one({ name })
+            : m.library_shared_from_other({ count: sharedFiles.length.toLocaleString(), name }));
+        } else if (sharedFiles.length === 1) {
+          toastSuccess(m.library_shared_one());
+        } else {
+          toastSuccess(m.library_shared_other({ count: sharedFiles.length.toLocaleString() }));
+        }
+      }
+      if (selected.added.length === 0) {
+        if (sharedFiles.length > 0 && mounted) await refresh();
+        return;
+      }
       stoppedByUser = false;
       scanning = true;
       scanTruncated = false;
       if (mounted) await refresh();
     } catch (e: unknown) {
-      // On success the scanning banner is cleared by the background
-      // hash-progress "done" event; on an `addSharedFolder` failure no such
-      // event fires, so clear it here or the banner sticks until the 3s poll.
       if (mounted) {
         scanning = false;
         error = toErr(e);
@@ -957,17 +969,8 @@
     }
   }
 
-  async function handleAddFolder() {
-    if (folders.length === 0) {
-      await pickAndAddFolders();
-      return;
-    }
+  function handleAddFolder() {
     addFolderOpen = true;
-  }
-
-  async function browseFromAddFolderModal() {
-    addFolderOpen = false;
-    await pickAndAddFolders();
   }
 
   async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
@@ -999,7 +1002,7 @@
   }
 
   async function handleRemoveFolder(path: string) {
-    const stats = folderStats.counts.get(path) ?? 0;
+    const stats = shareFileCounts.get(path) ?? 0;
     try {
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
@@ -1012,7 +1015,7 @@
       error = null;
       await removeSharedFolder(path);
       if (!mounted) return;
-      if (filterFolder !== null && pathsEqualForFolder(filterFolder, path)) filterFolder = null;
+      if (filterFolder !== null && (pathsEqualForFolder(filterFolder, path) || isPathInFolder(filterFolder, path))) filterFolder = null;
       await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
@@ -1194,19 +1197,10 @@
   });
 
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);
-  let libraryFileStats = $derived.by(() => {
-    let shared = 0;
+  let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
-    for (const f of files) {
-      if (f.shared) shared++;
-      if (f.hash) hashed++;
-    }
-    return { shared, hashed };
-  });
-  let filteredSharedCount = $derived.by(() => {
-    let n = 0;
-    for (const f of filteredFiles) if (f.shared) n++;
-    return n;
+    for (const f of files) if (f.hash) hashed++;
+    return hashed;
   });
   let allHashedFilesSelected = $derived.by(() => {
     const list = collectionFilteredFiles;
@@ -1236,11 +1230,6 @@
   let checkedHashedCount = $derived.by(() => {
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
-    return n;
-  });
-  let checkedShareCount = $derived.by(() => {
-    let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   let checkedRestrictCount = $derived.by(() => {
@@ -1380,27 +1369,6 @@
     }
   }
 
-  async function bulkShare() {
-    if (bulkBusy) return;
-    const checked = getCheckedFiles();
-    const targets = checked.filter(f => !!f.hash && !f.shared);
-    if (targets.length === 0) {
-      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
-      else if (checked.length > 0) toastWarning(m.library_selection_already_shared());
-      else toastWarning(m.library_no_hashed_in_selection());
-      return;
-    }
-    bulkBusy = true;
-    try {
-      const count = await runBulkBatches(targets, batchShare);
-      toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
-    } catch (e: unknown) { error = toErr(e); }
-    finally {
-      await refresh();
-      bulkBusy = false;
-    }
-  }
-
   async function bulkUnshare() {
     if (bulkBusy) return;
     const checked = getCheckedFiles();
@@ -1520,17 +1488,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      const unsharedCount = targets.filter(f => !f.shared).length;
-      if (unsharedCount > 0) {
-        toastWarning(m.library_copied_with_unshared({
-          links: files.length,
-          link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
-          unshared: unsharedCount,
-          unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
-        }));
-      } else {
-        toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
-      }
+      toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -1601,36 +1559,41 @@
     return copy;
   });
 
-  // Per-folder count AND size. Superset of the old `folderCounts` map;
-  // main's cherry-picked bulk-folder-delete handler reads `.counts` and
-  // `.sizes`, and ember-V2's tree UI reads `.counts` via the same derived
-  // store. Sort shared folders by depth (deepest first) so nested
-  // shared folders attribute each file to the most specific ancestor.
-  let folderStats = $derived.by(() => {
+  // One pass over the library builds the whole sidebar: the tree's top level
+  // is the shared folders, each carrying the count and size of everything
+  // beneath it, with a file attributed to the deepest share that contains it.
+  let folderTree = $derived(buildLibraryFolderTree(folders, files, normalizePathForMatch));
+  /** Files under each shared folder, for the remove-folder confirmation. */
+  let shareFileCounts = $derived.by(() => {
     const counts = new Map<string, number>();
-    const sizes = new Map<string, number>();
-    if (folders.length === 0) return { counts, sizes };
+    for (const node of folderTree) counts.set(node.path, node.count);
+    return counts;
+  });
+  let folderRows = $derived(flattenLibraryFolderTree(folderTree, expandedFolders));
+  let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
-    const normalizedFolders = folders
-      .map((folder) => ({ folder, norm: normalizePathForMatch(folder) }))
-      .sort((a, b) => b.norm.length - a.norm.length);
-    for (const { folder } of normalizedFolders) {
-      counts.set(folder, 0);
-      sizes.set(folder, 0);
-    }
-    for (const f of files) {
-      const np = f.matchPath;
-      for (const { folder, norm } of normalizedFolders) {
-        if (np === norm || np.startsWith(`${norm}/`)) {
-          counts.set(folder, (counts.get(folder) ?? 0) + 1);
-          sizes.set(folder, (sizes.get(folder) ?? 0) + f.size);
-          break;
-        }
+  function toggleFolderExpanded(path: string, e?: Event) {
+    e?.stopPropagation();
+    const next = new Set(expandedFolders);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    expandedFolders = next;
+  }
+
+  $effect(() => {
+    if (!filterFolder) return;
+    const ancestors = ancestorFolderPaths(folderTree, filterFolder, normalizePathForMatch);
+    if (ancestors.length === 0) return;
+    const next = new Set(untrack(() => expandedFolders));
+    let changed = false;
+    for (const path of ancestors) {
+      if (!next.has(path)) {
+        next.add(path);
+        changed = true;
       }
     }
-    return { counts, sizes };
+    if (changed) expandedFolders = next;
   });
-  let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
   // --- Top Uploads (popularity panel) ---
   let topPanelOpen = $state(false);
@@ -2034,17 +1997,7 @@
           toastError(m.library_copy_failed());
           return;
         }
-        const unsharedCount = targets.filter(f => !f.shared).length;
-        if (unsharedCount > 0) {
-          toastWarning(m.library_copied_with_unshared({
-            links: files.length,
-            link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
-            unshared: unsharedCount,
-            unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
-          }));
-        } else {
-          toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
-        }
+        toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
       } catch (e: unknown) { error = toErr(e); }
       return;
     }
@@ -2064,11 +2017,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      if (!selectedFile.shared) {
-        toastWarning(m.library_copied_link_unshared_single());
-      } else {
-        toastSuccess(m.library_copied_link_one());
-      }
+      toastSuccess(m.library_copied_link_one());
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2086,6 +2035,7 @@
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
+        if (addFolderOpen) addFolderOpen = false;
       }
       return;
     }
@@ -2335,9 +2285,7 @@
             toastError(m.library_copy_failed());
             break;
           }
-          if (!f.shared) {
-            toastWarning(m.library_copied_link_unshared_single());
-          } else if (extra === 'aich') {
+          if (extra === 'aich') {
             toastSuccess(m.library_copied_ed2k_link_aich());
           } else if (extra === 'sources') {
             toastSuccess(m.library_copied_ed2k_link_sources());
@@ -2357,11 +2305,6 @@
           toastSuccess(m.library_unshared_named({ name: f.name }));
           break;
         }
-        case 'share':
-          await shareFile(f.path);
-          await refresh();
-          toastSuccess(m.library_shared_named({ name: f.name }));
-          break;
         case 'send_to_friend': {
           if (!extra) break;
           const { offerFileToFriend } = await import('$lib/api/friends');
@@ -2475,6 +2418,16 @@
         if (parsed.topPanelScope === 'session' || parsed.topPanelScope === 'alltime') {
           topPanelScope = parsed.topPanelScope;
         }
+        if (Array.isArray(parsed.expandedFolders)) {
+          const restored = new Set<string>();
+          for (const path of parsed.expandedFolders) {
+            if (typeof path === 'string' && path.length > 0 && path.length <= 1024) {
+              restored.add(path);
+              if (restored.size >= 200) break;
+            }
+          }
+          expandedFolders = restored;
+        }
       }
     } catch {
       try { localStorage.removeItem(FILTERS_KEY); } catch {}
@@ -2494,6 +2447,7 @@
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
+        expandedFolders: [...expandedFolders],
       }));
     } catch {}
   }
@@ -2502,14 +2456,18 @@
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
     void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly;
-    void topPanelOpen; void topPanelMetric; void topPanelScope;
+    void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
 
   // If the persisted folder no longer exists after folders load, clear it silently.
   $effect(() => {
     if (!filtersRestored) return;
-    if (filterFolder && folders.length > 0 && !folders.some((f) => pathsEqualForFolder(f, filterFolder!))) {
+    if (
+      filterFolder &&
+      folders.length > 0 &&
+      !folders.some((f) => pathsEqualForFolder(f, filterFolder!) || isPathInFolder(filterFolder!, f))
+    ) {
       filterFolder = null;
     }
   });
@@ -2850,7 +2808,6 @@
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
-    <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>
 
@@ -2966,9 +2923,7 @@
     <span class="inline-stats">
       <span class="inline-stat">{m.library_stat_files({ count: files.length.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_shared({ count: libraryFileStats.shared.toLocaleString() })}</span>
-      <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_hashed({ count: libraryFileStats.hashed.toLocaleString() })}</span>
+      <span class="inline-stat">{m.library_stat_hashed({ count: libraryHashedCount.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{m.library_stat_folders({ count: folders.length.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
@@ -3040,54 +2995,11 @@
   </div>
 {/if}
 
-{#if addFolderOpen}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div
-    class="modal-overlay"
-    bind:this={addFolderOverlay}
-    role="dialog"
-    aria-modal="true"
-    aria-labelledby="add-folder-title"
-    tabindex="-1"
-    onclick={(e) => { if (e.target === e.currentTarget) addFolderOpen = false; }}
-    onkeydown={(e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        addFolderOpen = false;
-        return;
-      }
-      trapTabKey(e, addFolderModal);
-    }}
-  >
-    <div class="modal-content add-folder-modal" bind:this={addFolderModal}>
-      <div class="modal-header">
-        <span id="add-folder-title" class="modal-title">{m.library_add_folder_title()}</span>
-        <button type="button" class="modal-close" onclick={() => (addFolderOpen = false)} aria-label={m.common_close()}><IconX size={15} /></button>
-      </div>
-      <div class="modal-body">
-        <p class="add-folder-hint">{m.library_add_folder_hint()}</p>
-        <p class="add-folder-current-label">{m.library_add_folder_current()}</p>
-        {#if folders.length === 0}
-          <p class="add-folder-none">{m.library_add_folder_none()}</p>
-        {:else}
-          <ul class="add-folder-list">
-            {#each folders as folder}
-              <li>
-                <span class="add-folder-name"><bdi dir="auto">{folderDisplayName(folder)}</bdi></span>
-                <span class="add-folder-path" title={folder}><bdi dir="auto">{folder}</bdi></span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="ghost" onclick={() => (addFolderOpen = false)}>{m.common_cancel()}</button>
-        <button type="button" bind:this={addFolderBrowseBtn} onclick={() => void browseFromAddFolderModal()}>{m.library_add_folder_browse()}</button>
-      </div>
-    </div>
-  </div>
-{/if}
+<ShareFolderBrowser
+  bind:open={addFolderOpen}
+  onshared={(selected) => void onFoldersPicked(selected)}
+  onerror={(e) => { error = toErr(e); }}
+/>
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -3227,7 +3139,12 @@
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
   <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
-    <div class="sidebar-header">{m.library_shared_folders()}</div>
+    <div class="sidebar-header">
+      <span class="sidebar-header-title">{m.library_shared_folders()}</span>
+      <button type="button" class="sidebar-add-btn" onclick={handleAddFolder}>
+        {m.library_add_folder()}
+      </button>
+    </div>
     <div class="folder-tree">
       <div
         class="tree-item"
@@ -3255,32 +3172,65 @@
           <span class="tree-count">{files.length.toLocaleString()}</span>
         </div>
       </div>
-      {#each folders as folder (folder)}
+      {#each folderRows as row (row.path)}
+        {@const folder = row.path}
         <div
           class="tree-item"
+          class:child={!row.isShare}
           class:active={filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
+          style="--depth: {row.depth}"
           onclick={() => filterFolder = folder}
           role="button"
           tabindex="0"
+          aria-expanded={row.hasChildren ? row.expanded : undefined}
           onkeydown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               filterFolder = folder;
+            } else if (e.key === 'ArrowRight' && row.hasChildren && !row.expanded) {
+              e.preventDefault();
+              toggleFolderExpanded(folder);
+            } else if (e.key === 'ArrowLeft' && row.expanded) {
+              e.preventDefault();
+              toggleFolderExpanded(folder);
             }
           }}
         >
           <span class="tree-main">
-            <span class="tree-icon">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
-                <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
-              </svg>
-            </span>
+            {#if row.hasChildren}
+              <button
+                type="button"
+                class="tree-icon"
+                class:open={row.expanded}
+                onclick={(e) => toggleFolderExpanded(folder, e)}
+                title={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
+                aria-label={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
+              >
+                {#if row.expanded}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                    <path d="M2 6.2h12.4L13 12.4a1 1 0 0 1-1 .8H3.4a1 1 0 0 1-1-.7z"/>
+                    <path d="M2 6.2 3.3 4.4A1 1 0 0 1 4.1 4h2.1L7.6 5.4H12"/>
+                  </svg>
+                {:else}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                    <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+                  </svg>
+                {/if}
+              </button>
+            {:else}
+              <span class="tree-icon">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                  <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+                </svg>
+              </span>
+            {/if}
             <span class="tree-folder-name" title={folder}>
-              {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
+              {row.name}
             </span>
           </span>
           <div class="tree-meta">
-            <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
+            <span class="tree-count">{row.count.toLocaleString()} &middot; {formatSize(row.size)}</span>
+            {#if row.isShare}
             <select
               class="tree-prio"
               class:tree-prio-set={!!folderPriorities[folder]}
@@ -3336,6 +3286,7 @@
                 <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
               </button>
             </span>
+            {/if}
           </div>
         </div>
       {/each}
@@ -3606,7 +3557,6 @@
           </div>
         </div>
         <span class="bulk-sep" aria-hidden="true"></span>
-        <button class="tb-btn" disabled={bulkBusy || checkedShareCount === 0} onclick={bulkShare} title={checkedShareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
         <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
         {#if checkedUnrestrictCount > 0 && checkedRestrictCount === 0}
           <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkFriendsOnly(false)} title={m.library_bulk_friends_only_off_title()}>{m.library_bulk_friends_only_off()}</button>
@@ -3634,8 +3584,6 @@
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
         <span>{m.library_status_showing({ shown: filteredFiles.length.toLocaleString(), total: files.length.toLocaleString() })}</span>
         <span class="status-sep">&middot;</span>
-        <span>{m.library_status_shared_in_view({ count: filteredSharedCount.toLocaleString() })}</span>
-        <span class="status-sep">&middot;</span>
       {/if}
       <span>{activeFolderLabel}</span>
       {#if selectedFile}
@@ -3655,10 +3603,8 @@
             <span>{fileType(selectedFile.extension) || (selectedFile.extension ? selectedFile.extension.toUpperCase() : '—')}</span>
             <span class="drawer-sub-sep" aria-hidden="true">·</span>
             <span>{formatSize(selectedFile.size)}</span>
-            {#if selectedFile.shared}
-              <span class="drawer-sub-sep" aria-hidden="true">·</span>
-              <span class="drawer-sub-shared">{m.library_shared()}</span>
-            {/if}
+            <span class="drawer-sub-sep" aria-hidden="true">·</span>
+            <span class="drawer-sub-shared">{m.library_shared()}</span>
           </span>
         </div>
         <button type="button" class="drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
@@ -3742,18 +3688,20 @@
         <section class="drawer-block">
           <h3 class="drawer-block-title">{m.library_section_sharing()}</h3>
           <div class="details-meta-grid">
-            <span class="meta-label">{m.library_col_shared()}</span>
+            <span class="meta-label">{m.library_col_published()}</span>
             <span class="meta-value meta-shared-row">
-              <span class="shared-status" class:is-shared={selectedFile.shared}>
-                {selectedFile.shared ? m.library_shared() : m.library_not_shared()}
-              </span>
               {#if selectedFile.hash}
                 <span class="meta-badges">
-                  {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
-                  {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
-                  {#if selectedFile.shared && selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
+                  {#if selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
+                  {#if selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                  {#if selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
+                {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember && !selectedFile.aich_hash}
+                  <span class="shared-status">{m.library_not_published_yet()}</span>
+                {/if}
+              {:else}
+                <span class="shared-status">{m.common_pending()}</span>
               {/if}
             </span>
             <span class="meta-label">{m.library_col_priority()}</span>
@@ -4101,8 +4049,6 @@
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_unshare_file()}</button>
-      {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_share_file()}</button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
@@ -4258,7 +4204,10 @@
     box-shadow: var(--shadow-sm);
   }
   .sidebar-header {
-    padding: 9px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px 5px 12px;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
@@ -4266,6 +4215,24 @@
     color: var(--text-muted);
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
+  }
+  /* The button keeps its width; the caption gives way, because a sidebar
+     dragged narrow still needs the action it labels. */
+  .sidebar-header-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sidebar-add-btn {
+    flex-shrink: 0;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 600;
+    /* Both inherit from the uppercase section caption beside it. */
+    text-transform: none;
+    letter-spacing: normal;
   }
   .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 8px; min-height: 80px; }
 
@@ -4427,6 +4394,7 @@
     gap: 6px;
     padding: 7px 10px;
     margin-bottom: 6px;
+    margin-left: calc(var(--depth, 0) * 12px);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--bg-surface);
@@ -4435,6 +4403,28 @@
     cursor: pointer;
     color: var(--text-secondary);
     transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
+  }
+  .tree-item.child {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    margin-bottom: 2px;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+  .tree-item.child .tree-main {
+    flex: 1 1 auto;
+  }
+  .tree-item.child .tree-meta {
+    padding-left: 0;
+    margin-left: auto;
+    flex-wrap: nowrap;
+  }
+  .tree-item.child .tree-icon {
+    width: 18px;
+    height: 18px;
   }
   .tree-item:hover {
     background: var(--bg-hover);
@@ -4470,20 +4460,32 @@
     padding-left: 32px;
     min-width: 0;
   }
-  /* Folder icon sits in a rounded tinted chip for a more deliberate, app-like
-     look; the chip and glyph both intensify on the active row. */
+  /* Folder icon sits in a rounded tinted chip. When the folder has children
+     the chip is the expander: a closed folder folds them away, an open one
+     shows them. The global button style would otherwise paint it accent-blue. */
   .tree-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 24px;
     height: 24px;
+    padding: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
     flex-shrink: 0;
+    line-height: 1;
   }
-  .tree-item.active .tree-icon {
+  button.tree-icon { cursor: pointer; }
+  button.tree-icon:hover,
+  button.tree-icon:active:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--accent);
+    transform: none;
+  }
+  .tree-item.active .tree-icon,
+  .tree-item.active button.tree-icon:hover {
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     color: var(--accent);
   }
@@ -4521,56 +4523,76 @@
     gap: 4px;
     flex-shrink: 0;
   }
-  .tree-btn {
+  /* The global `button` rule paints these accent-blue with white icons and
+     7px 14px of padding. Name the element so color, fill, and padding win,
+     otherwise both chips collapse to the same empty grey square. */
+  button.tree-btn {
     width: 22px;
     height: 22px;
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
-    background: transparent;
+    background: var(--bg-secondary);
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     line-height: 1;
+    overflow: visible;
+    transform: none;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
-  .tree-btn:focus-visible {
+  button.tree-btn svg {
+    width: 13px;
+    height: 13px;
+    min-width: 13px;
+    min-height: 13px;
+    flex-shrink: 0;
+    display: block;
+    stroke: currentColor;
+  }
+  button.tree-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
+  button.tree-btn:hover,
+  button.tree-btn:active:not(:disabled) {
+    transform: none;
+  }
   /* Rest: tinted chips with distinct glyphs (share-off vs trash). Hover/focus
-     fills the chip and swaps to a white X so the two actions stay readable
+     fills the chip and swaps to an X so the two actions stay readable
      before you point at them, then match as confirm-style controls. */
-  .tree-btn .tree-btn-idle,
-  .tree-btn .tree-btn-confirm {
+  button.tree-btn .tree-btn-idle,
+  button.tree-btn .tree-btn-confirm {
     display: inline-flex;
     align-items: center;
     justify-content: center;
   }
-  .tree-btn .tree-btn-confirm { display: none; }
-  .tree-btn:hover .tree-btn-idle,
-  .tree-btn:focus-visible .tree-btn-idle { display: none; }
-  .tree-btn:hover .tree-btn-confirm,
-  .tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
-  .tree-btn.tree-unshare {
+  button.tree-btn .tree-btn-confirm { display: none; }
+  button.tree-btn:hover .tree-btn-idle,
+  button.tree-btn:focus-visible .tree-btn-idle { display: none; }
+  button.tree-btn:hover .tree-btn-confirm,
+  button.tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
+  button.tree-btn.tree-unshare,
+  button.tree-btn.tree-unshare:active:not(:disabled) {
     color: var(--warning);
-    border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
-    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
   }
-  .tree-btn.tree-unshare:hover,
-  .tree-btn.tree-unshare:focus-visible {
+  button.tree-btn.tree-unshare:hover,
+  button.tree-btn.tree-unshare:focus-visible {
     color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
   }
-  .tree-btn.tree-remove {
+  button.tree-btn.tree-remove,
+  button.tree-btn.tree-remove:active:not(:disabled) {
     color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+    background: color-mix(in srgb, var(--danger) 16%, var(--bg-secondary));
   }
-  .tree-btn.tree-remove:hover,
-  .tree-btn.tree-remove:focus-visible {
+  button.tree-btn.tree-remove:hover,
+  button.tree-btn.tree-remove:focus-visible {
     color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
@@ -5557,51 +5579,6 @@
   .create-coll-modal {
     width: min(520px, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
-  }
-  .add-folder-modal {
-    width: min(480px, calc(100vw - 2rem));
-    max-width: calc(100vw - 2rem);
-  }
-  .add-folder-hint,
-  .add-folder-none {
-    margin: 0 0 12px;
-    font-size: 13px;
-    color: var(--text-secondary);
-  }
-  .add-folder-current-label {
-    margin: 0 0 6px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .add-folder-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    max-height: 240px;
-    overflow: auto;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-  }
-  .add-folder-list li {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .add-folder-list li:last-child {
-    border-bottom: 0;
-  }
-  .add-folder-name {
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .add-folder-path {
-    font-size: 11px;
-    color: var(--text-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .modal-header {
     display: flex;

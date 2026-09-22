@@ -1956,6 +1956,11 @@ pub fn run() {
             commands::transfers::open_downloads_folder,
             commands::transfers::recover_archive,
             commands::sharing::pick_shared_folder,
+            commands::share_browser::open_share_browser,
+            commands::share_browser::list_share_browser_children,
+            commands::share_browser::navigate_share_browser,
+            commands::share_browser::share_browser_selection,
+            commands::share_browser::close_share_browser,
             commands::sharing::confirm_dropped_folders,
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
@@ -2176,12 +2181,11 @@ pub fn run() {
             }
 
             // Files and folders dropped onto the window. Handled here rather
-            // than in the webview's own drag-drop event because that is what
-            // makes the paths usable at all: `add_shared_folder` is not an
-            // invokable command, so a path arriving from the renderer is not
-            // authorization, while one the OS delivered to this window is. The
-            // frontend still draws the drop overlay; it just no longer decides
-            // what was dropped.
+            // than in the webview's own drag-drop event because a drop the OS
+            // delivered to this window is authorization, the same way the
+            // in-app folder browser's session tokens are. The frontend still
+            // draws the drop overlay; it just no longer decides what was
+            // dropped.
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let app_handle = window.app_handle().clone();
                 let paths = paths.clone();

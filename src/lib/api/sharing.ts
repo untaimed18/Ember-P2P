@@ -8,14 +8,82 @@ export interface SharedFolderPick {
   /** Folders this selection newly shared; a scan is running for each. */
   added: string[];
   /** Folders the user picked that were already shared. Reported separately
-   *  because the picker is the OS dialog and cannot mark them in the tree, so
-   *  this is the user's only indication. */
+   *  because the system-dialog fallback cannot mark them in the tree. */
   already_shared: string[];
+  /** Files shared into a folder that was already on the list. */
+  files_shared?: string[];
 }
 
 /** Open the backend-owned native picker and add every selected folder. */
 export async function addSharedFolder(): Promise<SharedFolderPick> {
   return invoke('pick_shared_folder');
+}
+
+export type ShareBrowserKind =
+  | 'this_pc'
+  | 'home'
+  | 'desktop'
+  | 'documents'
+  | 'downloads'
+  | 'music'
+  | 'pictures'
+  | 'videos'
+  | 'drive'
+  | 'folder'
+  | 'file';
+
+export type ShareBrowserStatus = 'shareable' | 'partial' | 'already' | 'overlap' | 'blocked';
+
+export interface ShareBrowserEntry {
+  id: number;
+  name: string;
+  path: string;
+  kind: ShareBrowserKind;
+  letter?: string | null;
+  parent_id: number | null;
+  share_status: ShareBrowserStatus;
+  /** Byte length. Present for files. */
+  size?: number | null;
+  /** Files currently offered from a partly shared folder. */
+  shared_count?: number | null;
+}
+
+export interface ShareBrowserView {
+  session_id: number;
+  current: ShareBrowserEntry;
+  children: ShareBrowserEntry[];
+  /** `children` is the first page of a location with more folders and files
+   *  than the backend lists in one call. */
+  truncated: boolean;
+}
+
+export async function openShareBrowser(): Promise<ShareBrowserView> {
+  return invoke('open_share_browser');
+}
+
+export async function listShareBrowserChildren(
+  sessionId: number,
+  entryId: number,
+): Promise<ShareBrowserView> {
+  return invoke('list_share_browser_children', { sessionId, entryId });
+}
+
+export async function navigateShareBrowser(
+  sessionId: number,
+  path: string,
+): Promise<ShareBrowserView> {
+  return invoke('navigate_share_browser', { sessionId, path });
+}
+
+export async function shareBrowserSelection(
+  sessionId: number,
+  entryIds: number[],
+): Promise<SharedFolderPick> {
+  return invoke('share_browser_selection', { sessionId, entryIds });
+}
+
+export async function closeShareBrowser(sessionId: number): Promise<void> {
+  return invoke('close_share_browser', { sessionId });
 }
 
 /** Approve the folders a dropped file asked about.

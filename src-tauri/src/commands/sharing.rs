@@ -2297,7 +2297,7 @@ async fn persist_pending_intents(
     Ok(())
 }
 
-async fn persist_folder_allowlists(
+pub(crate) async fn persist_folder_allowlists(
     state: &AppState,
     updates: &[(String, Vec<String>)],
     removals: &[String],
@@ -2305,25 +2305,43 @@ async fn persist_folder_allowlists(
     if updates.is_empty() && removals.is_empty() {
         return Ok(());
     }
+    edit_folder_allowlists(state, |lists| {
+        for (folder, files) in updates {
+            let folder_key = crate::search::index::normalize_path_key(folder);
+            let file_keys = files
+                .iter()
+                .map(|path| crate::search::index::normalize_path_key(path))
+                .collect::<Vec<_>>();
+            lists.insert(folder_key, file_keys);
+        }
+        for folder in removals {
+            lists.remove(&crate::search::index::normalize_path_key(folder));
+        }
+        true
+    })
+    .await
+}
+
+/// Read-modify-write the folder allowlists as one atomic step.
+///
+/// The read has to happen under `settings_save_lock`, not before it. Callers
+/// that compute a replacement list from a snapshot taken earlier — "this list
+/// minus the file being unshared" — would otherwise write back a list that
+/// predates a concurrent edit, silently dropping a file another command had
+/// just added to the same folder.
+///
+/// `edit` returns whether it changed anything; `false` skips the disk write.
+async fn edit_folder_allowlists<F>(state: &AppState, edit: F) -> Result<(), String>
+where
+    F: FnOnce(&mut std::collections::HashMap<String, Vec<String>>) -> bool,
+{
     let _settings_save_guard = state.settings_save_lock.lock().await;
     let mut settings = {
         let config = state.config.read().await;
         config.settings.clone()
     };
-    for (folder, files) in updates {
-        let folder_key = crate::search::index::normalize_path_key(folder);
-        let file_keys = files
-            .iter()
-            .map(|path| crate::search::index::normalize_path_key(path))
-            .collect::<Vec<_>>();
-        settings
-            .pending_folder_allowlists
-            .insert(folder_key, file_keys);
-    }
-    for folder in removals {
-        settings
-            .pending_folder_allowlists
-            .remove(&crate::search::index::normalize_path_key(folder));
+    if !edit(&mut settings.pending_folder_allowlists) {
+        return Ok(());
     }
     settings.settings_revision = settings.settings_revision.saturating_add(1);
     let save_data = {
@@ -3121,15 +3139,17 @@ pub struct SharedFolderPick {
     pub added: Vec<String>,
     /// Folders the user picked that were already in the shared list.
     pub already_shared: Vec<String>,
+    /// Files added to a folder that was already shared. A new folder's files
+    /// are not listed here; they show up when that folder's scan finishes.
+    pub files_shared: Vec<String>,
 }
 
 /// Open a trusted native directory picker and add the selected folder.
 ///
-/// The renderer never receives authority to submit an arbitrary path to the
-/// sharing mutator: the only registered IPC command obtains its path directly
-/// from the OS picker. The selected paths are returned solely so the Library can
-/// update its display and report what happened; they cannot be replayed as
-/// authorization.
+/// Kept as a fallback for paths the in-app Explorer cannot reach (some UNC
+/// locations, unusual devices). The Library's primary add-folder UI is
+/// [`crate::commands::share_browser`], which lists folders and shares by
+/// session token rather than by a path the renderer invented.
 #[tauri::command]
 pub async fn pick_shared_folder(
     app: tauri::AppHandle,
@@ -3174,6 +3194,9 @@ pub async fn pick_shared_folder(
     let Some(paths) = selected else {
         return Ok(SharedFolderPick::default());
     };
+    // Choosing a folder here means the whole folder, exactly as it does in the
+    // in-app browser: drop any allowlist limiting it, and offer every file
+    // under it that was taken off the network one at a time.
     let mut result = SharedFolderPick::default();
     let mut first_error: Option<String> = None;
     for path in paths {
@@ -3181,7 +3204,24 @@ pub async fn pick_shared_folder(
         // One bad folder must not discard the rest of the selection.
         match add_shared_folder(app.clone(), state.clone(), display_path.clone()).await {
             Ok(FolderAddOutcome::Added) => result.added.push(display_path),
-            Ok(FolderAddOutcome::AlreadyShared) => result.already_shared.push(display_path),
+            Ok(FolderAddOutcome::AlreadyShared) => {
+                if let Err(error) = clear_allowlists_under(&state, &display_path).await {
+                    tracing::warn!("Could not lift the file limit on {display_path}: {error}");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                match share_all_in_folder(app.clone(), state.inner(), &display_path).await {
+                    Ok(files) if files.is_empty() => result.already_shared.push(display_path),
+                    Ok(files) => result.files_shared.extend(files),
+                    Err(error) => {
+                        tracing::warn!("Could not offer the rest of {display_path}: {error}");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!("Selected folder {display_path} was not shared: {error}");
                 if first_error.is_none() {
@@ -3196,7 +3236,10 @@ pub async fn pick_shared_folder(
     // already-shared one, which the caller reports on its own terms. On a
     // partial success the folders that worked are visible in the library, and
     // failing the whole call would hide them.
-    if result.added.is_empty() && result.already_shared.is_empty() {
+    if result.added.is_empty()
+        && result.already_shared.is_empty()
+        && result.files_shared.is_empty()
+    {
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -3400,7 +3443,7 @@ async fn queue_drop_confirmation(
     files: Vec<String>,
     reason: &'static str,
 ) {
-    let token = rand::random::<u64>();
+    let token = crate::commands::js_safe_token();
     let names: Vec<String> = folders
         .iter()
         .map(|p| {
@@ -4222,6 +4265,37 @@ pub async fn set_files_friends_only(
     Ok(count)
 }
 
+/// Offer every indexed file under `folder`. Used when a partial share (an
+/// allowlist) is promoted to a full folder share. Returns the paths that
+/// changed. Files already offered are left out of that list.
+pub(crate) async fn share_all_in_folder(
+    app: tauri::AppHandle,
+    state: &AppState,
+    folder: &str,
+) -> Result<Vec<String>, String> {
+    let (snapshot, mutation) = {
+        let mut index = state.local_index.write().await;
+        let snapshot = index.all_files().to_vec();
+        let mutation = index.set_shared_by_path_prefix(folder, true);
+        (snapshot, mutation)
+    };
+    let paths = mutation
+        .pending_paths
+        .iter()
+        .chain(mutation.hashed_paths.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    if mutation.changed_paths > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        persist_share_mutation(state, &mutation, true, snapshot).await?;
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "shared": mutation.changed_paths, "folder": folder }),
+        );
+    }
+    Ok(paths)
+}
+
 /// Bulk-unshare many files in a single Tauri call. Returns the count of
 /// files actually flipped to unshared.
 #[tauri::command]
@@ -4247,6 +4321,13 @@ pub async fn batch_unshare(
         );
         info!("Batch unshared {count}/{} files", file_paths.len());
     }
+    // Same reason as `unshare_file`: an allowlist that still names these
+    // files would re-offer them on the next scan. Includes the other copies
+    // the mutation unshared by hash, not just the requested paths.
+    let mut cleared = file_paths;
+    cleared.extend(mutation.hashed_paths);
+    cleared.extend(mutation.pending_paths);
+    drop_from_allowlists(&state, &cleared).await?;
     Ok(count)
 }
 
@@ -4978,7 +5059,56 @@ pub async fn unshare_file(
                 .unwrap_or_default()
         );
     }
+    // A partial share's allowlist is what the next scan offers. Leaving this
+    // file on it would put it back on the network, and the picker would treat
+    // it as already shared. Every path the mutation touched, not just the one
+    // that was asked for: unsharing by hash also unshares the other copies,
+    // which may sit in allowlists of their own.
+    let mut cleared = mutation.hashed_paths;
+    cleared.extend(mutation.pending_paths);
+    if !cleared.iter().any(|path| path == &file_path) {
+        cleared.push(file_path);
+    }
+    drop_from_allowlists(&state, &cleared).await?;
     Ok(())
+}
+
+/// Drop `paths` from every folder allowlist that names them. An empty list is
+/// kept rather than removed: the folder stays shared, and nothing in it is
+/// offered until the user shares the folder again.
+pub(crate) async fn drop_from_allowlists(
+    state: &AppState,
+    paths: &[String],
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let keys = paths
+        .iter()
+        .map(|path| crate::search::index::normalize_path_key(path))
+        .collect::<HashSet<_>>();
+    edit_folder_allowlists(state, |lists| {
+        let mut changed = false;
+        for files in lists.values_mut() {
+            let before = files.len();
+            files.retain(|item| !keys.contains(item));
+            changed |= files.len() != before;
+        }
+        changed
+    })
+    .await
+}
+
+/// Forget the allowlists of `folder` and anything nested under it. Used when
+/// the whole folder stops being offered, so nothing is left to re-share its
+/// files the next time they are scanned.
+async fn clear_allowlists_under(state: &AppState, folder: &str) -> Result<(), String> {
+    edit_folder_allowlists(state, |lists| {
+        let before = lists.len();
+        lists.retain(|listed, _| !crate::security::path_matches_dir(listed, folder));
+        lists.len() != before
+    })
+    .await
 }
 
 #[tauri::command]
@@ -5031,6 +5161,9 @@ pub async fn unshare_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    // Before the index write, so a failure here cannot leave an allowlist
+    // that re-offers the folder's files on the next scan.
+    clear_allowlists_under(&state, &path).await?;
     let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
@@ -5175,7 +5308,7 @@ pub async fn delete_shared_file(
     Ok(())
 }
 
-/// Check the filesystem for every indexed shared file and return the list of
+/// Check the filesystem for every file being offered and return the list of
 /// paths that no longer exist. This is cheap (a single metadata lookup per
 /// file); typical libraries finish in well under a second even with tens of
 /// thousands of files. Callers can then display the count and offer a bulk
@@ -5188,9 +5321,18 @@ pub async fn delete_shared_file(
 pub async fn scan_missing_files(
     state: tauri::State<'_, AppState>,
 ) -> Result<MissingScanResult, String> {
+    // Offered files only. The Library lists what peers can download, so a
+    // count that also included files the user has taken off the network
+    // would not match the rows the "Missing" filter can show — and a file
+    // nobody is being offered going missing is not a problem to report.
     let paths: Vec<String> = {
         let index = state.local_index.read().await;
-        index.all_files().iter().map(|f| f.path.clone()).collect()
+        index
+            .all_files()
+            .iter()
+            .filter(|file| file.shared)
+            .map(|file| file.path.clone())
+            .collect()
     };
     let result = tokio::task::spawn_blocking(move || {
         let mut missing = Vec::new();
