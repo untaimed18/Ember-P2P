@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 50;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 51;
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -40,6 +40,28 @@ pub struct FriendChatRow {
     pub delivery: i64,
     /// The friend has opened our sent message. Received rows stay false.
     pub seen: bool,
+}
+
+/// One chat attachment, as either side of it needs to see it.
+#[derive(Debug, Clone)]
+pub struct ChatAttachmentRow {
+    /// Hex of the 16-byte transfer id.
+    pub xfer_id: String,
+    pub friend_hash: String,
+    /// `"sent"` or `"received"`.
+    pub direction: String,
+    pub file_name: String,
+    pub file_size: u64,
+    /// Hex of the BLAKE3 root the chunk list is checked against.
+    pub root_hash: String,
+    /// Where a completed inbound file was written. `None` until it finishes,
+    /// and always `None` on the sending side — the sender's own path is
+    /// deliberately not exposed to anything that renders.
+    pub dest_path: Option<String>,
+    pub status: String,
+    pub transferred: u64,
+    pub chat_message_id: Option<i64>,
+    pub created_at: i64,
 }
 
 /// One row of a room's history as the UI needs it.
@@ -2380,6 +2402,46 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 51 {
+            // Chat attachments. One row is both halves of the same fact: on the
+            // sending side it is the *grant* — the only thing that authorizes
+            // one friend to read one path — and on the receiving side it is the
+            // transfer's state. Persisted rather than held in memory because
+            // both halves have to survive a restart: a grant so an interrupted
+            // transfer can resume instead of the sender having to re-pick the
+            // file, and the receiving state so a half-written `.part` is either
+            // continued or cleaned up rather than orphaned.
+            //
+            // `source_path` is only ever set on the sending side and is never
+            // sent anywhere. It is what makes an attachment servable without
+            // being in the shared library, and it is the reason `expires_at`
+            // exists: a grant nobody ever answered must stop being readable.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chat_attachments (
+                    xfer_id TEXT PRIMARY KEY,
+                    friend_hash TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    root_hash TEXT NOT NULL,
+                    source_path TEXT,
+                    dest_path TEXT,
+                    status TEXT NOT NULL,
+                    transferred INTEGER NOT NULL DEFAULT 0,
+                    chat_message_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                 CREATE INDEX IF NOT EXISTS idx_chat_attachments_friend
+                    ON chat_attachments(friend_hash, created_at);
+                 CREATE INDEX IF NOT EXISTS idx_chat_attachments_status
+                    ON chat_attachments(status, expires_at);",
+            )?;
+            set_version(&tx, 51)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -2428,6 +2490,191 @@ impl Database {
             |r| r.get(0),
         )
         .unwrap_or(0)
+    }
+
+    /// Record one chat attachment, on either side of it.
+    ///
+    /// `source_path` is set only by the sender and is what the grant lookup
+    /// resolves to; the receiver passes `None` and fills `dest_path` when the
+    /// file lands. Replaces any row with the same `xfer_id` so a re-offer of the
+    /// same transfer cannot accumulate rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_chat_attachment(
+        &self,
+        xfer_id: &str,
+        friend_hash: &str,
+        direction: &str,
+        file_name: &str,
+        file_size: u64,
+        root_hash: &str,
+        source_path: Option<&str>,
+        status: &str,
+        chat_message_id: Option<i64>,
+        created_at: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO chat_attachments (
+                xfer_id, friend_hash, direction, file_name, file_size, root_hash,
+                source_path, dest_path, status, transferred, chat_message_id,
+                created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 0, ?9, ?10, ?11)
+             ON CONFLICT(xfer_id) DO UPDATE SET
+                friend_hash = excluded.friend_hash,
+                direction = excluded.direction,
+                file_name = excluded.file_name,
+                file_size = excluded.file_size,
+                root_hash = excluded.root_hash,
+                source_path = excluded.source_path,
+                status = excluded.status,
+                chat_message_id = excluded.chat_message_id,
+                expires_at = excluded.expires_at",
+            rusqlite::params![
+                xfer_id,
+                friend_hash,
+                direction,
+                file_name,
+                file_size as i64,
+                root_hash,
+                source_path,
+                status,
+                chat_message_id,
+                created_at,
+                expires_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The live grant for `xfer_id`, if `friend_hash` is who it was granted to.
+    ///
+    /// The friend is part of the lookup rather than something the caller checks
+    /// afterwards, so a grant cannot be resolved for the wrong peer by a caller
+    /// that forgets to compare. Returns `(source_path, file_size, root_hash)`.
+    ///
+    /// Expiry is applied here too: a grant past `expires_at` is not a grant, and
+    /// leaving that to the caller would make every call site a place the
+    /// check could be missed.
+    pub fn chat_attachment_grant(
+        &self,
+        xfer_id: &str,
+        friend_hash: &str,
+        now: i64,
+    ) -> Option<(String, u64, String)> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT source_path, file_size, root_hash FROM chat_attachments
+             WHERE xfer_id = ?1 AND friend_hash = ?2 AND direction = 'sent'
+               AND source_path IS NOT NULL AND expires_at > ?3
+               AND status NOT IN ('declined', 'cancelled', 'failed', 'expired')",
+            rusqlite::params![xfer_id, friend_hash, now],
+            |row| {
+                let path: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let root: String = row.get(2)?;
+                Ok((path, size.max(0) as u64, root))
+            },
+        )
+        .ok()
+    }
+
+    /// Move an attachment to a new status, optionally recording progress and
+    /// where the finished file went.
+    pub fn set_chat_attachment_status(
+        &self,
+        xfer_id: &str,
+        status: &str,
+        transferred: Option<u64>,
+        dest_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE chat_attachments SET
+                status = ?2,
+                transferred = COALESCE(?3, transferred),
+                dest_path = COALESCE(?4, dest_path)
+             WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id, status, transferred.map(|t| t as i64), dest_path],
+        )?;
+        Ok(())
+    }
+
+    /// Every attachment for one friend, newest first, for drawing the transcript.
+    pub fn chat_attachments_for_friend(
+        &self,
+        friend_hash: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChatAttachmentRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT xfer_id, friend_hash, direction, file_name, file_size, root_hash,
+                    dest_path, status, transferred, chat_message_id, created_at
+             FROM chat_attachments WHERE friend_hash = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![friend_hash, limit.max(0)], |row| {
+                Ok(ChatAttachmentRow {
+                    xfer_id: row.get(0)?,
+                    friend_hash: row.get(1)?,
+                    direction: row.get(2)?,
+                    file_name: row.get(3)?,
+                    file_size: row.get::<_, i64>(4)?.max(0) as u64,
+                    root_hash: row.get(5)?,
+                    dest_path: row.get(6)?,
+                    status: row.get(7)?,
+                    transferred: row.get::<_, i64>(8)?.max(0) as u64,
+                    chat_message_id: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One attachment by id, whichever side of it this node is on.
+    pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT xfer_id, friend_hash, direction, file_name, file_size, root_hash,
+                    dest_path, status, transferred, chat_message_id, created_at
+             FROM chat_attachments WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| {
+                Ok(ChatAttachmentRow {
+                    xfer_id: row.get(0)?,
+                    friend_hash: row.get(1)?,
+                    direction: row.get(2)?,
+                    file_name: row.get(3)?,
+                    file_size: row.get::<_, i64>(4)?.max(0) as u64,
+                    root_hash: row.get(5)?,
+                    dest_path: row.get(6)?,
+                    status: row.get(7)?,
+                    transferred: row.get::<_, i64>(8)?.max(0) as u64,
+                    chat_message_id: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Retire attachments nobody answered, and stop their grants being readable.
+    ///
+    /// Returns how many rows moved. Offers that lapsed are marked rather than
+    /// deleted so the transcript can still say what happened to them; the grant
+    /// stops resolving either way, because `chat_attachment_grant` refuses an
+    /// expired row and refuses this status.
+    pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let moved = conn.execute(
+            "UPDATE chat_attachments SET status = 'expired'
+             WHERE expires_at <= ?1
+               AND status IN ('offered', 'awaiting', 'accepted', 'active')",
+            rusqlite::params![now],
+        )?;
+        Ok(moved)
     }
 
     /// Write a consistent, self-contained copy of the live database to `dest`.
@@ -9591,6 +9838,168 @@ mod tests {
         assert_eq!(index_count(&again), 2);
 
         drop(again);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A chat attachment's grant is the only thing that lets a friend read a
+    /// file that is not in the shared library, so every way it can stop being a
+    /// grant matters as much as the way it starts being one.
+    #[test]
+    fn a_chat_attachment_grant_resolves_only_for_its_friend_while_it_lives() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-grant-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+
+        let xfer = "ab".repeat(8);
+        let friend = "cd".repeat(8);
+        let stranger = "ef".repeat(8);
+        let now = 1_000_000i64;
+        db.upsert_chat_attachment(
+            &xfer,
+            &friend,
+            "sent",
+            "holiday.zip",
+            4096,
+            &"11".repeat(32),
+            Some("C:\\private\\holiday.zip"),
+            "offered",
+            None,
+            now,
+            now + 600,
+        )
+        .expect("insert grant");
+
+        let granted = db
+            .chat_attachment_grant(&xfer, &friend, now)
+            .expect("the friend it was granted to");
+        assert_eq!(granted.0, "C:\\private\\holiday.zip");
+        assert_eq!(granted.1, 4096);
+
+        // Another friend holding the same id gets nothing. The friend is part of
+        // the lookup so a caller cannot forget to compare it.
+        assert!(db.chat_attachment_grant(&xfer, &stranger, now).is_none());
+
+        // Past its expiry it is not a grant, without anything having to sweep.
+        assert!(db.chat_attachment_grant(&xfer, &friend, now + 601).is_none());
+
+        // And a transfer that was refused or abandoned stops resolving.
+        for status in ["declined", "cancelled", "failed", "expired"] {
+            db.set_chat_attachment_status(&xfer, status, None, None)
+                .expect("set status");
+            assert!(
+                db.chat_attachment_grant(&xfer, &friend, now).is_none(),
+                "a {status} attachment must not still be readable"
+            );
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The receiving side has no source path, so it must never look like a
+    /// grant — otherwise receiving a file would authorize serving one.
+    #[test]
+    fn a_received_attachment_is_never_a_grant() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-inbound-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let xfer = "12".repeat(8);
+        let friend = "34".repeat(8);
+        let now = 2_000_000i64;
+        db.upsert_chat_attachment(
+            &xfer,
+            &friend,
+            "received",
+            "inbound.bin",
+            10,
+            &"22".repeat(32),
+            None,
+            "awaiting",
+            None,
+            now,
+            now + 600,
+        )
+        .expect("insert inbound");
+
+        assert!(db.chat_attachment_grant(&xfer, &friend, now).is_none());
+
+        // It is still readable as a transcript row, and completing it records
+        // where the bytes landed.
+        db.set_chat_attachment_status(&xfer, "complete", Some(10), Some("C:\\dl\\Chat Files\\inbound.bin"))
+            .expect("complete it");
+        let row = db.chat_attachment(&xfer).expect("row");
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.transferred, 10);
+        assert_eq!(
+            row.dest_path.as_deref(),
+            Some("C:\\dl\\Chat Files\\inbound.bin")
+        );
+        assert_eq!(db.chat_attachments_for_friend(&friend, 10).unwrap().len(), 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// An offer nobody answered has to stop being readable on its own, or a
+    /// forgotten one leaves a path open to a friend for the life of the profile.
+    #[test]
+    fn unanswered_attachments_expire_and_stop_granting() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-expire-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let friend = "56".repeat(8);
+        let now = 3_000_000i64;
+        for (i, status) in ["offered", "active", "complete"].iter().enumerate() {
+            db.upsert_chat_attachment(
+                &format!("{:02x}", i).repeat(8),
+                &friend,
+                "sent",
+                "f.bin",
+                10,
+                &"33".repeat(32),
+                Some("C:\\private\\f.bin"),
+                status,
+                None,
+                now,
+                now + 60,
+            )
+            .expect("insert");
+        }
+
+        // Only the two that were still in flight move; a finished transfer is
+        // not "expired" and is left saying what it did.
+        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep"), 2);
+        assert_eq!(
+            db.chat_attachment(&"00".repeat(8)).expect("row").status,
+            "expired"
+        );
+        assert_eq!(
+            db.chat_attachment(&"02".repeat(8)).expect("row").status,
+            "complete"
+        );
+
+        drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));

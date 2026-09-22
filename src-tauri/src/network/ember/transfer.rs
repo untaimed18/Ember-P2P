@@ -96,6 +96,17 @@ impl HashTree {
     }
 }
 
+/// Recompute the root a chunk-hash list commits to.
+///
+/// Public because a receiver is handed the list before any file bytes and has
+/// to check it against the root it was offered. That check is what makes the
+/// per-chunk hashes trustworthy, and therefore what lets
+/// [`HashTree::verify_chunk`] reject a bad chunk as it lands instead of the
+/// whole file failing after the last byte.
+pub fn root_from_chunk_hashes(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
+    compute_root(chunk_hashes)
+}
+
 /// Compute the root hash from chunk hashes.
 fn compute_root(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
     if chunk_hashes.is_empty() {

@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod broker;
 pub mod channel;
 pub mod crypto;
