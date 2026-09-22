@@ -54677,6 +54677,17 @@ async fn handle_ember_dht_message(
         &session_extras,
     );
 
+    // A STORE that did not authenticate cost nothing the budget exists to
+    // ration, so give the charge back. `sender_id` is set for every frame that
+    // decoded, so its absence here is precisely "the version, the signature, the
+    // session binding or the identity binding was wrong". See
+    // `DhtProtection::refund_store`.
+    if is_store && inbound.sender_id.is_none() {
+        state
+            .ember_dht_protection
+            .refund_store(from.ip(), msg_type, known_sender, store_records);
+    }
+
     // Any frame that decoded proves the DHT is still reachable; prolonged
     // silence is what triggers a re-bootstrap in the maintenance loop.
     if inbound.sender_id.is_some() {

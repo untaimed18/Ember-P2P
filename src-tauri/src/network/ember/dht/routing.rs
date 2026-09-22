@@ -1589,6 +1589,18 @@ impl RoutingTable {
                         Some(pos) => {
                             bucket.replacement_cache.remove(pos);
                         }
+                        // Every entry here is promotable and proven, so there is
+                        // no one a lead outranks — and preferring proven entries
+                        // means nothing if the last resort is to drop one for a
+                        // contact nobody has ever reached. Refuse the lead
+                        // instead. This is the state a healthy bucket's cache
+                        // reaches (`enforce_scale_quotas` demotes proven
+                        // contacts into it, and promotion drains leads first),
+                        // so it is the ordinary case rather than a corner: a
+                        // `FOUND_NODE` flood aimed at one bucket could still
+                        // recycle the whole cache through this arm and own the
+                        // backfill for every later eviction.
+                        None if !contact.is_verified() => return,
                         None => {
                             bucket.replacement_cache.pop_front();
                         }
@@ -2165,6 +2177,44 @@ mod tests {
             rt.get_contact(&proven.node_id).is_some(),
             "a firsthand observation must outlive a gossip flood in the cache"
         );
+    }
+
+    /// The same rule at the point where it used to run out.
+    ///
+    /// Preferring unverified entries as eviction victims does nothing once there
+    /// are none: the last resort was "drop the oldest", so on a cache where every
+    /// entry is proven a lead still took one of their slots. That is not a corner
+    /// case — `enforce_scale_quotas` demotes proven contacts into these caches and
+    /// promotion drains the leads first, so a healthy bucket arrives there — and
+    /// it handed a `FOUND_NODE` flood the whole cache one frame at a time, which
+    /// is the backfill for every later eviction.
+    #[test]
+    fn a_cache_of_proven_entries_refuses_a_lead() {
+        let mut rt = table_with_one_full_bucket();
+        for i in 0..K_BUCKET_SIZE as u8 {
+            rt.add_contact(contact_at(0x94 + i, 81, i, 1, 1));
+        }
+        assert_eq!(
+            rt.cached_len(),
+            K_BUCKET_SIZE,
+            "the cache is full, and every entry in it has answered us"
+        );
+
+        let mut lead = contact_at(0xE8, 82, 1, 1, 1);
+        lead.last_seen = 0;
+        rt.add_contact(lead.clone());
+
+        assert!(
+            rt.get_contact(&lead.node_id).is_none(),
+            "a contact nobody has reached must not displace one we have"
+        );
+        assert_eq!(rt.cached_len(), K_BUCKET_SIZE);
+        for i in 0..K_BUCKET_SIZE as u8 {
+            assert!(
+                rt.get_contact(&make_id(0x94 + i)).is_some(),
+                "firsthand observation {i} was flushed by gossip"
+            );
+        }
     }
 
     /// Preferring proven cache entries is only safe if one that has since gone

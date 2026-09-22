@@ -544,6 +544,26 @@ impl IterativeSearch {
         })
     }
 
+    /// Whether some *other* node is still owed a page follow-up.
+    ///
+    /// Pages are outstanding work that is not a hop, so [`Self::can_still_descend`]
+    /// cannot see them, and the upper allowance tier below is justified by there
+    /// being nothing left for extra records to crowd out. A queued or in-flight
+    /// page is exactly such a thing: `check_complete` ends a `FIND_VALUE` the
+    /// moment the result budget is full, and the page queue dies with the search.
+    ///
+    /// `node`'s own pages are deliberately excluded. The upper tier exists for
+    /// the lone storer that has to page its way through the only copy of a
+    /// keyword, so counting the pages it is in the middle of serving would deny
+    /// it the tier in precisely the case the tier was added for.
+    fn pages_owed_elsewhere(&self, node: &EmberNodeId) -> bool {
+        self.page_queue.iter().any(|(id, _)| id != node)
+            || self
+                .pending_requests
+                .values()
+                .any(|p| p.is_page() && p.node != *node)
+    }
+
     /// Blobs one node may offer this search, and the pages it may be asked for.
     ///
     /// Two tiers. [`MAX_RESULTS_PER_NODE`] exists because filling the result
@@ -560,8 +580,17 @@ impl IterativeSearch {
     /// shortlist to make up the difference. KAD rations none of this
     /// (`CIndexed::SendValidKeywordResult` answers one request with up to 300),
     /// so the share was also the one axis where Ember recall sat below it.
-    fn per_node_result_allowance(&self) -> usize {
-        if self.can_still_descend() {
+    ///
+    /// "Nothing is outstanding" has to include pages owed to other nodes, not
+    /// just hops. The last shortlist answer of a round arrives after every other
+    /// entry has already responded, so on the hop test alone it was handed the
+    /// whole budget while peers that had answered earlier still had pages
+    /// queued — and filling the budget then completed the search and discarded
+    /// those pages. One flooder answering last could take the walk's whole
+    /// output and drop the records the honest storers were mid-way through
+    /// handing over.
+    fn per_node_result_allowance(&self, node: &EmberNodeId) -> usize {
+        if self.can_still_descend() || self.pages_owed_elsewhere(node) {
             MAX_RESULTS_PER_NODE
         } else {
             MAX_SEARCH_RESULTS
@@ -590,7 +619,7 @@ impl IterativeSearch {
     /// to the offer cap — which is right, since checking it costs us either way
     /// — meant it also bought the tier the cap exists to ration.
     fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
-        if self.can_still_descend() {
+        if self.can_still_descend() || self.pages_owed_elsewhere(node) {
             return MAX_PAGES_PER_NODE;
         }
         let queued = self.pages_queued.get(node).copied().unwrap_or(0);
@@ -654,11 +683,17 @@ impl IterativeSearch {
             .shortlist
             .iter()
             .any(|e| e.state == NodeState::Pending && !self.queried.contains(&e.contact.node_id));
-        let page_budget = if has_descent {
-            (can_send / 2).max(1)
-        } else {
-            can_send
-        };
+        // Half, rounded *down*, so the descent always gets the odd slot. The
+        // floor of one this used to carry handed the last free slot to a page
+        // whenever only one was free — which is the steady state of a walk at
+        // `ALPHA` concurrency, since replies arrive one at a time and each frees
+        // exactly one slot. A key that keeps paging then took every slot a reply
+        // gave back and the frontier never moved, which is the failure the half
+        // split exists to prevent, reached by the arithmetic meant to implement
+        // it. Pages cannot starve in return: the descent is finite (a bounded
+        // shortlist, each entry asked at most `MAX_QUERY_ATTEMPTS` times), and
+        // `check_complete` keeps the search alive while any page is outstanding.
+        let page_budget = if has_descent { can_send / 2 } else { can_send };
         let mut skipped_pages = Vec::new();
         while batch.len() < page_budget {
             let Some((node_id, start)) = self.page_queue.pop_front() else {
@@ -911,7 +946,7 @@ impl IterativeSearch {
         // Read once, before the loop takes a borrow of `offered_results`: the
         // shortlist states this reads cannot change inside it (the responder was
         // marked above, and nothing here queries anyone).
-        let offer_allowance = self.per_node_result_allowance();
+        let offer_allowance = self.per_node_result_allowance(from_id);
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -1108,7 +1143,7 @@ impl IterativeSearch {
         // This node has already offered everything one peer is allowed to
         // contribute, so a further page could only be discarded.
         let offered = self.offered_results.get(node).copied().unwrap_or(0);
-        if offered >= self.per_node_result_allowance() {
+        if offered >= self.per_node_result_allowance(node) {
             return;
         }
         let page_allowance = self.per_node_page_allowance(node);
@@ -3644,6 +3679,116 @@ mod tests {
             "the second node has not answered, so the walk can still descend"
         );
         assert!(!search.complete);
+    }
+
+    /// The other half again, for the outstanding work that is not a hop.
+    ///
+    /// A page is owed to a node that has already answered, so it leaves no mark
+    /// on the shortlist: every entry reads `Responded` while most of the key is
+    /// still to come. On the hop test alone, the last answer of a round was
+    /// therefore handed the whole budget — and a `FIND_VALUE` ends the moment
+    /// that budget is full, taking the page queue with it. One peer answering
+    /// last could take the walk's entire output and discard what the storer
+    /// beside it was part-way through handing over.
+    #[test]
+    fn the_share_still_binds_while_another_node_is_owed_a_page() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let pager = make_contact(0xF0);
+        let flooder = make_contact(0xE0);
+        rt.add_contact(pager.clone());
+        rt.add_contact(flooder.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.query_pairs();
+        let pager_req = batch
+            .iter()
+            .find(|(c, _)| c.node_id == pager.node_id)
+            .map(|(_, r)| *r)
+            .expect("the pager is queried");
+        let flooder_req = batch
+            .iter()
+            .find(|(c, _)| c.node_id == flooder.node_id)
+            .map(|(_, r)| *r)
+            .expect("the flooder is queried");
+
+        // The pager answers first and still owes us the rest of its key.
+        search.process_response(
+            pager_req,
+            &pager.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 600,
+            }),
+        );
+        assert!(
+            !search.page_queue.is_empty(),
+            "the pager's follow-up is queued"
+        );
+
+        // Now the last shortlist entry answers, with more than one node's share.
+        let flood: Vec<Vec<u8>> = (0..(MAX_SEARCH_RESULTS as u16 + 20))
+            .map(|i| signed_value_blob("ubuntu", i + 1))
+            .collect();
+        search.process_unpaged(flooder_req, &flooder.node_id, vec![], flood);
+
+        let from_flooder = search
+            .results
+            .iter()
+            .filter(|r| r.from_node == flooder.node_id)
+            .count();
+        assert_eq!(
+            from_flooder, MAX_RESULTS_PER_NODE,
+            "a page is still owed elsewhere, so the quarter share has to bind"
+        );
+        assert!(
+            !search.complete,
+            "and the walk must stay open to collect it"
+        );
+    }
+
+    /// `ALPHA` is 5 and replies arrive one at a time, so the steady state of a
+    /// walk is exactly one free slot. The page budget's floor of one handed that
+    /// slot to a page every time, so a key that kept paging took back every slot
+    /// a reply freed and the frontier never moved — the failure the half-split
+    /// exists to prevent, produced by the arithmetic meant to implement it.
+    #[test]
+    fn a_queued_page_does_not_take_the_last_descent_slot() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), 8);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let opening = search.next_to_query();
+        assert_eq!(opening.len(), ALPHA, "the opening round fills the budget");
+
+        // One of them answers with a page outstanding, freeing a single slot.
+        let answered = &opening[0];
+        search.process_response(
+            answered.request_id,
+            &answered.contact.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 600,
+            }),
+        );
+        assert!(!search.page_queue.is_empty(), "a page is waiting");
+
+        let next = search.next_to_query();
+        assert_eq!(next.len(), 1, "one slot freed, one query sent");
+        assert_eq!(
+            next[0].start_position, 0,
+            "the freed slot has to go to a node the walk has not asked yet, \
+             not back to the node that is paging"
+        );
     }
 
     /// A page already taken out of `page_queue` and sitting in

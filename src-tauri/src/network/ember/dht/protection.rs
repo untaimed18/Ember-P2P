@@ -143,6 +143,18 @@ impl WindowCounter {
         self.count = self.count.saturating_add(cost);
     }
 
+    /// Hand back a `cost` that [`Self::commit_n`] spent on work that then did
+    /// not happen.
+    ///
+    /// Exact only while the charge and the refund fall in the same half-window,
+    /// because that is the only bucket this can subtract from. Both callers are
+    /// a few microseconds apart inside one datagram's handling, so the window
+    /// cannot have aged between them; a refund that did somehow straddle an
+    /// ageing would under-refund, never over-refund.
+    fn refund_n(&mut self, cost: u32) {
+        self.count = self.count.saturating_sub(cost);
+    }
+
     /// When this counter last saw traffic, for the idle-entry sweep.
     fn last_activity(&self) -> Option<Instant> {
         self.window_start
@@ -435,6 +447,52 @@ impl DhtProtection {
         }
     }
 
+    /// Return the STORE budget [`Self::allow_typed`] charged for a frame that
+    /// then failed to authenticate. Arguments must be the ones it was called
+    /// with, or this refunds the wrong budget.
+    ///
+    /// The gate runs before the signature check on purpose — the point of a
+    /// cheap gate is to reject junk before paying for crypto — but the charge
+    /// outliving the frame is not part of that bargain. A record's cost is the
+    /// two Ed25519 verifications the store pays for it, and a frame whose own
+    /// signature does not verify never reaches them: the whole datagram costs
+    /// one verification, which is what [`Self::allow_frame`] already rations.
+    ///
+    /// Left charged, the minute's publish allowance could be spent entirely on
+    /// frames that were thrown away. That mattered most where the budget is
+    /// shared: a verified peer's cost also lands on its address ceiling, so
+    /// junk from one instance behind a NAT was refusing its neighbours' real
+    /// publishes.
+    pub fn refund_store(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+    ) {
+        if !matches!(
+            msg_type,
+            MSG_STORE_RECORD | MSG_PROXY_STORE | MSG_STORE_BATCH
+        ) {
+            return;
+        }
+        let cost = store_records.max(1);
+        let budget_key = match sender_id {
+            Some(id) => StoreBudgetKey::Node(id),
+            None => StoreBudgetKey::Addr(ip),
+        };
+        if let Some(counter) = self.store_counters.get_mut(&budget_key) {
+            counter.refund_n(cost);
+        }
+        // Mirrors the charge: the address ceiling is only spent alongside a
+        // node budget, never on its own.
+        if sender_id.is_some() {
+            if let Some(counter) = self.store_counters.get_mut(&StoreBudgetKey::Addr(ip)) {
+                counter.refund_n(cost);
+            }
+        }
+    }
+
     fn maybe_trim(&mut self, now: Instant) {
         if self.msg_counters.len() > MAX_IP_ENTRIES / 2 {
             self.msg_counters.retain(|_, c| {
@@ -475,6 +533,40 @@ mod tests {
         }
         assert!(!p.allow_message(ip, MSG_PING, None, 1));
         assert_eq!(p.dropped_rate_limited(), 1);
+    }
+
+    /// The gate runs before the signature check, so the charge has to be
+    /// reversible. A frame that never authenticated cost one Ed25519
+    /// verification — which `allow_frame` rations — not the two-per-record the
+    /// store budget is denominated in, and leaving it charged let junk spend a
+    /// publisher's whole minute. Worst where the cost is shared: a verified
+    /// peer's charge also lands on its address ceiling, so one instance behind a
+    /// NAT was refusing its neighbours' real publishes.
+    #[test]
+    fn a_store_that_never_authenticated_costs_nothing() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(5);
+        let ip = IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7));
+        let sender = Some([3u8; 16]);
+
+        // Far more than either window would admit — the node budget is 5 and the
+        // address ceiling 5 * MAX_STORE_IDENTITIES_PER_ADDR — all of it on frames
+        // that then fail to verify.
+        for _ in 0..40 {
+            assert!(
+                p.allow_typed(ip, MSG_STORE_BATCH, sender, 5),
+                "a refunded charge must not accumulate"
+            );
+            p.refund_store(ip, MSG_STORE_BATCH, sender, 5);
+        }
+
+        assert!(
+            p.allow_typed(ip, MSG_STORE_BATCH, sender, 5),
+            "the allowance has to survive for the peer's genuine publishes"
+        );
+        // And it is a refund, not an exemption: the charge that stuck is still
+        // charged, so the budget past it still refuses.
+        assert!(!p.allow_typed(ip, MSG_STORE_BATCH, sender, 5));
     }
 
     #[test]

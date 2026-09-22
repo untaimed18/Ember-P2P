@@ -1574,7 +1574,11 @@ impl EmberDht {
     }
 
     fn callback_grant_ok(&self, buddy: EmberNodeId, file_hash: [u8; 16], token: [u8; 16], now: Instant) -> bool {
-        if token == [0u8; 16] || token != self.callback_token(&file_hash) {
+        // Constant-time for the same reason the relay side is — see
+        // [`callback_tokens_match`]. This is the check that decides whether a
+        // buddy's `CALLBACK` opens a TCP connection to an address it named, so
+        // recovering the token here buys the same thing as recovering it there.
+        if token == [0u8; 16] || !callback_tokens_match(&self.callback_token(&file_hash), &token) {
             return false;
         }
         self.proxy_file_grants

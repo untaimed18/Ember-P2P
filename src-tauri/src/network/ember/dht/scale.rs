@@ -18,8 +18,13 @@
 //! eMule KAD enforces, because by then there is enough diversity that refusing
 //! a duplicate costs nothing.
 //!
-//! Tightening is always safe: it only refuses *new* admissions, never evicts
-//! entries admitted under an earlier, looser limit.
+//! Tightening applies to the resident set as well as to new admissions:
+//! [`super::routing::RoutingTable::enforce_scale_quotas`] re-admits every
+//! contact under the new quotas and demotes whatever no longer fits to its
+//! bucket's replacement cache. It used to refuse only new admissions, which
+//! meant whatever a cold start let in stayed for the life of the process —
+//! so the permissive tiers below, which exist for the minute or two before a
+//! table fills, set the eclipse ceiling permanently.
 
 use super::K_BUCKET_SIZE;
 
@@ -98,10 +103,11 @@ impl NetworkScale {
     /// The curve is deliberately shallow. `Established` needs 80 verified
     /// contacts, so a node on a young network sits in `Small` more or less
     /// permanently and *that* is the value which decides eclipse resistance in
-    /// practice, not the 3 at the far end. Tightening also never evicts contacts
-    /// admitted under a looser tier, so whatever a cold start allows, an adversary
-    /// present at that moment keeps for the life of the process — in the bucket
-    /// that matters most, since geometric occupancy puts half of everyone there.
+    /// practice, not the 3 at the far end — in the bucket that matters most,
+    /// since geometric occupancy puts half of everyone there. What a cold start
+    /// admits is no longer kept for the life of the process: `enforce_scale_quotas`
+    /// demotes the over-quota residents as the tiers tighten, least proven of the
+    /// most crowded group first.
     pub fn max_contacts_per_subnet_per_bucket(&self) -> usize {
         match self {
             NetworkScale::Bootstrap => 5,

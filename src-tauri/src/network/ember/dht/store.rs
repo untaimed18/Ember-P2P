@@ -256,7 +256,7 @@ pub struct DhtRecord {
     /// Ed25519 public key of the publisher.
     pub publisher_key: [u8; 32],
     /// When this record was stored locally. Retained for diagnostics and
-    /// `Debug` output; expiry and replication are driven by `expires_at`
+    /// `Debug` output; expiry and replication are driven by `expires_at_unix`
     /// and `last_republished` rather than by store time.
     #[allow(dead_code)]
     pub stored_at: Instant,
@@ -271,8 +271,28 @@ pub struct DhtRecord {
     /// one per record — each getting a fresh quota. Those are attributed to
     /// the peer we actually received them from instead.
     pub attributed_ip: Option<std::net::Ipv4Addr>,
-    /// When this record expires.
-    pub expires_at: Instant,
+    /// When this record expires, as a unix timestamp.
+    ///
+    /// Wall clock, not [`Instant`], because this is not a local schedule: it is
+    /// `created_at + `[`record_ttl`], both read from the publisher's signed body,
+    /// so it is the same death time every other holder of these bytes computes.
+    /// The neighbouring `last_republished` and `stored_at` are the opposite case
+    /// — purely local intervals — and stay monotonic.
+    ///
+    /// It was an `Instant` derived from the remaining lifetime at admission, and
+    /// that split the one fact across two clocks. A forward step of the wall
+    /// clock (NTP correcting a drifted machine) or a suspend that the monotonic
+    /// clock does not count left the signed TTL over while `expires_at` was
+    /// still in the future, so this node went on serving the record on
+    /// `FIND_VALUE` and republishing it to the k-closest, where everyone
+    /// recomputed the age from the same signed bytes and refused it. A zombie
+    /// for the length of the skew, and invisible: locally it looked live.
+    ///
+    /// Going backwards is not symmetrical and does not need guarding here: it
+    /// extends the record's local life to exactly what its signed body claims,
+    /// which is what the rest of the network is enforcing anyway. Admission
+    /// tolerates [`CLOCK_SKEW_TOLERANCE_SECS`] of it on the creation side.
+    pub expires_at_unix: i64,
     /// When we last (re)published this record to the closest nodes. Used by
     /// the maintenance loop to replicate records on a schedule so they
     /// survive node churn. Initialised to the store time so a freshly
@@ -646,11 +666,11 @@ impl DhtStore {
             }
         }
 
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let expired: Vec<[u8; 16]> = self
             .entries
             .iter()
-            .filter(|(_, records)| records.iter().all(|r| r.expires_at <= now))
+            .filter(|(_, records)| records.iter().all(|r| r.expires_at_unix <= now_unix))
             .map(|(key, _)| *key)
             .collect();
         if !expired.is_empty() {
@@ -796,7 +816,7 @@ impl DhtStore {
                 let Some(soonest) = records
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, r)| r.expires_at)
+                    .min_by_key(|(_, r)| r.expires_at_unix)
                     .map(|(i, _)| i)
                 else {
                     break;
@@ -977,7 +997,10 @@ impl DhtStore {
         }
 
         let now = Instant::now();
-        let expires_at = now + Duration::from_secs((ttl_secs - age) as u64);
+        // From the signed body rather than from "now plus what is left", which
+        // are the same instant only until a clock moves. `age < ttl_secs` was
+        // checked above, so this is still in the future.
+        let expires_at_unix = created_at.saturating_add(ttl_secs);
         let incoming_ember = ember_digest_from_record_data(&data);
         let incoming_file = file_hash_from_record_data(&data);
         let record = DhtRecord {
@@ -987,7 +1010,7 @@ impl DhtStore {
             stored_at: now,
             created_at,
             attributed_ip,
-            expires_at,
+            expires_at_unix,
             last_republished: now,
             republish_due: false,
         };
@@ -1030,7 +1053,7 @@ impl DhtStore {
             // it cannot help here.
             if existing_ember != [0u8; 32]
                 && incoming_ember == [0u8; 32]
-                && records[pos].expires_at > now
+                && records[pos].expires_at_unix > now_unix
             {
                 // Keep the richer digest, but still treat this as the
                 // republish it is: the publisher is alive and re-announcing,
@@ -1081,7 +1104,7 @@ impl DhtStore {
         // the per-peer STORE rate limit.
 
         // Reclaim this key's lapsed records before any cap counts them. All three
-        // caps below count what is resident, and a record past its `expires_at` is
+        // caps below count what is resident, and a record past its expiry is
         // already invisible to `get_live` while still holding its slot until a
         // sweep removes it. The periodic sweep runs every five minutes
         // (`expire_records` on the cleanup timer), so without this a key at its
@@ -1095,7 +1118,7 @@ impl DhtStore {
         let mut reclaimed = 0usize;
         let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
         records.retain(|r| {
-            if r.expires_at <= now {
+            if r.expires_at_unix <= now_unix {
                 let cost = record_cost(r.data.len());
                 reclaimed += cost;
                 lapsed.push((r.publisher_key, cost));
@@ -1218,17 +1241,17 @@ impl DhtStore {
     /// of up to [`MAX_RECORDS_PER_KEY`] references is an allocation per key on
     /// the single task that also drives eD2K, KAD and every UI event.
     pub fn live_records<'a>(&'a self, key: &[u8; 16]) -> impl Iterator<Item = &'a DhtRecord> + 'a {
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         self.entries
             .get(key)
             .into_iter()
             .flatten()
-            .filter(move |r| r.expires_at > now)
+            .filter(move |r| r.expires_at_unix > now_unix)
     }
 
     /// Remove expired records. Returns how many were removed.
     pub fn expire(&mut self) -> usize {
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let mut total_removed = 0;
 
         let mut freed = 0usize;
@@ -1239,7 +1262,7 @@ impl DhtStore {
             let before = records.len();
             let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
             records.retain(|r| {
-                let live = r.expires_at > now;
+                let live = r.expires_at_unix > now_unix;
                 if !live {
                     let cost = record_cost(r.data.len());
                     freed += cost;
@@ -1329,6 +1352,7 @@ impl DhtStore {
         force: bool,
     ) -> Vec<(Vec<u8>, [u8; 64])> {
         let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let mut out = Vec::new();
         let ordered: Vec<[u8; 16]> = self.entries.keys().copied().collect();
         let key_count = ordered.len();
@@ -1397,7 +1421,7 @@ impl DhtStore {
                 // runs on its own schedule, so one that dies between sweeps would
                 // otherwise be fanned out once for nothing. `persistable` skips
                 // them on the same reasoning.
-                if r.expires_at <= now {
+                if r.expires_at_unix <= now_unix {
                     continue;
                 }
                 let due =
@@ -1428,7 +1452,7 @@ impl DhtStore {
     /// are most responsible for, matching how the byte budget chooses what to
     /// drop.
     pub fn persistable(&self, max: usize) -> Vec<PersistedRecord> {
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let mut keys: Vec<[u8; 16]> = self.entries.keys().copied().collect();
         if let Some(local) = self.local_id {
             keys.sort_by_key(|key| xor_distance(&local.0, key));
@@ -1445,7 +1469,7 @@ impl DhtStore {
                 }
                 // No point writing something that expires before the next
                 // launch reads it.
-                if record.expires_at <= now {
+                if record.expires_at_unix <= now_unix {
                     continue;
                 }
                 // Source records are deliberately not carried over. Each one names
@@ -1570,6 +1594,7 @@ impl DhtStore {
     /// Source records are excluded for the same reason the batch skips them.
     pub fn republish_backlog(&self, interval: Duration) -> usize {
         let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         self.entries
             .values()
             .flat_map(|records| records.iter())
@@ -1577,7 +1602,7 @@ impl DhtStore {
             .filter(|r| channel_kind_from_data(&r.data) != Some(CHANNEL_KIND_PRESENCE))
             // Counted on the same terms the batch selects on, or the gauge
             // reports work that will never be done.
-            .filter(|r| r.expires_at > now)
+            .filter(|r| r.expires_at_unix > now_unix)
             .filter(|r| r.republish_due || now.duration_since(r.last_republished) >= interval)
             .count()
     }
@@ -1621,13 +1646,13 @@ impl DhtStore {
     ///
     /// Returns `(keys_with_at_least_one_foreign_record, foreign_record_count)`.
     pub fn foreign_stats(&self, local_publisher_key: &[u8; 32]) -> (usize, usize) {
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let mut keys = 0usize;
         let mut records = 0usize;
         for recs in self.entries.values() {
             let mut any = false;
             for r in recs {
-                if r.expires_at > now && &r.publisher_key != local_publisher_key {
+                if r.expires_at_unix > now_unix && &r.publisher_key != local_publisher_key {
                     records += 1;
                     any = true;
                 }
@@ -1679,12 +1704,15 @@ impl DhtStore {
     /// Snapshot of live keys for the diagnostic UI. Sorted by record count
     /// descending, capped at `max`.
     pub fn snapshot(&self, max: usize) -> Vec<DhtStoreEntry> {
-        let now = Instant::now();
+        let now_unix = chrono::Utc::now().timestamp();
         let mut out: Vec<DhtStoreEntry> = self
             .entries
             .iter()
             .filter_map(|(key, records)| {
-                let live: Vec<_> = records.iter().filter(|r| r.expires_at > now).collect();
+                let live: Vec<_> = records
+                    .iter()
+                    .filter(|r| r.expires_at_unix > now_unix)
+                    .collect();
                 if live.is_empty() {
                     return None;
                 }
@@ -2222,9 +2250,7 @@ mod tests {
         for records in store.entries.values_mut() {
             for (i, r) in records.iter_mut().enumerate() {
                 if i % 3 == 0 {
-                    r.expires_at = Instant::now()
-                        .checked_sub(Duration::from_secs(1))
-                        .unwrap_or_else(Instant::now);
+                    r.expires_at_unix = now_ts() - 1;
                 }
             }
         }
@@ -2539,7 +2565,7 @@ mod tests {
         // between periodic sweeps.
         let bytes_before = store.byte_len();
         for record in store.entries.get_mut(&key).expect("the key").iter_mut() {
-            record.expires_at = Instant::now() - Duration::from_secs(1);
+            record.expires_at_unix = now_ts() - 1;
         }
         assert!(
             store.get_live(&key).is_empty(),
@@ -2736,7 +2762,7 @@ mod tests {
         let rich = SignedRecord::keyword("ubuntu", [1u8; 16], [9u8; 32], 10, "f.iso", &sk);
         let key = rich.keyword_hash;
         assert!(store.store(key, rich.data.clone(), rich.signature));
-        let first_expiry = store.get(&key).unwrap()[0].expires_at;
+        let first_expiry = store.get(&key).unwrap()[0].expires_at_unix;
 
         let bare = SignedRecord::keyword("ubuntu", [1u8; 16], [0u8; 32], 10, "f.iso", &sk);
         let (bare_data, bare_sig) = redated(&bare, &sk, rich.timestamp + 120);
@@ -2750,7 +2776,7 @@ mod tests {
             "the richer digest is kept"
         );
         assert_eq!(
-            held[0].expires_at, first_expiry,
+            held[0].expires_at_unix, first_expiry,
             "and its expiry stays the one its own signed body supports — which is \
              what every other holder derives from the bytes we re-send"
         );
@@ -3135,6 +3161,31 @@ mod tests {
         assert_eq!(store.reject_stats().timestamp, 1);
     }
 
+    /// Expiry has to be the timestamp the signed body names, not a local
+    /// countdown started when the bytes happened to arrive. The two agree at the
+    /// moment of admission and diverge the moment a clock moves: a wall clock
+    /// stepped forward by NTP, or a suspend the monotonic clock did not count,
+    /// used to leave the signed TTL over while the local countdown still had
+    /// time on it — so this node kept serving the record and republishing it to
+    /// peers that all recomputed the age from these same bytes and refused it.
+    #[test]
+    fn expiry_is_the_death_time_every_holder_derives_from_the_bytes() {
+        let mut store = DhtStore::new();
+        let (sk, _) = keypair();
+        let created = now_ts() - 6 * 3600;
+        let (d, sig) = signed_body_at([7u8; 16], &[1], &sk, created);
+        let ttl = record_ttl(&d).as_secs() as i64;
+        assert!(store.store([7u8; 16], d, sig));
+
+        let recs = store.get(&[7u8; 16]).unwrap();
+        assert_eq!(
+            recs[0].expires_at_unix,
+            created + ttl,
+            "a second holder admitting these bytes at any other moment has to \
+             arrive at the same instant"
+        );
+    }
+
     #[test]
     fn rejects_record_dated_far_in_future() {
         let mut store = DhtStore::new();
@@ -3155,11 +3206,10 @@ mod tests {
         let (d, sig) = signed_body_at([5u8; 16], &[1], &sk, old_ts);
         assert!(store.store([5u8; 16], d, sig));
         let recs = store.get(&[5u8; 16]).unwrap();
-        let remaining = recs[0].expires_at.saturating_duration_since(Instant::now());
+        let remaining = recs[0].expires_at_unix - now_ts();
         assert!(
-            remaining <= Duration::from_secs(3600 + 60)
-                && remaining >= Duration::from_secs(3600 - 300),
-            "expected ~1h of remaining TTL, got {remaining:?}"
+            (3600 - 300..=3600 + 60).contains(&remaining),
+            "expected ~1h of remaining TTL, got {remaining}s"
         );
     }
 
@@ -3467,7 +3517,7 @@ mod tests {
         let held = inside.get_live(&renewed.keyword_hash);
         assert_eq!(held.len(), 1, "a republish replaces, it does not accumulate");
         assert!(
-            held[0].expires_at > Instant::now() + Duration::from_secs((ttl - 3600) as u64),
+            held[0].expires_at_unix > now_ts() + ttl - 3600,
             "the replacement carries a fresh full lifetime"
         );
     }
@@ -3483,9 +3533,7 @@ mod tests {
 
         // Force-expire the record in place (without running the sweep).
         for r in store.entries.get_mut(&key).unwrap() {
-            r.expires_at = Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+            r.expires_at_unix = now_ts() - 1;
         }
         assert!(
             store.get_live(&key).is_empty(),
@@ -3510,9 +3558,7 @@ mod tests {
                 .unwrap_or_else(Instant::now),
             created_at: now_ts() - 100,
             attributed_ip: None,
-            expires_at: Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now),
+            expires_at_unix: now_ts() - 1,
             last_republished: Instant::now(),
             republish_due: false,
         };
@@ -3574,9 +3620,7 @@ mod tests {
 
         // An expired foreign record must not count either.
         for r in store.entries.get_mut(&theirs.keyword_hash).unwrap() {
-            r.expires_at = Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+            r.expires_at_unix = now_ts() - 1;
         }
         let (keys, records) = store.foreign_stats(&us_pk);
         assert_eq!(keys, 0, "an expired foreign record must not count");
@@ -3612,9 +3656,7 @@ mod tests {
             let key = [i; 16];
             if let Some(recs) = store.entries.get_mut(&key) {
                 for r in recs.iter_mut() {
-                    r.expires_at = Instant::now()
-                        .checked_sub(Duration::from_secs(1))
-                        .unwrap_or_else(Instant::now);
+                    r.expires_at_unix = now_ts() - 1;
                 }
             }
         }
