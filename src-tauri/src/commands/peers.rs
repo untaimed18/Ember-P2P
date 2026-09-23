@@ -167,9 +167,13 @@ fn parse_16_byte_hash(
 
 pub(crate) fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>), String> {
     let trimmed = value.trim();
+    // Any case, as the deep-link handler detects it: `Ember2:` was routed
+    // here as a friend code and then refused as a malformed ID.
+    const PREFIX: &str = "ember2:";
     if let Some(rest) = trimmed
-        .strip_prefix("ember2:")
-        .or_else(|| trimmed.strip_prefix("EMBER2:"))
+        .get(..PREFIX.len())
+        .filter(|head| head.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &trimmed[PREFIX.len()..])
     {
         let mut fields = rest.split(':');
         let hash_hex = fields.next().unwrap_or_default().to_ascii_lowercase();
@@ -2685,6 +2689,22 @@ mod tests {
             parse_friend_code(&format!("ember2:{}:{}", hex::encode(expected), hex::encode(pubkey)))
                 .expect("the ember2 form still parses");
         assert_eq!((viacode, code_hash, code_pubkey), (canonical, hash, parsed_pubkey));
+    }
+
+    #[test]
+    fn the_ember2_prefix_is_accepted_in_any_case() {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+        let body = format!("{}:{}", hex::encode(hash), hex::encode(pubkey));
+        for prefix in ["ember2:", "EMBER2:", "Ember2:", "eMbEr2:"] {
+            let (_, parsed, parsed_pubkey) = parse_friend_code(&format!("{prefix}{body}"))
+                .unwrap_or_else(|e| panic!("{prefix} was refused: {e}"));
+            assert_eq!((parsed, parsed_pubkey), (hash, Some(pubkey)));
+        }
+        assert!(parse_friend_code("Ember2:").is_err());
+        assert!(parse_friend_code("émber2:").is_err());
     }
 
     /// The bare-key branch is keyed on length, so the shapes either side of it

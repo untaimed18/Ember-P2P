@@ -1292,9 +1292,11 @@ impl TransferManager {
     /// and a source restored from `sources.met` may not yet). Without copying
     /// the placeholder's origin onto the live row, the Origin column goes
     /// blank for exactly the sources that are actually working (issue 121).
-    /// Prefer the same user hash, then a placeholder at this IP, then any
-    /// other row at this IP — never a different peer behind the same NAT
-    /// when a hash match exists.
+    ///
+    /// Only rows that can be this peer: the same user hash, or a placeholder
+    /// at this IP whose hash is unknown or matches. Any other row at this IP
+    /// may be a different peer behind the same NAT, and the live row's origin
+    /// is kept from then on, so a neighbour's label would stick.
     pub fn inherited_source_origin(
         &self,
         transfer_id: &str,
@@ -1309,12 +1311,15 @@ impl TransferManager {
                 same_hash.then_some(s.origin).flatten()
             })
             .or_else(|| {
-                rows.iter()
-                    .find_map(|s| (s.ip == ip && s.placeholder).then_some(s.origin).flatten())
-            })
-            .or_else(|| {
-                rows.iter()
-                    .find_map(|s| (s.ip == ip).then_some(s.origin).flatten())
+                rows.iter().find_map(|s| {
+                    let hash_agrees = match s.user_hash.filter(|h| *h != [0u8; 16]) {
+                        None => true,
+                        Some(h) => uh == Some(h),
+                    };
+                    (s.ip == ip && s.placeholder && hash_agrees)
+                        .then_some(s.origin)
+                        .flatten()
+                })
             })
     }
 
@@ -2171,6 +2176,48 @@ mod tests {
             inherited,
             Some(SourceOrigin::Ember),
             "a live session must keep its own provenance, not a neighbour's at another IP"
+        );
+    }
+
+    #[test]
+    fn inherited_origin_never_comes_from_a_neighbour_behind_the_same_nat() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        // A contacted neighbour at our peer's IP, and a placeholder that was
+        // seeded for someone else's hash.
+        let mut neighbour = src("198.51.100.11", SourceStatus::Queued);
+        neighbour.origin = Some(SourceOrigin::Kad);
+        neighbour.port = 4662;
+        neighbour.user_hash = Some([0x11; 16]);
+        manager.update_source_detail("a", neighbour);
+
+        let mut other_placeholder = src("198.51.100.11", SourceStatus::WaitCallback);
+        other_placeholder.origin = Some(SourceOrigin::Server);
+        other_placeholder.port = 4663;
+        other_placeholder.user_hash = Some([0x33; 16]);
+        other_placeholder.placeholder = true;
+        manager.update_source_detail("a", other_placeholder);
+
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", Some([0x22; 16])),
+            None
+        );
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", None),
+            None,
+            "with no hash of our own, only a hash-less placeholder can be us"
+        );
+
+        let mut ours = src("198.51.100.11", SourceStatus::WaitCallback);
+        ours.origin = Some(SourceOrigin::Ember);
+        ours.port = 4664;
+        ours.placeholder = true;
+        manager.update_source_detail("a", ours);
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", Some([0x22; 16])),
+            Some(SourceOrigin::Ember)
         );
     }
 

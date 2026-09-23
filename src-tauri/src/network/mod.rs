@@ -2773,6 +2773,27 @@ mod rendezvous_room_selection_tests {
     }
 
     #[test]
+    fn every_rotating_room_is_revisited_before_its_registration_expires() {
+        let depth = ember::channel::CHANNEL_RENDEZVOUS_ROTATION_DEPTH as u64;
+        let roster: Vec<StoredChannel> = (0..20u8).map(|i| room(i, true)).collect();
+        let focused = [7u8; 16];
+        for focus in [None, Some(focused)] {
+            let windows: Vec<Vec<String>> = (0..24u64)
+                .map(|beat| ids(&select_rendezvous_rooms(&roster, focus, beat)))
+                .collect();
+            let reached: std::collections::HashSet<&String> = windows.iter().flatten().collect();
+            // Any room registered once has to come round again within the
+            // depth, or its entry lapses between visits.
+            for id in reached {
+                for start in 0..(windows.len() as u64 - depth) {
+                    let seen = (start..start + depth).any(|b| windows[b as usize].contains(id));
+                    assert!(seen, "{id} missed beats {start}..{} (focus {focus:?})", start + depth);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_room_we_have_left_is_never_selected() {
         let mut roster: Vec<StoredChannel> = (0..8u8).map(|i| room(i, true)).collect();
         roster[2].in_room = false;
@@ -12889,6 +12910,12 @@ pub enum NetworkCommand {
         file_hash: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Whether a file could be offered to this friend right now. Asked before
+    /// the file picker opens; `SendChatAttachment` checks the same again.
+    ChatAttachmentPreflight {
+        ember_hash: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     /// Offer a friend a file in chat. The caller has already picked, checked and
     /// hashed it off the network task, so this only records the grant and sends
     /// the offer.
@@ -15001,6 +15028,17 @@ struct NetworkState {
     last_presence_blocked: bool,
     /// Invalidates late initial/heartbeat results after timeout/disconnect.
     rendezvous_register_generation: u64,
+    /// The beat the next `/register` selects its rooms with. See
+    /// [`select_rendezvous_rooms`].
+    ///
+    /// Apart from the generation above because that one also moves on
+    /// failures, the watchdog and resets, each of which skipped a slice of
+    /// rooms that was never registered. This advances only when a
+    /// registration lands, so a retry publishes the rooms that were missed.
+    rendezvous_room_beat: u64,
+    /// The beat the last successful `/register` used, so neighbor dialing
+    /// walks the rooms we were actually published for.
+    rendezvous_published_beat: u64,
     /// Last time we registered with the rendezvous server (for heartbeat)
     rendezvous_last_register: Option<std::time::Instant>,
     /// When the last presence heartbeat was spawned, including failures.
@@ -15258,6 +15296,8 @@ struct NetworkState {
     /// delivery)` — buffered until the tick that can persist and emit them.
     /// See [`note_channel_delivery`].
     channel_delivery_notes: VecDeque<([u8; 16], [u8; 16], i64)>,
+    /// Where a full verdict buffer is flushed from outside the tick.
+    channel_delivery_sink: (Arc<Database>, tauri::AppHandle),
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Room row plus derived content keys, memoised for the packet paths.
@@ -15275,17 +15315,22 @@ struct NetworkState {
         HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
     /// Last history-sync request per (channel_id, neighbor pubkey).
     channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
-    /// The room's newest stored timestamp when we last asked this neighbor.
+    /// The room's [`Self::channel_history_sync_ingested`] count when we last
+    /// asked this neighbor.
     ///
     /// The stamp above is written when a request is *sent*, so it cannot tell
     /// a neighbor who had nothing to add from one that is still feeding us a
     /// backlog — both wait the full five minutes. A reply is not a frame we
-    /// can correlate (it arrives as ordinary gossip), but its effect is
-    /// visible: the watermark moves. When it has moved past what it was at
-    /// the ask, the gap is still closing and this neighbor is worth asking
-    /// again on the shorter [`ember::channel::CHANNEL_HISTORY_WALK_SECS`]
-    /// rather than the idle interval.
+    /// can correlate (it arrives as ordinary gossip), but its lines have a
+    /// shape of their own. When more of them have landed since the ask, the
+    /// gap is still closing and this neighbor is worth asking again on the
+    /// shorter [`ember::channel::CHANNEL_HISTORY_WALK_SECS`] rather than the
+    /// idle interval. The room's newest timestamp cannot stand in for this:
+    /// live chat advances it too.
     channel_history_sync_mark: HashMap<([u8; 16], [u8; 32]), i64>,
+    /// Lines stored per room from catch-up-shaped frames this session. See
+    /// [`ember::channel::gossip_is_catch_up_shaped`].
+    channel_history_sync_ingested: HashMap<[u8; 16], i64>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
     ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
     /// Presence blobs accumulated for a channel while any FIND_VALUE for it
@@ -15785,10 +15830,11 @@ fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
 
 /// Most delivery verdicts held between ticks.
 ///
-/// A ceiling rather than a queue that can grow: the drain runs once a second
-/// and one verdict is 33 bytes, so this only fills if something is originating
-/// faster than the tick — in which case the newest verdicts are the ones worth
-/// keeping, and every one of them is refreshed by the row it describes anyway.
+/// The drain runs once a second, so this only fills if something is
+/// originating faster than the tick. A full buffer is flushed on the spot
+/// rather than trimmed: nothing refreshes a verdict once it is dropped, so a
+/// line that had reached the room stayed queued and the next start's sweep
+/// marked it failed — inviting the user to send it a second time.
 const CHANNEL_DELIVERY_NOTE_CAP: usize = 256;
 
 /// Note what became of an originated line, for the tick to persist and emit.
@@ -15803,8 +15849,13 @@ fn note_channel_delivery(
     msg_id: [u8; 16],
     delivery: i64,
 ) {
-    while state.channel_delivery_notes.len() >= CHANNEL_DELIVERY_NOTE_CAP {
-        state.channel_delivery_notes.pop_front();
+    if state.channel_delivery_notes.len() >= CHANNEL_DELIVERY_NOTE_CAP {
+        let (db, app_handle) = state.channel_delivery_sink.clone();
+        let notes: Vec<([u8; 16], [u8; 16], i64)> =
+            std::mem::take(&mut state.channel_delivery_notes).into();
+        tokio::spawn(async move {
+            write_channel_delivery_notes(notes, &db, &app_handle).await;
+        });
     }
     state
         .channel_delivery_notes
@@ -15822,6 +15873,14 @@ async fn flush_channel_delivery_notes(
     }
     let notes: Vec<([u8; 16], [u8; 16], i64)> =
         std::mem::take(&mut state.channel_delivery_notes).into();
+    write_channel_delivery_notes(notes, db, app_handle).await;
+}
+
+async fn write_channel_delivery_notes(
+    notes: Vec<([u8; 16], [u8; 16], i64)>,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+) {
     let db_write = db.clone();
     let written = tokio::task::spawn_blocking(move || {
         let mut moved = Vec::new();
@@ -15858,7 +15917,19 @@ fn queue_channel_origin_retry(
     queued_at: std::time::Instant,
 ) {
     while state.channel_origin_retry.len() >= ember::channel::CHANNEL_ORIGIN_RETRY_CAP {
-        state.channel_origin_retry.pop_front();
+        // Evicted means never retried, so say so rather than leave the row
+        // reading "sending" until the next start's sweep.
+        let Some((_, evicted)) = state.channel_origin_retry.pop_front() else {
+            break;
+        };
+        if let Some(gossip) = ember::channel::ChannelGossip::decode(&evicted) {
+            note_channel_delivery(
+                state,
+                gossip.channel_id,
+                gossip.msg_id,
+                crate::storage::database::CHAT_FAILED,
+            );
+        }
     }
     state
         .channel_origin_retry
@@ -16847,7 +16918,14 @@ fn select_rendezvous_rooms(
     // Only rooms we could not fit rotate. Staying put while everything already
     // fits keeps a settled member's registrations at the same addresses beat
     // after beat rather than churning them for nothing.
-    let reachable = rest.len().min(ember::channel::CHANNEL_RENDEZVOUS_COVERAGE);
+    //
+    // The window is the rotating slots times the depth, not the fixed
+    // coverage: with a room on screen only three slots rotate, and walking
+    // eight rooms with them came back to each one every 2.67 beats — past the
+    // server's expiry, so registrations lapsed between visits.
+    let reachable = rest
+        .len()
+        .min(slots.saturating_mul(ember::channel::CHANNEL_RENDEZVOUS_ROTATION_DEPTH));
     let start = if reachable > slots && slots > 0 {
         ((beat as usize).saturating_mul(slots)) % reachable
     } else {
@@ -17410,11 +17488,20 @@ async fn maybe_publish_owned_channel_records(
                 // they cannot take the name when they take the room. Sent from
                 // here as well as at nomination time, because that one-shot is
                 // lost if the registry was unreachable — or if the room had no
-                // name claim yet for the nomination to attach to.
+                // name claim yet for the nomination to attach to. Sent when
+                // there is no nominee too, so a withdrawal that did not land —
+                // a ban of the nominee while the registry was down — is not
+                // left standing there. A nominee banned by a moderator's
+                // gossip is withdrawn the same way: members already refuse
+                // their claim, and the registry must not let them move the name.
                 let nominee = hex::decode(&ch.successor_nominee)
                     .ok()
                     .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                    .filter(|_| ch.claim_after_days > 0);
+                    .filter(|_| ch.claim_after_days > 0)
+                    .filter(|_| {
+                        !db.channel_member_is_banned(&ch.channel_id, &ch.successor_nominee)
+                            .unwrap_or(false)
+                    });
                 let claim_after_days = ch.claim_after_days.clamp(0, u32::MAX as i64) as u32;
                 let our_pk = identity.ed25519_public_key;
                 let our_sk = identity.ed25519_secret_key;
@@ -17424,20 +17511,17 @@ async fn maybe_publish_owned_channel_records(
                     )
                     .await;
                     if claimed.is_ok() {
-                        if let Some(nominee) = nominee {
-                            if let Err(error) =
-                                crate::network::rendezvous::register_channel_nominee(
-                                    &url,
-                                    &cid,
-                                    &cpk,
-                                    &seed,
-                                    Some(&nominee),
-                                    claim_after_days,
-                                )
-                                .await
-                            {
-                                tracing::debug!(?error, "could not re-register the room's nominee");
-                            }
+                        if let Err(error) = crate::network::rendezvous::register_channel_nominee(
+                            &url,
+                            &cid,
+                            &cpk,
+                            &seed,
+                            nominee.as_ref(),
+                            claim_after_days,
+                        )
+                        .await
+                        {
+                            tracing::debug!(?error, "could not re-register the room's nominee");
                         }
                         return;
                     }
@@ -18240,7 +18324,7 @@ async fn maybe_dial_channel_neighbors(
     };
     // Same beat the registration used, so we dial neighbors in the rooms this
     // heartbeat actually published us for rather than a different slice.
-    let beat = state.rendezvous_register_generation;
+    let beat = state.rendezvous_published_beat;
     let Ok(neighbors) =
         collect_channel_neighbor_caps(db, &roster, &our_pubkey, state.channel_focused, beat)
     else {
@@ -19072,6 +19156,11 @@ async fn overlay_forward_channel_gossip(
         .filter(|c| ember_has_live_session(state, c))
         .take(3)
         .collect();
+    // A non-member hop is still tried, since it costs one frame, but current
+    // builds refuse to forward for a room they are not in, so a send to one is
+    // not evidence of anything. Reporting it as sent settled the line as
+    // delivered when no member had been reached at all.
+    let via_members = !hops.is_empty();
     if hops.is_empty() {
         hops = state
             .ember_dht
@@ -19100,7 +19189,7 @@ async fn overlay_forward_channel_gossip(
             }
         }
     }
-    sent
+    sent && via_members
 }
 
 async fn handle_inbound_channel_relay(
@@ -19571,6 +19660,7 @@ async fn handle_inbound_channel_gossip(
         false,
     ) {
         Ok(row_id) => {
+            note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
             if ember::channel::chat_author_joins_gossip_roster(
                 ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
             ) {
@@ -19711,7 +19801,18 @@ async fn apply_channel_handoff_ready(
 ) {
     if ch.is_owner {
         if let Ok(Some((pending, pending_ver))) = db.channel_pending_handoff(&ch.channel_id) {
-            if pending.eq_ignore_ascii_case(&hex::encode(sender_pk)) && pending_ver == version {
+            let sender_hex = hex::encode(sender_pk);
+            // The pending mark only gates offering to somebody else, so it can
+            // outlive both the offer's window and the target's standing in the
+            // room. Completing on either would hand the room to someone the
+            // owner no longer meant it for.
+            let acceptable = pending.eq_ignore_ascii_case(&sender_hex)
+                && pending_ver == version
+                && ember::channel::handoff_offer_live(version, chrono::Utc::now().timestamp())
+                && !db
+                    .channel_member_is_banned(&ch.channel_id, &sender_hex)
+                    .unwrap_or(true);
+            if acceptable {
                 if let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) {
                     let ident = ember::channel::ChannelIdentity::from_seed(&seed);
                     let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
@@ -20857,6 +20958,7 @@ async fn handle_inbound_channel_edit(
             );
         }
         Ok(crate::storage::database::ChannelEditOutcome::Created(id)) => {
+            note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
             // Catch-up serves a revised line as the revision alone, so this is
             // the first time the room has seen it at all. An edit event only
             // patches a bubble that is already on screen, which left the row
@@ -21191,21 +21293,36 @@ async fn send_channel_reaction_batch(
 
 /// How long this neighbor's last ask holds before we may ask again.
 ///
-/// The short walk interval while the room's frontier is ahead of where it was
-/// when we asked them — they are feeding us a backlog and the next batch is
-/// waiting — and the idle interval otherwise. Falling back to `interval` when
-/// no mark is recorded keeps a fresh stamp behaving exactly as it did before.
+/// The short walk interval while catch-up lines have landed since we asked
+/// them — a backlog is being fed to us and the next batch is waiting — and the
+/// idle interval otherwise. Falling back to `interval` when no mark is
+/// recorded keeps a fresh stamp behaving exactly as it did before.
 fn history_sync_gate(
     state: &NetworkState,
     channel_id: [u8; 16],
     peer: &[u8; 32],
-    latest: i64,
     interval: std::time::Duration,
     walk: std::time::Duration,
 ) -> std::time::Duration {
-    match state.channel_history_sync_mark.get(&(channel_id, *peer)) {
-        Some(mark) if latest > *mark => walk,
-        _ => interval,
+    let ingested = state
+        .channel_history_sync_ingested
+        .get(&channel_id)
+        .copied()
+        .unwrap_or(0);
+    let mark = state.channel_history_sync_mark.get(&(channel_id, *peer)).copied();
+    if ember::channel::history_sync_walking(mark, ingested) {
+        walk
+    } else {
+        interval
+    }
+}
+
+/// Count a stored line toward the room's catch-up progress when it arrived
+/// the way a catch-up reply sends it.
+fn note_channel_sync_ingest(state: &mut NetworkState, channel_id: [u8; 16], ttl: u8) {
+    if ember::channel::gossip_is_catch_up_shaped(ttl) {
+        let count = state.channel_history_sync_ingested.entry(channel_id).or_insert(0);
+        *count = count.saturating_add(1);
     }
 }
 
@@ -21251,20 +21368,12 @@ async fn maybe_sync_channel_history(
         let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
             continue;
         };
-        // The room's frontier, read once: it decides both the cheap gate
-        // below (has anything landed since we asked?) and the `since` the
-        // request carries.
-        let wall = chrono::Utc::now().timestamp();
-        let latest = db
-            .latest_channel_message_timestamp(&ch.channel_id)
-            .unwrap_or(0)
-            .min(wall)
-            .max(0);
         // Cheap per-room gate: if every neighbor slot was asked recently,
         // skip loading the roster. A room with fewer stamps may have grown
-        // new XOR-neighbors and still needs the member list. A slot whose
-        // watermark has moved since the ask is not "recent" for this purpose
-        // — that neighbor is mid-walk and gets the shorter interval.
+        // new XOR-neighbors and still needs the member list. A slot that has
+        // had catch-up lines land since the ask is not "recent" for this
+        // purpose — that neighbor is mid-walk and gets the shorter interval.
+        // Ahead of every query: this runs each second for every joined room.
         let recent_stamps = state
             .channel_history_sync_at
             .iter()
@@ -21272,7 +21381,7 @@ async fn maybe_sync_channel_history(
                 if *cid != channel_id {
                     return false;
                 }
-                let gate = history_sync_gate(state, channel_id, pk, latest, interval, walk);
+                let gate = history_sync_gate(state, channel_id, pk, interval, walk);
                 now.saturating_duration_since(**at) < gate
             })
             .count();
@@ -21291,7 +21400,7 @@ async fn maybe_sync_channel_history(
             .into_iter()
             .filter(|pk| {
                 let stamp_key = (channel_id, *pk);
-                let gate = history_sync_gate(state, channel_id, pk, latest, interval, walk);
+                let gate = history_sync_gate(state, channel_id, pk, interval, walk);
                 !state
                     .channel_history_sync_at
                     .get(&stamp_key)
@@ -21304,6 +21413,17 @@ async fn maybe_sync_channel_history(
         let Some(key) = channel_content_key(db, ch) else {
             continue;
         };
+        let wall = chrono::Utc::now().timestamp();
+        let latest = db
+            .latest_channel_message_timestamp(&ch.channel_id)
+            .unwrap_or(0)
+            .min(wall)
+            .max(0);
+        let ingested = state
+            .channel_history_sync_ingested
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
         // Ask from the frontier, not from a window behind it. Asking for the
         // last six hours got the same newest 32 lines back every round: the
         // watermark is `MAX(timestamp)`, so storing that batch advanced it past
@@ -21341,10 +21461,10 @@ async fn maybe_sync_channel_history(
                 .await
             {
                 state.channel_history_sync_at.insert(stamp_key, now);
-                // The frontier as it stood when we asked. If it is ahead of
-                // this by the next pass, their reply brought lines and the
-                // walk interval applies instead of the idle one.
-                state.channel_history_sync_mark.insert(stamp_key, since);
+                // Catch-up progress as it stood when we asked. If more has
+                // landed by the next pass, a reply brought lines and the walk
+                // interval applies instead of the idle one.
+                state.channel_history_sync_mark.insert(stamp_key, ingested);
                 sent += 1;
             }
         }
@@ -23531,26 +23651,25 @@ fn offer_files_signature(files: &[ed2k::server::OfferFile]) -> (usize, u64) {
     (files.len(), fold)
 }
 
-/// Files we have not yet published this server session, capped at eMule's
-/// `SendListToServer` total (`min(soft_files, 200)`).
+/// eMule's `ED2KREPUBLISHTIME`: `CSharedFileList::Process` calls
+/// `SendListToServer` at most this often while unpublished files remain.
+const ED2K_OFFER_PACKET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Files we have not yet published this server session.
 ///
-/// Lugdunum answers a full-list republish — the same hashes sent again when
-/// a scan finishes or a download starts — with "Too many files republished
-/// by your client software. Please upgrade it." aMule bug 303 was the same
-/// shape: incremental publishing, never the whole library twice.
+/// Uncapped: the `min(soft_files, 200)` limit in `SendListToServer` is per
+/// packet, and eMule keeps sending one such packet every
+/// `ED2KREPUBLISHTIME` until nothing unpublished is left. The drain applies
+/// both. What must never happen is a hash going out twice in one session —
+/// Lugdunum answers that with "Too many files republished by your client
+/// software. Please upgrade it." (aMule bug 303 was the same shape).
 fn incremental_ed2k_offers(
     desired: Vec<ed2k::server::OfferFile>,
     already_offered: &HashSet<[u8; 16]>,
-    session_limit: usize,
 ) -> Vec<ed2k::server::OfferFile> {
-    let remaining = session_limit.saturating_sub(already_offered.len());
-    if remaining == 0 {
-        return Vec::new();
-    }
     desired
         .into_iter()
         .filter(|file| !already_offered.contains(&file.hash))
-        .take(remaining)
         .collect()
 }
 
@@ -23925,43 +24044,39 @@ mod incremental_ed2k_offer_tests {
     }
 
     #[test]
-    fn opening_dump_takes_the_emule_session_cap() {
-        let desired: Vec<_> = (1..=5).map(|n| offer(n, true)).collect();
-        let already = HashSet::new();
-        let sent = incremental_ed2k_offers(desired, &already, 2);
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0].hash, [1; 16]);
-        assert_eq!(sent[1].hash, [2; 16]);
+    fn a_library_past_one_packet_is_offered_in_full() {
+        let desired: Vec<_> = (1..=250).map(|n| offer(n, true)).collect();
+        let sent = incremental_ed2k_offers(desired, &HashSet::new());
+        assert_eq!(sent.len(), 250, "the per-packet cap belongs to the drain, not the session");
     }
 
     #[test]
     fn later_changes_send_only_new_hashes() {
         let desired: Vec<_> = (1..=4).map(|n| offer(n, true)).collect();
         let already = HashSet::from([[1; 16], [2; 16]]);
-        let sent = incremental_ed2k_offers(desired, &already, 4);
+        let sent = incremental_ed2k_offers(desired, &already);
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].hash, [3; 16]);
         assert_eq!(sent[1].hash, [4; 16]);
     }
 
     #[test]
-    fn a_full_session_does_not_republish() {
-        let desired: Vec<_> = (1..=5).map(|n| offer(n, true)).collect();
+    fn an_offered_hash_is_never_sent_twice() {
+        let desired: Vec<_> = (1..=2).map(|n| offer(n, true)).collect();
         let already = HashSet::from([[1; 16], [2; 16]]);
-        let sent = incremental_ed2k_offers(desired, &already, 2);
-        assert!(sent.is_empty());
+        assert!(incremental_ed2k_offers(desired, &already).is_empty());
     }
 
     #[test]
     fn leftover_hashes_would_skip_a_new_server_opening_dump() {
         let leftover = HashSet::from([[1; 16], [2; 16], [3; 16]]);
         assert!(
-            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &leftover, 3)
+            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &leftover)
                 .is_empty(),
             "hashes from a previous session must not count against a new server"
         );
         assert_eq!(
-            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &HashSet::new(), 3)
+            incremental_ed2k_offers((1..=3).map(|n| offer(n, true)).collect(), &HashSet::new())
                 .len(),
             3
         );
@@ -27026,10 +27141,29 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_gossip_author_times.clear();
     state.channel_history_sync_at.clear();
     state.channel_history_sync_mark.clear();
-    state.channel_origin_retry.clear();
-    // Nothing left to deliver, so nothing left to report. The rows stay queued
-    // and the startup sweep settles them the next time Ember comes up.
-    state.channel_delivery_notes.clear();
+    state.channel_history_sync_ingested.clear();
+    // Nothing is left to carry a waiting line, so it fails now: the startup
+    // sweep only settles lines left by an earlier run, and would never reach
+    // one from this session. Verdicts already reached are written out with
+    // them rather than discarded.
+    for (_, body) in std::mem::take(&mut state.channel_origin_retry) {
+        if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+            note_channel_delivery(
+                state,
+                gossip.channel_id,
+                gossip.msg_id,
+                crate::storage::database::CHAT_FAILED,
+            );
+        }
+    }
+    if !state.channel_delivery_notes.is_empty() {
+        let (db, app_handle) = state.channel_delivery_sink.clone();
+        let notes: Vec<([u8; 16], [u8; 16], i64)> =
+            std::mem::take(&mut state.channel_delivery_notes).into();
+        tokio::spawn(async move {
+            write_channel_delivery_notes(notes, &db, &app_handle).await;
+        });
+    }
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -27342,6 +27476,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
         }
     }
+    // Taken after the policy wait, which drops commands: a line sent during it
+    // never reaches the retry queue and belongs to the startup sweep.
+    let channel_sweep_cutoff = chrono::Utc::now().timestamp();
     let data_dir = crate::storage::paths::ensure_data_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let geoip = crate::geoip::empty();
@@ -27977,6 +28114,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         rendezvous_registered: false,
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
+        rendezvous_room_beat: 0,
+        rendezvous_published_beat: 0,
         rendezvous_last_register: None,
         rendezvous_last_attempt: None,
         rendezvous_register_fail_streak: 0,
@@ -28040,11 +28179,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_local_times: VecDeque::new(),
         channel_origin_retry: VecDeque::new(),
         channel_delivery_notes: VecDeque::new(),
+        channel_delivery_sink: (db.clone(), app_handle.clone()),
         channel_gossip_from_times: HashMap::new(),
         channel_view_cache: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
         channel_history_sync_mark: HashMap::new(),
+        channel_history_sync_ingested: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
@@ -29296,6 +29437,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Chunked OP_OFFERFILES across loop turns (post-login + shared-files changes).
     let mut pending_offer_files: Option<Vec<ed2k::server::OfferFile>> = None;
     let mut pending_offer_signature: Option<(usize, u64)> = None;
+    let mut next_offer_packet_at: Option<tokio::time::Instant> = None;
 
     let (aich_set_tx, mut aich_set_rx) =
         tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
@@ -30082,8 +30224,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             ed2k::preview::cleanup_previews();
         }
 
-        // Drain at most one OP_OFFERFILES chunk per loop turn so large libraries
-        // cannot monopolize the network task (IPC/UDP/timers keep running).
+        // Drain at most one OP_OFFERFILES chunk per `ED2K_OFFER_PACKET_INTERVAL`,
+        // as eMule's `CSharedFileList::Process` does; the first packet after
+        // login goes out at once.
         if state.request_offer_files && pending_offer_files.is_none() {
             state.request_offer_files = false;
             if state.server_connected {
@@ -30161,11 +30304,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
                 let signature = offer_files_signature(&offer_files);
-                let limit = state
-                    .server_connection
-                    .as_ref()
-                    .map(|c| c.offer_files_chunk_limit())
-                    .unwrap_or(200);
                 if offer_files.is_empty() {
                     pending_offer_signature = Some(signature);
                     if state.offered_ed2k_hashes.is_empty() {
@@ -30177,11 +30315,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         pending_offer_files = Some(Vec::new());
                     }
                 } else {
-                    let incremental = incremental_ed2k_offers(
-                        offer_files,
-                        &state.offered_ed2k_hashes,
-                        limit,
-                    );
+                    let incremental =
+                        incremental_ed2k_offers(offer_files, &state.offered_ed2k_hashes);
                     pending_offer_signature = Some(signature);
                     if incremental.is_empty() {
                         state.last_offer_files_signature = Some(signature);
@@ -30192,7 +30327,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
             }
         }
-        if let Some(files) = pending_offer_files.as_mut() {
+        let offer_packet_due =
+            next_offer_packet_at.is_none_or(|at| tokio::time::Instant::now() >= at);
+        if let Some(files) = pending_offer_files.as_mut().filter(|_| offer_packet_due) {
             if state.server_connection.is_some() {
                 let limit = state
                     .server_connection
@@ -30206,6 +30343,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if !chunk.is_empty() {
                         match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
                             Ok(()) => {
+                                next_offer_packet_at =
+                                    Some(tokio::time::Instant::now() + ED2K_OFFER_PACKET_INTERVAL);
                                 record_offered_ed2k_hashes(&mut state, &chunk);
                                 if files.is_empty() {
                                     pending_offer_files = None;
@@ -30238,6 +30377,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // no-op.
                         match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
                             Ok(()) => {
+                                next_offer_packet_at =
+                                    Some(tokio::time::Instant::now() + ED2K_OFFER_PACKET_INTERVAL);
                                 pending_offer_files = None;
                                 state.offered_ed2k_hashes.clear();
                                 if let Some(sig) = pending_offer_signature.take() {
@@ -36993,7 +37134,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &db,
                                 rv_pubkey,
                                 state.channel_focused,
-                                state.rendezvous_register_generation,
+                                state.rendezvous_room_beat,
                             )
                             .await;
                         let tx = rendezvous_register_result_tx.clone();
@@ -37066,7 +37207,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &db,
                                 rv_pubkey,
                                 state.channel_focused,
-                                state.rendezvous_register_generation,
+                                state.rendezvous_room_beat,
                             )
                             .await;
                         let tx = rendezvous_register_result_tx.clone();
@@ -37413,6 +37554,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         // Social relay session: the friend that
                                         // opened it sends Hello first.
                                         serve_friend_ember_hash: None,
+                                        relayed: true,
                                     })
                                     .await
                                 {
@@ -37829,6 +37971,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             reader: Box::new(recv),
                                             writer: Box::new(send),
                                             serve_friend_ember_hash: serve_friend,
+                                            relayed: false,
                                         };
                                         if let Err(e) = punch_cb_tx.try_send(req) {
                                             tracing::debug!("Punch responder: dropping punched stream: {e}");
@@ -38531,15 +38674,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // Same cadence, same reason: the ceiling is in days, and a
                     // withdrawal nobody can deliver is holding the address of
                     // someone the user removed.
-                    // A room line still queued when this first runs was left
+                    // A room line queued before this run started was left
                     // mid-flight by a previous run: the retry that would have
                     // settled it lived in memory and went with the process, so
-                    // nothing else will ever move it off "sending".
+                    // nothing else will ever move it off "sending". Lines from
+                    // this run are left to the retry queue that holds them.
                     if !channel_queue_settled {
                         channel_queue_settled = true;
                         let db_channel = db.clone();
                         match tokio::task::spawn_blocking(move || {
-                            db_channel.fail_stale_queued_channel_messages()
+                            db_channel.fail_stale_queued_channel_messages(channel_sweep_cutoff)
                         })
                         .await
                         {
@@ -44430,15 +44574,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 // skipped `reset_ed2k_server_session` would make
                                 // incremental skip the opening dump entirely.
                                 state.offered_ed2k_hashes.clear();
+                                next_offer_packet_at = None;
                                 let limit = conn.offer_files_chunk_limit();
                                 let signature = offer_files_signature(&offer_files);
-                                let incremental = incremental_ed2k_offers(
-                                    offer_files,
-                                    &state.offered_ed2k_hashes,
-                                    limit,
-                                );
+                                let incremental =
+                                    incremental_ed2k_offers(offer_files, &state.offered_ed2k_hashes);
                                 info!(
-                                    "Queuing {} files to offer to server (session cap {limit})",
+                                    "Queuing {} files to offer to server ({limit} per packet)",
                                     incremental.len()
                                 );
                                 pending_offer_signature = Some(signature);
@@ -46053,6 +46195,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         state.last_presence_blocked = outcome.existing_friends_blocked();
                         state.rendezvous_last_register = Some(std::time::Instant::now());
                         state.rendezvous_register_fail_streak = 0;
+                        // Nothing else moves the room beat, so the one this
+                        // registration selected with is still current.
+                        state.rendezvous_published_beat = state.rendezvous_room_beat;
+                        state.rendezvous_room_beat = state.rendezvous_room_beat.wrapping_add(1);
                         if result.initial {
                             state.friend_presence_initial_done = true;
                         }

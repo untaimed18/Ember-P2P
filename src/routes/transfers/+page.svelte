@@ -2,7 +2,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES } from '$lib/stores/transfers';
+  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -45,7 +45,7 @@
     transferHealthReasonText,
   } from '$lib/i18n';
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
-  import { uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
+  import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -993,8 +993,11 @@
     return { all, active, completed, failed, queued };
   });
   let activeUploads = $derived(uploadPartition.active);
+  // The cap in force, which a schedule rule or USS can hold away from the
+  // manual setting — see `uploadCapInForce`.
+  let uploadCap = $derived(uploadCapInForce($effectiveUploadSpeed, $appSettings?.max_upload_speed));
   // Scale displayed upload-slot speeds so their sum cannot exceed the
-  // configured cap (issue 115). A slot handover otherwise left the remaining
+  // cap in force (issue 115). A slot handover otherwise left the remaining
   // rows at their pre-handover window rates while a fresh slot added a burst,
   // so the column sum read above the limit the user had set. Deliberately not
   // bounded by `$networkStats.upload_speed` as well: that figure is sampled
@@ -1005,7 +1008,7 @@
   // rendered idle.
   let uploadSpeedScale = $derived.by(() =>
     uploadScaleFactor(
-      uploadSumBound($appSettings?.max_upload_speed ?? 0),
+      uploadSumBound(uploadCap),
       activeUploads.filter((t) => !IDLE_STATUSES.has(t.status)).map((t) => t.speed),
     ),
   );
@@ -1852,12 +1855,11 @@
       // counter used to be payload (compression-inflated) and is sampled
       // against the time since the row appeared, which is how a fresh slot
       // printed 350 kB/s against a 200 kB/s cap (issue 115). Scale the
-      // backend rates so the visible slot sum cannot exceed the configured
-      // limit.
+      // backend rates so the visible slot sum cannot exceed the limit in
+      // force.
       if (t.speed <= 0) return 0;
       const scaled = t.speed * uploadSpeedScale;
-      const cap = $appSettings?.max_upload_speed ?? 0;
-      return cap > 0 ? Math.min(scaled, cap) : scaled;
+      return uploadCap > 0 ? Math.min(scaled, uploadCap) : scaled;
     }
     if (t.speed > 0) return t.speed;
     const entry = speedHistory.get(t.id);

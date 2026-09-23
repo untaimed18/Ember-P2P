@@ -3373,11 +3373,11 @@ pub async fn ban_channel_member(
         // rotation the key store refused — left the nomination already gone, with
         // the ban not applied and nothing to put it back. The owner saw a failed
         // ban and had no way to know their successor had been wiped too.
-        let owned = if owned
+        let withdraws_nominee = owned
             .row
             .successor_nominee
-            .eq_ignore_ascii_case(&hex::encode(pk))
-        {
+            .eq_ignore_ascii_case(&hex::encode(pk));
+        let owned = if withdraws_nominee {
             OwnedChannel {
                 row: StoredChannel {
                     successor_nominee: String::new(),
@@ -3395,6 +3395,29 @@ pub async fn ban_channel_member(
         // matters twice over, because the snapshot carries the new epoch number
         // and that is how the remaining members learn to fetch it.
         rotate_and_commit(&state, &owned, &bans, &mods).await?;
+        if withdraws_nominee {
+            register_nominee_with_registry(&state, &owned, None, 0).await;
+        }
+        // An offer still waiting on them would otherwise complete the moment
+        // their ready reply arrived, handing the room to the person just
+        // evicted from it.
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        let pending = tokio::task::spawn_blocking(move || db.channel_pending_handoff(&id))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
+        if pending.is_some_and(|(waiting_on, _)| waiting_on.eq_ignore_ascii_case(&hex::encode(pk)))
+        {
+            if let Err(e) = clear_channel_pending_handoff(&state, &channel_id).await {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    error = %e,
+                    "banned the pending successor but could not withdraw the transfer offer"
+                );
+            }
+        }
         // The rotation locks them out of what the room sends next, but a
         // transfer already under way runs on a key pair of its own and would
         // have carried on delivering.
@@ -3663,32 +3686,6 @@ pub async fn set_channel_successor_nominee(
         ..owned
     };
 
-    // The members learn the nomination from the moderation record below, but
-    // the name registry cannot read that — so tell it separately. Without this
-    // the nominee could take the room and still not be able to move its name,
-    // because the record would stay bound to the abandoned room's key.
-    let url = rendezvous_url(&state).await;
-    if !url.is_empty() {
-        if let Err(e) = registry_call(crate::network::rendezvous::register_channel_nominee(
-            &url,
-            &owned.ident.channel_id,
-            &owned.ident.pubkey,
-            &owned.ident.seed(),
-            nominee.as_ref(),
-            days as u32,
-        ))
-        .await
-        {
-            // Not fatal: the nomination itself lives in the signed record, and
-            // an unreachable registry only delays the name following the room.
-            tracing::warn!(
-                channel_id = %channel_id,
-                error = ?e,
-                "saved the nominee but could not register it with the name registry"
-            );
-        }
-    }
-
     // Publishes the nomination and stores it, in that order and as one step.
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mods = load_moderator_pubkeys(&state, &channel_id).await?;
@@ -3701,7 +3698,45 @@ pub async fn set_channel_successor_nominee(
         &mods,
     )
     .await?;
+    // Only once the commit has landed: a registry told first would hold a
+    // nominee the room never had whenever the commit then refused.
+    register_nominee_with_registry(&state, &owned, nominee.as_ref(), u32::from(days)).await;
     channel_info_from_id(&state, &channel_id).await
+}
+
+/// Tell the name registry who may inherit the room's name.
+///
+/// Members learn the nomination from the moderation record, but the registry
+/// cannot read that. Without this a nominee could take the room and still not
+/// move its name — or, once withdrawn, still move it after being banned.
+/// Not fatal on failure: the owner's periodic republish re-sends the current
+/// nominee, so an unreachable registry only delays it catching up.
+async fn register_nominee_with_registry(
+    state: &AppState,
+    owned: &OwnedChannel,
+    nominee: Option<&[u8; 32]>,
+    claim_after_days: u32,
+) {
+    let url = rendezvous_url(state).await;
+    if url.is_empty() {
+        return;
+    }
+    if let Err(e) = registry_call(crate::network::rendezvous::register_channel_nominee(
+        &url,
+        &owned.ident.channel_id,
+        &owned.ident.pubkey,
+        &owned.ident.seed(),
+        nominee,
+        claim_after_days,
+    ))
+    .await
+    {
+        tracing::warn!(
+            channel_id = %owned.row.channel_id,
+            error = ?e,
+            "saved the nominee but could not update the name registry"
+        );
+    }
 }
 
 /// Take over a room whose owner has gone silent, as the member they nominated.
@@ -4488,13 +4523,7 @@ pub async fn transfer_channel_ownership(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
     if let Some((waiting_on, offered_at)) = pending {
-        // The version is the offer's own wall-clock second, so it doubles as
-        // its age. A negative age means the clock moved backwards under us,
-        // which must not wedge the room either.
-        let age = chrono::Utc::now()
-            .timestamp()
-            .saturating_sub(offered_at as i64);
-        let lapsed = !(0..channel::HANDOFF_PENDING_TTL_SECS).contains(&age);
+        let lapsed = !channel::handoff_offer_live(offered_at, chrono::Utc::now().timestamp());
         if !lapsed && !waiting_on.eq_ignore_ascii_case(&hex::encode(pk)) {
             return Err(coded(
                 "channels_handoff_pending",

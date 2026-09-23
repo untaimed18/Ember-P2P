@@ -42,6 +42,17 @@ describe('computeRowWindow', () => {
     // re-measure until the user scrolled.
     expect(window.end).toBeGreaterThan(window.start);
     expect(window.start).toBeLessThan(12);
+    // And the whole of what is left, not the last row alone: `{ start: 11,
+    // end: 12 }` was one row behind the same spacer.
+    expect(window).toEqual({ start: 0, end: 12 });
+  });
+
+  it('anchors a stale scroll past the end of a long list to its last screenful', () => {
+    // 200 rows left, scrolled as though there were 500: the last 20 that fit,
+    // plus overscan above them.
+    const window = computeRowWindow({ ...base, total: 200, bodyTop: -500 * 34 });
+
+    expect(window).toEqual({ start: 172, end: 200 });
   });
 
   it('renders nothing for an empty list', () => {

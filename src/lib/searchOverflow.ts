@@ -32,6 +32,11 @@ import type { SearchResult } from '$lib/types';
  * a small minority of any result set big enough to overflow, so in practice it
  * survives whole and the cost is a few of the ordinary rows it displaces.
  *
+ * The spam flag still outranks position across classes. Positions are counted
+ * separately for flagged and unflagged rows, and the flag is compared first, so
+ * a flagged Ember row near the top of its class cannot sort ahead of a clean
+ * KAD row further down its own.
+ *
  * Mutates `results` in place, because the caller has just built it.
  */
 export function shedWeakestRows(results: SearchResult[], keep: number): void {
@@ -40,23 +45,26 @@ export function shedWeakestRows(results: SearchResult[], keep: number): void {
   // Availability still orders the flagged rows among themselves, so if a tab
   // is so polluted that only spam is left to keep, the least implausible of it
   // survives.
+  const flagged = (r: SearchResult) => (r.is_spam ? 1 : 0);
   const strongerFirst = (a: SearchResult, b: SearchResult) =>
-    (a.is_spam ? 1 : 0) - (b.is_spam ? 1 : 0) || (b.availability || 0) - (a.availability || 0);
+    flagged(a) - flagged(b) || (b.availability || 0) - (a.availability || 0);
   const isEmber = (r: SearchResult) => (r.result_origin || '').includes('Ember');
   // Indices rather than sorting the objects twice. `sort` is stable, so equal
   // strength keeps the earlier-seen hit inside each class.
   const rank = new Map<number, number>();
   for (const wantEmber of [true, false]) {
-    const members: number[] = [];
-    for (let i = 0; i < results.length; i++) {
-      if (isEmber(results[i]) === wantEmber) members.push(i);
+    for (const wantFlagged of [0, 1]) {
+      const members: number[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (isEmber(results[i]) === wantEmber && flagged(results[i]) === wantFlagged) members.push(i);
+      }
+      members.sort((a, b) => strongerFirst(results[a], results[b]));
+      members.forEach((idx, position) => rank.set(idx, position));
     }
-    members.sort((a, b) => strongerFirst(results[a], results[b]));
-    members.forEach((idx, position) => rank.set(idx, position));
   }
   const ordered = results
     .map((row, i) => ({ row, rank: rank.get(i) ?? 0 }))
-    .sort((a, b) => a.rank - b.rank || strongerFirst(a.row, b.row));
+    .sort((a, b) => flagged(a.row) - flagged(b.row) || a.rank - b.rank || strongerFirst(a.row, b.row));
   for (let i = 0; i < keep; i++) results[i] = ordered[i].row;
   results.length = keep;
 }

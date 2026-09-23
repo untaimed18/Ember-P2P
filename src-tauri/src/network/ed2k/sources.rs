@@ -22,6 +22,9 @@ const MINCOMMONPENALTY: i64 = 4;
 const SOURCE_EXPIRY_SECS: i64 = 3600;
 const MAX_SOURCES_IN_RESPONSE: usize = 500;
 const MAX_TRACKED_FILES: usize = 500;
+/// Ceiling on [`SourceManager::unregistered_sx_sent`]. Losing a stamp only
+/// allows one early re-ask, so this is sized for memory, not precision.
+const MAX_UNREGISTERED_SX_STAMPS: usize = 1024;
 
 /// eMule: minimum gap between TCP connection attempts to the same source (20 min)
 const MIN_TCP_RECONNECT_SECS: i64 = 1200;
@@ -1446,6 +1449,10 @@ fn origin_from_persist_byte(tag: u8) -> Option<crate::types::SourceOrigin> {
 pub struct SourceManager {
     sources: HashMap<[u8; 16], Vec<SourceEntry>>,
     max_per_file: usize,
+    /// `last_sx_sent` for a `(file, ip, port)` we asked for sources but hold no
+    /// row for, so [`Self::can_request_sources_for`] can apply its intervals to
+    /// it too. Runtime only, bounded by [`MAX_UNREGISTERED_SX_STAMPS`].
+    unregistered_sx_sent: HashMap<([u8; 16], Ipv4Addr, u16), i64>,
 }
 
 impl Default for SourceManager {
@@ -1459,6 +1466,7 @@ impl SourceManager {
         Self {
             sources: HashMap::new(),
             max_per_file: MAX_SOURCES_PER_FILE,
+            unregistered_sx_sent: HashMap::new(),
         }
     }
 
@@ -1469,6 +1477,7 @@ impl SourceManager {
     /// Drop every remembered source for `file_hash` (friends-only retract).
     pub fn remove_file(&mut self, file_hash: &[u8; 16]) {
         self.sources.remove(file_hash);
+        self.unregistered_sx_sent.retain(|(fh, _, _), _| fh != file_hash);
     }
 
     /// `origin` says which network is telling us about this source, for the
@@ -1547,7 +1556,7 @@ impl SourceManager {
         // Carry the provenance of the row discovery created onto this one, so a
         // lookup by the live port still names the network that found the peer
         // (issue 121). Same-file only: see `get_source_origin`.
-        let origin = self.origin_in_file(&file_hash, ip, tcp_port);
+        let origin = self.origin_to_inherit(&file_hash, ip, user_hash);
         self.register_source_full_server_ex(
             file_hash,
             ip,
@@ -1595,9 +1604,7 @@ impl SourceManager {
         if peer_is_highid && listening_port > 0 {
             if listening_port != ephemeral_port {
                 // Same peer, second port — see `register_live_session_port`.
-                // The same-IP fallback inside `origin_in_file` already covers
-                // the ephemeral row this callback arrived on.
-                let origin = self.origin_in_file(&file_hash, ip, listening_port);
+                let origin = self.origin_to_inherit(&file_hash, ip, user_hash);
                 self.register_source_full_opts(
                     file_hash,
                     ip,
@@ -2160,14 +2167,17 @@ impl SourceManager {
     /// the whole file, so that condition is dropped rather than guessed. It
     /// only loosens the rare case, where the source count is under fifty by
     /// definition and the traffic is correspondingly small.
+    ///
+    /// A source reached on an address with no row of its own is held to the
+    /// same rules through [`Self::unregistered_sx_sent`]; answering yes for it
+    /// unconditionally asked that peer again on every connection.
     pub fn can_request_sources_for(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let Some(entries) = self.sources.get(file_hash) else {
-            return true;
-        };
-        let Some(entry) = entries.iter().find(|e| e.ip == ip && e.tcp_port == port) else {
-            return true;
-        };
+        let entries = self.sources.get(file_hash).map_or(&[][..], Vec::as_slice);
+        let unregistered = self
+            .unregistered_sx_sent
+            .iter()
+            .filter(|((fh, _, _), _)| fh == file_hash);
 
         // eMule: `GetMaxSourcePerFileSoft()` is `maxsourceperfile * 9 / 10`
         // (`PartFile.cpp:5359-5362`). Past it, a file has enough sources and
@@ -2187,14 +2197,25 @@ impl SourceManager {
             return false;
         }
 
-        let since_source = if entry.last_sx_sent == 0 {
+        let source_stamp = entries
+            .iter()
+            .find(|e| e.ip == ip && e.tcp_port == port)
+            .map_or(0, |e| e.last_sx_sent)
+            .max(
+                self.unregistered_sx_sent
+                    .get(&(*file_hash, ip, port))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        let since_source = if source_stamp == 0 {
             i64::MAX
         } else {
-            now - entry.last_sx_sent
+            now - source_stamp
         };
         let since_file = entries
             .iter()
             .map(|e| e.last_sx_sent)
+            .chain(unregistered.map(|(_, stamp)| *stamp))
             .max()
             .filter(|stamp| *stamp != 0)
             .map_or(i64::MAX, |stamp| now - stamp);
@@ -2223,19 +2244,42 @@ impl SourceManager {
                 }
             }
         }
+        if let Some(stamp) = self.unregistered_sx_sent.get_mut(&(*file_hash, ip, port)) {
+            *stamp = when;
+        }
     }
 
     /// Record that an SX request was sent to this source.
     pub fn mark_sx_sent(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
         let now = chrono::Utc::now().timestamp();
-        if let Some(entries) = self.sources.get_mut(file_hash) {
-            if let Some(entry) = entries
-                .iter_mut()
-                .find(|e| e.ip == ip && e.tcp_port == port)
-            {
-                entry.last_sx_sent = now;
+        if let Some(entry) = self
+            .sources
+            .get_mut(file_hash)
+            .and_then(|entries| entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == port))
+        {
+            entry.last_sx_sent = now;
+            self.unregistered_sx_sent.remove(&(*file_hash, ip, port));
+            return;
+        }
+        let key = (*file_hash, ip, port);
+        if !self.unregistered_sx_sent.contains_key(&key)
+            && self.unregistered_sx_sent.len() >= MAX_UNREGISTERED_SX_STAMPS
+        {
+            // A stamp older than the longest interval gates nothing any more.
+            let horizon = now - SOURCECLIENTREASKS_I64.saturating_mul(MINCOMMONPENALTY);
+            self.unregistered_sx_sent.retain(|_, stamp| *stamp > horizon);
+            if self.unregistered_sx_sent.len() >= MAX_UNREGISTERED_SX_STAMPS {
+                if let Some(oldest) = self
+                    .unregistered_sx_sent
+                    .iter()
+                    .min_by_key(|(_, stamp)| **stamp)
+                    .map(|(k, _)| *k)
+                {
+                    self.unregistered_sx_sent.remove(&oldest);
+                }
             }
         }
+        self.unregistered_sx_sent.insert(key, now);
     }
 
     /// Return non-expired HighID sources for a file (directly connectable).
@@ -2409,7 +2453,7 @@ impl SourceManager {
             // already has — that stays per-file, so a peer found via KAD
             // for one download and a server for another still shows both.
             //
-            // Read-time only: the registration paths use `origin_in_file` so
+            // Read-time only: the registration paths use `origin_to_inherit` so
             // this inference is never written onto a row (and from there into
             // `sources.met`), where write-once would freeze a guess in place of
             // the authoritative answer a later announcement carries.
@@ -2427,7 +2471,15 @@ impl SourceManager {
     }
 
     /// The per-file half of [`Self::get_source_origin`]: this file's answer for
-    /// `ip:port`, or for the same IP on one of its other ports.
+    /// `ip:port`, or for another row in this file that may be the same peer.
+    ///
+    /// A callback/push-grant lands on the peer's ephemeral port, which is a
+    /// different row from the one discovery created, so the exact row alone
+    /// would blank the sources that are actually working. An IP is not an
+    /// identity, though — a neighbour behind the same NAT has rows here too. A
+    /// row with the same user hash is the same peer; a row with no hash may be
+    /// (discovery rarely learns one); a row with a *different* hash is someone
+    /// else and never lends its label.
     fn origin_in_file(
         &self,
         file_hash: &[u8; 16],
@@ -2435,15 +2487,45 @@ impl SourceManager {
         port: u16,
     ) -> Option<crate::types::SourceOrigin> {
         let entries = self.sources.get(file_hash)?;
+        let exact = entries.iter().find(|e| e.ip == ip && e.tcp_port == port);
+        if let Some(origin) = exact.and_then(|e| e.origin) {
+            return Some(origin);
+        }
+        let user_hash = exact.map_or([0u8; 16], |e| e.user_hash);
+        Self::same_peer_origin(entries, ip, user_hash).or_else(|| {
+            entries
+                .iter()
+                .find_map(|e| (e.ip == ip && e.user_hash == [0u8; 16]).then_some(e.origin)?)
+        })
+    }
+
+    /// The origin a registration may copy onto a new row for the peer at `ip`
+    /// with `user_hash`: only from a row that is provably the same peer.
+    ///
+    /// `origin` is write-once and persisted in `sources.met`, so a same-IP
+    /// guess stored here would outrank the authoritative answer a later
+    /// announcement carries, across restarts. The hash-less fallback in
+    /// [`Self::origin_in_file`] stays read-time only.
+    fn origin_to_inherit(
+        &self,
+        file_hash: &[u8; 16],
+        ip: Ipv4Addr,
+        user_hash: [u8; 16],
+    ) -> Option<crate::types::SourceOrigin> {
+        Self::same_peer_origin(self.sources.get(file_hash)?, ip, user_hash)
+    }
+
+    fn same_peer_origin(
+        entries: &[SourceEntry],
+        ip: Ipv4Addr,
+        user_hash: [u8; 16],
+    ) -> Option<crate::types::SourceOrigin> {
+        if user_hash == [0u8; 16] {
+            return None;
+        }
         entries
             .iter()
-            .find(|e| e.ip == ip && e.tcp_port == port)
-            .and_then(|e| e.origin)
-            // A callback/push-grant lands on the peer's ephemeral port, which
-            // is a different row from the one discovery created. Fall back to
-            // any other row for the same IP *in this file*, which is where
-            // that provenance lives.
-            .or_else(|| entries.iter().find_map(|e| (e.ip == ip).then_some(e.origin)?))
+            .find_map(|e| (e.ip == ip && e.user_hash == user_hash).then_some(e.origin)?)
     }
 
     /// Look up stored connect/crypt options for a peer by IP:port across ALL
@@ -3195,6 +3277,62 @@ mod tests {
             !sm.can_request_sources_for(&hash, peer, 4662),
             "past the soft cap eMule stops asking entirely"
         );
+    }
+
+    /// A source reached on an address we hold no row for used to be asked on
+    /// every connection: the gate answered yes before any check, and marking
+    /// the request had nowhere to record it.
+    #[test]
+    fn source_exchange_gates_an_address_with_no_row() {
+        let hash = [0xA3u8; 16];
+        let mut sm = SourceManager::new();
+        let stranger = Ipv4Addr::new(10, 0, 0, 7);
+
+        assert!(sm.can_request_sources_for(&hash, stranger, 4662));
+        sm.mark_sx_sent(&hash, stranger, 4662);
+        assert!(
+            !sm.can_request_sources_for(&hash, stranger, 4662),
+            "the per-source interval applies without a row"
+        );
+        sm.backdate_sx(&hash, stranger, 4662, SOURCECLIENTREASKS_I64 + 1);
+        assert!(sm.can_request_sources_for(&hash, stranger, 4662));
+
+        // The stamp also feeds the per-file floor once the file is not very rare.
+        for i in 0..(RARE_FILE_SOURCES / 5 + 1) as u32 {
+            sm.register_source(hash, Ipv4Addr::from(0x0D00_0000 + i), 4662, None);
+        }
+        sm.mark_sx_sent(&hash, stranger, 4662);
+        assert!(
+            !sm.can_request_sources_for(&hash, Ipv4Addr::from(0x0D00_0000), 4662),
+            "asking anyone about this file starts the per-file floor"
+        );
+
+        // And the soft cap holds for an address with no row.
+        sm.set_max_per_file(400);
+        for i in 0..(400u32 * 9 / 10) {
+            sm.register_source(hash, Ipv4Addr::from(0x0E00_0000 + i), 4662, None);
+        }
+        assert!(!sm.can_request_sources_for(&hash, Ipv4Addr::new(10, 0, 0, 8), 4662));
+    }
+
+    #[test]
+    fn unregistered_sx_stamps_are_bounded() {
+        let hash = [0xA4u8; 16];
+        let mut sm = SourceManager::new();
+        for i in 0..(MAX_UNREGISTERED_SX_STAMPS as u32 + 10) {
+            sm.mark_sx_sent(&hash, Ipv4Addr::from(0x0F00_0000 + i), 4662);
+        }
+        assert_eq!(sm.unregistered_sx_sent.len(), MAX_UNREGISTERED_SX_STAMPS);
+
+        // Registering the address moves the stamp onto the row.
+        let ip = Ipv4Addr::from(0x0F00_0000 + MAX_UNREGISTERED_SX_STAMPS as u32);
+        sm.register_source(hash, ip, 4662, None);
+        sm.mark_sx_sent(&hash, ip, 4662);
+        assert!(!sm.unregistered_sx_sent.contains_key(&(hash, ip, 4662)));
+        assert!(!sm.can_request_sources_for(&hash, ip, 4662));
+
+        sm.remove_file(&hash);
+        assert!(sm.unregistered_sx_sent.is_empty());
     }
 
     /// Fixed unix "now" for the reask-expiry checks, with an endorsement that
@@ -4070,8 +4208,8 @@ mod tests {
         assert_eq!(sm.get_source_origin(&server_file, ip, 4662), Some(SourceOrigin::Server));
 
         // A callback arrives on the peer's ephemeral port, which is its own
-        // row. Provenance is copied from the discovery row so a later lookup
-        // by the live port still names the network that found the peer.
+        // row. A lookup by the live port still names the network that found
+        // the peer, via the hash-less discovery row at the same IP.
         sm.register_live_session_port(kad_file, ip, 51000, [0u8; 16], 0);
         assert_eq!(
             sm.get_source_origin(&kad_file, ip, 51000),
@@ -4149,6 +4287,52 @@ mod tests {
             Some(SourceOrigin::Server),
             "the authoritative per-file answer must outrank the borrowed one"
         );
+    }
+
+    /// Two peers behind one NAT share an IP. The neighbour's label must not be
+    /// lent to our peer's live row, let alone stored on it: `origin` is
+    /// write-once and persisted, so a wrong guess would stick across restarts.
+    #[test]
+    fn a_neighbour_behind_the_same_nat_does_not_lend_its_origin() {
+        use crate::types::SourceOrigin;
+        let hash = [0x78; 16];
+        let ip = Ipv4Addr::new(9, 8, 7, 22);
+        let mut sm = SourceManager::new();
+        sm.register_source_with_hash(hash, ip, 4662, [0xAA; 16], Some(SourceOrigin::Kad));
+
+        sm.register_inbound_callback_ports(hash, ip, 51000, 4663, [0xBB; 16], 0, true);
+        for port in [51000, 4663] {
+            let row = sm.sources[&hash].iter().find(|e| e.tcp_port == port).unwrap();
+            assert_eq!(row.origin, None, "port {port} must not store the neighbour's label");
+            assert_eq!(
+                sm.get_source_origin(&hash, ip, port),
+                None,
+                "port {port} must not read the neighbour's label either"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_peer_lends_its_origin_and_a_hashless_row_only_at_read_time() {
+        use crate::types::SourceOrigin;
+        let peer = [0xCC; 16];
+        let ip = Ipv4Addr::new(9, 8, 7, 23);
+
+        // Same user hash: provably the same peer, so the label is stored.
+        let known = [0x79; 16];
+        let mut sm = SourceManager::new();
+        sm.register_source_with_hash(known, ip, 4662, peer, Some(SourceOrigin::Server));
+        sm.register_live_session_port(known, ip, 51000, peer, 0);
+        let row = sm.sources[&known].iter().find(|e| e.tcp_port == 51000).unwrap();
+        assert_eq!(row.origin, Some(SourceOrigin::Server));
+
+        // A discovery row with no hash may be the same peer: shown, not stored.
+        let guessed = [0x7A; 16];
+        sm.register_source(guessed, ip, 4662, Some(SourceOrigin::Kad));
+        sm.register_live_session_port(guessed, ip, 51000, peer, 0);
+        let row = sm.sources[&guessed].iter().find(|e| e.tcp_port == 51000).unwrap();
+        assert_eq!(row.origin, None, "a same-IP guess must never be persisted");
+        assert_eq!(sm.get_source_origin(&guessed, ip, 51000), Some(SourceOrigin::Kad));
     }
 
     #[test]

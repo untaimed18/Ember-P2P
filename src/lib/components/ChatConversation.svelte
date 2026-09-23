@@ -8,6 +8,7 @@
     markMessagesRead,
     isChatLocked,
     listChatAttachments,
+    mergeChatAttachment,
     parseChatAttachment,
     pickAndSendChatAttachment,
     type ChatAttachment,
@@ -973,11 +974,15 @@
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
     if (unlistenRead) { unlistenRead(); unlistenRead = null; }
+    if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
     liveError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
     await loadMessages(gen, hash, channel);
     if (gen === loadGen) liveError = !listenerOk;
+    // The bumped generation silenced the old attachment listener along with
+    // the rest, so it has to be registered again too.
+    if (!channel && gen === loadGen) await setupAttachments(gen, hash);
   }
 
   async function markAsRead() {
@@ -1154,13 +1159,9 @@
       attachments = [...attachments, next];
       return true;
     }
-    // Progress ticks carry no new status; a snapshot taken before the tick must
-    // not drag the bar backwards if the two cross in flight.
     const prev = attachments[at];
-    const merged =
-      prev.status === next.status && next.status === 'active'
-        ? { ...next, transferred: Math.max(prev.transferred, next.transferred) }
-        : next;
+    const merged = mergeChatAttachment(prev, next);
+    if (merged === prev) return false;
     const copy = [...attachments];
     copy[at] = merged;
     attachments = copy;

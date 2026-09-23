@@ -5257,6 +5257,17 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::ChatAttachmentPreflight { ember_hash: friend_eh, tx } => {
+            let result = if friend_hashes.read().await.contains(&friend_eh) {
+                super::chat_attach::offer_preflight(state, settings, &friend_eh)
+                    .await
+                    .map(|_| ())
+            } else {
+                Err(coded("peers_not_friend", "Can only send files to friends"))
+            };
+            let _ = tx.send(result);
+        }
+
         NetworkCommand::SendChatAttachment {
             ember_hash: friend_eh,
             xfer_id,

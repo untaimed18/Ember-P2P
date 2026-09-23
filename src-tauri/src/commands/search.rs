@@ -1565,7 +1565,11 @@ pub async fn rescore_search_results(
     };
     // No batch-local heuristics: this is a re-pass over already-shown rows,
     // and same-name/many-hashes context can flip a clean streamed row to spam.
-    // Per-row `origin_server_ip` still feeds server reputation.
+    // Per-row `origin_server_ip` still feeds server reputation. The batch
+    // signals a row was already flagged with are carried rather than recomputed
+    // (`BatchSpamContext::carry_batch_signals`): the UI adopts this verdict
+    // outright, so dropping them un-flagged a whole poisoning batch whenever the
+    // user marked or unmarked one row in it.
     //
     // Chunked, because this is the one enrichment path whose batch is large
     // enough to matter and the only one that can be triggered at will from the
@@ -1584,13 +1588,14 @@ pub async fn rescore_search_results(
     // file the library holds. Taken and released here rather than inside the
     // loop: `enrich_results_with_batch` holds `spam_filter.read()` for its whole
     // run, and nothing should hold the index across that.
-    let owned_ctx = {
+    let mut owned_ctx = {
         let li = state.local_index.read().await;
         BatchSpamContext::for_owned_hashes(results.iter().filter_map(|r| {
             li.get_by_hash(&r.file.hash.to_ascii_lowercase())
                 .map(|_| r.file.hash.clone())
         }))
     };
+    owned_ctx.carry_batch_signals(&results);
     const RESCORE_CHUNK: usize = 256;
     for chunk in results.chunks_mut(RESCORE_CHUNK) {
         enrich_results_with_batch(chunk, &state, &keywords, None, false, Some(&owned_ctx)).await;

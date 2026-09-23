@@ -2083,20 +2083,38 @@ pub async fn rename_transfer(
         return Err(error);
     }
 
-    {
+    let refused = {
         let mut manager = state.transfer_manager.write().await;
-        if !manager.set_file_name(&transfer_id, &sanitized) {
-            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        if manager.set_file_name(&transfer_id, &sanitized) {
+            None
+        } else {
+            // Finished or removed between the check above and here. The row
+            // keeps the name it has, so the persisted copy has to go back to
+            // it or the next restart shows a name nothing else agrees with.
+            Some(
+                manager
+                    .get_transfer(&transfer_id)
+                    .map(|transfer| transfer.file_name.clone()),
+            )
         }
+    };
+    if let Some(current) = refused {
+        let still_listed = current.is_some();
+        restore_transfer_file_name(&state, &transfer_id, &current.unwrap_or(previous)).await;
+        return Err(if still_listed {
+            coded("transfers_cannot_rename", "This download cannot be renamed")
+        } else {
+            coded("transfers_transfer_not_found", "Transfer not found")
+        });
     }
 
     Ok(sanitized)
 }
 
 /// Put the persisted name back when a rename could not be handed to the
-/// network task. Best effort: the command already reports the rename as
-/// failed, so a failure here costs only that the old name comes back on the
-/// next restart rather than immediately.
+/// network task or the row refused it. Best effort: the command already
+/// reports the rename as failed, so a failure here costs only that the
+/// persisted name disagrees with the row until the next rename or restart.
 async fn restore_transfer_file_name(state: &AppState, transfer_id: &str, previous: &str) {
     let db = state.db.clone();
     let tid = transfer_id.to_string();
@@ -2107,7 +2125,7 @@ async fn restore_transfer_file_name(state: &AppState, transfer_id: &str, previou
         .and_then(|result| result.map_err(|e| e.to_string()));
     if let Err(error) = restored {
         tracing::warn!(
-            "Rename of transfer {} was not handed over and its persisted name was not rolled back: {error}",
+            "Rename of transfer {} did not take and its persisted name was not rolled back: {error}",
             transfer_id_short(transfer_id)
         );
     }

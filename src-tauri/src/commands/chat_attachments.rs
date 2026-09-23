@@ -80,6 +80,16 @@ pub async fn pick_and_send_chat_attachment(
             "Chatting with friends is turned off in Settings",
         ));
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::ChatAttachmentPreflight {
+            ember_hash: friend,
+            tx,
+        },
+    )
+    .await?;
+    await_reply(rx, "peers_no_response", "No response").await??;
 
     let picker = app.clone();
     let picked = tokio::task::spawn_blocking(move || {

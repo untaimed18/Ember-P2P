@@ -98,6 +98,17 @@ pub const ATTACH_REQUEST_LEN: usize = 1 + 1 + 4 + 16 + 16 + 4;
 /// attachment handler is handed those 7 and reads this many more.
 pub const ATTACH_REQUEST_TAIL_LEN: usize = ATTACH_REQUEST_LEN - 7;
 
+/// QUIC close reason a recipient gives once every chunk arrived and verified.
+///
+/// The sender counts this as delivery alongside the stream's own
+/// acknowledgement, because the recipient closes the moment it has the last
+/// byte and the ACK for it can be lost behind the close. Earlier builds sent
+/// it after every fetch, so it is also what they send on success.
+pub const ATTACH_CLOSE_RECEIVED: &[u8] = b"attach done";
+
+/// QUIC close reason a recipient gives when a fetch attempt did not finish.
+pub const ATTACH_CLOSE_ABANDONED: &[u8] = b"attach abandoned";
+
 /// Keyed-hash domain for the capability tag on a stream request.
 const ATTACH_TAG_DOMAIN: &[u8] = b"ember-attach-stream-tag-v1";
 
@@ -161,6 +172,9 @@ pub enum AttachCancel {
     Stalled,
     /// The bytes did not match the hashes they were offered under.
     Corrupt,
+    /// The recipient never got a direct connection to the sender: the friend
+    /// session runs through a relay, or every dial failed to connect at all.
+    Unreachable,
 }
 
 impl AttachCancel {
@@ -170,6 +184,7 @@ impl AttachCancel {
             AttachCancel::SourceGone => 1,
             AttachCancel::Stalled => 2,
             AttachCancel::Corrupt => 3,
+            AttachCancel::Unreachable => 4,
         }
     }
 
@@ -179,6 +194,7 @@ impl AttachCancel {
             1 => AttachCancel::SourceGone,
             2 => AttachCancel::Stalled,
             3 => AttachCancel::Corrupt,
+            4 => AttachCancel::Unreachable,
             _ => return None,
         })
     }
@@ -642,6 +658,7 @@ mod tests {
             AttachCancel::SourceGone,
             AttachCancel::Stalled,
             AttachCancel::Corrupt,
+            AttachCancel::Unreachable,
         ] {
             let bytes = encode_attach_cancel(&id, reason);
             assert_eq!(decode_attach_cancel(&bytes), Some((id, reason)));

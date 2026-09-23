@@ -62,6 +62,11 @@ pub struct EmberSessionHandle {
     /// connection gets one, including authenticated duplicate connections
     /// that do not win the canonical outbound-routing slot.
     secure_registration: Option<Arc<SecureSessionRegistration>>,
+    /// The session runs through a relay (the rendezvous server's WebSocket
+    /// hop, or an Ember peer relay), so there is no direct address for the
+    /// friend behind it. Chat attachments need one: their bytes go over a
+    /// direct QUIC connection, never through the session.
+    relayed: bool,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -139,7 +144,17 @@ impl EmberSessionHandle {
             shutdown,
             peer_ember_pubkey,
             secure_registration: None,
+            relayed: false,
         }
+    }
+
+    pub fn via_relay(mut self, relayed: bool) -> Self {
+        self.relayed = relayed;
+        self
+    }
+
+    pub fn is_relayed(&self) -> bool {
+        self.relayed
     }
 
     pub fn new_secure(
@@ -286,7 +301,7 @@ async fn live_secure_friend_member(
 pub(crate) fn attach_event_from_ext(
     ember_hash: [u8; 16],
     payload: &[u8],
-    peer_addr: std::net::SocketAddr,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Option<UploadEventKind> {
     use crate::network::ember::attach;
     let (sub_type, body) = super::messages::parse_ember_ext(payload)?;
@@ -492,6 +507,7 @@ enum ConnInit {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
+        relayed: bool,
     },
 }
 
@@ -514,6 +530,9 @@ pub struct InboundStreamRequest {
     /// `None` — every other punch, relay, and broker stream — keeps the
     /// historical inbound behaviour.
     pub serve_friend_ember_hash: Option<[u8; 16]>,
+    /// The stream runs through a relay rather than straight to the peer, so
+    /// `peer_addr` is not an address the peer can be dialled at.
+    pub relayed: bool,
 }
 
 /// A fully handshaked outbound connection produced by `connect_and_serve`, handed
@@ -2192,7 +2211,8 @@ pub enum UploadEventKind {
         /// Where the friend session is connected. The recipient dials the
         /// sender's QUIC endpoint at this IP and the port the offer named, so a
         /// friend can steer the dial's port but not which host it goes to.
-        peer_addr: std::net::SocketAddr,
+        /// `None` for a relayed session, which has no direct address to dial.
+        peer_addr: Option<std::net::SocketAddr>,
     },
     /// A friend answered an attachment we offered them.
     EmberAttachReply {
@@ -2202,7 +2222,7 @@ pub enum UploadEventKind {
         /// The recipient's public QUIC port, on an accept that sent one. With
         /// `peer_addr` it is what the sender punches toward.
         quic_port: Option<u16>,
-        peer_addr: std::net::SocketAddr,
+        peer_addr: Option<std::net::SocketAddr>,
     },
     /// A friend gave up on an attachment in either direction.
     EmberAttachCancel {
@@ -2479,8 +2499,112 @@ const MIN_BROWSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// throttles it. Each answer walks the index under its read lock (the same lock
 /// every scoring and admission path takes) and spends real upload tokens from the
 /// shared bucket that feeds part sends. A per-session ceiling keeps the honest
-/// burst free while stopping the loop; set far above any real share layout.
+/// burst free while stopping the loop. The directory list itself is capped at
+/// the same figure (see [`DirBrowseListing::build`]) and the count restarts
+/// with each answered `OP_ASKSHAREDDIRS`, so an honest browse never reaches it.
 const MAX_DIR_BROWSE_ANSWERS_PER_SESSION: u32 = 256;
+
+/// `(hash_hex, name, size, extension)`, the shape [`encode_shared_files_answer`] takes.
+type BrowseEntry = (String, String, u64, String);
+
+/// One directory browse: the list a peer was sent and the files behind each
+/// entry, grouped once when the list is built.
+///
+/// eMule follows `OP_ASKSHAREDDIRSANS` with one `OP_ASKSHAREDFILESDIR` per
+/// entry, back to back. Regrouping the index for each of those made a browse
+/// cost folders × files under the index read lock; kept for the burst, each
+/// answer is a lookup.
+///
+/// Keyed by the label exactly as this peer was sent it. A peer without
+/// Unicode support was sent the folded form and echoes it back, so it matches
+/// directly; a Unicode peer's exact request cannot land on a different folder
+/// whose name merely folds onto the same ASCII.
+struct DirBrowseListing {
+    /// In the order they were advertised.
+    labels: Vec<String>,
+    groups: HashMap<String, Vec<BrowseEntry>>,
+    built: std::time::Instant,
+}
+
+impl DirBrowseListing {
+    /// How long a listing answers requests before it is rebuilt from the live
+    /// index. It only has to outlast the burst that follows the list; bounded
+    /// so a folder unshared since stops being browsable on a long-lived
+    /// connection.
+    const TTL: std::time::Duration = MIN_BROWSE_INTERVAL;
+
+    /// Groups `files` by the label this peer will see, advertising at most
+    /// `max_dirs` directories.
+    ///
+    /// eMule asks for every entry it is sent, so a list longer than
+    /// [`MAX_DIR_BROWSE_ANSWERS_PER_SESSION`] would turn an honest browse into
+    /// the loop that allowance exists to catch. Folders past the cap are merged
+    /// into [`super::messages::OP_OTHER_SHARED_FILES`] rather than dropped, so
+    /// their files stay reachable.
+    fn build(
+        files: Vec<(String, BrowseEntry)>,
+        peer_supports_unicode: bool,
+        max_dirs: usize,
+    ) -> Self {
+        let mut labels: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<BrowseEntry>> = HashMap::new();
+        for (folder, entry) in files {
+            let label = UploadHandler::browse_label_for_peer(
+                &UploadHandler::browse_dir_label(&folder),
+                peer_supports_unicode,
+            );
+            match groups.entry(label) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(entry),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    labels.push(e.key().clone());
+                    e.insert(vec![entry]);
+                }
+            }
+        }
+        if labels.len() > max_dirs {
+            let other = super::messages::OP_OTHER_SHARED_FILES.to_string();
+            let mut overflow = Vec::new();
+            for label in labels.drain(max_dirs.saturating_sub(1)..) {
+                if let Some(mut entries) = groups.remove(&label) {
+                    overflow.append(&mut entries);
+                }
+            }
+            if !groups.contains_key(&other) {
+                labels.push(other.clone());
+            }
+            groups.entry(other).or_default().extend(overflow);
+        }
+        Self {
+            labels,
+            groups,
+            built: std::time::Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.built.elapsed() < Self::TTL
+    }
+
+    /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
+    ///
+    /// Only directories that actually have something browsable in them.
+    /// eMule sends every shared directory including empty ones and says so in
+    /// a TODO; there is no reason to copy a listing entry that resolves to
+    /// nothing.
+    fn encode_dirs(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + self.labels.len() * 24);
+        buf.extend_from_slice(&(self.labels.len() as u32).to_le_bytes());
+        for label in &self.labels {
+            super::messages::write_ed2k_string(&mut buf, label);
+        }
+        buf
+    }
+
+    /// The files behind one advertised label; empty for a name we never sent.
+    fn files_in(&self, requested: &str) -> &[BrowseEntry] {
+        self.groups.get(requested).map_or(&[], Vec::as_slice)
+    }
+}
 
 /// Uncached whole-file hash computations one connection may trigger per window.
 const MAX_UNCACHED_HASH_JOBS: u32 = 4;
@@ -4214,7 +4338,12 @@ pub async fn start_upload_server(
                         .catch_unwind()
                         .await,
                         None => std::panic::AssertUnwindSafe(
-                            server.handle_inbound_stream(peer_addr, req.reader, req.writer),
+                            server.handle_inbound_stream(
+                                peer_addr,
+                                req.reader,
+                                req.writer,
+                                req.relayed,
+                            ),
                         )
                         .catch_unwind()
                         .await,
@@ -4690,63 +4819,29 @@ impl UploadHandler {
             .collect()
     }
 
-    /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
-    async fn build_shared_dirs_answer(&self, peer_supports_unicode: bool) -> Vec<u8> {
-        let mut labels: Vec<String> = Vec::new();
-        for (folder, _) in self.browsable_files_by_folder().await {
-            let label = Self::browse_label_for_peer(
-                &Self::browse_dir_label(&folder),
-                peer_supports_unicode,
-            );
-            if !labels.contains(&label) {
-                labels.push(label);
-            }
-        }
-        // Only directories that actually have something browsable in them.
-        // eMule sends every shared directory including empty ones and says so
-        // in a TODO; there is no reason to copy a listing entry that resolves
-        // to nothing.
-        let mut buf = Vec::with_capacity(4 + labels.len() * 24);
-        buf.extend_from_slice(&(labels.len() as u32).to_le_bytes());
-        for label in &labels {
-            super::messages::write_ed2k_string(&mut buf, label);
-        }
-        buf
+    async fn build_dir_browse_listing(&self, peer_supports_unicode: bool) -> DirBrowseListing {
+        DirBrowseListing::build(
+            self.browsable_files_by_folder().await,
+            peer_supports_unicode,
+            MAX_DIR_BROWSE_ANSWERS_PER_SESSION as usize,
+        )
     }
 
     /// `OP_ASKSHAREDFILESDIRANS`: the requested directory echoed back, then the
     /// same body as the flat answer.
-    async fn build_shared_files_dir_answer(
+    fn build_shared_files_dir_answer(
         &self,
         requested: &str,
+        files: &[BrowseEntry],
         client_id: u32,
         peer_supports_large_files: bool,
-        peer_supports_unicode: bool,
     ) -> Vec<u8> {
-        let files: Vec<(String, String, u64, String)> = self
-            .browsable_files_by_folder()
-            .await
-            .into_iter()
-            // A peer echoes back the label we sent it, so a peer that was sent a
-            // folded label asks for the folded one. Only consulted for a peer
-            // without Unicode support: folding on a Unicode peer's behalf could
-            // let its exact request match a *different* folder whose name folds
-            // onto the same ASCII.
-            .filter(|(folder, _)| {
-                let label = Self::browse_dir_label(folder);
-                label == requested
-                    || (!peer_supports_unicode
-                        && Self::browse_label_for_peer(&label, false) == requested)
-            })
-            .map(|(_, entry)| entry)
-            .collect();
-
         let mut buf = Vec::new();
         // Echoed verbatim, as eMule does with `strOrgReqDir` — the asker keys
         // its pending request on the exact string it sent.
         super::messages::write_ed2k_string(&mut buf, requested);
         buf.extend_from_slice(&encode_shared_files_answer(
-            &files,
+            files,
             client_id,
             self.advertised_tcp_port(),
             peer_supports_large_files,
@@ -5151,6 +5246,7 @@ impl UploadHandler {
         peer_addr: SocketAddr,
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        relayed: bool,
     ) -> anyhow::Result<()> {
         self.run_session(
             peer_addr,
@@ -5158,6 +5254,7 @@ impl UploadHandler {
                 reader,
                 writer,
                 secure_peer: None,
+                relayed,
             },
             Some(
                 tokio::time::Instant::now()
@@ -5695,6 +5792,8 @@ impl UploadHandler {
         // of continuing into the upload serve loop.
         let inbound_stream = matches!(init, ConnInit::InboundStream { .. });
         let skip_diversions = outbound || inbound_stream;
+        let relayed = matches!(init, ConnInit::InboundStream { relayed: true, .. });
+        let attach_addr = (!relayed).then_some(peer_addr);
 
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
@@ -5742,6 +5841,7 @@ impl UploadHandler {
                 reader: mut boxed_reader,
                 writer: boxed_writer,
                 secure_peer: preauthenticated_peer,
+                relayed: _,
             } => {
                 let (mut rd, mut wr, first_inner_byte) = if let Some(peer) = preauthenticated_peer {
                     secure_v2_peer = Some(peer);
@@ -5941,6 +6041,7 @@ impl UploadHandler {
                             reader: secure.reader,
                             writer: secure.writer,
                             secure_peer: Some(secure.peer),
+                            relayed: false,
                         },
                         preauth_deadline,
                     ))
@@ -7128,7 +7229,8 @@ impl UploadHandler {
                 // revocation, even when another connection already owns the
                 // canonical outbound-routing slot.  Chat/browse authorization
                 // on this socket does not require owns_ember_slot.
-                let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh);
+                let handle =
+                    EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh).via_relay(relayed);
                 ember_shutdown_rx = Some(handle.subscribe_shutdown());
                 ember_session_handle = Some(handle.clone());
 
@@ -7250,6 +7352,7 @@ impl UploadHandler {
         // `MAX_DIR_BROWSE_ANSWERS_PER_SESSION` for why these are counted rather
         // than spaced.
         let mut dir_browse_answers_served: u32 = 0;
+        let mut dir_browse: Option<DirBrowseListing> = None;
         // eMule `m_abyUpPartStatus`: the parts the downloader told us it
         // already has, captured from the `OP_REQUESTFILENAME` extended-info
         // block and shaded dark on the parts bar. Keyed by file hash so a
@@ -7946,6 +8049,7 @@ impl UploadHandler {
                                         // Slot already reserved atomically above.
                                         queued_identity = None;
                                         uploaded = 0;
+                                        uploaded_wire = 0;
                                         served_bytes_per_part.clear();
                                         sent_blocks.clear();
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -8337,6 +8441,7 @@ impl UploadHandler {
                                 // existed yet — otherwise a later REQUESTPARTS for
                                 // the new hash reuses the old file's sent_blocks.
                                 uploaded = 0;
+                                uploaded_wire = 0;
                                 served_bytes_per_part.clear();
                                 sent_blocks.clear();
                                 cached_part_tracker = None;
@@ -9197,6 +9302,7 @@ impl UploadHandler {
                     // Slot already reserved atomically via `try_activate` above.
                     queued_identity = None;
                     uploaded = 0;
+                    uploaded_wire = 0;
                     served_bytes_per_part.clear();
                     sent_blocks.clear();
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -9276,6 +9382,7 @@ impl UploadHandler {
                                         }).await;
                                     }
                                     uploaded = 0;
+                                    uploaded_wire = 0;
                                     served_bytes_per_part.clear();
                                     sent_blocks.clear();
                                     cached_part_tracker = None;
@@ -10532,6 +10639,7 @@ impl UploadHandler {
                         // connection, and a firewalled peer could not be
                         // re-promoted until it dialled back in.
                         uploaded = 0;
+                        uploaded_wire = 0;
                         served_bytes_per_part.clear();
                         sent_blocks.clear();
                         self.slot_rates.lock().remove(&peer_addr);
@@ -10781,6 +10889,7 @@ impl UploadHandler {
                     slot_guard.deactivate();
                     transfer_id = None;
                     uploaded = 0;
+                    uploaded_wire = 0;
                     served_bytes_per_part.clear();
                     sent_blocks.clear();
                     session_start = None;
@@ -10873,9 +10982,12 @@ impl UploadHandler {
                             continue;
                         }
                         last_browse = Some(std::time::Instant::now());
-                        let resp = self
-                            .build_shared_dirs_answer(hello_caps.supports_unicode)
+                        let listing = self
+                            .build_dir_browse_listing(hello_caps.supports_unicode)
                             .await;
+                        let resp = listing.encode_dirs();
+                        dir_browse = Some(listing);
+                        dir_browse_answers_served = 0;
                         self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                             .await?;
                         write_packet_async(
@@ -10925,24 +11037,32 @@ impl UploadHandler {
                     // back. Counted instead, because nothing else bounds it —
                     // this arm is reachable without the `OP_ASKSHAREDDIRS` whose
                     // throttle it was assumed to inherit. Still metered against
-                    // the upload cap.
+                    // the upload cap. The list we advertise never exceeds the
+                    // allowance, so only a peer asking past it is charged.
                     if dir_browse_answers_served >= MAX_DIR_BROWSE_ANSWERS_PER_SESSION {
                         debug!("Ignoring excess OP_ASKSHAREDFILESDIR from {peer_addr}");
                         self.note_abusive_request(peer_addr.ip()).await;
                         continue;
                     }
                     dir_browse_answers_served += 1;
+                    if !dir_browse.as_ref().is_some_and(DirBrowseListing::is_fresh) {
+                        dir_browse = Some(
+                            self.build_dir_browse_listing(hello_caps.supports_unicode)
+                                .await,
+                        );
+                    }
+                    let files = dir_browse
+                        .as_ref()
+                        .map_or(&[][..], |listing| listing.files_in(&requested));
                     let client_id = self
                         .external_ip_shared
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let resp = self
-                        .build_shared_files_dir_answer(
-                            &requested,
-                            client_id,
-                            hello_caps.supports_large_files,
-                            hello_caps.supports_unicode,
-                        )
-                        .await;
+                    let resp = self.build_shared_files_dir_answer(
+                        &requested,
+                        files,
+                        client_id,
+                        hello_caps.supports_large_files,
+                    );
                     self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                         .await?;
                     write_packet_async(
@@ -11287,6 +11407,7 @@ impl UploadHandler {
                                         }).await;
                                     }
                                     uploaded = 0;
+                                    uploaded_wire = 0;
                                     served_bytes_per_part.clear();
                                     sent_blocks.clear();
                                     cached_part_tracker = None;
@@ -12580,7 +12701,7 @@ impl UploadHandler {
                             Some((super::messages::EMBER_EXT_ATTACH_OFFER
                                 | super::messages::EMBER_EXT_ATTACH_REPLY
                                 | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
-                                if let Some(kind) = attach_event_from_ext(eh, &payload, peer_addr) {
+                                if let Some(kind) = attach_event_from_ext(eh, &payload, attach_addr) {
                                     let _ = self
                                         .upload_event_tx
                                         .send(UploadEvent {
@@ -13336,6 +13457,83 @@ mod unique_served_tests {
         // An ASCII folder is untouched either way — the common case pays nothing.
         assert_eq!(Server::browse_label_for_peer("Videos", false), "Videos");
         assert_eq!(Server::browse_label_for_peer("Videos", true), "Videos");
+    }
+
+    fn browse_entry(folder: &str, name: &str) -> (String, BrowseEntry) {
+        (
+            folder.to_string(),
+            ("00".repeat(16), name.to_string(), 1, String::new()),
+        )
+    }
+
+    fn decode_dir_labels(buf: &[u8]) -> Vec<String> {
+        let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        let mut rest = &buf[4..];
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u16::from_le_bytes(rest[..2].try_into().unwrap()) as usize;
+            out.push(String::from_utf8(rest[2..2 + len].to_vec()).unwrap());
+            rest = &rest[2 + len..];
+        }
+        assert!(rest.is_empty());
+        out
+    }
+
+    /// eMule asks for every directory it is sent, so the list must never be
+    /// longer than the per-session answer allowance — otherwise an honest
+    /// browse of a large library runs past it and is charged as abuse.
+    #[test]
+    fn dir_browse_list_is_capped_and_overflow_stays_reachable() {
+        let max = MAX_DIR_BROWSE_ANSWERS_PER_SESSION as usize;
+        let files: Vec<_> = (0..max + 50)
+            .map(|i| browse_entry(&format!("C:\\Share\\dir{i}"), &format!("f{i}")))
+            .collect();
+        let listing = DirBrowseListing::build(files, true, max);
+
+        let labels = decode_dir_labels(&listing.encode_dirs());
+        assert_eq!(labels.len(), max);
+        assert_eq!(labels[0], "dir0", "advertised in index order");
+        assert_eq!(
+            labels.last().map(String::as_str),
+            Some(super::super::messages::OP_OTHER_SHARED_FILES)
+        );
+        assert!(!labels.contains(&format!("dir{}", max - 1)));
+
+        let other = listing.files_in(super::super::messages::OP_OTHER_SHARED_FILES);
+        assert_eq!(other.len(), 51, "every overflow folder's files are kept");
+        assert_eq!(listing.files_in("dir0").len(), 1);
+        assert!(listing.files_in(&format!("dir{}", max + 10)).is_empty());
+        assert!(listing.files_in("never-sent").is_empty());
+    }
+
+    #[test]
+    fn dir_browse_list_under_cap_is_one_entry_per_label() {
+        let files = vec![
+            browse_entry("C:\\A\\Music", "a"),
+            browse_entry("D:\\B\\Music", "b"),
+            browse_entry("C:\\Videos", "c"),
+            browse_entry("C:\\A\\Music", "d"),
+        ];
+        let listing = DirBrowseListing::build(files, true, 256);
+        assert_eq!(decode_dir_labels(&listing.encode_dirs()), ["Music", "Videos"]);
+        let names: Vec<_> = listing.files_in("Music").iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(names, ["a", "b", "d"]);
+    }
+
+    /// The listing is keyed by the label as sent, so the folded name a
+    /// non-Unicode peer echoes back resolves, and a Unicode peer's exact
+    /// request never lands on a different folder that folds onto it.
+    #[test]
+    fn dir_browse_lookup_matches_the_label_the_peer_was_sent() {
+        let files = vec![browse_entry("C:\\Música", "x"), browse_entry("C:\\M_sica", "y")];
+
+        let folded = DirBrowseListing::build(files.clone(), false, 256);
+        assert_eq!(decode_dir_labels(&folded.encode_dirs()), ["M_sica"]);
+        assert_eq!(folded.files_in("M_sica").len(), 2);
+
+        let unicode = DirBrowseListing::build(files, true, 256);
+        assert_eq!(unicode.files_in("Música").len(), 1);
+        assert_eq!(unicode.files_in("M_sica")[0].1, "y");
     }
 
     #[test]

@@ -25,6 +25,7 @@
     getFolderPriorities,
     setFolderPriority,
     getFileMediaMetadata,
+    type SharedFolderPick,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
@@ -923,10 +924,14 @@
     }
   }
 
-  async function onFoldersPicked(selected: { added: string[]; already_shared: string[]; files_shared?: string[] }) {
+  async function onFoldersPicked(selected: SharedFolderPick) {
     error = null;
     try {
       if (!mounted) return;
+      // Part of the selection did not land. The rest is reported below, so
+      // this is the only place the user would learn about it.
+      const failed = selected.failed ?? [];
+      if (failed.length > 0) toastError(toErr(failed[0]));
       // The in-app explorer marks already-shared folders, but the system-dialog
       // fallback cannot, so a selection that changed nothing still needs a toast.
       if (selected.already_shared.length === 1) {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   clampDockWidth,
   maxDockWidth,
+  preferredDockWidth,
   DOCK_WIDTH_CAP,
   DOCK_WIDTH_DEFAULT,
   DOCK_WIDTH_MIN,
@@ -61,5 +62,26 @@ describe('clampDockWidth', () => {
         expect(width).toBeLessThanOrEqual(DOCK_WIDTH_CAP);
       }
     }
+  });
+});
+
+describe('preferredDockWidth', () => {
+  // The window only limits what is drawn. A preference clamped on read would
+  // be written back narrower the next time anything saved it.
+  it('keeps a stored width the current window cannot show', () => {
+    expect(preferredDockWidth('800')).toBe(800);
+    expect(clampDockWidth(preferredDockWidth('800'), 700)).toBe(630);
+    expect(clampDockWidth(preferredDockWidth('800'), 1600)).toBe(800);
+  });
+
+  it('still holds the absolute bounds', () => {
+    expect(preferredDockWidth('10')).toBe(DOCK_WIDTH_MIN);
+    expect(preferredDockWidth('5000')).toBe(DOCK_WIDTH_CAP);
+  });
+
+  it('falls back to the default for nothing or garbage', () => {
+    expect(preferredDockWidth(null)).toBe(DOCK_WIDTH_DEFAULT);
+    expect(preferredDockWidth('')).toBe(DOCK_WIDTH_DEFAULT);
+    expect(preferredDockWidth('wide')).toBe(DOCK_WIDTH_DEFAULT);
   });
 });

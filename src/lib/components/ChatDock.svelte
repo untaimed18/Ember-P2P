@@ -32,9 +32,11 @@
   import {
     clampDockWidth,
     maxDockWidth,
+    preferredDockWidth,
     DOCK_WIDTH_DEFAULT,
     DOCK_WIDTH_MIN,
   } from '$lib/dockWidth';
+  import { defaultSwitcherRow, filterSwitcherRows, searchNeedle } from '$lib/dockSearch';
 
   /**
    * How wide the dock is, in pixels, remembered per device.
@@ -51,31 +53,48 @@
     return typeof window === 'undefined' ? 0 : window.innerWidth;
   }
 
-  function loadDockWidth(): number {
+  function loadPreferredWidth(): number {
     if (typeof localStorage === 'undefined') return DOCK_WIDTH_DEFAULT;
     try {
-      const raw = localStorage.getItem(DOCK_WIDTH_KEY);
-      if (!raw) return DOCK_WIDTH_DEFAULT;
-      return clampDockWidth(Number.parseInt(raw, 10), viewport());
+      return preferredDockWidth(localStorage.getItem(DOCK_WIDTH_KEY));
     } catch {
       return DOCK_WIDTH_DEFAULT;
     }
   }
 
-  let dockWidth = $state(loadDockWidth());
-  let dockWidthMax = $state(maxDockWidth(viewport()));
+  /** What the user asked for, and what is saved. The window only ever limits
+   *  what is drawn: narrowing it past this must not rewrite the preference, or
+   *  widening it again would not bring the dock back to where they left it. */
+  let preferredWidth = $state(loadPreferredWidth());
+  let viewportWidth = $state(viewport());
+  let dockWidth = $derived(clampDockWidth(preferredWidth, viewportWidth));
+  let dockWidthMax = $derived(maxDockWidth(viewportWidth));
   let resizing = $state(false);
+
+  function persistDockWidth() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(DOCK_WIDTH_KEY, String(preferredWidth));
+    } catch {
+      // Quota exceeded / private mode. The width holds for this session.
+    }
+  }
 
   /** `persist` is false mid-drag: writing on every pointer move would put a
    *  synchronous `localStorage` write inside the frame doing the resizing. */
   function setDockWidth(px: number, persist = true) {
-    dockWidth = clampDockWidth(px, viewport());
-    if (!persist || typeof localStorage === 'undefined') return;
-    try {
-      localStorage.setItem(DOCK_WIDTH_KEY, String(dockWidth));
-    } catch {
-      // Quota exceeded / private mode. The width holds for this session.
-    }
+    viewportWidth = viewport();
+    preferredWidth = clampDockWidth(px, viewportWidth);
+    if (persist) persistDockWidth();
+  }
+
+  /** The drag's one write. Also reached when the dock closes mid-drag: the
+   *  handle leaves the DOM with the pointer still down, so neither `pointerup`
+   *  nor its own `lostpointercapture` ever arrives to end it. */
+  function finishResize() {
+    if (!resizing) return;
+    resizing = false;
+    persistDockWidth();
   }
 
   function onResizeStart(e: PointerEvent) {
@@ -95,11 +114,9 @@
 
   function onResizeEnd(e: PointerEvent) {
     if (!resizing) return;
-    resizing = false;
+    finishResize();
     const handle = e.currentTarget as HTMLElement;
     if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
-    // The drag wrote nothing; this is the one write it makes.
-    setDockWidth(dockWidth);
   }
 
   /** The separator is focusable, so it answers the keys a separator should:
@@ -138,9 +155,11 @@
    */
   let switcherOpen = $state(false);
   let query = $state('');
-  /** Highlighted row in `rows`, or -1 for none. Mouse hover sets it too, so
-   *  nothing destructive may hang off it — see the `Delete` handler. */
-  let activeIndex = $state(-1);
+  /** Highlighted row, by hash, or null for none. Mouse hover sets it too, so
+   *  nothing destructive may hang off it — see the `Delete` handler. Held by
+   *  identity rather than position so a row leaving the list or a re-sort
+   *  cannot leave the highlight past the end or move it onto someone else. */
+  let activeHash = $state<string | null>(null);
   let switcherEl: HTMLDivElement | undefined = $state();
   let searchEl: HTMLInputElement | undefined = $state();
   let switchBtnEl: HTMLButtonElement | undefined = $state();
@@ -198,19 +217,20 @@
           }),
   );
 
-  /** Match on the name and on the hash, because an unnamed friend is only ever
-   *  identified by the latter. */
-  function matches(row: SwitcherRow, needle: string): boolean {
-    if (!needle) return true;
-    return row.name.toLowerCase().includes(needle) || row.hash.includes(needle);
-  }
-
-  let needle = $derived(query.trim().toLowerCase());
-  let shownOpen = $derived(openRows.filter((r) => matches(r, needle)));
-  let shownFriends = $derived(friendRows.filter((r) => matches(r, needle)));
+  let needle = $derived(searchNeedle(query));
+  let shownOpen = $derived(filterSwitcherRows(openRows, needle));
+  let shownFriends = $derived(filterSwitcherRows(friendRows, needle));
   /** One index space over both sections, so the arrow keys cross the section
    *  heading the way the eye does. */
   let rows = $derived([...shownOpen, ...shownFriends]);
+  /** Position of the highlight in `rows`, or -1 for none. */
+  let activeIndex = $derived(
+    activeHash === null ? -1 : rows.findIndex((r) => r.hash === activeHash),
+  );
+
+  function highlight(index: number) {
+    activeHash = rows[index]?.hash ?? null;
+  }
 
   let activeTab = $derived(
     $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
@@ -231,7 +251,7 @@
   function openSwitcher() {
     switcherOpen = true;
     query = '';
-    activeIndex = -1;
+    activeHash = null;
     // Deferred: the input does not exist until this state change renders.
     requestAnimationFrame(() => searchEl?.focus());
   }
@@ -239,7 +259,7 @@
   function closeSwitcher(restoreFocus = true) {
     if (!switcherOpen) return;
     switcherOpen = false;
-    activeIndex = -1;
+    activeHash = null;
     if (restoreFocus) switchBtnEl?.focus();
   }
 
@@ -276,24 +296,25 @@
       const step = e.key === 'ArrowDown' ? 1 : -1;
       // From "no highlight", Down opens at the top and Up at the bottom, which
       // is how every other list in the app answers those keys.
-      activeIndex =
+      highlight(
         activeIndex === -1
           ? step === 1
             ? 0
             : rows.length - 1
-          : (activeIndex + step + rows.length) % rows.length;
+          : (activeIndex + step + rows.length) % rows.length,
+      );
       return;
     }
     if (e.key === 'Home' || e.key === 'End') {
       if (rows.length === 0) return;
       e.preventDefault();
-      activeIndex = e.key === 'Home' ? 0 : rows.length - 1;
+      highlight(e.key === 'Home' ? 0 : rows.length - 1);
       return;
     }
     if (e.key === 'Enter') {
-      // Nothing highlighted takes the first match, so the whole gesture is
+      // Nothing highlighted takes the best match, so the whole gesture is
       // "type two letters, press Enter" without an arrow key in between.
-      const row = rows[activeIndex] ?? rows[0];
+      const row = rows[activeIndex] ?? defaultSwitcherRow(rows, needle);
       if (!row) return;
       e.preventDefault();
       activateRow(row);
@@ -313,7 +334,7 @@
   function onSearchInput() {
     // Typing means the query is being edited, not the list navigated. Dropping
     // the highlight also disarms Delete for a row the pointer merely passed.
-    activeIndex = -1;
+    activeHash = null;
   }
 
   function isTypingTarget(t: EventTarget | null): boolean {
@@ -325,7 +346,10 @@
   }
 
   $effect(() => {
-    if (!$chatDockOpen) closeSwitcher(false);
+    if (!$chatDockOpen) {
+      closeSwitcher(false);
+      finishResize();
+    }
   });
 
   // Activate the dock as a focus context so screen readers announce
@@ -360,18 +384,21 @@
   // OS-level browser tab cycle in the rest of the app.
   function onKeydown(e: KeyboardEvent) {
     if (!$chatDockOpen) return;
+    // An open modal owns the keyboard. Its handlers sit on the dialog element
+    // and let the event bubble to this window listener, so without this guard
+    // one Escape both dismisses the dialog and collapses the dock behind it,
+    // Ctrl+W closes a conversation behind a confirm, and Ctrl+K pulls focus
+    // out of the dialog.
+    if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) {
+      return;
+    }
+    // Something closer to the target already answered the key — for Escape,
+    // page chrome such as the recent-search dropdown, column menus, clearing a
+    // filter. Don't answer it a second time.
+    if (e.defaultPrevented) return;
     // Esc — close the dock. Allowed even from inputs because users
     // press it instinctively to dismiss overlays.
     if (e.key === 'Escape') {
-      // An open modal owns Escape. Those handlers sit on the dialog element and
-      // let the event bubble to this window listener, so without this guard one
-      // press both dismisses the dialog and collapses the dock behind it.
-      if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) {
-        return;
-      }
-      // Page chrome that already handled Escape (recent-search dropdown, column
-      // menus, clearing a filter) calls preventDefault. Don't also close the dock.
-      if (e.defaultPrevented) return;
       if (switcherOpen) {
         e.preventDefault();
         closeSwitcher();
@@ -412,10 +439,10 @@
   }
 
   // A window narrowed past the stored width would otherwise leave the dock
-  // covering the app with no way back except widening the window again.
+  // covering the app with no way back except widening the window again. Only
+  // the drawn width follows; the preference comes back when the window does.
   function onWindowResize() {
-    dockWidthMax = maxDockWidth(viewport());
-    if (dockWidth > dockWidthMax) setDockWidth(dockWidthMax);
+    viewportWidth = viewport();
   }
 
   // A panel that only Escape can dismiss is one users leave open by accident —
@@ -527,6 +554,7 @@
       onpointermove={onResizeMove}
       onpointerup={onResizeEnd}
       onpointercancel={onResizeEnd}
+      onlostpointercapture={onResizeEnd}
       ondblclick={() => setDockWidth(DOCK_WIDTH_DEFAULT)}
       onkeydown={onResizeKeydown}
     ></div>
@@ -676,7 +704,7 @@
                 aria-selected={i === activeIndex}
                 tabindex="-1"
                 onclick={() => activateRow(row)}
-                onmouseenter={() => (activeIndex = i)}
+                onmouseenter={() => (activeHash = row.hash)}
                 onauxclick={(e) => {
                   // Middle-click closes, the way it closes a tab everywhere else.
                   if (e.button !== 1) return;
@@ -732,7 +760,7 @@
                 aria-selected={idx === activeIndex}
                 tabindex="-1"
                 onclick={() => activateRow(row)}
-                onmouseenter={() => (activeIndex = idx)}
+                onmouseenter={() => (activeHash = row.hash)}
               >
                 <span
                   class="dock-presence"
@@ -1062,7 +1090,7 @@
     cursor: pointer;
   }
 
-  /* One highlight, driven by `activeIndex`, which both the arrow keys and the
+  /* One highlight, driven by `activeHash`, which both the arrow keys and the
      pointer write — so hover and keyboard cannot disagree about the target. */
   .dock-row.active {
     background: var(--bg-hover);

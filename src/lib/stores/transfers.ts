@@ -1,8 +1,9 @@
 import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { Transfer } from '$lib/types';
+import type { RuntimeStatus, Transfer } from '$lib/types';
 import { getTransfers } from '$lib/api/transfers';
+import { getRuntimeStatus } from '$lib/api/system';
 import { formatBytes, withTimeout } from '$lib/utils';
 import { notify, shouldNotify } from '$lib/notifications';
 import { transferFailureReasonText } from '$lib/i18n';
@@ -376,6 +377,16 @@ interface TransferEventPayload {
 }
 
 export const transfers = writable<Transfer[]>([]);
+
+/** The upload cap in force (`RuntimeStatus.effective_upload_speed`, bytes/s,
+ *  0 = unlimited), or `null` until the backend has published one. Differs from
+ *  `AppSettings.max_upload_speed` while a schedule rule or USS is in charge. */
+export const effectiveUploadSpeed = writable<number | null>(null);
+
+function publishedUploadSpeed(status: Partial<RuntimeStatus> | null | undefined): number | null {
+  const speed = status?.effective_upload_speed;
+  return typeof speed === 'number' && Number.isFinite(speed) ? speed : null;
+}
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
@@ -1043,6 +1054,10 @@ export async function initTransferStore() {
         );
       },
     );
+    await safeListen<RuntimeStatus>('ember:runtime-status', (event) => {
+      const speed = publishedUploadSpeed(event.payload);
+      if (speed !== null) effectiveUploadSpeed.set(speed);
+    });
   } catch (e) {
     initialized = false;
     // Registration is sequential, so a failure part-way through leaves the
@@ -1106,6 +1121,16 @@ export async function initTransferStore() {
     });
   } catch {
     // Backend not ready yet
+  }
+
+  try {
+    const seeded = publishedUploadSpeed(await getRuntimeStatus());
+    if (myEpoch !== storeEpoch) return;
+    // The event only fires on change, so it can have landed while this was in
+    // flight; it is the newer figure.
+    effectiveUploadSpeed.update((current) => current ?? seeded);
+  } catch {
+    // Backend not ready yet; the manual setting stands in until an event.
   }
 }
 
@@ -1192,6 +1217,7 @@ export function cleanupTransferStore() {
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();
+  effectiveUploadSpeed.set(null);
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {

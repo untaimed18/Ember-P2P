@@ -109,6 +109,33 @@ describe('shedWeakestRows', () => {
     expect(rows.map((r) => r.file.hash)).toEqual(['honest', 'spam-strong']);
   });
 
+  it('sheds a flagged row near the top of its class before a clean row lower in another', () => {
+    // Ranked only by position within each class, the Ember spam row sat at
+    // position 5 and beat every clean KAD row from position 6 down.
+    const rows = [
+      ...Array.from({ length: 5 }, (_, i) => row(`ember${i}`, 10 - i, 'Ember')),
+      row('ember-spam', 1, 'Ember', true),
+      ...Array.from({ length: 12 }, (_, i) => row(`kad${i}`, 100 - i, 'KAD')),
+    ];
+
+    shedWeakestRows(rows, 17);
+
+    expect(rows).toHaveLength(17);
+    expect(rows.some((r) => r.is_spam)).toBe(false);
+  });
+
+  it('interleaves flagged rows across classes once only spam is left to keep', () => {
+    const rows = [
+      row('honest', 5, 'KAD'),
+      ...Array.from({ length: 3 }, (_, i) => row(`kad-spam${i}`, 50 - i, 'KAD', true)),
+      ...Array.from({ length: 3 }, (_, i) => row(`ember-spam${i}`, 3 - i, 'Ember', true)),
+    ];
+
+    shedWeakestRows(rows, 3);
+
+    expect(rows.map((r) => r.file.hash)).toEqual(['honest', 'kad-spam0', 'ember-spam0']);
+  });
+
   it('treats a mixed origin as Ember, since the publisher count is in the number', () => {
     const rows = [
       ...Array.from({ length: 10 }, (_, i) => row(`kad${i}`, 30 + i, 'KAD')),

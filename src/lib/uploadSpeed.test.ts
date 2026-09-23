@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { uploadScaleFactor, uploadSumBound } from './uploadSpeed';
+import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from './uploadSpeed';
 
 const KB = 1024;
 
@@ -21,6 +21,30 @@ describe('uploadSumBound', () => {
     // A settings value that should never reach here is still not a bound.
     expect(uploadSumBound(-1)).toBe(0);
     expect(uploadSumBound(Number.NaN)).toBe(0);
+  });
+});
+
+describe('uploadCapInForce', () => {
+  it('prefers the limit the backend says is in force', () => {
+    // USS holding uploads below the manual cap, and a schedule rule above it.
+    expect(uploadCapInForce(15 * KB, 200 * KB)).toBe(15 * KB);
+    expect(uploadCapInForce(500 * KB, 200 * KB)).toBe(500 * KB);
+  });
+
+  it('treats an effective 0 as unlimited, not as missing', () => {
+    expect(uploadCapInForce(0, 200 * KB)).toBe(0);
+  });
+
+  it('falls back to the manual setting until a figure is published', () => {
+    expect(uploadCapInForce(null, 200 * KB)).toBe(200 * KB);
+    expect(uploadCapInForce(undefined, 200 * KB)).toBe(200 * KB);
+    expect(uploadCapInForce(Number.NaN, 200 * KB)).toBe(200 * KB);
+    expect(uploadCapInForce(null, undefined)).toBe(0);
+  });
+
+  it('bounds the column by the scheduled cap rather than the manual one', () => {
+    const factor = uploadScaleFactor(uploadSumBound(uploadCapInForce(100 * KB, 200 * KB)), REPORTED_SLOTS);
+    expect(sumOf(REPORTED_SLOTS, factor)).toBeCloseTo(100 * KB, 6);
   });
 });
 

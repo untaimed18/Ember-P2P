@@ -175,6 +175,8 @@ export type ChatAttachmentStatus =
   | 'busy'
   | 'not_allowed'
   | 'cancelled'
+  | 'unreachable'
+  | 'source_gone'
   | 'failed'
   | 'expired';
 
@@ -201,9 +203,28 @@ export const CHAT_ATTACHMENT_TERMINAL: ReadonlySet<ChatAttachmentStatus> = new S
   'busy',
   'not_allowed',
   'cancelled',
+  'unreachable',
+  'source_gone',
   'failed',
   'expired',
 ]);
+
+/**
+ * Fold an update into the attachment already shown. A row that has ended keeps
+ * its ending: a list snapshot or a progress tick taken before it ended can
+ * arrive after it, and nothing moves a transfer out of a terminal status.
+ * Progress ticks carry no new status, so one that crosses a snapshot in flight
+ * must not drag the bar backwards either.
+ */
+export function mergeChatAttachment(prev: ChatAttachment, next: ChatAttachment): ChatAttachment {
+  if (CHAT_ATTACHMENT_TERMINAL.has(prev.status) && !CHAT_ATTACHMENT_TERMINAL.has(next.status)) {
+    return prev;
+  }
+  if (prev.status === 'active' && next.status === 'active') {
+    return { ...next, transferred: Math.max(prev.transferred, next.transferred) };
+  }
+  return next;
+}
 
 /** Pick a file and offer it to a friend. `null` when the picker was closed. */
 export async function pickAndSendChatAttachment(
@@ -245,7 +266,8 @@ export function parseChatAttachment(raw: unknown): ChatAttachment | null {
   if (r.direction !== 'sent' && r.direction !== 'received') return null;
   const statuses: ChatAttachmentStatus[] = [
     'offered', 'awaiting', 'accepted', 'active', 'complete', 'declined',
-    'too_large', 'busy', 'not_allowed', 'cancelled', 'failed', 'expired',
+    'too_large', 'busy', 'not_allowed', 'cancelled', 'unreachable', 'source_gone', 'failed',
+    'expired',
   ];
   const status = statuses.find((s) => s === r.status);
   if (!status) return null;

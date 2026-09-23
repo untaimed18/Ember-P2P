@@ -14,9 +14,30 @@
  */
 
 /**
+ * The upload cap actually in force, in bytes/s (0 = unlimited).
+ *
+ * `effective` is the backend's `RuntimeStatus.effective_upload_speed`, which
+ * follows a bandwidth schedule rule and the upload speed controller; the manual
+ * setting says neither, so bounding by it let a column held to 15 kB/s by USS
+ * sum to the 200 kB/s the user typed, and clipped rows a schedule had raised
+ * above it. The manual figure is only the fallback until the backend has
+ * published one. An effective 0 is a real answer ("unlimited"), not a gap.
+ */
+export function uploadCapInForce(
+  effective: number | null | undefined,
+  manual: number | null | undefined,
+): number {
+  if (typeof effective === 'number' && Number.isFinite(effective) && effective >= 0) {
+    return effective;
+  }
+  return manual ?? 0;
+}
+
+/**
  * The ceiling the visible slot rates are allowed to add up to.
  *
- * The configured upload cap, or 0 for "nothing to bound against" — uploads
+ * The upload cap in force ({@link uploadCapInForce}), or 0 for "nothing to
+ * bound against" — uploads
  * unlimited — which callers treat as "print the rows as measured".
  *
  * The status-bar total used to bound this as well, on the reasoning that a user

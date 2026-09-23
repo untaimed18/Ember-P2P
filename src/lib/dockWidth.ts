@@ -45,3 +45,16 @@ export function clampDockWidth(px: number, viewportWidth: number): number {
   if (!Number.isFinite(px)) return Math.min(max, DOCK_WIDTH_DEFAULT);
   return Math.min(max, Math.max(DOCK_WIDTH_MIN, Math.round(px)));
 }
+
+/**
+ * The width the user chose, read back from storage.
+ *
+ * Deliberately blind to the window. This is the preference, not what is drawn
+ * — `clampDockWidth` against the current window is — and clamping it here, on
+ * a first read that can happen before the window has settled at its size,
+ * would quietly shrink a width the user never changed.
+ */
+export function preferredDockWidth(stored: string | null): number {
+  if (!stored) return DOCK_WIDTH_DEFAULT;
+  return clampDockWidth(Number.parseInt(stored, 10), 0);
+}

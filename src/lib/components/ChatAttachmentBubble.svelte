@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    CHAT_ATTACHMENT_TERMINAL,
     cancelChatAttachment,
     openChatAttachment,
     respondChatAttachment,
@@ -58,6 +59,10 @@
         return m.chat_attach_not_allowed({ name });
       case 'cancelled':
         return m.chat_attach_cancelled();
+      case 'unreachable':
+        return m.chat_attach_unreachable({ name });
+      case 'source_gone':
+        return sent ? m.chat_attach_source_gone_sent() : m.chat_attach_source_gone_received({ name });
       case 'failed':
         return m.chat_attach_failed();
       case 'expired':
@@ -66,9 +71,7 @@
   });
 
   let problem = $derived(
-    ['declined', 'too_large', 'busy', 'not_allowed', 'cancelled', 'failed', 'expired'].includes(
-      attachment.status,
-    ),
+    attachment.status !== 'complete' && CHAT_ATTACHMENT_TERMINAL.has(attachment.status),
   );
 
   async function run(action: () => Promise<void>) {

@@ -14,8 +14,8 @@
 //! [`super::sharing::add_shared_folder`]: no filesystem roots, no Ember data
 //! directory, no sensitive names, no overlapping shares.
 //!
-//! Listing never follows symlinks or reparse points, so expanding a folder
-//! cannot jump the tree to an unrelated location.
+//! Listing never follows symlinks, junctions or mount points, so expanding a
+//! folder cannot jump the tree to an unrelated location.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
@@ -28,8 +28,8 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::commands::sharing::{
-    add_shared_folder, batch_share, persist_folder_allowlists, share_all_in_folder, FolderAddOutcome,
-    SharedFolderPick,
+    add_shared_folder_limited, batch_share, finish_pick, path_key_covers,
+    persist_folder_allowlists, share_all_in_folder, FolderAddOutcome, SharedFolderPick,
 };
 use crate::commands::settings::shared_paths_overlap;
 use crate::search::index::normalize_path_key;
@@ -124,9 +124,15 @@ struct StoredEntry {
 
 struct ShareBrowserSession {
     id: u64,
-    created: Instant,
+    /// Refreshed on every call, so [`SESSION_TTL`] measures idleness rather
+    /// than how long the dialog has been open.
+    last_used: Instant,
     next_entry: u64,
     entries: HashMap<u64, StoredEntry>,
+    /// Id already issued for a location under a given parent, so listing the
+    /// same folder again hands back the same ids instead of spending fresh
+    /// ones against [`MAX_SESSION_ENTRIES`].
+    issued: HashMap<(Option<u64>, String), u64>,
     shared_folders: Vec<PathBuf>,
     /// Partial shares: folder key → file keys that are actually shared.
     /// A shared folder with no entry here shares every file in it.
@@ -150,7 +156,32 @@ struct FolderOffer {
 }
 
 impl ShareBrowserSession {
+    fn new(id: u64, shared_folders: Vec<PathBuf>, data_dir: PathBuf) -> Self {
+        Self {
+            id,
+            last_used: Instant::now(),
+            next_entry: 1,
+            entries: HashMap::new(),
+            issued: HashMap::new(),
+            shared_folders,
+            allowlists: HashMap::new(),
+            unshared: HashSet::new(),
+            offers: HashMap::new(),
+            data_dir,
+        }
+    }
+
     fn insert(&mut self, stored: StoredEntry) -> Result<u64, String> {
+        let location_key = match &stored.location {
+            Location::ThisPc => String::new(),
+            Location::Path(path) => normalize_path_key(&display_fs_path(path)),
+        };
+        let issued_key = (stored.parent_id, location_key);
+        if let Some(id) = self.issued.get(&issued_key).copied() {
+            // Same place, possibly a fresher size or name casing.
+            self.entries.insert(id, stored);
+            return Ok(id);
+        }
         if self.entries.len() >= MAX_SESSION_ENTRIES {
             return Err(coded(
                 "sharing_browser_session",
@@ -160,6 +191,7 @@ impl ShareBrowserSession {
         let id = self.next_entry;
         self.next_entry = self.next_entry.saturating_add(1);
         self.entries.insert(id, stored);
+        self.issued.insert(issued_key, id);
         Ok(id)
     }
 }
@@ -191,12 +223,15 @@ fn require_session(
 ) -> Result<&mut ShareBrowserSession, String> {
     let expired = guard
         .as_ref()
-        .is_some_and(|session| session.created.elapsed() > SESSION_TTL);
+        .is_some_and(|session| session.last_used.elapsed() > SESSION_TTL);
     if expired {
         *guard = None;
     }
     match guard.as_mut() {
-        Some(session) if session.id == session_id => Ok(session),
+        Some(session) if session.id == session_id => {
+            session.last_used = Instant::now();
+            Ok(session)
+        }
         _ => Err(coded(
             "sharing_browser_session",
             "The folder browser session expired. Close it and try again.",
@@ -288,23 +323,6 @@ fn is_hidden_entry(_meta: &Metadata) -> bool {
     false
 }
 
-/// Junctions and other reparse points. `file_type().is_symlink()` does not
-/// catch every one of them on Windows, and following one would list a
-/// directory the user did not open.
-fn is_reparse_point(meta: &Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-        false
-    }
-}
-
 /// `path` is Ember's data directory or something inside it. Distinct from
 /// [`covers_data_dir`], which also matches a *parent* of the data directory —
 /// true of the user's home folder, which must stay browsable.
@@ -353,6 +371,10 @@ fn share_status_for(
             };
         }
         if shared_paths_overlap(path, existing) {
+            // A folder offered whole through its share's allowlist.
+            if allowlist_contains(allowlists, existing, path) == Some(true) {
+                return ShareBrowserStatus::Already;
+            }
             return ShareBrowserStatus::Overlap;
         }
     }
@@ -374,7 +396,7 @@ fn containing_share<'a>(file: &Path, shared: &'a [PathBuf]) -> Option<&'a Path> 
 fn allowlist_contains(allowlists: &HashMap<String, Vec<String>>, folder: &Path, file: &Path) -> Option<bool> {
     let list = allowlists.get(&normalize_path_key(&display_fs_path(folder)))?;
     let file_key = normalize_path_key(&display_fs_path(file));
-    Some(list.iter().any(|item| item == &file_key))
+    Some(list.iter().any(|item| path_key_covers(item, &file_key)))
 }
 
 /// A file is shared by adding its parent folder. One that already lives in a
@@ -651,6 +673,11 @@ fn list_child_dirs(parent: &Path, data_dir: &Path) -> Result<(Vec<PendingChild>,
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
+        // On Windows this is every name-surrogate reparse point — symlinks,
+        // junctions and volume mount points, the ones that redirect somewhere
+        // else. It is not every reparse point: OneDrive placeholders and
+        // deduplicated files carry one too, are ordinary files and folders
+        // where they sit, and skipping those emptied OneDrive-backed folders.
         if file_type.is_symlink() {
             continue;
         }
@@ -658,7 +685,7 @@ fn list_child_dirs(parent: &Path, data_dir: &Path) -> Result<(Vec<PendingChild>,
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        if is_hidden_entry(&meta) || is_reparse_point(&meta) {
+        if is_hidden_entry(&meta) {
             continue;
         }
         let path = parent.join(&name);
@@ -810,33 +837,56 @@ async fn current_allowlists(
 /// each shared folder is actually on the network. One pass over the index:
 /// a file counts towards the deepest share that contains it, the same rule
 /// the Library sidebar uses.
+///
+/// Runs on every listing, under the index read lock that hashing and search
+/// write through, so it costs one key per file and no more: the roots are
+/// keyed once up front and matched by prefix.
 async fn current_offer_state(
     state: &tauri::State<'_, AppState>,
     shared: &[PathBuf],
 ) -> (HashSet<String>, HashMap<String, FolderOffer>) {
-    let mut roots: Vec<String> = shared.iter().map(|path| display_fs_path(path)).collect();
+    let index = state.local_index.read().await;
+    offer_state(
+        index.all_files().iter().map(|file| (file.path.as_str(), file.shared)),
+        shared,
+    )
+}
+
+fn offer_state<'a>(
+    files: impl Iterator<Item = (&'a str, bool)>,
+    shared: &[PathBuf],
+) -> (HashSet<String>, HashMap<String, FolderOffer>) {
+    let mut roots: Vec<String> = shared
+        .iter()
+        .map(|path| {
+            normalize_path_key(&display_fs_path(path))
+                .trim_end_matches(['/', '\\'])
+                .to_string()
+        })
+        .filter(|root| !root.is_empty())
+        .collect();
     roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    roots.dedup();
     let mut offers: HashMap<String, FolderOffer> = roots
         .iter()
-        .map(|root| (normalize_path_key(root), FolderOffer::default()))
+        .map(|root| (root.clone(), FolderOffer::default()))
         .collect();
     let mut unshared = HashSet::new();
 
-    let index = state.local_index.read().await;
-    for file in index.all_files() {
-        if !file.shared {
-            unshared.insert(normalize_path_key(&file.path));
-        }
-        let Some(root) = roots
+    for (path, shared) in files {
+        let key = normalize_path_key(path);
+        if let Some(root) = roots
             .iter()
-            .find(|root| crate::security::path_matches_dir(&file.path, root))
-        else {
-            continue;
-        };
-        let offer = offers.entry(normalize_path_key(root)).or_default();
-        offer.indexed = offer.indexed.saturating_add(1);
-        if file.shared {
-            offer.offered = offer.offered.saturating_add(1);
+            .find(|root| path_key_covers(root, &key))
+        {
+            let offer = offers.entry(root.clone()).or_default();
+            offer.indexed = offer.indexed.saturating_add(1);
+            if shared {
+                offer.offered = offer.offered.saturating_add(1);
+            }
+        }
+        if !shared {
+            unshared.insert(key);
         }
     }
     (unshared, offers)
@@ -865,17 +915,11 @@ pub async fn open_share_browser(
             )
         })?;
 
-    let mut session = ShareBrowserSession {
-        id: crate::commands::js_safe_token(),
-        created: Instant::now(),
-        next_entry: 1,
-        entries: HashMap::new(),
-        shared_folders,
-        allowlists,
-        unshared,
-        offers,
-        data_dir,
-    };
+    let mut session =
+        ShareBrowserSession::new(crate::commands::js_safe_token(), shared_folders, data_dir);
+    session.allowlists = allowlists;
+    session.unshared = unshared;
+    session.offers = offers;
     let current_id = session.insert(StoredEntry {
         location: Location::ThisPc,
         kind: ShareBrowserKind::ThisPc,
@@ -1104,21 +1148,39 @@ struct ChosenShare {
     was_partial: bool,
 }
 
+/// Selected entries that share through one folder's allowlist.
+#[derive(Debug, Default, PartialEq)]
+struct FileGroup {
+    folder: String,
+    files: Vec<String>,
+    /// Selected folders inside `folder`, offered whole through its allowlist.
+    dirs: Vec<String>,
+}
+
 /// Folders to share in full, and files grouped under the folder that will hold
 /// their allowlist. A file inside a folder that is itself selected is covered
 /// by that folder. A file already inside a shared folder joins that share's
 /// allowlist instead of adding its immediate parent, which would overlap.
 /// Files at several depths of one new folder collapse onto the shallowest
 /// parent so the second add is not rejected as an overlap.
-fn selection_plan(
-    chosen: &[ChosenShare],
-    shared: &[PathBuf],
-) -> (Vec<String>, Vec<(String, Vec<String>)>) {
-    let folders: Vec<String> = chosen
-        .iter()
-        .filter(|item| !item.is_file)
-        .map(|item| item.path.clone())
-        .collect();
+///
+/// A selected folder inside a group's folder joins that group's allowlist
+/// whole, for the same reason: added on its own after the group it is an
+/// overlap, and the group's allowlist would then have left every file in it
+/// unshared. A selected folder inside another selected folder is covered by
+/// it.
+fn selection_plan(chosen: &[ChosenShare], shared: &[PathBuf]) -> (Vec<String>, Vec<FileGroup>) {
+    let mut folders: Vec<String> = Vec::new();
+    for item in chosen.iter().filter(|item| !item.is_file) {
+        let covered = chosen.iter().any(|other| {
+            !other.is_file
+                && !same_folder(&other.path, &item.path)
+                && crate::security::path_matches_dir(&item.path, &other.path)
+        });
+        if !covered {
+            remember_once(&mut folders, item.path.clone());
+        }
+    }
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for item in chosen.iter().filter(|item| item.is_file) {
         if folders
@@ -1142,9 +1204,30 @@ fn selection_plan(
         grouped.entry(key).or_default().push(item.path.clone());
     }
     collapse_nested_file_groups(&mut grouped);
-    let mut pairs: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    (folders, pairs)
+    let mut groups: Vec<FileGroup> = grouped
+        .into_iter()
+        .map(|(folder, files)| FileGroup {
+            folder,
+            files,
+            dirs: Vec::new(),
+        })
+        .collect();
+    groups.sort_by(|a, b| a.folder.cmp(&b.folder));
+    folders.retain(|folder| {
+        let Some(group) = groups
+            .iter_mut()
+            .filter(|group| {
+                !same_folder(&group.folder, folder)
+                    && crate::security::path_matches_dir(folder, &group.folder)
+            })
+            .max_by_key(|group| group.folder.len())
+        else {
+            return true;
+        };
+        group.dirs.push(folder.clone());
+        false
+    });
+    (folders, groups)
 }
 
 /// Move files from a deeper parent into a shallower parent that is also being
@@ -1202,14 +1285,10 @@ pub async fn share_browser_selection(
             MAX_SHARE_SELECTION,
         ));
     }
-    let shared_folders = current_shared_folders(&state).await;
-    let allowlists = current_allowlists(&state).await;
-    let (unshared, offers) = current_offer_state(&state, &shared_folders).await;
-    let (chosen, already_noted) = {
+    let (picked, data_dir) = {
         let mut guard = lock_session()?;
         let session = require_session(&mut guard, session_id)?;
-        let mut chosen = Vec::new();
-        let mut already_noted = Vec::new();
+        let mut picked = Vec::with_capacity(entry_ids.len());
         for id in &entry_ids {
             let Some(stored) = session.entries.get(id) else {
                 return Err(coded(
@@ -1223,53 +1302,71 @@ pub async fn share_browser_selection(
                     "Cannot share this location",
                 ));
             };
-            let status = if stored.kind == ShareBrowserKind::File {
-                file_share_status(
-                    path,
-                    &shared_folders,
-                    &session.data_dir,
-                    &allowlists,
-                    &unshared,
-                )
-            } else {
-                share_status_for(
-                    path,
-                    stored.kind,
-                    &shared_folders,
-                    &session.data_dir,
-                    &allowlists,
-                    &offers,
-                )
-            };
-            if status == ShareBrowserStatus::Blocked {
-                return Err(coded(
-                    "sharing_browser_blocked",
-                    "Cannot share this location",
-                ));
-            }
-            if status == ShareBrowserStatus::Already {
-                if let Some(folder) = containing_share(path, &shared_folders) {
-                    remember_once(&mut already_noted, display_fs_path(folder));
-                } else {
-                    remember_once(&mut already_noted, display_fs_path(path));
-                }
-                continue;
-            }
-            chosen.push(ChosenShare {
-                path: display_fs_path(path),
-                is_file: stored.kind == ShareBrowserKind::File,
-                was_partial: status == ShareBrowserStatus::Partial,
-            });
+            picked.push((path.clone(), stored.kind));
         }
-        (chosen, already_noted)
+        (picked, session.data_dir.clone())
     };
+    // Judged in the form the shared list stores, so a folder browsed through
+    // a mapped drive, a `subst` drive or a junctioned parent is recognised as
+    // the share it already is rather than added a second time.
+    let picked = tokio::task::spawn_blocking(move || {
+        picked
+            .into_iter()
+            .map(|(path, kind)| (resolve_selected(&path, kind), kind))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| {
+        coded_ctx(
+            "sharing_browser_task_failed",
+            "Folder browser failed",
+            error,
+        )
+    })?;
+    let shared_folders = current_shared_folders(&state).await;
+    let allowlists = current_allowlists(&state).await;
+    let (unshared, offers) = current_offer_state(&state, &shared_folders).await;
+    let mut chosen = Vec::new();
+    let mut already_noted = Vec::new();
+    for (path, kind) in &picked {
+        let status = if *kind == ShareBrowserKind::File {
+            file_share_status(path, &shared_folders, &data_dir, &allowlists, &unshared)
+        } else {
+            share_status_for(
+                path,
+                *kind,
+                &shared_folders,
+                &data_dir,
+                &allowlists,
+                &offers,
+            )
+        };
+        if status == ShareBrowserStatus::Blocked {
+            return Err(coded(
+                "sharing_browser_blocked",
+                "Cannot share this location",
+            ));
+        }
+        if status == ShareBrowserStatus::Already {
+            if let Some(folder) = containing_share(path, &shared_folders) {
+                remember_once(&mut already_noted, display_fs_path(folder));
+            } else {
+                remember_once(&mut already_noted, display_fs_path(path));
+            }
+            continue;
+        }
+        chosen.push(ChosenShare {
+            path: display_fs_path(path),
+            is_file: *kind == ShareBrowserKind::File,
+            was_partial: status == ShareBrowserStatus::Partial,
+        });
+    }
 
     let (folders, file_groups) = selection_plan(&chosen, &shared_folders);
     let mut result = SharedFolderPick {
         already_shared: already_noted,
         ..Default::default()
     };
-    let mut first_error: Option<String> = None;
 
     // Folders chosen in full drop any allowlist limiting them: the whole
     // folder is the share now.
@@ -1287,104 +1384,107 @@ pub async fn share_browser_selection(
         persist_folder_allowlists(&state, &[], &cleared).await?;
     }
 
-    for (parent, files) in file_groups {
-        let parent_is_shared = shared_folders
-            .iter()
-            .any(|existing| same_folder(&parent, &display_fs_path(existing)));
-        if parent_is_shared {
-            if let Some(existing) = allowlists.get(&normalize_path_key(&parent)) {
-                let mut merged = existing.clone();
-                for file in &files {
-                    let key = normalize_path_key(file);
-                    if !merged.iter().any(|item| item == &key) {
-                        merged.push(file.clone());
-                    }
-                }
-                persist_folder_allowlists(&state, &[(parent.clone(), merged)], &[]).await?;
-                match batch_share(app.clone(), state.clone(), files.clone()).await {
-                    Ok(_) => result.files_shared.extend(files),
-                    Err(error) => {
-                        tracing::warn!("Selected files in {parent} were not shared: {error}");
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                }
-            } else {
-                // The folder is already a full share. These files were taken
-                // off the network; offering them again does not limit the rest.
-                match batch_share(app.clone(), state.clone(), files.clone()).await {
-                    Ok(0) => remember_once(&mut result.already_shared, parent),
-                    Ok(_) => result.files_shared.extend(files),
-                    Err(error) => {
-                        tracing::warn!("Selected files in {parent} were not shared: {error}");
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-        persist_folder_allowlists(&state, &[(parent.clone(), files.clone())], &[]).await?;
-        match add_shared_folder(app.clone(), state.clone(), parent.clone()).await {
-            Ok(FolderAddOutcome::Added) => result.added.push(parent),
-            Ok(FolderAddOutcome::AlreadyShared) => {
-                if let Err(error) = batch_share(app.clone(), state.clone(), files.clone()).await {
-                    tracing::warn!("Selected files in {parent} were not shared: {error}");
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-                result.files_shared.extend(files);
-                remember_once(&mut result.already_shared, parent);
-            }
+    for group in file_groups {
+        let parent = group.folder;
+        let entries: Vec<String> = group.files.iter().chain(&group.dirs).cloned().collect();
+        let add = match add_shared_folder_limited(
+            app.clone(),
+            state.clone(),
+            parent.clone(),
+            Some(entries),
+        )
+        .await
+        {
+            Ok(add) => add,
             Err(error) => {
                 tracing::warn!("Selected files in {parent} were not shared: {error}");
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                let _ = persist_folder_allowlists(&state, &[], &[parent]).await;
+                result.failed.push(error);
+                continue;
             }
+        };
+        if add.outcome == FolderAddOutcome::Added {
+            result.added.push(parent);
+            continue;
+        }
+        // Already shared. The allowlist, if there is one, now names the
+        // selection, which covers what the next scan finds; anything already
+        // indexed and taken off the network has to be offered now.
+        let mut offered: Vec<String> = Vec::new();
+        let mut failed = false;
+        if !add.files.is_empty() {
+            match batch_share(app.clone(), state.clone(), add.files.clone()).await {
+                Ok(0) => {}
+                Ok(_) => offered.extend(add.files.iter().cloned()),
+                Err(error) => {
+                    tracing::warn!("Selected files in {parent} were not shared: {error}");
+                    result.failed.push(error);
+                    failed = true;
+                }
+            }
+        }
+        for dir in &add.dirs {
+            match share_all_in_folder(app.clone(), state.inner(), dir).await {
+                Ok(paths) => offered.extend(paths),
+                Err(error) => {
+                    tracing::warn!("Could not offer {dir}: {error}");
+                    result.failed.push(error);
+                    failed = true;
+                }
+            }
+        }
+        if offered.is_empty() && add.allowlist_grew {
+            // Nothing indexed yet to flip, but the allowlist now offers them.
+            offered = add.files.iter().chain(&add.dirs).cloned().collect();
+        }
+        if !offered.is_empty() {
+            result.files_shared.extend(offered);
+        } else if !failed {
+            remember_once(&mut result.already_shared, parent);
         }
     }
 
     for path in folders {
         let promoting = promoted.iter().any(|folder| same_folder(folder, &path));
-        match add_shared_folder(app.clone(), state.clone(), path.clone()).await {
-            Ok(FolderAddOutcome::Added) => result.added.push(path),
-            Ok(FolderAddOutcome::AlreadyShared) if promoting => {
-                match share_all_in_folder(app.clone(), state.inner(), &path).await {
+        match add_shared_folder_limited(app.clone(), state.clone(), path.clone(), None).await {
+            Ok(add) if add.outcome == FolderAddOutcome::Added => result.added.push(path),
+            Ok(add) if promoting => {
+                match share_all_in_folder(app.clone(), state.inner(), &add.folder).await {
                     Ok(paths) if paths.is_empty() => {
                         remember_once(&mut result.already_shared, path);
                     }
                     Ok(paths) => result.files_shared.extend(paths),
                     Err(error) => {
                         tracing::warn!("Could not offer the rest of {path}: {error}");
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
+                        result.failed.push(error);
                     }
                 }
             }
-            Ok(FolderAddOutcome::AlreadyShared) => remember_once(&mut result.already_shared, path),
+            Ok(_) => remember_once(&mut result.already_shared, path),
             Err(error) => {
                 tracing::warn!("Selected folder {path} was not shared: {error}");
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                result.failed.push(error);
             }
         }
     }
-    if result.added.is_empty()
-        && result.already_shared.is_empty()
-        && result.files_shared.is_empty()
-    {
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-    }
-    Ok(result)
+    finish_pick(result)
+}
+
+/// A selected entry spelled the way the shared list stores it: a folder
+/// canonicalized, a file as its canonicalized parent plus its name. Left as
+/// browsed when it cannot be resolved; the add then refuses it. Blocking.
+fn resolve_selected(path: &Path, kind: ShareBrowserKind) -> PathBuf {
+    let resolved = if kind == ShareBrowserKind::File {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .map(|(parent, name)| parent.join(name))
+    } else {
+        path.canonicalize().ok()
+    };
+    resolved.map_or_else(
+        || path.to_path_buf(),
+        |resolved| PathBuf::from(display_fs_path(&resolved)),
+    )
 }
 
 #[tauri::command]
@@ -1596,7 +1696,7 @@ mod tests {
         let (folders, files) = selection_plan(&chosen, &[]);
         assert_eq!(folders, vec![folder.to_string()]);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].1, vec![other.to_string()]);
+        assert_eq!(files[0].files, vec![other.to_string()]);
     }
 
     #[test]
@@ -1610,8 +1710,8 @@ mod tests {
         let chosen = vec![chosen_file(nested)];
         let (_folders, files) = selection_plan(&chosen, &[PathBuf::from(share)]);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, share);
-        assert_eq!(files[0].1, vec![nested.to_string()]);
+        assert_eq!(files[0].folder, share);
+        assert_eq!(files[0].files, vec![nested.to_string()]);
     }
 
     #[test]
@@ -1630,12 +1730,209 @@ mod tests {
         let chosen = vec![chosen_file(top), chosen_file(nested)];
         let (_folders, files) = selection_plan(&chosen, &[]);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, parent);
-        let mut got = files[0].1.clone();
+        assert_eq!(files[0].folder, parent);
+        let mut got = files[0].files.clone();
         got.sort();
         let mut expect = vec![top.to_string(), nested.to_string()];
         expect.sort();
         assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn a_folder_beside_a_selected_file_joins_that_files_allowlist() {
+        let (file, folder, parent) = if cfg!(windows) {
+            (r"C:\Music\a.mp3", r"C:\Music\Album", r"C:\Music")
+        } else {
+            ("/music/a.mp3", "/music/album", "/music")
+        };
+        let chosen = vec![chosen_file(file), chosen_folder(folder)];
+        let (folders, groups) = selection_plan(&chosen, &[]);
+        assert!(
+            folders.is_empty(),
+            "added on its own after the parent it would be refused as an overlap"
+        );
+        assert_eq!(
+            groups,
+            vec![FileGroup {
+                folder: parent.to_string(),
+                files: vec![file.to_string()],
+                dirs: vec![folder.to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_another_selected_folder_is_covered_by_it() {
+        let (outer, inner) = if cfg!(windows) {
+            (r"C:\Music", r"C:\Music\Album")
+        } else {
+            ("/music", "/music/album")
+        };
+        let chosen = vec![chosen_folder(inner), chosen_folder(outer)];
+        let (folders, groups) = selection_plan(&chosen, &[]);
+        assert_eq!(folders, vec![outer.to_string()]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn a_folder_on_its_shares_allowlist_reads_as_shared() {
+        let (share, album, other, file, data) = if cfg!(windows) {
+            (
+                r"C:\Music",
+                r"C:\Music\Album",
+                r"C:\Music\Other",
+                r"C:\Music\Album\b.mp3",
+                r"D:\Ember",
+            )
+        } else {
+            (
+                "/music",
+                "/music/album",
+                "/music/other",
+                "/music/album/b.mp3",
+                "/ember",
+            )
+        };
+        let allowlists =
+            HashMap::from([(normalize_path_key(share), vec![normalize_path_key(album)])]);
+        let shared = [PathBuf::from(share)];
+        let status = |path: &str| {
+            share_status_for(
+                Path::new(path),
+                ShareBrowserKind::Folder,
+                &shared,
+                Path::new(data),
+                &allowlists,
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(status(album), ShareBrowserStatus::Already);
+        assert_eq!(status(other), ShareBrowserStatus::Overlap);
+        let file_status = file_share_status(
+            Path::new(file),
+            &shared,
+            Path::new(data),
+            &allowlists,
+            &HashSet::new(),
+        );
+        assert_eq!(file_status, ShareBrowserStatus::Already);
+    }
+
+    #[test]
+    fn relisting_a_folder_reuses_its_ids() {
+        let (folder, child) = if cfg!(windows) {
+            (r"C:\Music", r"C:\Music\Album")
+        } else {
+            ("/music", "/music/album")
+        };
+        let mut session = ShareBrowserSession::new(1, Vec::new(), PathBuf::from("/ember"));
+        let entry = |parent_id: Option<u64>, path: &str| StoredEntry {
+            location: Location::Path(PathBuf::from(path)),
+            kind: ShareBrowserKind::Folder,
+            letter: None,
+            name: "x".to_string(),
+            parent_id,
+            size: None,
+        };
+        let parent = session.insert(entry(None, folder)).unwrap();
+        let first = session.insert(entry(Some(parent), child)).unwrap();
+        for _ in 0..10 {
+            assert_eq!(session.insert(entry(Some(parent), child)).unwrap(), first);
+        }
+        assert_eq!(session.entries.len(), 2);
+        assert_ne!(
+            session.insert(entry(Some(first), child)).unwrap(),
+            first,
+            "the same place reached through another parent keeps its own id"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_expires_and_a_used_one_does_not() {
+        let mut guard = Some(ShareBrowserSession::new(7, Vec::new(), PathBuf::from("/ember")));
+        let past = Instant::now()
+            .checked_sub(SESSION_TTL - Duration::from_secs(1))
+            .expect("clock far enough from boot");
+        guard.as_mut().unwrap().last_used = past;
+        assert!(require_session(&mut guard, 7).is_ok());
+        assert!(
+            guard.as_ref().unwrap().last_used > past,
+            "every use pushes the expiry back"
+        );
+        guard.as_mut().unwrap().last_used = Instant::now()
+            .checked_sub(SESSION_TTL + Duration::from_secs(1))
+            .expect("clock far enough from boot");
+        assert!(require_session(&mut guard, 7).is_err());
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn offer_state_counts_each_file_towards_its_deepest_share() {
+        let (outer, inner, a, b, c, elsewhere) = if cfg!(windows) {
+            (
+                r"\\?\C:\Music",
+                r"C:\Music\Live",
+                r"C:\Music\a.mp3",
+                r"C:\Music\Live\b.mp3",
+                r"C:\Music\Live\c.mp3",
+                r"C:\Musical\d.mp3",
+            )
+        } else {
+            (
+                "/music",
+                "/music/live",
+                "/music/a.mp3",
+                "/music/live/b.mp3",
+                "/music/live/c.mp3",
+                "/musical/d.mp3",
+            )
+        };
+        let files = [(a, true), (b, true), (c, false), (elsewhere, false)];
+        let (unshared, offers) = offer_state(
+            files.iter().copied(),
+            &[PathBuf::from(outer), PathBuf::from(inner)],
+        );
+        let outer_offer = offers[&normalize_path_key(&display_fs_path(Path::new(outer)))];
+        assert_eq!((outer_offer.indexed, outer_offer.offered), (1, 1));
+        let inner_offer = offers[&normalize_path_key(inner)];
+        assert_eq!((inner_offer.indexed, inner_offer.offered), (2, 1));
+        assert_eq!(
+            unshared,
+            HashSet::from([normalize_path_key(c), normalize_path_key(elsewhere)])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn listing_skips_junctions_but_not_ordinary_folders() {
+        // Not the system temp directory: it sits under `AppData`, which the
+        // browser refuses to list at all.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!(
+            "ember-share-browser-junction-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("target");
+        let listed = dir.join("listed");
+        std::fs::create_dir_all(target.join("inner")).unwrap();
+        std::fs::create_dir_all(listed.join("real")).unwrap();
+        std::fs::write(listed.join("song.mp3"), b"x").unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(listed.join("link"))
+            .arg(&target)
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+
+        let (children, truncated) =
+            list_child_dirs(&listed, Path::new(r"Z:\no-ember-here")).unwrap();
+        let names: Vec<&str> = children.iter().map(|child| child.name.as_str()).collect();
+        assert!(!truncated);
+        assert_eq!(names, vec!["real", "song.mp3"]);
+        let _ = std::fs::remove_dir(listed.join("link"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn chosen_file(path: &str) -> ChosenShare {

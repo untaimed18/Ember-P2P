@@ -6,6 +6,7 @@ import {
   ignoredKeysForChannel,
   ignoredMemberKeys,
   ignoredMembers,
+  ignoreMemberEverywhere,
   isMemberIgnored,
   toggleMemberIgnore,
   toggleMemberIgnoreInChannel,
@@ -96,6 +97,40 @@ describe('toggling', () => {
     expect(ignoreScopeFor(list, ALICE, ROOM_B)).toBe('none');
     expect(ignoreScopeFor(list, BOB, ROOM_A)).toBe('global');
     expect(ignoreScopeFor(list, BOB, null)).toBe('global');
+  });
+});
+
+describe('ignoring everywhere', () => {
+  it('adds a global entry for someone not yet ignored', () => {
+    ignoreMemberEverywhere(ALICE, 'Ada');
+    expect(get(ignoredMembers)).toEqual([{ pubkey: ALICE, name: 'Ada' }]);
+  });
+
+  it('widens an ignore in this room instead of lifting it', () => {
+    toggleMemberIgnoreInChannel(ALICE, ROOM_A, 'Ada');
+    ignoreMemberEverywhere(ALICE, 'Ada');
+
+    expect(get(ignoredMembers)).toEqual([{ pubkey: ALICE, name: 'Ada' }]);
+    expect(isMemberIgnored(get(ignoredMembers), ALICE, ROOM_A)).toBe(true);
+    expect(isMemberIgnored(get(ignoredMembers), ALICE, ROOM_B)).toBe(true);
+  });
+
+  it('widens an ignore in another room when asked from this one', () => {
+    toggleMemberIgnoreInChannel(ALICE, ROOM_B, 'Ada');
+    ignoreMemberEverywhere(ALICE);
+
+    expect(ignoreScopeFor(get(ignoredMembers), ALICE, ROOM_A)).toBe('global');
+    expect(isMemberIgnored(get(ignoredMembers), ALICE, ROOM_B)).toBe(true);
+    // No name to give keeps the one already on the entry.
+    expect(get(ignoredMembers)[0].name).toBe('Ada');
+  });
+
+  it('leaves a global entry as it is', () => {
+    toggleMemberIgnore(ALICE, 'Ada');
+    toggleMemberIgnore(BOB);
+    const before = get(ignoredMembers);
+    ignoreMemberEverywhere(ALICE);
+    expect(get(ignoredMembers)).toBe(before);
   });
 });
 

@@ -171,11 +171,9 @@ pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
 /// the one after. Rotating the non-focused slots across two beats therefore
 /// keeps twice as many rooms reachable for the same number of POSTs — which
 /// is the only way to widen coverage, since the cap above is fixed by a limit
-/// on the other end.
+/// on the other end. The walk spans the *rotating* slots times this depth, so
+/// a room on screen narrows it rather than stretching each revisit past expiry.
 pub const CHANNEL_RENDEZVOUS_ROTATION_DEPTH: usize = 2;
-/// Rooms that can hold a live rendezvous registration at once.
-pub const CHANNEL_RENDEZVOUS_COVERAGE: usize =
-    CHANNEL_RENDEZVOUS_MAX_CHANNELS * CHANNEL_RENDEZVOUS_ROTATION_DEPTH;
 /// Deterministic gossip degree: XOR-closest members to self.
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.
@@ -316,6 +314,23 @@ const _: () = assert!(
     CHANNEL_HISTORY_WALK_SECS * (CHANNEL_HISTORY_SYNC_PER_MIN as u64) > 60,
     "the walk interval must stay inside the budget a responder admits"
 );
+
+/// Whether a newly stored line arrived the way a catch-up reply sends it.
+///
+/// Replies go out as TTL-1 unicasts that nobody floods on, while a live line
+/// reaches us with most of [`CHANNEL_MSG_TTL_DEFAULT`] left. Only these may
+/// put a room on [`CHANNEL_HISTORY_WALK_SECS`]: ordinary chat moves the
+/// room's watermark too, and counting it had every busy room asking all its
+/// neighbors ten times as often for backlog that did not exist.
+pub fn gossip_is_catch_up_shaped(ttl: u8) -> bool {
+    ttl <= 1
+}
+
+/// Whether a neighbor is mid-walk: catch-up lines have landed in the room
+/// since we asked them. `mark` is the room's catch-up count at that ask.
+pub fn history_sync_walking(mark: Option<i64>, ingested: i64) -> bool {
+    mark.is_some_and(|mark| ingested > mark)
+}
 /// How soon opening a room may re-ask for its history ahead of that gate.
 ///
 /// Focusing a room drops its catch-up stamps so the next tick asks straight
@@ -369,6 +384,16 @@ pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
 /// short, and short enough that a lapsed one stops being a life sentence.
 /// Re-offering to the *same* member stays allowed at any age.
 pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
+
+/// Whether an ownership offer is still inside [`HANDOFF_PENDING_TTL_SECS`].
+///
+/// The offer's version is its own wall-clock second, so it doubles as its
+/// age. A negative age means the clock moved backwards, and counts as lapsed
+/// so it cannot wedge the room either.
+pub fn handoff_offer_live(version: u64, now: i64) -> bool {
+    let offered_at = i64::try_from(version).unwrap_or(i64::MAX);
+    (0..HANDOFF_PENDING_TTL_SECS).contains(&now.saturating_sub(offered_at))
+}
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -4626,6 +4651,30 @@ mod tests {
         let other = ChannelIdentity::generate();
         assert!(decode_channel_handoff_offer(&bytes, &channel.channel_id, &other.pubkey).is_none());
         assert!(decode_channel_handoff_offer(&bytes, &[0u8; 16], &channel.pubkey).is_none());
+    }
+
+    #[test]
+    fn a_handoff_offer_is_live_only_inside_its_window() {
+        let offered = 1_700_000_000u64;
+        let at = offered as i64;
+        assert!(handoff_offer_live(offered, at));
+        assert!(handoff_offer_live(offered, at + HANDOFF_PENDING_TTL_SECS - 1));
+        assert!(!handoff_offer_live(offered, at + HANDOFF_PENDING_TTL_SECS));
+        // A clock that ran backwards must not keep an offer open forever.
+        assert!(!handoff_offer_live(offered, at - 1));
+        assert!(!handoff_offer_live(u64::MAX, at));
+    }
+
+    #[test]
+    fn only_catch_up_shaped_lines_put_a_room_on_the_walk_interval() {
+        assert!(gossip_is_catch_up_shaped(1));
+        assert!(gossip_is_catch_up_shaped(0));
+        assert!(!gossip_is_catch_up_shaped(CHANNEL_MSG_TTL_DEFAULT));
+        assert!(!gossip_is_catch_up_shaped(2));
+
+        assert!(!history_sync_walking(None, 10), "no ask recorded means no walk");
+        assert!(!history_sync_walking(Some(4), 4), "nothing landed since the ask");
+        assert!(history_sync_walking(Some(4), 5));
     }
 
     #[test]

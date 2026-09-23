@@ -86,6 +86,7 @@ pub async fn open_and_run_friend_session(
         Box::new(raw_r),
         Box::new(raw_w),
         addr,
+        false,
         expected_ember_hash,
         our_user_hash,
         our_ember_hash,
@@ -340,15 +341,18 @@ async fn send_friend_request_verdict(
 /// hole-punch and rendezvous-relay transports, which hand back boxed
 /// `AsyncRead`/`AsyncWrite` halves rather than a `TcpStream`.
 ///
-/// `addr` is used only for logging and the identity-guard error message —
-/// for non-TCP transports pass the best available description of where
-/// the peer was actually reached (e.g. the rendezvous-reported punch
-/// address, or `0.0.0.0:0` for a pure relay hop).
+/// `addr` is where the session reports the peer to be, and it is the IP a
+/// connect-back from this session goes to — for non-TCP transports pass where
+/// the peer was actually reached (the punched address), or the best address
+/// known for it when a relay hop has none. `relayed` marks that last case: a
+/// chat attachment is then refused rather than dialled at an address the
+/// session itself could not reach.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_friend_session_over_transport(
     raw_r: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     raw_w: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     addr: SocketAddr,
+    relayed: bool,
     expected_ember_hash: [u8; 16],
     our_user_hash: [u8; 16],
     our_ember_hash: [u8; 16],
@@ -481,7 +485,8 @@ pub async fn run_friend_session_over_transport(
     // stale or key-mismatched entry.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let ember_session_handle =
-        EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
+        EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash)
+            .via_relay(relayed);
     {
         let mut sessions = ember_sessions.write().await;
         // The user may have gone offline while this dial was in flight.
@@ -980,7 +985,7 @@ pub async fn run_friend_session_over_transport(
                                             if let Some(kind) = super::upload::attach_event_from_ext(
                                                 peer_ember_hash,
                                                 &payload,
-                                                addr,
+                                                (!relayed).then_some(addr),
                                             ) {
                                                 let _ = session_ul_event_tx.send(UploadEvent {
                                                     transfer_id: String::new(),
@@ -1240,7 +1245,7 @@ pub async fn connect_friend_with_fallback(
     )
     .await
     {
-        Ok(FallbackTransport::Punch(send, recv)) => {
+        Ok(FallbackTransport::Punch((send, recv, punched_addr))) => {
             info!(
                 "Friend hole-punch to {} succeeded",
                 hex::encode(expected_ember_hash)
@@ -1248,7 +1253,8 @@ pub async fn connect_friend_with_fallback(
             run_friend_session_over_transport(
                 Box::new(recv),
                 Box::new(send),
-                addr,
+                punched_addr,
+                false,
                 expected_ember_hash,
                 our_user_hash,
                 our_ember_hash,
@@ -1272,10 +1278,14 @@ pub async fn connect_friend_with_fallback(
                 hex::encode(expected_ember_hash)
             );
             let (r, w) = tokio::io::split(ws_stream);
+            // A relay hop has no direct address of its own. The one we dialled
+            // is still the friend's last known one — the address this session
+            // reports, and the only IP anything dialled back from it may use.
             run_friend_session_over_transport(
                 Box::new(r),
                 Box::new(w),
                 addr,
+                true,
                 expected_ember_hash,
                 our_user_hash,
                 our_ember_hash,
@@ -1311,9 +1321,13 @@ pub async fn connect_friend_with_fallback(
 /// buy nothing: the value is moved once and read through thereafter.
 #[allow(clippy::large_enum_variant)]
 enum FallbackTransport {
-    Punch(quinn::SendStream, quinn::RecvStream),
+    Punch(PunchedStreams),
     Relay(crate::network::ember::relay::WsStream),
 }
+
+/// A punched friend connection's stream, and the address it actually landed
+/// on — the friend's current mapping, which the saved address may not be.
+type PunchedStreams = (quinn::SendStream, quinn::RecvStream, SocketAddr);
 
 struct AbortOnDropTask<T>(Option<tokio::task::JoinHandle<T>>);
 
@@ -1713,7 +1727,7 @@ async fn nat_fallback_transport(
                 crate::network::ember::relay::close_server_relay(stream).await;
             }
             abandon_offered_ticket(&offered_ticket).await;
-            Ok(FallbackTransport::Punch(value.0, value.1))
+            Ok(FallbackTransport::Punch(value))
         }
         FallbackRace::Relay { value } => Ok(FallbackTransport::Relay(value)),
         FallbackRace::Failed(error) => {
@@ -1746,7 +1760,7 @@ async fn punch_from_register(
     secret_key: [u8; 32],
     deadline: tokio::time::Instant,
     skip_tx: tokio::sync::watch::Sender<bool>,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     // Register a port on the QUIC endpoint's own socket, not
     // `our_external_addr.port()` — that address comes from the KAD UDP
     // STUN probe (a *different* socket than the QUIC endpoint the friend
@@ -1858,7 +1872,7 @@ async fn punch_friend_until(
     friend_ember_hash: [u8; 16],
     secret_key: &[u8; 32],
     deadline: tokio::time::Instant,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1921,7 +1935,7 @@ async fn try_complete_friend_punch(
     friend_ember_hash: [u8; 16],
     secret_key: &[u8; 32],
     info: crate::network::ember::relay::PunchInfo,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     let our_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
         .verifying_key()
         .to_bytes();
@@ -1993,7 +2007,7 @@ async fn try_complete_friend_punch(
     )
     .await
     {
-        Ok(streams) => {
+        Ok((send, recv)) => {
             crate::network::ember::relay::ack_punch(
                 rendezvous_url,
                 &our_ember_hash,
@@ -2003,7 +2017,7 @@ async fn try_complete_friend_punch(
                 secret_key,
             )
             .await?;
-            Ok(streams)
+            Ok((send, recv, peer_addr))
         }
         Err(error) => {
             debug!("Friend QUIC punch to {peer_addr} failed: {error}");
@@ -2891,6 +2905,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -3036,6 +3051,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -3166,6 +3182,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -3305,6 +3322,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,

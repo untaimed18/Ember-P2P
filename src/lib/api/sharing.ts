@@ -12,6 +12,9 @@ export interface SharedFolderPick {
   already_shared: string[];
   /** Files shared into a folder that was already on the list. */
   files_shared?: string[];
+  /** Coded errors for the part of the selection that did not land while the
+   *  rest did. A selection that shares nothing rejects instead. */
+  failed?: string[];
 }
 
 /** Open the backend-owned native picker and add every selected folder. */

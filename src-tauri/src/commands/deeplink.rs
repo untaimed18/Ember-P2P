@@ -543,6 +543,13 @@ mod tests {
         assert_eq!(preview.kind, "friend");
         assert_eq!(preview.hash.as_deref(), Some(hash_hex.as_str()));
         assert!(is_deep_link_payload(&code));
+        let mixed = format!("Ember2:{}:{}", hash_hex, hex::encode(pubkey));
+        assert!(is_deep_link_payload(&mixed));
+        assert_eq!(
+            preview_deep_link_payload(&mixed).unwrap().hash.as_deref(),
+            Some(hash_hex.as_str()),
+            "a code detected in any case must also parse in any case"
+        );
         assert!(preview_deep_link_payload("ember2:not-a-code").is_err());
     }
 

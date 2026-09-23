@@ -126,7 +126,9 @@ pub struct FetchOutcome {
 ///
 /// `on_progress` is told the transfer id once it is known and authorized, then
 /// the absolute byte position after each chunk — absolute rather than "sent this
-/// call", so a resumed stream reports where the file actually is.
+/// call", so a resumed stream reports where the file actually is. Returning
+/// false stops the stream there: the grant was checked when it opened, and
+/// this is how a caller withdraws it from a stream already running.
 ///
 /// `limiter` is the user's upload cap. A chat file is still upload, and a user
 /// who capped theirs to keep the connection usable should not find a friend's
@@ -143,7 +145,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
-    P: FnMut(&[u8; 16], u64, u64),
+    P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
     let mut tail = [0u8; ATTACH_REQUEST_TAIL_LEN];
     tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut tail)).await??;
@@ -232,7 +234,9 @@ where
     let mut sent = 0u64;
     let mut position = request.start_chunk as u64 * ATTACH_CHUNK_SIZE as u64;
     handle.seek(std::io::SeekFrom::Start(position)).await?;
-    on_progress(&request.xfer_id, position, size);
+    if !on_progress(&request.xfer_id, position, size) {
+        anyhow::bail!("attachment grant withdrawn before streaming");
+    }
     for index in request.start_chunk as usize..info.chunk_count() {
         let len = info
             .chunk_len(index)
@@ -252,7 +256,9 @@ where
         }
         sent += len as u64;
         position += len as u64;
-        on_progress(&request.xfer_id, position, size);
+        if !on_progress(&request.xfer_id, position, size) {
+            anyhow::bail!("attachment grant withdrawn mid-stream");
+        }
     }
     tokio::time::timeout(ATTACH_IO_TIMEOUT, send.flush()).await??;
     Ok(sent)
@@ -469,7 +475,7 @@ mod tests {
                 &mut server_w,
                 &prefix,
                 |id| (*id == xfer_id).then(|| (served_source.clone(), size, root, cap_sender)),
-                |_, _, _| {},
+                |_, _, _| true,
                 None,
             )
             .await
@@ -627,7 +633,7 @@ mod tests {
                 &mut send,
                 &prefix,
                 |id| (*id == xfer_id).then(|| (served_source.clone(), size, root, cap)),
-                |_, _, _| {},
+                |_, _, _| true,
                 None,
             )
             .await
@@ -724,7 +730,7 @@ mod tests {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await.expect("prefix");
             // No grant for anything.
-            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| None, |_, _, _| {}, None)
+            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| None, |_, _, _| true, None)
                 .await
         });
 
@@ -746,6 +752,66 @@ mod tests {
             Some(AttachStreamStatus::Unknown)
         );
         assert_eq!(server.await.expect("join").expect("served nothing"), 0);
+    }
+
+    /// A cancel while the stream is running has to end it, not just refuse the
+    /// next dial: once the caller says the grant is gone, no further chunk is
+    /// sent and the receiver sees the stream stop short.
+    #[tokio::test]
+    async fn a_grant_withdrawn_mid_stream_stops_the_stream() {
+        let (a_seed, a_pub, b_seed, b_pub) = pair();
+        let xfer_id = [10u8; 16];
+        let cap_sender = derive_attach_capability(&a_seed, &b_pub, &xfer_id).expect("cap");
+        let cap_recv = derive_attach_capability(&b_seed, &a_pub, &xfer_id).expect("cap");
+
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 4)
+            .map(|i| (i % 199) as u8)
+            .collect();
+        let source = temp_path("src-withdrawn");
+        std::fs::write(&source, &data).expect("write");
+        let root = HashTree::from_data(&data).root_hash;
+        let size = data.len() as u64;
+
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
+        let served = source.clone();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await.expect("prefix");
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), size, root, cap_sender)),
+                |_, position, _| position < ATTACH_CHUNK_SIZE as u64,
+                None,
+            )
+            .await
+        });
+
+        let part = temp_path("part-withdrawn");
+        let fetched = fetch_attachment(
+            &mut client_r,
+            &mut client_w,
+            &xfer_id,
+            &cap_recv,
+            size,
+            &root,
+            open_part(&part),
+            |_, _| {},
+        )
+        .await;
+        assert!(
+            matches!(fetched, Err(FetchError::Transient(_))),
+            "the receiver sees a stream that stopped short: {fetched:?}"
+        );
+        let err = server.await.expect("join").expect_err("serving must stop");
+        assert!(
+            err.to_string().contains("withdrawn"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&part);
     }
 
     /// The tag is the proof the dialer was actually offered this transfer. A
@@ -775,7 +841,7 @@ mod tests {
                 &mut server_w,
                 &prefix,
                 |_| Some((served.clone(), 6, root, cap_sender)),
-                |_, _, _| {},
+                |_, _, _| true,
                 None,
             )
             .await
@@ -830,7 +896,7 @@ mod tests {
                 &mut server_w,
                 &prefix,
                 |_| Some((served.clone(), 18, offered_root, cap_sender)),
-                |_, _, _| {},
+                |_, _, _| true,
                 None,
             )
             .await

@@ -16,7 +16,6 @@
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
-  import { initChannelRosterStore, cleanupChannelRosterStore } from '$lib/stores/channelRoster';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
@@ -223,10 +222,6 @@
       { init: initSearchStore, essential: false },
       { init: initFriendsStore, essential: false },
       { init: initChannelsStore, essential: false },
-      // Rosters and presence live outside the Channels page so a room can be
-      // drawn in the dock from any page. Non-essential: without it a docked
-      // room still loads, it just names people by key fragment.
-      { init: initChannelRosterStore, essential: false },
       { init: loadAppSettings, essential: true },
     ];
     const outcomes = await Promise.allSettled(stores.map((s) => s.init()));
@@ -580,7 +575,6 @@
           cleanupSearchStore();
           cleanupFriendsStore();
           cleanupChannelsStore();
-          cleanupChannelRosterStore();
         }
       })
       .catch((e) => {
@@ -589,7 +583,6 @@
         cleanupSearchStore();
         cleanupFriendsStore();
         cleanupChannelsStore();
-        cleanupChannelRosterStore();
         initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
@@ -610,7 +603,6 @@
       cleanupSearchStore();
       cleanupFriendsStore();
       cleanupChannelsStore();
-      cleanupChannelRosterStore();
       clearAllToasts();
       clearAppSettings();
       if (unlistenClose) unlistenClose();

@@ -338,6 +338,25 @@ struct PendingQuery {
     /// to advance past it, and so a page follow-up is distinguishable from a
     /// first query (only the latter is ever zero).
     start_position: u16,
+    /// For a page, whether the answer that earned it delivered anything. See
+    /// [`OwedPage::backed`].
+    backed: bool,
+}
+
+/// A page follow-up waiting to be sent, or parked until it may be.
+#[derive(Debug, Clone, Copy)]
+struct OwedPage {
+    node: EmberNodeId,
+    start: u16,
+    /// The answer that asked for this page carried at least one new record
+    /// with a valid publisher signature.
+    ///
+    /// Only a backed page holds other nodes to the quarter share in
+    /// [`IterativeSearch::pages_owed_elsewhere`]. The claim that earns a page is
+    /// free to make — zero records and `next_position: 1` against a large total
+    /// clears every check in `queue_next_page` — so counting it let one peer
+    /// keep the share binding on everyone else for its whole page allowance.
+    backed: bool,
 }
 
 impl PendingQuery {
@@ -414,7 +433,19 @@ pub struct IterativeSearch {
     pending_requests: HashMap<u32, PendingQuery>,
     /// Nodes that reported records past the page they served, with the offset to
     /// resume at. Drained by [`Self::next_to_query`].
-    page_queue: VecDeque<(EmberNodeId, u16)>,
+    page_queue: VecDeque<OwedPage>,
+    /// Pages refused only because the quarter share was binding, held until
+    /// nothing else is owed and re-offered one at a time by
+    /// [`Self::release_parked_page`].
+    ///
+    /// Dropping them instead lost the node for the rest of the search: nothing
+    /// else ever puts it back on `page_queue`, so when the peer that was holding
+    /// the share down finished, the storers it had cut off were already gone
+    /// and the walk ended short of the budget it had every record for.
+    parked_pages: VecDeque<OwedPage>,
+    /// A shortlist query took a slot while a page was waiting, so the next
+    /// lone free slot belongs to a page. See [`Self::next_to_query`].
+    page_turn_owed: bool,
     /// Page follow-ups queued per node, against [`MAX_PAGES_PER_NODE`].
     pages_queued: HashMap<EmberNodeId, u8>,
     /// Queries sent per `(node, offset)` page, against [`MAX_QUERY_ATTEMPTS`].
@@ -501,6 +532,8 @@ impl IterativeSearch {
             complete: false,
             pending_requests: HashMap::new(),
             page_queue: VecDeque::new(),
+            parked_pages: VecDeque::new(),
+            page_turn_owed: false,
             pages_queued: HashMap::new(),
             page_attempts: HashMap::new(),
             next_request_id: 1,
@@ -556,12 +589,22 @@ impl IterativeSearch {
     /// the lone storer that has to page its way through the only copy of a
     /// keyword, so counting the pages it is in the middle of serving would deny
     /// it the tier in precisely the case the tier was added for.
+    ///
+    /// Only pages earned by an answer that delivered something count — see
+    /// [`OwedPage::backed`]. Parked pages do not count either: they are waiting
+    /// for exactly this to become false.
     fn pages_owed_elsewhere(&self, node: &EmberNodeId) -> bool {
-        self.page_queue.iter().any(|(id, _)| id != node)
+        self.page_queue.iter().any(|p| p.backed && p.node != *node)
             || self
                 .pending_requests
                 .values()
-                .any(|p| p.is_page() && p.node != *node)
+                .any(|p| p.is_page() && p.backed && p.node != *node)
+    }
+
+    /// Whether the quarter share is what binds `node` right now, rather than
+    /// the budget itself.
+    fn share_binds(&self, node: &EmberNodeId) -> bool {
+        self.can_still_descend() || self.pages_owed_elsewhere(node)
     }
 
     /// Blobs one node may offer this search, and the pages it may be asked for.
@@ -589,8 +632,12 @@ impl IterativeSearch {
     /// those pages. One flooder answering last could take the walk's whole
     /// output and drop the records the honest storers were mid-way through
     /// handing over.
+    ///
+    /// A node the share cuts off is parked rather than dropped, so it gets the
+    /// rest of the budget once whatever was binding it has finished — see
+    /// [`Self::parked_pages`].
     fn per_node_result_allowance(&self, node: &EmberNodeId) -> usize {
-        if self.can_still_descend() || self.pages_owed_elsewhere(node) {
+        if self.share_binds(node) {
             MAX_RESULTS_PER_NODE
         } else {
             MAX_SEARCH_RESULTS
@@ -619,7 +666,7 @@ impl IterativeSearch {
     /// to the offer cap — which is right, since checking it costs us either way
     /// — meant it also bought the tier the cap exists to ration.
     fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
-        if self.can_still_descend() || self.pages_owed_elsewhere(node) {
+        if self.share_binds(node) {
             return MAX_PAGES_PER_NODE;
         }
         let queued = self.pages_queued.get(node).copied().unwrap_or(0);
@@ -669,6 +716,7 @@ impl IterativeSearch {
         if can_send == 0 {
             return Vec::new();
         }
+        self.release_parked_page();
 
         let mut batch = Vec::new();
 
@@ -690,15 +738,26 @@ impl IterativeSearch {
         // exactly one slot. A key that keeps paging then took every slot a reply
         // gave back and the frontier never moved, which is the failure the half
         // split exists to prevent, reached by the arithmetic meant to implement
-        // it. Pages cannot starve in return: the descent is finite (a bounded
-        // shortlist, each entry asked at most `MAX_QUERY_ATTEMPTS` times), and
-        // `check_complete` keeps the search alive while any page is outstanding.
-        let page_budget = if has_descent { can_send / 2 } else { can_send };
+        // it.
+        //
+        // Rounding down alone starved pages the other way, though: at one free
+        // slot the page share is zero for as long as any shortlist entry is
+        // unasked, and a shortlist that keeps learning leads can outlast
+        // `SEARCH_TIMEOUT_SECS`, ending the search with the pages never sent. So
+        // a lone slot alternates — once a shortlist query has taken one while a
+        // page waited, the next goes to the page — which is the half split this
+        // exists to implement, spread over successive replies instead of within
+        // one batch.
+        let mut page_budget = if has_descent { can_send / 2 } else { can_send };
+        if page_budget == 0 && self.page_turn_owed {
+            page_budget = 1;
+        }
         let mut skipped_pages = Vec::new();
         while batch.len() < page_budget {
-            let Some((node_id, start)) = self.page_queue.pop_front() else {
+            let Some(owed) = self.page_queue.pop_front() else {
                 break;
             };
+            let (node_id, start) = (owed.node, owed.start);
             // The shortlist is trimmed as the walk progresses, so a node that
             // answered may no longer be on it. Re-queue the page rather than
             // dropping the rest of that node's records; the trim keep-set now
@@ -709,7 +768,7 @@ impl IterativeSearch {
                 .find(|e| e.contact.node_id == node_id)
                 .map(|e| e.contact.clone())
             else {
-                skipped_pages.push((node_id, start));
+                skipped_pages.push(owed);
                 continue;
             };
             let req_id = self.take_request_id();
@@ -719,6 +778,7 @@ impl IterativeSearch {
                 PendingQuery {
                     node: node_id,
                     start_position: start,
+                    backed: owed.backed,
                 },
             );
             batch.push(QueryTarget {
@@ -730,9 +790,14 @@ impl IterativeSearch {
         for item in skipped_pages {
             self.page_queue.push_back(item);
         }
+        let pages_sent = batch.len();
+        if pages_sent > 0 {
+            self.page_turn_owed = false;
+        }
         if batch.len() >= can_send {
             return batch;
         }
+        let page_waiting = !self.page_queue.is_empty();
         // The class preference — pinned session peers, then verified contacts,
         // then mute leads — applies to the *opening* batch only, and exists so
         // the first round does not lead with a lead the routing table happened
@@ -787,6 +852,7 @@ impl IterativeSearch {
                         PendingQuery {
                             node: entry.contact.node_id,
                             start_position: 0,
+                            backed: false,
                         },
                     );
                     batch.push(QueryTarget {
@@ -800,8 +866,11 @@ impl IterativeSearch {
                 break;
             }
         }
-        if batch.iter().any(|q| q.start_position == 0) {
+        if batch.len() > pages_sent {
             self.seed_round_done = true;
+            if page_waiting {
+                self.page_turn_owed = true;
+            }
         }
         batch
     }
@@ -947,6 +1016,8 @@ impl IterativeSearch {
         // shortlist states this reads cannot change inside it (the responder was
         // marked above, and nothing here queries anyone).
         let offer_allowance = self.per_node_result_allowance(from_id);
+        let mut cut_short = false;
+        let mut delivered_now = 0usize;
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -968,6 +1039,7 @@ impl IterativeSearch {
             // the search gets to go.
             let offered = self.offered_results.entry(*from_id).or_insert(0);
             if *offered >= offer_allowance {
+                cut_short = true;
                 continue;
             }
             // Dedup before the cap, not after: counting copies against
@@ -1000,6 +1072,7 @@ impl IterativeSearch {
                 continue;
             }
             *self.delivered_results.entry(*from_id).or_insert(0) += 1;
+            delivered_now += 1;
             if !self.value_budget_full() {
                 self.budget_spent
                     .insert(budget_identity(&data, &blob_digest));
@@ -1011,7 +1084,7 @@ impl IterativeSearch {
         }
 
         if let Some(page) = page {
-            self.queue_next_page(from_id, asked_start, page);
+            self.queue_next_page(from_id, asked_start, page, cut_short, delivered_now > 0);
         }
 
         // Merge closer nodes into shortlist
@@ -1076,7 +1149,8 @@ impl IterativeSearch {
             let owed: HashSet<EmberNodeId> = self
                 .page_queue
                 .iter()
-                .map(|(id, _)| *id)
+                .chain(self.parked_pages.iter())
+                .map(|p| p.node)
                 .chain(
                     self.pending_requests
                         .values()
@@ -1119,7 +1193,18 @@ impl IterativeSearch {
     /// send traffic. A node that reports an enormous total, or one that keeps
     /// naming a position it has already served, must cost a bounded number of
     /// queries either way.
-    fn queue_next_page(&mut self, node: &EmberNodeId, asked_start: u16, page: ValuePage) {
+    ///
+    /// `cut_short` says the offer allowance turned away records this answer
+    /// carried, and `backed` that it delivered at least one new signed record —
+    /// see [`OwedPage::backed`].
+    fn queue_next_page(
+        &mut self,
+        node: &EmberNodeId,
+        asked_start: u16,
+        page: ValuePage,
+        cut_short: bool,
+        backed: bool,
+    ) {
         if self.search_type != SearchType::FindValue {
             return;
         }
@@ -1141,18 +1226,99 @@ impl IterativeSearch {
             return;
         }
         // This node has already offered everything one peer is allowed to
-        // contribute, so a further page could only be discarded.
+        // contribute, so a further page could only be discarded — for now. If
+        // the share is what stops it, the node is parked instead, and resumes
+        // where the allowance cut it off: re-asking the window it just served
+        // costs nothing for the records we kept, which dedup before they are
+        // charged, and returns the ones we turned away.
+        let resume_at = if cut_short && asked_start > 0 {
+            asked_start
+        } else {
+            page.next_position
+        };
         let offered = self.offered_results.get(node).copied().unwrap_or(0);
         if offered >= self.per_node_result_allowance(node) {
+            if self.share_binds(node) && offered < MAX_SEARCH_RESULTS {
+                self.park_page(node, resume_at);
+            }
             return;
         }
         let page_allowance = self.per_node_page_allowance(node);
-        let queued = self.pages_queued.entry(*node).or_insert(0);
-        if *queued >= page_allowance {
+        let queued = self.pages_queued.get(node).copied().unwrap_or(0);
+        if queued >= page_allowance {
+            if self.share_binds(node) && queued < MAX_PAGES_PER_NODE_EXHAUSTED {
+                self.park_page(node, resume_at);
+            }
             return;
         }
-        *queued += 1;
-        self.page_queue.push_back((*node, page.next_position));
+        *self.pages_queued.entry(*node).or_insert(0) += 1;
+        self.page_queue.push_back(OwedPage {
+            node: *node,
+            start: page.next_position,
+            backed,
+        });
+    }
+
+    /// Hold a page the quarter share refused until nothing else is owed. See
+    /// [`Self::parked_pages`].
+    fn park_page(&mut self, node: &EmberNodeId, start: u16) {
+        if self.parked_pages.iter().any(|p| p.node == *node) {
+            return;
+        }
+        self.parked_pages.push_back(OwedPage {
+            node: *node,
+            start,
+            backed: false,
+        });
+    }
+
+    /// Re-offer one parked page once nothing is left that could bind the share.
+    ///
+    /// One at a time, and only with no delivering page outstanding anywhere, so
+    /// the released node really is the only one with work and gets the upper
+    /// tier — releasing them together would have each hold the others to the
+    /// share again and park them straight back, every round trip wasted. The
+    /// allowances are re-checked on the tier the node can now have, and a
+    /// release is charged to `pages_queued` like any page, so a node cannot be
+    /// parked and released past its ceiling and the search still ends.
+    fn release_parked_page(&mut self) {
+        if self.search_type != SearchType::FindValue
+            || self.complete
+            || self.parked_pages.is_empty()
+        {
+            return;
+        }
+        if self.value_budget_full() {
+            self.parked_pages.clear();
+            return;
+        }
+        let backed_page_owed = self.page_queue.iter().any(|p| p.backed)
+            || self
+                .pending_requests
+                .values()
+                .any(|p| p.is_page() && p.backed);
+        if self.can_still_descend() || backed_page_owed {
+            return;
+        }
+        while let Some(mut parked) = self.parked_pages.pop_front() {
+            let node = parked.node;
+            let offered = self.offered_results.get(&node).copied().unwrap_or(0);
+            if offered >= self.per_node_result_allowance(&node) {
+                continue;
+            }
+            let queued = self.pages_queued.get(&node).copied().unwrap_or(0);
+            if queued >= self.per_node_page_allowance(&node) {
+                continue;
+            }
+            *self.pages_queued.entry(node).or_insert(0) += 1;
+            // A fresh window as far as retries go: the parked offset may be one
+            // this node was already asked for, and losing the re-ask to a
+            // single dropped datagram would lose the node all over again.
+            self.page_attempts.remove(&(node, parked.start));
+            parked.backed = self.delivered_results.get(&node).is_some_and(|&d| d > 0);
+            self.page_queue.push_back(parked);
+            return;
+        }
     }
 
     /// Mark a node's request as failed (timeout, error).
@@ -1260,7 +1426,11 @@ impl IterativeSearch {
                 // answers cannot be re-asked past the cap, and `check_complete`
                 // counts a queued page as outstanding work so the retry is not
                 // stranded behind an early completion.
-                self.page_queue.push_back((node_id, start));
+                self.page_queue.push_back(OwedPage {
+                    node: node_id,
+                    start,
+                    backed: pending.backed,
+                });
             }
         }
         self.check_complete();
@@ -1293,7 +1463,9 @@ impl IterativeSearch {
         //
         // Queued and outstanding pages count as work: a walk that has asked
         // every node it knows of may still be owed most of the records, and
-        // finishing here would discard them along with the search.
+        // finishing here would discard them along with the search. A parked page
+        // becomes one here once nothing else is left to hold it back.
+        self.release_parked_page();
         let has_pending = self.shortlist.iter().any(|e| e.state == NodeState::Pending);
         let has_in_flight = self
             .shortlist
@@ -3789,6 +3961,231 @@ mod tests {
             "the freed slot has to go to a node the walk has not asked yet, \
              not back to the node that is paging"
         );
+    }
+
+    /// The other side of the same arithmetic. At one free slot, rounding down
+    /// gave pages nothing for as long as any shortlist entry was unasked, and a
+    /// walk that keeps learning leads could reach `SEARCH_TIMEOUT_SECS` with its
+    /// pages never sent. The lone slot alternates instead.
+    #[test]
+    fn a_waiting_page_gets_the_next_lone_slot_after_the_descent_takes_one() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), 12);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let opening = search.next_to_query();
+        assert_eq!(opening.len(), ALPHA);
+        search.process_response(
+            opening[0].request_id,
+            &opening[0].contact.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 600,
+            }),
+        );
+        let first = search.next_to_query();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].start_position, 0, "the descent takes the first lone slot");
+
+        search.process_unpaged(opening[1].request_id, &opening[1].contact.node_id, vec![], vec![]);
+        let second = search.next_to_query();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            (second[0].contact.node_id, second[0].start_position),
+            (opening[0].contact.node_id, 1),
+            "the waiting page takes the next one, though the shortlist still has unasked entries"
+        );
+
+        search.process_unpaged(opening[2].request_id, &opening[2].contact.node_id, vec![], vec![]);
+        let third = search.next_to_query();
+        assert_eq!(third.len(), 1);
+        assert_eq!(
+            third[0].start_position, 0,
+            "with no page waiting the slot goes back to the descent"
+        );
+    }
+
+    /// Answer every query `search` sends with `answer`, until it has nothing
+    /// left to send. Returns how many queries were answered.
+    fn drive_value_search(
+        search: &mut IterativeSearch,
+        mut answer: impl FnMut(&EmberNodeId, u16) -> (Vec<Vec<u8>>, Option<ValuePage>),
+    ) -> usize {
+        let mut answered = 0usize;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for query in batch {
+                answered += 1;
+                assert!(answered < 2_000, "the search must terminate");
+                let (records, page) = answer(&query.contact.node_id, query.start_position);
+                search.process_response(
+                    query.request_id,
+                    &query.contact.node_id,
+                    vec![],
+                    records,
+                    page,
+                );
+            }
+        }
+        answered
+    }
+
+    /// An honest storer's page at `start`: [`RECORDS_PER_UNFRAGMENTED_PAGE`] of
+    /// its `total` distinct files, numbered from `base`.
+    fn storer_page(base: u16, total: u16, start: u16) -> (Vec<Vec<u8>>, Option<ValuePage>) {
+        let end = (start + RECORDS_PER_UNFRAGMENTED_PAGE as u16).min(total);
+        let records = (start..end)
+            .map(|i| signed_value_blob("ubuntu", base + i))
+            .collect();
+        (
+            records,
+            Some(ValuePage {
+                next_position: end,
+                total_available: total,
+            }),
+        )
+    }
+
+    /// Replicas paging side by side each hold the others to the quarter share,
+    /// so each reached it while another still owed a page — and was dropped,
+    /// since nothing ever re-queued it. The last one standing got the upper
+    /// tier; the rest were gone, and the walk ended short of a budget the
+    /// replicas together held more than enough for.
+    #[test]
+    fn replicas_cut_off_by_the_share_resume_once_the_others_finish() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let bases: HashMap<EmberNodeId, u16> = [(0xF0, 0u16), (0xE0, 1000), (0xD0, 2000)]
+            .into_iter()
+            .map(|(byte, base)| {
+                rt.add_contact(make_contact(byte));
+                (make_id(byte), base)
+            })
+            .collect();
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Each holds more than its share and less than the budget, so no one
+        // node can finish the search alone.
+        const HELD: u16 = 120;
+        drive_value_search(search, |node, start| storer_page(bases[node], HELD, start));
+
+        assert_eq!(
+            search.budget_spent.len(),
+            MAX_SEARCH_RESULTS,
+            "three storers holding {} files between them must fill the budget",
+            HELD as usize * bases.len()
+        );
+        assert!(search.poll_complete());
+    }
+
+    /// The attack on the same rule: a peer answering nothing but a page claim
+    /// held every other node to the share for its whole page allowance, and the
+    /// honest storer it cut off never came back.
+    #[test]
+    fn an_empty_page_claim_does_not_hold_other_nodes_to_the_share() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let storer = make_contact(0xF0);
+        let claimer = make_contact(0xE0);
+        rt.add_contact(storer.clone());
+        rt.add_contact(claimer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let mut claimer_queries = 0usize;
+        drive_value_search(search, |node, start| {
+            if *node == claimer.node_id {
+                claimer_queries += 1;
+                (
+                    vec![],
+                    Some(ValuePage {
+                        next_position: start + 1,
+                        total_available: 600,
+                    }),
+                )
+            } else {
+                storer_page(0, MAX_SEARCH_RESULTS as u16, start)
+            }
+        });
+
+        assert_eq!(
+            search.budget_spent.len(),
+            MAX_SEARCH_RESULTS,
+            "the lone storer must be able to fill the budget"
+        );
+        assert!(
+            claimer_queries <= MAX_PAGES_PER_NODE as usize + 1,
+            "the claimer is still held to the base page ceiling, and got {claimer_queries} queries"
+        );
+        assert!(search.poll_complete());
+    }
+
+    /// A peer that does deliver — one real record a page — still holds the
+    /// others to the share while it pages, which is the rule working. What it
+    /// may not do is make that permanent: the storer it cut off is parked and
+    /// picks up where it stopped once the peer runs out of pages.
+    #[test]
+    fn a_storer_parked_behind_a_delivering_pager_resumes_after_it() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let storer = make_contact(0xF0);
+        let dripper = make_contact(0xE0);
+        rt.add_contact(storer.clone());
+        rt.add_contact(dripper.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let mut dripper_queries = 0usize;
+        drive_value_search(search, |node, start| {
+            if *node == dripper.node_id {
+                dripper_queries += 1;
+                (
+                    vec![signed_value_blob("ubuntu", 5000 + start)],
+                    Some(ValuePage {
+                        next_position: start + 1,
+                        total_available: 600,
+                    }),
+                )
+            } else {
+                storer_page(0, MAX_SEARCH_RESULTS as u16, start)
+            }
+        });
+
+        let from_storer = search
+            .results
+            .iter()
+            .filter(|r| r.from_node == storer.node_id)
+            .count();
+        assert!(
+            from_storer > MAX_RESULTS_PER_NODE,
+            "the storer stopped at {from_storer}, its share, and never resumed"
+        );
+        assert_eq!(search.budget_spent.len(), MAX_SEARCH_RESULTS);
+        assert_eq!(
+            dripper_queries,
+            MAX_PAGES_PER_NODE as usize + 1,
+            "the dripper never earns the upper page tier"
+        );
+        assert!(
+            search.offered_results[&storer.node_id] <= MAX_SEARCH_RESULTS,
+            "the per-node hard limit still holds"
+        );
+        assert!(search.poll_complete());
     }
 
     /// A page already taken out of `page_queue` and sitting in

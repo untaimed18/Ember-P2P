@@ -3,7 +3,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   listChannels,
   listChannelTransfers,
-  respondChannelTransfer,
   type ChannelInfo,
   type ChannelTransferInfo,
 } from '$lib/api/channels';
@@ -333,6 +332,26 @@ export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
 }
 
 /**
+ * Ignore everywhere, widening a room-scoped entry rather than replacing it.
+ *
+ * Never a toggle: the menu offers this beside a room-scoped ignore, and
+ * {@link toggleMemberIgnore} would read an existing entry as "turn it off" —
+ * so asking to hide someone in more places un-hid them in the rooms they were
+ * already hidden in. A stored name survives when this call has none to give.
+ */
+export function ignoreMemberEverywhere(memberPubkey: string, name?: string): void {
+  const pk = memberPubkey.toLowerCase();
+  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  ignoredMembers.update((list) => {
+    const existing = list.find((entry) => entry.pubkey === pk);
+    if (!existing) return [...list, { pubkey: pk, name: label }];
+    if (existing.rooms === undefined && (!label || existing.name === label)) return list;
+    const widened: IgnoredMember = { pubkey: pk, name: label || existing.name };
+    return list.map((entry) => (entry.pubkey === pk ? widened : entry));
+  });
+}
+
+/**
  * Turn ignoring on or off for one room, leaving the other rooms alone.
  *
  * Escalating rather than narrowing: asking to ignore someone in a room while
@@ -444,29 +463,14 @@ export function mergeChannelUnreadFromSnapshot(
  */
 export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
 
-/** Incoming Ember Transfer offers still waiting for a decision. */
-export const awaitingChannelOfferList = derived(channelTransfers, (xfers) =>
-  Object.values(xfers)
-    .filter((xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting')
-    // Stable, so a row does not jump while the user is reaching for it.
-    .sort((a, b) => a.xfer_id.localeCompare(b.xfer_id)),
-);
-
+/** How many incoming Ember Transfer offers are still waiting for a decision. */
 export const awaitingChannelOffers = derived(
-  awaitingChannelOfferList,
-  (offers) => offers.length,
+  channelTransfers,
+  (xfers) =>
+    Object.values(xfers).filter(
+      (xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting',
+    ).length,
 );
-
-/**
- * Answer a room file offer from outside the room it arrived in.
- *
- * The Channels page calls the command directly because it also tracks which
- * row is busy across the whole transfer strip; this is the same command for
- * the dock, which only ever sees offers still waiting on a decision.
- */
-export async function respondToChannelOffer(xferId: string, accept: boolean): Promise<void> {
-  await respondChannelTransfer(xferId, accept);
-}
 
 const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'complete',

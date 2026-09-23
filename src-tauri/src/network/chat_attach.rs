@@ -14,9 +14,11 @@
 //! | `awaiting`    | receiver | offered to us, waiting on the user              |
 //! | `accepted`    | sender   | the friend said yes and will dial               |
 //! | `active`      | both     | bytes are moving                                |
-//! | `complete`    | both     | sender: every byte written; receiver: verified and in `Chat Files` |
+//! | `complete`    | both     | sender: the friend acknowledged every byte; receiver: verified and in `Chat Files` |
 //! | `declined`, `too_large`, `busy`, `not_allowed` | sender | the friend's answer was no |
 //! | `cancelled`   | both     | someone pressed cancel                          |
+//! | `unreachable` | both     | the recipient never got a direct connection to the sender |
+//! | `source_gone` | both     | the sender's file changed or went away before it was read |
 //! | `failed`      | both     | it could not be finished                        |
 //! | `expired`     | both     | nobody answered in time, or a restart stranded it |
 
@@ -132,9 +134,16 @@ fn emit_by_id(app: &tauri::AppHandle, db: &Database, xfer_hex: &str) {
     }
 }
 
-/// A progress tick. Built from a snapshot rather than re-read, so a transfer
-/// reporting four times a second costs no database reads.
-fn emit_progress(app: &tauri::AppHandle, row: &ChatAttachmentRow, transferred: u64) {
+/// A progress tick, built from a snapshot. The stored status is still read
+/// first: a cancel can land between two chunks, and a tick after it would set
+/// a stopped bubble moving again.
+fn emit_progress(app: &tauri::AppHandle, db: &Database, row: &ChatAttachmentRow, transferred: u64) {
+    if db
+        .chat_attachment(&row.xfer_id)
+        .is_none_or(|current| is_terminal(&current.status))
+    {
+        return;
+    }
     let mut info = ChatAttachmentInfo::from_row(row);
     info.transferred = transferred.min(row.file_size);
     info.status = "active".into();
@@ -151,6 +160,8 @@ fn is_terminal(status: &str) -> bool {
             | "busy"
             | "not_allowed"
             | "cancelled"
+            | "unreachable"
+            | "source_gone"
             | "failed"
             | "expired"
     )
@@ -185,7 +196,8 @@ fn dial_target(ip: IpAddr, port: u16) -> Option<SocketAddr> {
 pub(crate) struct InboundAttach {
     friend: [u8; 16],
     peer_pubkey: [u8; 32],
-    peer_addr: SocketAddr,
+    /// `None` when the offer came over a relayed session.
+    peer_addr: Option<SocketAddr>,
     offer: AttachOffer,
     /// Sanitized: what the file will be called on disk.
     name: String,
@@ -219,13 +231,53 @@ async fn send_ext(
         })
 }
 
-async fn session_is_live(state: &NetworkState, friend: &[u8; 16]) -> bool {
-    state
-        .ember_sessions
-        .read()
-        .await
+fn relayed() -> String {
+    coded(
+        "peers_attach_relayed",
+        "You and your friend are only connected through a relay, and files need a direct connection. Try again later.",
+    )
+}
+
+/// Everything that has to hold before a file can be offered, and our public
+/// QUIC port when it does. Asked once before the picker opens, so the user is
+/// not made to choose and hash a file that cannot go anywhere, and again with
+/// the offer itself, since the session can change in between.
+///
+/// A relayed session is refused rather than tried. The recipient dials the
+/// address the session came from, and a relay leaves none — or only the one
+/// the session already failed to reach directly — so the offer would sit
+/// through every retry and end as a failure nobody could explain.
+pub(super) async fn offer_preflight(
+    state: &NetworkState,
+    settings: &AppSettings,
+    friend: &[u8; 16],
+) -> Result<u16, String> {
+    if settings.friend_chat_disabled {
+        return Err(coded(
+            "peers_attach_disabled",
+            "Chatting with friends is turned off in Settings",
+        ));
+    }
+    let Some(quic_port) = super::advertised_quic_port(state) else {
+        return Err(unavailable());
+    };
+    if quic_endpoint(state).is_none() {
+        return Err(unavailable());
+    }
+    let sessions = state.ember_sessions.read().await;
+    let Some(session) = sessions
         .get(friend)
-        .is_some_and(|h| h.is_fresh() && h.is_secure_v2())
+        .filter(|h| h.is_fresh() && h.is_secure_v2())
+    else {
+        return Err(coded(
+            "peers_attach_offline",
+            "Your friend is offline. Files can only be sent while you are both connected.",
+        ));
+    };
+    if session.is_relayed() {
+        return Err(relayed());
+    }
+    Ok(quic_port)
 }
 
 async fn session_pubkey(state: &NetworkState, friend: &[u8; 16]) -> Option<[u8; 32]> {
@@ -298,24 +350,7 @@ pub(super) async fn send_offer(
     size: u64,
     root: [u8; 32],
 ) -> Result<ChatAttachmentInfo, String> {
-    if settings.friend_chat_disabled {
-        return Err(coded(
-            "peers_attach_disabled",
-            "Chatting with friends is turned off in Settings",
-        ));
-    }
-    let Some(quic_port) = super::advertised_quic_port(state) else {
-        return Err(unavailable());
-    };
-    if quic_endpoint(state).is_none() {
-        return Err(unavailable());
-    }
-    if !session_is_live(state, &friend).await {
-        return Err(coded(
-            "peers_attach_offline",
-            "Your friend is offline. Files can only be sent while you are both connected.",
-        ));
-    }
+    let quic_port = offer_preflight(state, settings, &friend).await?;
     let offer = AttachOffer {
         xfer_id,
         size,
@@ -375,7 +410,7 @@ pub(super) async fn on_reply(
     xfer_id: [u8; 16],
     reply: AttachReply,
     quic_port: Option<u16>,
-    peer_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
 ) {
     let xfer_hex = hex::encode(xfer_id);
     let Some(row) = db.chat_attachment(&xfer_hex) else {
@@ -395,13 +430,21 @@ pub(super) async fn on_reply(
             return;
         }
         let now = chrono::Utc::now().timestamp();
-        let _ = db.set_chat_attachment_expiry(&xfer_hex, now + ATTACH_GRANT_TTL_SECS);
+        let Some(expires_at) = db.chat_attachment_expiry(&xfer_hex) else {
+            return;
+        };
+        let Some(extend) = accept_extends_grant(row.created_at, expires_at, now) else {
+            return;
+        };
+        if extend {
+            let _ = db.set_chat_attachment_expiry(&xfer_hex, now + ATTACH_GRANT_TTL_SECS);
+        }
         if row.status == "offered" {
             let _ = db.set_chat_attachment_status(&xfer_hex, "accepted", None, None);
         }
         emit_by_id(app, db, &xfer_hex);
-        if let (Some(port), Some(endpoint)) = (quic_port, quic_endpoint(state)) {
-            if let Some(target) = dial_target(peer_addr.ip(), port) {
+        if let (Some(port), Some(endpoint), Some(addr)) = (quic_port, quic_endpoint(state), peer_addr) {
+            if let Some(target) = dial_target(addr.ip(), port) {
                 spawn_punch(endpoint, state.local_ed25519_seed, friend, target);
             }
         }
@@ -419,6 +462,18 @@ pub(super) async fn on_reply(
     };
     let _ = db.set_chat_attachment_status(&xfer_hex, status, None, None);
     emit_by_id(app, db, &xfer_hex);
+}
+
+/// What an accept may do to a grant: `None` once it has lapsed — a late accept
+/// is not a way back into an offer nobody answered — and otherwise whether it
+/// still carries the offer's short lifetime and should move to the grant's.
+/// Once moved it stays put, so a friend repeating the accept cannot keep a
+/// path readable indefinitely.
+fn accept_extends_grant(created_at: i64, expires_at: i64, now: i64) -> Option<bool> {
+    if expires_at <= now {
+        return None;
+    }
+    Some(expires_at <= created_at + ATTACH_OFFER_TTL_SECS)
 }
 
 /// Dial the recipient while it dials us, so our NAT has an outbound mapping for
@@ -460,6 +515,9 @@ fn spawn_punch(
 pub(crate) struct ServeProgress {
     row: Option<ChatAttachmentRow>,
     last_emit: Option<Instant>,
+    /// Every chunk has been handed to the stream. Not the same as delivered:
+    /// the caller still has to see the friend acknowledge them.
+    queued_all: bool,
 }
 
 impl ServeProgress {
@@ -469,18 +527,23 @@ impl ServeProgress {
         matches!(status, "offered" | "accepted" | "active")
     }
 
+    /// Record where a stream has got to. Returns false once it should stop:
+    /// the grant is looked up again as the stream runs, so a cancel on either
+    /// side, or a grant that lapsed, ends a transfer already in flight rather
+    /// than only refusing the next one.
     pub(crate) fn note(
         &mut self,
         db: &Database,
         app: &tauri::AppHandle,
         xfer_id: &[u8; 16],
+        peer_hex: &str,
         position: u64,
         size: u64,
-    ) {
+    ) -> bool {
         let xfer_hex = hex::encode(xfer_id);
         if self.row.is_none() {
             let Some(row) = db.chat_attachment(&xfer_hex) else {
-                return;
+                return false;
             };
             if Self::writable(&row.status) {
                 let _ = db.set_chat_attachment_status(&xfer_hex, "active", Some(position), None);
@@ -490,26 +553,44 @@ impl ServeProgress {
                 emit_row(app, row);
             }
             self.last_emit = Some(Instant::now());
-            return;
+            return true;
         }
         if position >= size {
-            if let Some(current) = db.chat_attachment(&xfer_hex) {
-                if Self::writable(&current.status) {
-                    let _ = db.set_chat_attachment_status(&xfer_hex, "complete", Some(size), None);
-                }
+            self.queued_all = true;
+            if let Some(row) = &self.row {
+                emit_progress(app, db, row, position);
             }
-            emit_by_id(app, db, &xfer_hex);
-            return;
+            return true;
         }
         let due = self
             .last_emit
             .is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL);
-        if due {
-            self.last_emit = Some(Instant::now());
-            if let Some(row) = &self.row {
-                emit_progress(app, row, position);
-            }
+        if !due {
+            return true;
         }
+        self.last_emit = Some(Instant::now());
+        let now = chrono::Utc::now().timestamp();
+        if db.chat_attachment_grant(&xfer_hex, peer_hex, now).is_none() {
+            return false;
+        }
+        if let Some(row) = &self.row {
+            emit_progress(app, db, row, position);
+        }
+        true
+    }
+
+    /// The stream is over. `delivered` is whether the friend acknowledged
+    /// every byte. Only then is the row finished — otherwise it is left for
+    /// the friend's retry or its cancel to settle.
+    pub(crate) fn finish(&self, db: &Database, app: &tauri::AppHandle, delivered: bool) {
+        let Some(row) = &self.row else {
+            return;
+        };
+        if !(delivered && self.queued_all) {
+            return;
+        }
+        let _ = db.advance_chat_attachment(&row.xfer_id, "complete", Some(row.file_size), None);
+        emit_by_id(app, db, &row.xfer_id);
     }
 }
 
@@ -524,7 +605,7 @@ pub(super) async fn on_offer(
     settings: &AppSettings,
     friend: [u8; 16],
     offer: AttachOffer,
-    peer_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
 ) {
     let xfer_id = offer.xfer_id;
     let xfer_hex = hex::encode(xfer_id);
@@ -543,6 +624,37 @@ pub(super) async fn on_offer(
         return;
     }
     let now = chrono::Utc::now().timestamp();
+    // Only a race gets here — the sender refuses to offer over a relayed
+    // session — but an offer with no address behind it can never be fetched,
+    // so it is settled now rather than left for an Accept that cannot work.
+    if peer_addr.is_none() {
+        let name = crate::security::sanitize_filename(&offer.name);
+        if db
+            .upsert_chat_attachment(
+                &xfer_hex,
+                &hex::encode(friend),
+                "received",
+                &name,
+                offer.size,
+                &hex::encode(offer.root),
+                None,
+                "unreachable",
+                now,
+                now,
+            )
+            .is_ok()
+        {
+            emit_by_id(app, db, &xfer_hex);
+        }
+        let _ = send_ext(
+            state,
+            &friend,
+            EMBER_EXT_ATTACH_CANCEL,
+            &attach::encode_attach_cancel(&xfer_id, AttachCancel::Unreachable),
+        )
+        .await;
+        return;
+    }
     prune_inbound(state, db, app, now);
     let pending = state
         .attach_inbound
@@ -586,14 +698,36 @@ pub(super) async fn on_offer(
             received_at: now,
         },
     );
-    emit_by_id(app, db, &xfer_hex);
 
+    // Announced only once it is known to be waiting on the user: the UI treats
+    // `awaiting` as "offered you a file", which is wrong for one fetched
+    // without asking.
+    if !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+        emit_by_id(app, db, &xfer_hex);
+    }
+}
+
+/// Fetch a fresh offer without asking, if it is under the user's ceiling and
+/// the friend's budget. False leaves it waiting for the user rather than
+/// refused: they can still take it.
+#[allow(clippy::too_many_arguments)]
+async fn try_auto_accept(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    xfer_id: [u8; 16],
+    size: u64,
+    now: i64,
+) -> bool {
+    let xfer_hex = hex::encode(xfer_id);
     let ceiling = settings
         .chat_attachment_auto_accept_mb
         .min(crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
         .saturating_mul(1024 * 1024);
     if ceiling == 0 || size > ceiling || running_fetches(state) >= MAX_ACTIVE_FETCHES {
-        return;
+        return false;
     }
     // Bound the map itself: an entry per friend who ever auto-sent, dropped
     // once its window has emptied.
@@ -603,16 +737,21 @@ pub(super) async fn on_offer(
     let log = state.attach_auto_log.entry(friend).or_default();
     if !auto_accept_allowed(log, now, size, ceiling) {
         debug!("Chat attachment: {xfer_hex} waits for the user; this friend's auto-accept budget is spent");
-        return;
+        return false;
     }
     match accept_offer(state, db, app, settings, xfer_id).await {
-        Ok(()) => state
-            .attach_auto_log
-            .entry(friend)
-            .or_default()
-            .push_back((now, size)),
-        // Left waiting rather than refused: the user can still take it.
-        Err(e) => debug!("Chat attachment: auto-accept of {xfer_hex} deferred: {e}"),
+        Ok(()) => {
+            state
+                .attach_auto_log
+                .entry(friend)
+                .or_default()
+                .push_back((now, size));
+            true
+        }
+        Err(e) => {
+            debug!("Chat attachment: auto-accept of {xfer_hex} deferred: {e}");
+            false
+        }
     }
 }
 
@@ -703,22 +842,21 @@ async fn accept_offer(
     let Some(inbound) = state.attach_inbound.remove(&xfer_id) else {
         return Err(not_found());
     };
-    let Some(dial) = dial_target(inbound.peer_addr.ip(), inbound.offer.quic_port) else {
+    let Some(dial) = inbound
+        .peer_addr
+        .and_then(|addr| dial_target(addr.ip(), inbound.offer.quic_port))
+    else {
         let _ = send_ext(
             state,
             &inbound.friend,
             EMBER_EXT_ATTACH_CANCEL,
-            &attach::encode_attach_cancel(&xfer_id, AttachCancel::Stalled),
+            &attach::encode_attach_cancel(&xfer_id, AttachCancel::Unreachable),
         )
         .await;
         let xfer_hex = hex::encode(xfer_id);
-        let _ = db.set_chat_attachment_status(&xfer_hex, "failed", None, None);
+        let _ = db.set_chat_attachment_status(&xfer_hex, "unreachable", None, None);
         emit_by_id(app, db, &xfer_hex);
-        return Err(coded_ctx(
-            "peers_attach_failed",
-            "Could not receive that file",
-            "your friend's address cannot be reached directly",
-        ));
+        return Err(relayed());
     };
     let reply = attach::encode_attach_reply(
         &xfer_id,
@@ -734,6 +872,10 @@ async fn accept_offer(
     let cancel_tx = session_tx(state, &inbound.friend).await;
     let xfer_hex = hex::encode(xfer_id);
     let _ = db.set_chat_attachment_status(&xfer_hex, "active", Some(0), None);
+    let _ = db.set_chat_attachment_expiry(
+        &xfer_hex,
+        chrono::Utc::now().timestamp() + ATTACH_GRANT_TTL_SECS,
+    );
     let Some(row) = db.chat_attachment(&xfer_hex) else {
         return Err(not_found());
     };
@@ -787,8 +929,10 @@ enum ReceiveFailure {
     Corrupt(String),
     /// The sender refused the stream.
     Refused(AttachStreamStatus),
-    /// We never got a working stream, or it kept dropping.
+    /// Connected, but the stream kept dropping.
     Unreachable(String),
+    /// No dial ever connected: there is no direct path to the sender.
+    NoRoute(String),
     /// We could not prepare or finish the file on disk.
     Disk(String),
 }
@@ -798,7 +942,8 @@ impl std::fmt::Display for ReceiveFailure {
         match self {
             ReceiveFailure::Corrupt(d) => write!(f, "content did not verify: {d}"),
             ReceiveFailure::Refused(s) => write!(f, "sender refused: {s:?}"),
-            ReceiveFailure::Unreachable(d) => write!(f, "could not reach the sender: {d}"),
+            ReceiveFailure::Unreachable(d) => write!(f, "lost the sender: {d}"),
+            ReceiveFailure::NoRoute(d) => write!(f, "could not reach the sender: {d}"),
             ReceiveFailure::Disk(d) => write!(f, "could not save the file: {d}"),
         }
     }
@@ -807,22 +952,18 @@ impl std::fmt::Display for ReceiveFailure {
 async fn run_fetch(ctx: FetchCtx) {
     let xfer_hex = hex::encode(ctx.xfer_id);
     match fetch_to_chat_files(&ctx).await {
-        Ok(dest) => {
-            let dest = dest.to_string_lossy().into_owned();
-            let _ = ctx
-                .db
-                .set_chat_attachment_status(&xfer_hex, "complete", Some(ctx.size), Some(&dest));
-            info!("Chat attachment: received {xfer_hex} ({} bytes)", ctx.size);
-        }
+        Ok(true) => info!("Chat attachment: received {xfer_hex} ({} bytes)", ctx.size),
+        Ok(false) => debug!("Chat attachment: {xfer_hex} ended while it was being saved"),
         Err(failure) => {
             warn!("Chat attachment: receive of {xfer_hex} failed: {failure}");
-            let _ = ctx.db.set_chat_attachment_status(&xfer_hex, "failed", None, None);
-            let reason = match failure {
-                ReceiveFailure::Corrupt(_) => AttachCancel::Corrupt,
-                ReceiveFailure::Refused(AttachStreamStatus::SourceGone) => AttachCancel::SourceGone,
-                _ => AttachCancel::Stalled,
-            };
-            if let Some(tx) = &ctx.cancel_tx {
+            let (status, reason) = failure_outcome(&failure);
+            // A row that already ended — the user cancelled — keeps that
+            // status, and the sender was told when it did.
+            let failed = ctx
+                .db
+                .advance_chat_attachment(&xfer_hex, status, None, None)
+                .unwrap_or(false);
+            if let (true, Some(tx)) = (failed, &ctx.cancel_tx) {
                 let _ = tx.try_send(build_ember_ext_frame(
                     EMBER_EXT_ATTACH_CANCEL,
                     &attach::encode_attach_cancel(&ctx.xfer_id, reason),
@@ -833,7 +974,22 @@ async fn run_fetch(ctx: FetchCtx) {
     emit_by_id(&ctx.app, &ctx.db, &xfer_hex);
 }
 
-async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<PathBuf, ReceiveFailure> {
+/// What a failed receive leaves on our row, and what the sender is told. The
+/// two causes a user can act on get their own status; the rest are `failed`.
+fn failure_outcome(failure: &ReceiveFailure) -> (&'static str, AttachCancel) {
+    match failure {
+        ReceiveFailure::NoRoute(_) => ("unreachable", AttachCancel::Unreachable),
+        ReceiveFailure::Refused(AttachStreamStatus::SourceGone) => {
+            ("source_gone", AttachCancel::SourceGone)
+        }
+        ReceiveFailure::Corrupt(_) => ("failed", AttachCancel::Corrupt),
+        _ => ("failed", AttachCancel::Stalled),
+    }
+}
+
+/// Receive, verify, and move the file into `Chat Files`, marking the row
+/// complete. `Ok(false)` when the row ended while the file was being moved.
+async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<bool, ReceiveFailure> {
     let root = ctx.download_folder.clone();
     let allowed = vec![root.to_string_lossy().into_owned()];
 
@@ -867,18 +1023,37 @@ async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<PathBuf, ReceiveFailure> 
     }
 
     let name = ctx.name.clone();
-    let moved = tokio::task::spawn_blocking(move || {
+    let db = ctx.db.clone();
+    let xfer_hex = hex::encode(ctx.xfer_id);
+    let size = ctx.size;
+    // The row is settled on the blocking thread, not back in this task. A
+    // cancel aborts the task but cannot stop the move, so whichever of the two
+    // writes the row first decides whether the moved file stays.
+    tokio::task::spawn_blocking(move || {
         let target = super::unique_download_path(&chat_dir.join(&name));
-        super::ed2k::transfer::move_part_to_final_approved(&part_path, &target, &root, &identity)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&part_path);
-                e.to_string()
-            })
+        let dest = super::ed2k::transfer::move_part_to_final_approved(
+            &part_path, &target, &root, &identity,
+        )
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&part_path);
+            e.to_string()
+        })?;
+        let dest_str = dest.to_string_lossy().into_owned();
+        match db.advance_chat_attachment(&xfer_hex, "complete", Some(size), Some(&dest_str)) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let _ = std::fs::remove_file(&dest);
+                Ok(false)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(e.to_string())
+            }
+        }
     })
     .await
     .map_err(|e| ReceiveFailure::Disk(e.to_string()))?
-    .map_err(ReceiveFailure::Disk)?;
-    Ok(moved)
+    .map_err(ReceiveFailure::Disk)
 }
 
 async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<(), ReceiveFailure> {
@@ -888,6 +1063,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         .map_err(|e| ReceiveFailure::Unreachable(e.to_string()))?;
 
     let mut last = ReceiveFailure::Unreachable("no attempt was made".into());
+    let mut connected = false;
     for attempt in 0..FETCH_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
@@ -915,6 +1091,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
                 continue;
             }
         };
+        connected = true;
         let (mut send, mut recv) = match conn.open_bi().await {
             Ok(streams) => streams,
             Err(e) => {
@@ -937,13 +1114,17 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             |done, _| {
                 if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
                     last_emit = Some(Instant::now());
-                    emit_progress(&ctx.app, &ctx.row, done);
+                    emit_progress(&ctx.app, &ctx.db, &ctx.row, done);
                 }
             },
         )
         .await;
         let _ = send.finish();
-        conn.close(0u32.into(), b"attach done");
+        let reason = match &fetched {
+            Ok(outcome) if outcome.complete => attach::ATTACH_CLOSE_RECEIVED,
+            _ => attach::ATTACH_CLOSE_ABANDONED,
+        };
+        conn.close(0u32.into(), reason);
         match fetched {
             Ok(outcome) if outcome.complete => return Ok(()),
             Ok(_) => last = ReceiveFailure::Unreachable("the stream ended early".into()),
@@ -952,7 +1133,10 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             Err(FetchError::Transient(e)) => last = ReceiveFailure::Unreachable(e.to_string()),
         }
     }
-    Err(last)
+    Err(match last {
+        ReceiveFailure::Unreachable(detail) if !connected => ReceiveFailure::NoRoute(detail),
+        other => other,
+    })
 }
 
 // --- Either side ---------------------------------------------------------------
@@ -984,11 +1168,18 @@ pub(super) async fn cancel(
     let Some(row) = db.chat_attachment(&xfer_hex) else {
         return Err(not_found());
     };
-    if is_terminal(&row.status) {
-        return Ok(());
-    }
+    // Written before anything is stopped, and only over a live row: a receive
+    // saving its file right now either finishes first and keeps it, or finds
+    // the row cancelled and removes what it moved. A stream we are serving
+    // sees the grant gone and stops.
+    let cancelled = db
+        .advance_chat_attachment(&xfer_hex, "cancelled", None, None)
+        .unwrap_or(false);
+    // Whatever the row says: a receive still running under a row that ended
+    // without it has to be stoppable too.
+    stop_local(state, &settings.download_folder, &xfer_id);
     let mut friend = [0u8; 16];
-    if hex::decode_to_slice(&row.friend_hash, &mut friend).is_ok() {
+    if cancelled && hex::decode_to_slice(&row.friend_hash, &mut friend).is_ok() {
         // Best effort: an offline friend finds out when their side lapses.
         let _ = send_ext(
             state,
@@ -998,8 +1189,6 @@ pub(super) async fn cancel(
         )
         .await;
     }
-    stop_local(state, &settings.download_folder, &xfer_id);
-    let _ = db.set_chat_attachment_status(&xfer_hex, "cancelled", None, None);
     emit_by_id(app, db, &xfer_hex);
     Ok(())
 }
@@ -1019,17 +1208,22 @@ pub(super) fn on_cancel(
         return;
     };
     // Only the friend on the other end of this transfer may stop it.
-    if row.friend_hash != hex::encode(friend) || is_terminal(&row.status) {
+    if row.friend_hash != hex::encode(friend) {
         return;
     }
-    stop_local(state, &settings.download_folder, &xfer_id);
-    let status = if reason == AttachCancel::User {
-        "cancelled"
-    } else {
-        "failed"
+    let status = match reason {
+        AttachCancel::User => "cancelled",
+        AttachCancel::Unreachable => "unreachable",
+        AttachCancel::SourceGone => "source_gone",
+        AttachCancel::Stalled | AttachCancel::Corrupt => "failed",
     };
-    let _ = db.set_chat_attachment_status(&xfer_hex, status, None, None);
-    emit_by_id(app, db, &xfer_hex);
+    let moved = db
+        .advance_chat_attachment(&xfer_hex, status, None, None)
+        .unwrap_or(false);
+    stop_local(state, &settings.download_folder, &xfer_id);
+    if moved {
+        emit_by_id(app, db, &xfer_hex);
+    }
 }
 
 /// Settle what a restart stranded.
@@ -1039,10 +1233,13 @@ pub(super) fn on_cancel(
 /// across processes. Both are marked and their part files cleared, so the
 /// transcript says what happened instead of showing a transfer that will never
 /// move. Unanswered offers of our own keep their grant until it lapses — the
-/// friend may still answer after we come back.
+/// friend may still answer after we come back — and a send that was cut off
+/// goes back to `accepted`, since the friend's receive can resume against the
+/// same grant if it dials again.
 pub(super) fn sweep_interrupted(db: &Database, download_folder: &str) {
     let now = chrono::Utc::now().timestamp();
     let _ = db.expire_chat_attachments(now);
+    let _ = db.requeue_interrupted_outbound_chat_attachments();
     let Ok(stranded) = db.interrupted_inbound_chat_attachments() else {
         return;
     };
@@ -1100,6 +1297,8 @@ mod tests {
             "busy",
             "not_allowed",
             "cancelled",
+            "unreachable",
+            "source_gone",
             "failed",
             "expired",
         ] {
@@ -1108,6 +1307,29 @@ mod tests {
         for status in ["offered", "awaiting", "accepted", "active"] {
             assert!(!is_terminal(status), "{status}");
         }
+    }
+
+    /// A receive that never connected says so on both ends; one that connected
+    /// and then lost the sender is an ordinary failure, because the direct path
+    /// did exist.
+    #[test]
+    fn a_receive_that_never_connected_is_unreachable_not_failed() {
+        assert_eq!(
+            failure_outcome(&ReceiveFailure::NoRoute("timed out".into())),
+            ("unreachable", AttachCancel::Unreachable)
+        );
+        assert_eq!(
+            failure_outcome(&ReceiveFailure::Unreachable("stream ended early".into())),
+            ("failed", AttachCancel::Stalled)
+        );
+        assert_eq!(
+            failure_outcome(&ReceiveFailure::Refused(AttachStreamStatus::SourceGone)),
+            ("source_gone", AttachCancel::SourceGone)
+        );
+        assert_eq!(
+            failure_outcome(&ReceiveFailure::Corrupt("chunk 3".into())),
+            ("failed", AttachCancel::Corrupt)
+        );
     }
 
     /// A cancelled transfer's row must not be walked back by a stream that was
@@ -1120,6 +1342,22 @@ mod tests {
         for status in ["cancelled", "failed", "expired", "declined", "complete"] {
             assert!(!ServeProgress::writable(status), "{status}");
         }
+    }
+
+    /// An accept moves a fresh offer onto the grant's lifetime once, and a
+    /// late or repeated one cannot move it again.
+    #[test]
+    fn an_accept_extends_a_grant_once_and_never_revives_one() {
+        let created = 1_000;
+        let offer_expiry = created + ATTACH_OFFER_TTL_SECS;
+        let extends = |expires_at, now| accept_extends_grant(created, expires_at, now);
+        assert_eq!(extends(offer_expiry, created + 10), Some(true));
+        assert_eq!(extends(offer_expiry, offer_expiry), None);
+        assert_eq!(extends(offer_expiry, offer_expiry + 60), None);
+
+        let granted = created + 10 + ATTACH_GRANT_TTL_SECS;
+        assert_eq!(extends(granted, created + 20), Some(false));
+        assert_eq!(extends(granted, granted), None);
     }
 
     const MB: u64 = 1024 * 1024;

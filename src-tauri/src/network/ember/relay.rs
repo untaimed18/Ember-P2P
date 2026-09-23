@@ -1936,6 +1936,26 @@ pub struct AttachServeContext {
     pub app_handle: tauri::AppHandle,
 }
 
+/// How long a sender holds an attachment connection open after the last chunk,
+/// waiting for the friend to confirm it has every byte.
+const ATTACH_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait for a finished attachment stream to reach the friend.
+///
+/// True once the friend has acknowledged every byte, or has closed the
+/// connection saying the file arrived — it closes the moment it has the last
+/// chunk, and that close can overtake the acknowledgement. Anything else, the
+/// timeout included, is not delivery.
+async fn attachment_delivered(send: &quinn::SendStream) -> bool {
+    match tokio::time::timeout(ATTACH_DELIVERY_TIMEOUT, send.stopped()).await {
+        Ok(Ok(None)) => true,
+        Ok(Err(quinn::StoppedError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(close),
+        ))) => close.reason.as_ref() == super::attach::ATTACH_CLOSE_RECEIVED,
+        _ => false,
+    }
+}
+
 /// Run the QUIC accept loop. Handles four kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
@@ -2199,21 +2219,40 @@ pub async fn run_quic_accept_loop(
                         Some((std::path::PathBuf::from(path), size, root, capability))
                     },
                     |xfer_id, position, size| {
-                        progress.note(&progress_db, &progress_app, xfer_id, position, size);
+                        // Removing the friend has to end a stream already
+                        // running, as it refuses the next one. A contended lock
+                        // is not a removal; the next chunk looks again.
+                        let still_friend = friends
+                            .try_read()
+                            .map_or(true, |set| set.contains(&peer_id));
+                        still_friend
+                            && progress.note(
+                                &progress_db,
+                                &progress_app,
+                                xfer_id,
+                                &peer_hex,
+                                position,
+                                size,
+                            )
                     },
                     Some(limiter.as_ref()),
                 )
                 .await;
-                match served {
+                match &served {
                     Ok(0) => debug!("QUIC accept: no live attachment grant for {peer_hex}"),
                     Ok(bytes) => {
                         info!("Chat attachment: served {bytes} byte(s) to {peer_hex}");
                     }
                     Err(e) => debug!("QUIC accept: attachment stream to {peer_hex} failed: {e}"),
                 }
-                // The stream is the whole conversation, so the connection has
-                // nothing further to carry.
+                // The stream is the whole conversation, but returning drops the
+                // last handle on the connection, and quinn closes it on the spot
+                // — discarding whatever is still queued, which after a fast
+                // write loop can be most of the file. Hold it until the friend
+                // has it all.
                 let _ = init_send.finish();
+                let delivered = attachment_delivered(&init_send).await;
+                progress.finish(&ctx.db, &ctx.app_handle, served.is_ok() && delivered);
                 return;
             }
 
@@ -2542,6 +2581,8 @@ pub async fn run_quic_accept_loop(
                     // We are the relay *target*, i.e. the peer being reached;
                     // the initiator drives the eD2K handshake.
                     serve_friend_ember_hash: None,
+                    // `remote` is the relay node, not the peer behind it.
+                    relayed: true,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
@@ -2569,6 +2610,7 @@ pub async fn run_quic_accept_loop(
                     // belongs to whichever side *initiated* a transfer punch,
                     // and that side never arrives through this accept loop.
                     serve_friend_ember_hash: None,
+                    relayed: false,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping direct stream from {remote}: {e}");

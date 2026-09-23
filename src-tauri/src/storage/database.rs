@@ -2596,6 +2596,42 @@ impl Database {
         Ok(())
     }
 
+    /// [`Self::set_chat_attachment_status`], but only while the row is still
+    /// live. Returns whether it moved.
+    ///
+    /// The status check and the write are one statement, so two parties
+    /// settling the same transfer at once — a cancel and the task finishing
+    /// the file — cannot both believe they won.
+    pub fn advance_chat_attachment(
+        &self,
+        xfer_id: &str,
+        status: &str,
+        transferred: Option<u64>,
+        dest_path: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let moved = conn.execute(
+            "UPDATE chat_attachments SET
+                status = ?2,
+                transferred = COALESCE(?3, transferred),
+                dest_path = COALESCE(?4, dest_path)
+             WHERE xfer_id = ?1 AND status IN ('offered', 'awaiting', 'accepted', 'active')",
+            rusqlite::params![xfer_id, status, transferred.map(|t| t as i64), dest_path],
+        )?;
+        Ok(moved > 0)
+    }
+
+    /// When an attachment's row stops being live on its own.
+    pub fn chat_attachment_expiry(&self, xfer_id: &str) -> Option<i64> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT expires_at FROM chat_attachments WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
     /// Move an attachment's expiry, which on the sending side is how long the
     /// grant stays readable. Extended when the recipient accepts, because an
     /// offer's short lifetime is for "nobody answered", not for the transfer.
@@ -2621,6 +2657,21 @@ impl Database {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Put files we were sending when the process last stopped back to
+    /// `accepted`. The friend's receive resumes from its last verified chunk
+    /// if it dials again while the grant lasts, and if it never does the grant
+    /// lapses like any other accepted offer — either way nothing is left
+    /// claiming to be mid-send.
+    pub fn requeue_interrupted_outbound_chat_attachments(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let moved = conn.execute(
+            "UPDATE chat_attachments SET status = 'accepted'
+             WHERE direction = 'sent' AND status = 'active'",
+            [],
+        )?;
+        Ok(moved)
     }
 
     /// Every attachment for one friend, newest first, for drawing the transcript.
@@ -2681,12 +2732,16 @@ impl Database {
     /// deleted so the transcript can still say what happened to them; the grant
     /// stops resolving either way, because `chat_attachment_grant` refuses an
     /// expired row and refuses this status.
+    ///
+    /// A receive that is running is not swept: its expiry is only the offer's,
+    /// and the task moving the bytes is what settles it.
     pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let moved = conn.execute(
             "UPDATE chat_attachments SET status = 'expired'
              WHERE expires_at <= ?1
-               AND status IN ('offered', 'awaiting', 'accepted', 'active')",
+               AND ((direction = 'sent' AND status IN ('offered', 'accepted', 'active'))
+                 OR (direction = 'received' AND status = 'awaiting'))",
             rusqlite::params![now],
         )?;
         Ok(moved)
@@ -4348,11 +4403,16 @@ impl Database {
     /// The retry queue that would have resolved them lives in memory, so a
     /// restart mid-flight would otherwise leave a bubble reading "sending"
     /// for the life of the database with nothing left to move it.
-    pub fn fail_stale_queued_channel_messages(&self) -> anyhow::Result<usize> {
+    ///
+    /// Only lines written at or before `cutoff` — the second this run started.
+    /// Anything later belongs to this run, still in its command queue or retry
+    /// queue, and will be settled by that.
+    pub fn fail_stale_queued_channel_messages(&self, cutoff: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "UPDATE channel_messages SET delivery = ?1 WHERE direction = 'sent' AND delivery = ?2",
-            params![CHAT_FAILED, CHAT_QUEUED],
+            "UPDATE channel_messages SET delivery = ?1 \
+             WHERE direction = 'sent' AND delivery = ?2 AND timestamp <= ?3",
+            params![CHAT_FAILED, CHAT_QUEUED, cutoff],
         )?;
         Ok(changed)
     }
@@ -4424,7 +4484,7 @@ impl Database {
                 "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(user_hash) DO UPDATE SET last_ip = excluded.last_ip, \
-                     last_port = excluded.last_port",
+                     last_port = excluded.last_port, queued_at = excluded.queued_at",
                 params![
                     user_hash,
                     last_ip,
@@ -8858,12 +8918,17 @@ mod tests {
         db.set_channel_delivery(&channel_id, "s1", CHAT_QUEUED)
             .expect("queue it");
 
-        assert_eq!(db.fail_stale_queued_channel_messages().expect("sweep"), 1);
+        assert_eq!(
+            db.fail_stale_queued_channel_messages(99).expect("this run's"),
+            0,
+            "a line written after the run started is its retry queue's to settle"
+        );
+        assert_eq!(db.fail_stale_queued_channel_messages(100).expect("sweep"), 1);
         let rows = db.get_channel_messages(&channel_id, 10, None).expect("read");
         assert_eq!(rows[0].delivery, CHAT_FAILED);
         // Idempotent, so the once-per-run guard is a cost saving rather than a
         // correctness requirement.
-        assert_eq!(db.fail_stale_queued_channel_messages().expect("again"), 0);
+        assert_eq!(db.fail_stale_queued_channel_messages(100).expect("again"), 0);
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -8953,6 +9018,38 @@ mod tests {
         assert!(db.pending_friend_request_declines().expect("list").is_empty());
         // And a request that was never there is not an error either.
         assert!(!db.reject_and_queue_friend_decline("66").expect("reject none"));
+    }
+
+    /// A second refusal is a new delivery with its own lifetime, not the tail
+    /// end of the first one's.
+    #[test]
+    fn rejecting_again_restarts_the_decline_clock() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
+                 VALUES ('88', '203.0.113.9', 4662, 0)",
+                [],
+            )
+            .expect("seed decline");
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port) \
+                 VALUES ('88', 'Persistent', '203.0.113.10', 4663)",
+                [],
+            )
+            .expect("seed request");
+
+        assert!(db.reject_and_queue_friend_decline("88").expect("reject"));
+        assert_eq!(
+            db.expire_stale_friend_request_declines().expect("expire"),
+            0,
+            "the fresh refusal must not inherit the old one's age"
+        );
+        let queued = db.pending_friend_request_declines().expect("list");
+        assert_eq!((queued[0].1.as_str(), queued[0].2), ("203.0.113.10", 4663));
     }
 
     /// Adding somebody is the opposite answer to declining them, so an
@@ -10025,6 +10122,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn attach_test_db(tag: &str) -> (Database, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-{tag}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Database::open_at(&path).expect("open db"), path)
+    }
+
+    fn drop_attach_test_db(db: Database, path: std::path::PathBuf) {
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A receive carries only the offer's short expiry. The sweep that runs
+    /// every time the transcript is listed must not end one that is still
+    /// moving bytes, while an offer that was never answered still lapses.
+    #[test]
+    fn a_running_receive_outlives_its_offer_expiry() {
+        let (db, path) = attach_test_db("expire-recv");
+        let friend = "57".repeat(8);
+        let now = 3_000_000i64;
+        for (id, status) in [("aa", "active"), ("bb", "awaiting")] {
+            db.upsert_chat_attachment(
+                &id.repeat(16),
+                &friend,
+                "received",
+                "f.bin",
+                10,
+                &"33".repeat(32),
+                None,
+                status,
+                now,
+                now + 60,
+            )
+            .expect("insert");
+        }
+
+        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep"), 1);
+        assert_eq!(db.chat_attachment(&"aa".repeat(16)).expect("row").status, "active");
+        assert_eq!(db.chat_attachment(&"bb".repeat(16)).expect("row").status, "expired");
+        drop_attach_test_db(db, path);
+    }
+
+    /// The conditional write is what settles a race between a cancel and a
+    /// finishing receive: whichever lands first holds.
+    #[test]
+    fn only_a_live_attachment_can_be_advanced() {
+        let (db, path) = attach_test_db("advance");
+        let xfer = "cc".repeat(16);
+        db.upsert_chat_attachment(
+            &xfer,
+            &"58".repeat(8),
+            "received",
+            "f.bin",
+            10,
+            &"33".repeat(32),
+            None,
+            "active",
+            1,
+            2,
+        )
+        .expect("insert");
+
+        assert!(db.advance_chat_attachment(&xfer, "cancelled", None, None).expect("cancel"));
+        assert!(!db
+            .advance_chat_attachment(&xfer, "complete", Some(10), Some("C:\\dl\\f.bin"))
+            .expect("late completion"));
+        let row = db.chat_attachment(&xfer).expect("row");
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(row.dest_path, None);
+        assert_eq!(db.chat_attachment_expiry(&xfer), Some(2));
+        drop_attach_test_db(db, path);
+    }
+
+    /// A send cut off by a restart goes back to waiting for the friend's dial,
+    /// and a receive is left for the inbound sweep.
+    #[test]
+    fn an_interrupted_send_is_requeued_not_left_sending() {
+        let (db, path) = attach_test_db("requeue");
+        let friend = "59".repeat(8);
+        for (id, direction) in [("dd", "sent"), ("ee", "received")] {
+            db.upsert_chat_attachment(
+                &id.repeat(16),
+                &friend,
+                direction,
+                "f.bin",
+                10,
+                &"33".repeat(32),
+                (direction == "sent").then_some("C:\\private\\f.bin"),
+                "active",
+                1,
+                i64::MAX,
+            )
+            .expect("insert");
+        }
+
+        assert_eq!(db.requeue_interrupted_outbound_chat_attachments().expect("requeue"), 1);
+        assert_eq!(db.chat_attachment(&"dd".repeat(16)).expect("row").status, "accepted");
+        assert_eq!(db.chat_attachment(&"ee".repeat(16)).expect("row").status, "active");
+        drop_attach_test_db(db, path);
     }
 
     /// Unread means "they said something I have not read". A sent row that

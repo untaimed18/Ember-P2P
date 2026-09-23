@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -68,6 +68,7 @@
     hideChannel,
     ignoredMembers,
     ignoredKeysForChannel,
+    ignoreMemberEverywhere,
     ignoreScopeFor,
     forgetChannelIgnores,
     mutedChannels,
@@ -444,6 +445,10 @@
 
   function onPageKeydown(e: KeyboardEvent) {
     if (e.key !== 'Escape') return;
+    // The dock answers Escape on `window`, which this `document` listener runs
+    // ahead of — and it stands down on `defaultPrevented`, so a press in the
+    // dock's composer or search would close this page's pane instead.
+    if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
     if (document.querySelector('.card-more[open]')) {
       closeCardMenus();
       e.preventDefault();
@@ -1220,7 +1225,9 @@
       discovered = discovered.filter((item) => item.channel_id !== id);
       resetSearch();
       // After the conversation unmounts — its cleanup stashes the composer,
-      // and a draft for a room we just deleted should not come back.
+      // and a draft for a room we just deleted should not come back. Effects
+      // flush in a microtask, so clearing in this tick ran before that cleanup.
+      await tick();
       clearDraft(`ch:${id}`);
       await refreshChannels();
     } catch (e) {
@@ -2588,7 +2595,11 @@
                           <button
                             type="button"
                             role="menuitem"
-                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey, mem.nickname); }}
+                            onclick={(e) => {
+                              closeCardMenu(e.currentTarget);
+                              if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
+                              else ignoreMemberEverywhere(mem.member_pubkey, mem.nickname);
+                            }}
                           >{ignoreScope === 'global'
                             ? m.channels_unignore()
                             : m.channels_ignore_everywhere()}</button>
