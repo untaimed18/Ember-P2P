@@ -288,10 +288,6 @@ pub const EMBER_EXT_FRIEND_DECLINE: u8 = 0x07;
 /// code in the `OP_EMULEPROT` space, and a peer that predates these three
 /// sub-types ignores them — which reads to the sender as an offer nobody ever
 /// answered, and lapses on its own.
-///
-/// Allowed dead for the moment: the QUIC serve side is wired, the friend-session
-/// signalling that sends and receives these three is the next step.
-#[allow(dead_code)]
 pub const EMBER_EXT_ATTACH_OFFER: u8 = 0x08;
 
 /// [`OP_EMBER_EXT`] sub-type: the recipient's answer to
@@ -301,7 +297,6 @@ pub const EMBER_EXT_ATTACH_OFFER: u8 = 0x08;
 /// An accept is what tells the sender to keep the grant alive and expect a
 /// stream; every other answer retires it. Nothing is transferred on the
 /// strength of an offer alone.
-#[allow(dead_code)]
 pub const EMBER_EXT_ATTACH_REPLY: u8 = 0x09;
 
 /// [`OP_EMBER_EXT`] sub-type: either side is giving up on an attachment. Body
@@ -310,7 +305,6 @@ pub const EMBER_EXT_ATTACH_REPLY: u8 = 0x09;
 /// Sent by a recipient that no longer wants the file and by a sender that can
 /// no longer read it, so the other end stops waiting rather than sitting on a
 /// transfer until it lapses.
-#[allow(dead_code)]
 pub const EMBER_EXT_ATTACH_CANCEL: u8 = 0x0A;
 
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.

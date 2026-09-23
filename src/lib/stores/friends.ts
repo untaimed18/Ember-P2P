@@ -8,6 +8,7 @@ import {
   getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
+  parseChatAttachment,
   type FriendInfo,
   type FriendRequestInfo,
   type IncomingFileOffer,
@@ -229,6 +230,10 @@ function armSearchTimer(hash: string) {
 // of which UI surface is mounted.
 export const activeChatHash = writable<string | null>(null);
 
+/** Chat-attachment moments already announced, as `xfer_id:moment`. Bounded,
+ *  oldest first out; a stale entry costs at most one repeated notification. */
+const announcedAttachments = new Set<string>();
+
 // Dedup window for inbound `ember:chat-message` events. The backend can deliver
 // the same logical message twice in quick succession (the download- and
 // upload-side session loops both surface it), which would otherwise double-bump
@@ -406,6 +411,36 @@ export async function initFriendsStore() {
             file_name,
           );
         }
+      }),
+    );
+    registered.push(
+      await listen('ember:attach-update', (event) => {
+        const a = parseChatAttachment(event.payload);
+        if (!a || a.direction !== 'received') return;
+        // Two moments are worth interrupting for, and only when the user is not
+        // already looking at that conversation: a file waiting for an answer,
+        // and one that arrived by itself under the auto-accept ceiling.
+        // Progress ticks repeat the same status many times a second, so each
+        // (transfer, moment) pair is announced once.
+        const moment = a.status === 'awaiting' ? 'offer' : a.status === 'complete' ? 'done' : null;
+        if (!moment) return;
+        const key = `${a.xfer_id}:${moment}`;
+        if (announcedAttachments.has(key)) return;
+        announcedAttachments.add(key);
+        if (announcedAttachments.size > 500) {
+          const oldest = announcedAttachments.values().next().value;
+          if (oldest !== undefined) announcedAttachments.delete(oldest);
+        }
+        if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
+        if (!shouldNotify('friend_message')) return;
+        const name = friendDisplayName(a.user_hash);
+        void notify(
+          'friend_message',
+          moment === 'offer'
+            ? m.chat_attach_notify_offer({ name })
+            : m.chat_attach_notify_received({ name }),
+          safeEventText(a.name, 256),
+        );
       }),
     );
     registered.push(

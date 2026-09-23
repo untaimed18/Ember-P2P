@@ -1,7 +1,20 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { getChatMessages, sendChatMessage, sendChatTyping, markMessagesRead, isChatLocked, type ChatMessage } from '$lib/api/friends';
+  import {
+    getChatMessages,
+    sendChatMessage,
+    sendChatTyping,
+    markMessagesRead,
+    isChatLocked,
+    listChatAttachments,
+    parseChatAttachment,
+    pickAndSendChatAttachment,
+    type ChatAttachment,
+    type ChatMessage,
+  } from '$lib/api/friends';
+  import ChatAttachmentBubble from '$lib/components/ChatAttachmentBubble.svelte';
+  import { placeAttachments } from '$lib/chatAttachmentPlacement';
   import {
     deleteChannelMessage,
     getChannelMessages,
@@ -211,6 +224,20 @@
   let unlistenDelivery: UnlistenFn | null = null;
   let unlistenTyping: UnlistenFn | null = null;
   let unlistenRead: UnlistenFn | null = null;
+  let unlistenAttach: UnlistenFn | null = null;
+
+  /**
+   * Files sent in this conversation, in either direction.
+   *
+   * Kept beside `messages` rather than inside it: an attachment is not a chat
+   * line on the wire or on disk (friend chat bodies are plain text), and folding
+   * it into the message model would put a second kind of row through every
+   * path that assumes a message — dedup, delivery, read receipts, search. They
+   * are merged into the transcript only where it is drawn, by time.
+   */
+  let attachments: ChatAttachment[] = $state([]);
+  /** Picking and hashing a file can take a while for a large one. */
+  let attaching = $state(false);
   let friendTyping = $state(false);
   let typingHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let lastTypingSentOn = false;
@@ -521,7 +548,9 @@
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
+      if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
       messages = [];
+      attachments = [];
       earlyDeliveredIds.clear();
       loadError = null;
       liveError = false;
@@ -546,6 +575,8 @@
           if (gen !== loadGen) return;
           await loadMessages(gen, friend, channel);
           if (gen === loadGen) liveError = !listenerOk;
+          // Friends only: rooms have their own transfer system.
+          if (!channel && gen === loadGen) await setupAttachments(gen, friend);
         } finally {
           if (gen === loadGen) loading = false;
         }
@@ -562,6 +593,7 @@
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
+      if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
       if (key) setDraft(key, inputText);
       releaseChannelOnScreen?.();
       releaseChannelOnScreen = null;
@@ -1113,6 +1145,84 @@
   /** Note an incoming message the reader is not positioned to see. */
   function noteMissedMessage(wasPinned: boolean, direction: string) {
     if (!wasPinned && direction === 'received') missedWhileAway = true;
+  }
+
+  /** Merge one attachment into the list, by id. Returns whether it was new. */
+  function upsertAttachment(next: ChatAttachment): boolean {
+    const at = attachments.findIndex((a) => a.xfer_id === next.xfer_id);
+    if (at === -1) {
+      attachments = [...attachments, next];
+      return true;
+    }
+    // Progress ticks carry no new status; a snapshot taken before the tick must
+    // not drag the bar backwards if the two cross in flight.
+    const prev = attachments[at];
+    const merged =
+      prev.status === next.status && next.status === 'active'
+        ? { ...next, transferred: Math.max(prev.transferred, next.transferred) }
+        : next;
+    const copy = [...attachments];
+    copy[at] = merged;
+    attachments = copy;
+    return false;
+  }
+
+  /**
+   * Load this conversation's files and follow their progress.
+   *
+   * Listener first, then the list, so an update that lands between the two is
+   * not lost; the list is merged rather than assigned for the same reason.
+   */
+  async function setupAttachments(gen: number, hash: string) {
+    const friend = (hash || '').toLowerCase();
+    try {
+      const fn = await listen('ember:attach-update', (event) => {
+        if (gen !== loadGen) return;
+        const next = parseChatAttachment(event.payload);
+        if (!next || next.user_hash !== friend) return;
+        const wasPinned = isPinnedToBottom();
+        const isNew = upsertAttachment(next);
+        if (isNew) {
+          if (wasPinned || next.direction === 'sent') scrollToBottom();
+          else noteMissedMessage(false, next.direction);
+        }
+      });
+      if (gen !== loadGen) {
+        fn();
+        return;
+      }
+      unlistenAttach = fn;
+    } catch (e) {
+      console.warn('ChatConversation: failed to register attachment listener', e);
+    }
+    try {
+      const listed = await listChatAttachments(friend);
+      if (gen !== loadGen) return;
+      const wasPinned = isPinnedToBottom();
+      for (const a of listed) upsertAttachment(a);
+      if (wasPinned) scrollToBottom();
+    } catch (e) {
+      // Non-fatal: the conversation still works, it just opens without its
+      // earlier files until it is reopened.
+      console.warn('ChatConversation: failed to load attachments', e);
+    }
+  }
+
+  async function sendAttachment() {
+    if (attaching || isChannel || !friendHash) return;
+    attaching = true;
+    try {
+      const sentOne = await pickAndSendChatAttachment(friendHash);
+      if (sentOne) {
+        upsertAttachment(sentOne);
+        scrollToBottom();
+      }
+    } catch (e) {
+      toastError(translateError(e));
+    } finally {
+      attaching = false;
+      chatInputEl?.focus();
+    }
   }
 
   /** The message a search hit pointed at, marked briefly so the eye can find
@@ -1809,11 +1919,21 @@
       d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   }
 
+  /** Where each file sits among the messages. See `chatAttachmentPlacement`. */
+  let attachmentPlacement = $derived(
+    placeAttachments(
+      rows.map((r) => ({ id: r.msg.id, timestamp: r.msg.timestamp })),
+      isChannel ? [] : attachments,
+      hasMoreHistory,
+    ),
+  );
+
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
     if (unlistenRead) { unlistenRead(); unlistenRead = null; }
+    if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
     if (typingHoldTimer) { clearTimeout(typingHoldTimer); typingHoldTimer = null; }
     if (lastTypingSentOn && friendHash) {
       void sendChatTyping(friendHash, false).catch(() => {});
@@ -1822,6 +1942,20 @@
     if (reactionPulseTimer) { clearTimeout(reactionPulseTimer); reactionPulseTimer = null; }
   });
 </script>
+
+{#snippet attachmentRow(a: ChatAttachment)}
+  <div
+    class="conv-msg conv-attach-row starts-run"
+    class:sent={a.direction === 'sent'}
+    class:received={a.direction === 'received'}
+  >
+    <ChatAttachmentBubble
+      attachment={a}
+      friendName={friendName || friendHash.slice(0, 8)}
+      time={formatTime(a.created_at)}
+    />
+  </div>
+{/snippet}
 
 {#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
@@ -1893,7 +2027,7 @@
         <span>{m.chat_load_error({ error: loadError })}</span>
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
-    {:else if messages.length === 0}
+    {:else if messages.length === 0 && attachmentPlacement.count === 0}
       <div class="conv-empty">
         {#if chatLocked}
           {m.friends_chat_locked_title()}
@@ -1924,6 +2058,9 @@
         </div>
       {/if}
       {#each rows as row (row.msg.id)}
+        {#each attachmentPlacement.before.get(row.msg.id) ?? [] as a (a.xfer_id)}
+          {@render attachmentRow(a)}
+        {/each}
         {#if row.daySeparator}
           <div class="conv-day">{row.daySeparator}</div>
         {/if}
@@ -2169,6 +2306,9 @@
         {/if}
         </div>
       {/each}
+      {#each attachmentPlacement.after as a (a.xfer_id)}
+        {@render attachmentRow(a)}
+      {/each}
     {/if}
     {#if friendTyping && !isChannel && !loading && !loadError}
       <div class="conv-msg received conv-typing-row">
@@ -2234,6 +2374,29 @@
             </li>
           {/each}
         </ul>
+      {/if}
+      {#if !isChannel}
+        <!-- Disabled rather than hidden while the friend is offline: the bytes
+             move over a live connection between the two of you, and a button
+             that vanished would give no hint why. -->
+        <button
+          type="button"
+          class="conv-attach"
+          class:busy={attaching}
+          onclick={sendAttachment}
+          disabled={attaching || !isOnline}
+          title={attaching
+            ? m.chat_attach_preparing()
+            : isOnline
+              ? m.chat_attach_button()
+              : m.chat_attach_offline({ name: friendName || friendHash.slice(0, 8) })}
+          aria-label={m.chat_attach_button()}
+          aria-busy={attaching}
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15.5 9.5 10 15a3.5 3.5 0 0 1-5-5l6-6a2.3 2.3 0 0 1 3.3 3.3l-6 6a1.2 1.2 0 0 1-1.7-1.7L12 6"/>
+          </svg>
+        </button>
       {/if}
       <textarea
         class="conv-input"
@@ -3515,6 +3678,62 @@
   }
 
   .conv-send svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* Quiet beside the send button: it is the second thing you reach for. */
+  .conv-attach {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    align-self: center;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .conv-attach:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .conv-attach:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .conv-attach:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .conv-attach.busy {
+    opacity: 1;
+    color: var(--accent);
+    animation: conv-attach-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes conv-attach-pulse {
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-attach.busy {
+      animation: none;
+    }
+  }
+
+  .conv-attach svg {
     width: 18px;
     height: 18px;
   }

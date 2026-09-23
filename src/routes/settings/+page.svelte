@@ -16,6 +16,7 @@
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
   import type { WebService } from '$lib/types';
+  import { openChatFilesFolder } from '$lib/api/friends';
   import {
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
@@ -1107,7 +1108,7 @@
       'max_connections', 'max_connections_per_five_secs',
       'download_queue_wait_secs', 'multisource_retry_rounds',
       'download_part_retry_rounds', 'max_download_file_size_gib',
-      'search_timeout_secs', 'max_friends',
+      'search_timeout_secs', 'max_friends', 'chat_attachment_auto_accept_mb',
     ] as const;
     const numericValues = s as unknown as Record<string, unknown>;
     for (const key of numericFields) {
@@ -1153,6 +1154,8 @@
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
     s.max_friends = ci(s.max_friends, 1, 500, 100);
+    // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
+    s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
     return { error: null, adjusted };
   }
 
@@ -3649,6 +3652,24 @@
           </div>
 
           <div class="field">
+            <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
+            <div class="chat-attach-auto">
+              <input
+                id="chat-attach-auto"
+                type="number"
+                min="0"
+                max="2048"
+                bind:value={settings.chat_attachment_auto_accept_mb}
+              />
+              <span class="chat-attach-auto-unit">{m.settings_chat_attach_auto_unit()}</span>
+              <button type="button" class="secondary" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                {m.settings_chat_attach_open_folder()}
+              </button>
+            </div>
+            <span class="hint">{m.settings_chat_attach_auto_hint()}</span>
+          </div>
+
+          <div class="field">
             <label for="max-friends">{m.settings_max_friends()}</label>
             <input
               id="max-friends"
@@ -6105,5 +6126,21 @@
     font-size: 14px;
     color: var(--text-muted);
     margin: 0;
+  }
+
+  .chat-attach-auto {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .chat-attach-auto input {
+    width: 96px;
+  }
+
+  .chat-attach-auto-unit {
+    color: var(--text-muted);
+    font-size: 13px;
   }
 </style>

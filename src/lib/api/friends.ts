@@ -163,6 +163,106 @@ export interface IncomingFileOffer {
   ember_file_hash?: string;
 }
 
+/** Where a chat attachment is. See `network/chat_attach.rs` for who moves it. */
+export type ChatAttachmentStatus =
+  | 'offered'
+  | 'awaiting'
+  | 'accepted'
+  | 'active'
+  | 'complete'
+  | 'declined'
+  | 'too_large'
+  | 'busy'
+  | 'not_allowed'
+  | 'cancelled'
+  | 'failed'
+  | 'expired';
+
+/** One file sent in chat, in either direction. Also the `ember:attach-update`
+ *  payload, so an event and a listed row can be merged by `xfer_id`. */
+export interface ChatAttachment {
+  xfer_id: string;
+  user_hash: string;
+  direction: 'sent' | 'received';
+  name: string;
+  size: number;
+  transferred: number;
+  status: ChatAttachmentStatus;
+  created_at: number;
+  /** A received file that finished and can be opened. */
+  has_file: boolean;
+}
+
+/** Statuses a transfer never leaves. */
+export const CHAT_ATTACHMENT_TERMINAL: ReadonlySet<ChatAttachmentStatus> = new Set([
+  'complete',
+  'declined',
+  'too_large',
+  'busy',
+  'not_allowed',
+  'cancelled',
+  'failed',
+  'expired',
+]);
+
+/** Pick a file and offer it to a friend. `null` when the picker was closed. */
+export async function pickAndSendChatAttachment(
+  userHashHex: string,
+): Promise<ChatAttachment | null> {
+  return invoke('pick_and_send_chat_attachment', { userHashHex });
+}
+
+export async function respondChatAttachment(xferId: string, accept: boolean): Promise<void> {
+  return invoke('respond_chat_attachment', { xferId, accept });
+}
+
+export async function cancelChatAttachment(xferId: string): Promise<void> {
+  return invoke('cancel_chat_attachment', { xferId });
+}
+
+export async function listChatAttachments(userHashHex: string): Promise<ChatAttachment[]> {
+  return invoke('list_chat_attachments', { userHashHex });
+}
+
+/** Open a received file, or with `reveal` show it in its folder. */
+export async function openChatAttachment(xferId: string, reveal: boolean): Promise<void> {
+  return invoke('open_chat_attachment', { xferId, reveal });
+}
+
+export async function openChatFilesFolder(): Promise<void> {
+  return invoke('open_chat_files_folder');
+}
+
+/** Narrow an `ember:attach-update` payload before it touches any state. */
+export function parseChatAttachment(raw: unknown): ChatAttachment | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const hex = (v: unknown, len: number) =>
+    typeof v === 'string' && v.length === len && /^[0-9a-f]+$/.test(v) ? v : null;
+  const xfer_id = hex(r.xfer_id, 32);
+  const user_hash = hex(r.user_hash, 32);
+  if (!xfer_id || !user_hash) return null;
+  if (r.direction !== 'sent' && r.direction !== 'received') return null;
+  const statuses: ChatAttachmentStatus[] = [
+    'offered', 'awaiting', 'accepted', 'active', 'complete', 'declined',
+    'too_large', 'busy', 'not_allowed', 'cancelled', 'failed', 'expired',
+  ];
+  const status = statuses.find((s) => s === r.status);
+  if (!status) return null;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  return {
+    xfer_id,
+    user_hash,
+    direction: r.direction,
+    name: typeof r.name === 'string' ? r.name.slice(0, 255) : '',
+    size: num(r.size),
+    transferred: num(r.transferred),
+    status,
+    created_at: num(r.created_at),
+    has_file: r.has_file === true,
+  };
+}
+
 export async function retryFriendSearch(userHashHex: string): Promise<void> {
   return invoke('retry_friend_search', { userHashHex });
 }

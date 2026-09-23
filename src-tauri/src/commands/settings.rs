@@ -687,6 +687,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // Past the attachment size cap the ceiling means nothing, and a hand-edited
+    // config with an absurd value should read as "accept everything a friend can
+    // send", not overflow the byte arithmetic that compares against it.
+    if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
+        settings.chat_attachment_auto_accept_mb = crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB;
+        changed = true;
+    }
+
     // A username stored under the older, looser rule (spaces, punctuation, up
     // to 32 bytes) is not a corrupt config — but `validate_settings` now
     // refuses it, and on load that answer means backup-and-reset of every
@@ -841,6 +849,13 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_channel_file_offers_invalid",
             "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
+        return Err(coded_ctx(
+            "settings_chat_attachment_auto_accept_invalid",
+            "The automatic download limit is larger than any file a friend can send",
+            crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
         ));
     }
     if settings.update_check_frequency != "daily"

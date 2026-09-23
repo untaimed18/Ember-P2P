@@ -276,6 +276,49 @@ async fn live_secure_friend_member(
 /// Passing this rather than a precomputed boolean keeps the mutual-friend
 /// lookup lazy: it happens only when the resolved file is actually restricted,
 /// so ordinary public serving takes no extra lock.
+/// Turn an `OP_EMBER_EXT` attachment frame into the event the network loop acts
+/// on, or `None` if it does not decode.
+///
+/// Shared by the two readers that carry friend sessions — the dedicated
+/// outbound one in `friend_connect` and the inbound secure-v2 upload socket
+/// here — so the two cannot disagree about what an attachment frame means. Both
+/// call it only after their own friend-privilege gate.
+pub(crate) fn attach_event_from_ext(
+    ember_hash: [u8; 16],
+    payload: &[u8],
+    peer_addr: std::net::SocketAddr,
+) -> Option<UploadEventKind> {
+    use crate::network::ember::attach;
+    let (sub_type, body) = super::messages::parse_ember_ext(payload)?;
+    let kind = match sub_type {
+        super::messages::EMBER_EXT_ATTACH_OFFER => UploadEventKind::EmberAttachOffer {
+            ember_hash,
+            offer: attach::decode_attach_offer(body)?,
+            peer_addr,
+        },
+        super::messages::EMBER_EXT_ATTACH_REPLY => {
+            let (xfer_id, reply, quic_port) = attach::decode_attach_reply(body)?;
+            UploadEventKind::EmberAttachReply {
+                ember_hash,
+                xfer_id,
+                reply,
+                quic_port,
+                peer_addr,
+            }
+        }
+        super::messages::EMBER_EXT_ATTACH_CANCEL => {
+            let (xfer_id, reason) = attach::decode_attach_cancel(body)?;
+            UploadEventKind::EmberAttachCancel {
+                ember_hash,
+                xfer_id,
+                reason,
+            }
+        }
+        _ => return None,
+    };
+    Some(kind)
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PeerFileAccess {
     /// Peer Ember hash, once proven. `None` until `OP_EMBER_HELLO` lands, and
@@ -2137,6 +2180,35 @@ pub enum UploadEventKind {
         offer: super::messages::EmberFileOffer,
         /// The friend session this arrived on, for the offer ack.
         reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    /// A friend is offering us a file in chat (`EMBER_EXT_ATTACH_OFFER`).
+    ///
+    /// Signalling only. Whether to take it is the network loop's decision —
+    /// under the user's auto-accept ceiling it is fetched without asking, above
+    /// it the user is asked — and the bytes come over QUIC, never this session.
+    EmberAttachOffer {
+        ember_hash: [u8; 16],
+        offer: crate::network::ember::attach::AttachOffer,
+        /// Where the friend session is connected. The recipient dials the
+        /// sender's QUIC endpoint at this IP and the port the offer named, so a
+        /// friend can steer the dial's port but not which host it goes to.
+        peer_addr: std::net::SocketAddr,
+    },
+    /// A friend answered an attachment we offered them.
+    EmberAttachReply {
+        ember_hash: [u8; 16],
+        xfer_id: [u8; 16],
+        reply: crate::network::ember::attach::AttachReply,
+        /// The recipient's public QUIC port, on an accept that sent one. With
+        /// `peer_addr` it is what the sender punches toward.
+        quic_port: Option<u16>,
+        peer_addr: std::net::SocketAddr,
+    },
+    /// A friend gave up on an attachment in either direction.
+    EmberAttachCancel {
+        ember_hash: [u8; 16],
+        xfer_id: [u8; 16],
+        reason: crate::network::ember::attach::AttachCancel,
     },
     /// A friend answered a file offer we sent them.
     EmberFileOfferAck {
@@ -12501,6 +12573,19 @@ impl UploadHandler {
                                                 ember_hash: eh,
                                                 contacts: body.to_vec(),
                                             },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_ATTACH_OFFER
+                                | super::messages::EMBER_EXT_ATTACH_REPLY
+                                | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
+                                if let Some(kind) = attach_event_from_ext(eh, &payload, peer_addr) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind,
                                         })
                                         .await;
                                 }

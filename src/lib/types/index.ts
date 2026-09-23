@@ -954,6 +954,9 @@ export interface AppSettings {
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
    *  is always a separate, explicit choice. */
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
+  /** Files a friend sends in chat at or under this many MB download without
+   *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
+  chat_attachment_auto_accept_mb: number;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**

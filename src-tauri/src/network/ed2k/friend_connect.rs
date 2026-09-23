@@ -974,6 +974,20 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_ATTACH_OFFER
+                                            | super::messages::EMBER_EXT_ATTACH_REPLY
+                                            | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
+                                            if let Some(kind) = super::upload::attach_event_from_ext(
+                                                peer_ember_hash,
+                                                &payload,
+                                                addr,
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind,
+                                                }).await;
+                                            }
+                                        }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(

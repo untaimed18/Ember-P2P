@@ -12,13 +12,7 @@
 //! blocks inbound QUIC is the case the hole-punch path already exists for; see
 //! [`fetch_attachment`] on what a caller should pass as `addr`.
 
-// `serve_attachment` runs from the QUIC accept loop; `fetch_attachment` is the
-// receiving side and is tested but not yet called, because the friend-session
-// signalling that decides to fetch is the next step. See the note in
-// `super::attach`.
-#![allow(dead_code)]
-
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -35,6 +29,76 @@ use super::transfer::HashTree;
 /// but bounded: a peer that opens a stream and then says nothing must not hold
 /// a task and a file handle for the life of the process.
 const ATTACH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bytes the sender writes between checks of the upload cap.
+const ATTACH_SEND_SLICE: usize = 16 * 1024;
+
+/// Fill `buf` from the stream, with the timeout measured between reads rather
+/// than across the whole buffer.
+///
+/// A chunk is 256 KiB. Under a low upload cap on the far end that can honestly
+/// take longer than [`ATTACH_IO_TIMEOUT`] to arrive, and a timeout over the
+/// whole chunk would abandon a transfer that was moving the entire time. Any
+/// progress resets it; only a stream that stops delivering anything times out.
+async fn read_full<R>(recv: &mut R, buf: &mut [u8]) -> Result<(), FetchError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read(&mut buf[filled..])).await??;
+        if n == 0 {
+            return Err(FetchError::Transient(anyhow::anyhow!(
+                "attachment stream closed mid-chunk"
+            )));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// Why a fetch stopped, sorted by what the caller should do about it.
+///
+/// The distinction is the whole point: a dropped stream is worth re-dialling
+/// and resuming, while bytes that failed their hash will fail again from the
+/// same sender, and a refusal means the grant is gone. Collapsing these into
+/// one error would have the receiver retrying a lie or giving up on a blip.
+#[derive(Debug)]
+pub enum FetchError {
+    /// The sender answered with a refusal. Not retried: the grant is gone,
+    /// the file changed, or the resume cursor was wrong.
+    Refused(AttachStreamStatus),
+    /// Something failed verification or did not parse. Not retried.
+    Corrupt(String),
+    /// The stream, the connection, or the disk failed. Worth another dial.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Refused(status) => {
+                write!(f, "attachment refused by the sender: {status:?}")
+            }
+            FetchError::Corrupt(detail) => f.write_str(detail),
+            FetchError::Transient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+impl From<std::io::Error> for FetchError {
+    fn from(e: std::io::Error) -> Self {
+        FetchError::Transient(e.into())
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for FetchError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        FetchError::Transient(anyhow::anyhow!("attachment stream timed out"))
+    }
+}
 
 /// What a completed fetch produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,19 +120,30 @@ pub struct FetchOutcome {
 /// who it claims: the QUIC certificate is the identity, and this function only
 /// checks that the request also carries the pairwise tag.
 ///
-/// `tail` is the part of the request the accept loop has not already read, so
-/// this can be called from a dispatcher that consumed the first seven bytes to
-/// decide what the connection was.
-pub async fn serve_attachment<R, W, F>(
+/// `prefix` is the part of the request the accept loop already read, so this can
+/// be called from a dispatcher that consumed the first seven bytes to decide
+/// what the connection was.
+///
+/// `on_progress` is told the transfer id once it is known and authorized, then
+/// the absolute byte position after each chunk — absolute rather than "sent this
+/// call", so a resumed stream reports where the file actually is.
+///
+/// `limiter` is the user's upload cap. A chat file is still upload, and a user
+/// who capped theirs to keep the connection usable should not find a friend's
+/// download saturating it; the room transfer honours the same cap.
+pub async fn serve_attachment<R, W, F, P>(
     recv: &mut R,
     send: &mut W,
     prefix: &[u8; 7],
     capability_for: F,
+    mut on_progress: P,
+    limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
 ) -> anyhow::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
+    P: FnMut(&[u8; 16], u64, u64),
 {
     let mut tail = [0u8; ATTACH_REQUEST_TAIL_LEN];
     tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut tail)).await??;
@@ -112,18 +187,33 @@ where
     // the offer and the dial, and serving new bytes under the old root would
     // fail the recipient's per-chunk check anyway. Hashing first means we
     // notice here and say so, instead of streaming a file that cannot verify.
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
+    //
+    // On the blocking pool: this is a read of the whole file, up to 2 GiB, and
+    // it runs from the QUIC accept loop. Done inline it would pin a runtime
+    // worker for seconds, stalling every other task scheduled on it.
+    let hashed = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<HashTree> {
+            let file = std::fs::File::open(&path)?;
+            HashTree::from_reader(std::io::BufReader::new(file))
+        })
+        .await
+    };
+    let tree = match hashed {
+        Ok(Ok(tree)) if tree.file_size == size && tree.root_hash == root => tree,
+        Ok(Ok(_)) => {
+            refuse(send, AttachStreamStatus::SourceGone).await?;
+            anyhow::bail!("attachment on disk no longer matches the offer");
+        }
+        Ok(Err(e)) => {
             refuse(send, AttachStreamStatus::SourceGone).await?;
             return Err(e.into());
         }
+        Err(e) => {
+            refuse(send, AttachStreamStatus::SourceGone).await?;
+            anyhow::bail!("attachment hash task failed: {e}");
+        }
     };
-    let tree = HashTree::from_reader(std::io::BufReader::new(file))?;
-    if tree.file_size != size || tree.root_hash != root {
-        refuse(send, AttachStreamStatus::SourceGone).await?;
-        anyhow::bail!("attachment on disk no longer matches the offer");
-    }
 
     let info = AttachFileInfo {
         size,
@@ -135,16 +225,34 @@ where
     )
     .await??;
 
-    let mut handle = std::fs::File::open(&path)?;
+    // `tokio::fs`, which moves each read onto the blocking pool for the same
+    // reason as the hash above.
+    let mut handle = tokio::fs::File::open(&path).await?;
     let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
     let mut sent = 0u64;
+    let mut position = request.start_chunk as u64 * ATTACH_CHUNK_SIZE as u64;
+    handle.seek(std::io::SeekFrom::Start(position)).await?;
+    on_progress(&request.xfer_id, position, size);
     for index in request.start_chunk as usize..info.chunk_count() {
         let len = info
             .chunk_len(index)
             .ok_or_else(|| anyhow::anyhow!("chunk index past the end"))?;
-        read_chunk_at(&mut handle, index, &mut buf[..len])?;
-        tokio::time::timeout(ATTACH_IO_TIMEOUT, send.write_all(&buf[..len])).await??;
+        handle.read_exact(&mut buf[..len]).await?;
+        // Sliced so a low cap paces the stream smoothly rather than parking for
+        // a whole chunk's worth of tokens and then bursting it.
+        for slice in buf[..len].chunks(ATTACH_SEND_SLICE) {
+            if let Some(limiter) = limiter {
+                if !limiter.acquire_upload(slice.len() as u64).await {
+                    // The refill task is gone; sending on regardless would
+                    // ignore the cap entirely.
+                    anyhow::bail!("upload limiter stopped");
+                }
+            }
+            tokio::time::timeout(ATTACH_IO_TIMEOUT, send.write_all(slice)).await??;
+        }
         sent += len as u64;
+        position += len as u64;
+        on_progress(&request.xfer_id, position, size);
     }
     tokio::time::timeout(ATTACH_IO_TIMEOUT, send.flush()).await??;
     Ok(sent)
@@ -159,22 +267,23 @@ where
     Ok(())
 }
 
-fn read_chunk_at(file: &mut std::fs::File, index: usize, out: &mut [u8]) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(index as u64 * ATTACH_CHUNK_SIZE as u64))?;
-    file.read_exact(out)
-}
-
-/// Ask a peer for an attachment and write it into `part_path`, verifying as it
-/// goes.
+/// Ask a peer for an attachment and write it into `part`, verifying as it goes.
+///
+/// `part` is a handle, not a path, and the caller must have opened it through
+/// the approved-root layer (`open_or_create_approved`). The part file's name is
+/// derived from the transfer id, which the *sending* peer chose, so opening it
+/// here by pathname would follow a planted symlink or junction — the exact hole
+/// the room transfer's receive path was closed against. Open it read/write and
+/// not truncated: whatever whole chunks are already in it are the resume point.
 ///
 /// `on_progress` is called with the running total so a caller can drive a
 /// progress bar; it is called per chunk, so a caller that emits an event from it
 /// should throttle.
 ///
-/// Resumes from whatever is already in `part_path`, rounded down to a whole
-/// verified chunk — a partial chunk is discarded rather than trusted, because
-/// nothing has checked it yet.
+/// Resumes from whatever is already in `part`, rounded down to a whole verified
+/// chunk — a partial chunk is discarded rather than trusted, because nothing has
+/// checked it yet.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_attachment<R, W, P>(
     recv: &mut R,
     send: &mut W,
@@ -182,20 +291,20 @@ pub async fn fetch_attachment<R, W, P>(
     capability: &[u8; 32],
     size: u64,
     root: &[u8; 32],
-    part_path: &Path,
+    part: std::fs::File,
     mut on_progress: P,
-) -> anyhow::Result<FetchOutcome>
+) -> Result<FetchOutcome, FetchError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     P: FnMut(u64, u64),
 {
-    let chunk_count =
-        attach_chunk_count(size).ok_or_else(|| anyhow::anyhow!("attachment size out of range"))?;
+    let chunk_count = attach_chunk_count(size)
+        .ok_or_else(|| FetchError::Corrupt("attachment size out of range".into()))?;
 
     // Whole chunks only. A trailing partial chunk has been through no check at
     // all, so resuming "after" it would import bytes nothing vouches for.
-    let have = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
+    let have = part.metadata().map(|m| m.len()).unwrap_or(0);
     let start_chunk = u32::try_from(have / ATTACH_CHUNK_SIZE as u64)
         .unwrap_or(0)
         .min(chunk_count.saturating_sub(1));
@@ -217,25 +326,28 @@ where
     // header that was never coming.
     let mut status_byte = [0u8; 1];
     tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut status_byte)).await??;
-    let status = AttachStreamStatus::from_byte(status_byte[0])
-        .ok_or_else(|| anyhow::anyhow!("attachment peer sent an unknown status"))?;
+    let status = AttachStreamStatus::from_byte(status_byte[0]).ok_or_else(|| {
+        FetchError::Corrupt("attachment peer sent an unknown status".into())
+    })?;
     if status != AttachStreamStatus::Ok {
-        anyhow::bail!("attachment refused by the sender: {status:?}");
+        return Err(FetchError::Refused(status));
     }
 
     let info_len = attach_file_info_len(size)
-        .ok_or_else(|| anyhow::anyhow!("attachment size out of range"))?;
+        .ok_or_else(|| FetchError::Corrupt("attachment size out of range".into()))?;
     let mut info_bytes = vec![0u8; info_len];
     info_bytes[0] = AttachStreamStatus::Ok.to_byte();
-    tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut info_bytes[1..])).await??;
+    read_full(recv, &mut info_bytes[1..]).await?;
     let info = decode_attach_file_info(&info_bytes)
-        .map_err(|s| anyhow::anyhow!("attachment header refused: {s:?}"))?;
+        .map_err(|s| FetchError::Corrupt(format!("attachment header refused: {s:?}")))?;
 
     // The check the whole scheme rests on. Until the chunk list is shown to be
     // the one the offered root commits to, the per-chunk hashes are only what
     // the sender says they are, and verifying against them proves nothing.
     if info.size != size || !info.matches_root(root) {
-        anyhow::bail!("attachment chunk list does not match the offered root");
+        return Err(FetchError::Corrupt(
+            "attachment chunk list does not match the offered root".into(),
+        ));
     }
 
     let tree = HashTree {
@@ -244,16 +356,9 @@ where
         file_size: size,
     };
 
-    // Explicitly not truncating: whatever whole chunks are already here have
-    // been verified, and `resume_at` is where writing continues from. The
-    // `set_len` below is what drops a trailing partial chunk.
-    let mut part = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(part_path)
-        .await?;
+    // `set_len` is what drops a trailing partial chunk; the verified whole
+    // chunks before `resume_at` stay where they are.
+    let mut part = tokio::fs::File::from_std(part);
     part.set_len(resume_at).await?;
     part.seek(std::io::SeekFrom::Start(resume_at)).await?;
 
@@ -263,14 +368,16 @@ where
     for index in start_chunk as usize..info.chunk_count() {
         let len = info
             .chunk_len(index)
-            .ok_or_else(|| anyhow::anyhow!("chunk index past the end"))?;
-        tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut buf[..len])).await??;
+            .ok_or_else(|| FetchError::Corrupt("chunk index past the end".into()))?;
+        read_full(recv, &mut buf[..len]).await?;
 
         // Per chunk, so a bad one costs this chunk rather than the whole file.
         // The room transfer could only check its root at the end, which meant
         // discarding everything and starting over.
         if !tree.verify_chunk(index, &buf[..len]) {
-            anyhow::bail!("attachment chunk {index} did not match its hash");
+            return Err(FetchError::Corrupt(format!(
+                "attachment chunk {index} did not match its hash"
+            )));
         }
 
         part.write_all(&buf[..len]).await?;
@@ -298,6 +405,7 @@ mod tests {
     use super::*;
     use super::super::attach::derive_attach_capability;
     use ed25519_dalek::SigningKey;
+    use std::path::Path;
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -305,6 +413,18 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
+    }
+
+    /// What production gets from `open_or_create_approved`: read/write, created
+    /// if absent, never truncated.
+    fn open_part(path: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open part file")
     }
 
     fn pair() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
@@ -344,9 +464,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await?;
-            serve_attachment(&mut server_r, &mut server_w, &prefix, |id| {
-                (*id == xfer_id).then(|| (served_source.clone(), size, root, cap_sender))
-            })
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |id| (*id == xfer_id).then(|| (served_source.clone(), size, root, cap_sender)),
+                |_, _, _| {},
+                None,
+            )
             .await
         });
 
@@ -373,10 +498,11 @@ mod tests {
                 &cap_recv,
                 size,
                 &root,
-                part,
+                open_part(part),
                 |_, _| {},
             )
             .await
+            .map_err(anyhow::Error::from)
         };
 
         let _ = server.await;
@@ -434,10 +560,108 @@ mod tests {
             capability,
             size,
             root,
-            part,
+            open_part(part),
             |_, _| {},
         )
         .await
+        .map_err(anyhow::Error::from)
+    }
+
+    /// End to end over a real QUIC connection, authorized the way the accept
+    /// loop does it: the receiver dials with the sender's identity pinned, and
+    /// the sender reads the receiver's identity and key back off the certificate
+    /// the handshake proved, then derives the capability from that key.
+    #[tokio::test]
+    async fn a_file_crosses_a_real_quic_connection_to_the_pinned_friend() {
+        use super::super::crypto::node_id_from_public_key;
+        use super::super::quic::{
+            build_server_client_endpoint, connect_pinned, connection_ed25519_pubkey,
+            connection_node_id, generate_self_signed_cert,
+        };
+
+        let sender_sk = SigningKey::from_bytes(&[31u8; 32]);
+        let receiver_sk = SigningKey::from_bytes(&[32u8; 32]);
+        let sender_seed = sender_sk.to_bytes();
+        let receiver_seed = receiver_sk.to_bytes();
+        let sender_pub = sender_sk.verifying_key().to_bytes();
+        let sender_id = node_id_from_public_key(&sender_sk.verifying_key());
+        let receiver_id = node_id_from_public_key(&receiver_sk.verifying_key());
+
+        let (s_cert, s_key) = generate_self_signed_cert(&sender_seed).expect("sender cert");
+        let (r_cert, r_key) = generate_self_signed_cert(&receiver_seed).expect("receiver cert");
+        let (server, _) = build_server_client_endpoint(&s_cert, &s_key, 0, false)
+            .await
+            .expect("sender endpoint");
+        let (client, _) = build_server_client_endpoint(&r_cert, &r_key, 0, false)
+            .await
+            .expect("receiver endpoint");
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            server.local_addr().expect("addr").port(),
+        );
+
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 2 + 777).map(|i| (i % 241) as u8).collect();
+        let source = temp_path("quic-src");
+        std::fs::write(&source, &data).expect("write source");
+        let root = HashTree::from_data(&data).root_hash;
+        let size = data.len() as u64;
+        let xfer_id = [40u8; 16];
+
+        let served_source = source.clone();
+        let server_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let peer_id = connection_node_id(&conn).expect("peer id");
+            let peer_pub = connection_ed25519_pubkey(&conn).expect("peer key");
+            assert_eq!(peer_id, receiver_id, "the identity comes off the certificate");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("stream");
+            let mut prefix = [0u8; 7];
+            recv.read_exact(&mut prefix).await.expect("prefix");
+            let cap = derive_attach_capability(&sender_seed, &peer_pub, &xfer_id).expect("cap");
+            let sent = serve_attachment(
+                &mut recv,
+                &mut send,
+                &prefix,
+                |id| (*id == xfer_id).then(|| (served_source.clone(), size, root, cap)),
+                |_, _, _| {},
+                None,
+            )
+            .await
+            .expect("serve");
+            let _ = send.finish();
+            conn.closed().await;
+            sent
+        });
+
+        let conn = connect_pinned(&client, addr, "ember", Some((&r_cert, &r_key, sender_id)))
+            .await
+            .expect("pinned dial");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open stream");
+        let cap = derive_attach_capability(&receiver_seed, &sender_pub, &xfer_id).expect("cap");
+        let part = temp_path("quic-part");
+        let outcome = fetch_attachment(
+            &mut recv,
+            &mut send,
+            &xfer_id,
+            &cap,
+            size,
+            &root,
+            open_part(&part),
+            |_, _| {},
+        )
+        .await
+        .expect("fetch");
+        conn.close(0u32.into(), b"done");
+
+        assert!(outcome.complete);
+        assert_eq!(std::fs::read(&part).expect("part"), data);
+        assert_eq!(server_task.await.expect("server task"), size);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&part);
     }
 
     #[tokio::test]
@@ -500,7 +724,8 @@ mod tests {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await.expect("prefix");
             // No grant for anything.
-            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| None).await
+            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| None, |_, _, _| {}, None)
+                .await
         });
 
         let request = AttachRequest {
@@ -545,9 +770,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await.expect("prefix");
-            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| {
-                Some((served.clone(), 6, root, cap_sender))
-            })
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), 6, root, cap_sender)),
+                |_, _, _| {},
+                None,
+            )
             .await
         });
 
@@ -595,9 +825,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await.expect("prefix");
-            serve_attachment(&mut server_r, &mut server_w, &prefix, |_| {
-                Some((served.clone(), 18, offered_root, cap_sender))
-            })
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), 18, offered_root, cap_sender)),
+                |_, _, _| {},
+                None,
+            )
             .await
         });
 
@@ -609,7 +844,7 @@ mod tests {
             &cap_recv,
             18,
             &offered_root,
-            &part,
+            open_part(&part),
             |_, _| {},
         )
         .await

@@ -43,11 +43,7 @@ pub struct FriendChatRow {
 }
 
 /// One chat attachment, as either side of it needs to see it.
-///
-/// Read in full by the transcript once the UI lands; for now only the grant
-/// lookup and the tests consume it, hence the allow.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ChatAttachmentRow {
     /// Hex of the 16-byte transfer id.
     pub xfer_id: String,
@@ -56,15 +52,12 @@ pub struct ChatAttachmentRow {
     pub direction: String,
     pub file_name: String,
     pub file_size: u64,
-    /// Hex of the BLAKE3 root the chunk list is checked against.
-    pub root_hash: String,
     /// Where a completed inbound file was written. `None` until it finishes,
     /// and always `None` on the sending side — the sender's own path is
     /// deliberately not exposed to anything that renders.
     pub dest_path: Option<String>,
     pub status: String,
     pub transferred: u64,
-    pub chat_message_id: Option<i64>,
     pub created_at: i64,
 }
 
@@ -2433,7 +2426,6 @@ impl Database {
                     dest_path TEXT,
                     status TEXT NOT NULL,
                     transferred INTEGER NOT NULL DEFAULT 0,
-                    chat_message_id INTEGER,
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL
                 );
@@ -2498,10 +2490,6 @@ impl Database {
 
     /// Record one chat attachment, on either side of it.
     ///
-    /// Reached from the command layer once the friend-session signalling lands;
-    /// the grant reader below is already live from the QUIC accept loop.
-    #[allow(dead_code)]
-    ///
     /// `source_path` is set only by the sender and is what the grant lookup
     /// resolves to; the receiver passes `None` and fills `dest_path` when the
     /// file lands. Replaces any row with the same `xfer_id` so a re-offer of the
@@ -2517,7 +2505,6 @@ impl Database {
         root_hash: &str,
         source_path: Option<&str>,
         status: &str,
-        chat_message_id: Option<i64>,
         created_at: i64,
         expires_at: i64,
     ) -> anyhow::Result<()> {
@@ -2525,9 +2512,8 @@ impl Database {
         conn.execute(
             "INSERT INTO chat_attachments (
                 xfer_id, friend_hash, direction, file_name, file_size, root_hash,
-                source_path, dest_path, status, transferred, chat_message_id,
-                created_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 0, ?9, ?10, ?11)
+                source_path, dest_path, status, transferred, created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 0, ?9, ?10)
              ON CONFLICT(xfer_id) DO UPDATE SET
                 friend_hash = excluded.friend_hash,
                 direction = excluded.direction,
@@ -2536,7 +2522,6 @@ impl Database {
                 root_hash = excluded.root_hash,
                 source_path = excluded.source_path,
                 status = excluded.status,
-                chat_message_id = excluded.chat_message_id,
                 expires_at = excluded.expires_at",
             rusqlite::params![
                 xfer_id,
@@ -2547,7 +2532,6 @@ impl Database {
                 root_hash,
                 source_path,
                 status,
-                chat_message_id,
                 created_at,
                 expires_at,
             ],
@@ -2572,10 +2556,14 @@ impl Database {
     ) -> Option<(String, u64, String)> {
         let conn = self.conn.lock();
         conn.query_row(
+            // An allow-list, not a deny-list: a status added later is not a
+            // grant until someone decides it should be. `offered` has to be on
+            // it because the recipient dials straight after sending its accept,
+            // and the accept can still be in flight when the stream arrives.
             "SELECT source_path, file_size, root_hash FROM chat_attachments
              WHERE xfer_id = ?1 AND friend_hash = ?2 AND direction = 'sent'
                AND source_path IS NOT NULL AND expires_at > ?3
-               AND status NOT IN ('declined', 'cancelled', 'failed', 'expired')",
+               AND status IN ('offered', 'accepted', 'active', 'complete')",
             rusqlite::params![xfer_id, friend_hash, now],
             |row| {
                 let path: String = row.get(0)?;
@@ -2589,7 +2577,6 @@ impl Database {
 
     /// Move an attachment to a new status, optionally recording progress and
     /// where the finished file went.
-    #[allow(dead_code)]
     pub fn set_chat_attachment_status(
         &self,
         xfer_id: &str,
@@ -2609,8 +2596,34 @@ impl Database {
         Ok(())
     }
 
+    /// Move an attachment's expiry, which on the sending side is how long the
+    /// grant stays readable. Extended when the recipient accepts, because an
+    /// offer's short lifetime is for "nobody answered", not for the transfer.
+    pub fn set_chat_attachment_expiry(&self, xfer_id: &str, expires_at: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE chat_attachments SET expires_at = ?2 WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every received attachment that was waiting or moving when the process
+    /// last stopped. The offer an `awaiting` row needs lives only in memory and
+    /// a receive does not survive a restart, so both are stale on startup.
+    pub fn interrupted_inbound_chat_attachments(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT xfer_id, status FROM chat_attachments
+             WHERE direction = 'received' AND status IN ('awaiting', 'active')",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Every attachment for one friend, newest first, for drawing the transcript.
-    #[allow(dead_code)]
     pub fn chat_attachments_for_friend(
         &self,
         friend_hash: &str,
@@ -2618,55 +2631,46 @@ impl Database {
     ) -> anyhow::Result<Vec<ChatAttachmentRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT xfer_id, friend_hash, direction, file_name, file_size, root_hash,
-                    dest_path, status, transferred, chat_message_id, created_at
+            "SELECT xfer_id, friend_hash, direction, file_name, file_size,
+                    dest_path, status, transferred, created_at
              FROM chat_attachments WHERE friend_hash = ?1
              ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![friend_hash, limit.max(0)], |row| {
-                Ok(ChatAttachmentRow {
-                    xfer_id: row.get(0)?,
-                    friend_hash: row.get(1)?,
-                    direction: row.get(2)?,
-                    file_name: row.get(3)?,
-                    file_size: row.get::<_, i64>(4)?.max(0) as u64,
-                    root_hash: row.get(5)?,
-                    dest_path: row.get(6)?,
-                    status: row.get(7)?,
-                    transferred: row.get::<_, i64>(8)?.max(0) as u64,
-                    chat_message_id: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![friend_hash, limit.max(0)],
+                Self::chat_attachment_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
+    /// Column order shared by every attachment read: xfer_id, friend_hash,
+    /// direction, file_name, file_size, dest_path, status, transferred,
+    /// created_at.
+    fn chat_attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatAttachmentRow> {
+        Ok(ChatAttachmentRow {
+            xfer_id: row.get(0)?,
+            friend_hash: row.get(1)?,
+            direction: row.get(2)?,
+            file_name: row.get(3)?,
+            file_size: row.get::<_, i64>(4)?.max(0) as u64,
+            dest_path: row.get(5)?,
+            status: row.get(6)?,
+            transferred: row.get::<_, i64>(7)?.max(0) as u64,
+            created_at: row.get(8)?,
+        })
+    }
+
     /// One attachment by id, whichever side of it this node is on.
-    #[allow(dead_code)]
     pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT xfer_id, friend_hash, direction, file_name, file_size, root_hash,
-                    dest_path, status, transferred, chat_message_id, created_at
+            "SELECT xfer_id, friend_hash, direction, file_name, file_size,
+                    dest_path, status, transferred, created_at
              FROM chat_attachments WHERE xfer_id = ?1",
             rusqlite::params![xfer_id],
-            |row| {
-                Ok(ChatAttachmentRow {
-                    xfer_id: row.get(0)?,
-                    friend_hash: row.get(1)?,
-                    direction: row.get(2)?,
-                    file_name: row.get(3)?,
-                    file_size: row.get::<_, i64>(4)?.max(0) as u64,
-                    root_hash: row.get(5)?,
-                    dest_path: row.get(6)?,
-                    status: row.get(7)?,
-                    transferred: row.get::<_, i64>(8)?.max(0) as u64,
-                    chat_message_id: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            },
+            Self::chat_attachment_from_row,
         )
         .ok()
     }
@@ -2677,7 +2681,6 @@ impl Database {
     /// deleted so the transcript can still say what happened to them; the grant
     /// stops resolving either way, because `chat_attachment_grant` refuses an
     /// expired row and refuses this status.
-    #[allow(dead_code)]
     pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let moved = conn.execute(
@@ -9882,7 +9885,6 @@ mod tests {
             &"11".repeat(32),
             Some("C:\\private\\holiday.zip"),
             "offered",
-            None,
             now,
             now + 600,
         )
@@ -9901,8 +9903,18 @@ mod tests {
         // Past its expiry it is not a grant, without anything having to sweep.
         assert!(db.chat_attachment_grant(&xfer, &friend, now + 601).is_none());
 
-        // And a transfer that was refused or abandoned stops resolving.
-        for status in ["declined", "cancelled", "failed", "expired"] {
+        // And a transfer that was refused or abandoned stops resolving —
+        // including the refusals no deny-list ever named, because the query is
+        // an allow-list.
+        for status in [
+            "declined",
+            "too_large",
+            "busy",
+            "not_allowed",
+            "cancelled",
+            "failed",
+            "expired",
+        ] {
             db.set_chat_attachment_status(&xfer, status, None, None)
                 .expect("set status");
             assert!(
@@ -9941,7 +9953,6 @@ mod tests {
             &"22".repeat(32),
             None,
             "awaiting",
-            None,
             now,
             now + 600,
         )
@@ -9992,7 +10003,6 @@ mod tests {
                 &"33".repeat(32),
                 Some("C:\\private\\f.bin"),
                 status,
-                None,
                 now,
                 now + 60,
             )

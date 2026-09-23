@@ -1931,6 +1931,9 @@ where
 pub struct AttachServeContext {
     pub db: std::sync::Arc<crate::storage::database::Database>,
     pub our_ed25519_seed: [u8; 32],
+    /// For the sender's own progress bar: the friend reading the file is the
+    /// only one who knows how far it has got, and this is where it is read.
+    pub app_handle: tauri::AppHandle,
 }
 
 /// Run the QUIC accept loop. Handles four kinds of inbound QUIC connections:
@@ -2174,6 +2177,9 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
                 let peer_hex = hex::encode(peer_id);
+                let mut progress = crate::network::chat_attach::ServeProgress::default();
+                let progress_db = ctx.db.clone();
+                let progress_app = ctx.app_handle.clone();
                 let served = super::attach_stream::serve_attachment(
                     &mut init_recv,
                     &mut init_send,
@@ -2192,6 +2198,10 @@ pub async fn run_quic_accept_loop(
                         )?;
                         Some((std::path::PathBuf::from(path), size, root, capability))
                     },
+                    |xfer_id, position, size| {
+                        progress.note(&progress_db, &progress_app, xfer_id, position, size);
+                    },
+                    Some(limiter.as_ref()),
                 )
                 .await;
                 match served {

@@ -5257,6 +5257,41 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::SendChatAttachment {
+            ember_hash: friend_eh,
+            xfer_id,
+            path,
+            name,
+            size,
+            root,
+            tx,
+        } => {
+            if !friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err(coded("peers_not_friend", "Can only send files to friends")));
+                return;
+            }
+            let result = super::chat_attach::send_offer(
+                state, db, app_handle, settings, friend_eh, xfer_id, path, name, size, root,
+            )
+            .await;
+            let _ = tx.send(result);
+        }
+
+        NetworkCommand::RespondChatAttachment {
+            xfer_id,
+            accept,
+            tx,
+        } => {
+            let result =
+                super::chat_attach::respond(state, db, app_handle, settings, xfer_id, accept).await;
+            let _ = tx.send(result);
+        }
+
+        NetworkCommand::CancelChatAttachment { xfer_id, tx } => {
+            let result = super::chat_attach::cancel(state, db, app_handle, settings, xfer_id).await;
+            let _ = tx.send(result);
+        }
+
         NetworkCommand::SetFilesFriendsOnly { updates, tx } => {
             let mut parsed = Vec::with_capacity(updates.len());
             let mut error = None;

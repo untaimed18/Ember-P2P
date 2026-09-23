@@ -1,4 +1,5 @@
 mod browse;
+pub(crate) mod chat_attach;
 mod command;
 pub mod ed2k;
 pub mod ember;
@@ -12888,6 +12889,29 @@ pub enum NetworkCommand {
         file_hash: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Offer a friend a file in chat. The caller has already picked, checked and
+    /// hashed it off the network task, so this only records the grant and sends
+    /// the offer.
+    SendChatAttachment {
+        ember_hash: [u8; 16],
+        xfer_id: [u8; 16],
+        path: PathBuf,
+        name: String,
+        size: u64,
+        root: [u8; 32],
+        tx: oneshot::Sender<Result<chat_attach::ChatAttachmentInfo, String>>,
+    },
+    /// Accept or decline an attachment a friend offered us.
+    RespondChatAttachment {
+        xfer_id: [u8; 16],
+        accept: bool,
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Stop an attachment in either direction, and tell the friend.
+    CancelChatAttachment {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     GetFileComments {
         file_hash: String,
         tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,
@@ -15385,6 +15409,16 @@ struct NetworkState {
     xfer_offer_policy: String,
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     xfer_friend_hashes: crate::app_state::SharedFriendHashes,
+    /// Chat attachments a friend has offered us that nobody has answered yet,
+    /// with what accepting one needs. In memory only: see
+    /// [`chat_attach::sweep_interrupted`] for what a restart does to them.
+    attach_inbound: HashMap<[u8; 16], chat_attach::InboundAttach>,
+    /// Receives in flight, so a cancel from either side can stop one.
+    attach_fetches: HashMap<[u8; 16], tokio::task::JoinHandle<()>>,
+    /// Recent auto-accepts per friend, as `(when, bytes)`, for the budget that
+    /// stops a friend filling the disk one small file at a time. See
+    /// [`chat_attach::auto_accept_allowed`].
+    attach_auto_log: HashMap<[u8; 16], VecDeque<(i64, u64)>>,
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
@@ -28050,6 +28084,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_upload_credit: 0,
         xfer_offer_policy: settings.channel_file_offers.clone(),
         xfer_friend_hashes: friend_hashes.clone(),
+        attach_inbound: HashMap::new(),
+        attach_fetches: HashMap::new(),
+        attach_auto_log: HashMap::new(),
         ember_channel_epoch_searches: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
@@ -28058,6 +28095,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     };
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
+
+    // Chat attachments a restart stranded: offers whose details lived only in
+    // memory and receives cut off mid-file. Settled before anything can emit,
+    // so the transcript never shows a transfer that will not move again.
+    {
+        let db = db.clone();
+        let folder = settings.download_folder.clone();
+        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folder)).await;
+    }
 
     // Seed the Ember DHT routing table from the last session's persisted
     // contacts (slice 7). This is the native equivalent of KAD's
@@ -32575,6 +32621,48 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
+                // Chat attachments. The readers only surface these from a
+                // session that already holds friend privileges; the friend set
+                // is checked again here because it is the one this loop acts on.
+                if let UploadEventKind::EmberAttachOffer { ember_hash: attach_eh, ref offer, peer_addr } = event.kind {
+                    if friend_hashes.read().await.contains(&attach_eh) {
+                        chat_attach::on_offer(
+                            &mut state,
+                            &db,
+                            &app_handle,
+                            &settings,
+                            attach_eh,
+                            offer.clone(),
+                            peer_addr,
+                        )
+                        .await;
+                    }
+                }
+                if let UploadEventKind::EmberAttachReply { ember_hash: attach_eh, xfer_id, reply, quic_port, peer_addr } = event.kind {
+                    chat_attach::on_reply(
+                        &mut state,
+                        &db,
+                        &app_handle,
+                        attach_eh,
+                        xfer_id,
+                        reply,
+                        quic_port,
+                        peer_addr,
+                    )
+                    .await;
+                }
+                if let UploadEventKind::EmberAttachCancel { ember_hash: attach_eh, xfer_id, reason } = event.kind {
+                    chat_attach::on_cancel(
+                        &mut state,
+                        &db,
+                        &app_handle,
+                        &settings,
+                        attach_eh,
+                        xfer_id,
+                        reason,
+                    );
+                }
+
                 if let UploadEventKind::EmberFileOfferAck { ember_hash: ack_eh, status, file_hash } = event.kind {
                     let _ = app_handle.emit(
                         "ember:file-offer-ack",
@@ -36781,6 +36869,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             Some(ember::relay::AttachServeContext {
                                                 db: db.clone(),
                                                 our_ed25519_seed: ed25519_secret_key,
+                                                app_handle: app_handle.clone(),
                                             }),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
@@ -59518,6 +59607,9 @@ async fn handle_upload_event(
         | UploadEventKind::EmberTransferRequest { .. }
         | UploadEventKind::EmberTransferAck { .. }
         | UploadEventKind::EmberFileOffer { .. }
+        | UploadEventKind::EmberAttachOffer { .. }
+        | UploadEventKind::EmberAttachReply { .. }
+        | UploadEventKind::EmberAttachCancel { .. }
         | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberDhtContactRequest { .. }
         | UploadEventKind::EmberDhtContacts { .. }

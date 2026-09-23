@@ -34,6 +34,7 @@ mod tests {
 
 pub mod backup;
 pub mod channels;
+pub mod chat_attachments;
 pub mod collections;
 pub mod comments;
 pub mod deeplink;

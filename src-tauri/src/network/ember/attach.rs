@@ -44,15 +44,6 @@
 //!    A `xfer_id` is 16 random bytes, so this is not what stops guessing — it
 //!    stops a *friend* from probing for transfers meant for someone else.
 
-// The data half of this module is live — `attach_stream::serve_attachment` runs
-// from the QUIC accept loop. The signalling half (offer, reply, cancel, and the
-// receiving side's fetch) is written and tested but not yet called from the
-// friend session, so its items have no production caller. This attribute is that
-// gap and nothing more: it comes off in the commit that wires the friend-session
-// sub-types, and until then it exists so a genuinely dead item elsewhere is not
-// lost in the noise.
-#![allow(dead_code)]
-
 use super::crypto;
 use super::transfer::{root_from_chunk_hashes, CHUNK_SIZE};
 
@@ -488,21 +479,49 @@ pub fn decode_attach_offer(bytes: &[u8]) -> Option<AttachOffer> {
     })
 }
 
-pub fn encode_attach_reply(xfer_id: &[u8; 16], reply: AttachReply) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 16 + 1);
+/// Encode an answer to an offer.
+///
+/// An accept carries the recipient's own public QUIC port, and nothing else
+/// does. The recipient is the one that dials, but a sender behind a
+/// port-restricted NAT drops that dial unless its NAT has already seen traffic
+/// go out to the recipient. With the port, the sender can fire a short-lived
+/// dial of its own at the same moment — simultaneous open — which is what opens
+/// the mapping the recipient's dial then lands in. A refusal needs no port,
+/// because nothing is coming.
+pub fn encode_attach_reply(
+    xfer_id: &[u8; 16],
+    reply: AttachReply,
+    quic_port: Option<u16>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 1 + 2);
     out.push(ATTACH_VERSION);
     out.extend_from_slice(xfer_id);
     out.push(reply.to_byte());
+    if let (true, Some(port)) = (reply.is_accept(), quic_port.filter(|p| *p != 0)) {
+        out.extend_from_slice(&port.to_le_bytes());
+    }
     out
 }
 
-pub fn decode_attach_reply(bytes: &[u8]) -> Option<([u8; 16], AttachReply)> {
-    if bytes.len() != 1 + 16 + 1 || bytes[0] != ATTACH_VERSION {
+/// Decode an answer; the port is present only on an accept that sent one.
+pub fn decode_attach_reply(bytes: &[u8]) -> Option<([u8; 16], AttachReply, Option<u16>)> {
+    if !(bytes.len() == 1 + 16 + 1 || bytes.len() == 1 + 16 + 1 + 2) || bytes[0] != ATTACH_VERSION
+    {
         return None;
     }
     let mut xfer_id = [0u8; 16];
     xfer_id.copy_from_slice(&bytes[1..17]);
-    Some((xfer_id, AttachReply::from_byte(bytes[17])?))
+    let reply = AttachReply::from_byte(bytes[17])?;
+    let port = if bytes.len() == 20 {
+        // A port on a refusal is a malformed answer, not a hint to act on.
+        if !reply.is_accept() {
+            return None;
+        }
+        Some(u16::from_le_bytes([bytes[18], bytes[19]])).filter(|p| *p != 0)
+    } else {
+        None
+    };
+    Some((xfer_id, reply, port))
 }
 
 pub fn encode_attach_cancel(xfer_id: &[u8; 16], reason: AttachCancel) -> Vec<u8> {
@@ -603,9 +622,21 @@ mod tests {
             AttachReply::Busy,
             AttachReply::NotAllowed,
         ] {
-            let bytes = encode_attach_reply(&id, reply);
-            assert_eq!(decode_attach_reply(&bytes), Some((id, reply)));
+            let bytes = encode_attach_reply(&id, reply, None);
+            assert_eq!(decode_attach_reply(&bytes), Some((id, reply, None)));
         }
+        // Only an accept carries the recipient's port, and a refusal that
+        // claims one is malformed rather than a hint to dial somewhere.
+        let accept = encode_attach_reply(&id, AttachReply::Accept, Some(41330));
+        assert_eq!(
+            decode_attach_reply(&accept),
+            Some((id, AttachReply::Accept, Some(41330)))
+        );
+        let decline = encode_attach_reply(&id, AttachReply::Decline, Some(41330));
+        assert_eq!(decline.len(), 18, "a refusal never carries a port");
+        let mut forged = encode_attach_reply(&id, AttachReply::Decline, None);
+        forged.extend_from_slice(&41330u16.to_le_bytes());
+        assert!(decode_attach_reply(&forged).is_none());
         for reason in [
             AttachCancel::User,
             AttachCancel::SourceGone,

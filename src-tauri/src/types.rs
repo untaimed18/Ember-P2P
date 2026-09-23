@@ -1572,6 +1572,16 @@ pub struct AppSettings {
     /// against the friends list by its derived Ember hash.
     #[serde(default = "default_channel_file_offers")]
     pub channel_file_offers: String,
+    /// Files a friend sends in chat at or under this many megabytes are
+    /// fetched without asking; larger ones wait for an explicit accept. Zero
+    /// asks every time.
+    ///
+    /// What messaging apps do, and it is a threshold rather than on/off because
+    /// "small" is a judgement about someone's disk and connection. Only friends
+    /// can send attachments at all, and `friend_chat_disabled` refuses them
+    /// outright, so this never makes a stranger's file land on disk.
+    #[serde(default = "default_chat_attachment_auto_accept_mb")]
+    pub chat_attachment_auto_accept_mb: u64,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -2071,6 +2081,15 @@ fn default_channel_file_offers() -> String {
     CHANNEL_FILE_OFFERS_EVERYONE.to_string()
 }
 
+fn default_chat_attachment_auto_accept_mb() -> u64 {
+    crate::network::ember::attach::ATTACH_AUTO_ACCEPT_DEFAULT_MB
+}
+
+/// Highest auto-accept ceiling the settings page may store, in megabytes.
+/// Matches the attachment size cap, past which the value means nothing.
+pub const CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB: u64 =
+    crate::network::ember::attach::ATTACH_MAX_BYTES / (1024 * 1024);
+
 /// Default rendezvous server URL.
 ///
 /// L13: trust model for the V1 default rendezvous host.
@@ -2269,6 +2288,7 @@ impl Default for AppSettings {
             friend_browse_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
+            chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,
