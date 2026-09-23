@@ -1751,9 +1751,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // best-effort. A coordinated transfer punch cannot tolerate that at all.
     let mut punch_poll_timer = tokio::time::interval(std::time::Duration::from_secs(3));
     punch_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Idle cadence for the same poll, preserving the old behaviour when no
-    // transfer punch is pending so an idle client does not poll every 3 s.
-    const PUNCH_POLL_IDLE_SECS: u64 = 60;
     let mut last_punch_poll: Option<tokio::time::Instant> = None;
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
@@ -1805,11 +1802,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // matching the eMule UX the user pointed out.
     let mut udp_source_timer = tokio::time::interval(std::time::Duration::from_millis(200));
     udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Max UDP source-query packets to dispatch per `udp_source_timer`
-    // tick. Combined with the 200ms tick above this yields a peak rate
-    // of 15 packets/sec during bursts (e.g. just after a download is
-    // added) while remaining idle when the queue is empty.
-    const UDP_SOURCE_BURST_PER_TICK: usize = 3;
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // `None` so the first cleanup tick sweeps, clearing anything left queued by
@@ -7146,144 +7138,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic publishing
             _ = publish_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Ember DHT source publishing (slice 9) runs independently of
-                // KAD connectivity, so it must come before the KAD-status gate
-                // and the KAD-routing-table check below: it works on a
-                // KAD-less network as long as the Ember routing table is warm.
-                maybe_publish_ember_sources(
+                let __panic_result = std::panic::AssertUnwindSafe(on_publish_tick(
                     &udp_socket,
                     &mut state,
-                    &settings,
                     &local_index,
-                    &known_files,
-                )
-                .await;
-
-                // Ember DHT keyword publishing (slice 8), same independence
-                // from KAD connectivity as source publishing above.
-                maybe_publish_ember_keywords(
-                    &udp_socket,
-                    &mut state,
                     &settings,
-                    &local_index,
                     &mut known_files,
-                )
+                ))
+                .catch_unwind()
                 .await;
-
-                // Ember's own publish heartbeat. Every other publish line in
-                // the log comes from KAD, so without this there was no way to
-                // tell a tick that delivered its records from one that dropped
-                // them — which for a long time was most of them.
-                if settings.ember_native_enabled {
-                    let (contacts, verified) = ember_dht_ui_contact_counts(&state);
-                    let queued = state.ember_batch_publish.queued_count;
-                    let in_flight = state.ember_batch_publish.in_flight.len();
-                    let unplaced = state.ember_publish_unplaced.len();
-                    let pass = state.ember_publish_pass;
-                    let acked_at_last_beat = state.ember_publish_beat_acked;
-                    let failed_at_last_beat = state.ember_publish_beat_failed;
-                    state.ember_publish_beat_acked =
-                        state.ember_diagnostics.ember_dht_stores_acked;
-                    state.ember_publish_beat_failed =
-                        state.ember_diagnostics.ember_dht_stores_failed;
-                    // An empty overlay short-circuits both publishers before
-                    // they count what is due, so the usual stats would print
-                    // a row of zeros that reads as "nothing to publish" when
-                    // the truth is "nowhere to publish it". Name that instead,
-                    // and never fall silent: a tick that does nothing is the
-                    // one worth reading. Session peers the public table
-                    // refused count here the same way the publishers do.
-                    //
-                    // Unverified leads count as overlay contacts (bootstrap
-                    // still needs them) but not as STORE targets. Flooding
-                    // them used to log selected=82 / failed=102 against a
-                    // single seed that never completed a Noise handshake.
-                    let publishable = ember_publishable_peer_count(&state);
-                    if contacts == 0 {
-                        info!(
-                            "Ember publish cycle: idle, Ember overlay is empty so there is \
-                             nobody to publish to — queued={queued}, in-flight={in_flight}, \
-                             awaiting placement={unplaced}"
-                        );
-                    } else if publishable == 0 {
-                        info!(
-                            "Ember publish cycle: idle, holding STOREs until a verified peer \
-                             answers — contacts={contacts} ({verified} verified), \
-                             queued={queued}, in-flight={in_flight}, \
-                             awaiting placement={unplaced}"
-                        );
-                    } else {
-                        info!(
-                            "Ember publish cycle: contacts={contacts} ({verified} verified), \
-                             due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \
-                             in-flight={in_flight}, sent={} in {} frame(s), behind handshake={} \
-                             in {} frame(s), held over={}, dropped={}, re-armed={}, \
-                             acked={} of {} total, failed={} of {} total",
-                            pass.due,
-                            pass.selected,
-                            pass.flush.records_sent,
-                            pass.flush.frames_sent,
-                            pass.flush.records_behind_handshake,
-                            pass.flush.frames_behind_handshake,
-                            pass.flush.records_carried,
-                            pass.flush.records_dropped,
-                            pass.flush.records_rearmed,
-                            // Every other field on this line is per-cycle
-                            // (`ember_publish_pass` is reset just below), but
-                            // these two counters are session totals, so a cycle
-                            // that acked nothing read as though it had acked
-                            // thousands. Report the delta and keep the total.
-                            state
-                                .ember_diagnostics
-                                .ember_dht_stores_acked
-                                .saturating_sub(acked_at_last_beat),
-                            state.ember_diagnostics.ember_dht_stores_acked,
-                            state
-                                .ember_diagnostics
-                                .ember_dht_stores_failed
-                                .saturating_sub(failed_at_last_beat),
-                            state.ember_diagnostics.ember_dht_stores_failed,
-                        );
-                    }
-                    state.ember_publish_pass = EmberPublishPassStats::default();
-                }
-
-                // KAD publish diagnostics only. Presence heartbeat lives on
-                // `bootstrap_timer` so an eD2K-only session (status stays
-                // `Disconnected`) still refreshes rendezvous.
-                if state.stats.status == NetworkStatus::Disconnected
-                    || state.routing_table.is_empty()
-                {
-                    debug!("Skipping publish cycle: KAD is not connected or its routing table is empty");
-                } else {
-                let total_files = state.publish_manager.file_count();
-                let needing_source = state.publish_manager.files_needing_source_publish().len();
-                let needing_keyword = state.publish_manager.keywords_needing_publish_count();
-                info!(
-                    "Publish cycle: {total_files} files registered, {needing_source} need source publish, \
-                     {needing_keyword} keyword targets need publish, {} confirmed, {} outstanding pending ack, \
-                     PublishRes plain_seen={} obf_decoded={}/{} wire={} received={} unmatched={}, \
-                     firewalled={}, routing_table={}",
-                    state.publish_confirmed,
-                    state.publish_pending.len(),
-                    state.publish_res_plain_seen,
-                    state.publish_res_obf_decoded,
-                    state.obf_decoded_total,
-                    state.publish_res_wire,
-                    state.publish_res_received,
-                    state.publish_res_unmatched,
-                    state.publish_manager.firewalled,
-                    state.routing_table.len(),
-                );
-                } // end routing-table guard: publish diagnostics only
-
-                // Rendezvous presence heartbeat lives on `bootstrap_timer`
-                // (10s) so it actually honours `PRESENCE_HEARTBEAT_SECS`.
-                // Punch polling was split onto `punch_poll_timer` for the
-                // same reason: this 60s arm quantized both past their TTLs.
-
-                }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'publish_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -7293,277 +7156,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // run on a cadence shorter than the rendezvous server's 30 s punch
             // TTL, and so it no longer depends on the KAD routing table.
             _ = punch_poll_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Adaptive gate: poll every tick while a transfer punch is in
-                // flight in either direction, otherwise fall back to the
-                // historical idle cadence.
-                //
-                // Both roles need the fast cadence. The uploader polls to learn
-                // where to dial; the downloader polls to find the uploader's
-                // reciprocal registration and dial *out* itself, which is what
-                // opens its own NAT mapping toward the uploader — without that
-                // outbound packet the uploader's stream would be dropped by the
-                // downloader's NAT.
-                let now = tokio::time::Instant::now();
-                let owe_serve_punch = !state.friend_xfer_punch_serve.is_empty();
-                let awaiting_punch = state.friend_xfer_attempts.values().any(|attempt| {
-                    matches!(attempt.transport, FriendXferTransport::Punch { .. })
-                        && now
-                            .duration_since(tokio::time::Instant::from_std(attempt.sent_at))
-                            .as_secs()
-                            < FRIEND_XFER_ATTEMPT_TIMEOUT_SECS
-                });
-                let idle_due = last_punch_poll.is_none_or(|last| {
-                    now.duration_since(last) >= std::time::Duration::from_secs(PUNCH_POLL_IDLE_SECS)
-                });
-                if !owe_serve_punch && !awaiting_punch && !idle_due {
-                    return;
-                }
-                last_punch_poll = Some(now);
-
-                // Poll signed v2 punch requests addressed to our registered
-                // Ember identity. Only known friends are accepted; anonymous
-                // LowID sources bypass punch and use relay.
-                if state.rendezvous_registered {
-                    if let (Some(_ext_ip), Some(broker)) =
-                        (state.external_ip, state.connection_broker.as_ref())
-                    {
-                        if let Some(endpoint) = broker.quic_endpoint().cloned() {
-                            // Friends we owe an uploader-role punch, keyed by the
-                            // same hashed rendezvous id the mailbox reports, so
-                            // the task can match without re-deriving.
-                            let punch_serve_friends: HashMap<String, [u8; 16]> = state
-                                .friend_xfer_punch_serve
-                                .keys()
-                                .map(|hash| (rendezvous::hashed_id(hash), *hash))
-                                .collect();
-                            let known_punch_friends: HashMap<String, [u8; 16]> = friend_hashes
-                                .read()
-                                .await
-                                .iter()
-                                .map(|hash| (rendezvous::hashed_id(hash), *hash))
-                                .collect();
-                            let our_punch_hash = ember_hash;
-                            let punch_secret = ed25519_secret_key;
-                            // The port we ask the initiator to dial back on IS
-                            // the QUIC port (opposite of the id above): this is
-                            // the payload value carried in the signed v2 punch record,
-                            // not the lookup key, and the initiator's
-                            // `punch_quic` call connects over QUIC — so it must
-                            // land on our actual QUIC socket, not the
-                            // NAT-probed KAD UDP port `nat_info.external_addr`
-                            // reflects. Behind a re-mapping NAT the bound port
-                            // isn't reachable either, hence the public one.
-                            let advertised_quic_port =
-                                advertised_quic_port(&state).unwrap_or(state.tcp_port);
-                            let rv_url = settings.rendezvous_url.clone();
-                            let our_nat_type = state.nat_info.nat_type;
-                            let our_ext_addr = state.nat_info.external_addr;
-                            let punch_cb_tx = inbound_stream_tx.clone();
-                            tokio::spawn(async move {
-                                let info = match ember::relay::poll_punch(
-                                    &rv_url,
-                                    &our_punch_hash,
-                                    &punch_secret,
-                                ).await {
-                                    Ok(Some(info)) => info,
-                                    Ok(None) => return,
-                                    Err(e) => {
-                                        tracing::trace!("Punch responder poll: {e}");
-                                        return;
-                                    }
-                                };
-                                let Some(friend_hash) = known_punch_friends.get(&info.from_id).copied() else {
-                                    let _ = ember::relay::ack_punch(
-                                        &rv_url,
-                                        &our_punch_hash,
-                                        &info.punch_id,
-                                        &info.capability,
-                                        info.epoch,
-                                        &punch_secret,
-                                    ).await;
-                                    return;
-                                };
-                                let expected_capability =
-                                    match rendezvous::fetch_identity_pubkey_authenticated(
-                                        &rv_url,
-                                        &friend_hash,
-                                        &our_punch_hash,
-                                        &ed25519_dalek::SigningKey::from_bytes(&punch_secret)
-                                            .verifying_key()
-                                            .to_bytes(),
-                                        &punch_secret,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(pubkey)) => {
-                                            let owner_pubkey =
-                                                ed25519_dalek::SigningKey::from_bytes(
-                                                    &punch_secret,
-                                                )
-                                                .verifying_key()
-                                                .to_bytes();
-                                            ember::crypto::derive_pairwise_presence_capability(
-                                                &punch_secret,
-                                                &pubkey,
-                                                &owner_pubkey,
-                                                info.epoch,
-                                            )
-                                        }
-                                        _ => None,
-                                    };
-                                if expected_capability != Some(info.capability) {
-                                    let _ = ember::relay::ack_punch(
-                                        &rv_url,
-                                        &our_punch_hash,
-                                        &info.punch_id,
-                                        &info.capability,
-                                        info.epoch,
-                                        &punch_secret,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
-                                    let _ = ember::relay::ack_punch(
-                                        &rv_url,
-                                        &our_punch_hash,
-                                        &info.punch_id,
-                                        &info.capability,
-                                        info.epoch,
-                                        &punch_secret,
-                                    )
-                                    .await;
-                                    return;
-                                };
-                                let routable = match ip {
-                                    std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
-                                    std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
-                                };
-                                if !routable || info.port == 0 {
-                                    tracing::debug!(
-                                        "Punch responder: ignoring non-routable initiator {ip}:{}",
-                                        info.port
-                                    );
-                                    let _ = ember::relay::ack_punch(
-                                        &rv_url,
-                                        &our_punch_hash,
-                                        &info.punch_id,
-                                        &info.capability,
-                                        info.epoch,
-                                        &punch_secret,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                let initiator_addr = SocketAddr::new(ip, info.port);
-                                tracing::info!(
-                                    "Punch responder: reciprocating for initiator {} at {initiator_addr}",
-                                    &info.from_id[..8.min(info.from_id.len())]
-                                );
-
-                                // Reciprocate so the initiator's own `poll_punch`
-                                // (keyed on its own id) finds us and learns our
-                                // real external address to dial. The registered
-                                // port is our QUIC port, not `our_addr.port()`
-                                // (the KAD UDP NAT mapping) — the initiator
-                                // dials this port over QUIC, not UDP/KAD.
-                                if let Some(ext_addr) = our_ext_addr {
-                                    if let Err(e) = ember::relay::register_punch_with_ip(
-                                        &rv_url,
-                                        &our_punch_hash,
-                                        &friend_hash,
-                                        advertised_quic_port,
-                                        our_nat_type.as_u8(),
-                                        ext_addr.ip(),
-                                        &punch_secret,
-                                        &our_punch_hash,
-                                    ).await {
-                                        tracing::debug!("Punch responder: reciprocal register failed: {e}");
-                                    }
-                                } else {
-                                    tracing::debug!("Punch responder: no external address known yet, skipping reciprocal register");
-                                }
-
-                                // Also dial out ourselves. If this succeeds, treat
-                                // it as a normal inbound connection — we remain the
-                                // upload/server role at the eD2K protocol level
-                                // (the initiator sends OP_HELLO first regardless
-                                // of which side's transport-level `connect()` won
-                                // the race), so hand the punched stream to the
-                                // upload listener's inbound-stream path rather
-                                // than the download-adoption `kad_callback_tx`
-                                // (which has no consumer for a connection with no
-                                // matching active download / zero file hash). If
-                                // it fails, that's fine: the initiator's own
-                                // connect attempt may still land in our
-                                // already-running QUIC accept loop.
-                                //
-                                // The one exception is a punch we ourselves
-                                // agreed to as the *uploader* of a friend
-                                // transfer: there the friend is the downloader
-                                // and is waiting for OUR Hello, so this stream
-                                // must take the serve role instead. Without
-                                // this both sides would wait on each other.
-                                // There is a single punch mailbox per identity
-                                // with 5 s leases, so this decision has to be
-                                // made here rather than by a second poller
-                                // competing for the same entries.
-                                let serve_friend = punch_serve_friends
-                                    .get(&info.from_id)
-                                    .copied();
-                                // Pin to the initiator's node id: `friend_hash`
-                                // came from `known_punch_friends` keyed on
-                                // `info.from_id`, and the pairwise presence
-                                // capability was verified above, so the peer's
-                                // identity is established from a signed source
-                                // before we dial back.
-                                match ember::broker::punch_quic_pinned(
-                                    &endpoint,
-                                    initiator_addr,
-                                    &punch_secret,
-                                    friend_hash,
-                                )
-                                .await
-                                {
-                                    Ok((send, recv)) => {
-                                        if serve_friend.is_some() {
-                                            tracing::info!(
-                                                "Punch responder: taking the serve role for friend transfer with {}",
-                                                &info.from_id[..8.min(info.from_id.len())]
-                                            );
-                                        }
-                                        let req = crate::network::ed2k::upload::InboundStreamRequest {
-                                            peer_addr: initiator_addr,
-                                            reader: Box::new(recv),
-                                            writer: Box::new(send),
-                                            serve_friend_ember_hash: serve_friend,
-                                            relayed: false,
-                                        };
-                                        if let Err(e) = punch_cb_tx.try_send(req) {
-                                            tracing::debug!("Punch responder: dropping punched stream: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            "Punch responder: outbound punch to {initiator_addr} failed (initiator's own connect may still land): {e}"
-                                        );
-                                    }
-                                }
-                                let _ = ember::relay::ack_punch(
-                                    &rv_url,
-                                    &our_punch_hash,
-                                    &info.punch_id,
-                                    &info.capability,
-                                    info.epoch,
-                                    &punch_secret,
-                                ).await;
-                            });
-                        }
-                    }
-                }
-
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_punch_poll_tick(
+                    &state,
+                    &settings,
+                    &friend_hashes,
+                    ember_hash,
+                    ed25519_secret_key,
+                    &inbound_stream_tx,
+                    &mut last_punch_poll,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'punch_poll_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -7575,252 +7178,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // most one source, one keyword, and one note store per tick while
             // respecting the local eMule per-type active-search caps.
             _ = kad_publish_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                const KADEMLIA_TOTAL_STORE_SRC: usize = 4;
-                const KADEMLIA_TOTAL_STORE_KEY: usize = 3;
-                const KADEMLIA_TOTAL_STORE_NOTES: usize = 1;
-                const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
-
-                if state.stats.status == NetworkStatus::Disconnected || state.routing_table.is_empty() {
-                    return;
-                }
-
-                // eMule `CSharedFileList::Publish()` examines exactly one
-                // round-robin candidate per type per tick — a blind index
-                // walk (`m_currFileSrc`/`GetNextKeyword()`/`m_currFileNotes`)
-                // that only sometimes lands on something actually due —
-                // rather than scanning the whole set for the next due item.
-                // With the concurrency caps below now an effective throttle
-                // (searches occupy their slot for close to the full eMule
-                // lifetime, see `check_phase_transition`), matching this
-                // walk too avoids Ember reacting to "just became due" faster
-                // than eMule ever would.
-                let active_store_src = state.store_source_searches.len();
-                if active_store_src < KADEMLIA_TOTAL_STORE_SRC {
-                    let in_flight_sources: HashSet<KadId> = state
-                        .store_source_searches
-                        .values()
-                        .map(|(hash, _)| *hash)
-                        .collect();
-                    if let Some(file) = state.publish_manager.next_source_candidate().cloned() {
-                        if in_flight_sources.contains(&file.file_hash) {
-                            // Already being published this cycle — eMule's
-                            // PrepareLookup would likewise no-op on a
-                            // duplicate target. The cursor already moved on.
-                        } else if let Some(msg) = state.publish_manager.build_source_publish(&file) {
-                            let closest = state
-                                .routing_table
-                                .find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
-                            if !closest.is_empty() {
-                                let sid = start_kad_search(
-                                    &mut state,
-                                    &app_handle,
-                                    file.file_hash,
-                                    SearchType::StoreFile,
-                                    closest,
-                                );
-                                if sid != SearchId(0) {
-                                    name_kad_search(&mut state, sid, &file.file_name);
-                                    // Fresh publish cycle: reset before lookup-time
-                                    // publishes can receive acks.
-                                    state.source_publish_acks.insert(file.file_hash, 0);
-                                    state.store_source_searches.insert(sid, (file.file_hash, msg));
-                                }
-                            }
-                        } else {
-                            debug!(
-                                "Skipping source publish for {} — firewalled={} buddy={} direct_udp_cb={}",
-                                file.file_hash,
-                                state.publish_manager.firewalled,
-                                state.publish_manager.buddy_id.is_some(),
-                                state.publish_manager.direct_udp_callback,
-                            );
-                        }
-                    }
-                }
-
-                // Advertise ourselves under the Ember rendezvous key so a node
-                // with an empty DHT table can find us. Rides the same store
-                // slot budget and the same round-robin tick as shared-file
-                // publishes, and is skipped unless we are actually useful as a
-                // bootstrap contact:
-                //
-                //   * Ember on — otherwise we would not answer a DHT PING.
-                //   * `build_source_publish` returns None for an unreachable
-                //     firewalled node, which is exactly who should not be
-                //     listed as a bootstrap contact.
-                //
-                // Deliberately *not* gated on sharing files any more. Ember has
-                // no hardcoded bootstrap seeds, so this key is the only way a
-                // cold node joins, and requiring a shared library to appear in
-                // it excluded every downloader — a large share of exactly the
-                // reachable, long-running nodes that make good first contacts.
-                // Answering a DHT PING has nothing to do with having a library.
-                // The cost is one source record per five hours.
-                let rendezvous_now = chrono::Utc::now().timestamp();
-                let rendezvous_due = settings.ember_native_enabled
-                    && rendezvous_now.saturating_sub(state.ember_rendezvous_published_at)
-                        > EMBER_RENDEZVOUS_REPUBLISH_SECS;
-                if rendezvous_due && state.store_source_searches.len() < KADEMLIA_TOTAL_STORE_SRC {
-                    let key = kad::publish::ember_rendezvous_key();
-                    let already_publishing = state
-                        .store_source_searches
-                        .values()
-                        .any(|(hash, _)| *hash == key);
-                    if !already_publishing {
-                        // A synthetic record, deliberately never added to the
-                        // publish manager's file set: that set is mirrored from
-                        // the shared library, and a phantom entry there would
-                        // surface in share counts and reconcile passes.
-                        let advert = kad::publish::PublishableFile {
-                            file_hash: key,
-                            file_name: String::new(),
-                            file_size: 0,
-                            file_type: String::new(),
-                            complete_sources: 0,
-                            keyword_publishable: false,
-                            last_source_publish: 0,
-                        };
-                        if let Some(msg) = state.publish_manager.build_source_publish(&advert) {
-                            let closest = state
-                                .routing_table
-                                .find_closest_prefer_verified(&key, SEARCH_INITIAL_CONTACTS);
-                            if !closest.is_empty() {
-                                let sid = start_kad_search(
-                                    &mut state,
-                                    &app_handle,
-                                    key,
-                                    SearchType::StoreFile,
-                                    closest,
-                                );
-                                if sid != SearchId(0) {
-                                    // The advert is synthetic and has no file
-                                    // name, so label the row by what it is.
-                                    // `kadSearchNameLabel` translates this
-                                    // sentinel on the way to the UI.
-                                    name_kad_search(&mut state, sid, "Ember Rendezvous");
-                                    state.ember_rendezvous_published_at = rendezvous_now;
-                                    state.source_publish_acks.insert(key, 0);
-                                    state.store_source_searches.insert(sid, (key, msg));
-                                    // `info!`, not `debug!`: once per republish
-                                    // interval in steady state, and it is the
-                                    // only record that this node is discoverable
-                                    // by peers who have never met it.
-                                    info!("Ember rendezvous: advertising self under {key}");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let active_store_key = state.store_keyword_searches.len();
-                if active_store_key < KADEMLIA_TOTAL_STORE_KEY {
-                    let in_flight_keywords: HashSet<KadId> = state
-                        .store_keyword_searches
-                        .values()
-                        .map(|batch| batch.keyword_hash)
-                        .collect();
-                    if let Some(batch) = state.publish_manager.next_keyword_candidate() {
-                        if !in_flight_keywords.contains(&batch.keyword_hash) {
-                            let closest = state
-                                .routing_table
-                                .find_closest_prefer_verified(&batch.keyword_hash, SEARCH_INITIAL_CONTACTS);
-                            if !closest.is_empty() {
-                                let sid = start_kad_search(
-                                    &mut state,
-                                    &app_handle,
-                                    batch.keyword_hash,
-                                    SearchType::StoreKeyword,
-                                    closest,
-                                );
-                                if sid != SearchId(0) {
-                                    name_kad_search(&mut state, sid, &batch.keyword);
-                                    state.store_keyword_searches.insert(sid, batch);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let active_store_notes = state.pending_note_publishes.len();
-                if active_store_notes < KADEMLIA_TOTAL_STORE_NOTES {
-                    let now_ts = chrono::Utc::now().timestamp();
-                    let in_flight: HashSet<KadId> = state
-                        .pending_note_publishes
-                        .values()
-                        .map(|pending| pending.file_hash)
-                        .collect();
-                    let due_note = round_robin_next(&state.published_notes, &mut state.notes_publish_cursor)
-                        .filter(|hash| !in_flight.contains(hash))
-                        .and_then(|hash| state.published_notes.get(&hash).map(|note| (hash, note)))
-                        .filter(|(_, note)| now_ts - note.last_publish > REPUBLISH_NOTE_SECS)
-                        .map(|(hash, note)| {
-                            (
-                                hash,
-                                note.rating,
-                                note.comment.clone(),
-                                note.file_name.clone(),
-                                note.file_size,
-                            )
-                        });
-
-                    if let Some((file_hash, rating, comment, file_name, file_size)) = due_note {
-                        let closest = state
-                            .routing_table
-                            .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
-                        if !closest.is_empty() {
-                            let sid = start_kad_search(
-                                &mut state,
-                                &app_handle,
-                                file_hash,
-                                SearchType::StoreNotes,
-                                closest,
-                            );
-                            if sid != SearchId(0) {
-                                name_kad_search(
-                                    &mut state,
-                                    sid,
-                                    file_name.as_deref().unwrap_or_default(),
-                                );
-                                let local_note_file = {
-                                    let index = local_index.read().await;
-                                    index.get_by_hash(&file_hash.to_hex()).cloned()
-                                };
-                                let message = build_publish_notes_message(
-                                    state.local_id,
-                                    file_hash,
-                                    local_note_file,
-                                    file_name.as_deref(),
-                                    file_size,
-                                    rating,
-                                    &comment,
-                                );
-                                state.pending_note_publishes.insert(
-                                    sid,
-                                    PendingNotePublish {
-                                        file_hash,
-                                        rating,
-                                        comment: comment.clone(),
-                                        file_name: file_name.clone(),
-                                        file_size,
-                                        message,
-                                    },
-                                );
-                                // `last_publish`/the DB row are updated once the
-                                // search actually completes and PublishNotesReq
-                                // packets go out (see the `sent > 0` branch in
-                                // the StoreNotes search-completion handler
-                                // below), not here at scheduling time — a
-                                // search that finds no reachable closest nodes
-                                // or times out would otherwise still reset the
-                                // 24h republish timer despite nothing being
-                                // published.
-                                info!("Republishing KAD note for file {file_hash} (search {})", sid.0);
-                            }
-                        }
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_kad_publish_tick(
+                    &mut state,
+                    &local_index,
+                    &settings,
+                    &app_handle,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'kad_publish_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -7887,232 +7252,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // many beats means servers aren't replying (firewall,
             // missing UDP obfuscation, dead servers).
             _ = udp_discovery_health_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Forward what we know about relays to every live friend
-                // session. This is the only channel that does not depend on
-                // sharing a swarm with the peer, which is exactly the case the
-                // relay broker starves in: attestations otherwise arrive only
-                // on EPX exchanges for files already being traded, so two
-                // friends alone together never accumulate any.
-                //
-                // Re-sent only when the set actually changes. A digest of the
-                // offered attestation hashes is cheaper to compare than the
-                // block and is stable across reorderings that carry no new
-                // information, so a steady-state pair exchanges nothing.
-                {
-                    let now_unix = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut offer = state
-                        .connection_broker
-                        .as_ref()
-                        .map(|b| b.gossipable_attestations(now_unix))
-                        .unwrap_or_default();
-                    // Lead with ourselves when we are usable as a relay. We
-                    // are never in our own candidate list — that only holds
-                    // relays learned from others — yet for a friend who has no
-                    // peers at all we may be the only relay they can reach,
-                    // and they cannot discover us any other way.
-                    if let Some(mine) = sign_local_relay_attestation(
-                        &state,
-                        &settings,
-                        &ed25519_secret_key,
-                        ed25519_pubkey,
-                    ) {
-                        // Register the hash before advertising it. A friend that
-                        // acts on this attestation presents its hash when dialling
-                        // us as a relay, and `accepts_attestation_hash` refuses
-                        // anything it was never told to expect. Signing mints a
-                        // fresh expiry each tick, so the hash differs every time
-                        // and the EPX path cannot cover it: without this the offer
-                        // advertised a relay that answers every taker with
-                        // REJECT_AUTH, and a node with no swarm traffic — the one
-                        // this feature is for — never registered a hash at all.
-                        let hash = ember::relay_attestation_hash(&mine);
-                        state
-                            .relay_manager
-                            .lock()
-                            .await
-                            .set_current_attestation_hash(hash, mine.expires_at_unix);
-                        offer.truncate(ember::MAX_RELAY_ATTESTATIONS.saturating_sub(1));
-                        offer.insert(0, mine);
-                    }
-                    if !offer.is_empty() {
-                        let digest = relay_offer_digest(&offer, now_unix);
-                        let body = ember::build_relay_attestation_block(&offer);
-                        let payload =
-                            ed2k::messages::build_ember_ext(
-                                ed2k::messages::EMBER_EXT_RELAY_OFFER,
-                                &body,
-                            );
-                        let mut packet = Vec::with_capacity(6 + payload.len());
-                        packet.push(OP_EMULEPROT);
-                        packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
-                        packet.push(ed2k::messages::OP_EMBER_EXT);
-                        packet.extend_from_slice(&payload);
-
-                        // Friends only, matching who the relay will actually
-                        // serve. `run_quic_accept_loop` admits a RELAY_REQUEST
-                        // only from a friend, so offering to every
-                        // authenticated session advertised a service that
-                        // answers `REJECT_AUTH` — and a rejected relay
-                        // candidate is one the requester spent a QUIC
-                        // handshake to discover was useless. The field name has
-                        // always said friends; the send did not.
-                        // Two sequential reads rather than one nested pair.
-                        // Holding a `friend_hashes` guard across an
-                        // `ember_sessions` acquisition would introduce a lock
-                        // order that no other site follows, and tokio's
-                        // `RwLock` is fair — a queued writer makes even
-                        // read-on-read nesting deadlockable if some other task
-                        // takes the two the other way round. Neither critical
-                        // section is long enough for the split to matter.
-                        let candidates: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
-                            let sessions = state.ember_sessions.read().await;
-                            sessions
-                                .iter()
-                                .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
-                                .map(|(eh, h)| (*eh, h.session_id(), h.tx.clone()))
-                                .collect()
-                        };
-                        let live: Vec<([u8; 16], u64, tokio::sync::mpsc::Sender<Vec<u8>>)> = {
-                            let friends = friend_hashes.read().await;
-                            candidates
-                                .into_iter()
-                                .filter(|(eh, _, _)| friends.contains(eh))
-                                .collect()
-                        };
-                        for (eh, session_id, tx) in live {
-                            if state.friend_relay_offer_sent.get(&eh)
-                                == Some(&(session_id, digest))
-                            {
-                                continue;
-                            }
-                            if tx.try_send(packet.clone()).is_ok() {
-                                state
-                                    .friend_relay_offer_sent
-                                    .insert(eh, (session_id, digest));
-                            }
-                        }
-                    }
-                    // Prune outside the "we have something to offer" branch:
-                    // when every candidate expires at once the offer goes
-                    // empty, and skipping the sweep then would let entries for
-                    // departed friends accumulate for the life of the process
-                    // — the exact leak this guards against. Also ensures a
-                    // reconnecting friend is offered the set again.
-                    {
-                        let sessions = state.ember_sessions.read().await;
-                        state
-                            .friend_relay_offer_sent
-                            .retain(|eh, _| sessions.contains_key(eh));
-                    }
-                }
-
-                // Only the eD2K UDP-discovery diagnostics below are KAD-scoped.
-                // The friend relay-offer work above must not be: `stats.status`
-                // is advanced only by KAD paths, so an eD2K-only session (the
-                // default) sits at `Disconnected` for its whole life — and this
-                // gate then meant we never registered our own attestation hash,
-                // so every friend that tried to use us as a relay was answered
-                // with REJECT_AUTH, starving the one discovery channel that does
-                // not need a shared swarm.
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-
-                let cur = UdpDiscoveryHealthSnapshot {
-                    sent: state.udp_discovery_sent,
-                    send_errs: state.udp_discovery_send_errs,
-                    replies: state.udp_discovery_replies,
-                    sources_found: state.udp_discovery_sources_found,
-                };
-                let prev = last_udp_discovery_health;
-                let any_change = cur.sent != prev.sent
-                    || cur.send_errs != prev.send_errs
-                    || cur.replies != prev.replies
-                    || cur.sources_found != prev.sources_found;
-                if any_change {
-                    let d_sent = cur.sent.saturating_sub(prev.sent);
-                    let d_errs = cur.send_errs.saturating_sub(prev.send_errs);
-                    let d_replies = cur.replies.saturating_sub(prev.replies);
-                    let d_sources = cur.sources_found.saturating_sub(prev.sources_found);
-                    // `ok` and `fail` are disjoint counts of the
-                    // **attempted** sends since the last beat (each
-                    // `send_to` call bumps exactly one). The totals
-                    // are cumulative since process start (each kind
-                    // separately). Earlier wording put them in the
-                    // same paren which read as "errs are a subset
-                    // of sent" — they aren't.
-                    info!(
-                        "UDP source-discovery health (30s): sends ok=+{d_sent} fail=+{d_errs} (totals ok={} fail={}), replies=+{d_replies} (total {}), sources_found=+{d_sources} (total {})",
-                        cur.sent, cur.send_errs,
-                        cur.replies,
-                        cur.sources_found,
-                    );
-
-                    // Per-server breakdown so the user can see which
-                    // entries in their server.met are actually
-                    // useful for source discovery. Three categories:
-                    //   * source-responsive: ever returned
-                    //     OP_GLOBFOUNDSOURCES (= actually has source
-                    //     data we can use). The good column.
-                    //   * status-only: responds to status pings but
-                    //     never to GETSOURCES — server is alive but
-                    //     doesn't index our specific file hashes.
-                    //     Most servers fall here for any given user
-                    //     because the long tail of file hashes is
-                    //     vast and individual servers index small
-                    //     subsets.
-                    //   * silent: never replied to anything.
-                    //   * pruned: > MAX_UDP_CONSECUTIVE_FAILURES
-                    //     consecutive unanswered queries.
-                    //
-                    // Previously this was one "alive" bucket which
-                    // misled readers into thinking source discovery
-                    // was working when servers were just answering
-                    // status pings.
-                    let now_ts = chrono::Utc::now().timestamp();
-                    let mut source_responsive: Vec<String> = Vec::new();
-                    let mut status_only: Vec<String> = Vec::new();
-                    let mut silent: Vec<String> = Vec::new();
-                    let mut pruned: Vec<String> = Vec::new();
-                    for s in state.server_list.servers().iter() {
-                        let label = if s.name.is_empty() {
-                            format!("{}:{}", s.ip, s.port)
-                        } else {
-                            format!("{} ({}:{})", s.name, s.ip, s.port)
-                        };
-                        if s.udp_consecutive_failures >= MAX_UDP_CONSECUTIVE_FAILURES {
-                            pruned.push(label);
-                        } else if s.last_udp_source_reply_at > 0 {
-                            let ago = (now_ts - s.last_udp_source_reply_at).max(0);
-                            source_responsive.push(format!("{label} (last sources {ago}s ago)"));
-                        } else if s.last_udp_reply_at > 0 {
-                            let ago = (now_ts - s.last_udp_reply_at).max(0);
-                            status_only.push(format!("{label} (status reply {ago}s ago, never returned sources)"));
-                        } else {
-                            silent.push(format!("{label} (fails={})", s.udp_consecutive_failures));
-                        }
-                    }
-                    info!(
-                        "UDP server health: {} source-responsive, {} status-only (alive but never returned sources), {} silent, {} pruned (>= {MAX_UDP_CONSECUTIVE_FAILURES} unanswered queries)",
-                        source_responsive.len(), status_only.len(), silent.len(), pruned.len(),
-                    );
-                    if !source_responsive.is_empty() {
-                        info!("UDP source-responsive servers: {}", source_responsive.join("; "));
-                    }
-                    if !status_only.is_empty() {
-                        info!("UDP status-only servers: {}", status_only.join("; "));
-                    }
-                    if !silent.is_empty() {
-                        info!("UDP silent servers: {}", silent.join("; "));
-                    }
-                    if !pruned.is_empty() {
-                        info!("UDP pruned servers (re-eligible on any inbound UDP): {}", pruned.join("; "));
-                    }
-                }
-                last_udp_discovery_health = cur;
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_udp_discovery_health_tick(
+                    &mut state,
+                    &settings,
+                    &friend_hashes,
+                    ed25519_pubkey,
+                    ed25519_secret_key,
+                    &mut last_udp_discovery_health,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'udp_discovery_health_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8162,281 +7311,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // one `try_recv()` (returns `Empty` instantly) plus a
             // hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
             _ = broker_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Not gated on KAD status: the broker serves friend connections
-                // over rendezvous, which has nothing to do with Kademlia, and
-                // an eD2K-only session never leaves `Disconnected`. Both halves
-                // below are already no-ops when no broker exists.
-                if let Some(ref mut broker) = state.connection_broker {
-                    broker.tick().await;
-                }
-
-                if let Some(ref mut rx) = state.broker_event_rx {
-                    while let Ok(event) = rx.try_recv() {
-                        match event {
-                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash, .. } => {
-                                tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
-
-                                let attempt_key_owned = attempt_key.clone();
-
-                                let (attempt_transfer_id, _) = state.connection_broker.as_ref()
-                                    .and_then(|b| b.get_attempt_info(&attempt_key_owned))
-                                    .map(|(tid, _, _, _)| (tid, ()))
-                                    .unwrap_or_default();
-
-                                let broker_tx = state.connection_broker.as_ref()
-                                    .map(|b| b.event_sender());
-
-                                if let Some(ref mut broker) = state.connection_broker {
-                                    broker.set_relay_phase(&attempt_key_owned);
-                                }
-
-                                if let Some((relay_ip, relay_port)) = relay_addr {
-                                    let quic_ep = state.connection_broker.as_ref()
-                                        .and_then(|b| b.quic_endpoint().cloned());
-                                    let transfer_id = attempt_transfer_id.clone();
-
-                                    tokio::spawn(async move {
-                                        let Some(broker_tx) = broker_tx else { return; };
-                                        let Some(endpoint) = quic_ep else {
-                                            tracing::warn!("Broker: no QUIC endpoint for relay {attempt_key_owned}");
-                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                attempt_key: attempt_key_owned,
-                                                reason: "no QUIC endpoint".into(),
-                                                // Our endpoint, not their fault.
-                                                relay_at_fault: false,
-                                            }) {
-                                                tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                            }
-                                            return;
-                                        };
-
-                                        let relay_addr = SocketAddr::new(
-                                            std::net::IpAddr::V4(relay_ip), relay_port,
-                                        );
-
-                                        // `pin` for `connect_to_peer_relay` must be *our own*
-                                        // QUIC cert/key DER bytes (proving to the relay who
-                                        // we are) paired with the *relay's* expected node id
-                                        // (so our verifier confirms we actually reached that
-                                        // relay, not an impostor). This used to pass our raw
-                                        // 32-byte Ed25519 identity key bytes directly as if
-                                        // they were DER-encoded cert/key material — rustls
-                                        // would fail to parse them as X.509/PKCS8 on every
-                                        // single pinned relay attempt, so pinned peer-relay
-                                        // connects never succeeded. Derive a real (cert_der,
-                                        // key_der) pair from our identity key on demand
-                                        // instead — cheap and deterministic, see
-                                        // `generate_self_signed_cert`'s doc comment.
-                                        let relay_pin_material = relay_ember_hash.and_then(|hash| {
-                                            match ember::quic::generate_self_signed_cert(&ed25519_secret_key) {
-                                                Ok(cert_and_key) => Some((cert_and_key, hash)),
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Broker: failed to derive QUIC cert for relay pin, connecting unpinned: {e}"
-                                                    );
-                                                    None
-                                                }
-                                            }
-                                        });
-                                        let relay_pin = relay_pin_material
-                                            .as_ref()
-                                            .map(|((cert_der, key_der), hash)| {
-                                                (cert_der.as_slice(), key_der.as_slice(), *hash)
-                                            });
-                                        let Some(attestation_hash) = relay_attestation_hash else {
-                                            tracing::warn!(
-                                                "Broker: peer relay {attempt_key_owned} missing attestation hash"
-                                            );
-                                            if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                attempt_key: attempt_key_owned,
-                                                reason: "missing relay attestation hash".into(),
-                                                // Missing on our side, before we ever dialled.
-                                                relay_at_fault: false,
-                                            }) {
-                                                tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                            }
-                                            return;
-                                        };
-                                        match ember::relay::connect_to_peer_relay(
-                                            &endpoint,
-                                            relay_addr,
-                                            source_ip,
-                                            source_port,
-                                            &file_hash,
-                                            &attestation_hash,
-                                            &ed25519_pubkey,
-                                            &ember_hash,
-                                            &ed25519_secret_key,
-                                            relay_pin,
-                                        ).await {
-                                            Ok((send, recv)) => {
-                                                tracing::info!("Broker: peer relay connected via {relay_addr}");
-                                                let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
-                                                    ember::broker::BrokerConnection {
-                                                        transfer_id,
-                                                        file_hash,
-                                                        source_ip,
-                                                        source_port,
-                                                        method: ember::broker::ConnectionMethod::PeerRelay,
-                                                        relay_addr: Some((relay_ip, relay_port)),
-                                                        reader: Box::new(recv),
-                                                        writer: Box::new(send),
-                                                    },
-                                                )).await;
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!("Broker: peer relay failed: {e}");
-                                                if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                                        attempt_key: attempt_key_owned,
-                                                        // Attribution comes from the
-                                                        // dial itself: unreachable or
-                                                        // misbehaving counts against
-                                                        // the relay, a proper refusal
-                                                        // does not.
-                                                        relay_at_fault: e.relay_at_fault,
-                                                        reason: e.reason,
-                                                    }) {
-                                                    tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                                }
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    tracing::debug!(
-                                        "Broker: no peer relay candidate for {attempt_key_owned}; \
-                                         authenticated server relay is restricted to known friends"
-                                    );
-                                    tokio::spawn(async move {
-                                        let Some(broker_tx) = broker_tx else { return; };
-                                        if let Err(send_err) = broker_tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                            attempt_key: attempt_key_owned,
-                                            reason: "anonymous LowID sources cannot use server relay".into(),
-                                            // No relay was involved at all.
-                                            relay_at_fault: false,
-                                        }) {
-                                            tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
-                                        }
-                                    });
-                                }
-                            }
-                            ember::broker::BrokerEvent::ConnectionReady(conn) => {
-                                tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
-                                let method = conn.method;
-                                let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
-
-                                // The broker stream is freshly established and
-                                // NOT yet greeted: WE initiated it (QUIC
-                                // hole-punch / relay), so the peer's upload
-                                // listener is waiting to RECEIVE our eMule Hello
-                                // before it will answer. Greet it here with the
-                                // client Hello (plain — a hole-punched QUIC hop
-                                // is end-to-end encrypted, and on the relay path
-                                // RC4 obfuscation would not help anyway: the
-                                // relay terminates QUIC and bridges cleartext,
-                                // so integrity there rests on MD4/AICH part
-                                // verification), then hand the worker a properly
-                                // greeted stream carrying the peer's real
-                                // capabilities. Without this the worker adopts an
-                                // ungreeted stream with default (ext_ver=0) caps
-                                // and both sides stall — the "stranded callback"
-                                // failure. Done in a spawned task so the Hello
-                                // round-trip never blocks the network event loop;
-                                // `send().await` is safe off-loop (it cannot
-                                // self-deadlock the select! arm that drains the
-                                // channel).
-                                let greet_tx = kad_callback_tx.clone();
-                                let greet_user_hash = state.user_hash;
-                                let greet_client_id = state
-                                    .external_ip
-                                    .map(|ip| u32::from_le_bytes(ip.octets()))
-                                    .unwrap_or(0);
-                                // The active broker-event receiver prevents a
-                                // whole-struct borrow here. Inline the same
-                                // STUN-over-TCP-confirmed fallback used by
-                                // `advertised_tcp_port`.
-                                let greet_tcp_port = state
-                                    .external_tcp_port
-                                    .filter(|port| *port != 0)
-                                    .unwrap_or(state.tcp_port);
-                                // Same STUN-aware fallback as TCP above (via
-                                // `advertised_udp_port`, inlined for the same
-                                // borrow-conflict reason as `greet_tcp_port`).
-                                let greet_udp_port = state
-                                    .external_udp_port
-                                    .filter(|p| *p != 0)
-                                    .unwrap_or(state.udp_port);
-                                let greet_nickname = settings.nickname.clone();
-                                let greet_peer_ip = conn.source_ip;
-                                let greet_peer_port = conn.source_port;
-                                let greet_file_hash = conn.file_hash;
-                                let mut greet_reader = conn.reader;
-                                let mut greet_writer = conn.writer;
-                                tokio::spawn(async move {
-                                    match ed2k::multi_source::perform_outbound_hello(
-                                        &mut *greet_reader,
-                                        &mut *greet_writer,
-                                        &greet_user_hash,
-                                        greet_client_id,
-                                        greet_tcp_port,
-                                        greet_udp_port,
-                                        &greet_nickname,
-                                    )
-                                    .await
-                                    {
-                                        Ok((peer_user_hash, peer_caps)) => {
-                                            let parts = upload_server::KadCallbackParts {
-                                                peer_ip: greet_peer_ip,
-                                                peer_port: greet_peer_port,
-                                                peer_hello_port: 0,
-                                                peer_user_hash,
-                                                file_hash: greet_file_hash,
-                                                reader: greet_reader,
-                                                writer: greet_writer,
-                                                emule_info_done: false,
-                                                peer_caps,
-                                                friend_ember_hash: None,
-                                            };
-                                            if let Err(e) = greet_tx.send(parts).await {
-                                                tracing::debug!(
-                                                    "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "Broker: Ember client Hello failed for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                            );
-                                        }
-                                    }
-                                });
-
-                                if let Some(ref mut broker) = state.connection_broker {
-                                    broker.mark_succeeded(&key, method);
-                                }
-                            }
-                            ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
-                                tracing::debug!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
-                                if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
-                                    // `BrokerEvent::ConnectionFailed` doesn't carry the
-                                    // source's user hash, so an unspecified-IP source
-                                    // (LowID buddy publish with no real IP) can't be
-                                    // resolved here — safer to no-op than risk mutating
-                                    // an unrelated peer's row that happens to share the
-                                    // same advertised port (see `PerFileSourceList::
-                                    // resolve_idx`).
-                                    pfs.set_low_to_low(source_ip, source_port, None);
-                                }
-                            }
-                            ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault } => {
-                                if let Some(ref mut broker) = state.connection_broker {
-                                    broker.relay_failed(attempt_key, reason, relay_at_fault).await;
-                                }
-                            }
-                        }
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_broker_tick(
+                    &mut state,
+                    &settings,
+                    ember_hash,
+                    ed25519_pubkey,
+                    ed25519_secret_key,
+                    &kad_callback_tx,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'broker_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8458,63 +7342,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Transfers whose hash finished on the blocking pool. Drained
-                // here for the same branch-budget reason as the pacing below,
-                // but ahead of both gates it sits under: the verification was
-                // started while Ember was enabled and the overlay connected,
-                // and the sender is waiting on a completion frame it has no
-                // other way to obtain. Dropping the verdict because a setting
-                // was toggled or the eMule side went down mid-hash would leave
-                // that peer to time the transfer out as failed after it had
-                // already succeeded.
-                while let Ok(finished) = xfer_finish_rx.try_recv() {
-                    apply_xfer_finish(&udp_socket, &mut state, &db, &app_handle, finished).await;
-                }
-                // Ember Transfer pacing shares this 100ms tick rather than
-                // taking its own arm — `tokio::select!` tops out at 64
-                // branches and this loop is already at the limit. It runs
-                // ahead of the KAD status gate below because Ember is a
-                // separate overlay: a room transfer has no reason to stop
-                // because the eMule network is disconnected. Returns straight
-                // away when nothing is in flight.
-                if settings.ember_native_enabled {
-                    drive_channel_transfers(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &app_handle,
-                        &bandwidth_limiter,
-                    )
-                    .await;
-                }
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-                let now_bt = chrono::Utc::now().timestamp();
-                if let Some(target) =
-                    state
-                        .routing_table
-                        .try_fire_big_timer(now_bt, state.last_kad_contact)
-                {
-                    let closest = state
-                        .routing_table
-                        .find_closest(&target, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        let sid = start_kad_search(
-                            &mut state,
-                            &app_handle,
-                            target,
-                            SearchType::FindNode,
-                            closest,
-                        );
-                        if sid != SearchId(0) {
-                            debug!(
-                                "BigTimer: started FindNode search {} (eMule RandomLookup)",
-                                sid.0
-                            );
-                        }
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_kad_process_tick(
+                    &udp_socket,
+                    &mut state,
+                    &settings,
+                    &bandwidth_limiter,
+                    &db,
+                    &app_handle,
+                    &mut xfer_finish_rx,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'kad_process_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8565,69 +7403,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // within the first second. See the timer-definition comment
             // for the rate rationale.
             _ = udp_source_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                for _ in 0..UDP_SOURCE_BURST_PER_TICK {
-                    let Some((packet, addr)) = state.udp_source_queue.pop_front() else {
-                        break;
-                    };
-                    let sock = server_udp.socket_handle();
-                    let pkt_len = packet.len() as u64;
-                    // Compute the canonical (TCP_port) lookup key from the
-                    // wire dest port (TCP+4 for plain, obfuscation_port_udp
-                    // for obfuscated). The recv path canonicalises to the
-                    // TCP+4 port; we mirror that so per-server pruning
-                    // tracks the right entry.
-                    let server_tcp_port = state
-                        .server_list
-                        .lookup_for_udp_addr(
-                            match addr.ip() {
-                                std::net::IpAddr::V4(v4) => v4,
-                                _ => std::net::Ipv4Addr::UNSPECIFIED,
-                            },
-                            addr.port(),
-                        )
-                        .map(|(_key, tcp_port)| tcp_port);
-                    match sock.send_to(&packet, addr).await {
-                        Ok(_) => {
-                            // Outbound source-asking traffic to non-connected
-                            // servers. The queue is exclusively populated by
-                            // `build_all_getsources_packets[_multi]`, so every
-                            // byte that leaves here is `OP_GLOBGETSOURCES`
-                            // (or `OP_GLOBGETSOURCES2`) for source discovery.
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::SourceExchange,
-                                crate::storage::statistics::OverheadDirection::Upload,
-                                pkt_len,
-                            );
-                            state.udp_discovery_sent = state.udp_discovery_sent.saturating_add(1);
-                            // Per-server pruning: bump
-                            // udp_consecutive_failures. The recv path
-                            // resets it on any inbound UDP reply, so a
-                            // genuinely responsive server ratchets back
-                            // to zero immediately. Servers that never
-                            // reply hit MAX_UDP_CONSECUTIVE_FAILURES
-                            // and get excluded from future UDP queries
-                            // by `is_eligible_udp_server`.
-                            if let Some(tcp_port) = server_tcp_port {
-                                let ip_str = addr.ip().to_string();
-                                state.server_list.record_udp_query_sent(&ip_str, tcp_port);
-                            }
-                        }
-                        Err(e) => {
-                            // Don't double-count failed sends in stats.
-                            // Failed sends to dead/unreachable servers are
-                            // expected (each cycle queues to *every*
-                            // eligible server in `server.met`, many of
-                            // which are stale). Per-server failure is
-                            // tracked via `state.udp_discovery_send_errs`
-                            // for the periodic health log; debug here
-                            // gives detail when needed without spamming.
-                            debug!("UDP source send_to {addr} failed: {e}");
-                            state.udp_discovery_send_errs = state.udp_discovery_send_errs.saturating_add(1);
-                        }
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_udp_source_tick(
+                    &mut state,
+                    &mut stats_manager,
+                    &server_udp,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'udp_source_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8635,85 +7417,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // SmallTimer (eMule): probe expired contacts with HELLO_REQ, remove dead
             _ = small_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-
-                // eMule KADEMLIADISCONNECTDELAY: if no valid KAD contact for 20 minutes,
-                // transition back to Connecting so bootstrap re-engages. Do NOT tear
-                // down eD2K here — temporary KAD quiet must not yank a working server
-                // (and would flap Connected↔Connecting against stale verified rows).
-                const KAD_DISCONNECT_DELAY_SECS: i64 = 1200;
-                if state.stats.status == NetworkStatus::Connected {
-                    if let Some(last_contact) = state.last_kad_contact {
-                        let now_dc = chrono::Utc::now().timestamp();
-                        if now_dc - last_contact > KAD_DISCONNECT_DELAY_SECS {
-                            debug!(
-                                "No KAD contact for {}s, resetting to Connecting (eMule KADEMLIADISCONNECTDELAY)",
-                                now_dc - last_contact
-                            );
-                            state.stats.status = NetworkStatus::Connecting;
-                            state.self_lookup_done = false;
-                            state.last_self_lookup = 0;
-                            // Clear so bootstrap cannot promote back to Connected
-                            // until a fresh decoded packet updates last_kad_contact.
-                            state.last_kad_contact = None;
-                            state.routing_table.reset_big_timer_global(now_dc);
-                            let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
-                        }
-                    }
-                }
-
-                let dead_removed = state.routing_table.remove_dead_contacts();
-                if dead_removed > 0 {
-                    debug!("SmallTimer: removed {dead_removed} dead contacts");
-                    state.stats.connected_peers = state.routing_table.len() as u32;
-                }
-
-                let to_probe = state.routing_table.get_contacts_to_probe();
-                for contact in to_probe {
-                    let our_options: u8 = 0x04
-                        | if state.udp_firewalled { 0x01 } else { 0 }
-                        | if state.firewalled { 0x02 } else { 0 };
-                    let mut hello_tags = vec![
-                        KadTag {
-                            name: TagName::Id(TAG_KADMISCOPTIONS),
-                            value: TagValue::Uint8(our_options),
-                        },
-                    ];
-                    if !settings.nickname.is_empty() {
-                        hello_tags.push(KadTag {
-                            name: TagName::Id(TAG_FILENAME),
-                            value: TagValue::String(settings.nickname.clone()),
-                        });
-                    }
-                    let msg = match messages::build_hello_req(
-                        &state.local_id,
-                        advertised_tcp_port(&state),
-                        KADEMLIA_VERSION,
-                        &hello_tags,
-                    ) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!("Failed to encode hello req: {e}");
-                            continue;
-                        }
-                    };
-                    let dest = std::net::SocketAddr::new(
-                        std::net::IpAddr::V4(contact.ip),
-                        contact.udp_port,
-                    );
-                    state.flood_protection.track_request(dest, 0x11);
-                    let _ = send_kad_packet(
-                        &udp_socket,
-                        &msg,
-                        dest,
-                        &state,
-                        &contact.id,
-                    )
-                    .await;
-                }
-
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_small_tick(
+                    &udp_socket,
+                    &mut state,
+                    &settings,
+                    &app_handle,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'small_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8721,239 +7432,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
             _ = buddy_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-                let tcp_fw = state.firewall_checker.tcp_status();
-                let udp_fw = state.firewall_checker.udp_status();
-                // eMule (ClientList.cpp:604-629): a buddy is only useful while we
-                // are firewalled on BOTH TCP and UDP -- a UDP-open client is
-                // reachable via direct UDP callback, so it needs no relay. If our
-                // firewall status improved (TCP or UDP opened), proactively drop
-                // the relay / cancel the in-flight search instead of holding a
-                // buddy slot we no longer need (eMule's `else if (m_pBuddy)` drop).
-                let need_buddy = state.firewall_checker.tcp_firewalled()
-                    && state.firewall_checker.udp_firewalled();
-                if !need_buddy {
-                    match state.buddy_manager.state() {
-                        BuddyState::Connected => {
-                            state.buddy_manager.disconnect_buddy().await;
-                            state.buddy_event_rx = None;
-                            *state.shared_buddy_info.write().await = None;
-                            info!("Dropped buddy: no longer firewalled on both TCP and UDP");
-                        }
-                        BuddyState::FindingBuddy => {
-                            state.buddy_manager.find_failed();
-                            let findbuddy_sids: Vec<_> = state.search_manager.active.iter()
-                                .filter(|(_, s)| matches!(s.search_type, SearchType::FindBuddy))
-                                .map(|(sid, _)| *sid)
-                                .collect();
-                            for sid in findbuddy_sids {
-                                if let Some(removed) = state.search_manager.remove(&sid) {
-                                    state.routing_table.release_contacts_in_use(&removed.in_use_ids);
-                                }
-                            }
-                            info!("Cancelled buddy search: no longer firewalled on both TCP and UDP");
-                        }
-                        BuddyState::NoBuddy => {}
-                    }
-                }
-                let buddy_state = state.buddy_manager.state();
-                if buddy_state != BuddyState::Connected {
-                    debug!("Buddy tick: state={:?}, tcp_fw={:?}, udp_fw={:?}, routing_table={}", buddy_state, tcp_fw, udp_fw, state.routing_table.len());
-                }
-                if buddy_state == BuddyState::Connected {
-                    state.buddy_manager.send_buddy_ping().await;
-                }
-                if state.buddy_manager.finding_timed_out() {
-                    state.buddy_manager.find_failed();
-                    info!("Buddy search timed out waiting for FindBuddyRes");
-                }
-                if state.buddy_manager.should_find_buddy(tcp_fw, udp_fw) {
-                    state.buddy_manager.start_finding();
-                    let target = state.buddy_manager.find_buddy_target();
-                    let local_tcp = state.buddy_manager.tcp_port();
-                    let user_id_for_buddy = KadId(cuint128_swap(&state.user_hash));
-                    info!(
-                        "FindBuddy identities: local_kad_id={}, buddy_target={}, user_hash_wire={}, tcp_port={}, obfuscation={}",
-                        state.local_id, target, user_id_for_buddy, local_tcp, state.obfuscation_enabled
-                    );
-                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        let sid = start_kad_search(
-                            &mut state,
-                            &app_handle,
-                            target,
-                            SearchType::FindBuddy,
-                            closest,
-                        );
-                        if sid == SearchId(0) {
-                            // Search manager at capacity — do not sit in
-                            // FindingBuddy with zero requests until timeout.
-                            state.buddy_manager.find_failed();
-                            warn!(
-                                "FindBuddy search rejected: active search cap reached"
-                            );
-                        } else {
-
-                        // Send FindBuddyReq to a broad sample of verified contacts.
-                        // Any non-firewalled node can be buddy, so sample from across
-                        // the entire routing table, not just close to the target.
-                        let mut sent_addrs = std::collections::HashSet::new();
-                        let mut initial_sent = 0u32;
-
-                        // 1) 10 contacts closest to the inverted-ID target
-                        let target_contacts = state.routing_table.find_closest_verified(&target, 10);
-                        let mut logged_wire = false;
-                        let mut obf_count = 0u32;
-                        let mut plain_count = 0u32;
-                        for contact in &target_contacts {
-                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                            if !state
-                                .search_manager
-                                .get_mut(&sid)
-                                .map(|search| search.reserve_find_buddy_request(contact.id))
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            let msg = KadMessage::FindBuddyReq {
-                                buddy_id: target,
-                                user_id: user_id_for_buddy,
-                                tcp_port: local_tcp,
-                            };
-                            match messages::encode_packet(&msg) {
-                                Ok(packet) => {
-                                    if !logged_wire {
-                                        let preview: Vec<u8> =
-                                            packet.iter().take(10).copied().collect();
-                                        info!(
-                                            "FindBuddyReq wire: {:02X?} (len={}, buddy_target={}, user_id={}, tcp={})",
-                                            preview, packet.len(), target, user_id_for_buddy, local_tcp
-                                        );
-                                        logged_wire = true;
-                                    }
-                                    let c_obf = state.obfuscation_enabled
-                                        && state
-                                            .routing_table
-                                            .get_contact(&contact.id)
-                                            .is_some_and(|c| c.supports_obfuscation());
-                                    if c_obf {
-                                        obf_count += 1;
-                                    } else {
-                                        plain_count += 1;
-                                    }
-                                    if send_kad_packet(
-                                        &udp_socket,
-                                        &packet,
-                                        addr,
-                                        &state,
-                                        &contact.id,
-                                    )
-                                    .await
-                                    .is_ok()
-                                    {
-                                        state.flood_protection.track_request(addr, 0x51);
-                                        sent_addrs.insert(addr);
-                                        initial_sent += 1;
-                                    } else if let Some(search) =
-                                        state.search_manager.get_mut(&sid)
-                                    {
-                                        search.release_find_buddy_request(contact.id);
-                                    }
-                                }
-                                Err(_) => {
-                                    if let Some(search) = state.search_manager.get_mut(&sid) {
-                                        search.release_find_buddy_request(contact.id);
-                                    }
-                                }
-                            }
-                        }
-
-                        // 2) Up to 20 random verified contacts from across the
-                        //    routing table (different part of keyspace).
-                        let all_contacts: Vec<_> = state
-                            .routing_table
-                            .all_contacts()
-                            .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
-                            .collect();
-                        let random_contacts: Vec<KadContact> = {
-                            use rand::seq::SliceRandom;
-                            let mut rng = rand::thread_rng();
-                            let mut shuffled: Vec<_> = all_contacts.iter().collect();
-                            shuffled.shuffle(&mut rng);
-                            shuffled
-                                .into_iter()
-                                .take(20)
-                                .cloned()
-                                .cloned()
-                                .collect()
-                        };
-                        for contact in &random_contacts {
-                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                            if sent_addrs.contains(&addr) {
-                                continue;
-                            }
-                            if !state
-                                .search_manager
-                                .get_mut(&sid)
-                                .map(|search| search.reserve_find_buddy_request(contact.id))
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            let msg = KadMessage::FindBuddyReq {
-                                buddy_id: target,
-                                user_id: user_id_for_buddy,
-                                tcp_port: local_tcp,
-                            };
-                            match messages::encode_packet(&msg) {
-                                Ok(packet) => {
-                                    let c_obf = state.obfuscation_enabled
-                                        && state
-                                            .routing_table
-                                            .get_contact(&contact.id)
-                                            .is_some_and(|c| c.supports_obfuscation());
-                                    if c_obf {
-                                        obf_count += 1;
-                                    } else {
-                                        plain_count += 1;
-                                    }
-                                    if send_kad_packet(
-                                        &udp_socket,
-                                        &packet,
-                                        addr,
-                                        &state,
-                                        &contact.id,
-                                    )
-                                    .await
-                                    .is_ok()
-                                    {
-                                        state.flood_protection.track_request(addr, 0x51);
-                                        sent_addrs.insert(addr);
-                                        initial_sent += 1;
-                                    } else if let Some(search) =
-                                        state.search_manager.get_mut(&sid)
-                                    {
-                                        search.release_find_buddy_request(contact.id);
-                                    }
-                                }
-                                Err(_) => {
-                                    if let Some(search) = state.search_manager.get_mut(&sid) {
-                                        search.release_find_buddy_request(contact.id);
-                                    }
-                                }
-                            }
-                        }
-
-                        if initial_sent > 0 {
-                            info!("Sent initial FindBuddyReq to {} contacts ({} target-close + random from {} verified, {} obfuscated/{} plaintext)",
-                                initial_sent, target_contacts.len(), all_contacts.len(), obf_count, plain_count);
-                        }
-                        } // sid != SearchId(0)
-                    }
-                }
-
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_buddy_tick(
+                    &udp_socket,
+                    &mut state,
+                    &app_handle,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'buddy_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -8961,141 +7446,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Cleanup flood protection tracking and cap peer nicknames
             _ = flood_cleanup_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                state.flood_protection.cleanup();
-
-                // Prevent unbounded growth of peer_nicknames
-                const MAX_NICKNAME_ENTRIES: usize = 500;
-                if state.peer_nicknames.len() > MAX_NICKNAME_ENTRIES {
-                    let current_contacts: HashSet<KadId> = state.routing_table
-                        .all_contacts()
-                        .map(|c| c.id)
-                        .collect();
-                    state.peer_nicknames.retain(|id, _| current_contacts.contains(id));
-                }
-
-                // Expire overloaded node entries after 10 minutes
-                let now = chrono::Utc::now().timestamp();
-                state.overloaded_nodes.retain(|_, &mut ts| now - ts < 600);
-
-                // Expire online_friends entries not seen in 5 minutes, but only
-                // when no live Ember session is still fresh. Keepalives refresh
-                // `EmberSessionHandle`, not this map, so a healthy idle session
-                // must not flip the friend Offline / disable Browse.
-                {
-                    let now = chrono::Utc::now().timestamp();
-                    let sessions = state.ember_sessions.read().await;
-                    let mut refresh = Vec::new();
-                    let mut expired = Vec::new();
-                    for (eh, &ts) in &state.online_friends {
-                        if now - ts < 300 {
-                            continue;
-                        }
-                        if sessions.get(eh).is_some_and(|h| h.is_fresh()) {
-                            refresh.push(*eh);
-                        } else {
-                            expired.push(*eh);
-                        }
-                    }
-                    drop(sessions);
-                    for eh in refresh {
-                        state.online_friends.insert(eh, now);
-                    }
-                    for eh in &expired {
-                        state.online_friends.remove(eh);
-                        let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
-                            "user_hash": hex::encode(eh),
-                        }));
-                    }
-                }
-
-                // Cap banned_ips to prevent unbounded growth: rebuild from
-                // durable sources + active reputation bans (same path as the
-                // periodic reputation-timer sync). The rebuild is asynchronous
-                // now, so the over-cap check moved to where the result is
-                // applied.
-                if state.banned_ips.len() > MAX_BANNED_IPS {
-                    request_banned_ips_sync(
-                        &mut banned_ips_sync_in_flight,
-                        &db,
-                        &banned_ips_sync_tx,
-                    );
-                }
-
-                // Sweep orphaned Ember ping waiters. Each entry is created
-                // when we send `EmberControlMessage::Ping` to a peer; the
-                // entry is normally removed when the matching `Pong` lands
-                // in `handle_udp_packet`. If the peer never replies (lost
-                // packet, peer dropped, peer doesn't speak the protocol),
-                // the entry would otherwise stay until process exit and
-                // eventually saturate `MAX_EMBER_PENDING_PINGS=1024` so
-                // no further pings could register. The awaiting caller's
-                // own `tokio::time::timeout` already returned long ago by
-                // the time `MAX_PING_AGE` elapses, so dropping the
-                // oneshot here only frees backend memory — no
-                // user-visible behaviour change.
-                {
-                    const MAX_PING_AGE: std::time::Duration =
-                        std::time::Duration::from_secs(120);
-                    let now = std::time::Instant::now();
-                    let stale: Vec<u64> = state
-                        .ember_pending_pings
-                        .iter()
-                        .filter(|(_, (sent_at, _))| now.duration_since(*sent_at) >= MAX_PING_AGE)
-                        .map(|(nonce, _)| *nonce)
-                        .collect();
-                    if !stale.is_empty() {
-                        for nonce in &stale {
-                            state.ember_pending_pings.remove(nonce);
-                        }
-                        debug!(
-                            "Ember: swept {} orphaned pending ping(s) older than {}s",
-                            stale.len(),
-                            MAX_PING_AGE.as_secs(),
-                        );
-                    }
-
-                    // The dev-panel DHT harness has the same two maps and had
-                    // no sweep at all: `ember_dht_pending_pings` and
-                    // `ember_dht_pending_finds` were only ever drained by a
-                    // matching wire reply. Every probe that timed out — a peer
-                    // that never answered, or a send that only reached
-                    // `OutgoingResult::Queued` because the handshake never
-                    // completed, so nothing went on the wire to be answered —
-                    // left its entry behind. A thousand of those and
-                    // `MAX_EMBER_PENDING_PINGS` refuses every further DHT ping
-                    // and find for the rest of the run, which reads as the
-                    // dev panel being broken.
-                    let before = state.ember_dht_pending_pings.len()
-                        + state.ember_dht_pending_finds.len();
-                    state
-                        .ember_dht_pending_pings
-                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
-                    state
-                        .ember_dht_pending_finds
-                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
-                    let swept = before
-                        - (state.ember_dht_pending_pings.len()
-                            + state.ember_dht_pending_finds.len());
-                    if swept > 0 {
-                        debug!(
-                            "Ember: swept {swept} orphaned DHT harness waiter(s) older than {}s",
-                            MAX_PING_AGE.as_secs(),
-                        );
-                    }
-                }
-
-                // Reap idle Noise sessions and pending handshakes. The
-                // documented TTLs in `EmberTransport::cleanup` (300s
-                // session, 30s pending) were previously dead code — only
-                // the absolute caps (`MAX_SESSIONS=4096`, `MAX_PENDING=512`)
-                // bounded growth. Calling the sweep on the same 30s
-                // cadence as flood-protection cleanup makes the TTL the
-                // primary eviction signal again, so memory tracks live
-                // peer activity instead of accumulating until the cap
-                // forces eviction.
-                state.ember_transport.cleanup();
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_flood_cleanup_tick(
+                    &mut state,
+                    &db,
+                    &app_handle,
+                    &mut banned_ips_sync_in_flight,
+                    &banned_ips_sync_tx,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'flood_cleanup_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -10282,87 +8641,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic nodes.dat save to protect against crashes
             _ = nodes_save_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if !nodes_save_in_flight {
-                    let ownership = state.nodes_save_lock.clone().lock_owned().await;
-                    let contacts = state.routing_table.export_bootstrap_contacts(200);
-                    let nodes_path = state.data_dir.join("nodes.dat");
-                    let tx = periodic_save_result_tx.clone();
-                    nodes_save_in_flight = true;
-                    nodes_save_started_at = Some(tokio::time::Instant::now());
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let _ownership = ownership;
-                            bootstrap::save_nodes_dat(&nodes_path, &contacts)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(|e| format!("nodes.dat save task failed: {e}"))
-                        .and_then(|r| r);
-                        let _ = tx.send(PeriodicSaveResult {
-                            job: PeriodicSaveJob::Nodes,
-                            result,
-                        });
-                    });
-                }
-                // Fold the live overlay into the remembered set and persist that
-                // (slice 7). Additive by construction: a peer that has just been
-                // evicted as an unresponsive lead stays in the cache, so this
-                // write can grow the file or refresh it but never cuts it down
-                // to whatever the table happens to hold five minutes into a
-                // session. Retiring an address is a once-per-session decision
-                // and belongs to the shutdown path. Still skipped when empty, so
-                // a brand-new profile doesn't churn a zero-contact file.
-                let live = ember_persistable_contacts(&state);
-                state.ember_bootstrap_cache.observe(live.iter());
-                let local_id = state.ember_dht.local_id();
-                // Bound the in-memory set here too, not only on the way out. It
-                // takes the whole replacement cache and every session peer every
-                // five minutes, and a peer answering FIND_NODE with invented
-                // contacts can inject fresh ids at will, so over a long session
-                // it would grow into the tens of thousands — and each save sorts
-                // the lot. Trimming to the same ceiling the file is written under
-                // discards only entries that could never have been saved anyway,
-                // and is a no-op below it.
-                state
-                    .ember_bootstrap_cache
-                    .trim_to(&local_id, EMBER_PERSIST_MAX_CONTACTS);
-                let ember_contacts = state
-                    .ember_bootstrap_cache
-                    .snapshot(&local_id, EMBER_PERSIST_MAX_CONTACTS);
-                if !ember_contacts.is_empty() {
-                    let ember_path = state.data_dir.join("nodes_ember.dat");
-                    // Off the loop, like the nodes.dat write above and for the
-                    // reason `spawn_save_server_met` documents: `save_nodes`
-                    // commits through `atomic_write`, so it fsyncs the file *and*
-                    // the parent directory inline. Running that in the select arm
-                    // stalled UDP receive, every timer and every transfer event for
-                    // the duration, and a full receive buffer drops KAD and Ember
-                    // packets outright.
-                    // Take ownership for the write so the shutdown writer, which
-                    // waits on the same lock, cannot have its newer snapshot
-                    // renamed over by a save spawned just before the loop exits.
-                    // `try_lock` rather than `lock().await`: this arm must never
-                    // block the event loop on disk I/O, and skipping a periodic
-                    // save is free — the next tick writes the same state. It gets
-                    // its own lock because `nodes_save_lock` is still held by the
-                    // nodes.dat task spawned a few lines above.
-                    let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
-                        return;
-                    };
-                    let nodes_file_state = state.ember_nodes_file;
-                    tokio::task::spawn_blocking(move || {
-                        let _ownership = ownership;
-                        if let Err(e) = ember::dht::bootstrap::save_nodes(
-                            &ember_path,
-                            &ember_contacts,
-                            nodes_file_state,
-                        ) {
-                            error!("Failed periodic nodes_ember.dat save: {e}");
-                        }
-                    });
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_nodes_save_tick(
+                    &mut state,
+                    &mut nodes_save_in_flight,
+                    &mut nodes_save_started_at,
+                    &periodic_save_result_tx,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'nodes_save_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -10397,452 +8683,111 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
 
             Some(result) = upnp_maintain_result_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                upnp_maintain_in_flight = false;
-                upnp_maintain_started_at = None;
-                // The pass that produced this result has finished; dropping a
-                // completed handle is what keeps the watchdog from aborting
-                // whichever pass happens to be running next.
-                upnp_maintain_handle = None;
-                if result.revision == upnp_mappings.revision() {
-                    let was_mapped = state.upnp_mapped;
-                    upnp_mappings = result.mappings;
-                    let mapped = result.mapped;
-                    state.upnp_mapped = mapped;
-                    state.stats.upnp_mapped = mapped;
-                    // A live inbound forward is `tcp_port -> tcp_port`, so it
-                    // is authoritative for what peers should dial. Re-run the
-                    // publish state whenever that changes so the advertise
-                    // atomic the upload listener reads follows immediately
-                    // rather than at the next unrelated update.
-                    let upnp_tcp_port = upnp_mappings.tcp_mapped().then_some(state.tcp_port);
-                    if state.upnp_tcp_port != upnp_tcp_port {
-                        state.upnp_tcp_port = upnp_tcp_port;
-                        update_publish_manager_state(&mut state);
-                    }
-                    if mapped && !was_mapped {
-                        // Same semantics as startup (`firewalled:
-                        // !upnp_success`): a fresh mapping means inbound
-                        // TCP should now reach us. The shared atomic is
-                        // only ever allowed to clear the firewalled flag
-                        // (see the sweep that consumes it), never assert
-                        // it, so this can't override a FirewallChecker
-                        // determination in the other direction.
-                        // Do not clear while the ed2k server has us on
-                        // LowID — that assignment is authoritative until
-                        // the server gives HighID.
-                        if !state.low_id {
-                            state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    // Always emit so deferred startup's first result (and
-                    // mid-session maintain) update the UI, including the
-                    // `gateway_found` bit when mapping stayed false.
-                    let _ = app_handle.emit(
-                        "upnp-status",
-                        serde_json::json!({
-                            "mapped": mapped,
-                            "gateway_found": upnp_mappings.has_gateway(),
-                            "auto_disabled": false,
-                            "tcp_port": state.tcp_port,
-                            "udp_port": state.udp_port,
-                        }),
-                    );
-                } else {
-                    debug!("Discarding stale UPnP maintenance result after mapping state changed");
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_upnp_maintain_result(
+                    result,
+                    &mut state,
+                    &app_handle,
+                    &mut upnp_maintain_handle,
+                    &mut upnp_maintain_in_flight,
+                    &mut upnp_maintain_started_at,
+                    &mut upnp_mappings,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'upnp_maintain_result_rx' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             Some(result) = nat_probe_result_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if result.generation != state.nat_probe_generation {
-                    debug!(
-                        "Ignoring stale NAT probe result generation {} (current {})",
-                        result.generation, state.nat_probe_generation
-                    );
-                    return;
-                }
-                nat_probe_in_flight = false;
-                nat_probe_started_at = None;
-                nat_probe_packet_tx = None;
-                let probe_mapped_v4 = result.info.external_addr.and_then(|a| match a.ip() {
-                    std::net::IpAddr::V4(ip) => Some(ip),
-                    std::net::IpAddr::V6(_) => None,
-                });
-                state.nat_info = result.info;
-                // A STUN keep-alive-confirmed mapping is more current than
-                // whatever this probe found (or failed to find) — restore it
-                // so a failed/partial probe cannot silently drop it.
-                if stun_udp_mapping_active(&state) {
-                    if let (Some(ip), Some(port)) =
-                        (state.external_ip, state.stun_sourced_udp_port)
-                    {
-                        let confirmed = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-                        state.nat_info.external_addr = Some(confirmed);
-                        if state.nat_info.nat_type == ember::nat::NatType::Unknown {
-                            state.nat_info.nat_type = ember::nat::NatType::PortRestricted;
-                        }
-                    }
-                }
-                if state.nat_info.nat_type == ember::nat::NatType::Unknown {
-                    nat_probe_backoff_until = Some(
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-                    );
-                } else {
-                    nat_probe_backoff_until = None;
-                }
-                // STUN may replace a KAD/Ember vote that won the startup race.
-                // A live HighID is left alone (TCP connect-back vs UDP mapping).
-                if let Some(ip) = probe_mapped_v4 {
-                    adopt_stun_mapped_external_ip(&mut state, ip);
-                }
-                if let Some(ext_ip) = state.external_ip {
-                    if state.nat_info.apply_highid_fallback(
-                        std::net::IpAddr::V4(ext_ip),
-                        state.udp_port,
-                    ) {
-                        info!(
-                            "NAT probe ({}) failed but external IP {} is confirmed — assuming PortRestricted (mapped {}:{})",
-                            result.reason, ext_ip, ext_ip, state.udp_port,
-                        );
-                    }
-                }
-                // Publish the final (post-fallback) nat_type/external_addr to
-                // spawned friend-dial tasks — see `FriendNatContext`.
-                {
-                    let mut ctx = state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner());
-                    ctx.nat_type = state.nat_info.nat_type;
-                    ctx.external_addr = state.nat_info.external_addr;
-                }
-                // Surface the class to the UI so the Friends page can be honest
-                // about a symmetric NAT, where friend hole-punching cannot work.
-                state.stats.nat_type = format!("{:?}", state.nat_info.nat_type);
-                maybe_suspend_stun_from_nat_type(&mut state);
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_nat_probe_result(
+                    result,
+                    &mut state,
+                    &mut nat_probe_backoff_until,
+                    &mut nat_probe_in_flight,
+                    &mut nat_probe_packet_tx,
+                    &mut nat_probe_started_at,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'nat_probe_result_rx' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             Some(result) = udp_map_ka_result_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Flags/sender are keyed by this cycle's local generation.
-                // `mapping_ka_generation` can be bumped by
-                // `reset_stun_keepalive_session` (STUN toggle / KAD
-                // disconnect) without touching those locals; a matching
-                // local generation must still release them so the timer
-                // is not stuck until the 90s watchdog. Payload is applied
-                // only while the global generation still matches, so a
-                // superseded cycle cannot re-populate advertise ports.
-                if Some(result.generation) != udp_map_ka_gen {
-                    return;
-                }
-                udp_map_ka_in_flight = false;
-                udp_map_ka_started_at = None;
-                udp_map_ka_gen = None;
-                udp_map_ka_packet_tx = None;
-                if result.generation == state.mapping_ka_generation {
-                    if let Some(mapped) = result.mapped {
-                        if apply_udp_mapping_keepalive(&mut state, mapped, &app_handle) {
-                            mapping_ka_cycle_success = true;
-                            // Confirmed (1:1 or 2-hit stable) — this is the
-                            // freshest known-good mapping, so it always wins
-                            // over whatever a NAT probe last found. A later
-                            // probe result restores this too (see
-                            // nat_probe_result_rx / stun_udp_mapping_active).
-                            // Deliberately does NOT set nat_type here — see the
-                            // matching comment in apply_udp_mapping_keepalive's
-                            // 1:1 branch for why inferring PortRestricted from a
-                            // keep-alive confirmation defeats the dedicated
-                            // NAT-type probe (and therefore auto-suspend).
-                            state.nat_info.external_addr = Some(mapped);
-                            // Friend dials read the address from here, and the
-                            // hole-punch is skipped outright while it is `None`.
-                            // The re-mapped branch of `apply_udp_mapping_keepalive`
-                            // publishes it, but the 1:1 branch — the common
-                            // outcome, and one that lands within seconds of
-                            // startup — used to leave friends waiting for the
-                            // dedicated probe to finish before punch was possible.
-                            {
-                                let mut ctx = state
-                                    .friend_nat_context
-                                    .write()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                ctx.external_addr = Some(mapped);
-                            }
-                        }
-                    }
-                }
-                if !udp_map_ka_in_flight
-                    && !tcp_map_ka_in_flight
-                    && !mapping_ka_cycle_success
-                {
-                    if state.stats.stun_keepalive_active {
-                        info!(
-                            "STUN keepalive: cycle {} without a confirmed UDP mapping or TCP hold — marking inactive until the next cycle",
-                            if result.mapped.is_none() { "timed out" } else { "completed" }
-                        );
-                    }
-                    state.stats.stun_keepalive_active = false;
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_udp_mapping_keepalive_result(
+                    result,
+                    &mut state,
+                    &app_handle,
+                    &mut mapping_ka_cycle_success,
+                    tcp_map_ka_in_flight,
+                    &mut udp_map_ka_gen,
+                    &mut udp_map_ka_in_flight,
+                    &mut udp_map_ka_packet_tx,
+                    &mut udp_map_ka_started_at,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'udp_map_ka_result_rx' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             Some(result) = tcp_map_ka_result_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Same local-vs-global split as the UDP arm: release this
-                // cycle's in-flight flag even after an external generation
-                // bump, but do not apply a superseded mapped port or fire a
-                // LowID remap reconnect from that payload.
-                if Some(result.generation) != tcp_map_ka_gen {
-                    return;
-                }
-                tcp_map_ka_in_flight = false;
-                tcp_map_ka_started_at = None;
-                tcp_map_ka_gen = None;
-                if result.generation == state.mapping_ka_generation {
-                    if apply_tcp_mapping_keepalive(&mut state, result.hold_ok, result.mapped, &app_handle) {
-                        mapping_ka_cycle_success = true;
-                    }
-                    // A reconnect that fails just falls back to the existing
-                    // backoff-driven auto-reconnect (which will use the
-                    // now-current `advertised_tcp_port` anyway) — see
-                    // `should_reconnect_for_tcp_remap` for the full rationale.
-                    let cooldown_elapsed = state
-                        .last_tcp_remap_reconnect_at
-                        .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
-                    // Deliberately not gated on UPnP: a LowID session is exactly
-                    // where a UPnP forward has been shown not to work, and
-                    // `advertised_tcp_port` already falls back to the STUN port in
-                    // that state, so this reconnect re-logs in on a port that has
-                    // not been tried yet rather than re-sending the same one.
-                    if should_reconnect_for_tcp_remap(
-                        state.low_id,
-                        state.server_connected,
-                        state.pending_server_connect.is_some(),
-                        state.external_tcp_port,
-                        state.server_login_tcp_port,
-                        cooldown_elapsed,
-                    ) {
-                        if let Some(addr) = state.server_addr {
-                            info!(
-                                "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",
-                                state.external_tcp_port, state.server_login_tcp_port
-                            );
-                            state.last_tcp_remap_reconnect_at = Some(std::time::Instant::now());
-                            initiate_server_connect(
-                                &mut state,
-                                &settings,
-                                &app_handle,
-                                &shared_server_addr,
-                                addr.ip().to_string(),
-                                addr.port(),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                if !udp_map_ka_in_flight
-                    && !tcp_map_ka_in_flight
-                    && !mapping_ka_cycle_success
-                {
-                    if state.stats.stun_keepalive_active {
-                        info!(
-                            "STUN keepalive: cycle completed without a confirmed UDP mapping or TCP hold (tcp_hold_ok={}) — marking inactive until the next cycle",
-                            result.hold_ok
-                        );
-                    }
-                    state.stats.stun_keepalive_active = false;
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_tcp_mapping_keepalive_result(
+                    result,
+                    &mut state,
+                    &settings,
+                    &app_handle,
+                    &shared_server_addr,
+                    &mut mapping_ka_cycle_success,
+                    &mut tcp_map_ka_gen,
+                    &mut tcp_map_ka_in_flight,
+                    &mut tcp_map_ka_started_at,
+                    udp_map_ka_in_flight,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'tcp_map_ka_result_rx' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             _ = tokio::time::sleep_until(next_mapping_ka_at) => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                let now = tokio::time::Instant::now();
-                if !state.stun_keepalive_enabled {
-                    state.stats.stun_keepalive_active = false;
-                    next_mapping_ka_at = now
-                        + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
-                    return;
-                }
-                if state.stun_ka_auto_suspended {
-                    state.stats.stun_keepalive_active = false;
-                    // Retry every ~5 minutes in case the path became full-cone/CGNAT.
-                    let cooldown = std::time::Duration::from_secs(300);
-                    let ready = state
-                        .stun_ka_suspended_at
-                        .is_none_or(|at| at.elapsed() >= cooldown);
-                    if !ready {
-                        next_mapping_ka_at = now
-                            + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
-                        return;
-                    }
-                    info!("STUN keepalive: retrying after auto-suspend cooldown");
-                    state.stun_ka_auto_suspended = false;
-                    state.stun_ka_suspended_at = None;
-                    state.stun_ka_candidate_port = None;
-                    state.stun_ka_stable_hits = 0;
-                    state.stun_ka_tcp_candidate_port = None;
-                    state.stun_ka_tcp_stable_hits = 0;
-                }
-                // Wait for any in-flight cycle; retry soon (not a full extra
-                // interval) so a slow STUN/TCP hold delays the next round by
-                // as little as possible. Realistic worst case is still 79s
-                // (3×(5+8)+4×(5+5) DNS+connect timeouts): UDP runs in
-                // parallel (≤ 5+5=10s). Pathological (~139s: every STUN
-                // write/read stage also times out) is abandoned at 90s on
-                // purpose — a cycle still running then has already missed four
-                // 20s keep-alive intervals.
-                if udp_map_ka_in_flight || tcp_map_ka_in_flight {
-                    next_mapping_ka_at = now + std::time::Duration::from_secs(1);
-                    return;
-                }
-                next_mapping_ka_at = now
-                    + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
-                // Probe UDP and TCP independently. Equal numeric port values
-                // do not conflict because each transport has its own socket
-                // namespace. QUIC is a fire-and-forget datagram from the real
-                // endpoint (no result to wait on) and is skipped until the
-                // endpoint exists. UDP and QUIC use adjacent STUN indices so
-                // they do not hit the same reflector in one cycle; the index
-                // then advances by one so UDP still walks sequentially.
-                state.mapping_ka_generation = state.mapping_ka_generation.wrapping_add(1);
-                mapping_ka_cycle_success = false;
-                let gen = state.mapping_ka_generation;
-                let ka_index = mapping_ka_server_index;
-                mapping_ka_server_index = mapping_ka_server_index.wrapping_add(1);
-                udp_map_ka_in_flight = true;
-                udp_map_ka_started_at = Some(tokio::time::Instant::now());
-                udp_map_ka_gen = Some(gen);
-                udp_map_ka_packet_tx = Some(spawn_udp_mapping_keepalive(
-                    udp_socket.clone(),
-                    udp_map_ka_result_tx.clone(),
-                    gen,
-                    ka_index,
-                ));
-                tcp_map_ka_in_flight = true;
-                tcp_map_ka_started_at = Some(tokio::time::Instant::now());
-                tcp_map_ka_gen = Some(gen);
-                let tcp_port = state.tcp_port;
-                let tx = tcp_map_ka_result_tx.clone();
-                tokio::spawn(async move {
-                    let (hold_ok, mapped) =
-                        ember::mapping_keepalive::tcp_mapping_cycle(tcp_port).await;
-                    let _ = tx.send(TcpMappingKeepaliveResult {
-                        generation: gen,
-                        hold_ok,
-                        mapped,
-                    });
-                });
-                if let Some(quic_ep) = state
-                    .connection_broker
-                    .as_ref()
-                    .and_then(|b| b.quic_endpoint().cloned())
-                {
-                    let quic_index = ka_index.wrapping_add(1);
-                    tokio::spawn(async move {
-                        ember::mapping_keepalive::quic_mapping_keepalive(quic_ep, quic_index)
-                            .await;
-                    });
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_mapping_keepalive_tick(
+                    &udp_socket,
+                    &mut state,
+                    &mut mapping_ka_cycle_success,
+                    &mut mapping_ka_server_index,
+                    &mut next_mapping_ka_at,
+                    &mut tcp_map_ka_gen,
+                    &mut tcp_map_ka_in_flight,
+                    &tcp_map_ka_result_tx,
+                    &mut tcp_map_ka_started_at,
+                    &mut udp_map_ka_gen,
+                    &mut udp_map_ka_in_flight,
+                    &mut udp_map_ka_packet_tx,
+                    &udp_map_ka_result_tx,
+                    &mut udp_map_ka_started_at,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'mapping_keepalive_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             Some(result) = rendezvous_register_result_rx.recv() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if result.generation != state.rendezvous_register_generation {
-                    debug!(
-                        "Ignoring stale rendezvous result generation {} (current {})",
-                        result.generation, state.rendezvous_register_generation
-                    );
-                    return;
-                }
-                rendezvous_register_in_flight = false;
-                rendezvous_register_started_at = None;
-                match result.result {
-                    Ok(outcome) => {
-                        // Classic `/register` succeeded. Latch registered *and*
-                        // `friend_presence_initial_done` even when intro
-                        // presence failed: existing friends still resolve via
-                        // pairwise, and leaving the latch unset would retry
-                        // the full 1+1+N mutation sequence every 10s.
-                        state.rendezvous_registered = true;
-                        state.last_presence_blocked = outcome.existing_friends_blocked();
-                        state.rendezvous_last_register = Some(std::time::Instant::now());
-                        state.rendezvous_register_fail_streak = 0;
-                        // Nothing else moves the room beat, so the one this
-                        // registration selected with is still current.
-                        state.rendezvous_published_beat = state.rendezvous_room_beat;
-                        state.rendezvous_room_beat = state.rendezvous_room_beat.wrapping_add(1);
-                        if result.initial {
-                            state.friend_presence_initial_done = true;
-                        }
-                        if state.last_presence_blocked {
-                            warn!(
-                                "Rendezvous: registered, but intro and all {} pairwise presence registration(s) failed — existing friends cannot resolve us (initial={})",
-                                outcome.pairwise_attempted,
-                                result.initial
-                            );
-                        } else if !outcome.intro_ok || outcome.pairwise_failed > 0 {
-                            debug!(
-                                "Rendezvous: registered with degraded presence intro_ok={} pairwise {}/{} (initial={})",
-                                outcome.intro_ok,
-                                outcome.pairwise_succeeded(),
-                                outcome.pairwise_attempted,
-                                result.initial
-                            );
-                        }
-                        let _ = app_handle.emit(
-                            "ember:friend-discoverable",
-                            friend_discoverable_event(&outcome, result.initial),
-                        );
-                    }
-                    Err(e) => {
-                        if result.initial {
-                            debug!("Initial rendezvous register failed: {e}");
-                        } else {
-                            debug!("Rendezvous heartbeat failed: {e}");
-                        }
-                        state.rendezvous_registered = false;
-                        state.last_presence_blocked = false;
-                        state.rendezvous_last_register = None;
-                        if !result.initial {
-                            state.rendezvous_register_fail_streak =
-                                state.rendezvous_register_fail_streak.saturating_add(1);
-                        }
-                        let _ = app_handle.emit(
-                            "ember:friend-discoverable",
-                            serde_json::json!({
-                                "discoverable": false,
-                                "reason": "rendezvous_error",
-                                // Distinguishes "never established presence"
-                                // from "held it and lost a heartbeat". Only the
-                                // former justifies telling the user outright
-                                // that friends cannot find them; a dropped
-                                // heartbeat is retried on the next tick and is
-                                // usually nothing, so the UI lets its own grace
-                                // period decide instead of reacting to one
-                                // missed beat.
-                                "initial": result.initial,
-                            }),
-                        );
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_rendezvous_register_result(
+                    result,
+                    &mut state,
+                    &app_handle,
+                    &mut rendezvous_register_in_flight,
+                    &mut rendezvous_register_started_at,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'rendezvous_register_result_rx' panicked: {}", describe_panic(&*__p));
                 }
@@ -10850,180 +8795,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Statistics rate recording (every second)
             _ = stats_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Fold in any completed-download BLAKE3 digests finished on the
-                // blocking pool since the last tick, so the file can be
-                // published to the Ember DHT and verified on later transfers.
-                // Drained here rather than in its own `select!` arm because
-                // this loop is already at tokio's 64-branch ceiling.
-                while let Ok((digest_hash, digest)) = ember_digest_result_rx.try_recv() {
-                    // Hashed from the completed bytes on this disk, so it
-                    // outranks any DHT claim about the same file.
-                    seed_ember_content_hash(
-                        &mut state.ember_content_hashes,
-                        digest_hash,
-                        digest,
-                        EmberDigestProvenance::Local,
-                    );
-                    let digest_hex = hex::encode(digest);
-                    if let Some(record) = known_files.find_by_hash_mut(&digest_hash) {
-                        if record.ember_file_hash != digest_hex {
-                            record.ember_file_hash = digest_hex.clone();
-                            known_files.mark_dirty();
-                        }
-                    }
-                    let hash_hex = hex::encode(digest_hash);
-                    let changed = {
-                        let mut index = local_index.write().await;
-                        index.set_ember_file_hash_by_hash(&hash_hex, &digest_hex)
-                    };
-                    if changed {
-                        debug!("Ember digest for {hash_hex} computed after completion");
-                    }
-                }
-                // Apply any enforced-ban rebuild whose DB reads finished on the
-                // blocking pool. A failed read arrives as `None` and keeps the
-                // current set (fail-closed) rather than wiping bans.
-                while let Ok(inputs) = banned_ips_sync_rx.try_recv() {
-                    banned_ips_sync_in_flight = false;
-                    if let Some((peers, auto_bans)) = inputs {
-                        let before = state.banned_ips.len();
-                        {
-                            let sm = source_manager.read().await;
-                            apply_enforced_banned_ips(
-                                &mut state,
-                                &shared_banned_ips,
-                                peers,
-                                auto_bans,
-                                &sm,
-                            );
-                        }
-                        if state.banned_ips.len() > MAX_BANNED_IPS {
-                            warn!(
-                                "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
-                                before,
-                                state.banned_ips.len()
-                            );
-                        }
-                    }
-                }
-                // Same deal for ed2k part hashsets recomputed after a
-                // completion that arrived without one: the record is written
-                // immediately with an empty hashset and patched here, so
-                // `known.met` gains the parts needed to serve the file without
-                // the completion path having blocked on the read.
-                while let Ok((hashset_hash, part_hashes)) = part_hashset_result_rx.try_recv() {
-                    if let Some(record) = known_files.find_by_hash_mut(&hashset_hash) {
-                        if record.part_hashes != part_hashes {
-                            record.part_hashes = part_hashes;
-                            known_files.mark_dirty();
-                            debug!(
-                                "ed2k hashset for {} computed after completion",
-                                hex::encode(hashset_hash)
-                            );
-                        }
-                    }
-                }
-                while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
-                    apply_channel_neighbor_lookup(
-                        &udp_socket,
-                        &mut state,
-                        lookup,
-                        &settings,
-                        ember_hash,
-                        ed25519_pubkey,
-                        ed25519_secret_key,
-                        &channel_relay_event_tx,
-                    )
-                    .await;
-                }
-                while let Ok(event) = channel_relay_event_rx.try_recv() {
-                    apply_channel_relay_event(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &app_handle,
-                        event,
-                    )
-                    .await;
-                }
-                if settings.ember_native_enabled {
-                    maybe_dial_channel_neighbors(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &settings,
-                        ember_hash,
-                        ed25519_pubkey,
-                        ed25519_secret_key,
-                        &channel_neighbor_lookup_tx,
-                    )
-                    .await;
-                    // Driven from the one-second tick rather than the minute
-                    // one it used to share with DHT maintenance. Its own
-                    // per-room gates decide when a walk actually happens, and
-                    // on the slow tick the shorter of those gates could not
-                    // mean anything: a room we are alone in asks every twenty
-                    // seconds, which a sixty-second caller rounds up to sixty
-                    // whatever the constant says.
-                    maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
-                    // On the same tick and for the same reason: the beat is
-                    // tens of seconds, which a minute-granularity caller cannot
-                    // express. Its own per-room gate decides when one is due.
-                    maybe_beat_channel_presence(&udp_socket, &mut state, &db, &settings).await;
-                    // Ahead of the emit, so a member heard from during this
-                    // tick is reported on this tick rather than the next.
-                    flush_channel_member_touches(&mut state, &db);
-                    emit_channel_presence_deltas(&mut state, &app_handle);
-                    maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
-                    drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
-                    // After the drain, so a verdict reached on this tick is
-                    // reported on this tick rather than the next.
-                    flush_channel_delivery_notes(&mut state, &db, &app_handle).await;
-                }
-                stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
-                stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
-                // Fold lock-free SX / file-request / EPX / Ember-DHT
-                // bytes into their Statistics-page categories. Without
-                // this drain, those rows only show traffic recorded
-                // directly on the network loop (server packets, KAD
-                // recv) and read zero for peer TCP / Ember UDP.
-                stats_manager.drain_sx_counters();
-                stats_manager.record_rate(chrono::Utc::now().timestamp());
-                // Keep the Statistics IPC cache in lock-step with the 1s rate
-                // tick. The heavy 5s cache refresh can skip while a prior write
-                // is still running; without this, the page lagged several
-                // seconds behind StatsManager under load.
-                {
-                    let snap = stats_manager.get_stats();
-                    *shared_transfer_stats.write().await = snap;
-                }
-                state.ip_filter.collect_shared_hits(&shared_ip_filter);
-                for (transfer_id, injected, remaining) in drain_active_source_overflow(&mut state) {
-                    debug!(
-                        "Drained {} overflow source(s) for active download {}, {} remaining queued",
-                        injected,
-                        transfer_id,
-                        remaining
-                    );
-                }
-                let (health_updates, speed_resets) = {
-                    let mut mgr = transfer_manager.write().await;
-                    mgr.refresh_health(chrono::Utc::now().timestamp())
-                };
-                for update in &health_updates {
-                    emit_transfer_health(&app_handle, update);
-                }
-                for sr in &speed_resets {
-                    let _ = app_handle.emit(
-                        "transfer-speed-decay",
-                        serde_json::json!({
-                            "id": sr.id,
-                            "speed": 0,
-                        }),
-                    );
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_stats_tick(
+                    &udp_socket,
+                    &mut state,
+                    &local_index,
+                    &settings,
+                    &bandwidth_limiter,
+                    &db,
+                    &app_handle,
+                    &transfer_manager,
+                    &source_manager,
+                    &mut stats_manager,
+                    &mut known_files,
+                    &shared_banned_ips,
+                    ember_hash,
+                    ed25519_pubkey,
+                    ed25519_secret_key,
+                    &mut banned_ips_sync_in_flight,
+                    &mut banned_ips_sync_rx,
+                    &mut channel_neighbor_lookup_rx,
+                    &channel_neighbor_lookup_tx,
+                    &mut channel_relay_event_rx,
+                    &channel_relay_event_tx,
+                    &mut ember_digest_result_rx,
+                    &mut part_hashset_result_rx,
+                    &shared_ip_filter,
+                    &shared_transfer_stats,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'stats_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -11218,133 +9018,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic known.met save (every 120s)
             _ = known_met_save_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if known_met_save_in_flight
-                    && known_met_save_started_at
-                        .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(300))
-                {
-                    warn!(
-                        "known.met save exceeded watchdog timeout; retaining serialized ownership and suppressing overlapping retries"
-                    );
-                }
-                sync_ember_publish_to_known(
-                    &state.ember_source_publish_unix,
-                    &state.ember_keyword_publish_unix,
+                let __panic_result = std::panic::AssertUnwindSafe(on_known_met_save_tick(
+                    &mut state,
                     &mut known_files,
-                );
-                // `is_authoritative` gates the attempt because this interval's
-                // first tick fires immediately, roughly half a second before the
-                // deferred known.met load lands. Without it every launch spent a
-                // blocking task and the save lock on a write `save` then refused,
-                // and reported the refusal back as `Ok(false)` — indistinguishable
-                // from a genuine known_paths.dat durability failure, so the arm
-                // below logged "save completed but companion was not durable"
-                // immediately after `save` had logged that it skipped. Nothing was
-                // lost either way (the catalog stays dirty and the next tick, by
-                // which time the load has landed, writes it), but the pair of
-                // contradictory warnings described a failure that never happened.
-                // The `|| !exists` arm mirrors `save`'s own condition, which
-                // refuses only when *both* hold. Gating on `is_authoritative`
-                // alone would also block a genuine first run — where there is no
-                // catalog on disk to protect and `save` would have written
-                // happily — and because `authoritative` is only ever set by the
-                // deferred load's absorb, a panic in that task would then skip
-                // every periodic save for the rest of the session.
-                if known_files.is_dirty()
-                    && (known_files.is_authoritative()
-                        || !state.data_dir.join("known.met").exists())
-                    && !known_met_save_in_flight
-                {
-                    let ownership = state
-                        .known_met_save_lock
-                        .clone()
-                        .lock_owned()
-                        .await;
-                    let known_path = state.data_dir.join("known.met");
-                    let generation = known_files.dirty_generation();
-                    let mut snapshot = known_files.clone();
-                    let tx = known_met_save_result_tx.clone();
-                    known_met_save_in_flight = true;
-                    known_met_save_started_at = Some(tokio::time::Instant::now());
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let _ownership = ownership;
-                            snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
-                        .and_then(|r| r);
-                        let _ = tx.send(KnownMetSaveResult { generation, result });
-                    });
-                }
-                while let Ok(hs) = aich_set_rx.try_recv() {
-                    // Cap aich_hash_sets to a sane upper bound. The
-                    // recovery sets are persisted to known2_64.met and
-                    // grow with the local file corpus; in normal use
-                    // this is bounded by user activity, but a buggy
-                    // hashing path or a maliciously-named file ingested
-                    // through the indexer could in principle insert
-                    // without limit. We refuse new sets past the cap
-                    // (rather than evicting) because dropping a stored
-                    // set risks losing the only AICH root we trust for
-                    // a file — eviction would silently downgrade
-                    // corruption-recovery integrity.
-                    if state.aich_hash_sets.len() >= MAX_AICH_HASH_SETS {
-                        warn!(
-                            "aich_hash_sets at cap ({}), dropping new set for root {}",
-                            MAX_AICH_HASH_SETS,
-                            hex::encode(hs.root_hash),
-                        );
-                        continue;
-                    }
-                    state.aich_hash_sets.push(hs);
-                }
-                // Gated on the set having actually grown, the way the
-                // `known.met` save above is gated on `is_dirty()`. Unconditional,
-                // this deep-cloned the whole recovery corpus on the event loop,
-                // re-serialised it in the blocking task and rewrote the file
-                // every 120s for the life of the session — at the loader's
-                // 64 MiB ceiling, tens of GiB of writes a day to persist bytes
-                // already on disk.
-                if !state.aich_hash_sets.is_empty()
-                    && known2_saved_len != Some(state.aich_hash_sets.len())
-                    && !known2_save_in_flight
-                {
-                    let known2_path = state.data_dir.join("known2_64.met");
-                    let hash_sets = state.aich_hash_sets.clone();
-                    known2_in_flight_len = hash_sets.len();
-                    let tx = periodic_save_result_tx.clone();
-                    known2_save_in_flight = true;
-                    known2_save_started_at = Some(tokio::time::Instant::now());
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            ed2k::aich::save_known2_met(&known2_path, &hash_sets)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(|e| format!("known2_64.met save task failed: {e}"))
-                        .and_then(|r| r);
-                        let _ = tx.send(PeriodicSaveResult {
-                            job: PeriodicSaveJob::Known2,
-                            result,
-                        });
-                    });
-                }
-
-                // Visibility for the other AICH cache. Same eviction-is-
-                // unsafe argument applies, so we surface a soft warning
-                // instead of silently dropping entries — operators
-                // running pathological libraries will see the log and
-                // can intervene (split shares, increase the cap).
-                if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
-                    warn!(
-                        "aich_root_map size {} above soft cap {}; \
-                         consider trimming the file library",
-                        state.aich_root_map.len(),
-                        MAX_AICH_ROOT_MAP_SOFT_CAP,
-                    );
-                }
-                }).catch_unwind().await;
+                    &mut aich_set_rx,
+                    &mut known2_in_flight_len,
+                    &mut known2_save_in_flight,
+                    &mut known2_save_started_at,
+                    known2_saved_len,
+                    &mut known_met_save_in_flight,
+                    &known_met_save_result_tx,
+                    &mut known_met_save_started_at,
+                    &periodic_save_result_tx,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'known_met_save_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -11442,388 +9130,73 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
 
             _ = ember_maintenance_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Background health loop. `force = false`: honour the
-                // staleness gates so steady-state churn stays low.
-                //
-                // Run when there are contacts to maintain, or when the table is
-                // empty but we hold something the bridge could bootstrap from —
-                // Ember peers learned from KAD source tags (dialed over Noise_IK)
-                // or from eD2K sessions (dialed over Noise_XX). An idle node with
-                // nothing to work with stays quiet.
-                //
-                // The remembered address book counts as work on its own. Every
-                // other condition here is live state, and all of it is
-                // perishable: contacts fault out after three missed pings,
-                // `ember_noise_keys` expires on `KNOWN_EMBER_PEER_TTL`, keyless
-                // peers and friend sessions go with their eD2K sessions. A
-                // suspend/resume, an interface or VPN change, an `ipfilter.dat`
-                // reload or simply a long stretch offline can empty all of them
-                // together — and then the one thing that could still get us
-                // back, the book on disk, was unreachable, because the top-up
-                // that offers it and the `rearm_offers` that makes a spent book
-                // offerable again both run *inside* this cycle. Nothing outside
-                // it can add a contact when no peer knows us and the eD2K side
-                // is quiet too, so the node stayed dark until it was restarted.
-                // That is the restart-only ratchet `peer_cache` exists to break.
-                let mut ember_has_work = state.ember_dht.contact_count() > 0
-                    || !state.ember_session_dht_contacts.is_empty()
-                    || !state.ember_noise_keys.is_empty()
-                    || !state.ember_keyless_peers.is_empty()
-                    || state.ember_bootstrap_cache.remembered_len() > 0;
-                // A live friend session counts on its own. It is the one
-                // bootstrap path that needs no dialable address for the peer
-                // introducing us, so the node it matters most to — a cold join
-                // whose only peer is a friend behind a relayed session — has
-                // every condition above empty. Without this the friend ask
-                // could never fire in the case it exists for. Read last, so the
-                // lock is only taken when the cheap checks all missed.
-                if settings.ember_native_enabled && !ember_has_work {
-                    ember_has_work = state
-                        .ember_sessions
-                        .read()
-                        .await
-                        .values()
-                        .any(|h| h.is_fresh() && h.is_secure_v2());
-                }
-                if settings.ember_native_enabled && ember_has_work {
-                    let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
-                    maybe_publish_channel_presence(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &settings,
-                        &identity,
-                    )
-                    .await;
-                    publish_channel_departures(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &settings,
-                        &identity,
-                    )
-                    .await;
-                    maybe_publish_owned_channel_records(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &settings,
-                        &identity,
-                    )
-                    .await;
-                }
-                if settings.ember_native_enabled {
-                    // Release per-author flood slots for members who have gone
-                    // quiet. Without this the map fills in a busy room and then
-                    // refuses newcomers, since an untracked author has to be
-                    // refused rather than waved through.
-                    ember::channel::prune_rate_windows(
-                        &mut state.channel_gossip_author_times,
-                        std::time::Instant::now(),
-                        std::time::Duration::from_secs(60),
-                    );
-                    // Same reclaim for the catch-up budget: its entries only
-                    // mean anything for a minute, and holding them past that
-                    // fills the map with requesters who asked once and left.
-                    ember::channel::prune_rate_windows(
-                        &mut state.channel_history_sync_times,
-                        std::time::Instant::now(),
-                        std::time::Duration::from_secs(60),
-                    );
-                    // And the hop admission map, which was the one being
-                    // missed. It refuses any unseen hop once
-                    // `CHANNEL_GOSSIP_IN_PEER_CAP` slots are held, and DHT
-                    // churn alone fills it, so without this sweep a long
-                    // session quietly stopped accepting channel traffic from
-                    // anyone it had not already spoken to until the next
-                    // restart.
-                    ember::channel::prune_rate_windows(
-                        &mut state.channel_gossip_from_times,
-                        std::time::Instant::now(),
-                        std::time::Duration::from_secs(60),
-                    );
-                    maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)
-                        .await;
-                    maybe_refresh_channel_handoff(&udp_socket, &mut state, &db, &settings)
-                        .await;
-                    maybe_refresh_channel_key_epoch(
-                        &udp_socket,
-                        &mut state,
-                        &db,
-                        &settings,
-                        &identity,
-                    )
-                    .await;
-                }
-
-                // Nothing to bridge from means nobody has crossed our path yet.
-                // Ask KAD directly for other Ember nodes. The 1 Hz search timer
-                // drives the same helper until the first lookup starts, because
-                // this tick cannot: its first evaluation is too early for KAD to
-                // be up and its second is a minute later.
-                maybe_start_ember_rendezvous_lookup(
+                let __panic_result = std::panic::AssertUnwindSafe(on_ember_maintenance_tick(
+                    &udp_socket,
                     &mut state,
+                    &settings,
+                    &db,
                     &app_handle,
-                    settings.ember_native_enabled,
-                );
-                }).catch_unwind().await;
+                    &identity,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_maintenance_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             _ = source_count_sync_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                let hashes = {
-                    let index = local_index.read().await;
-                    index.all_hashes()
-                };
-                if hashes.is_empty() {
-                    return;
-                }
-                // Library "Peers" = known complete copies (active download PFS)
-                // and/or KAD peers that ACK'd our source publish. Do NOT use
-                // SourceManager::source_count — that counts every known peer
-                // including incomplete ones and inflated the column.
-                // `per_file_sources` is keyed by transfer id, so answering
-                // "how many complete sources for this hash" from it is a
-                // linear scan. Done once per shared file that was
-                // O(shared files × tracked files) every 60s on the event loop
-                // — tens of millions of comparisons for a large library.
-                // Invert it once instead, then probe.
-                let complete_by_hash: HashMap<[u8; 16], u32> = {
-                    let mut m: HashMap<[u8; 16], u32> =
-                        HashMap::with_capacity(state.per_file_sources.len());
-                    for pfs in state.per_file_sources.values() {
-                        let count = u32::from(pfs.complete_source_count());
-                        m.entry(pfs.file_hash)
-                            .and_modify(|c| *c = (*c).max(count))
-                            .or_insert(count);
-                    }
-                    m
-                };
-                let mut computed: Vec<(String, [u8; 16], u32)> = Vec::with_capacity(hashes.len());
-                for hash_hex in &hashes {
-                    let hash_bytes: [u8; 16] = match hex::decode(hash_hex) {
-                        Ok(b) if b.len() == 16 => {
-                            let mut h = [0u8; 16];
-                            h.copy_from_slice(&b);
-                            h
-                        }
-                        _ => continue,
-                    };
-                    let mut count = complete_by_hash.get(&hash_bytes).copied().unwrap_or(0);
-                    // Purely-shared files (never searched/downloaded) have no
-                    // PFS entry; fall back to KAD publish ACKs — peers that
-                    // stored our source record. Local copy is not counted.
-                    let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-                    if let Some(&ack_count) = state.source_publish_acks.get(&kad_hash) {
-                        count = count.max(ack_count);
-                    }
-                    computed.push((hash_hex.clone(), hash_bytes, count));
-                }
-
-                let mut updates: Vec<(String, [u8; 16], u32)> = Vec::new();
-                {
-                    let index = local_index.read().await;
-                    for (hash_hex, hash_bytes, count) in &computed {
-                        let current = index
-                            .get_by_hash(hash_hex)
-                            .map(|f| f.complete_sources)
-                            .unwrap_or(0);
-                        if current != *count {
-                            updates.push((hash_hex.clone(), *hash_bytes, *count));
-                        }
-                    }
-                }
-
-                if updates.is_empty() {
-                    return;
-                }
-
-                {
-                    let mut index = local_index.write().await;
-                    for (hash_hex, _, count) in &updates {
-                        index.update_complete_sources(hash_hex, *count);
-                    }
-                }
-                // Persist so Library shows last-known Peers at next startup
-                // (including clearing to 0 when the gauge drops).
-                let mut known_dirty = false;
-                for (_, hash_bytes, count) in &updates {
-                    if let Some(record) = known_files.find_by_hash_mut(hash_bytes) {
-                        if record.complete_sources != *count {
-                            record.complete_sources = *count;
-                            known_dirty = true;
-                        }
-                    }
-                }
-                if known_dirty {
-                    known_files.mark_dirty();
-                }
-                let li_ref = local_index.clone();
-                let s_files = shared_files.clone();
-                let app_for_peers = app_handle.clone();
-                let changed_count = updates.len();
-                let kad_connected = state.stats.status == NetworkStatus::Connected;
-                let srv_connected = state.server_connected;
-                let ember_live =
-                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
-                let kad_published = state.publish_manager.source_published_md4_hashes();
-                let ed2k_offered = state.offered_ed2k_hashes.clone();
-                let ember_published = state.ember_published_sources.clone();
-                tokio::spawn(async move {
-                    let file_snap = {
-                        let index = li_ref.read().await;
-                        let mut snap = index.all_files().to_vec();
-                        apply_publish_badges(
-                            &mut snap,
-                            kad_connected,
-                            srv_connected,
-                            ember_live,
-                            &kad_published,
-                            &ed2k_offered,
-                            &ember_published,
-                        );
-                        snap
-                    };
-                    *s_files.write().await = file_snap;
-                    // Library only refreshes on this event (or scan done) —
-                    // without it the Peers column stayed stale for the
-                    // whole session after the initial load.
-                    let _ = app_for_peers.emit(
-                        "shared-files-changed",
-                        serde_json::json!({
-                            "phase": "peer-counts",
-                            "count": changed_count,
-                        }),
-                    );
-                });
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_source_count_sync_tick(
+                    &state,
+                    &local_index,
+                    &settings,
+                    &app_handle,
+                    &mut known_files,
+                    &shared_files,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'source_count_sync_timer' panicked: {}", describe_panic(&*__p));
                 }
             }
 
             _ = watchdog_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                let now = chrono::Utc::now().timestamp();
-
-                if state.server_connected
-                    && state.server_connection.is_some()
-                    && now.saturating_sub(last_server_activity_at) > 120
-                {
-                    handle_server_disconnect(
-                        &mut state,
-                        &shared_server_addr,
-                        &app_handle,
-                        "watchdog: no server activity for 120s",
-                    ).await;
-                }
-
-                if cache_write_handle.as_ref().is_some_and(|h| !h.is_finished())
-                    && last_cache_refresh_started_at > 0
-                    && now.saturating_sub(last_cache_refresh_started_at) > 20
-                {
-                    warn!(
-                        "Watchdog: cache refresh still running after {}s; leaving it owned so the cache bundle cannot be partially applied by abort",
-                        now.saturating_sub(last_cache_refresh_started_at)
-                    );
-                    last_cache_refresh_started_at = 0;
-                }
-
-                let timed_out = |started: Option<tokio::time::Instant>, limit: std::time::Duration| {
-                    started.is_some_and(|started| started.elapsed() > limit)
-                };
-                if nodes_save_in_flight && timed_out(nodes_save_started_at, SHORT_IO_WATCHDOG) {
-                    warn!(
-                        "Watchdog: nodes.dat save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
-                    );
-                }
-                if spam_save_in_flight && timed_out(spam_save_started_at, SHORT_IO_WATCHDOG) {
-                    warn!("Watchdog: spam-filter save exceeded timeout; allowing next retry");
-                    spam_save_in_flight = false;
-                    spam_save_started_at = None;
-                }
-                if stats_save_in_flight && timed_out(stats_save_started_at, PERIODIC_SAVE_WATCHDOG) {
-                    warn!("Watchdog: statistics save exceeded timeout; allowing next retry");
-                    stats_save_in_flight = false;
-                    stats_save_started_at = None;
-                }
-                if reputation_save_in_flight
-                    && timed_out(reputation_save_started_at, PERIODIC_SAVE_WATCHDOG)
-                {
-                    warn!(
-                        "Watchdog: reputation save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
-                    );
-                }
-                if known2_save_in_flight && timed_out(known2_save_started_at, PERIODIC_SAVE_WATCHDOG) {
-                    warn!(
-                        "Watchdog: known2_64.met save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
-                    );
-                }
-                if upnp_maintain_in_flight
-                    && timed_out(upnp_maintain_started_at, PERIODIC_SAVE_WATCHDOG)
-                {
-                    warn!("Watchdog: UPnP maintenance exceeded timeout; aborting it and allowing next retry");
-                    // Abort before clearing the flag. Left running it is
-                    // unobservable — nothing joins it and its result is
-                    // discarded on arrival by the revision check — so it would
-                    // only sit on a gateway socket while the pass we are about
-                    // to allow does the same work.
-                    if let Some(handle) = upnp_maintain_handle.take() {
-                        handle.abort();
-                    }
-                    upnp_maintain_in_flight = false;
-                    upnp_maintain_started_at = None;
-                }
-                if nat_probe_in_flight && timed_out(nat_probe_started_at, NAT_PROBE_WATCHDOG) {
-                    warn!("Watchdog: NAT probe exceeded timeout; allowing next retry");
-                    state.nat_probe_generation =
-                        state.nat_probe_generation.saturating_add(1);
-                    nat_probe_in_flight = false;
-                    nat_probe_started_at = None;
-                    nat_probe_packet_tx = None;
-                    nat_probe_backoff_until = Some(
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-                    );
-                }
-                if (udp_map_ka_in_flight
-                    && timed_out(udp_map_ka_started_at, MAPPING_KA_WATCHDOG))
-                    || (tcp_map_ka_in_flight
-                        && timed_out(tcp_map_ka_started_at, MAPPING_KA_WATCHDOG))
-                {
-                    warn!(
-                        "Watchdog: STUN mapping keepalive exceeded timeout; allowing next retry"
-                    );
-                    state.mapping_ka_generation =
-                        state.mapping_ka_generation.wrapping_add(1);
-                    udp_map_ka_in_flight = false;
-                    tcp_map_ka_in_flight = false;
-                    udp_map_ka_started_at = None;
-                    tcp_map_ka_started_at = None;
-                    udp_map_ka_gen = None;
-                    tcp_map_ka_gen = None;
-                    udp_map_ka_packet_tx = None;
-                    state.stats.stun_keepalive_active = false;
-                }
-
-                if !state.pending_downloads.is_empty()
-                    && network_ready_for_sources(&state)
-                    && now.saturating_sub(last_kad_activity_at) > 180
-                {
-                    for pending in state.pending_downloads.values_mut() {
-                        pending.last_search_at = 0;
-                    }
-                    debug!(
-                        "Watchdog: no UDP activity for {}s with {} pending downloads; forcing immediate source refresh",
-                        now.saturating_sub(last_kad_activity_at),
-                        state.pending_downloads.len()
-                    );
-                    last_kad_activity_at = now;
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_watchdog_tick(
+                    &mut state,
+                    &app_handle,
+                    &shared_server_addr,
+                    &cache_write_handle,
+                    known2_save_in_flight,
+                    known2_save_started_at,
+                    &mut last_cache_refresh_started_at,
+                    &mut last_kad_activity_at,
+                    last_server_activity_at,
+                    &mut nat_probe_backoff_until,
+                    &mut nat_probe_in_flight,
+                    &mut nat_probe_packet_tx,
+                    &mut nat_probe_started_at,
+                    nodes_save_in_flight,
+                    nodes_save_started_at,
+                    reputation_save_in_flight,
+                    reputation_save_started_at,
+                    &mut spam_save_in_flight,
+                    &mut spam_save_started_at,
+                    &mut stats_save_in_flight,
+                    &mut stats_save_started_at,
+                    &mut tcp_map_ka_gen,
+                    &mut tcp_map_ka_in_flight,
+                    &mut tcp_map_ka_started_at,
+                    &mut udp_map_ka_gen,
+                    &mut udp_map_ka_in_flight,
+                    &mut udp_map_ka_packet_tx,
+                    &mut udp_map_ka_started_at,
+                    &mut upnp_maintain_handle,
+                    &mut upnp_maintain_in_flight,
+                    &mut upnp_maintain_started_at,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'watchdog_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -11831,68 +9204,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic UDP source requests (eMule UDPSERVERREASKTIME)
             _ = server_udp_source_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if !network_ready_for_sources(&state) {
-                    return;
-                }
-                let mut all_for_udp: Vec<([u8; 16], u64)> = state.pending_downloads.values()
-                    .filter(|pd| !pd.control.is_cancelled())
-                    .filter_map(|pd| {
-                        let hash_bytes = hex::decode(&pd.file_hash).ok()?;
-                        if hash_bytes.len() != 16 {
-                            return None;
-                        }
-                        let mut fh = [0u8; 16];
-                        fh.copy_from_slice(&hash_bytes);
-                        Some((fh, pd.file_size))
-                    })
-                    .collect();
-
-                // Also query servers for active downloads (not just pending)
-                {
-                    let mgr = transfer_manager.read().await;
-                    let mut seen: std::collections::HashSet<[u8; 16]> = all_for_udp.iter().map(|(fh, _)| *fh).collect();
-                    for tid in state.active_source_senders.keys() {
-                        if let Some(transfer) = mgr.get_transfer(tid) {
-                            if let Ok(hash_bytes) = hex::decode(&transfer.file_hash) {
-                                if hash_bytes.len() == 16 {
-                                    let mut fh = [0u8; 16];
-                                    fh.copy_from_slice(&hash_bytes);
-                                    if seen.insert(fh) {
-                                        all_for_udp.push((fh, transfer.total_size));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if all_for_udp.is_empty() { return; }
-                let total_downloads = all_for_udp.len();
-                // Filter out files that already have enough sources
-                let mut need_sources: Vec<([u8; 16], u64)> = Vec::new();
-                {
-                    let sm = source_manager.read().await;
-                    for (fh, file_size) in all_for_udp {
-                        if sm.source_count(&fh) < MAX_SOURCES_FOR_UDP {
-                            need_sources.push((fh, file_size));
-                        }
-                    }
-                }
-                if !need_sources.is_empty() {
-                    // eMule packs multiple file hashes per server packet (up to 35)
-                    let packets = build_all_getsources_packets_multi(&mut state, &need_sources);
-                    if !packets.is_empty() {
-                        let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                        let queued = packets.len().min(room);
-                        debug!("Queuing {}/{} packed UDP source packets for {} files across servers",
-                            queued, packets.len(), need_sources.len());
-                        state.udp_source_queue.extend(packets.into_iter().take(room));
-                    }
-                }
-                debug!("Periodic UDP source sweep for {} downloads ({} need sources)",
-                    total_downloads, need_sources.len());
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_server_udp_source_tick(
+                    &mut state,
+                    &transfer_manager,
+                    &source_manager,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'server_udp_source_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -11901,102 +9219,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule ProcessLocalRequests(): batch TCP OP_GETSOURCES over the
             // active server connection every 4 min, up to 15 per frame.
             _ = server_tcp_source_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.server_connection.is_none() { return; }
-                // Shares the frame budget with the starved re-ask and warm-start
-                // paths, so this 4-minute tick is a poll rather than a licence:
-                // whichever path last spent the frame sets the floor for all
-                // three. See `SERVER_TCP_SRCREQ_INTERVAL_SECS`.
-                let srcreq_now = chrono::Utc::now().timestamp();
-                if !server_tcp_srcreq_frame_open(&state, srcreq_now) { return; }
-
-                let mut all_downloads: Vec<(String, [u8; 16], u64, usize)> = Vec::new();
-
-                {
-                    let sm = source_manager.read().await;
-                    for (tid, pd) in &state.pending_downloads {
-                        if pd.control.is_cancelled() { continue; }
-                        if let Ok(raw) = hex::decode(&pd.file_hash) {
-                            if raw.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&raw[..16]);
-                                let src_count = sm.source_count(&fh);
-                                all_downloads.push((tid.clone(), fh, pd.file_size, src_count));
-                            }
-                        }
-                    }
-                }
-
-                // Also include active downloads
-                {
-                    let mgr = transfer_manager.read().await;
-                    let sm = source_manager.read().await;
-                    let seen: std::collections::HashSet<String> = all_downloads.iter().map(|(t, _, _, _)| t.clone()).collect();
-                    for tid in state.active_source_senders.keys() {
-                        if seen.contains(tid) { continue; }
-                        if let Some(transfer) = mgr.get_transfer(tid) {
-                            if let Ok(raw) = hex::decode(&transfer.file_hash) {
-                                if raw.len() == 16 {
-                                    let mut fh = [0u8; 16];
-                                    fh.copy_from_slice(&raw[..16]);
-                                    let src_count = sm.source_count(&fh);
-                                    all_downloads.push((tid.clone(), fh, transfer.total_size, src_count));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Prioritize files with fewer sources; skip files already
-                // at the soft source cap (same gate as UDP/KAD sweeps).
-                all_downloads.retain(|(_, _, _, sc)| *sc < MAX_SOURCES_FOR_UDP);
-                if all_downloads.is_empty() { return; }
-                all_downloads.sort_by_key(|(_, _, _, sc)| *sc);
-
-                let total = all_downloads.len();
-                let cursor = state.server_tcp_getsources_cursor % total;
-                let batch_size = SERVER_TCP_SRCREQ_MAX_PER_FRAME.min(total);
-                let mut sent = 0u32;
-                close_server_tcp_srcreq_frame(&mut state, srcreq_now);
-
-                if let Some(conn) = state.server_connection.as_mut() {
-                    for i in 0..batch_size {
-                        let idx = (cursor + i) % total;
-                        let (_, ref fh, file_size, _) = all_downloads[idx];
-                        match conn.send_get_sources(fh, file_size).await {
-                            Ok(bytes) => {
-                                if bytes > 0 {
-                                    sent += 1;
-                                    // Periodic TCP source-asking sweep also counts as
-                                    // SourceExchange overhead — same wire flow as the
-                                    // login-time and on-demand requests below.
-                                    stats_manager.add_overhead(
-                                        crate::storage::statistics::OverheadCategory::SourceExchange,
-                                        crate::storage::statistics::OverheadDirection::Upload,
-                                        bytes,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                // Sequential 30 s-timeout TCP writes on the
-                                // network task: continuing past a failure makes
-                                // the whole frame cost `batch_size` timeouts
-                                // with nothing to show for it. The cursor still
-                                // advances, so the next sweep starts elsewhere.
-                                warn!(
-                                    "TCP source batch: OP_GETSOURCES write failed: {e} — abandoning the rest of this frame"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                state.server_tcp_getsources_cursor = (cursor + batch_size) % total;
-                if sent > 0 {
-                    info!("TCP source batch: sent OP_GETSOURCES for {sent}/{batch_size} downloads (cursor at {}/{})", state.server_tcp_getsources_cursor, total);
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_server_tcp_source_tick(
+                    &mut state,
+                    &transfer_manager,
+                    &source_manager,
+                    &mut stats_manager,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'server_tcp_source_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -12004,107 +9234,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // USS: send a KAD Ping to the selected host for RTT measurement
             _ = uss_ping_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-                if !state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some((addr, _)) = state.uss_host.take() {
-                        state.uss_prev_host = Some(addr);
-                    }
-                    state.pending_uss_pings.clear();
-                    state.uss_missed_pongs = 0;
-                    return;
-                }
-                let now_ts = chrono::Utc::now().timestamp();
-                const USS_PING_TIMEOUT_SECS: u64 = 3;
-
-                // Count timed-out in-flight pings as misses, then drop them.
-                // Do NOT increment on send — that falsely rotates hosts when
-                // RTT is merely slower than the 2s timer interval.
-                let timed_out: Vec<SocketAddr> = state
-                    .pending_uss_pings
-                    .iter()
-                    .filter(|(_, sent)| sent.elapsed().as_secs() >= USS_PING_TIMEOUT_SECS)
-                    .map(|(addr, _)| *addr)
-                    .collect();
-                for addr in timed_out {
-                    state.pending_uss_pings.remove(&addr);
-                    state.uss_missed_pongs = state.uss_missed_pongs.saturating_add(1);
-                }
-
-                // Rotate host every 5 minutes or after 3 consecutive timed-out pings
-                let should_rotate = state.uss_host.is_some()
-                    && (state.uss_missed_pongs >= 3 || now_ts.saturating_sub(state.uss_host_selected_at) > 300);
-                if should_rotate {
-                    debug!(
-                        "USS: rotating ping host (missed={}, age={}s)",
-                        state.uss_missed_pongs,
-                        now_ts.saturating_sub(state.uss_host_selected_at)
-                    );
-                    if let Some((addr, _)) = state.uss_host.take() {
-                        state.uss_prev_host = Some(addr);
-                        state.pending_uss_pings.remove(&addr);
-                    }
-                }
-
-                // Select a host if needed (prefer not re-picking the just-rotated
-                // one, but fall back to it when it is the only eligible contact —
-                // otherwise a single-peer KAD table leaves USS stuck with no host
-                // and the Preparing min upload forever).
-                if state.uss_host.is_none() {
-                    let exclude = state.uss_prev_host;
-                    let all_eligible: Vec<_> = state
-                        .routing_table
-                        .all_contacts()
-                        .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
-                        .cloned()
-                        .collect();
-                    let mut candidates: Vec<_> = all_eligible
-                        .iter()
-                        .filter(|c| {
-                            let addr = SocketAddr::new(c.ip.into(), c.udp_port);
-                            exclude != Some(addr)
-                        })
-                        .cloned()
-                        .collect();
-                    if candidates.is_empty() {
-                        candidates = all_eligible;
-                    }
-                    // Prefer a stable pick among eligible contacts rather than
-                    // always the first table entry (which caused sticky reselect
-                    // of the same dead peer after rotation when alternatives exist).
-                    let candidate = if candidates.is_empty() {
-                        None
-                    } else {
-                        let idx = (now_ts.unsigned_abs() as usize) % candidates.len();
-                        Some(candidates[idx].clone())
-                    };
-                    if let Some(contact) = candidate {
-                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                        state.uss_host = Some((addr, contact.id));
-                        state.uss_missed_pongs = 0;
-                        state.uss_host_selected_at = now_ts;
-                        info!("USS: selected ping host {addr}");
-                    }
-                }
-
-                // Send at most one in-flight Ping per host so a late pong cannot
-                // measure against a newer overwrite of the send timestamp.
-                if let Some((addr, ref contact_id)) = state.uss_host {
-                    if !state.pending_uss_pings.contains_key(&addr) {
-                        let msg = KadMessage::Ping;
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            match send_kad_packet(&udp_socket, &packet, addr, &state, contact_id).await {
-                                Ok(_) => {
-                                    state.pending_uss_pings.insert(addr, std::time::Instant::now());
-                                }
-                                Err(e) => {
-                                    debug!("USS: failed to send ping to {addr}: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_uss_ping_tick(
+                    &udp_socket,
+                    &mut state,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'uss_ping_timer' panicked: {}", describe_panic(&*__p));
                 }
@@ -12112,274 +9247,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Refresh shared peer/stats caches for frontend reads (non-blocking)
             _ = cache_refresh_timer.tick() => {
-                let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Skip if previous write task hasn't finished yet — avoids
-                // accumulating queued writers on the RwLocks which would starve
-                // Tauri IPC read handlers and freeze the UI.
-                if cache_write_handle.as_ref().is_some_and(|h| !h.is_finished()) {
-                    return;
-                }
-
-                // Collect raw contact data quickly (no hex/distance computation).
-                // The expensive conversions happen in the spawned background task.
-                let local_id = state.local_id;
-                let raw_contacts: Vec<_> = state.routing_table.all_contacts()
-                    .take(500)
-                    .map(|c| {
-                        let nick = state.peer_nicknames.get(&c.id).cloned().unwrap_or_default();
-                        (c.clone(), nick)
-                    })
-                    .collect();
-
-                state.stats.connected_peers = state.routing_table.len() as u32;
-                state.stats.kad_users_estimate = state.routing_table.estimate_count();
-                state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
-                state.stats.download_speed = bandwidth_limiter.smoothed_download_speed();
-                state.stats.total_uploaded = bandwidth_limiter.total_uploaded();
-                state.stats.total_downloaded = bandwidth_limiter.total_downloaded();
-                state.stats.upnp_mapped = state.upnp_mapped;
-                state.stats.buddy_status = match state.buddy_manager.state() {
-                    BuddyState::NoBuddy => {
-                        if let Some(bid) = state.buddy_manager.serving_for() {
-                            format!("serving:{}", bid)
-                        } else {
-                            "none".to_string()
-                        }
-                    }
-                    BuddyState::FindingBuddy => "searching".to_string(),
-                    BuddyState::Connected => {
-                        if let Some(bid) = state.buddy_manager.buddy_id() {
-                            format!("connected:{}", bid)
-                        } else {
-                            "connected".to_string()
-                        }
-                    }
-                };
-                state.stats.external_ip = state
-                    .external_ip
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_default();
-                // Do not swap `tcp_connect_back_shared` here — the firewall-sync
-                // arm is the sole consumer. Dual swap was discarding probe proof
-                // under LowID before that arm could record it.
-                let fw_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-                if state.low_id {
-                    if !fw_shared {
-                        state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if !state.firewalled {
-                        // Sticky LowID keeps the aggregate badge; do not wipe
-                        // tcp_status Open via note_tcp_firewalled.
-                        state.firewalled = true;
-                    }
-                } else if state.firewalled && !fw_shared {
-                    // UPnP optimism only — do not mark tcp_status Open.
-                    state.firewalled = false;
-                }
-                state.stats.firewalled = state.firewalled;
-                // Keep polled NetworkStats in lockstep with the checker.
-                // Connect-backs used to flip the checker to Open while leaving
-                // stats.tcp_status as "Unknown", so the UI poll briefly
-                // clobbered a correct firewall-status event back to Unknown.
-                state.stats.tcp_status =
-                    format!("{:?}", state.firewall_checker.tcp_status());
-                state.stats.udp_status =
-                    format!("{:?}", state.firewall_checker.udp_status());
-                update_publish_manager_state(&mut state);
-
-                // Was a second, hand-copied transcription of
-                // `kad_searches_snapshot` kept in sync by comment alone, and it
-                // had already drifted: the copy never grew the routing-walk
-                // branch of the `responses` count, so whichever of the poll and
-                // the cache answered first decided what FindNode/FindBuddy rows
-                // reported. Call the one implementation instead.
-                let cached_s: Vec<KadSearchInfo> = kad_searches_snapshot(&state);
-
-                let stats_snapshot = state.stats.clone();
-
-                // Both of these were hand-copied transcriptions too, and the
-                // connected-server one had drifted in the same way the Kad
-                // copy above had: it zeroed `description`, `max_users`,
-                // `soft_files`, `hard_files` and `is_static`, so the row for
-                // the server the user was actually on lost the very fields
-                // `connected_server_info` exists to borrow from the list
-                // entry — depending on whether the poll or this cache
-                // answered first. Call the one implementation instead.
-                let cached_srv: Vec<ServerInfo> =
-                    state.server_list.servers().iter().map(server_entry_to_info).collect();
-
-                let cached_conn_srv: Option<ServerInfo> = connected_server_info(&state);
-
-                let cached_tstats = stats_manager.get_stats();
-
-                let kad_connected = state.stats.status == NetworkStatus::Connected;
-                let srv_connected = state.server_connected;
-                let ember_live =
-                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
-                let kad_published = state.publish_manager.source_published_md4_hashes();
-                let ed2k_offered = state.offered_ed2k_hashes.clone();
-                let ember_published = state.ember_published_sources.clone();
-
-                // The peer/contact/stats half of this bundle genuinely changes
-                // every tick, but the file snapshot underneath it depends on
-                // exactly two things: the all-time counters in known.met and the
-                // publish-badge inputs. Index *content* edits are pushed by
-                // `refresh_file_cache` at each of its mutation sites, so this
-                // timer never had to re-derive them. Rebuilding regardless meant
-                // an idle node took `local_index.write()` every 5s and deep-cloned
-                // every `FileInfo` behind it — on a large library that starves
-                // hashing, scans and IPC readers for as long as it runs.
-                let known_generation = known_files.dirty_generation();
-                let badge_fingerprint = publish_badge_fingerprint(
-                    kad_connected,
-                    srv_connected,
-                    ember_live,
-                    &kad_published,
-                    &ed2k_offered,
-                    &ember_published,
-                );
-                let file_snapshot_stale =
-                    last_file_snapshot_inputs != Some((known_generation, badge_fingerprint));
-
-                // Collect known-file stats for the background task (can't move
-                // known_files into spawn). Skipped entirely when the snapshot is
-                // current: at a full library this is ~140k tuples per tick.
-                let known_stats: Vec<([u8; 16], u32, u32, u64)> = if file_snapshot_stale {
-                    known_files
-                        .all_records()
-                        .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Spawn ALL heavy work (hex conversion, distance computation, writes,
-                // and the local_index stats merge) as a background task so the event
-                // loop isn't blocked by any RwLock contention.
-                let sp = shared_peers.clone();
-                let ss = shared_stats.clone();
-                let sc = shared_contacts.clone();
-                let ssrch = shared_searches.clone();
-                let s_srv = shared_servers.clone();
-                let s_conn = shared_connected_server.clone();
-                let s_tstats = shared_transfer_stats.clone();
-                let s_files = shared_files.clone();
-                let db_ref = db.clone();
-                let li_ref = local_index.clone();
-                let app_for_cache = app_handle.clone();
-                last_cache_refresh_started_at = chrono::Utc::now().timestamp();
-                // Marked applied here rather than inside the task: the watchdog
-                // never aborts this one, and a task that panics only costs a
-                // delayed merge, which the next known.met change re-triggers.
-                last_file_snapshot_inputs = Some((known_generation, badge_fingerprint));
-                cache_write_handle = Some(tokio::spawn(async move {
-                    // Merge all-time stats from known.met into local_index, then
-                    // snapshot the file list for frontend IPC reads.
-                    // IMPORTANT: release the local_index lock before acquiring
-                    // cached_shared_files -- never nest these two locks.
-                    let file_snap = if file_snapshot_stale {
-                        let mut index = li_ref.write().await;
-                        index.update_alltime_stats_bulk(&known_stats);
-                        let mut snap = index.all_files().to_vec();
-                        apply_publish_badges(
-                            &mut snap,
-                            kad_connected,
-                            srv_connected,
-                            ember_live,
-                            &kad_published,
-                            &ed2k_offered,
-                            &ember_published,
-                        );
-                        Some(snap)
-                    } else {
-                        None
-                    };
-                    // Do the expensive hex/distance conversions here, off the event loop
-                    let mut peers: Vec<PeerInfo> = Vec::new();
-                    let mut cached_c: Vec<KadContactInfo> = Vec::new();
-                    for (c, nick) in &raw_contacts {
-                        let hex_id = c.id.to_hex();
-                        if peers.len() < 200 {
-                            peers.push(PeerInfo {
-                                id: hex_id.clone(),
-                                addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
-                                nickname: nick.clone(),
-                                last_seen: c.last_seen,
-                                files_shared: 0,
-                                banned: false,
-                            });
-                        }
-                        let distance = c.id.xor_distance(&local_id);
-                        cached_c.push(KadContactInfo {
-                            id: hex_id,
-                            contact_type: c.contact_type,
-                            version: c.version,
-                            distance: distance.to_hex(),
-                            ip_verified: c.verified,
-                            bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
-                        });
-                    }
-
-                    let saved_peers = tokio::task::spawn_blocking(move || {
-                        db_ref.get_peers().unwrap_or_default()
-                    }).await.unwrap_or_default();
-                    for saved in saved_peers {
-                        if let Some(existing) = peers.iter_mut().find(|peer| peer.id == saved.id) {
-                            if !saved.nickname.is_empty() {
-                                existing.nickname = saved.nickname;
-                            }
-                            if !saved.addresses.is_empty() {
-                                existing.addresses = saved.addresses;
-                            }
-                            existing.last_seen = existing.last_seen.max(saved.last_seen);
-                            existing.files_shared = existing.files_shared.max(saved.files_shared);
-                            existing.banned = saved.banned;
-                        } else if saved.banned {
-                            peers.push(saved);
-                        }
-                    }
-                    *sp.write().await = peers;
-                    *ss.write().await = stats_snapshot;
-                    *sc.write().await = cached_c;
-                    *ssrch.write().await = cached_s;
-                    *s_srv.write().await = cached_srv;
-                    *s_conn.write().await = cached_conn_srv;
-                    *s_tstats.write().await = cached_tstats;
-                    // Apply the file snapshot last, after every expensive/fallible
-                    // preparation step. The watchdog never aborts this task, so
-                    // a refresh cannot leave only the leading subset of this
-                    // cache bundle updated.
-                    //
-                    // This is also the only place the KAD / eD2K / Ember publish
-                    // badges are computed, and a file that has just finished
-                    // publishing gives the Library no other reason to re-read the
-                    // list — it reloads on `shared-files-changed` alone. Emit when
-                    // a badge actually flips, so the flags land in the UI without
-                    // waiting on unrelated activity and without reloading the
-                    // whole list on a five-second clock.
-                    let badges_changed = match file_snap {
-                        Some(file_snap) => {
-                            let mut cache = s_files.write().await;
-                            let changed = badge_counts(&file_snap) != badge_counts(&cache);
-                            *cache = file_snap;
-                            changed
-                        }
-                        // Neither the known.met counters nor any badge input
-                        // moved, so the cache already holds this exact list and
-                        // no badge can have flipped.
-                        None => false,
-                    };
-                    if badges_changed {
-                        let _ = app_for_cache.emit(
-                            "shared-files-changed",
-                            serde_json::json!({
-                                "phase": "publish-badges",
-                                "count": 0,
-                            }),
-                        );
-                    }
-                }));
-                }).catch_unwind().await;
+                let __panic_result = std::panic::AssertUnwindSafe(on_cache_refresh_tick(
+                    &mut state,
+                    &local_index,
+                    &settings,
+                    &bandwidth_limiter,
+                    &db,
+                    &app_handle,
+                    &stats_manager,
+                    &known_files,
+                    &mut cache_write_handle,
+                    &mut last_cache_refresh_started_at,
+                    &mut last_file_snapshot_inputs,
+                    &shared_connected_server,
+                    &shared_contacts,
+                    &shared_files,
+                    &shared_peers,
+                    &shared_searches,
+                    &shared_servers,
+                    &shared_stats,
+                    &shared_transfer_stats,
+                ))
+                .catch_unwind()
+                .await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'cache_refresh_timer' panicked: {}", describe_panic(&*__p));
                 }
