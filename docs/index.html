@@ -256,7 +256,7 @@
     .hero-kicker a { color: #ffd9b8; font-weight: 600; }
     .hero-kicker a:hover { color: #fff; }
 
-    .hero h1 { color: #fff; font-size: clamp(2.5rem, 5.4vw, 4.3rem); line-height: 1.04; font-weight: 800; letter-spacing: -0.03em; }
+    .hero h1 { color: #fff; font-size: clamp(2.4rem, 5vw, 3.9rem); line-height: 1.04; font-weight: 800; letter-spacing: -0.03em; }
     .glow-text {
       background: linear-gradient(100deg, #ffd66e, #ff9a3c 35%, #ff5a36 65%, #ffd66e);
       background-size: 220% 100%;
@@ -459,8 +459,8 @@
     .platform-card h3 { font-size: 1.3rem; font-weight: 800; }
     .platform-card .platform-sub { font-size: 14px; color: var(--text-muted); }
     .platform-card ul { list-style: none; display: grid; gap: 8px; margin: 6px 0 24px; color: var(--text-secondary); font-size: 15px; flex: 1; }
-    .platform-card li { display: flex; gap: 10px; }
-    .platform-card li::before { content: "✓"; color: var(--ok); font-weight: 800; }
+    .platform-card li { position: relative; padding-left: 24px; }
+    .platform-card li::before { content: "✓"; position: absolute; left: 0; top: 0; color: var(--ok); font-weight: 800; }
     .download-extras { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 28px; margin-top: 32px; color: var(--text-secondary); font-size: 15px; }
     .download-extras span { display: inline-flex; align-items: center; gap: 8px; }
     .download-links { text-align: center; margin-top: 18px; font-size: 15px; }
@@ -771,7 +771,7 @@
   <div class="wrap hero-inner">
     <div class="hero-copy">
       <p class="hero-kicker">
-        <span class="pill">🔥 Version <span data-latest-version>1.6.7</span> is out</span>
+        <span class="pill"><span aria-hidden="true">🔥</span><span>Version <span data-latest-version>1.6.7</span> is out</span></span>
         <a href="#releases">See what&rsquo;s new &rarr;</a>
       </p>
       <h1 id="hero-title">File sharing that&rsquo;s <span class="glow-text">fast, friendly</span> and free.</h1>
@@ -938,7 +938,7 @@
     <div class="tabs reveal" data-tabs>
       <div class="tablist" role="tablist" aria-label="Choose your path">
         <button class="tab" role="tab" type="button" id="tab-new" aria-controls="panel-new" aria-selected="true">🌱 New to file sharing</button>
-        <button class="tab" role="tab" type="button" id="tab-mule" aria-controls="panel-mule" aria-selected="false">🫏 I&rsquo;ve used eMule</button>
+        <button class="tab" role="tab" type="button" id="tab-mule" aria-controls="panel-mule" aria-selected="false">🐴 I&rsquo;ve used eMule</button>
         <button class="tab" role="tab" type="button" id="tab-dev" aria-controls="panel-dev" aria-selected="false">🛠️ I&rsquo;m a developer</button>
       </div>
 
@@ -4248,7 +4248,7 @@ npm run tauri build</code></pre>
       <p>Free, open source, and about 15&nbsp;MB. Your first download is a couple of minutes away.</p>
       <a class="btn btn-primary btn-lg js-download" href="https://github.com/untaimed18/Ember-P2P/releases/latest" target="_blank" rel="noopener">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download Ember <span data-latest-version>1.6.7</span>
+        <span>Download Ember <span data-latest-version>1.6.7</span></span>
       </a>
     </div>
   </div>
@@ -4994,6 +4994,21 @@ npm run tauri build</code></pre>
       });
       ctx.setLineDash([]);
 
+      packets.forEach(function (pk) {
+        var p = pk.peer;
+        var mx = (p.x + cx) / 2 + (cy - p.y) * 0.18, my = (p.y + cy) / 2 + (p.x - cx) * 0.18;
+        for (var k = 4; k >= 0; k--) {
+          var t = Math.max(0, pk.t - k * 0.035);
+          var u = 1 - t;
+          var x = u * u * p.x + 2 * u * t * mx + t * t * cx;
+          var y = u * u * p.y + 2 * u * t * my + t * t * cy;
+          ctx.fillStyle = k === 0 ? '#fff4d6' : 'rgba(255, 170, 60, ' + (0.5 - k * 0.1).toFixed(2) + ')';
+          ctx.beginPath();
+          ctx.arc(x, y, k === 0 ? 3.2 : 3 - k * 0.45, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+
       var ringR = 40;
       var seg = (Math.PI * 2) / TOTAL;
       ctx.lineWidth = 6 + ringPulse * 2;
@@ -5032,21 +5047,6 @@ npm run tauri build</code></pre>
       ctx.textBaseline = 'middle';
       ctx.font = '800 ' + (done ? 22 : 14) + 'px system-ui, -apple-system, "Segoe UI", sans-serif';
       ctx.fillText(done ? '\u2713' : 'You', cx, cy + 1);
-
-      packets.forEach(function (pk) {
-        var p = pk.peer;
-        var mx = (p.x + cx) / 2 + (cy - p.y) * 0.18, my = (p.y + cy) / 2 + (p.x - cx) * 0.18;
-        for (var k = 4; k >= 0; k--) {
-          var t = Math.max(0, pk.t - k * 0.035);
-          var u = 1 - t;
-          var x = u * u * p.x + 2 * u * t * mx + t * t * cx;
-          var y = u * u * p.y + 2 * u * t * my + t * t * cy;
-          ctx.fillStyle = k === 0 ? '#fff4d6' : 'rgba(255, 170, 60, ' + (0.5 - k * 0.1).toFixed(2) + ')';
-          ctx.beginPath();
-          ctx.arc(x, y, k === 0 ? 3.2 : 3 - k * 0.45, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      });
 
       peers.forEach(function (p) {
         var s = p.scale < 1 ? 1 - Math.pow(1 - p.scale, 3) * Math.cos(p.scale * 9) : 1;
