@@ -1,9 +1,12 @@
 //! Handlers for the arms of `start_network`'s event loop, one file per arm.
 //!
-//! Each handler is the body of its `select!` arm as an `async fn`. The arm
-//! still wraps the call in `catch_unwind`, so a panic in one handler is
-//! logged and the loop carries on. Parameters are the loop's locals the arm
-//! uses, borrowed the way the arm's `async` block borrowed them.
+//! Each handler is the body of its `select!` arm as an `async fn`. Arms that
+//! ran their body under `catch_unwind` still wrap the call in it, so a panic
+//! in one handler is logged and the loop carries on; the download and upload
+//! event handlers never were, and guard only their `handle_*_event` call.
+//! Parameters are the loop's locals the arm uses, borrowed the way the arm
+//! borrowed them. A `return` in the download or upload handler is what was a
+//! `continue` of the loop.
 //!
 //! Shares the parent module's namespace through `use super::*`, the same
 //! way `command.rs` does.
@@ -16,6 +19,7 @@ mod broker_tick;
 mod buddy_tick;
 mod cache_refresh_tick;
 mod cleanup_tick;
+mod download_event;
 mod ember_maintenance_tick;
 mod ember_refresh_tick;
 mod ember_search_tick;
@@ -43,6 +47,7 @@ mod tcp_mapping_keepalive_result;
 mod udp_discovery_health_tick;
 mod udp_mapping_keepalive_result;
 mod udp_source_tick;
+mod upload_event;
 mod upnp_maintain_result;
 mod uss_ping_tick;
 mod watchdog_tick;
@@ -53,6 +58,7 @@ pub(super) use self::broker_tick::on_broker_tick;
 pub(super) use self::buddy_tick::on_buddy_tick;
 pub(super) use self::cache_refresh_tick::on_cache_refresh_tick;
 pub(super) use self::cleanup_tick::on_cleanup_tick;
+pub(super) use self::download_event::on_download_event;
 pub(super) use self::ember_maintenance_tick::on_ember_maintenance_tick;
 pub(super) use self::ember_refresh_tick::on_ember_refresh_tick;
 pub(super) use self::ember_search_tick::on_ember_search_tick;
@@ -80,6 +86,7 @@ pub(super) use self::tcp_mapping_keepalive_result::on_tcp_mapping_keepalive_resu
 pub(super) use self::udp_discovery_health_tick::on_udp_discovery_health_tick;
 pub(super) use self::udp_mapping_keepalive_result::on_udp_mapping_keepalive_result;
 pub(super) use self::udp_source_tick::on_udp_source_tick;
+pub(super) use self::upload_event::on_upload_event;
 pub(super) use self::upnp_maintain_result::on_upnp_maintain_result;
 pub(super) use self::uss_ping_tick::on_uss_ping_tick;
 pub(super) use self::watchdog_tick::on_watchdog_tick;
