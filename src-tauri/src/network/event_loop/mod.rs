@@ -4,11 +4,11 @@
 //!
 //! Each handler is the body of its `select!` arm as an `async fn`. Arms that
 //! ran their body under `catch_unwind` still wrap the call in it, so a panic
-//! in one handler is logged and the loop carries on; the download and upload
-//! event handlers never were, and guard only their `handle_*_event` call.
-//! Parameters are the loop's locals the arm uses, borrowed the way the arm
-//! borrowed them. A `return` in the download or upload handler is what was a
-//! `continue` of the loop.
+//! in one handler is logged and the loop carries on. The rest (download and
+//! upload events, the server-connect and buddy results, relay tickets) never
+//! were, and are still called bare; in those, a `return` is what was a
+//! `continue` of the loop. Parameters are the loop's locals the arm uses,
+//! borrowed the way the arm borrowed them.
 //!
 //! Shares the parent module's namespace through `use super::*`, the same
 //! way `command.rs` does.
@@ -18,6 +18,7 @@ use super::*;
 mod a4af_tick;
 mod bootstrap_tick;
 mod broker_tick;
+mod buddy_event;
 mod buddy_tick;
 mod cache_refresh_tick;
 mod cleanup_tick;
@@ -26,6 +27,7 @@ mod ember_maintenance_tick;
 mod ember_refresh_tick;
 mod ember_search_tick;
 mod flood_cleanup_tick;
+mod friend_relay_ticket_result;
 mod kad_callback;
 mod kad_process_tick;
 mod kad_publish_tick;
@@ -39,6 +41,7 @@ mod punch_poll_tick;
 mod rendezvous_register_result;
 mod resume_downloads;
 mod search_poll_tick;
+mod server_connect_result;
 mod server_tcp_source_tick;
 mod server_tick;
 mod server_udp_ping_tick;
@@ -61,6 +64,7 @@ mod watchdog_tick;
 pub(super) use self::a4af_tick::on_a4af_tick;
 pub(super) use self::bootstrap_tick::on_bootstrap_tick;
 pub(super) use self::broker_tick::on_broker_tick;
+pub(super) use self::buddy_event::on_buddy_event;
 pub(super) use self::buddy_tick::on_buddy_tick;
 pub(super) use self::cache_refresh_tick::on_cache_refresh_tick;
 pub(super) use self::cleanup_tick::on_cleanup_tick;
@@ -69,6 +73,7 @@ pub(super) use self::ember_maintenance_tick::on_ember_maintenance_tick;
 pub(super) use self::ember_refresh_tick::on_ember_refresh_tick;
 pub(super) use self::ember_search_tick::on_ember_search_tick;
 pub(super) use self::flood_cleanup_tick::on_flood_cleanup_tick;
+pub(super) use self::friend_relay_ticket_result::on_friend_relay_ticket_poll_result;
 pub(super) use self::kad_callback::on_kad_callback_conn;
 pub(super) use self::kad_process_tick::on_kad_process_tick;
 pub(super) use self::kad_publish_tick::on_kad_publish_tick;
@@ -82,6 +87,7 @@ pub(super) use self::punch_poll_tick::on_punch_poll_tick;
 pub(super) use self::rendezvous_register_result::on_rendezvous_register_result;
 pub(super) use self::resume_downloads::resume_incomplete_downloads;
 pub(super) use self::search_poll_tick::on_search_poll_tick;
+pub(super) use self::server_connect_result::on_server_connect_result;
 pub(super) use self::server_tcp_source_tick::on_server_tcp_source_tick;
 pub(super) use self::server_tick::on_server_tick;
 pub(super) use self::server_udp_ping_tick::on_server_udp_ping_tick;
