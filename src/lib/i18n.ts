@@ -331,7 +331,7 @@ export function degradedReasonText(reason: string | undefined): string {
 const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['cancelled', m.transfers_failure_reason_cancelled],
   ['remote_missing_file', m.transfers_failure_reason_remote_missing],
-  // Same wording as the row badge, which the Ember page and docs also use.
+  // Same wording as the status label on the row, which the Ember page and docs also use.
   ['ember_content_hash_mismatch', m.transfers_ember_mismatch_label],
   ['aich_hash_mismatch', m.transfers_failure_reason_aich_mismatch],
   ['hash_mismatch', m.transfers_failure_reason_hash_mismatch],

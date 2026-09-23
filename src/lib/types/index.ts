@@ -166,12 +166,6 @@ export interface Transfer {
    *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the
    *  green served-this-session fill. */
   up_peer_part_status?: string;
-  /** Downloads only: true once this completion re-checked the file's Ember
-   *  content BLAKE3 hash on disk and it matched. Only ever set by a
-   *  completion that actually ran the check — never inferred from
-   *  `expected_aich`-style presence, since the crash-recovery re-verify
-   *  path skips it. */
-  ember_verified: boolean;
 }
 
 export interface SourceInfo {

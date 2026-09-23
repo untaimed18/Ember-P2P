@@ -365,10 +365,6 @@ interface TransferEventPayload {
   active_sources?: number;
   queued_sources?: number;
   peer_id?: string;
-  /** Set on `transfer-complete` when this completion actually re-checked
-   *  the Ember BLAKE3 pin. Absent/false means no pin was known, or the
-   *  event predates that field. */
-  ember_verified?: boolean;
   /** Backend tags upload-direction terminal events so the store can
    *  vanish the row on completion (matches eMule UX where finished
    *  upload sessions disappear from the active list). Falls back to
@@ -745,7 +741,7 @@ export async function initTransferStore() {
     });
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
-      const { id, direction, ember_verified } = event.payload;
+      const { id, direction } = event.payload;
       // Read the row before the update rather than inside it: a store updater
       // must stay a pure function of its input, and the download branch below
       // is unreachable for uploads (they return early), so there is nowhere
@@ -798,7 +794,6 @@ export async function initTransferStore() {
             // columns on a finished row.
             transferred: Math.max(t.transferred || 0, t.total_size),
             completed_size: t.total_size,
-            ember_verified: ember_verified === true || t.ember_verified,
           };
         });
       });
