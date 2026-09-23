@@ -379,3 +379,50 @@ pub(super) fn apply_network_settings(
     *settings = new_settings;
     needs_ipfilter_load
 }
+
+/// Applies an `UpdateSettings` command to the loop-owned `settings` and to
+/// everything that caches a setting. The command drain and the `cmd_rx` arm
+/// both route it here, since `handle_command` cannot reach `settings`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn apply_settings_update(
+    udp_socket: &Arc<UdpSocket>,
+    state: &mut NetworkState,
+    settings: &mut AppSettings,
+    new_settings: AppSettings,
+    db: &Arc<Database>,
+    identity: &Arc<crate::storage::identity::NodeIdentity>,
+    app_handle: &tauri::AppHandle,
+    shared_nickname: &Arc<tokio::sync::RwLock<String>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+) {
+    let old_channel_username = settings.channel_username.clone();
+    if apply_network_settings(state, settings, new_settings, app_handle) {
+        load_ipfilter_on_enable(state).await;
+    }
+    publish_presence_under_new_username(
+        udp_socket,
+        state,
+        db,
+        settings,
+        identity,
+        &old_channel_username,
+    )
+    .await;
+    state
+        .relay_manager
+        .lock()
+        .await
+        .set_policy(settings.relay_for_peers, settings.max_relay_sessions);
+    {
+        let mut nick = shared_nickname.write().await;
+        *nick = settings.nickname.clone();
+    }
+    source_manager
+        .write()
+        .await
+        .set_max_per_file(settings.max_sources_per_file);
+    if settings.filter_servers_by_ip {
+        apply_server_ip_filter(state, shared_server_addr, app_handle, true).await;
+    }
+}

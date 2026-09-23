@@ -1,4 +1,6 @@
-//! Handlers for the arms of `start_network`'s event loop, one file per arm.
+//! Handlers for the arms of `start_network`'s event loop, one file per arm,
+//! plus the deferred-startup steps that run at the top of each pass and the
+//! save sequence that runs once the loop ends.
 //!
 //! Each handler is the body of its `select!` arm as an `async fn`. Arms that
 //! ran their body under `catch_unwind` still wrap the call in it, so a panic
@@ -31,17 +33,21 @@ mod known_met_save_tick;
 mod mapping_keepalive_tick;
 mod nat_probe_result;
 mod nodes_save_tick;
+mod offer_files;
 mod publish_tick;
 mod punch_poll_tick;
 mod rendezvous_register_result;
+mod resume_downloads;
 mod search_poll_tick;
 mod server_tcp_source_tick;
 mod server_tick;
 mod server_udp_ping_tick;
 mod server_udp_source_tick;
+mod shutdown;
 mod small_tick;
 mod source_count_sync_tick;
 mod source_retry_tick;
+mod startup_disk_loads;
 mod stats_tick;
 mod tcp_mapping_keepalive_result;
 mod udp_discovery_health_tick;
@@ -70,17 +76,21 @@ pub(super) use self::known_met_save_tick::on_known_met_save_tick;
 pub(super) use self::mapping_keepalive_tick::on_mapping_keepalive_tick;
 pub(super) use self::nat_probe_result::on_nat_probe_result;
 pub(super) use self::nodes_save_tick::on_nodes_save_tick;
+pub(super) use self::offer_files::drain_offer_files;
 pub(super) use self::publish_tick::on_publish_tick;
 pub(super) use self::punch_poll_tick::on_punch_poll_tick;
 pub(super) use self::rendezvous_register_result::on_rendezvous_register_result;
+pub(super) use self::resume_downloads::resume_incomplete_downloads;
 pub(super) use self::search_poll_tick::on_search_poll_tick;
 pub(super) use self::server_tcp_source_tick::on_server_tcp_source_tick;
 pub(super) use self::server_tick::on_server_tick;
 pub(super) use self::server_udp_ping_tick::on_server_udp_ping_tick;
 pub(super) use self::server_udp_source_tick::on_server_udp_source_tick;
+pub(super) use self::shutdown::save_on_shutdown;
 pub(super) use self::small_tick::on_small_tick;
 pub(super) use self::source_count_sync_tick::on_source_count_sync_tick;
 pub(super) use self::source_retry_tick::on_source_retry_tick;
+pub(super) use self::startup_disk_loads::apply_deferred_disk_loads;
 pub(super) use self::stats_tick::on_stats_tick;
 pub(super) use self::tcp_mapping_keepalive_result::on_tcp_mapping_keepalive_result;
 pub(super) use self::udp_discovery_health_tick::on_udp_discovery_health_tick;
