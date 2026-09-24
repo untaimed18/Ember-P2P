@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Nessun client di origine trovato, ricerca in rete",
   "transfers_dl_tooltip_queued_base": "In attesa nella coda di upload di un client remoto",
+  "transfers_dl_tooltip_queued_idle": "Nessuna fonte ha ancora il file in coda o lo sta inviando; le fonti note vengono ritentate periodicamente",
   "transfers_dl_tooltip_queued_reason": "In attesa nella coda di upload di un client remoto. {reason}",
   "transfers_dl_tooltip_paused": "Download in pausa dall'utente",
   "transfers_dl_tooltip_stopped": "Download arrestato dall'utente",

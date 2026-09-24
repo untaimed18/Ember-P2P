@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}。{reason}",
   "transfers_dl_tooltip_queued_no_sources": "尚未找到来源，正在网络中搜索",
   "transfers_dl_tooltip_queued_base": "在远程客户端的上传队列中等待",
+  "transfers_dl_tooltip_queued_idle": "尚无源将此文件加入队列或正在发送；将定期重试已知的源",
   "transfers_dl_tooltip_queued_reason": "在远程客户端的上传队列中等待。{reason}",
   "transfers_dl_tooltip_paused": "下载已由用户暂停",
   "transfers_dl_tooltip_stopped": "下载已由用户停止",

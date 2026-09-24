@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Aún no se han encontrado fuentes, buscando en la red",
   "transfers_dl_tooltip_queued_base": "Esperando en la cola de subida de un cliente remoto",
+  "transfers_dl_tooltip_queued_idle": "Ninguna fuente tiene el archivo en cola ni está enviando todavía; las fuentes conocidas se reintentan periódicamente",
   "transfers_dl_tooltip_queued_reason": "Esperando en la cola de subida de un cliente remoto. {reason}",
   "transfers_dl_tooltip_paused": "Descarga pausada por el usuario",
   "transfers_dl_tooltip_stopped": "Descarga detenida por el usuario",

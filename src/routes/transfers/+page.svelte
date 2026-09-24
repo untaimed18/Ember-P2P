@@ -2203,6 +2203,10 @@
       .join(' — ');
   }
 
+  function isRemotelyQueued(t: Transfer): boolean {
+    return (t.queued_sources || 0) > 0;
+  }
+
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
@@ -2218,6 +2222,10 @@
       }
       case 'queued':
         if (t.sources === 0) return m.transfers_dl_status_searching();
+        // The backend reports `queued` for any idle download with a non-empty
+        // source list; only claim "Queued" when a peer actually holds us in its
+        // upload queue. Otherwise it is eMule's "Waiting".
+        if (!isRemotelyQueued(t)) return m.transfers_dl_status_waiting();
         // Transfer-level queue_rank is never populated by the backend; per-source
         // ranks still show in the source drawer via SourceInfo.queue_rank.
         return m.transfer_status_queued();
@@ -3944,6 +3952,9 @@
       }
       case 'queued': {
         if (t.sources === 0) return m.transfers_dl_tooltip_queued_no_sources();
+        // The backend's age-based "waiting for an upload slot" reason assumes a
+        // remote queue, so it is skipped along with the queue wording.
+        if (!isRemotelyQueued(t)) return m.transfers_dl_tooltip_queued_idle();
         const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
         return health
           ? m.transfers_dl_tooltip_queued_reason({ reason: health })

@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Aucune source trouvée pour l'instant, recherche sur le réseau",
   "transfers_dl_tooltip_queued_base": "En attente dans la file d'envoi d'un client distant",
+  "transfers_dl_tooltip_queued_idle": "Aucune source n'a encore mis le fichier en file ni n'envoie de données ; les sources connues sont réessayées régulièrement",
   "transfers_dl_tooltip_queued_reason": "En attente dans la file d'envoi d'un client distant. {reason}",
   "transfers_dl_tooltip_paused": "Téléchargement mis en pause par l'utilisateur",
   "transfers_dl_tooltip_stopped": "Téléchargement arrêté par l'utilisateur",

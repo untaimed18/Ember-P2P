@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Источники пока не найдены, идёт поиск в сети",
   "transfers_dl_tooltip_queued_base": "Ожидание в очереди отдачи удалённого клиента",
+  "transfers_dl_tooltip_queued_idle": "Пока ни один источник не поставил файл в очередь и не передаёт данные; известные источники периодически опрашиваются повторно",
   "transfers_dl_tooltip_queued_reason": "Ожидание в очереди отдачи удалённого клиента. {reason}",
   "transfers_dl_tooltip_paused": "Загрузка приостановлена пользователем",
   "transfers_dl_tooltip_stopped": "Загрузка остановлена пользователем",

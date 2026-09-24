@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Nenhuma fonte encontrada ainda, buscando na rede",
   "transfers_dl_tooltip_queued_base": "Aguardando na fila de upload de um cliente remoto",
+  "transfers_dl_tooltip_queued_idle": "Nenhuma fonte colocou o arquivo na fila nem está enviando ainda; as fontes conhecidas são tentadas novamente periodicamente",
   "transfers_dl_tooltip_queued_reason": "Aguardando na fila de upload de um cliente remoto. {reason}",
   "transfers_dl_tooltip_paused": "Download pausado pelo usuário",
   "transfers_dl_tooltip_stopped": "Download parado pelo usuário",

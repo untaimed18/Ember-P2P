@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "No sources found yet, searching the network",
   "transfers_dl_tooltip_queued_base": "Waiting in a remote client's upload queue",
+  "transfers_dl_tooltip_queued_idle": "No source is queuing or sending this file yet; known sources are retried periodically",
   "transfers_dl_tooltip_queued_reason": "Waiting in a remote client's upload queue. {reason}",
   "transfers_dl_tooltip_paused": "Download paused by user",
   "transfers_dl_tooltip_stopped": "Download stopped by user",

@@ -1813,6 +1813,7 @@
   "transfers_dl_tooltip_searching_reason": "{base}. {reason}",
   "transfers_dl_tooltip_queued_no_sources": "Noch keine Quellen gefunden, Netzwerk wird durchsucht",
   "transfers_dl_tooltip_queued_base": "Wartet in der Upload-Warteschlange eines entfernten Clients",
+  "transfers_dl_tooltip_queued_idle": "Noch keine Quelle hat die Datei in der Warteschlange oder sendet; bekannte Quellen werden regelmäßig erneut versucht",
   "transfers_dl_tooltip_queued_reason": "Wartet in der Upload-Warteschlange eines entfernten Clients. {reason}",
   "transfers_dl_tooltip_paused": "Download vom Benutzer pausiert",
   "transfers_dl_tooltip_stopped": "Download vom Benutzer gestoppt",
