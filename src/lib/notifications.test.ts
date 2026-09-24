@@ -27,6 +27,7 @@ function settingsWith(patch: Partial<AppSettings> = {}): AppSettings {
     notify_friend_online: true,
     notify_friend_message: true,
     notify_friend_request: true,
+    notify_shares_browsed: true,
     notify_channel_message: true,
     ...patch,
   } as AppSettings;

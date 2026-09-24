@@ -125,6 +125,23 @@ pub(in crate::network) async fn on_upload_event(
         upload_raw_progress.remove(&event.transfer_id);
     }
 
+    if let UploadEventKind::SharesBrowsed {
+        peer_addr,
+        ref peer_name,
+        ref client_software,
+        allowed,
+    } = event.kind
+    {
+        report_ed2k_shares_browsed(
+            state,
+            app_handle,
+            peer_addr,
+            peer_name,
+            client_software,
+            allowed,
+        );
+    }
+
     if let UploadEventKind::ShareInterest {
         ref file_hash,
         inc_requests,
@@ -876,10 +893,8 @@ pub(in crate::network) async fn on_upload_event(
         // until a friendship is mutual, but that is cosmetic: the
         // wire has to enforce it, or anyone who learns our Ember
         // hash could add us one-sidedly and read our library.
-        if !settings.friend_browse_disabled
-            && mutual_friend_hashes.read().await.contains(&browse_eh)
-        {
-            let hash_hex = hex::encode(browse_eh);
+        let is_mutual_friend = mutual_friend_hashes.read().await.contains(&browse_eh);
+        if !settings.friend_browse_disabled && is_mutual_friend {
             let files = {
                 let idx = local_index.read().await;
                 idx.all_files().to_vec()
@@ -981,9 +996,7 @@ pub(in crate::network) async fn on_upload_event(
                     session_id,
                 );
             }
-            let _ = app_handle.emit("ember:browse-request", serde_json::json!({
-                "user_hash": hash_hex,
-            }));
+            report_friend_shares_browsed(state, app_handle, browse_eh, true);
         } else {
             // Complete the requester's wait. Dropping the packet
             // left their UI spinning until the 30s browse timeout
@@ -1007,6 +1020,12 @@ pub(in crate::network) async fn on_upload_event(
                     hex::encode(browse_eh),
                     session_id,
                 );
+            }
+            // Only a real friend is worth mentioning: they were refused because
+            // friend browsing is off. Anyone else is refused silently, and
+            // saying so would let a stranger put text on the user's screen.
+            if is_mutual_friend {
+                report_friend_shares_browsed(state, app_handle, browse_eh, false);
             }
         }
     }

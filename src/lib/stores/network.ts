@@ -5,11 +5,19 @@ import type { DegradedReason, NetworkStats, ServerLogLine } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
 import { getServerLog } from '$lib/api/server';
 import { relatedSearchSupported as apiRelatedSearchSupported } from '$lib/api/search';
-import { withTimeout } from '$lib/utils';
+import { isAppVisible, withTimeout } from '$lib/utils';
 import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
-import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+import { addToast, removeToast, toast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
 import { appendServerLog, hydrateServerLog } from '$lib/stores/serverLog';
+import { friendDisplayName } from '$lib/stores/friends';
+import { notify } from '$lib/notifications';
+import {
+  describePeer,
+  parseSharesBrowsed,
+  sharesBrowsedToastDue,
+  type SharesBrowsedNotice,
+} from '$lib/sharesBrowsed';
 import * as m from '$lib/paraglide/messages';
 import { translateError } from '$lib/i18n';
 
@@ -179,6 +187,22 @@ function syncServerStatus(stats: NetworkStats) {
     setServerStatus(s);
   }
 }
+
+/** When the last "someone viewed your shared files" toast was shown. */
+let lastSharesBrowsedToastAt = 0;
+
+/** The sentence for a browse of our shares, naming the peer as `who`. */
+function sharesBrowsedLine(notice: SharesBrowsedNotice, who: string): string {
+  if (notice.via === 'friend') {
+    return notice.allowed
+      ? m.shares_browsed_friend({ name: who })
+      : m.shares_browsed_friend_refused({ name: who });
+  }
+  return notice.allowed
+    ? m.shares_browsed_peer({ who })
+    : m.shares_browsed_peer_refused({ who });
+}
+
 let lastNetworkUpdate = 0;
 
 /** Prefer a known TCP/UDP result over a stale Unknown from poll/events. */
@@ -409,6 +433,23 @@ export async function initNetworkStore() {
     registered.push(await listen<ServerLogLine>('server-log', (event) => {
       const line = event.payload;
       if (typeof line?.message === 'string') appendServerLog(line.message, line);
+    }));
+    // Someone viewed our shared files. Always logged, as eMule does. An answered
+    // browse also toasts while Ember is on screen and raises a desktop
+    // notification (its own switch) while it is not; a refusal showed the peer
+    // nothing, so the log is enough.
+    registered.push(await listen<unknown>('shares-browsed', (event) => {
+      const notice = parseSharesBrowsed(event.payload, friendDisplayName);
+      if (!notice) return;
+      const line = sharesBrowsedLine(notice, describePeer(notice));
+      appendServerLog(line);
+      if (!notice.allowed) return;
+      const now = Date.now();
+      if (isAppVisible() && sharesBrowsedToastDue(lastSharesBrowsedToastAt, now)) {
+        lastSharesBrowsedToastAt = now;
+        toast(sharesBrowsedLine(notice, notice.name));
+      }
+      void notify('shares_browsed', m.notify_shares_browsed_title(), line);
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       const status = narrowServerStatus(event.payload?.status);

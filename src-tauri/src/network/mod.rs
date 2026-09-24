@@ -31,6 +31,7 @@ pub mod rendezvous;
 mod search;
 mod server;
 mod settings;
+mod shares_browsed;
 mod snapshots;
 mod sources;
 mod state;
@@ -144,6 +145,7 @@ use self::publishing::*;
 use self::search::*;
 use self::server::*;
 use self::settings::*;
+use self::shares_browsed::*;
 use self::snapshots::*;
 use self::sources::*;
 use self::state::*;
@@ -906,6 +908,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
         ember_reach_external_ip: None,
+        shares_browsed_seen: HashMap::new(),
             ember_kad_bridge_attempted: HashMap::new(),
         ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
         ember_friend_contacts_asked: HashMap::new(),

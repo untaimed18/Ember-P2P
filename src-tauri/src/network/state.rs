@@ -833,6 +833,10 @@ pub(super) struct NetworkState {
     /// disconnect clears the address until STUN reports the same one again.
     /// See [`reach_evidence_survives`].
     pub(super) ember_reach_external_ip: Option<Ipv4Addr>,
+    /// When each peer's last browse of our shares was reported, so repeats
+    /// inside the quiet window stay out of the log and off the screen. See
+    /// [`shares_browse_is_new`].
+    pub(super) shares_browsed_seen: HashMap<(SharesBrowser, bool), std::time::Instant>,
     /// KAD-bridge bootstrap bookkeeping (slice 13): when the bridge last
     /// DHT-pinged each KAD-learned Ember peer and how many of those pings have
     /// gone unanswered, so it moves through the `ember_noise_keys` cache

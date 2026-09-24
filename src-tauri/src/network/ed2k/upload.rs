@@ -2042,6 +2042,17 @@ pub enum UploadEventKind {
         inc_requests: u32,
         inc_accepted: u32,
     },
+    /// An ed2k client asked for our shared-file list ("View Files"), either
+    /// flat or as the directory list stock eMule sends. `allowed` is whether
+    /// we answered it or sent the denial (`allow_shared_files_browse`). Sent
+    /// once per list request, not per folder the peer then opens.
+    SharesBrowsed {
+        peer_addr: std::net::SocketAddr,
+        /// The nickname the client announced in its hello; may be empty.
+        peer_name: String,
+        client_software: String,
+        allowed: bool,
+    },
     /// Sources discovered via Ember Peer Exchange from an incoming Ember peer.
     EmberSources {
         entries: Vec<([u8; 16], Vec<(std::net::Ipv4Addr, u16, u16, u8)>)>,
@@ -5145,6 +5156,29 @@ impl UploadHandler {
     /// IPv4-only, so a pure-IPv6 peer (which can't be ban-set keyed) is
     /// dropped here; the abuse tracker's own per-connection enforcement
     /// still applies in that case.
+    /// Tell the network loop an ed2k client asked for our shared-file list.
+    ///
+    /// Best effort: the peer's answer has already gone out, and a full event
+    /// channel must not hold it up, so the notice is dropped rather than
+    /// awaited.
+    fn note_shares_browsed(
+        &self,
+        peer_addr: std::net::SocketAddr,
+        peer_name: &str,
+        client_software: &str,
+        allowed: bool,
+    ) {
+        let _ = self.upload_event_tx.try_send(UploadEvent {
+            transfer_id: String::new(),
+            kind: UploadEventKind::SharesBrowsed {
+                peer_addr,
+                peer_name: peer_name.to_string(),
+                client_software: client_software.to_string(),
+                allowed,
+            },
+        });
+    }
+
     /// Charge one packet-level abuse event to `ip` and ban it if that crossed
     /// the window limit.
     ///
@@ -10952,6 +10986,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Answered OP_ASKSHAREDFILES from {peer_addr}");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            true,
+                        );
                     } else {
                         write_packet_async(
                             &mut writer,
@@ -10961,6 +11001,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Denied OP_ASKSHAREDFILES from {peer_addr} (browsing disabled)");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            false,
+                        );
                     }
                 }
 
@@ -10998,6 +11044,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Answered OP_ASKSHAREDDIRS from {peer_addr}");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            true,
+                        );
                     } else {
                         write_packet_async(
                             &mut writer,
@@ -11007,6 +11059,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Denied OP_ASKSHAREDDIRS from {peer_addr} (browsing disabled)");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            false,
+                        );
                     }
                 }
 

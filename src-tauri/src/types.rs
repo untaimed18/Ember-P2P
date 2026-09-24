@@ -1726,6 +1726,11 @@ pub struct AppSettings {
     /// Somebody asked to be friends.
     #[serde(default = "default_true")]
     pub notify_friend_request: bool,
+    /// Somebody viewed our shared files: an ed2k client's "View Files", or a
+    /// friend browsing over Ember. Only answered browses notify; refusals go
+    /// to the server log alone.
+    #[serde(default = "default_true")]
+    pub notify_shares_browsed: bool,
     /// A message arrived in a joined channel.
     ///
     /// The only one of these that defaults **off**: a room is a group
@@ -2308,6 +2313,7 @@ impl Default for AppSettings {
             notify_friend_online: true,
             notify_friend_message: true,
             notify_friend_request: true,
+            notify_shares_browsed: true,
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,

@@ -1011,6 +1011,10 @@ export interface AppSettings {
   /** Friend chat messages and incoming file offers. */
   notify_friend_message: boolean;
   notify_friend_request: boolean;
+  /** Someone viewed our shared files (an ed2k client's "View Files", or a
+   *  friend over Ember). Only answered browses notify; refusals go to the
+   *  server log alone. */
+  notify_shares_browsed: boolean;
   /** Messages in joined rooms. The one category that defaults **off** — a room
    *  can carry hundreds of messages an hour. Muted rooms and ignored members
    *  are excluded regardless. */

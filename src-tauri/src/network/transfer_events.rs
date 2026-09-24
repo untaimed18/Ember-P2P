@@ -995,7 +995,7 @@ pub(super) async fn handle_upload_event(
                 },
             );
         }
-        UploadEventKind::ShareInterest { .. } => {}
+        UploadEventKind::ShareInterest { .. } | UploadEventKind::SharesBrowsed { .. } => {}
         UploadEventKind::Completed { full_file } => {
             // Match eMule's "session ends → row vanishes" UX. We still
             // call `mgr.complete()` so the queued-promotion logic fires

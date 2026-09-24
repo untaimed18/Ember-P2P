@@ -2676,6 +2676,17 @@
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_shares_browsed()}</span>
+              <span class="hint">{m.settings_notify_shares_browsed_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_shares_browsed}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_shares_browsed()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_notify_channel_message()}</span>
               <span class="hint">{m.settings_notify_channel_message_hint()}</span>
             </div>

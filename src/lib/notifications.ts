@@ -42,6 +42,7 @@ export type NotifyCategory =
   | 'friend_online'
   | 'friend_message'
   | 'friend_request'
+  | 'shares_browsed'
   | 'channel_message';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
@@ -53,6 +54,7 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   // reason about.
   friend_message: 'notify_friend_message',
   friend_request: 'notify_friend_request',
+  shares_browsed: 'notify_shares_browsed',
   channel_message: 'notify_channel_message',
 };
 
