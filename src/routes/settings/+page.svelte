@@ -3664,20 +3664,27 @@
 
           <div class="field">
             <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
-            <div class="chat-attach-auto">
-              <input
-                id="chat-attach-auto"
-                type="number"
-                min="0"
-                max="2048"
-                bind:value={settings.chat_attachment_auto_accept_mb}
-              />
-              <span class="chat-attach-auto-unit">{m.settings_chat_attach_auto_unit()}</span>
-              <button type="button" class="secondary" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+            <div class="chat-attach-row">
+              <div class="unit-input">
+                <input
+                  id="chat-attach-auto"
+                  type="number"
+                  min="0"
+                  max="2048"
+                  inputmode="numeric"
+                  aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
+                  bind:value={settings.chat_attachment_auto_accept_mb}
+                />
+                <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
+              </div>
+              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                </svg>
                 {m.settings_chat_attach_open_folder()}
               </button>
             </div>
-            <span class="hint">{m.settings_chat_attach_auto_hint()}</span>
+            <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
           </div>
 
           <div class="field">
@@ -6139,19 +6146,62 @@
     margin: 0;
   }
 
-  .chat-attach-auto {
+  .chat-attach-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: space-between;
+    gap: 12px;
     flex-wrap: wrap;
   }
 
-  .chat-attach-auto input {
-    width: 96px;
+  /* A number with its unit attached, styled like `.folder-input`. */
+  .unit-input {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--bg-input);
+    transition: border-color 0.15s;
   }
 
-  .chat-attach-auto-unit {
-    color: var(--text-muted);
-    font-size: 13px;
+  .unit-input:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
+  }
+
+  /* Specific enough to beat `.field input[type='number'] { width: 100% }`. */
+  .field .unit-input input[type='number'] {
+    width: 96px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    padding: 7px 10px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .unit-input-suffix {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .chat-files-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .chat-files-btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
   }
 </style>
