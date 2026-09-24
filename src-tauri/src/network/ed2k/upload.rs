@@ -3566,13 +3566,60 @@ fn encode_shared_files_answer(
     payload
 }
 
-/// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
+/// Whether `entry` is a waiter at `ip`, connected or not.
 ///
-/// Matches on either a known `user_hash` or the UDP source IP — we don't
-/// have the user hash from UDP alone, so IP+file is the normal fallback.
-/// If multiple candidate entries match (e.g., two peers NATted behind the
-/// same address) we pick the earliest join time so the rank we report is
-/// stable and non-inflationary.
+/// `last_ip` is what makes a disconnected waiter findable: every queued socket
+/// is released after [`QUEUED_SOCKET_IDLE_SECS`], which clears `current_addr`,
+/// and a waiter identified by user hash has nothing else that names an address.
+fn queue_entry_is_at_ip(entry: &QueueEntry, ip: IpAddr) -> bool {
+    let canonical = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    let ip = canonical(ip);
+    matches!(&entry.identity, QueueIdentity::Ip(own) if canonical(*own) == ip)
+        || entry.current_addr.is_some_and(|a| canonical(a.ip()) == ip)
+        || entry.last_ip.is_some_and(|last| canonical(last) == ip)
+}
+
+/// The waiting-list row a UDP `OP_REASKFILEPING` from `from_ip:from_udp_port`
+/// about `file_hash` belongs to.
+///
+/// eMule's `CUploadQueue::GetWaitingClientByIP_UDP(ip, port, true)`: an exact
+/// address-and-port match wins, and a port that differs is ignored when only
+/// one waiter is at that address, since a NAT may have remapped it. Several
+/// waiters behind one address need the port to tell them apart, and a
+/// datagram whose address matches no waiter matches nothing — the UDP port
+/// alone is not an identity, and eMule's default one is shared by thousands of
+/// clients. Among exact matches the earliest join wins, so the rank reported
+/// is stable when several peers share an address and port.
+fn find_udp_reasker(
+    queue: &[QueueEntry],
+    from_ip: IpAddr,
+    from_udp_port: u16,
+    file_hash: &[u8; 16],
+) -> Option<usize> {
+    let mut exact: Option<usize> = None;
+    let mut only_at_ip: Option<usize> = None;
+    let mut at_ip = 0usize;
+    for (i, entry) in queue.iter().enumerate() {
+        if entry.file_hash != *file_hash || !queue_entry_is_at_ip(entry, from_ip) {
+            continue;
+        }
+        at_ip += 1;
+        only_at_ip = Some(i);
+        if entry.udp_port != 0
+            && entry.udp_port == from_udp_port
+            && exact.is_none_or(|best| entry.join_time < queue[best].join_time)
+        {
+            exact = Some(i);
+        }
+    }
+    exact.or(if at_ip == 1 { only_at_ip } else { None })
+}
+
+/// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING),
+/// matched by [`find_udp_reasker`], and refresh its purge clock.
 ///
 /// Returns `Some(rank)` where rank is 1-based (matching TCP `OP_QUEUERANKING`
 /// semantics) or `None` if no matching entry exists (caller should treat as
@@ -3600,52 +3647,13 @@ pub(crate) async fn udp_queue_rank_for_peer(
     let idx = local_index.read().await;
     let mut queue = upload_queue.lock().await;
 
-    // A UDP re-ask is the peer holding its place, so it has to refresh the
-    // purge clock exactly as the TCP path does — eMule stamps
-    // `SetLastUpRequest` here too (`ClientUDPSocket.cpp:255`). Folded into the
-    // match scan rather than run as a second pass, but note the two conditions
-    // differ: the refresh is deliberately not gated on the UDP port.
-    let now = std::time::Instant::now();
-    let mut best: Option<usize> = None;
-    let mut best_join: Option<std::time::Instant> = None;
-    for i in 0..queue.len() {
-        let entry = &mut queue[i];
-        if entry.file_hash != *file_hash {
-            continue;
-        }
-        let ip_matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-            || entry
-                .current_addr
-                .map(|a| a.ip() == from_ip)
-                .unwrap_or(false);
-        if ip_matches {
-            entry.last_request = now;
-        }
-        if entry.udp_port != 0 && entry.udp_port != from_udp_port {
-            continue;
-        }
-        let matches = ip_matches
-            // Port-only fallback for entries with no known address yet.
-            // Requires a real (non-zero) stored UDP port so multiple
-            // queued peers that both still have `udp_port == 0` can't
-            // spuriously match each other via `0 == 0`, and so this
-            // branch never substitutes for the IP checks above by
-            // coincidence when the port happens to still be unset.
-            || (entry.current_addr.is_none()
-                && entry.udp_port != 0
-                && entry.udp_port == from_udp_port);
-        if matches {
-            // Earliest join wins, so the reported rank is stable and
-            // non-inflationary when several peers NAT to one address.
-            let join = entry.join_time;
-            if best_join.is_none_or(|bj| join < bj) {
-                best = Some(i);
-                best_join = Some(join);
-            }
-        }
-    }
+    // A UDP re-ask is the peer holding its place, so it refreshes the purge
+    // clock exactly as the TCP path does — eMule stamps `SetLastUpRequest` on
+    // the matched sender here too (`ClientUDPSocket.cpp:255`).
+    let best = find_udp_reasker(&queue, from_ip, from_udp_port, file_hash)?;
+    queue[best].last_request = std::time::Instant::now();
 
-    let target = &queue[best?];
+    let target = &queue[best];
     let my_score = score_queue_entry(
         &cm,
         &idx,
@@ -15191,6 +15199,56 @@ mod abuse_and_seniority_tests {
 
     fn addr(ip: &str) -> SocketAddr {
         format!("{ip}:4662").parse().unwrap()
+    }
+
+    fn waiter(ip: &str, udp_port: u16) -> QueueEntry {
+        let mut entry = queue_entry(Some(ip.parse().unwrap()), None);
+        entry.udp_port = udp_port;
+        entry
+    }
+
+    /// Every queued socket is released after `QUEUED_SOCKET_IDLE_SECS`, so a
+    /// waiter known by user hash is disconnected nearly all the time it waits.
+    /// Its UDP re-asks used to match nothing that refreshed its purge clock,
+    /// so each waiter fell off the list an hour after its last TCP visit while
+    /// still re-asking every 29 minutes — capping the queue at about an hour of
+    /// arrivals, well below aMule on the same share.
+    #[test]
+    fn a_disconnected_waiter_is_found_by_its_last_address() {
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        assert!(queue[0].current_addr.is_none());
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[1u8; 16]), Some(0));
+        // A NAT may remap the UDP port; alone at its address, it still matches.
+        assert_eq!(find_udp_reasker(&queue, from, 50_000, &[1u8; 16]), Some(0));
+    }
+
+    #[test]
+    fn the_udp_port_alone_is_not_an_identity() {
+        // eMule's default UDP port is shared by countless clients, so a
+        // stranger re-asking from it must not inherit someone else's place.
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, stranger, 4672, &[1u8; 16]), None);
+    }
+
+    #[test]
+    fn waiters_behind_one_address_are_told_apart_by_port() {
+        let queue = vec![waiter("203.0.113.7", 4672), waiter("203.0.113.7", 4673)];
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4673, &[1u8; 16]), Some(1));
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[1u8; 16]), Some(0));
+        // Neither port: ambiguous, so neither is claimed.
+        assert_eq!(find_udp_reasker(&queue, from, 9_999, &[1u8; 16]), None);
+    }
+
+    #[test]
+    fn udp_reask_matching_ignores_ipv4_mapping_and_other_files() {
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, mapped, 4672, &[1u8; 16]), Some(0));
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[2u8; 16]), None);
     }
 
     fn backdate(
