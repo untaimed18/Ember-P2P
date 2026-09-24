@@ -484,17 +484,15 @@ pub(in crate::network) async fn save_on_shutdown(
             "Final known.met save skipped: serialized periodic writer still owns the file; refusing a racing overwrite"
         ),
     }
-    // Drain remaining AICH sets, but honour the same cap as the
-    // periodic timer — we don't want shutdown to be the one place
-    // that silently writes a known2_64.met file larger than every
-    // subsequent startup is willing to load.
+    // Drain remaining AICH sets into the append queue, bounded as the
+    // periodic timer bounds it.
     let mut shutdown_dropped = 0usize;
     while let Ok(hs) = aich_set_rx.try_recv() {
-        if state.aich_hash_sets.len() >= MAX_AICH_HASH_SETS {
+        if state.pending_known2_sets.len() >= MAX_AICH_HASH_SETS {
             shutdown_dropped = shutdown_dropped.saturating_add(1);
             continue;
         }
-        state.aich_hash_sets.push(hs);
+        state.pending_known2_sets.push(hs);
     }
     if shutdown_dropped > 0 {
         warn!(
@@ -502,7 +500,7 @@ pub(in crate::network) async fn save_on_shutdown(
             MAX_AICH_HASH_SETS, shutdown_dropped,
         );
     }
-    if !state.aich_hash_sets.is_empty() {
+    if !state.pending_known2_sets.is_empty() {
         // Wait out a periodic writer still in flight. Every sibling shutdown
         // save drains its in-flight flag or takes its lock; this one did
         // neither, so a 120-second periodic save that happened to be running
@@ -553,20 +551,20 @@ pub(in crate::network) async fn save_on_shutdown(
                 );
             }
         }
-        let known2_path = state.data_dir.join("known2_64.met");
-        let hash_sets = state.aich_hash_sets.clone();
-        let hash_set_count = hash_sets.len();
+        // The periodic append that may just have finished covered a prefix of
+        // this queue; appending the whole of it again is harmless, since the
+        // store skips masters it already holds.
+        let hash_sets = std::mem::take(&mut state.pending_known2_sets);
         if tokio::time::Instant::now() >= shutdown_deadline {
             error!(
                 "Shutdown deadline exhausted before known2_64.met save; shutdown result is explicitly truncated"
             );
         } else {
-            let writer = tokio::task::spawn_blocking(move || {
-                ed2k::aich::save_known2_met(&known2_path, &hash_sets)
-            });
+            let writer =
+                tokio::task::spawn_blocking(move || ed2k::aich::append_known2_sets(&hash_sets));
             match tokio::time::timeout_at(shutdown_deadline, writer).await {
-                Ok(Ok(Ok(()))) => info!(
-                    "Saved {hash_set_count} AICH hash sets to known2_64.met"
+                Ok(Ok(Ok(added))) => info!(
+                    "Appended {added} AICH hash sets to known2_64.met"
                 ),
                 Ok(Ok(Err(e))) => error!("Failed to save known2_64.met on shutdown: {e}"),
                 Ok(Err(e)) => error!("known2_64.met shutdown writer failed: {e}"),

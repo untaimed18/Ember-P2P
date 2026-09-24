@@ -11267,7 +11267,20 @@ impl UploadHandler {
                                 let memoized_aich = if is_partial || !request_aich {
                                     None
                                 } else {
-                                    self.aich_cache.lock().await.get(&cache_key)
+                                    let cached = self.aich_cache.lock().await.get(&cache_key);
+                                    match cached {
+                                        Some(hs) => Some(hs),
+                                        None => {
+                                            let stored = stored_aich_set(aich_root, file_size).await;
+                                            if let Some(hs) = &stored {
+                                                self.aich_cache
+                                                    .lock()
+                                                    .await
+                                                    .insert(cache_key.clone(), hs.clone());
+                                            }
+                                            stored
+                                        }
+                                    }
                                 };
                                 let compute_aich = request_aich && memoized_aich.is_none();
                                 // A request answered entirely from the memos
@@ -11709,10 +11722,21 @@ impl UploadHandler {
                                 let mut cache = self.aich_cache.lock().await;
                                 cache.get(&hash_hex)
                             };
+                            let stored = if cached.is_none() && !file.is_partial {
+                                stored_aich_set(parse_aich_root_hash(&file.aich_hash_hex), file.size)
+                                    .await
+                            } else {
+                                None
+                            };
                             let aich_result = if let Some(hs) = cached {
                                 Ok(hs)
                             } else if file.is_partial {
                                 Err(anyhow::anyhow!("AICH unavailable for partial file"))
+                            } else if let Some(hs) = stored {
+                                // A disk read of the stored leaves, not a hash of
+                                // the file, so it spends none of the budget.
+                                self.aich_cache.lock().await.insert(hash_hex.clone(), hs.clone());
+                                Ok(hs)
                             } else if !uncached_hash_budget.try_spend() {
                                 warn!(
                                     "Peer {peer_addr} exceeded its uncached hashset budget; refusing OP_AICHREQUEST"
@@ -13119,6 +13143,20 @@ fn parse_aich_root_hash(hex_str: &str) -> Option<[u8; 20]> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Some(out)
+}
+
+/// The file's recovery set as `known2_64.met` holds it, verified against its
+/// AICH master, instead of one rebuilt by hashing the whole file. `None` when
+/// the file has no known master or the store has no matching set.
+async fn stored_aich_set(
+    aich_root: Option<[u8; 20]>,
+    file_size: u64,
+) -> Option<crate::network::ed2k::aich::AICHRecoveryHashSet> {
+    let root = aich_root?;
+    tokio::task::spawn_blocking(move || crate::network::ed2k::aich::known2_load_set(&root, file_size))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn encode_legacy_hashset_response(file_hash: &[u8; 16], hashes: &[[u8; 16]]) -> Option<Vec<u8>> {

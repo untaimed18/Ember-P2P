@@ -175,7 +175,10 @@ fn picked_download_roots() -> &'static std::sync::Mutex<Vec<Vec<String>>> {
 
 /// Remembered in the same normalized form the change check below compares in,
 /// so a path can never be authorized and then fail to match itself.
-fn remember_picked_download_root(path: &std::path::Path) {
+///
+/// Also called by the eMule import for the incoming folder it read from an
+/// eMule folder the user picked, which is the same provenance one step removed.
+pub(crate) fn remember_picked_download_root(path: &std::path::Path) {
     const MAX_REMEMBERED: usize = 16;
     let key = normalized_path_components(path);
     let mut picked = picked_download_roots()
@@ -1188,16 +1191,16 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 folder,
             ));
         }
-        if is_filesystem_root(path)
-            || path
-                .canonicalize()
-                .ok()
-                .as_deref()
-                .is_some_and(is_filesystem_root)
-        {
+        // A data drive's root is allowed: it only reaches the config through
+        // `add_shared_folder_limited`, which asked first, or an eMule import
+        // the user approved. The system and profile drives never are.
+        let refused_root = |p: &std::path::Path| {
+            crate::sharing::drive_root_share(p) == crate::sharing::DriveRootShare::Refused
+        };
+        if refused_root(path) || path.canonicalize().ok().as_deref().is_some_and(refused_root) {
             return Err(coded_ctx(
                 "settings_shared_folder_root",
-                "Cannot share a filesystem root",
+                "Cannot share the system drive or the drive holding your user profile",
                 folder,
             ));
         }

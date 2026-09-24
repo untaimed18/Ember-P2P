@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { pickDownloadFolder } from '$lib/api/settings';
   import { relaunch } from '@tauri-apps/plugin-process';
   import { onDestroy, untrack } from 'svelte';
@@ -7,6 +8,13 @@
   import type { AppSettings } from '$lib/types';
   import ToggleSwitch from './ToggleSwitch.svelte';
   import SpeedInput from './SpeedInput.svelte';
+  import EmuleImport from './EmuleImport.svelte';
+  import {
+    stageEmuleImport,
+    type EmuleImportSelection,
+    type EmulePreview,
+    type EmuleStageProgress,
+  } from '$lib/api/emuleImport';
   import {
     updateSettings as saveSettings,
     getSettings,
@@ -35,7 +43,8 @@
     closeDialogOpen?: boolean;
   } = $props();
 
-  const TOTAL_STEPS = 8;
+  const TOTAL_STEPS = 9;
+  const IMPORT_STEP = 2;
   let step = $state(1);
   let transitioning = $state(false);
 
@@ -48,6 +57,87 @@
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
   let selectedTheme: Theme = $state(getInitialTheme());
+
+  let emuleSelection: EmuleImportSelection | null = $state(null);
+  let emulePreview: EmulePreview | null = $state(null);
+  let importing = $state(false);
+
+  /** What importing filled in from eMule's settings, so the later steps can
+   *  say where a value came from, and starting fresh after all can put back
+   *  whatever the user has not edited since. */
+  type Prefill = {
+    nickname?: string;
+    downloadFolder?: string;
+    tcpPort?: number;
+    udpPort?: number;
+    maxUpload?: number;
+    maxDownload?: number;
+  };
+  let prefill = $state<Prefill | null>(null);
+
+  // Only fields still at their defaults are filled in.
+  function applyPrefill(p: EmulePreview) {
+    const filled: Prefill = {};
+    const nick = p.nickname?.trim();
+    if (nick && nickname === _init.nickname) nickname = filled.nickname = nick;
+    if (p.incoming_dir && downloadFolder === _init.download_folder) {
+      downloadFolder = filled.downloadFolder = p.incoming_dir;
+    }
+    if (p.tcp_port && tcpPort === _init.tcp_port) tcpPort = filled.tcpPort = p.tcp_port;
+    if (p.udp_port && udpPort === _init.udp_port) udpPort = filled.udpPort = p.udp_port;
+    if (p.max_upload != null && maxUploadSpeed === _init.max_upload_speed) {
+      maxUploadSpeed = filled.maxUpload = p.max_upload;
+    }
+    if (p.max_download != null && maxDownloadSpeed === _init.max_download_speed) {
+      maxDownloadSpeed = filled.maxDownload = p.max_download;
+    }
+    prefill = filled;
+  }
+
+  function revertPrefill() {
+    if (!prefill) return;
+    if (prefill.nickname !== undefined && nickname === prefill.nickname) nickname = _init.nickname;
+    if (prefill.downloadFolder !== undefined && downloadFolder === prefill.downloadFolder) {
+      downloadFolder = _init.download_folder;
+    }
+    if (prefill.tcpPort !== undefined && tcpPort === prefill.tcpPort) tcpPort = _init.tcp_port;
+    if (prefill.udpPort !== undefined && udpPort === prefill.udpPort) udpPort = _init.udp_port;
+    if (prefill.maxUpload !== undefined && maxUploadSpeed === prefill.maxUpload) {
+      maxUploadSpeed = _init.max_upload_speed;
+    }
+    if (prefill.maxDownload !== undefined && maxDownloadSpeed === prefill.maxDownload) {
+      maxDownloadSpeed = _init.max_download_speed;
+    }
+    prefill = null;
+  }
+
+  $effect(() => {
+    const preview = emulePreview;
+    const chosen = emuleSelection !== null;
+    untrack(() => {
+      if (chosen && preview && !prefill) applyPrefill(preview);
+      else if (!chosen && prefill) revertPrefill();
+    });
+  });
+
+  function onEmulePreview(preview: EmulePreview) {
+    // Another profile, or this one read again: its values are applied afresh.
+    revertPrefill();
+    emulePreview = preview;
+  }
+
+  let nicknameFromEmule = $derived(prefill?.nickname !== undefined && nickname === prefill.nickname);
+  let folderFromEmule = $derived(
+    prefill?.downloadFolder !== undefined && downloadFolder === prefill.downloadFolder,
+  );
+  let portsFromEmule = $derived(
+    (prefill?.tcpPort !== undefined && tcpPort === prefill.tcpPort) ||
+      (prefill?.udpPort !== undefined && udpPort === prefill.udpPort),
+  );
+  let speedsFromEmule = $derived(
+    (prefill?.maxUpload !== undefined && maxUploadSpeed === prefill.maxUpload) ||
+      (prefill?.maxDownload !== undefined && maxDownloadSpeed === prefill.maxDownload),
+  );
 
   let speedTestRunning = $state(false);
   let speedTestResult = $state('');
@@ -65,11 +155,11 @@
   $effect(() => {
     step;
     requestAnimationFrame(() => {
-      cardEl
-        ?.querySelector<HTMLElement>(
-          'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        )
-        ?.focus();
+      const focusable = cardEl?.querySelectorAll<HTMLElement>(
+        'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      const visible = Array.from(focusable ?? []).filter((el) => !el.closest('[hidden]'));
+      (visible.find((el) => el.hasAttribute('data-autofocus')) ?? visible[0])?.focus();
     });
   });
 
@@ -103,11 +193,11 @@
   /** Whether the current step's required fields pass validation. */
   let canAdvance = $derived.by(() => {
     switch (step) {
-      case 2: // Identity
+      case 3: // Identity
         return nickname.trim().length > 0;
-      case 3: // Storage
+      case 4: // Storage
         return downloadFolder.trim().length > 0;
-      case 4: // Network
+      case 5: // Network
         // TCP and UDP are independent protocols and the OS keeps two
         // separate port tables, so reusing the same number on both is
         // fine — useful when a VPN only forwards a single port.
@@ -122,11 +212,11 @@
 
   let nextDisabledReason = $derived.by(() => {
     switch (step) {
-      case 2:
-        return nickname.trim().length > 0 ? '' : m.wizard_validation_nickname();
       case 3:
-        return downloadFolder.trim().length > 0 ? '' : m.wizard_validation_folder();
+        return nickname.trim().length > 0 ? '' : m.wizard_validation_nickname();
       case 4:
+        return downloadFolder.trim().length > 0 ? '' : m.wizard_validation_folder();
+      case 5:
         return tcpPort >= 1 && tcpPort <= 65535 && udpPort >= 1 && udpPort <= 65535
           ? ''
           : m.wizard_validation_ports();
@@ -201,13 +291,38 @@
     theme.set(t);
   }
 
+  let importStatus = $state<'idle' | 'pending' | 'ok'>('idle');
+  let importPercent: number | null = $state(null);
+
+  /** Stage the chosen import once the download folder it needs is saved. */
+  async function stageImport(selection: EmuleImportSelection): Promise<boolean> {
+    importStatus = 'pending';
+    importPercent = null;
+    const unlisten = await listen<EmuleStageProgress>('emule-import-progress', (event) => {
+      const { done, total } = event.payload;
+      importPercent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null;
+    }).catch(() => null);
+    try {
+      await stageEmuleImport(selection);
+      importStatus = 'ok';
+      return true;
+    } catch (e) {
+      importStatus = 'idle';
+      saveError = m.wizard_import_failed({ error: translateError(e, m.emule_import_stage_failed()) });
+      return false;
+    } finally {
+      unlisten?.();
+      importPercent = null;
+    }
+  }
+
   async function finish() {
-    if (saving || downloading) return;
+    if (saving || downloading || importing) return;
     // Final validation before writing any settings to disk. Prevents an
     // empty-nickname or port=0 config from sneaking past the per-step guard
     // if the user somehow reaches the last step with invalid state.
-    if (!nickname.trim()) { saveError = m.wizard_validation_nickname(); step = 2; return; }
-    if (!downloadFolder.trim()) { saveError = m.wizard_validation_folder(); step = 3; return; }
+    if (!nickname.trim()) { saveError = m.wizard_validation_nickname(); step = 3; return; }
+    if (!downloadFolder.trim()) { saveError = m.wizard_validation_folder(); step = 4; return; }
     const tcp = clampInt(tcpPort, 1, 65535, 4662);
     const udp = clampInt(udpPort, 1, 65535, 4672);
     // TCP and UDP on the same port number is allowed: they're different
@@ -276,12 +391,25 @@
 
     // Brief pause so the user can see the green checkmarks
     await new Promise(r => setTimeout(r, 900));
+
+    // Staged before `setup_complete` flips, so a failure leaves the wizard up
+    // to retry or skip it, and the relaunch below is the one that applies it.
+    if (emuleSelection && importStatus !== 'ok') {
+      importing = true;
+      downloading = false;
+      const staged = await stageImport(emuleSelection);
+      if (!staged) {
+        importing = false;
+        return;
+      }
+    }
     // Hand the guard back to `saving` rather than dropping it: both flags being
     // false through the final read-modify-write re-enables the Finish button
     // mid-flight, and a second `finish()` can then write `setup_complete: false`
     // after this one has written `true`.
     saving = true;
     downloading = false;
+    importing = false;
 
     // `download_ipfilter` persists `ip_filter_enabled` and bumps the revision.
     // Re-read before flipping setup_complete so the final save isn't rejected
@@ -329,6 +457,7 @@
 
   const stepLabels: (() => string)[] = [
     () => m.wizard_step_welcome(),
+    () => m.wizard_step_import(),
     () => m.wizard_step_identity(),
     () => m.wizard_step_storage(),
     () => m.wizard_step_network(),
@@ -426,7 +555,10 @@
           <p class="step-hint">{m.wizard_welcome_hint()}</p>
         </div>
 
-      {:else if step === 2}
+      {:else if step === IMPORT_STEP}
+        <!-- Rendered below, outside this chain, so detection and choices survive Back and Next. -->
+
+      {:else if step === 3}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_nickname_title()}</h2>
           <p class="step-desc">{m.wizard_nickname_desc()}</p>
@@ -434,10 +566,13 @@
             <label for="nickname">{m.wizard_nickname_label()}</label>
             <input id="nickname" type="text" bind:value={nickname} maxlength="128" class="text-input" placeholder={m.wizard_nickname_placeholder()} />
           </div>
+          {#if nicknameFromEmule}
+            <p class="step-hint from-emule">{m.wizard_from_emule()}</p>
+          {/if}
           <p class="step-hint">{m.wizard_nickname_hint()}</p>
         </div>
 
-      {:else if step === 3}
+      {:else if step === 4}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_folder_title()}</h2>
           <p class="step-desc">{m.wizard_folder_desc()}</p>
@@ -462,6 +597,9 @@
               />
               <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
+            {#if folderFromEmule}
+              <p class="step-hint from-emule">{m.wizard_folder_from_emule()}</p>
+            {/if}
             <p class="step-hint">{m.wizard_folder_picker_hint()}</p>
             {#if folderError}
               <p class="save-error">{folderError}</p>
@@ -469,7 +607,7 @@
           </div>
         </div>
 
-      {:else if step === 4}
+      {:else if step === 5}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_ports_title()}</h2>
           <p class="step-desc">{m.wizard_ports_desc()}</p>
@@ -486,10 +624,13 @@
           <div class="toggle-row">
             <ToggleSwitch bind:checked={upnpEnabled} label={m.wizard_ports_upnp_label()} />
           </div>
+          {#if portsFromEmule}
+            <p class="step-hint from-emule">{m.wizard_ports_from_emule()}</p>
+          {/if}
           <p class="step-hint">{m.wizard_ports_hint()}</p>
         </div>
 
-      {:else if step === 5}
+      {:else if step === 6}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_bandwidth_title()}</h2>
           <p class="step-desc">{m.wizard_bandwidth_desc()}</p>
@@ -501,6 +642,9 @@
               <SpeedInput bind:value={maxDownloadSpeed} label={m.wizard_bandwidth_download_label()} />
             </div>
           </div>
+          {#if speedsFromEmule}
+            <p class="step-hint from-emule">{m.wizard_from_emule()}</p>
+          {/if}
           <button type="button" class="speed-test-btn" onclick={runSpeedTest} disabled={speedTestRunning}>
             {speedTestRunning ? m.wizard_speed_test_running() : m.wizard_speed_test_run()}
           </button>
@@ -509,7 +653,7 @@
           {/if}
         </div>
 
-      {:else if step === 6}
+      {:else if step === 7}
         <!--
           No switches left on this step, and it stays anyway: it is the one
           screen that tells a new user which networks the app is about to join
@@ -542,7 +686,7 @@
           <p class="step-hint">{m.wizard_connect_hint()}</p>
         </div>
 
-      {:else if step === 7}
+      {:else if step === 8}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_theme_title()}</h2>
           <p class="step-desc">{m.wizard_theme_desc()}</p>
@@ -584,7 +728,7 @@
           </div>
         </div>
 
-      {:else if step === 8}
+      {:else if step === 9}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_ready_title()}</h2>
           <p class="step-desc">{m.wizard_ready_desc()}</p>
@@ -616,6 +760,10 @@
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_theme()}</span>
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">{m.wizard_summary_import()}</span>
+              <span class="summary-value">{emuleSelection ? m.wizard_summary_import_yes() : m.wizard_summary_import_no()}</span>
             </div>
           </div>
           <!-- Said before the button rather than discovered after it: the
@@ -666,15 +814,42 @@
                   <span class="dl-warn">{m.wizard_dl_ipfilter_failed()}</span>
                 {/if}
               </div>
+              {#if emuleSelection}
+                <div class="dl-item">
+                  {#if importStatus === 'pending'}
+                    <span class="spinner xs" aria-hidden="true"></span>
+                  {:else if importStatus === 'ok'}
+                    <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+                  {:else}
+                    <span class="dl-icon placeholder" aria-hidden="true"></span>
+                  {/if}
+                  <span>
+                    {importPercent === null
+                      ? m.wizard_import_progress()
+                      : m.wizard_import_progress_percent({ percent: importPercent })}
+                  </span>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>
       {/if}
+
+      <div class="step-content" hidden={step !== IMPORT_STEP}>
+        <h2 class="step-title">{m.wizard_import_title()}</h2>
+        <p class="step-desc">{m.wizard_import_desc()}</p>
+        <EmuleImport
+          mode="wizard"
+          bind:selection={emuleSelection}
+          downloadFolderIsIncoming={!!emulePreview?.incoming_dir && downloadFolder === emulePreview.incoming_dir}
+          onpreview={onEmulePreview}
+        />
+      </div>
     </div>
 
     <!-- Footer -->
     <div class="wizard-footer">
-      {#if step > 1 && !saving && !downloading}
+      {#if step > 1 && !saving && !downloading && !importing}
         <button type="button" class="btn-back" onclick={goBack}>{m.common_back()}</button>
       {:else}
         <div></div>
@@ -688,11 +863,13 @@
             </button>
           </span>
         {:else}
-          <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading}>
+          <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading || importing}>
             {#if saving}
               <span class="spinner sm"></span> {m.wizard_saving()}
             {:else if downloading}
               <span class="spinner sm"></span> {m.wizard_downloading()}
+            {:else if importing}
+              <span class="spinner sm"></span> {m.wizard_importing()}
             {:else}
               {m.wizard_launch()}
             {/if}
@@ -896,6 +1073,10 @@
     font-size: 12px;
     color: var(--text-muted);
     margin: 12px 0 0;
+  }
+
+  .step-hint.from-emule {
+    color: var(--accent);
   }
 
   /* Info cards (welcome) */
@@ -1451,7 +1632,7 @@
   }
 
   /*
-   * Eight 9px uppercase labels in one row is a lot of type for a narrow
+   * Nine 9px uppercase labels in one row is a lot of type for a narrow
    * card, and they only disappeared at 700px — so there was a band where
    * they were on screen, touching, and unreadable. Between here and there,
    * label just the step you are on: that is the only one that answers

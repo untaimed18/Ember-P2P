@@ -563,6 +563,17 @@ pub fn initialize_approved_roots(
     data_dir: &Path,
     configured_roots: &[String],
 ) -> io::Result<Arc<ApprovedRootRegistry>> {
+    initialize_approved_roots_with_additions(data_dir, configured_roots, &[])
+}
+
+/// [`initialize_approved_roots`], also approving `explicit_additions` — roots
+/// the user approved in an eMule import's preview before the restart that
+/// applied it. Every one must also be in `configured_roots`.
+pub fn initialize_approved_roots_with_additions(
+    data_dir: &Path,
+    configured_roots: &[String],
+    explicit_additions: &[String],
+) -> io::Result<Arc<ApprovedRootRegistry>> {
     let state_path = data_dir.join(ROOT_STATE_FILE);
     let transaction_path = data_dir.join(ROOT_TRANSACTION_FILE);
     // An interrupted replace parks this file under a fixed backup name. Reading
@@ -660,11 +671,12 @@ pub fn initialize_approved_roots(
         state_path,
         roots: parking_lot::RwLock::new(roots),
     });
-    let additions = if state_exists {
+    let mut additions = if state_exists {
         Vec::new()
     } else {
         configured_roots.to_vec()
     };
+    additions.extend(explicit_additions.iter().cloned());
     // Startup revokes roots whose identity changed rather than refusing to run:
     // a folder that was deleted and recreated (or a re-imaged volume) otherwise
     // left the app unable to launch at all, with no in-app way to recover.

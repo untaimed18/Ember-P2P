@@ -2704,6 +2704,33 @@ async fn extend_folder_allowlist(
     Ok(grew)
 }
 
+/// Ask, in a dialog the renderer can neither draw nor dismiss, whether to share
+/// a whole drive. Every way of adding a folder (picker, in-app browser, drop)
+/// arrives here, so this is the one place the question is asked.
+pub(crate) async fn confirm_drive_root_share(app: &tauri::AppHandle, root: &std::path::Path) -> bool {
+    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+    let shown = crate::commands::share_browser::display_fs_path(root);
+    let prompt = format!(
+        "Share the entire drive {}?\n\nEvery file on it, in every folder, will be offered to other peers. \
+         Only do this for a drive that holds nothing but files you mean to share.",
+        crate::commands::settings::elide_for_dialog(&shown)
+    );
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .message(prompt)
+            .title("Share a whole drive?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Share the drive".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// [`add_shared_folder`], optionally offering only `only` out of the folder:
 /// files, or folders whose whole contents are offered.
 ///
@@ -2763,18 +2790,15 @@ pub(crate) async fn add_shared_folder_limited(
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
 
-    // Reject sharing a filesystem root (e.g. "C:\" or "/"). Sharing a root
-    // would index the entire volume and make every path on it pass
-    // `is_path_within_dirs`, defeating shared-folder containment. A real
-    // shared folder always has at least one named path component.
-    if canonical.parent().is_none()
-        || !canonical
-            .components()
-            .any(|c| matches!(c, std::path::Component::Normal(_)))
-    {
+    // A whole volume makes every path on it pass `is_path_within_dirs`, so it
+    // is never the system drive or the one holding the user's profile. A
+    // dedicated data drive is allowed once the user confirms below, since that
+    // is how an eMule archive spread over drives has always been shared.
+    let drive_root = crate::sharing::drive_root_share(&canonical);
+    if drive_root == crate::sharing::DriveRootShare::Refused {
         return Err(coded_ctx(
             "sharing_cannot_share_root",
-            "Cannot share a filesystem root",
+            "Cannot share the system drive or the drive holding your user profile",
             canonical.display(),
         ));
     }
@@ -2813,6 +2837,23 @@ pub(crate) async fn add_shared_folder_limited(
     }
 
     let canonical_str = canonical.to_string_lossy().to_string();
+    if drive_root == crate::sharing::DriveRootShare::NeedsConfirmation {
+        let already_shared = state
+            .config
+            .read()
+            .await
+            .settings
+            .shared_folders
+            .iter()
+            .any(|f| paths_equal_ignore_case(f, &canonical_str));
+        if !already_shared && !confirm_drive_root_share(&app, &canonical).await {
+            return Err(coded_ctx(
+                "sharing_drive_root_declined",
+                "The drive was not shared",
+                canonical.display(),
+            ));
+        }
+    }
     let limit = match resolved_only {
         Some(entries) => {
             let mut files = Vec::new();

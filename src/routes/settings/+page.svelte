@@ -100,6 +100,7 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import EmuleImport from '$lib/components/EmuleImport.svelte';
   import {
     updater,
     checkForUpdates,
@@ -654,7 +655,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'import' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below.
   ///
@@ -679,6 +680,7 @@
     'security',
     'friends',
     'channels',
+    'import',
     'backup',
     'about',
   ];
@@ -706,6 +708,12 @@
   }
 
   let activeSection: SettingsSection = $state(initialSection());
+  /// The import card scans eMule's folder when it mounts, so it waits until
+  /// the section is first opened rather than running on every Settings visit.
+  let importOpened = $state(false);
+  $effect(() => {
+    if (activeSection === 'import') importOpened = true;
+  });
 
   /**
    * Free-text filter across every control on the page.
@@ -837,6 +845,7 @@
       case 'channels': return m.settings_section_channels();
       case 'search': return m.settings_section_search();
       case 'webservices': return m.webservices_title();
+      case 'import': return m.settings_section_import();
       case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
     }
@@ -2274,6 +2283,12 @@
                   <circle cx="10" cy="10" r="7.5"/>
                   <line x1="2.5" y1="10" x2="17.5" y2="10"/>
                   <path d="M10 2.5c2.2 2 3.4 4.7 3.4 7.5s-1.2 5.5-3.4 7.5c-2.2-2-3.4-4.7-3.4-7.5S7.8 4.5 10 2.5z"/>
+                </svg>
+              {:else if section === 'import'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
+                  <line x1="10" y1="3" x2="10" y2="12"/>
+                  <polyline points="6.5,8.5 10,12 13.5,8.5"/>
                 </svg>
               {:else if section === 'backup'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3886,6 +3901,32 @@
                   </li>
                 {/each}
               </ul>
+            {/if}
+          </div>
+        </div>
+      </section>
+
+      <!-- Import from eMule -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'import'} id={panelId('import')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('import')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
+              <line x1="10" y1="3" x2="10" y2="12"/>
+              <polyline points="6.5,8.5 10,12 13.5,8.5"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.settings_section_import()}</h3>
+            <p class="card-desc">{m.settings_import_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            {#if importOpened}
+              <EmuleImport mode="settings" onrestart={performRestart} />
+            {:else}
+              <span class="hint">{m.settings_import_hint()}</span>
             {/if}
           </div>
         </div>

@@ -325,6 +325,12 @@ impl AppConfig {
         Ok((data, self.config_path.clone(), self.config_path.clone()))
     }
 
+    /// Where `config.json` lives, for writers that run before the config is
+    /// shared behind its lock (the startup apply of an eMule import).
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
     /// Blocking file write -- call this OUTSIDE of the RwLock.
     /// `_tmp_path` is retained for back-compat but ignored; `atomic_write`
     /// generates a unique temp path internally.

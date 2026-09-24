@@ -10,7 +10,6 @@ pub(in crate::network) async fn on_known_met_save_tick(
     known2_in_flight_len: &mut usize,
     known2_save_in_flight: &mut bool,
     known2_save_started_at: &mut Option<tokio::time::Instant>,
-    known2_saved_len: Option<usize>,
     known_met_save_in_flight: &mut bool,
     known_met_save_result_tx: &mpsc::UnboundedSender<KnownMetSaveResult>,
     known_met_save_started_at: &mut Option<tokio::time::Instant>,
@@ -75,47 +74,34 @@ pub(in crate::network) async fn on_known_met_save_tick(
         });
     }
     while let Ok(hs) = aich_set_rx.try_recv() {
-        // Cap aich_hash_sets to a sane upper bound. The
-        // recovery sets are persisted to known2_64.met and
-        // grow with the local file corpus; in normal use
-        // this is bounded by user activity, but a buggy
-        // hashing path or a maliciously-named file ingested
-        // through the indexer could in principle insert
-        // without limit. We refuse new sets past the cap
-        // (rather than evicting) because dropping a stored
-        // set risks losing the only AICH root we trust for
-        // a file — eviction would silently downgrade
-        // corruption-recovery integrity.
-        if state.aich_hash_sets.len() >= MAX_AICH_HASH_SETS {
+        // Only the not-yet-appended queue is bounded; the file is not. A
+        // queue this deep means appends keep failing, and refusing (rather
+        // than evicting) keeps the sets that are already waiting.
+        if state.pending_known2_sets.len() >= MAX_AICH_HASH_SETS {
             warn!(
-                "aich_hash_sets at cap ({}), dropping new set for root {}",
+                "known2_64.met append queue at cap ({}), dropping new set for root {}",
                 MAX_AICH_HASH_SETS,
                 hex::encode(hs.root_hash),
             );
             continue;
         }
-        state.aich_hash_sets.push(hs);
+        state.pending_known2_sets.push(hs);
     }
-    // Gated on the set having actually grown, the way the
-    // `known.met` save above is gated on `is_dirty()`. Unconditional,
-    // this deep-cloned the whole recovery corpus on the event loop,
-    // re-serialised it in the blocking task and rewrote the file
-    // every 120s for the life of the session — at the loader's
-    // 64 MiB ceiling, tens of GiB of writes a day to persist bytes
-    // already on disk.
-    if !state.aich_hash_sets.is_empty()
-        && known2_saved_len != Some(state.aich_hash_sets.len())
+    // Appends only what is new. Until the deferred load has indexed the file
+    // there is no store to append to, and the sets simply wait.
+    if !state.pending_known2_sets.is_empty()
         && !*known2_save_in_flight
+        && ed2k::aich::known2_store().read().is_some()
     {
-        let known2_path = state.data_dir.join("known2_64.met");
-        let hash_sets = state.aich_hash_sets.clone();
+        let hash_sets = state.pending_known2_sets.clone();
         *known2_in_flight_len = hash_sets.len();
         let tx = periodic_save_result_tx.clone();
         *known2_save_in_flight = true;
         *known2_save_started_at = Some(tokio::time::Instant::now());
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                ed2k::aich::save_known2_met(&known2_path, &hash_sets)
+                ed2k::aich::append_known2_sets(&hash_sets)
+                    .map(|_| ())
                     .map_err(|e| e.to_string())
             })
             .await

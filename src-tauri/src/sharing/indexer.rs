@@ -276,9 +276,18 @@ impl FileIndexer {
                 #[cfg(target_os = "windows")]
                 {
                     use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+                    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
                     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                    const HIDDEN_SYSTEM: u32 = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
                     if let Ok(metadata) = entry.metadata() {
-                        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        let attributes = metadata.file_attributes();
+                        // Hidden *and* system is how Windows marks what it owns
+                        // on a volume (recycle bins, restore points, desktop.ini).
+                        // A shared drive root walks straight into them.
+                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                            || attributes & HIDDEN_SYSTEM == HIDDEN_SYSTEM
+                        {
                             continue;
                         }
                     }

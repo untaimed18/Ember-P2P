@@ -678,6 +678,35 @@ impl CreditManager {
                     }
                 }
             }
+            // An eMule or aMule `cryptkey.dat` copied in by someone moving
+            // over. It is the identity peers hold that user's credits against,
+            // so adopting it is the point; calling it corrupt left SecIdent off
+            // for good (issue 126).
+            if !was_protected {
+                if let Some((public, private)) = decode_emule_cryptkey(&data) {
+                    let original = key_path.with_extension("dat.emule");
+                    if std::fs::copy(&key_path, &original).is_ok() {
+                        crate::security::restrict_file_permissions(&original);
+                    }
+                    let rewritten = encode_keypair_file(&public, &private).and_then(|bytes| {
+                        crate::security::atomic_write(&key_path, &bytes, true)
+                            .map_err(anyhow::Error::from)
+                    });
+                    match rewritten {
+                        Ok(()) => tracing::info!(
+                            "Adopted an eMule-format cryptkey.dat; the original is kept as cryptkey.dat.emule"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Adopted an eMule-format cryptkey.dat for this session but could not rewrite it: {e}"
+                        ),
+                    }
+                    self.our_public_key = public;
+                    self.our_private_key = private;
+                    self.crypto_available = true;
+                    self.crypto_unreadable = false;
+                    return;
+                }
+            }
             let backup = key_path.with_extension(format!(
                 "dat.{}.corrupt",
                 chrono::Utc::now().format("%Y%m%d%H%M%S")
@@ -1908,6 +1937,54 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     };
 
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
+}
+
+/// `cryptkey.dat` as eMule and aMule write it: the RSA-384 private key as
+/// PKCS#8 DER, base64-encoded by Crypto++ with a line break every 72 columns
+/// (`CClientCreditsList::CreateKeyPair`). Raw DER, and PKCS#1 rather than
+/// PKCS#8, are accepted too, for a file someone has already converted.
+///
+/// Returns `(public SPKI, private PKCS#8)`, the pair Ember stores. Only 384-bit
+/// keys are taken: that is the size eMule's SecIdent uses, and the one whose
+/// public key fits the 80-byte `MAXPUBKEYSIZE` peers accept.
+pub(crate) fn decode_emule_cryptkey(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine as _;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+
+    let der = if raw.first() == Some(&0x30) {
+        raw.to_vec()
+    } else {
+        let text: Vec<u8> = raw
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        base64::engine::general_purpose::STANDARD.decode(text).ok()?
+    };
+    let key = RsaPrivateKey::from_pkcs8_der(&der)
+        .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der))
+        .ok()?;
+    if key.size() * 8 != 384 {
+        return None;
+    }
+    let public = key.to_public_key().to_public_key_der().ok()?;
+    let private = key.to_pkcs8_der().ok()?;
+    Some((public.as_ref().to_vec(), private.as_bytes().to_vec()))
+}
+
+/// Ember's `cryptkey.dat` bytes for a keypair, wrapped for this account:
+/// `u32 LE len | public SPKI | u32 LE len | private PKCS#8`, then
+/// `secret_store::protect`.
+pub(crate) fn encode_keypair_file(public_der: &[u8], private_der: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(8 + public_der.len() + private_der.len());
+    out.extend_from_slice(&(public_der.len() as u32).to_le_bytes());
+    out.extend_from_slice(public_der);
+    out.extend_from_slice(&(private_der.len() as u32).to_le_bytes());
+    out.extend_from_slice(private_der);
+    crate::storage::secret_store::protect(&out)
 }
 
 /// Re-encode a cached public key as SPKI if it's in the bare PKCS#1
@@ -3265,6 +3342,44 @@ mod tests {
         let peer = [0x33u8; 16];
         assert!(!cm.add_uploaded(peer, 2_000_000));
         assert!(!cm.has_download_bonus(&peer, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue 126: eMule's `cryptkey.dat` copied into the data folder used to be
+    /// quarantined as corrupt, leaving SecIdent off and the user's credits on
+    /// the network unreachable.
+    #[test]
+    fn an_emule_cryptkey_dropped_in_is_adopted_and_rewritten() {
+        use base64::Engine as _;
+        use rsa::pkcs8::EncodePrivateKey;
+        let dir = std::env::temp_dir().join(format!(
+            "ember-cryptkey-emule-{}-{}",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 384).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(key.to_pkcs8_der().unwrap().as_bytes());
+        let wrapped: String = b64
+            .as_bytes()
+            .chunks(72)
+            .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
+            .collect();
+        std::fs::write(dir.join("cryptkey.dat"), &wrapped).unwrap();
+
+        let mut cm = CreditManager::new();
+        cm.load_or_create_keypair(&dir);
+        assert!(!cm.crypto_unreadable());
+        let adopted = cm.our_public_key().to_vec();
+        assert!(dir.join("cryptkey.dat.emule").exists(), "the original is kept");
+
+        let mut again = CreditManager::new();
+        again.load_or_create_keypair(&dir);
+        assert_eq!(again.our_public_key(), adopted.as_slice(), "rewritten in Ember's layout");
+
+        let bits_512 = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 512).unwrap();
+        assert!(decode_emule_cryptkey(bits_512.to_pkcs8_der().unwrap().as_bytes()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

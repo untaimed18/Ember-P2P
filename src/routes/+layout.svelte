@@ -38,6 +38,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
+  import { getEmuleImportReport } from '$lib/api/emuleImport';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
@@ -331,6 +332,17 @@
     })
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
+
+    // An eMule import staged before this launch was applied during startup.
+    // Marked seen as it is read, so the notice shows once; the full report
+    // stays in Settings → Import.
+    getEmuleImportReport(true)
+      .then((report) => {
+        if (!mounted || !report || report.seen) return;
+        if (report.items.every((item) => item.ok)) toastSuccess(m.emule_import_toast_done());
+        else toastWarning(m.emule_import_toast_problems());
+      })
+      .catch((e) => console.error('Failed to read the eMule import report:', e));
 
     // The upgrade turned the Ember overlay on for a profile that had it off.
     // There is no stored difference between "off because that was the default"

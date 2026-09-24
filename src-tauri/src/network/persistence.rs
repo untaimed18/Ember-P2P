@@ -6,13 +6,10 @@
 
 use super::*;
 
-/// Hard cap on `aich_hash_sets` (full per-file recovery hash sets
-/// loaded from / persisted to `known2_64.met`). Each set is on the
-/// order of `(file_size / PARTSIZE) * 20` bytes — a 4 GiB file is
-/// ~9 KiB. At 10k entries the persisted file would be ~90 MB, which
-/// is already implausibly large for a single user; pushing past this
-/// cap most likely indicates a hashing-loop bug rather than legitimate
-/// growth, so we refuse the insert and log a warning.
+/// Cap on `pending_known2_sets`: recovery sets computed this session and not
+/// yet appended to `known2_64.met`. The file itself has no cap (see
+/// `ed2k::aich::Known2Store`); this only bounds what can pile up in memory if
+/// appends keep failing, and a queue this deep means something is wrong.
 pub(super) const MAX_AICH_HASH_SETS: usize = 10_000;
 
 /// Soft cap on `aich_root_map` (ed2k → AICH root hash). At ~60 B per
@@ -413,6 +410,6 @@ pub(super) async fn load_ipfilter_on_enable(state: &mut NetworkState) {
 pub(super) struct DeferredDiskLoads {
     pub(super) ip_filter: IpFilter,
     pub(super) known_files: KnownFileList,
-    pub(super) aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
+    pub(super) known2: Option<ed2k::aich::Known2Store>,
     pub(super) aich_root_map: HashMap<[u8; 16], [u8; 20]>,
 }

@@ -12,6 +12,9 @@ const MET_HEADER_I64TAGS: u8 = 0x0F;
 
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
+/// High 32 bits of a file size, beside a 32-bit `FT_FILESIZE`. Older eMule
+/// builds and some mods write large files this way instead of as one u64.
+const FT_FILESIZE_HI: u8 = 0x3A;
 const FT_AICH_HASH: u8 = 0x27;
 const FT_ATTRANSFERRED: u8 = 0x50;
 const FT_ATTRANSFERREDHI: u8 = 0x51;
@@ -89,6 +92,50 @@ const MAX_KNOWN_PATH_MAPPINGS: usize = 512 * 100_000;
 /// above claims to support. Crossing it is treated as "cannot read", never as
 /// "reset" — see the `oversize` handling in [`KnownFileList::load`].
 const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Version byte plus record count: the size of a `known.met` with no records.
+const KNOWN_MET_HEADER_LEN: u64 = 5;
+
+/// A string tag from a `.met` file. eMule writes a name that is not plain
+/// ASCII twice: first as UTF-8 behind a byte-order mark, then in the local
+/// code page. Readers keep the first `FT_FILENAME`, as eMule does, and the
+/// mark is not part of the name.
+pub(crate) fn decode_met_string(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Beside `known.met`, the unix time an eMule import landed. While present,
+/// pathless records are not pruned: imported records have no path until the
+/// library scan matches each to its file, and pruning first would throw away
+/// exactly the hashes the import exists to keep.
+pub const PRUNE_HOLD_FILE: &str = "known_prune_hold";
+/// The hold ends once the scan has matched enough, or after this long.
+const PRUNE_HOLD_SECS: i64 = 14 * 24 * 3600;
+
+/// Start a prune hold for the catalog in `data_dir`. See [`PRUNE_HOLD_FILE`].
+pub fn hold_pruning(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        data_dir.join(PRUNE_HOLD_FILE),
+        chrono::Utc::now().timestamp().to_string(),
+    )
+}
+
+/// Whether a hold still applies, releasing it once pruning would do nothing
+/// anyway (the scan has caught up) or it has run its course.
+fn prune_hold_active(known_met: &Path, pathless: usize, ceiling: usize) -> bool {
+    let marker = known_met.with_file_name(PRUNE_HOLD_FILE);
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let since = text.trim().parse::<i64>().unwrap_or(0);
+    let expired = chrono::Utc::now().timestamp().saturating_sub(since) > PRUNE_HOLD_SECS;
+    if expired || pathless <= ceiling {
+        let _ = std::fs::remove_file(&marker);
+        return false;
+    }
+    true
+}
 
 fn quarantined_paths() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
     use std::collections::HashSet;
@@ -354,6 +401,18 @@ impl KnownFileList {
         // Absorbing a catalog that was actually read off disk is what makes
         // this list safe to write back.
         self.authoritative |= other.authoritative;
+    }
+
+    /// Parse a `known.met` already read into memory, touching no file.
+    ///
+    /// For another client's catalog (an eMule import): the interrupted-replace
+    /// recovery and the corrupt-file quarantine in [`Self::load_checked`] would
+    /// otherwise write into that client's folder.
+    pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
+        let mut list = Self::new();
+        list.parse_known_met(data)?;
+        list.authoritative = true;
+        Ok(list)
     }
 
     /// Strict loader used by security-policy and share-intent startup. Missing
@@ -688,9 +747,9 @@ impl KnownFileList {
                         }
                         cursor.set_position(new_pos);
                     }
-                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    let s = decode_met_string(&sbuf);
                     match name_id {
-                        FT_FILENAME => record.file_name = s,
+                        FT_FILENAME if record.file_name.is_empty() => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         FT_EMBER_MEDIA_CODEC => {
@@ -711,7 +770,14 @@ impl KnownFileList {
                 TAG_UINT32 => {
                     let v = cursor.read_u32::<LittleEndian>()?;
                     match name_id {
-                        FT_FILESIZE => record.file_size = v as u64,
+                        // Either half may come first, so neither clears the other.
+                        FT_FILESIZE => {
+                            record.file_size = (record.file_size & 0xFFFF_FFFF_0000_0000) | v as u64;
+                        }
+                        FT_FILESIZE_HI => {
+                            record.file_size =
+                                (record.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32);
+                        }
                         FT_ATTRANSFERRED => {
                             record.all_time_transferred =
                                 (record.all_time_transferred & 0xFFFF_FFFF_0000_0000) | v as u64;
@@ -743,11 +809,19 @@ impl KnownFileList {
                         _ => {}
                     }
                 }
+                // Writers that pick the smallest integer type (aMule, mods)
+                // store a small file's size in these.
                 0x08 => {
-                    cursor.read_u16::<LittleEndian>()?;
+                    let v = cursor.read_u16::<LittleEndian>()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v as u64;
+                    }
                 }
                 0x09 => {
-                    cursor.read_u8()?;
+                    let v = cursor.read_u8()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v as u64;
+                    }
                 }
                 0x0B => {
                     let v = cursor.read_u64::<LittleEndian>()?;
@@ -800,9 +874,9 @@ impl KnownFileList {
                     let len = (t - 0x11 + 1) as usize;
                     let mut sbuf = vec![0u8; len];
                     cursor.read_exact(&mut sbuf)?;
-                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    let s = decode_met_string(&sbuf);
                     match name_id {
-                        FT_FILENAME => record.file_name = s,
+                        FT_FILENAME if record.file_name.is_empty() => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         _ => {}
@@ -868,16 +942,41 @@ impl KnownFileList {
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        let mut matches = self
+        // An exact time wins. Failing that, a time off by FAT's 2-second
+        // rounding, or by exactly an hour, is still the same file when only one
+        // record is that close: the hour is the daylight-saving shift FAT and
+        // older NTFS tooling apply to stored times (eMule corrects the same
+        // with `AdjustNTFSDaylightFileTime`). Without it an archive carried
+        // over from eMule on such a drive was re-hashed in full, which on a
+        // multi-terabyte library is days of disk time.
+        const FAT_SLACK_SECS: i64 = 2;
+        const DST_SHIFT_SECS: i64 = 3600;
+        let (mut exact, mut exact_count) = (None, 0usize);
+        let (mut near, mut near_count) = (None, 0usize);
+        for record in self
             .files
             .values()
-            .filter(|r| r.file_name == name && r.file_size == size && r.modified_at == mtime);
-        let first = matches.next()?;
-        if matches.next().is_some() {
+            .filter(|r| r.file_name == name && r.file_size == size)
+        {
+            let delta = (record.modified_at - mtime).abs();
+            if delta == 0 {
+                exact = Some(record);
+                exact_count += 1;
+            } else if delta <= FAT_SLACK_SECS || (delta - DST_SHIFT_SECS).abs() <= FAT_SLACK_SECS {
+                near = Some(record);
+                near_count += 1;
+            }
+        }
+        let (found, count) = if exact_count > 0 {
+            (exact, exact_count)
+        } else {
+            (near, near_count)
+        };
+        if count > 1 {
             warn!("known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing");
             return None;
         }
-        Some(first)
+        found
     }
 
     pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
@@ -1211,13 +1310,16 @@ impl KnownFileList {
     /// cached hashes for files the library no longer contains — at worst a
     /// re-hash if one reappears, against an index that otherwise grows until it
     /// can no longer be read.
-    fn prune_unreferenced(&mut self) {
+    fn prune_unreferenced(&mut self, known_met: &Path) {
         let mut pathless: Vec<([u8; 16], i64)> = self
             .files
             .iter()
             .filter(|(hash, _)| !self.path_refs.contains_key(*hash))
             .map(|(hash, record)| (*hash, record.modified_at))
             .collect();
+        if prune_hold_active(known_met, pathless.len(), Self::MAX_UNREFERENCED_RECORDS) {
+            return;
+        }
         if pathless.len() <= Self::MAX_UNREFERENCED_RECORDS {
             return;
         }
@@ -1255,10 +1357,21 @@ impl KnownFileList {
             );
             return Ok(());
         }
+        // Nothing in this type removes every record — pathless ones are kept
+        // for exactly the re-hash they save — so an empty list here is a
+        // catalog that failed to arrive, not one the user emptied. Writing it
+        // is how a shutdown mid-reindex once left "Saved 0 known files" over a
+        // library's worth of hashes.
+        if self.files.is_empty()
+            && std::fs::metadata(path).is_ok_and(|meta| meta.len() > KNOWN_MET_HEADER_LEN)
+        {
+            warn!("Skipping known.met save: refusing to replace a populated catalog with an empty one");
+            return Ok(());
+        }
         // Bounded here rather than on every mutation: this is the one place the
         // whole catalog is already being walked, and the only place its size
         // has a consequence.
-        self.prune_unreferenced();
+        self.prune_unreferenced(path);
 
         // Partitioned before the header is written, because the header commits
         // a record count and there is no way to skip a record after it.
@@ -1299,7 +1412,11 @@ impl KnownFileList {
         })?;
         buf.write_u32::<LittleEndian>(encodable.len() as u32)?;
 
+        // Encoded size of each record no library path refers to, the ones
+        // that can go if the catalog outgrows what `load_checked` reads back.
+        let mut pathless_sizes: Vec<([u8; 16], i64, u64)> = Vec::new();
         for record in encodable {
+            let record_start = buf.len();
             buf.write_u32::<LittleEndian>(
                 (record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32
             )?;
@@ -1426,6 +1543,47 @@ impl KnownFileList {
 
             buf.write_u32::<LittleEndian>(tag_count)?;
             buf.write_all(&tags)?;
+            if !self.path_refs.contains_key(&record.file_hash) {
+                pathless_sizes.push((
+                    record.file_hash,
+                    record.modified_at,
+                    (buf.len() - record_start) as u64,
+                ));
+            }
+        }
+
+        // A catalog over the read ceiling would load as "cannot read" at the
+        // next launch, which turns sharing off. That is how a prune hold after
+        // a large import would end, so the ceiling wins over the hold: the
+        // oldest pathless records go until it fits, and if records with live
+        // paths alone are too many, the readable catalog on disk is kept.
+        if buf.len() as u64 > MAX_KNOWN_MET_BYTES {
+            let mut excess = buf.len() as u64 - MAX_KNOWN_MET_BYTES;
+            pathless_sizes.sort_unstable_by_key(|(_, modified_at, _)| *modified_at);
+            let mut shed = Vec::new();
+            for (hash, _, size) in pathless_sizes {
+                if excess == 0 {
+                    break;
+                }
+                shed.push(hash);
+                excess = excess.saturating_sub(size);
+            }
+            if excess > 0 {
+                anyhow::bail!(
+                    "known.met would be {} bytes, over the {MAX_KNOWN_MET_BYTES} it can be read back \
+                     at; keeping the catalog already on disk",
+                    buf.len()
+                );
+            }
+            for hash in &shed {
+                self.files.remove(hash);
+            }
+            warn!(
+                "Dropped the {} oldest known.met record(s) whose files are not in the library, \
+                 to keep the catalog readable",
+                shed.len()
+            );
+            return self.save(path);
         }
 
         crate::security::atomic_write(path, &buf, true)?;
@@ -1947,6 +2105,109 @@ mod tests {
             media: None,
             media_scanned: false,
         }
+    }
+
+    fn pathless(hash: u8, modified_at: i64) -> KnownFileRecord {
+        let mut record = sample_record();
+        record.file_hash = [hash; 16];
+        record.file_path = String::new();
+        record.modified_at = modified_at;
+        record
+    }
+
+    /// A file carried over from eMule on a FAT drive, or across a DST change,
+    /// reports a time 2 s or an hour off what eMule stored. That is still the
+    /// file, unless two records are equally close.
+    #[test]
+    fn a_near_modified_time_still_finds_the_record() {
+        fn find(kf: &KnownFileList, mtime: i64) -> Option<[u8; 16]> {
+            kf.find_by_name_and_meta("movie.mkv", 1024 * 1024, mtime)
+                .map(|r| r.file_hash)
+        }
+        let mut kf = KnownFileList::new();
+        kf.files.insert([1; 16], pathless(1, 1_700_000_000));
+        for delta in [0, 1, -2, 3600, -3600, 3601] {
+            assert!(find(&kf, 1_700_000_000 + delta).is_some(), "delta {delta}");
+        }
+        for delta in [3, 60, 7200] {
+            assert!(find(&kf, 1_700_000_000 + delta).is_none(), "delta {delta}");
+        }
+
+        // An exact match wins over a near one.
+        kf.files.insert([2; 16], pathless(2, 1_700_000_002));
+        assert_eq!(find(&kf, 1_700_000_002), Some([2; 16]));
+        // Two near matches and no exact one: ambiguous, so re-hash.
+        assert!(find(&kf, 1_700_000_001).is_none());
+    }
+
+    #[test]
+    fn a_split_file_size_reads_whole_in_either_tag_order() {
+        let mut buf = vec![MET_HEADER];
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for hi_first in [true, false] {
+            buf.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+            buf.extend_from_slice(&[if hi_first { 0x31 } else { 0x32 }; 16]);
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            let lo = |buf: &mut Vec<u8>| {
+                buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE]);
+                buf.extend_from_slice(&0x0000_1000u32.to_le_bytes());
+            };
+            let hi = |buf: &mut Vec<u8>| {
+                buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE_HI]);
+                buf.extend_from_slice(&3u32.to_le_bytes());
+            };
+            if hi_first {
+                hi(&mut buf);
+                lo(&mut buf);
+            } else {
+                lo(&mut buf);
+                hi(&mut buf);
+            }
+        }
+        let mut kf = KnownFileList::new();
+        kf.parse_known_met(&buf).unwrap();
+        for hash in [[0x31; 16], [0x32; 16]] {
+            assert_eq!(kf.files[&hash].file_size, (3u64 << 32) | 0x1000);
+        }
+    }
+
+    #[test]
+    fn an_empty_catalog_never_replaces_a_populated_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-empty-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut full = KnownFileList::new();
+        full.mark_authoritative_for_tests();
+        full.add_or_update(sample_record());
+        full.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut empty = KnownFileList::new();
+        empty.mark_authoritative_for_tests();
+        empty.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_import_prune_hold_keeps_pathless_records_until_released() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-hold-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        hold_pruning(&dir).unwrap();
+        assert!(prune_hold_active(&path, 10, 5), "held while the scan has not caught up");
+        assert!(!prune_hold_active(&path, 5, 5), "released once pruning would do nothing");
+        assert!(!dir.join(PRUNE_HOLD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `path_refs` is only ever read to answer "does another path still point

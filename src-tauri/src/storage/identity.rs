@@ -135,6 +135,24 @@ impl NodeIdentity {
         KadId(self.kad_id)
     }
 
+    /// Replace the eD2K user hash and keep the rest of the identity. Used by
+    /// an eMule import: peers hold that user's credits against eMule's hash,
+    /// alongside the SecIdent key imported with it. Ember's own KAD id and
+    /// Ember keys stay, so friends and KAD contacts are unaffected.
+    pub fn replace_user_hash(data_dir: &Path, user_hash: [u8; 16]) -> anyhow::Result<()> {
+        let mut id = Self::load_or_create(data_dir)?;
+        id.user_hash = user_hash;
+        let data = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
+        let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
+        crate::security::atomic_write(&data_dir.join("identity.json"), &protected, true)?;
+        crate::security::atomic_write(
+            &data_dir.join("identity.protected"),
+            PROTECTION_MARKER,
+            true,
+        )?;
+        Ok(())
+    }
+
     /// Load identity from disk, or generate and save a new one.
     ///
     /// Identity loss silently rotates `user_hash` / `ember_hash`, which breaks

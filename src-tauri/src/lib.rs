@@ -25,6 +25,7 @@ mod app_state;
 mod background;
 mod bandwidth;
 mod commands;
+mod emule_import;
 mod geoip;
 mod network;
 mod power;
@@ -606,13 +607,18 @@ pub fn run() {
                 })?,
             );
 
-            let config = AppConfig::load(&app_handle).map_err(|e| {
+            let mut config = AppConfig::load(&app_handle).map_err(|e| {
                 tracing::error!("Failed to load config: {e}");
                 e
             })?;
-            let settings = config.settings.clone();
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            // An eMule import staged last session. Here because it rewrites
+            // what the identity, the approved roots, the credit store and the
+            // network all read below, and none of them can take a change once
+            // they have.
+            let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
+            let settings = config.settings.clone();
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
             // propagating that out of `setup` returns Err from `build()` — which
@@ -638,11 +644,15 @@ pub fn run() {
             if !settings.download_folder.is_empty() {
                 configured_roots.push(settings.download_folder.clone());
             }
-            let approved_roots = security::filesystem::initialize_approved_roots(
+            let import_roots =
+                emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
+            let approved_roots = security::filesystem::initialize_approved_roots_with_additions(
                 &data_dir,
                 &configured_roots,
+                &import_roots,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
+            emule_import::apply::root_additions_approved(&data_dir);
             storage::share_intent::initialize(&data_dir)
                 .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
             // Load the persistent identity once before commands or the network
@@ -2085,6 +2095,13 @@ pub fn run() {
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
             commands::settings::pick_preview_player,
+            commands::emule_import::detect_emule_installs,
+            commands::emule_import::pick_emule_folder,
+            commands::emule_import::preview_emule_import,
+            commands::emule_import::stage_emule_import,
+            commands::emule_import::discard_emule_import,
+            commands::emule_import::pending_emule_import,
+            commands::emule_import::get_emule_import_report,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,

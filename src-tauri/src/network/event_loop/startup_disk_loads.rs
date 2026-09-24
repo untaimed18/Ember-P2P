@@ -15,7 +15,6 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
     shared_friends_only_hashes: &upload_server::SharedFriendsOnlyHashes,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     deferred_disk_loads: &mut Option<tokio::task::JoinHandle<DeferredDiskLoads>>,
-    known2_saved_len: &mut Option<usize>,
     known_met_ready: &mut bool,
 ) {
     if let Some(handle) = deferred_disk_loads.as_mut() {
@@ -101,11 +100,9 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                         &mut state.ember_keyword_publish_unix,
                         &mut state.ember_published_sources,
                     );
-                    state.aich_hash_sets = loads.aich_hash_sets;
-                    // The deferred load replaces the in-memory set wholesale,
-                    // so any length this session already wrote no longer
-                    // describes what is in memory.
-                    *known2_saved_len = None;
+                    if let Some(store) = loads.known2 {
+                        *ed2k::aich::known2_store().write() = Some(store);
+                    }
                     for (k, v) in loads.aich_root_map {
                         if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
                             break;

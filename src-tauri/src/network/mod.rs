@@ -857,7 +857,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         uss_host_selected_at: 0,
         uss_rtt_queue,
         uss_enabled_flag,
-        aich_hash_sets: Vec::new(),
+        pending_known2_sets: Vec::new(),
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(
             settings.max_concurrent_uploads as usize,
         )),
@@ -2002,7 +2002,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut stats_save_started_at: Option<tokio::time::Instant> = None;
     let mut reputation_save_in_flight = false;
     let mut reputation_save_started_at: Option<tokio::time::Instant> = None;
-    // Same dirty-check shape as `known2_saved_len` below: the generation the
+    // Dirty check for the periodic reputation save: the generation the
     // last *durable* reputation write covered, and the one the in-flight write
     // is carrying. On a long-lived node the peer/IP maps sit near their 20k cap
     // and rarely change between 5-minute ticks, so without this the timer
@@ -2011,12 +2011,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut reputation_in_flight_generation: u64 = 0;
     let mut known2_save_in_flight = false;
     let mut known2_save_started_at: Option<tokio::time::Instant> = None;
-    // Length of `aich_hash_sets` as of the last durable `known2_64.met` write,
-    // or `None` if this session has not written one yet. `aich_hash_sets` is
-    // append-only — nothing removes an entry and the cap refuses new sets
-    // rather than evicting — so its length identifies its contents, which
-    // makes this a sufficient dirty check.
-    let mut known2_saved_len: Option<usize> = None;
+    // How many of the front of `pending_known2_sets` the in-flight append
+    // carries; a successful append drains exactly that many.
     let mut known2_in_flight_len: usize = 0;
     let mut nodes_save_in_flight = false;
     let mut nodes_save_started_at: Option<tokio::time::Instant> = None;
@@ -2170,42 +2166,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             let known_files = KnownFileList::load(&known_met_path);
             info!("Loaded {} known files", known_files.file_count());
 
-            let mut aich_hash_sets = Vec::new();
-            match ed2k::aich::load_known2_met(&known2_met_path) {
-                Ok(sets) => {
-                    let total = sets.len();
-                    aich_hash_sets = sets
-                        .into_iter()
-                        .take(MAX_AICH_HASH_SETS)
-                        .map(|(root, leaves)| {
-                            let file_size =
-                                leaves.len() as u64 * ed2k::aich::AICH_BLOCK_SIZE as u64;
-                            ed2k::aich::AICHRecoveryHashSet {
-                                root_hash: root,
-                                leaf_hashes: leaves,
-                                file_size,
-                            }
-                        })
-                        .collect();
-                    if total > MAX_AICH_HASH_SETS {
-                        warn!(
-                            "known2_64.met has {} sets (cap {}); dropping {} oldest on load",
-                            total,
-                            MAX_AICH_HASH_SETS,
-                            total - MAX_AICH_HASH_SETS,
-                        );
-                    }
-                    info!(
-                        "Loaded {} AICH hash sets from known2_64.met",
-                        aich_hash_sets.len()
-                    );
+            let known2 = match ed2k::aich::Known2Store::open(&known2_met_path) {
+                Ok(store) => {
+                    info!("Indexed {} AICH hash sets in known2_64.met", store.len());
+                    Some(store)
                 }
                 Err(e) => {
-                    if known2_met_path.exists() {
-                        warn!("Failed to load known2_64.met: {e}");
-                    }
+                    // Not installed, so appends queue and are retried rather
+                    // than written over a file this build could not read.
+                    warn!("Failed to index known2_64.met: {e}");
+                    None
                 }
-            }
+            };
 
             let mut aich_root_map = HashMap::new();
             if let Ok(contents) = std::fs::read_to_string(&aich_cache_path) {
@@ -2246,7 +2218,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             DeferredDiskLoads {
                 ip_filter: filter,
                 known_files,
-                aich_hash_sets,
+                known2,
                 aich_root_map,
             }
         }))
@@ -2396,7 +2368,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             &shared_friends_only_hashes,
             &shared_server_addr,
             &mut deferred_disk_loads,
-            &mut known2_saved_len,
             &mut known_met_ready,
         )
         .await;
@@ -4113,9 +4084,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         known2_save_in_flight = false;
                         known2_save_started_at = None;
                         if result.result.is_ok() {
-                            // Only a durable write lets the next tick skip; a
-                            // failed one leaves the file behind the set.
-                            known2_saved_len = Some(known2_in_flight_len);
+                            // A failed append keeps its sets queued for the next tick.
+                            let done = known2_in_flight_len.min(state.pending_known2_sets.len());
+                            state.pending_known2_sets.drain(..done);
                         }
                         "known2_64.met"
                     }
@@ -4266,7 +4237,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut known2_in_flight_len,
                     &mut known2_save_in_flight,
                     &mut known2_save_started_at,
-                    known2_saved_len,
                     &mut known_met_save_in_flight,
                     &known_met_save_result_tx,
                     &mut known_met_save_started_at,

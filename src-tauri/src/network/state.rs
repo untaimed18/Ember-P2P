@@ -622,8 +622,10 @@ pub(super) struct NetworkState {
     pub(super) uss_rtt_queue: crate::bandwidth::UssRttQueue,
     /// Shared USS enabled flag
     pub(super) uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
-    /// AICH recovery hash sets loaded from known2_64.met (saved on shutdown)
-    pub(super) aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
+    /// AICH recovery sets computed this session and not yet appended to
+    /// `known2_64.met`. The file is indexed and read by `ed2k::aich::Known2Store`,
+    /// never held in memory; only this queue is.
+    pub(super) pending_known2_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
     /// Shared max upload slots (updated on settings change, read by upload handler)
     pub(super) upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Shared obfuscation flag mirroring `state.obfuscation_enabled`. The

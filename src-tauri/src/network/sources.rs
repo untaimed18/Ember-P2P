@@ -261,7 +261,7 @@ pub(super) async fn handle_epx_sources(
             );
             continue;
         }
-        // L-EPX-AICH: `aich_hash_sets` is a flat list of recovery trees for
+        // L-EPX-AICH: `known2_64.met` is a flat list of recovery trees for
         // *all* of our own locally-known files with no ed2k-hash binding —
         // checking only `root_hash` membership let a peer pair a real root
         // belonging to an unrelated file we happen to have locally with an

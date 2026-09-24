@@ -275,10 +275,13 @@ fn same_folder(a: &str, b: &str) -> bool {
 }
 
 fn is_filesystem_root(path: &Path) -> bool {
-    path.parent().is_none()
-        || !path
-            .components()
-            .any(|c| matches!(c, Component::Normal(_)))
+    crate::sharing::is_volume_root(path)
+}
+
+/// A volume root that may never be shared. Other drive roots are offered like
+/// folders, and `add_shared_folder_limited` asks before sharing one.
+fn root_share_refused(path: &Path) -> bool {
+    crate::sharing::drive_root_share(path) == crate::sharing::DriveRootShare::Refused
 }
 
 fn path_has_sensitive_component(path: &Path) -> bool {
@@ -348,7 +351,7 @@ fn share_status_for(
     allowlists: &HashMap<String, Vec<String>>,
     offers: &HashMap<String, FolderOffer>,
 ) -> ShareBrowserStatus {
-    if matches!(kind, ShareBrowserKind::ThisPc) || is_filesystem_root(path) {
+    if matches!(kind, ShareBrowserKind::ThisPc) || root_share_refused(path) {
         return ShareBrowserStatus::Blocked;
     }
     if path_has_sensitive_component(path) || covers_data_dir(path, data_dir) {
@@ -432,7 +435,7 @@ fn file_share_status(
     let Some(parent) = path.parent() else {
         return ShareBrowserStatus::Blocked;
     };
-    if is_filesystem_root(parent) {
+    if root_share_refused(parent) {
         return ShareBrowserStatus::Blocked;
     }
     match share_status_for(
@@ -1196,7 +1199,7 @@ fn selection_plan(chosen: &[ChosenShare], shared: &[PathBuf]) -> (Vec<String>, V
             let Some(parent) = path.parent() else {
                 continue;
             };
-            if is_filesystem_root(parent) {
+            if root_share_refused(parent) {
                 continue;
             }
             display_fs_path(parent)
@@ -1649,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_on_a_drive_root_cannot_be_shared() {
+    fn a_file_on_the_system_drive_root_cannot_be_shared() {
         let file = if cfg!(windows) { r"C:\song.mp3" } else { "/song.mp3" };
         let data = if cfg!(windows) { r"D:\Ember" } else { "/ember" };
         let status = file_share_status(

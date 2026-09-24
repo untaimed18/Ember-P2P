@@ -1279,6 +1279,8 @@ impl PartTracker {
         let mut file_size_from_tags: Option<u64> = None;
         let mut verified_bitmap_bytes: Option<Vec<u8>> = None;
         let mut tags_parsed: u32 = 0;
+        // The first name wins; see `decode_met_string`.
+        let mut name_read = false;
 
         for _ in 0..tag_count {
             if cursor.position() as usize >= data.len() {
@@ -1292,7 +1294,10 @@ impl PartTracker {
                             file_size_from_tags = Some(s);
                         }
                         MetTag::FileName(n) => {
-                            self.file_name = n;
+                            if !name_read {
+                                self.file_name = n;
+                                name_read = true;
+                            }
                         }
                         MetTag::GapStart(idx, val) => {
                             if let Some(prev) = gap_starts.insert(idx, val) {
@@ -1313,7 +1318,7 @@ impl PartTracker {
                         MetTag::Transferred(v) => {
                             self.transferred.store(v, Ordering::Relaxed);
                         }
-                        MetTag::Unknown => {}
+                        MetTag::Status(_) | MetTag::Unknown => {}
                     }
                 }
                 Err(e) => {
@@ -1818,7 +1823,63 @@ enum MetTag {
     GapFormat(u64),
     /// Cumulative wire bytes — eMule's `m_uTransferred`.
     Transferred(u64),
+    /// eMule's `FT_STATUS`: non-zero when the download was paused.
+    Status(u64),
     Unknown,
+}
+
+/// What an eMule or aMule `.part.met` says about its download, read without
+/// modelling the gaps: enough to list it in an import preview and to create
+/// the transfer that adopts it.
+#[derive(Debug, Clone)]
+pub struct PartMetSummary {
+    pub file_hash: [u8; 16],
+    pub file_name: String,
+    pub file_size: u64,
+    pub paused: bool,
+}
+
+/// Read the header and identity tags of an eMule-format `.part.met`.
+pub fn summarize_part_met(data: &[u8]) -> anyhow::Result<PartMetSummary> {
+    let version = *data.first().ok_or_else(|| anyhow::anyhow!("empty part.met"))?;
+    if !(version == PARTFILE_VERSION || version == PARTFILE_VERSION_LARGEFILE || version == 0xE1) {
+        anyhow::bail!("not an eMule part.met (version 0x{version:02X})");
+    }
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(1);
+    let _date = cursor.read_u32::<LittleEndian>()?;
+    let mut file_hash = [0u8; 16];
+    cursor.read_exact(&mut file_hash)?;
+    let part_hash_count = cursor.read_u16::<LittleEndian>()? as u64;
+    let skip = cursor.position() + part_hash_count * 16;
+    if skip > data.len() as u64 {
+        anyhow::bail!("truncated part hashes in part.met");
+    }
+    cursor.set_position(skip);
+    let tag_count = cursor.read_u32::<LittleEndian>()?.min(100_000);
+    let use_large = version == PARTFILE_VERSION_LARGEFILE;
+    let (mut file_name, mut file_size, mut paused) = (String::new(), None, false);
+    for _ in 0..tag_count {
+        if cursor.position() as usize >= data.len() {
+            break;
+        }
+        match read_emule_tag(&mut cursor, use_large)? {
+            MetTag::FileName(name) if file_name.is_empty() => file_name = name,
+            MetTag::FileSize(size) => file_size = Some(size),
+            MetTag::Status(status) => paused = status != 0,
+            _ => {}
+        }
+    }
+    let file_size = file_size.ok_or_else(|| anyhow::anyhow!("part.met names no file size"))?;
+    if file_hash == [0u8; 16] || file_name.is_empty() {
+        anyhow::bail!("part.met names no file");
+    }
+    Ok(PartMetSummary {
+        file_hash,
+        file_name,
+        file_size,
+        paused,
+    })
 }
 
 fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Result<MetTag> {
@@ -1859,7 +1920,7 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             }
             let mut sbuf = vec![0u8; slen];
             cursor.read_exact(&mut sbuf)?;
-            let s = String::from_utf8_lossy(&sbuf).to_string();
+            let s = crate::storage::known_files::decode_met_string(&sbuf);
 
             if name_len == 1 {
                 match name_buf[0] {
@@ -1929,7 +1990,7 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             FT_FILESIZE => return Ok(MetTag::FileSize(value)),
             FT_EMBER_GAP_FORMAT => return Ok(MetTag::GapFormat(value)),
             FT_TRANSFERRED => return Ok(MetTag::Transferred(value)),
-            FT_STATUS => return Ok(MetTag::Unknown),
+            FT_STATUS => return Ok(MetTag::Status(value)),
             _ => {}
         }
     }
