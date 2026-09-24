@@ -2014,7 +2014,7 @@
   </div>
   {/if}
 
-  <div class="conv-messages" bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
+  <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
     {#if liveError && !loading && !loadError}
       <div class="conv-live-error" role="status">
         <span>{m.chat_live_unavailable()}</span>
@@ -2022,7 +2022,10 @@
       </div>
     {/if}
     {#if loading}
-      <div class="conv-loading">{m.chat_loading_messages()}</div>
+      <div class="conv-loading" role="status">
+        <span class="spinner sm" aria-hidden="true"></span>
+        <span>{m.chat_loading_messages()}</span>
+      </div>
     {:else if loadError}
       <div class="conv-load-error" role="alert">
         <span>{m.chat_load_error({ error: loadError })}</span>
@@ -2339,7 +2342,7 @@
   {/if}
 
   {#if sendError}
-    <div class="conv-error">{sendError}</div>
+    <div class="conv-error" role="alert">{sendError}</div>
   {/if}
 
   {#if youAreBanned}
@@ -2412,6 +2415,7 @@
         onkeyup={refreshMentionToken}
         onblur={() => (mentionStart = -1)}
         placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
+        aria-label={m.chat_input_label()}
         maxlength="4096"
         rows="2"
         readonly={sending}
@@ -2436,7 +2440,7 @@
         title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
         aria-label={m.chat_send_aria()}
       >
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
       </button>
@@ -2577,6 +2581,13 @@
     color: var(--text-muted);
     padding: 24px;
     font-size: 13px;
+  }
+
+  .conv-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
   }
 
   .conv-empty-title,
@@ -3476,7 +3487,7 @@
     color: var(--text-secondary);
     font-size: 11px;
     font-weight: 600;
-    box-shadow: 0 4px 12px rgb(0 0 0 / 22%);
+    box-shadow: var(--shadow-md);
     cursor: pointer;
   }
 
@@ -3670,12 +3681,17 @@
   }
 
   .conv-send:hover:not(:disabled) {
-    background: var(--accent-hover, var(--accent));
+    background: var(--accent-hover);
   }
 
   .conv-send:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+
+  .conv-send:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .conv-send svg {

@@ -3900,6 +3900,16 @@
     }
   }
 
+  function reputationLabelText(label: ReturnType<typeof labelForReputation>): string {
+    switch (label) {
+      case 'trusted': return m.transfers_rep_trusted();
+      case 'neutral': return m.transfers_rep_neutral();
+      case 'suspect': return m.transfers_rep_suspect();
+      case 'banned': return m.transfers_rep_banned();
+      default: return '\u2014';
+    }
+  }
+
   function dlStatusTooltip(t: Transfer): string {
     switch (t.status) {
       case 'active': {
@@ -4401,7 +4411,7 @@
                   </td>
                 {:else if column.key === 'status'}
                   <td class="status-cell">
-                    <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
+                    <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
                   </td>
                 {:else if column.key === 'remaining'}
                   {@const spd = liveSpeed(t)}
@@ -4538,7 +4548,7 @@
           {#if filteredCompletedDownloads.length > 0}
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
-                <button class="divider-toggle" onclick={() => completedCollapsed = !completedCollapsed}>
+                <button type="button" class="divider-toggle" aria-expanded={!completedCollapsed} onclick={() => completedCollapsed = !completedCollapsed}>
                   <span class="divider-chevron" class:collapsed={completedCollapsed} aria-hidden="true">{'\u25B6'}</span>
                   {m.transfers_completed_failed_section({ count: filteredCompletedDownloads.length })}
                 </button>
@@ -5268,7 +5278,7 @@
                             ? m.transfers_known_rep_no_record()
                             : m.transfers_known_rep_fetching()}
                       >
-                        {label === 'unknown' ? '—' : label}
+                        {reputationLabelText(label)}
                       </span>
                     </td>
                   {:else if column.key === 'ident_state'}
@@ -6410,8 +6420,8 @@
     font-size: 11px;
   }
   .filter-input:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: 0;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
   .pane-toolbar {
     display: flex;
@@ -6496,10 +6506,10 @@
     z-index: 9999;
     min-width: 160px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -7060,7 +7070,6 @@
     border-radius: var(--radius-pill);
     font-size: 10px;
     font-weight: 600;
-    text-transform: capitalize;
     line-height: 1.3;
     border: 1px solid transparent;
     white-space: nowrap;
@@ -7109,14 +7118,14 @@
     padding: 0;
     border-radius: 0;
   }
-  .prio-release { color: var(--warning); font-weight: 700; }
-  .prio-high { color: var(--danger); }
+  /* Same colors as the Library's priority column, so a priority reads the
+     same on both pages. */
+  .prio-release { color: var(--danger); font-weight: 600; }
+  .prio-high { color: var(--warning); }
   .prio-normal { color: var(--text-secondary); }
-  /* L8: distinguish prio-low from prio-verylow visually — prior rules
-     only differed in opacity and were hard to tell apart at a glance. */
-  .prio-low { color: var(--text-secondary); font-style: italic; }
-  .prio-verylow { color: var(--text-muted); opacity: 0.55; font-style: italic; }
-  .prio-auto { color: var(--accent); }
+  .prio-low { color: var(--priority-low); }
+  .prio-verylow { color: var(--priority-verylow); }
+  .prio-auto { color: var(--priority-auto); }
 
   /* --- Section divider --- */
   .section-divider-row td {
@@ -7130,18 +7139,27 @@
     letter-spacing: 0.03em;
   }
   .divider-toggle {
-    all: unset;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    font: inherit;
     font-size: 10px;
     font-weight: 600;
     color: var(--text-muted);
     letter-spacing: 0.03em;
   }
   .divider-toggle:hover {
+    background: none;
     color: var(--text-secondary);
+  }
+  .divider-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .divider-chevron {
     font-size: 8px;
@@ -7279,7 +7297,7 @@
     align-items: center;
     gap: 6px;
     padding: 3px 8px;
-    background: var(--bg-input, var(--bg-primary));
+    background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     flex: 1 1 240px;
@@ -7472,8 +7490,11 @@
      failed, and the source recovers on its own once reachability changes. */
   .src-dot-unreachable { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queued { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
+  .src-dot-waiting_for_slot,
+  .src-dot-stalled { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queue_full { background: var(--text-muted); }
-  .src-dot-no_needed_parts { background: var(--text-muted); }
+  .src-dot-no_needed_parts,
+  .src-dot-parts_busy { background: var(--text-muted); }
   .src-dot-transferring { background: var(--accent); box-shadow: 0 0 4px color-mix(in srgb, var(--accent) 60%, transparent); }
   .src-dot-completed { background: var(--success); box-shadow: 0 0 3px color-mix(in srgb, var(--success) 50%, transparent); }
   .src-dot-failed { background: var(--danger); }
@@ -7622,12 +7643,15 @@
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
-  .src-st-queued {
+  .src-st-queued,
+  .src-st-waiting_for_slot,
+  .src-st-stalled {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
   .src-st-queue_full,
-  .src-st-no_needed_parts {
+  .src-st-no_needed_parts,
+  .src-st-parts_busy {
     color: var(--text-muted);
     background: color-mix(in srgb, var(--text-muted) 8%, transparent);
   }

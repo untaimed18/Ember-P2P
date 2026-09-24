@@ -660,6 +660,7 @@
   let visibleSearchColumns = $derived(
     SEARCH_COLUMNS.filter((c) => c.key === SEARCH_FIXED_COL || !searchColHidden[c.key]),
   );
+  const NUMERIC_SEARCH_COLUMNS = new Set(['load', 'packets_sent', 'responses']);
 
   let searchTableWidth = $derived(
     visibleSearchColumns.reduce((sum, c) => sum + searchColWidth(c.key), 0) + SEARCH_ACTIONS_WIDTH,
@@ -891,7 +892,7 @@
 </div>
 
 {#if kadError}
-  <div class="error-banner">
+  <div class="error-banner" role="alert">
     <span>{kadError}</span>
     <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>{m.common_dismiss()}</button>
   </div>
@@ -958,8 +959,8 @@
         {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-            <p>{m.kad_not_connected()}</p>
-            <p class="sub">{m.kad_press_connect()}</p>
+            <p class="empty-title">{m.kad_not_connected()}</p>
+            <p class="empty-sub">{m.kad_press_connect()}</p>
             <!-- Same pending chrome as the header button. `handleConnect`
                  already drops re-clicks, but a button that stays enabled and
                  unchanged makes a slow connect look like a dead control. -->
@@ -983,8 +984,8 @@
         {:else if contacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-            <p>{m.kad_empty_no_contacts()}</p>
-            <p class="sub">{m.kad_empty_no_contacts_sub()}</p>
+            <p class="empty-title">{m.kad_empty_no_contacts()}</p>
+            <p class="empty-sub">{m.kad_empty_no_contacts_sub()}</p>
             <div class="empty-actions">
               <button class="empty-action" onclick={() => openBootstrap('clients')}>{m.kad_bootstrap_from_clients()}</button>
               <button class="empty-action ghost" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
@@ -994,8 +995,8 @@
         {:else if filteredContacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
-            <p>{m.kad_empty_no_matches()}</p>
-            <p class="sub">{m.kad_empty_no_matches_sub()}</p>
+            <p class="empty-title">{m.kad_empty_no_matches()}</p>
+            <p class="empty-sub">{m.kad_empty_no_matches_sub()}</p>
             <button class="empty-action ghost" onclick={() => { contactFilterInput = ''; contactFilter = ''; contactTypeFilter = 'all'; }}>{m.common_clear_filters()}</button>
           </div>
         {:else}
@@ -1315,8 +1316,8 @@
       {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-          <p>{m.kad_not_connected()}</p>
-          <p class="sub">{m.kad_searches_empty_disconnected_sub()}</p>
+          <p class="empty-title">{m.kad_not_connected()}</p>
+          <p class="empty-sub">{m.kad_searches_empty_disconnected_sub()}</p>
           <button
             class="empty-action"
             onclick={handleConnect}
@@ -1332,8 +1333,8 @@
       {:else if searches.length === 0}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-          <p>{m.kad_searches_empty_title()}</p>
-          <p class="sub">{m.kad_searches_empty_sub()}</p>
+          <p class="empty-title">{m.kad_searches_empty_title()}</p>
+          <p class="empty-sub">{m.kad_searches_empty_sub()}</p>
         </div>
       {:else}
         <table
@@ -1357,6 +1358,7 @@
               {#each visibleSearchColumns as column (column.key)}
                 <th
                   class="sortable"
+                  class:num={NUMERIC_SEARCH_COLUMNS.has(column.key)}
                   class:resizing={searchResizeKey === column.key}
                   tabindex="0"
                   role="columnheader"
@@ -1403,11 +1405,11 @@
                       </span>
                     </td>
                   {:else if column.key === 'load'}
-                    <td>{search.load} ({search.load_response}/{search.load_total})</td>
+                    <td class="num">{search.load} ({search.load_response}/{search.load_total})</td>
                   {:else if column.key === 'packets_sent'}
-                    <td>{search.packets_sent} / {search.request_answer}</td>
+                    <td class="num">{search.packets_sent} / {search.request_answer}</td>
                   {:else if column.key === 'responses'}
-                    <td>{search.responses}</td>
+                    <td class="num">{search.responses}</td>
                   {:else if column.key === 'started_at'}
                     <td title={new Date(search.started_at * 1000).toLocaleString()}>{formatSearchAge(search.started_at)}</td>
                   {/if}
@@ -1610,7 +1612,7 @@
     padding: 14px 20px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .modal-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
   .modal-close {
     display: inline-flex;
     align-items: center;
@@ -1706,26 +1708,6 @@
   }
   .port-input {
     width: 110px;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    margin-left: auto;
-    padding-right: 8px;
-  }
-
-  .pager-btn {
-    padding: 1px 6px;
-    font-size: 10px;
-    min-width: 0;
-    line-height: 1;
-  }
-
-  .pager-info {
-    font-size: 10px;
-    color: var(--text-muted);
   }
 
   .panel-content {
@@ -1907,12 +1889,6 @@
     opacity: 0.6;
   }
 
-  .empty-action {
-    margin-top: 10px;
-    font-size: 12px;
-    padding: 5px 16px;
-  }
-
   .page-subtitle {
     margin: 4px 0 0;
     font-size: 13px;
@@ -1981,6 +1957,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .searches-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .col-resize-handle {
@@ -2140,15 +2121,6 @@
 
   .empty-state.compact {
     padding: 34px 16px;
-  }
-
-  .empty-state.compact p {
-    font-size: 13px;
-  }
-
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
   }
 
   /* Local badge variants. Follow the same tinted-chip recipe as the

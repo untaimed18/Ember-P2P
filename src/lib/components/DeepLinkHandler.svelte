@@ -37,6 +37,7 @@
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
+  import { formatBytes } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
   type ConfirmDecision = 'accept' | 'reject' | 'defer';
@@ -65,24 +66,11 @@
     }
   }
 
-  function formatSize(bytes: number): string {
-    if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
-    if (bytes < 1024) return `${bytes} B`;
-    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-    let value = bytes;
-    let unit = -1;
-    do {
-      value /= 1024;
-      unit++;
-    } while (value >= 1024 && unit < units.length - 1);
-    return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unit]}`;
-  }
-
   function deepLinkConfirmationMessage(preview: DeepLinkPreview): string {
     if (preview.kind === 'file') {
       const lines = [
         preview.name ?? '',
-        formatSize(preview.size ?? 0),
+        formatBytes(preview.size ?? 0),
         preview.hash ?? '',
       ];
       if (preview.ember) {

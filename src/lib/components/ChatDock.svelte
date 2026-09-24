@@ -1222,7 +1222,7 @@
   .dock-offer-accept {
     border: 1px solid var(--accent);
     background: var(--accent);
-    color: var(--on-accent, #fff);
+    color: var(--on-accent);
   }
 
   .dock-offer-dismiss {

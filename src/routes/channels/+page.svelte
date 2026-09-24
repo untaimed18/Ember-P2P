@@ -1884,7 +1884,7 @@
                 type="text"
                 class="search-input"
                 bind:value={listQuery}
-                placeholder={m.common_search() + '…'}
+                placeholder={m.common_search_placeholder()}
                 aria-label={m.common_search()}
                 onkeydown={(e) => {
                   if (e.key !== 'Escape' || !listQuery) return;
@@ -3357,7 +3357,7 @@
   .unread {
     min-width: 18px;
     height: 18px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
     font-size: 11px;
@@ -4013,10 +4013,10 @@
     z-index: 20;
     min-width: 180px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
   }
@@ -4061,32 +4061,9 @@
 
   .empty-icon svg { width: 32px; height: 32px; }
 
-  .empty-title {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
   .empty-sub {
-    font-size: 12px;
-    color: var(--text-secondary);
     max-width: 360px;
     margin: 0 auto;
-    line-height: 1.5;
-  }
-
-  .empty-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: center;
-    margin-top: 16px;
-    flex-wrap: wrap;
-  }
-
-  .empty-action {
-    font-size: 12px;
-    padding: 7px 20px;
   }
 
   .muted { color: var(--text-secondary); }
@@ -4128,15 +4105,11 @@
       z-index: 4;
       border: 0;
       padding: 0;
-      background: color-mix(in srgb, #000 28%, transparent);
+      background: var(--overlay-bg);
       cursor: pointer;
       opacity: 0;
       pointer-events: none;
       transition: opacity var(--transition-slow) ease;
-    }
-
-    :global([data-theme="dark"]) .members-backdrop {
-      background: var(--overlay-bg);
     }
 
     .workspace.members-open .members-backdrop {

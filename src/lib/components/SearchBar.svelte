@@ -422,10 +422,10 @@
     left: 0;
     right: 0;
     z-index: 9999;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     overflow: hidden;
     max-height: 280px;
     overflow-y: auto;

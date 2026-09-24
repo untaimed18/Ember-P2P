@@ -803,11 +803,17 @@ tr:hover td {
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
   color: var(--badge-danger-text);
 }
-.info-banner,
 .success-banner {
   background: color-mix(in srgb, var(--success) 9%, var(--bg-secondary));
   border-bottom: 1px solid color-mix(in srgb, var(--success) 36%, var(--border));
   color: var(--badge-success-text);
+}
+/* Neutral news ("nothing to pause", "3 paused"): accent, so it neither claims
+   success nor raises an alarm. */
+.info-banner {
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  color: var(--badge-accent-text);
 }
 /* For a state that is the user's own choice rather than a fault: the app is
    working as asked, but the consequence is worth saying out loud. Danger red
@@ -1306,12 +1312,6 @@ button.ctx-backdrop:active {
   flex-wrap: wrap;
   gap: 8px;
 }
-@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes dialog-in {
-  from { opacity: 0; transform: scale(0.96); }
-  to   { opacity: 1; transform: scale(1); }
-}
-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

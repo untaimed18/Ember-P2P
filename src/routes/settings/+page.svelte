@@ -2171,8 +2171,8 @@
 <div class="page-content" bind:this={pageContentEl}>
   {#if loadError}
     <div class="empty-state">
-      <p style="color: var(--danger)">{loadError}</p>
-      <button onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
+      <p class="empty-title" role="alert">{loadError}</p>
+      <button type="button" class="empty-action" onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
     </div>
   {:else if !settings}
     <div class="empty-state">
@@ -2299,7 +2299,7 @@
               ? m.settings_filter_one_result()
               : m.settings_filter_results({ count: filterMatchCount })}
           </p>
-          <button class="ghost btn-sm settings-filter-clear" onclick={() => (settingsFilter = '')}>
+          <button type="button" class="ghost settings-filter-clear" onclick={() => (settingsFilter = '')}>
             {m.common_clear_filters()}
           </button>
         {/if}
@@ -2734,7 +2734,7 @@
                 <input id="download-folder" value={settings.download_folder} readonly />
                 <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
               </div>
-              <span class="field-hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
+              <span class="hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
             </div>
           </div>
 
@@ -2777,7 +2777,7 @@
 
             <div class="field">
               <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-              <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+              <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
               <span class="hint">{m.settings_max_file_size_hint()}</span>
             </div>
           </div>
@@ -2838,7 +2838,7 @@
                   <button class="folder-btn" onclick={() => (settings && (settings.preview_player = ''))}>{m.common_clear()}</button>
                 {/if}
               </div>
-              <span class="field-hint">{m.settings_preview_player_hint()}</span>
+              <span class="hint">{m.settings_preview_player_hint()}</span>
             </div>
           </div>
 
@@ -2846,7 +2846,7 @@
             <h4 class="subsection-title">{m.settings_group_history()}</h4>
             <div class="field">
               <span class="toggle-title">{m.settings_download_history()}</span>
-              <span class="field-hint">
+              <span class="hint">
                 {m.settings_download_history_hint()}
               </span>
               <div class="history-grid">
@@ -2879,7 +2879,7 @@
                 </div>
               </div>
               {#if historyStatsError}
-                <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
+                <span class="hint hint-error" role="alert">{historyStatsError}</span>
               {/if}
               {#if historyClearMsg}
                 <span class="hint">{historyClearMsg}</span>
@@ -3032,7 +3032,7 @@
             {#if spamStatsLoading}
               <span class="hint">{m.settings_spam_loading()}</span>
             {:else if spamStatsError}
-              <span class="hint" style="color: var(--danger)">{spamStatsError}</span>
+              <span class="hint hint-error" role="alert">{spamStatsError}</span>
             {:else if spamStats}
               <div class="spam-stats-grid">
                 <div class="spam-stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
@@ -3051,15 +3051,16 @@
           <div class="divider"></div>
           <div class="field">
             <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
-            <span class="hint">{m.settings_search_timeout_hint()}</span>
             <input
               id="search-timeout-secs"
+              class="compact-number"
               type="number"
               min="30"
               max="600"
               step="1"
               bind:value={settings.search_timeout_secs}
             />
+            <span class="hint">{m.settings_search_timeout_hint()}</span>
           </div>
           <div class="field">
             <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
@@ -3691,6 +3692,7 @@
             <label for="max-friends">{m.settings_max_friends()}</label>
             <input
               id="max-friends"
+              class="compact-number"
               type="number"
               min="1"
               max="500"
@@ -4729,6 +4731,16 @@
     line-height: 1.5;
   }
 
+  .hint.hint-error {
+    color: var(--badge-danger-text);
+  }
+
+  /* Counts and sizes want a few digits, not the whole card; specific enough
+     to beat the `.field input[type='number']` full-width rule above. */
+  .field input[type='number'].compact-number {
+    width: 120px;
+  }
+
   /* Marks a control that persists on change rather than on Save. */
   .hint-live {
     margin-top: 4px;
@@ -4830,13 +4842,6 @@
     min-width: 0;
   }
 
-  .field-hint {
-    display: block;
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-top: 0;
-    line-height: 1.5;
-  }
 
   .folder-btn {
     border: none;
@@ -5510,7 +5515,7 @@
   .behavior-card:focus-visible {
     outline: none;
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
   }
 
   .behavior-card.selected {
@@ -5595,6 +5600,11 @@
   @media (max-width: 640px) {
     .behavior-picker {
       grid-template-columns: 1fr;
+    }
+
+    /* Paired fields (ports, limits) stack rather than squeeze side by side. */
+    .field-row {
+      flex-direction: column;
     }
   }
 
@@ -5688,7 +5698,7 @@
     align-self: flex-start;
     margin-top: 4px;
     padding: 1px 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
     font-size: 11px;
@@ -5786,7 +5796,7 @@
     padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-elevated, var(--bg-surface));
+    background: var(--bg-surface);
     color: var(--text-muted);
     font-size: 12px;
     line-height: 1;
@@ -5873,7 +5883,7 @@
     border: 1px dashed var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-secondary, var(--text-muted));
+    color: var(--text-secondary);
     font-size: 13px;
     cursor: pointer;
   }

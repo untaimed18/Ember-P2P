@@ -47,6 +47,8 @@
   ];
 
   const DEFAULT_HIDDEN = new Set(['hash', 'requests', 'accepted', 'folder']);
+  /** Columns whose cells are right-aligned numbers; their headers align with them. */
+  const NUMERIC_COLUMNS = new Set(['size', 'requests', 'accepted', 'transferred', 'sources']);
   const FIXED_KEY = 'name';
   const STORAGE_WIDTHS = 'library-col-widths';
   const STORAGE_HIDDEN = 'library-col-hidden';
@@ -555,6 +557,7 @@
             class:drag-enabled={canDrag(col.key)}
             class:drop-before={isDropBefore(col.key)}
             class:drop-after={isDropAfter(col.key)}
+            class:num={NUMERIC_COLUMNS.has(col.key)}
             tabindex={col.sortField ? 0 : undefined}
             role="columnheader"
             draggable={canDrag(col.key)}
@@ -630,9 +633,9 @@
               {:else if col.key === 'size'}
                 <td class="cell-num">{formatSize(file.size)}</td>
               {:else if col.key === 'type'}
-                <td class="cell-type">{fileType(file.extension)}</td>
+                <td class="cell-type" title={fileType(file.extension)}>{fileType(file.extension)}</td>
               {:else if col.key === 'priority'}
-                <td class="cell-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
+                <td class="cell-prio prio-{file.priority}" title={priorityLabel(file.priority)}>{priorityLabel(file.priority)}</td>
               {:else if col.key === 'hash'}
                 <td class="cell-hash" title={file.hash || m.library_hashing()}>
                   {#if file.hash}
@@ -754,6 +757,9 @@
   }
   .lib-table th.sortable {
     cursor: pointer;
+  }
+  .lib-table th.num {
+    text-align: right;
   }
   .lib-table th.sortable:hover {
     color: var(--text-primary);

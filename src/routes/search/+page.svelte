@@ -3592,7 +3592,7 @@
           />
           <!-- The visible label belongs to the number input beside it, so the
                unit picker had no accessible name of its own. -->
-          <select bind:value={filterMinUnit} aria-label={m.search_min_size()}>
+          <select bind:value={filterMinUnit} aria-label={m.search_min_size_unit()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -3611,7 +3611,7 @@
             placeholder="—"
             bind:value={filterMaxSize}
           />
-          <select bind:value={filterMaxUnit} aria-label={m.search_max_size()}>
+          <select bind:value={filterMaxUnit} aria-label={m.search_max_size_unit()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -3711,13 +3711,13 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>{m.search_empty_title()}</p>
-      <p class="hint">{m.search_empty_hint()}</p>
+      <p class="empty-title">{m.search_empty_title()}</p>
+      <p class="empty-sub">{m.search_empty_hint()}</p>
     </div>
   {:else if activeTab?.isSearching && visibleResults.length === 0}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>{m.search_searching_network()}</p>
+      <p class="empty-title">{m.search_searching_network()}</p>
       {#if activeTab.progress}
         {@const phase = searchPhaseLabel(activeTab.progress.phase)}
         <p class="search-detail">
@@ -3744,10 +3744,10 @@
            answering "nothing" is a fact about its index rather than something
            the user can retype. Saying so is the difference between the
            feature looking broken and looking finished. -->
-      <p>{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
-      <p class="hint">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      <p class="empty-title">{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
+      <p class="empty-sub">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
       {#if extensionOnlyHintExt}
-        <p class="hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
+        <p class="empty-sub">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
       {/if}
     </div>
   {:else}
@@ -3771,7 +3771,7 @@
       </div>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>
-          <summary class="column-menu-summary" title={m.search_columns_aria()} aria-haspopup="true">
+          <summary class="column-menu-summary" title={m.search_columns_aria()} aria-label={m.search_columns_aria()} aria-haspopup="true">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <rect x="2" y="2.5" width="12" height="11" rx="1.5"/>
               <line x1="6.5" y1="2.5" x2="6.5" y2="13.5"/>
@@ -4112,8 +4112,8 @@
     </table>
     {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
-        <p>{m.search_no_results_filters()}</p>
-        <button class="ghost" onclick={clearFilters}>{m.common_clear_filters()}</button>
+        <p class="empty-title">{m.search_no_results_filters()}</p>
+        <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
       </div>
     {/if}
 
@@ -4171,15 +4171,20 @@
         <!-- eMule's right-click → Web services. Shown even when nothing is
              configured, so the feature is discoverable from a result rather
              than only from Settings. -->
-        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
         <div
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxWebSub}
           role="menuitem"
-          tabindex="-1"
+          tabindex="0"
           aria-haspopup="menu"
           aria-expanded={ctxWebSub}
           onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+              e.preventDefault();
+              ctxWebSub = true;
+            }
+          }}
         >
           {m.webservices_ctx_menu()}
           {#if ctxWebSub}
@@ -4969,6 +4974,11 @@
     color: var(--text-primary);
   }
 
+  .column-menu-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
   .column-menu[open] .column-menu-summary {
     border-color: var(--accent);
     color: var(--text-primary);
@@ -4980,10 +4990,10 @@
     right: 0;
     z-index: 9999;
     min-width: 180px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     padding: 6px;
     display: flex;
     flex-direction: column;
@@ -5147,7 +5157,7 @@
 
   .col-sources {
     width: 7%;
-    text-align: center;
+    text-align: right;
     font-variant-numeric: tabular-nums;
   }
 
@@ -5164,7 +5174,7 @@
 
   .col-complete {
     width: 7%;
-    text-align: center;
+    text-align: right;
     font-variant-numeric: tabular-nums;
   }
 
@@ -5353,7 +5363,7 @@
     font-weight: 600;
     cursor: pointer;
     flex-shrink: 0;
-    box-shadow: 0 1px 0 color-mix(in srgb, #000 12%, transparent);
+    box-shadow: var(--shadow-sm);
     transition: background-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
   }
 
@@ -5375,15 +5385,12 @@
     color: var(--accent);
     font-weight: 600;
     margin-right: 8px;
+    animation: pulse-opacity 1.5s ease-in-out infinite;
   }
 
   @keyframes pulse-opacity {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
-  }
-
-  .searching-indicator {
-    animation: pulse-opacity 1.5s ease-in-out infinite;
   }
 
   .hint, .search-detail {

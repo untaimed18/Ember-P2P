@@ -179,7 +179,7 @@
 
 <div class="library-media-player" class:is-video={kind === 'video'} class:is-audio={kind === 'audio'}>
   {#if loadError}
-    <p class="media-error">{loadError}</p>
+    <p class="media-error" role="alert">{loadError}</p>
   {:else if src}
     {#if kind === 'video'}
       <!-- svelte-ignore a11y_media_has_caption -->

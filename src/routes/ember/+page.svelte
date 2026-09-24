@@ -1017,13 +1017,13 @@
   }
 
   .check-indicator.ok {
-    color: var(--badge-success-text, var(--success));
+    color: var(--badge-success-text);
     background: color-mix(in srgb, var(--success) 14%, transparent);
     border-color: color-mix(in srgb, var(--success) 28%, transparent);
   }
 
   .check-indicator.warn {
-    color: var(--badge-warning-text, var(--warning));
+    color: var(--badge-warning-text);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
     border-color: color-mix(in srgb, var(--warning) 28%, transparent);
   }
@@ -1067,15 +1067,15 @@
   }
 
   .pill.ok {
-    color: var(--badge-success-text, #3ccf6d);
-    background: color-mix(in srgb, var(--success, #3ccf6d) 15%, transparent);
-    border-color: color-mix(in srgb, var(--success, #3ccf6d) 30%, transparent);
+    color: var(--badge-success-text);
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    border-color: color-mix(in srgb, var(--success) 30%, transparent);
   }
 
   .pill.warn {
-    color: var(--badge-warning-text, #d9a441);
-    background: color-mix(in srgb, var(--warning, #d9a441) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
+    color: var(--badge-warning-text);
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
   }
 
   .pill.muted {
@@ -1330,13 +1330,13 @@
   .banner-error {
     background: color-mix(in srgb, var(--danger) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: var(--danger);
+    color: var(--badge-danger-text);
   }
 
   .banner-warn {
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
-    color: var(--warning);
+    color: var(--badge-warning-text);
   }
 
   .banner-info {

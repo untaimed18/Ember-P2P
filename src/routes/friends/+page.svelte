@@ -1135,7 +1135,7 @@
             type="text"
             class="search-input"
             bind:value={searchQuery}
-            placeholder={m.common_search() + '…'}
+            placeholder={m.common_search_placeholder()}
             aria-label={m.common_search()}
             onkeydown={(e) => {
               if (e.key !== 'Escape' || !searchQuery) return;
@@ -2082,10 +2082,10 @@
     z-index: 9999;
     min-width: 190px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
   }
@@ -2170,25 +2170,11 @@
     height: 32px;
   }
 
-  .empty-title {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
+  /* Title, supporting line and action come from app.css; only the width cap
+     is Friends' own. */
   .empty-sub {
-    font-size: 12px;
-    color: var(--text-muted);
     max-width: 360px;
     margin: 0 auto;
-    line-height: 1.5;
-  }
-
-  .empty-action {
-    margin-top: 16px;
-    font-size: 12px;
-    padding: 7px 20px;
   }
 
   /* --- Online status --- */

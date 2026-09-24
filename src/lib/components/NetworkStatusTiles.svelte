@@ -197,7 +197,7 @@
     text-align: left;
   }
 
-  .stat-link:hover { color: var(--accent-hover, var(--accent)); }
+  .stat-link:hover { color: var(--accent-hover); }
 
   /* Badges inside tiles shouldn't stretch — they sit at their natural width
      so the tile column stays flexible. */

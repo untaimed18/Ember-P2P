@@ -281,7 +281,8 @@
   }
 
   .attach-actions button.attach-primary:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 88%, black);
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
     color: var(--on-accent);
   }
 

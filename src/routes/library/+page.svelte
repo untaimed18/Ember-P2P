@@ -2940,7 +2940,7 @@
 {#if loadedCollection || collectionLoading}
   <div class="collection-section">
     <div class="collection-toggle-bar">
-      <button class="collection-toggle" onclick={() => collectionsOpen = !collectionsOpen}>
+      <button type="button" class="collection-toggle" aria-expanded={collectionsOpen} onclick={() => collectionsOpen = !collectionsOpen}>
         <span class="toggle-arrow" class:open={collectionsOpen} aria-hidden="true">{'\u25B6'}</span>
         <span class="collection-title">
           {m.library_collection_label({ name: loadedCollection?.name ?? m.library_loading_ellipsis() })}
@@ -3480,8 +3480,8 @@
           <line x1="11" y1="8" x2="11" y2="14"></line>
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
-        <p>{m.library_empty_no_matches()}</p>
-        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
+        <p class="empty-title">{m.library_empty_no_matches()}</p>
+        <p class="empty-sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
       </div>
     {:else if sortedFiles.length === 0 && !initialLoadDone}
       <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
@@ -3504,9 +3504,9 @@
           <line x1="12" y1="13" x2="12" y2="17"></line>
           <line x1="10" y1="15" x2="14" y2="15"></line>
         </svg>
-        <p>{m.library_empty_no_shared()}</p>
-        <p class="sub">{m.library_empty_no_shared_sub()}</p>
-        <button class="empty-action" onclick={handleAddFolder}>{m.library_add_folder()}</button>
+        <p class="empty-title">{m.library_empty_no_shared()}</p>
+        <p class="empty-sub">{m.library_empty_no_shared_sub()}</p>
+        <button type="button" class="empty-action" onclick={handleAddFolder}>{m.library_add_folder()}</button>
       </div>
     {:else if sortedFiles.length === 0 && scanning}
       <div class="empty-state">
@@ -3971,15 +3971,20 @@
       <!-- eMule's right-click → Web services. Shown even when nothing is
            configured, so the feature is discoverable from the file it applies
            to rather than only from Settings. -->
-      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
       <div
         class="ctx-item ctx-sub"
         class:ctx-sub-open={ctxWebSub}
         role="menuitem"
-        tabindex="-1"
+        tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxWebSub}
         onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            ctxWebSub = true;
+          }
+        }}
       >
         {m.webservices_ctx_menu()}
         {#if ctxWebSub}
@@ -4805,9 +4810,6 @@
     color: var(--text-muted);
     padding: 40px;
   }
-  .empty-state .sub { font-size: 13px; margin-top: 4px; }
-  .empty-action { margin-top: 12px; font-size: 12px; padding: 6px 18px; }
-
   .status-bar {
     padding: 6px 12px;
     font-size: 11px;

@@ -442,12 +442,12 @@
       </div>
 
       <div class="toolbar">
-        <button type="button" class="tool-btn" onclick={goBack} disabled={history.length === 0 || loading || sharing} title={m.library_explorer_back()}>
+        <button type="button" class="tool-btn" onclick={goBack} disabled={history.length === 0 || loading || sharing} title={m.library_explorer_back()} aria-label={m.library_explorer_back()}>
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M10 3 L5 8 L10 13" />
           </svg>
         </button>
-        <button type="button" class="tool-btn" onclick={goUp} disabled={!currentEntry?.parent_id || loading || sharing} title={m.library_explorer_up()}>
+        <button type="button" class="tool-btn" onclick={goUp} disabled={!currentEntry?.parent_id || loading || sharing} title={m.library_explorer_up()} aria-label={m.library_explorer_up()}>
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M8 12 V4" /><path d="M4 8 L8 4 L12 8" />
           </svg>

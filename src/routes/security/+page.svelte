@@ -650,8 +650,8 @@
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <path d="M12 2l7 4v6c0 4.4-3 8.5-7 10-4-1.5-7-5.6-7-10V6l7-4z"></path>
         </svg>
-        <p>{m.security_empty_no_ranges()}</p>
-        <p class="sub">{m.security_empty_no_ranges_sub()}</p>
+        <p class="empty-title">{m.security_empty_no_ranges()}</p>
+        <p class="empty-sub">{m.security_empty_no_ranges_sub()}</p>
       </div>
     {:else if matchedCount === 0}
       <div class="empty-state">
@@ -659,8 +659,8 @@
           <circle cx="11" cy="11" r="8"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
-        <p>{m.security_empty_no_matches()}</p>
-        <p class="sub">{m.security_empty_no_matches_sub()}</p>
+        <p class="empty-title">{m.security_empty_no_matches()}</p>
+        <p class="empty-sub">{m.security_empty_no_matches_sub()}</p>
       </div>
     {:else}
       <div
@@ -753,8 +753,8 @@
          Without this the page is an error banner over an empty body, and the
          only way back was to restart the app. -->
     <div class="empty-state">
-      <p>{m.security_load_failed()}</p>
-      <button onclick={() => void loadStats()} disabled={loading}>
+      <p class="empty-title">{m.security_load_failed()}</p>
+      <button type="button" class="empty-action" onclick={() => void loadStats()} disabled={loading}>
         {loading ? m.common_loading() : m.common_retry()}
       </button>
     </div>
@@ -778,21 +778,6 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-
-  /* Visually-hidden label for the URL input; the placeholder
-     doubles as the visible cue while the label keeps the
-     accessibility tree honest for screen readers. */
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 
   /* Collapsible "Fetch from URL" row. Sits directly under the
@@ -935,7 +920,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     padding: 0 8px;
-    background: var(--bg-input, var(--bg-primary));
+    background: var(--bg-input);
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .search-wrap:focus-within {
@@ -1049,7 +1034,10 @@
   }
   .col-range { width: 36%; }
   .col-desc { width: auto; }
+  /* `.ip-table th` left-aligns every header and outranks a bare column class. */
+  .ip-table th.col-hits,
   .col-hits { width: 80px; text-align: right; }
+  .ip-table th.col-actions,
   .col-actions { width: 44px; text-align: center; }
 
   .ip-table td {
@@ -1153,12 +1141,5 @@
   .ip-table tbody tr:focus-within .btn-remove,
   .btn-remove:focus-visible {
     opacity: 1;
-  }
-
-  /* --- Empty state --- */
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 2px;
   }
 </style>

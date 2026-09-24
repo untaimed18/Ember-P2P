@@ -342,7 +342,7 @@
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 12px;
     color: var(--text-secondary);
-    background: var(--bg-tertiary, var(--bg-primary));
+    background: var(--bg-tertiary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 8px 10px;

@@ -233,7 +233,7 @@
   .notice-progress {
     height: 6px;
     border-radius: var(--radius-pill);
-    background: var(--bg-tertiary, var(--bg-hover));
+    background: var(--bg-tertiary);
     overflow: hidden;
   }
 

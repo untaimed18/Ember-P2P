@@ -951,8 +951,8 @@
               <line x1="10" y1="6.5" x2="16" y2="6.5"></line>
               <line x1="10" y1="17.5" x2="16" y2="17.5"></line>
             </svg>
-            <p>{m.servers_empty_no_servers()}</p>
-            <p class="sub">{m.servers_empty_no_servers_sub()}</p>
+            <p class="empty-title">{m.servers_empty_no_servers()}</p>
+            <p class="empty-sub">{m.servers_empty_no_servers_sub()}</p>
           </div>
         {:else if filteredServers.length === 0}
           <div class="empty-state compact">
@@ -962,8 +962,8 @@
               <line x1="11" y1="8" x2="11" y2="14"></line>
               <line x1="8" y1="11" x2="14" y2="11"></line>
             </svg>
-            <p>{m.servers_empty_no_matches()}</p>
-            <p class="sub">{m.servers_empty_no_matches_sub()}</p>
+            <p class="empty-title">{m.servers_empty_no_matches()}</p>
+            <p class="empty-sub">{m.servers_empty_no_matches_sub()}</p>
             <!-- The filter box is up in the toolbar, out of the eyeline of
                  someone reading an empty table, so put the way out here too —
                  the same move the KAD and Library empty states already make. -->
@@ -1018,7 +1018,7 @@
                   in:fade={{ duration: 150 }}
                   animate:flip={{ duration: 180 }}
                 >
-                  <td class="name-cell">
+                  <td class="name-cell" title={server.name || m.servers_unnamed()}>
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
                     <bdi dir="auto">{server.name || m.servers_unnamed()}</bdi>
                   </td>
@@ -1354,7 +1354,7 @@
     min-width: 240px;
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
-    background: var(--bg-input, var(--bg-surface));
+    background: var(--bg-input);
     overflow: hidden;
     transition: border-color 0.15s ease;
   }
@@ -1716,15 +1716,6 @@
     padding: 40px 16px;
   }
 
-  .empty-state.compact p {
-    font-size: 13px;
-  }
-
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   .connect-spinner {
@@ -1742,42 +1733,14 @@
     to { transform: rotate(360deg); }
   }
 
+  /* Colors come from the shared `.badge` recipes in app.css, so a connection
+     state reads the same here as on the KAD page. */
   .badge {
-    display: inline-flex;
-    align-items: center;
     gap: 5px;
-    padding: 2px 8px;
-    border-radius: var(--radius-pill);
-    font-size: 11px;
-    font-weight: 600;
   }
 
-  .badge.connected {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    color: var(--success);
-  }
-
-  .badge.connecting {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    color: var(--accent);
-  }
-
-  .badge.disconnected {
-    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
-    color: var(--text-secondary);
-  }
-
-  .badge.lowid {
-    background: color-mix(in srgb, var(--danger) 15%, transparent);
-    color: var(--danger);
-    font-size: 10px;
-    padding: 1px 6px;
-  }
-
+  .badge.lowid,
   .badge.highid {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    color: var(--success);
     font-size: 10px;
     padding: 1px 6px;
   }
