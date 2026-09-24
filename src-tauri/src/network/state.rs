@@ -827,6 +827,12 @@ pub(super) struct NetworkState {
     /// did not need one, and it hides exactly the open-port nodes that make the
     /// best relays for everyone else. See [`ember_udp_reachable`].
     pub(super) ember_udp_reachable_at: Option<i64>,
+    /// The external address `ember_reach_witness` and `ember_udp_reachable_at`
+    /// were earned under. The evidence is dropped when the address moves to a
+    /// different one, not when it is merely unknown for a while: KAD
+    /// disconnect clears the address until STUN reports the same one again.
+    /// See [`reach_evidence_survives`].
+    pub(super) ember_reach_external_ip: Option<Ipv4Addr>,
     /// KAD-bridge bootstrap bookkeeping (slice 13): when the bridge last
     /// DHT-pinged each KAD-learned Ember peer and how many of those pings have
     /// gone unanswered, so it moves through the `ember_noise_keys` cache

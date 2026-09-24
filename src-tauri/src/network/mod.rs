@@ -905,6 +905,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_store_loaded: false,
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
+        ember_reach_external_ip: None,
             ember_kad_bridge_attempted: HashMap::new(),
         ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
         ember_friend_contacts_asked: HashMap::new(),

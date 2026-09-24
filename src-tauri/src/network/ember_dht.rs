@@ -1972,9 +1972,13 @@ pub(super) async fn handle_ember_dht_message(
                     );
                 }
                 state.ember_udp_reachable_at = Some(now);
+                state.ember_reach_external_ip = state.external_ip;
             }
             Some(_) => {}
-            None => state.ember_reach_witness = Some((from.ip(), now)),
+            None => {
+                state.ember_reach_witness = Some((from.ip(), now));
+                state.ember_reach_external_ip = state.external_ip;
+            }
         }
     }
 

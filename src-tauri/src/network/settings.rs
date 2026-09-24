@@ -241,6 +241,7 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_publish_target_lookups.clear();
     state.ember_udp_reachable_at = None;
     state.ember_reach_witness = None;
+    state.ember_reach_external_ip = None;
 
     // Cumulative dev-console counters: start each enable-session clean
     // (matching the session reset above). The live fields — session count,

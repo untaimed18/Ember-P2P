@@ -529,6 +529,40 @@ pub(super) fn adopt_stun_mapped_external_ip(state: &mut NetworkState, ip: Ipv4Ad
     state.stats.external_ip = ip.to_string();
 }
 
+/// Whether reachability evidence earned while our external address was
+/// `earned_under` still holds once the address becomes `new_ip`.
+///
+/// Only a move to a different known address invalidates it. An address that
+/// is merely unknown for a while has not moved: KAD disconnect clears it until
+/// STUN reports the same one again.
+pub(super) fn reach_evidence_survives(
+    earned_under: Option<Ipv4Addr>,
+    new_ip: Option<Ipv4Addr>,
+) -> bool {
+    match new_ip {
+        None => true,
+        Some(ip) => earned_under == Some(ip),
+    }
+}
+
+/// The external address KAD's UDP firewall check proved reachable, if Ember
+/// should inherit that proof when KAD stops.
+///
+/// The check proves the shared socket accepts unsolicited datagrams, and
+/// disconnecting KAD does not close it. Ember keeps running on that port, so
+/// the proof stays true for Ember after KAD discards its own verdict.
+pub(super) fn kad_udp_proof_to_inherit(
+    udp_fw_verified: bool,
+    udp_firewalled: bool,
+    external_ip: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    if udp_fw_verified && !udp_firewalled {
+        external_ip
+    } else {
+        None
+    }
+}
+
 pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
@@ -547,8 +581,10 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
         // network entirely, so the evidence has to be earned again rather than
         // coasting to the end of its TTL — including the first witness, which is
         // half of that evidence.
-        state.ember_udp_reachable_at = None;
-        state.ember_reach_witness = None;
+        if !reach_evidence_survives(state.ember_reach_external_ip, ip) {
+            state.ember_udp_reachable_at = None;
+            state.ember_reach_witness = None;
+        }
     }
     state.external_ip = ip;
     state.routing_table.set_external_ip(ip);
@@ -1022,5 +1058,52 @@ mod firewall_request_bound_tests {
         assert!(bucket.available_tokens() < 8.0);
         assert!(bucket.try_take());
         assert!(!bucket.try_take());
+    }
+}
+
+#[cfg(test)]
+mod reach_evidence_tests {
+    use super::*;
+
+    const A: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+    const B: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+
+    #[test]
+    fn evidence_is_dropped_only_when_the_address_moves() {
+        assert!(reach_evidence_survives(Some(A), Some(A)));
+        assert!(!reach_evidence_survives(Some(A), Some(B)));
+        // Unknown for a while is not a move.
+        assert!(reach_evidence_survives(Some(A), None));
+        assert!(reach_evidence_survives(None, None));
+        // Evidence earned before we knew our address cannot vouch for the
+        // first one we learn.
+        assert!(!reach_evidence_survives(None, Some(A)));
+    }
+
+    /// Issue #124: disconnecting KAD showed a reachable node as relayed. KAD
+    /// disconnect drops the external address until STUN reports it again, and
+    /// that round trip wiped Ember's proof that the port is open.
+    #[test]
+    fn a_kad_disconnect_round_trip_keeps_the_node_reachable() {
+        let now = 1_000_000i64;
+        let proven_at = Some(now - 60);
+        let earned_under = Some(A);
+        assert!(reach_evidence_survives(earned_under, None));
+        assert!(reach_evidence_survives(earned_under, Some(A)));
+        assert!(ember_udp_reachable_from(
+            ember::nat::NatType::PortRestricted,
+            proven_at,
+            now
+        ));
+    }
+
+    #[test]
+    fn ember_inherits_only_a_verified_open_kad_udp_result() {
+        assert_eq!(kad_udp_proof_to_inherit(true, false, Some(A)), Some(A));
+        // Never verified, or verified firewalled: nothing to inherit.
+        assert_eq!(kad_udp_proof_to_inherit(false, false, Some(A)), None);
+        assert_eq!(kad_udp_proof_to_inherit(true, true, Some(A)), None);
+        // A proof that names no address cannot be tied to one.
+        assert_eq!(kad_udp_proof_to_inherit(true, false, None), None);
     }
 }

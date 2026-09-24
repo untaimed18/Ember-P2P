@@ -4295,6 +4295,18 @@ async fn handle_command_inner(
             // harmless while this handler also dropped the server; it is
             // reachable now that it leaves the server alone.
             let surviving_highid = live_highid_external_ip(state);
+            // KAD's verdict on our UDP port goes with the session below, but the
+            // port itself stays open and Ember keeps using it. Without this a
+            // node that was reachable a moment ago publishes as relayed until
+            // two strangers happen to reach it unsolicited.
+            if let Some(ip) = kad_udp_proof_to_inherit(
+                state.udp_fw_verified,
+                state.udp_firewalled,
+                state.external_ip,
+            ) {
+                state.ember_udp_reachable_at = Some(chrono::Utc::now().timestamp());
+                state.ember_reach_external_ip = Some(ip);
+            }
             set_external_ip(state, surviving_highid);
             state.external_udp_port = None;
             state.firewalled = surviving_highid.is_none();
