@@ -9,6 +9,25 @@ use super::*;
 /// state changes; `start_network` explains why this is throttled.
 const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Tell the UI, at most once per this many seconds, that downloads are being
+/// refused by the download folder. Every waiting download hits the same wall on
+/// each retry, and one notice says everything the next hundred would.
+const DOWNLOAD_FOLDER_NOTICE_INTERVAL_SECS: i64 = 300;
+
+fn emit_download_folder_unavailable(app_handle: &tauri::AppHandle) {
+    static LAST_NOTICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_NOTICE.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < DOWNLOAD_FOLDER_NOTICE_INTERVAL_SECS
+        || LAST_NOTICE
+            .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let _ = app_handle.emit("download-folder-unavailable", ());
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -628,6 +647,15 @@ pub(in crate::network) async fn on_download_event(
         let failure_kind_name = ed2k::transfer::failure_kind_name(failure_kind);
         let failure_code = ed2k::transfer::classify_failure(error, failure_kind);
         let failure_summary = failure_code.message();
+        // Our own folder refused the write; no peer was involved, so none is
+        // blamed or penalized. The row still re-queues below and recovers by
+        // itself once the folder is fixed, which is what eMule does too.
+        let is_folder_error =
+            failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable;
+        if is_folder_error {
+            warn!("Download {transfer_id} cannot use its download folder: {error}");
+            emit_download_folder_unavailable(app_handle);
+        }
 
         // Prefer is_user_cancel_error for source-failure classification;
         // also honour an already-cancelled control (cancel race).
@@ -656,7 +684,7 @@ pub(in crate::network) async fn on_download_event(
             )
         };
 
-        if !is_user_cancel && !settled_by_user {
+        if !is_user_cancel && !settled_by_user && !is_folder_error {
             let _ = app_handle.emit("transfer:source-failed", serde_json::json!({
                 "transfer_id": transfer_id,
                 "source": peer_id_str,
@@ -671,7 +699,7 @@ pub(in crate::network) async fn on_download_event(
         // SourceDetail "failed" events (which carry the actual IP/port).
         // For single-source downloads that set peer_id, apply a
         // belt-and-suspenders mark here as well.
-        {
+        if !is_folder_error {
             // Sources retired below are also dropped from the
             // registry, which is what makes the count honest — see
             // `retire_dead_source_from_registry`. Collected while the

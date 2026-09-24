@@ -564,6 +564,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                         src.tcp_port,
                         fh,
                         src.user_hash,
+                        crate::types::SourceOrigin::Ember,
                     )
                     .await;
                     info!(

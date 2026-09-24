@@ -483,6 +483,12 @@ pub(super) async fn handle_download_event(
                         placeholder: false,
                     },
                 );
+                // Report what the row now holds, not only what this lookup
+                // found. The drawer builds a row from the first event it sees
+                // for a peer, so an event saying "no origin" for a row the
+                // backend has labelled left that peer on a dash for good.
+                let detail_origin =
+                    mgr.source_detail_origin(&transfer_id, &ip, port).or(detail_origin);
                 // This row just changed a peer's state, which is exactly what
                 // eMule's `xx`/`zz` count — and the worker atomics cannot see
                 // a queue slot whose socket is gone. Only emit when the column

@@ -198,6 +198,8 @@ pub(in crate::network) async fn on_source_retry_tick(
                     job.src_port,
                     job.file_hash,
                     job.user_hash,
+                    // Only KAD answers carry a KAD buddy.
+                    crate::types::SourceOrigin::Kad,
                 ).await;
                 let ip_s = upload_server::kad_callback_display_key(job.src_ip, job.user_hash);
                 state.callback_row_pending_since.insert(
@@ -330,6 +332,8 @@ pub(in crate::network) async fn on_source_retry_tick(
                         job.src_port,
                         job.file_hash,
                         job.user_hash,
+                        // Only Ember DHT answers carry an Ember buddy.
+                        crate::types::SourceOrigin::Ember,
                     )
                     .await;
                     let ip_s = upload_server::kad_callback_display_key(

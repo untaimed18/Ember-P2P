@@ -244,6 +244,7 @@ pub(in crate::network) async fn on_broker_tick(
                                     emule_info_done: false,
                                     peer_caps,
                                     friend_ember_hash: None,
+                                    origin: None,
                                 };
                                 if let Err(e) = greet_tx.send(parts).await {
                                     tracing::debug!(

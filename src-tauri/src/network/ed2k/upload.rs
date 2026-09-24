@@ -887,6 +887,16 @@ pub struct KadCallbackParts {
     /// for the same file was the friend connect-back it was waiting on (a
     /// genuine server/KAD LowID callback can arrive for the same download).
     pub friend_ember_hash: Option<[u8; 16]>,
+    /// The network that found this peer, when the route that brought the
+    /// connection knows it: the pending KAD or Ember callback it answered, or a
+    /// friend connect-back. `None` for server-LowID callbacks and push-grants,
+    /// whose peers already have a source row that records it.
+    ///
+    /// Carried because a buddy-callback peer has no such row. It is known only
+    /// by the pending callback and a drawer placeholder, which is removed as
+    /// the connection is adopted, so without this the live row had nothing to
+    /// inherit a label from and showed a dash.
+    pub origin: Option<crate::types::SourceOrigin>,
 }
 
 /// Path B (eMule queued-source model) inbound reconnect index.
@@ -986,6 +996,9 @@ pub struct PendingKadCallbackEntry {
     /// `TAG_SOURCEPORT` from the KAD publish (used for disambiguation).
     pub expected_tcp_port: u16,
     pub registered_at: i64,
+    /// Which network's answer this callback was requested for, handed on to
+    /// the adopted connection as [`KadCallbackParts::origin`].
+    pub origin: Option<crate::types::SourceOrigin>,
 }
 
 /// Pending inbound KAD callbacks. Type 3/5 sources are keyed by user hash;
@@ -6442,6 +6455,7 @@ impl UploadHandler {
         if peer_user_hash != [0u8; 16] {
             self.credit_manager.write().await.note_client_identity(
                 peer_user_hash,
+                Some(peer_addr.ip()),
                 &hello_caps.peer_name,
                 &ul_client_software,
             );
@@ -6582,6 +6596,7 @@ impl UploadHandler {
                             emule_info_done: true,
                             peer_caps: hello_caps.clone(),
                             friend_ember_hash: Some(peer.ember_hash),
+                            origin: Some(crate::types::SourceOrigin::Ember),
                         })
                         .await;
                     return Ok(());
@@ -6630,7 +6645,7 @@ impl UploadHandler {
                     lookup_keys.push(PendingKadCallbackKey::SourceIp(peer_v4));
                 }
 
-                let mut matched: Option<[u8; 16]> = None;
+                let mut matched: Option<([u8; 16], Option<crate::types::SourceOrigin>)> = None;
                 'outer: for key in lookup_keys {
                     let Some(entries) = cbs.get_mut(&key) else {
                         continue;
@@ -6674,7 +6689,7 @@ impl UploadHandler {
                         if entries.is_empty() {
                             cbs.remove(&key);
                         }
-                        matched = Some(entry.file_hash);
+                        matched = Some((entry.file_hash, entry.origin));
                         break 'outer;
                     }
                 }
@@ -6708,7 +6723,7 @@ impl UploadHandler {
                 }
                 matched
             };
-            if let Some(file_hash) = callback_file {
+            if let Some((file_hash, callback_origin)) = callback_file {
                 info!(
                     "Recognized KAD callback connection from {peer_addr} for file {}",
                     hex::encode(file_hash)
@@ -6740,6 +6755,7 @@ impl UploadHandler {
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
+                    origin: callback_origin,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -6808,6 +6824,7 @@ impl UploadHandler {
                         emule_info_done: emule_done,
                         peer_caps: hello_caps.clone(),
                         friend_ember_hash: None,
+                        origin: None,
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
@@ -6879,6 +6896,7 @@ impl UploadHandler {
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
+                    origin: None,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -6954,6 +6972,7 @@ impl UploadHandler {
                 if peer_user_hash != [0u8; 16] {
                     self.credit_manager.write().await.note_client_identity(
                         peer_user_hash,
+                        Some(peer_addr.ip()),
                         &hello_caps.peer_name,
                         &ul_client_software,
                     );
@@ -11951,6 +11970,7 @@ impl UploadHandler {
                         if peer_user_hash != [0u8; 16] {
                             self.credit_manager.write().await.note_client_identity(
                                 peer_user_hash,
+                                Some(peer_addr.ip()),
                                 &hello_caps.peer_name,
                                 &ul_client_software,
                             );

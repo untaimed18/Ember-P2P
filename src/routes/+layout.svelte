@@ -276,6 +276,7 @@
     let unlistenFoldersFailed: UnlistenFn | null = null;
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
+    let unlistenDownloadFolder: UnlistenFn | null = null;
 
     // Last-resort floor for promise rejections nothing else caught. Every
     // `invoke()` rejects whenever its Rust command returns `Err`, so a call
@@ -393,6 +394,15 @@
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    // Downloads re-queue on their own once the folder is fixed, so without this
+    // the only sign of a folder Ember cannot write is rows that never start.
+    listen('download-folder-unavailable', () => {
+      if (!mounted) return;
+      toastWarning(m.layout_download_folder_unavailable());
+    })
+      .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
+      .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
 
     listen<{ token?: number; folders?: string[]; reason?: string }>(
       'shared-folder-drop-pending',
@@ -613,6 +623,7 @@
       if (unlistenFoldersFailed) unlistenFoldersFailed();
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
+      if (unlistenDownloadFolder) unlistenDownloadFolder();
     };
   });
 </script>

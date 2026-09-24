@@ -1051,6 +1051,45 @@ pub fn is_disk_full_error(err: &str) -> bool {
         || lower.contains("storagefull")
 }
 
+/// Prefix on every error raised while preparing the local download folder or
+/// opening a `.part` inside it.
+///
+/// Such an error involves no peer, so it is not a source failure, and retrying
+/// another source cannot fix it. Untagged, it fell through `classify_failure` to
+/// "Transient connection failure": the row went back to Searching and retried
+/// forever while telling the user to look at the network (issue 128).
+pub(crate) const DOWNLOAD_FOLDER_STAGE: &str = "stage:download_folder";
+
+pub(crate) fn is_download_folder_error(error: &str) -> bool {
+    error.contains(DOWNLOAD_FOLDER_STAGE)
+}
+
+pub(crate) fn download_folder_error(
+    what: &str,
+    download_dir: &std::path::Path,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!("{DOWNLOAD_FOLDER_STAGE}: {what} in {}: {error}", download_dir.display())
+}
+
+/// Create `<download_dir>/Temp` (for `.part` files) and `<download_dir>/Downloads`
+/// (for completed ones) inside the approved root, returning both.
+pub(crate) async fn prepare_download_dirs(
+    download_dir: &std::path::Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let root = download_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let allowed = vec![root.to_string_lossy().into_owned()];
+        let temp = crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)?;
+        let done =
+            crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)?;
+        Ok::<_, std::io::Error>((temp, done))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+    .map_err(|e| download_folder_error("preparing Temp and Downloads", download_dir, e))
+}
+
 pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
     match kind {
         SourceFailureKind::Transient => "transient".to_string(),
@@ -1119,6 +1158,8 @@ transfer_failure_codes! {
     PermanentFailure => "permanent_failure", "Permanent transfer failure";
     TransientFailure => "transient_failure", "Transient connection failure";
     NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
+    DownloadFolderUnavailable => "download_folder_unavailable",
+        "The download folder cannot be written; check it in Settings";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -1135,6 +1176,9 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
     let lower = error.to_lowercase();
     if lower.contains("cancelled") {
         return TransferFailureCode::Cancelled;
+    }
+    if is_download_folder_error(error) {
+        return TransferFailureCode::DownloadFolderUnavailable;
     }
     if lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
@@ -1176,6 +1220,9 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
 
 
 pub(crate) fn infer_stage_from_error(error: &str) -> &'static str {
+    if is_download_folder_error(error) {
+        return "download_folder";
+    }
     if error.contains("stage:tcp_connect") {
         return "tcp_connect";
     }
@@ -1388,6 +1435,11 @@ mod tests {
                 "stage:tcp_obfuscation required by peer but failed",
                 Transient,
                 C::ConnectionFailed,
+            ),
+            (
+                "stage:download_folder: opening the part file in /x: Permission denied",
+                Transient,
+                C::DownloadFolderUnavailable,
             ),
             ("unrecognised", Permanent, C::PermanentFailure),
             ("unrecognised", Transient, C::TransientFailure),
@@ -1663,6 +1715,33 @@ mod tests {
         let failure = classify_failure("peer does not have the file", &kind);
         assert_eq!(failure, TransferFailureCode::RemoteMissingFile);
         assert_eq!(failure.message(), "Remote missing file");
+    }
+
+    /// The raw error names a path and an OS error, and the path must not reach
+    /// the UI; the code is what says which folder problem this is.
+    #[test]
+    fn a_download_folder_error_is_not_reported_as_a_connection_failure() {
+        let raw = download_folder_error(
+            "opening the part file",
+            std::path::Path::new("/home/someone/Ember"),
+            "Permission denied (os error 13)",
+        )
+        .to_string();
+        let kind = classify_error(&raw);
+        assert_eq!(kind, SourceFailureKind::Transient, "it still re-queues");
+        assert_eq!(classify_failure(&raw, &kind), TransferFailureCode::DownloadFolderUnavailable);
+        assert_eq!(infer_stage_from_error(&raw), "download_folder");
+        assert!(!TransferFailureCode::DownloadFolderUnavailable.message().contains("/home"));
+    }
+
+    #[tokio::test]
+    async fn a_download_folder_that_is_not_an_approved_root_is_tagged() {
+        let _registry = crate::security::filesystem::test_registry_lock();
+        let dir = std::env::temp_dir().join(format!("ember-unapproved-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = prepare_download_dirs(&dir).await.expect_err("not approved").to_string();
+        assert!(is_download_folder_error(&error), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2170,6 +2249,9 @@ impl Ed2kDownload {
                     peer_user_hash,
                     0,
                     peer_caps.is_high_id(),
+                    // `on_kad_callback_conn` registered this peer with the
+                    // route's origin before starting this download.
+                    None,
                 );
             }
         }
@@ -4409,24 +4491,7 @@ impl Ed2kDownload {
         //   <download_dir>/Temp/     -- .part files during download
         //   <download_dir>/Downloads/ -- completed files
         let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let temp_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
-        };
-        let completed_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
-        };
+        let (temp_dir, completed_dir) = prepare_download_dirs(&self.download_dir).await?;
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
 
@@ -4550,7 +4615,7 @@ impl Ed2kDownload {
                 Some(self.control.discarding_flag()),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
+            .map_err(|e| download_folder_error("opening the part file", &self.download_dir, e))?
         };
 
         let mut downloaded: u64 = tracker.completed_bytes();
@@ -6353,24 +6418,7 @@ pub(super) async fn finalize_zero_ed2k_file(
         );
     }
     let allowed = vec![download_dir.to_string_lossy().into_owned()];
-    let temp_dir = {
-        let root = download_dir.to_path_buf();
-        let allowed = allowed.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("temp dir task failed: {error}"))??
-    };
-    let completed_dir = {
-        let root = download_dir.to_path_buf();
-        let allowed = allowed.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("downloads dir task failed: {error}"))??
-    };
+    let (temp_dir, completed_dir) = prepare_download_dirs(download_dir).await?;
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let final_path = completed_dir.join(&safe_name);

@@ -423,6 +423,7 @@ pub(super) async fn register_or_refresh_pending_friend_callback(
         // treats an unknown advertised port.
         expected_tcp_port: 0,
         registered_at: now,
+        origin: Some(crate::types::SourceOrigin::Ember),
     });
 }
 
@@ -2080,6 +2081,7 @@ mod friend_transfer_tests {
             file_hash,
             expected_tcp_port: 0,
             registered_at: 0,
+            origin: None,
         };
         map.insert(
             upload_server::PendingKadCallbackKey::FriendEmber(FRIEND_A),
@@ -2118,6 +2120,7 @@ mod friend_transfer_tests {
             file_hash: FILE_1,
             expected_tcp_port: 4662,
             registered_at: 0,
+            origin: None,
         };
         map.insert(
             upload_server::PendingKadCallbackKey::SourceIp(Ipv4Addr::new(198, 51, 100, 9)),

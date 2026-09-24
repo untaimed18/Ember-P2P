@@ -196,6 +196,12 @@ pub(super) struct NetworkState {
     /// hands each source to the download the moment a node answers. Entries
     /// are pruned when their search leaves `download_source_searches`.
     pub(super) source_search_stream_cursor: HashMap<SearchId, usize>,
+    /// Direct sources a KAD source search found before capacity eviction ended
+    /// it: `(file_hash, ip, tcp_port, udp_port, user_hash, connect_options)`.
+    /// The eviction path injects them into the download at once but cannot
+    /// reach the source manager, so they are recorded as KAD finds on the next
+    /// search-poll tick instead of reaching the Origin column unlabelled.
+    pub(super) evicted_kad_sources: Vec<([u8; 16], Ipv4Addr, u16, u16, [u8; 16], u8)>,
     /// Downloads waiting for sources (transfer_id -> PendingDownload)
     pub(super) pending_downloads: HashMap<String, PendingDownload>,
     pub(super) data_dir: PathBuf,

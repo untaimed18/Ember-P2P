@@ -234,13 +234,19 @@ pub(in crate::network) async fn on_a4af_tick(
                         break;
                     }
                 }
-                let (moved_user_hash, moved_connect_options, moved_session_only) = {
+                // The origin moves with the peer, as eMule's `m_nSourceFrom`
+                // does: it lives on the one `CUpDownClient` A4AF reassigns, so a
+                // swapped client keeps saying how it was found. Dropping it here
+                // also deleted the only row the cross-file fallback in
+                // `get_source_origin` could have read it back from.
+                let (moved_user_hash, moved_connect_options, moved_session_only, moved_origin) = {
                     let sm = source_manager.read().await;
                     (
                         sm.get_user_hash(&swap.from_file, v4, port),
                         sm.get_connect_options(&swap.from_file, v4, port)
                             .unwrap_or(0),
                         sm.is_session_only_port(&swap.from_file, v4, port),
+                        sm.get_source_origin(&swap.from_file, v4, port),
                     )
                 };
                 {
@@ -258,15 +264,9 @@ pub(in crate::network) async fn on_a4af_tick(
                             port,
                             moved_user_hash.unwrap_or([0u8; 16]),
                             moved_connect_options,
+                            moved_origin,
                         );
                     } else if let Some(user_hash) = moved_user_hash {
-                        // A4AF: the peer itself told us, mid-session,
-                        // that it also holds the target file. That is
-                        // not something any of the four networks
-                        // said, and copying the origin it carries for
-                        // the file it was found for would attribute
-                        // this one to a network that never mentioned
-                        // it. So: no origin.
                         sm.register_source_full_opts(
                             swap.to_file,
                             v4,
@@ -274,7 +274,7 @@ pub(in crate::network) async fn on_a4af_tick(
                             moved_udp_port,
                             user_hash,
                             moved_connect_options,
-                            None,
+                            moved_origin,
                         );
                     } else {
                         sm.register_source_full(
@@ -283,7 +283,7 @@ pub(in crate::network) async fn on_a4af_tick(
                             port,
                             moved_udp_port,
                             [0u8; 16],
-                            None,
+                            moved_origin,
                         );
                     }
                 }

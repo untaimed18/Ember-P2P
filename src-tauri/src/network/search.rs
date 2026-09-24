@@ -1475,6 +1475,16 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
                 if !direct.is_empty() {
                     let matching = [transfer_id.clone()];
                     let mut injected = 0usize;
+                    state.evicted_kad_sources.extend(direct.iter().map(|ds| {
+                        (
+                            file_hash,
+                            ds.ip,
+                            ds.tcp_port,
+                            ds.udp_port,
+                            ds.source_user_hash.unwrap_or([0u8; 16]),
+                            ds.connect_options,
+                        )
+                    }));
                     for ds in &direct {
                         let source = DownloadSource {
                             peer_ip: ds.ip.to_string(),

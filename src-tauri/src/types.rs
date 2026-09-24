@@ -2017,9 +2017,10 @@ pub struct KnownClient {
     /// "Verified" | "Failed" | "Unknown" | "BadGuy" | "Needed"
     pub ident_state: String,
     /// Best-known peer IPv4/IPv6 string for display, or `None` when unknown.
-    /// Prefer SecIdent `ident_ip` when present; otherwise may be filled from
-    /// the friends table (`last_ip`) for Ember friends that have no verified
-    /// credit IP yet — that path is observed/friend-seen, not SecIdent.
+    /// Prefer SecIdent `ident_ip` when present; otherwise the address of our
+    /// last session with the peer (`CreditRecord::seen_ip`), and failing that
+    /// the friends table (`last_ip`) for Ember friends. Only the first is
+    /// SecIdent-proven.
     pub last_known_ip: Option<String>,
     /// ISO 3166-1 alpha-2, geoip-resolved from `last_known_ip`.
     pub country_code: Option<String>,

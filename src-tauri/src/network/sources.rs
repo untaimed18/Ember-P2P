@@ -564,6 +564,7 @@ pub(super) async fn register_or_refresh_pending_kad_callback(
     source_tcp_port: u16,
     file_hash: [u8; 16],
     user_hash: Option<[u8; 16]>,
+    origin: crate::types::SourceOrigin,
 ) {
     // eMule matches a firewalled peer's callback connect-back primarily by its
     // ED2K *user hash* (ListenSocket OP_CALLBACK → AttachToAlreadyKnown →
@@ -620,14 +621,17 @@ pub(super) async fn register_or_refresh_pending_kad_callback(
             .find(|e| e.file_hash == file_hash && e.expected_tcp_port == source_tcp_port)
         {
             entry.registered_at = now;
+            entry.origin.get_or_insert(origin);
         } else if let Some(entry) = entries.iter_mut().find(|e| e.file_hash == file_hash) {
             entry.expected_tcp_port = source_tcp_port;
             entry.registered_at = now;
+            entry.origin.get_or_insert(origin);
         } else {
             entries.push(upload_server::PendingKadCallbackEntry {
                 file_hash,
                 expected_tcp_port: source_tcp_port,
                 registered_at: now,
+                origin: Some(origin),
             });
         }
     }

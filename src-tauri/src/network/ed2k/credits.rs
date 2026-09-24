@@ -235,6 +235,17 @@ pub struct CreditRecord {
     pub peer_name: String,
     /// Client software and version, as `client_software_from_caps` renders it.
     pub client_software: String,
+    /// IPv4 (big-endian, like `ident_ip`) of the last session we held with
+    /// this peer, whatever SecIdent made of it.
+    ///
+    /// Display only. `ident_ip` is the address an identity was *proven* from
+    /// and drives BadGuy detection, so it is only written after a signature
+    /// verifies — which leaves it at 0 for every peer that lacks SecIdent,
+    /// never finishes the challenge, or meets us while our own key is
+    /// unavailable. The Known Clients tab fell back to nothing for those and
+    /// showed no IP and no flag. This field is what it falls back to instead,
+    /// and nothing that scores or trusts a peer reads it.
+    pub seen_ip: u32,
 }
 
 /// Enhanced credit record for verified Ember peers.
@@ -363,6 +374,7 @@ impl CreditRecord {
             crypto_verified_once: false,
             peer_name: String::new(),
             client_software: String::new(),
+            seen_ip: 0,
         }
     }
 }
@@ -771,13 +783,27 @@ impl CreditManager {
     /// `CT_NAME` on its first handshake and omits it on a later one is
     /// common, and treating the omission as "my name is now blank" would lose
     /// the name for exactly the peers we talk to most.
+    ///
+    /// `peer_ip` is the address of the session this came from, recorded as
+    /// [`CreditRecord::seen_ip`]. Unlike the strings it always replaces the
+    /// stored value: a peer on a dynamic address should show where it is now.
     pub fn note_client_identity(
         &mut self,
         user_hash: [u8; 16],
+        peer_ip: Option<std::net::IpAddr>,
         peer_name: &str,
         client_software: &str,
     ) {
-        if user_hash == [0u8; 16] || (peer_name.is_empty() && client_software.is_empty()) {
+        let seen_ip = peer_ip
+            .and_then(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            })
+            .filter(|v4| !v4.is_unspecified())
+            .map(|v4| u32::from_be_bytes(v4.octets()));
+        if user_hash == [0u8; 16]
+            || (peer_name.is_empty() && client_software.is_empty() && seen_ip.is_none())
+        {
             return;
         }
         let record = self.get_or_create(user_hash);
@@ -786,6 +812,9 @@ impl CreditManager {
         }
         if !client_software.is_empty() {
             record.client_software = truncate_identity(client_software);
+        }
+        if let Some(ip) = seen_ip {
+            record.seen_ip = ip;
         }
     }
 
@@ -1672,6 +1701,9 @@ impl CreditManager {
                 // user_hash and may name only some of these records.
                 peer_name: String::new(),
                 client_software: String::new(),
+                // `clients.met` has no field for it; the SQLite table, which
+                // is the primary store, does.
+                seen_ip: 0,
             };
             self.credits.insert(user_hash, record);
             loaded_hashes.push(user_hash);
@@ -2406,8 +2438,8 @@ mod tests {
     fn a_later_handshake_without_a_name_does_not_erase_the_stored_one() {
         let mut cm = CreditManager::new();
         let peer = [0x44u8; 16];
-        cm.note_client_identity(peer, "Aoife", "eMule 0.60a");
-        cm.note_client_identity(peer, "", "eMule 0.60b");
+        cm.note_client_identity(peer, None, "Aoife", "eMule 0.60a");
+        cm.note_client_identity(peer, None, "", "eMule 0.60b");
         let record = cm.get_record(&peer).expect("record");
         assert_eq!(record.peer_name, "Aoife");
         assert_eq!(
@@ -2426,10 +2458,31 @@ mod tests {
         let peer = [0x45u8; 16];
         // 3 bytes each, so the cap lands mid-character if taken naively.
         let long = "☃".repeat(100);
-        cm.note_client_identity(peer, &long, "");
+        cm.note_client_identity(peer, None, &long, "");
         let stored = &cm.get_record(&peer).expect("record").peer_name;
         assert!(stored.len() <= MAX_IDENTITY_LEN, "{}", stored.len());
         assert!(stored.chars().all(|c| c == '☃'), "{stored}");
+    }
+
+    /// A peer that never completes SecIdent still gets an address on its
+    /// ledger row, and recording it leaves the identity pin alone.
+    #[test]
+    fn a_session_records_the_address_without_touching_the_ident_pin() {
+        let mut cm = CreditManager::new();
+        let peer = [0x46u8; 16];
+        let first: std::net::IpAddr = std::net::Ipv4Addr::new(9, 8, 7, 6).into();
+        let moved: std::net::IpAddr = std::net::Ipv4Addr::new(9, 8, 7, 7).into();
+
+        cm.note_client_identity(peer, Some(first), "", "");
+        let record = cm.get_record(&peer).expect("an address alone creates the row");
+        assert_eq!(record.seen_ip, 0x0908_0706);
+        assert_eq!(record.ident_ip, 0, "only a verified signature pins ident_ip");
+
+        cm.note_client_identity(peer, Some(moved), "Aoife", "");
+        assert_eq!(cm.get_record(&peer).unwrap().seen_ip, 0x0908_0707, "the newest session wins");
+
+        cm.note_client_identity(peer, None, "Aoife", "");
+        assert_eq!(cm.get_record(&peer).unwrap().seen_ip, 0x0908_0707, "no address keeps the last");
     }
 
     /// Monotonic-ish suffix for temp filenames so concurrent test runs don't

@@ -726,6 +726,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         udp_search_queue: VecDeque::new(),
         download_source_searches: HashMap::new(),
         source_search_stream_cursor: HashMap::new(),
+        evicted_kad_sources: Vec::new(),
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
         known_met_save_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1420,6 +1421,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 crypto_verified_once,
                 peer_name,
                 client_software,
+                seen_ip,
             ) in records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
@@ -1449,6 +1451,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 record.crypto_verified_once = crypto_verified_once;
                 record.peer_name = peer_name;
                 record.client_software = client_software;
+                record.seen_ip = seen_ip;
             }
             info!(
                 "Loaded {} credit records from database",

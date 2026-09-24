@@ -670,12 +670,11 @@ pub(super) async fn known_clients_snapshot(
             let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
             let meta = ember.and_then(|eh| friend_meta.get(&eh));
 
-            let mut last_known_ip = if record.ident_ip != 0 {
-                let octets = record.ident_ip.to_be_bytes();
-                Some(std::net::Ipv4Addr::from(octets).to_string())
-            } else {
-                None
-            };
+            // The proven address first: a session address is only as good as
+            // the user hash the peer claimed on it.
+            let ip_u32 = if record.ident_ip != 0 { record.ident_ip } else { record.seen_ip };
+            let mut last_known_ip = (ip_u32 != 0)
+                .then(|| std::net::Ipv4Addr::from(ip_u32.to_be_bytes()).to_string());
             if last_known_ip.is_none() {
                 if let Some(m) = meta {
                     if !m.last_ip.is_empty() {

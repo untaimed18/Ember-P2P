@@ -345,6 +345,7 @@ const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['permanent_failure', m.transfers_failure_reason_permanent],
   ['transient_failure', m.transfers_failure_reason_transient],
   ['network_channel_unavailable', m.transfers_failure_reason_no_channel],
+  ['download_folder_unavailable', m.transfers_failure_reason_download_folder],
   ['ember_pin_corrupt', m.transfers_failure_reason_ember_pin_corrupt],
   ['aich_pin_corrupt', m.transfers_failure_reason_aich_pin_corrupt],
 ]);

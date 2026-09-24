@@ -1150,6 +1150,22 @@ impl TransferManager {
         }
     }
 
+    /// The origin the stored row for `ip:port` carries, which can be more than
+    /// the caller's own lookup found: a discovery seed or an earlier event may
+    /// have set it, and `update_source_detail` never clears one.
+    pub fn source_detail_origin(
+        &self,
+        transfer_id: &str,
+        ip: &str,
+        port: u16,
+    ) -> Option<crate::types::SourceOrigin> {
+        self.source_details
+            .get(transfer_id)?
+            .iter()
+            .find(|s| s.ip == ip && s.port == port)?
+            .origin
+    }
+
     /// Get all source details for a transfer.
     pub fn get_source_details(&self, transfer_id: &str) -> Vec<crate::types::SourceInfo> {
         self.source_details

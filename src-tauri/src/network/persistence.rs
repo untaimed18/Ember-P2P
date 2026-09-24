@@ -129,6 +129,7 @@ pub(super) async fn flush_credit_state(
                     r.crypto_verified_once,
                     r.peer_name.clone(),
                     r.client_software.clone(),
+                    r.seen_ip,
                 )
             })
             .collect();
@@ -166,7 +167,7 @@ pub(super) async fn flush_credit_state(
         let _ownership = ownership;
         let refs: Vec<crate::storage::database::CreditRowRef<'_>> = owned
             .iter()
-            .map(|(h, u, d, l, p, ip, st, eh, cv, name, software)| {
+            .map(|(h, u, d, l, p, ip, st, eh, cv, name, software, seen)| {
                 (
                     h,
                     *u,
@@ -179,6 +180,7 @@ pub(super) async fn flush_credit_state(
                     *cv,
                     name.as_str(),
                     software.as_str(),
+                    *seen,
                 )
             })
             .collect();

@@ -1910,24 +1910,8 @@ impl MultiSourceDownload {
         );
 
         let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let temp_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
-        };
-        let _completed_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
-        };
+        let (temp_dir, _completed_dir) =
+            super::transfer::prepare_download_dirs(&self.download_dir).await?;
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let file_size = self.file_size;
@@ -2008,7 +1992,10 @@ impl MultiSourceDownload {
                 Ok(())
             })
             .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
+            .map_err(|e| {
+                super::transfer::download_folder_error("creating the part file", &self.download_dir, e)
+            })?;
         }
 
         let _ = event_tx
@@ -2447,7 +2434,9 @@ impl MultiSourceDownload {
             Some(self.control.discarding_flag()),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
+        .map_err(|e| {
+            super::transfer::download_folder_error("opening the part file", &self.download_dir, e)
+        })?;
 
         // Spawn per-source download tasks
         let mut handles = Vec::new();
@@ -5027,6 +5016,9 @@ async fn download_parts_from_source(
                     es.peer_user_hash,
                     0,
                     es.peer_caps.is_high_id(),
+                    // `on_kad_callback_conn` registered this peer with the
+                    // route's origin before handing the stream over.
+                    None,
                 );
             }
         }
@@ -10201,6 +10193,7 @@ async fn download_parts_from_source(
                                 // anything.
                                 cm.note_client_identity(
                                     peer_user_hash,
+                                    Some(addr.ip()),
                                     &src_peer_name,
                                     &src_client_software,
                                 );

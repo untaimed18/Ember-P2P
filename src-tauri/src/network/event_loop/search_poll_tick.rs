@@ -31,6 +31,21 @@ pub(in crate::network) async fn on_search_poll_tick(
     pending_lowid_callback_queue: &mut VecDeque<([u8; 16], u32)>,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
 ) {
+    if !state.evicted_kad_sources.is_empty() {
+        let evicted = std::mem::take(&mut state.evicted_kad_sources);
+        let mut sm = source_manager.write().await;
+        for (fh, ip, tcp_port, udp_port, user_hash, connect_options) in evicted {
+            sm.register_source_full_opts(
+                fh,
+                ip,
+                tcp_port,
+                udp_port,
+                user_hash,
+                connect_options,
+                Some(crate::types::SourceOrigin::Kad),
+            );
+        }
+    }
     let mut udp_finished_request = None;
     if let Some(active) = state.active_search_request.as_mut() {
         if active.udp_pending {
@@ -1183,6 +1198,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 cb_src.tcp_port,
                                 fh,
                                 cb_src.source_user_hash,
+                                crate::types::SourceOrigin::Kad,
                             ).await;
                             info!(
                                 "Sent KAD CallbackReq to buddy {} at {} (attempt {}) for file {}",
@@ -1251,6 +1267,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 ds.tcp_port,
                                 fh,
                                 ds.source_user_hash,
+                                crate::types::SourceOrigin::Kad,
                             ).await;
                         }
                     } else {

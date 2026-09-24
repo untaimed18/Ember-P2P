@@ -190,6 +190,34 @@ fn remember_picked_download_root(path: &std::path::Path) {
     picked.push(key);
 }
 
+/// Prove a newly chosen download folder can hold a download before it is saved.
+///
+/// Creates the two subfolders every download needs and writes, syncs and removes
+/// a probe file in `Temp`, which is where a `.part` goes. The folder picker
+/// happily returns a folder the user cannot write (root-owned, read-only
+/// mount), and nothing else checks until a download starts, where the failure
+/// used to surface only as a retry loop with no mention of the folder.
+fn probe_download_folder_writable(folder: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    for sub in ["Temp", "Downloads"] {
+        std::fs::create_dir_all(folder.join(sub))?;
+    }
+    let probe = folder
+        .join("Temp")
+        .join(format!(".ember-write-probe-{:016x}", rand::random::<u64>()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            file.write_all(b"ember")?;
+            file.sync_all()
+        });
+    let removed = std::fs::remove_file(&probe);
+    written?;
+    removed
+}
+
 fn download_root_was_picked(path: &std::path::Path) -> bool {
     let key = normalized_path_components(path);
     picked_download_roots()
@@ -1456,6 +1484,17 @@ pub async fn update_settings(
                     "Choose the download folder with Browse before saving",
                 ));
             }
+            let folder = std::path::PathBuf::from(&settings.download_folder);
+            tokio::task::spawn_blocking(move || probe_download_folder_writable(&folder))
+                .await
+                .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+                .map_err(|e| {
+                    coded_ctx(
+                        "settings_download_folder_not_writable",
+                        "Ember cannot write to this download folder",
+                        e,
+                    )
+                })?;
             explicit_additions.push(settings.download_folder.clone());
         }
         // Same provenance rule for the media player, and the same narrowness:
@@ -1570,9 +1609,22 @@ pub async fn update_settings(
     // lock, preserving commit order with a concurrent settings save. Root
     // reconciliation below may wait for a scan that persists cursors under
     // this same lock, so it must run only after the durable transaction ends.
-    let runtime_update_deferred = match state.network_tx.try_send(NetworkCommand::UpdateSettings {
-        settings: settings.clone(),
-    }) {
+    //
+    // Waits briefly for room rather than giving up at once. By now the
+    // approved-root set already names the new download folder and no longer
+    // names the old one, so a dropped update left the loop starting every
+    // download in a folder it could no longer write to until a restart. A full
+    // queue is a busy loop, not a dead one, and a few seconds is normally enough.
+    let runtime_update_deferred = match state
+        .network_tx
+        .send_timeout(
+            NetworkCommand::UpdateSettings {
+                settings: settings.clone(),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
         Ok(()) => false,
         Err(e) => {
             tracing::warn!(
@@ -2986,6 +3038,25 @@ mod tests {
             err.contains("settings_download_folder_not_picked"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn the_download_folder_probe_leaves_only_the_folders_downloads_need() {
+        let base = std::env::temp_dir().join(format!("ember-probe-{:016x}", rand::random::<u64>()));
+        let folder = base.join("Ember");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        probe_download_folder_writable(&folder).expect("a writable folder passes");
+        assert!(folder.join("Downloads").is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(folder.join("Temp")).unwrap().collect();
+        assert!(leftovers.is_empty(), "the probe file must be removed: {leftovers:?}");
+
+        // A path that cannot be a folder at all: its parent is a file.
+        let file = base.join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(probe_download_folder_writable(&file.join("Ember")).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The default has to be absolute, or `AppSettings::default()` composes

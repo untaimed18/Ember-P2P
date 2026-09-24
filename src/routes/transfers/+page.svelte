@@ -637,7 +637,11 @@
         for (const s of expandedSources) {
           liveByKey.set(`${s.ip}:${s.port}`, s);
         }
-        const merged: SourceInfo[] = [...expandedSources];
+        const snapshotByKey = new Map(sources.map((s) => [`${s.ip}:${s.port}`, s] as const));
+        const merged: SourceInfo[] = expandedSources.map((s) => {
+          const snapshot = snapshotByKey.get(`${s.ip}:${s.port}`);
+          return snapshot ? mergeLiveSource(s, snapshot) : s;
+        });
         for (const s of sources) {
           const key = `${s.ip}:${s.port}`;
           if (!liveByKey.has(key)) merged.push(s);
@@ -661,6 +665,21 @@
 
   // Consecutive empty API snapshots are tracked via emptySourceSnapshotStreak
   // (declared with the source-drawer state above).
+
+  /// A row built from push events is fresher than the snapshot, but it only
+  /// knows what those events carried. Let it win on state and fill its gaps from
+  /// the snapshot: the origin in particular is recorded once, often before the
+  /// peer's first event, and letting the live row win outright kept any row
+  /// that missed it on a dash through every later refresh.
+  function mergeLiveSource(live: SourceInfo, snapshot: SourceInfo): SourceInfo {
+    return {
+      ...live,
+      origin: live.origin ?? snapshot.origin,
+      country_code: live.country_code ?? snapshot.country_code,
+      peer_name: live.peer_name || snapshot.peer_name,
+      client_software: live.client_software || snapshot.client_software,
+    };
+  }
 
   async function refreshExpandedSourceDetails(transferId: string, authoritativeEmpty = false) {
     // Do NOT bump sourceDetailRequestId — that would invalidate the open
@@ -699,7 +718,10 @@
           return;
         }
         emptySourceSnapshotStreak = 0;
-        expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
+        expandedSources = sources.map((s) => {
+          const live = liveByKey.get(`${s.ip}:${s.port}`);
+          return live ? mergeLiveSource(live, s) : s;
+        });
       }
       if (expandedTransferId === transferId) {
         loadingSources = false;

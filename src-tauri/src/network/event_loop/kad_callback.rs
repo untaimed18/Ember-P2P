@@ -48,6 +48,21 @@ pub(in crate::network) async fn on_kad_callback_conn(
                 let expected_aich_master =
                     expected_aich_bytes(pd.expected_aich.as_deref());
                 info!("Starting callback download {tid} from {source_addr}");
+                // Record the route's origin now: a buddy-callback peer has no
+                // source row yet, and the single-source worker registers its
+                // ports without one.
+                if parts.origin.is_some() {
+                    source_manager.write().await.register_inbound_callback_ports(
+                        parts.file_hash,
+                        parts.peer_ip,
+                        parts.peer_port,
+                        parts.peer_hello_port,
+                        parts.peer_user_hash,
+                        0,
+                        parts.peer_caps.is_high_id(),
+                        parts.origin,
+                    );
+                }
                 let download = Ed2kDownload {
                     transfer_id: pd.transfer_id.clone(),
                     file_hash: parts.file_hash,
@@ -267,6 +282,7 @@ pub(in crate::network) async fn on_kad_callback_conn(
                     cb_peer_user_hash,
                     0,
                     cb_peer_caps.is_high_id(),
+                    parts.origin,
                 );
             }
             let matching_tids = {
