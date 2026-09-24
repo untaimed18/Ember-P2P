@@ -860,9 +860,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(
             settings.max_concurrent_uploads as usize,
         )),
-        upload_max_conn_per_five: Arc::new(std::sync::atomic::AtomicUsize::new(
-            settings.max_connections_per_five_secs as usize,
-        )),
         obfuscation_enabled_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.obfuscation_enabled,
         )),
@@ -1363,6 +1360,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // before any download tasks can spawn, so the raised per-file source
     // budget stays globally bounded.
     ed2k::multi_source::set_global_conn_limit(settings.max_connections as usize);
+    ed2k::multi_source::set_new_connections_per_five(
+        settings.max_connections_per_five_secs as usize,
+    );
 
     // Install the global "preview priority for all downloads" preference so the
     // chunk selector front-loads first/last parts from the very first task.
@@ -1609,7 +1609,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_nickname = shared_nickname.clone();
         let ul_app = app_handle.clone();
         let ul_max = state.upload_max_slots.clone();
-        let ul_max_conn_per_five = state.upload_max_conn_per_five.clone();
         let ul_sm = source_manager.clone();
         let ul_comments = state.comment_manager.clone();
         let ul_cm = credit_manager.clone();
@@ -1665,7 +1664,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_bw,
                 ul_tx,
                 ul_max,
-                ul_max_conn_per_five,
                 ul_sm,
                 ul_comments,
                 ul_cm,

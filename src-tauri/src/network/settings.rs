@@ -309,9 +309,8 @@ pub(super) fn apply_network_settings(
         new_settings.max_concurrent_uploads as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
-    state.upload_max_conn_per_five.store(
+    ed2k::multi_source::set_new_connections_per_five(
         new_settings.max_connections_per_five_secs as usize,
-        std::sync::atomic::Ordering::Relaxed,
     );
     ed2k::multi_source::set_global_conn_limit(new_settings.max_connections as usize);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);

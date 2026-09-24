@@ -1450,12 +1450,14 @@ pub struct AppSettings {
     /// `ed2k::multi_source::listener_reserve`.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
-    /// Most new TCP connections the upload listener will accept in any
-    /// five-second window (eMule: `MaxConnectionsPerFiveSeconds`, default 20
-    /// via `MAXCONPER5SEC`). `0` disables the gate.
+    /// Most new client connections one five-second window may count before we
+    /// stop opening more (eMule: `MaxConnectionsPerFiveSeconds`, default 20 via
+    /// `MAXCONPER5SEC`). `0` disables the gate.
     ///
     /// Bounds the *rate* of socket creation rather than the count, which is
     /// what keeps consumer routers and NAT tables from choking on a burst.
+    /// Accepted connections count toward it but are never refused by it, as in
+    /// eMule: by the time we could refuse one it has already crossed the router.
     #[serde(default = "default_max_connections_per_five_secs")]
     pub max_connections_per_five_secs: u32,
     /// Add new downloads in paused state (eMule: addnewfilespaused)

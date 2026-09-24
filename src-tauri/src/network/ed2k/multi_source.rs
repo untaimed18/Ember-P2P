@@ -716,10 +716,76 @@ const OUTBOUND_DIAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 static OUTBOUND_DIAL_GATE: std::sync::OnceLock<tokio::sync::Mutex<std::time::Instant>> =
     std::sync::OnceLock::new();
 
-/// Block until this task may open a new outbound connection, spacing dials by
-/// `OUTBOUND_DIAL_MIN_INTERVAL`. The gate lock is never held across the sleep
-/// — each caller reserves its slot, releases the lock, then waits.
+/// eMule's `MaxConperFive`, the "New Connections / 5s" setting: how many new
+/// client connections, in either direction, one five-second window may count
+/// before we stop opening more (`CListenSocket::TooManySockets`, with the
+/// window reset every five seconds by `CListenSocket::Process`,
+/// `UploadQueue.cpp:1085`). `0` turns the limit off.
+///
+/// Only our own dials wait on it. eMule's accept path passes `bIgnoreInterval`
+/// (`ListenSocket.cpp:2524`) and merely counts the connection: one that has
+/// reached us has already crossed the router, so refusing it protects nothing
+/// and turns away a peer that wanted our files. eMule also shrinks the budget
+/// during connection spikes (`GetMaxConperFiveModifier`); that only ever makes
+/// it stricter, and is not reproduced here.
+static NEW_CONNS_PER_FIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20);
+const NEW_CONN_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// When the current window opened, and how many connections it has counted.
+static NEW_CONN_WINDOW_STATE: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// Apply the "New Connections / 5s" setting. Safe to call at start and on
+/// every settings change.
+pub fn set_new_connections_per_five(budget: usize) {
+    NEW_CONNS_PER_FIVE.store(budget, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count a connection the upload listener accepted toward the window.
+pub fn note_inbound_connection() {
+    let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = admit_new_connection(&mut window, budget, std::time::Instant::now(), false);
+}
+
+/// Count a new connection in the window, or, for an outbound one that finds
+/// the window full, say how long until it reopens. Inbound connections are
+/// always counted and never refused.
+fn admit_new_connection(
+    window: &mut Option<(std::time::Instant, usize)>,
+    budget: usize,
+    now: std::time::Instant,
+    outbound: bool,
+) -> Option<std::time::Duration> {
+    let (started, count) = match *window {
+        Some((started, count)) if now.saturating_duration_since(started) < NEW_CONN_WINDOW => {
+            (started, count)
+        }
+        _ => (now, 0),
+    };
+    if outbound && budget > 0 && count >= budget {
+        *window = Some((started, count));
+        return Some(NEW_CONN_WINDOW.saturating_sub(now.saturating_duration_since(started)));
+    }
+    *window = Some((started, count + 1));
+    None
+}
+
+/// Block until this task may open a new outbound connection: first until the
+/// "New Connections / 5s" window has room, then spacing dials by
+/// `OUTBOUND_DIAL_MIN_INTERVAL`. Neither lock is held across a sleep — each
+/// caller reserves its place, releases the lock, then waits.
 async fn throttle_outbound_dial() {
+    loop {
+        let wait = {
+            let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+            let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+            admit_new_connection(&mut window, budget, std::time::Instant::now(), true)
+        };
+        match wait {
+            None => break,
+            Some(wait) => tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await,
+        }
+    }
     let gate = OUTBOUND_DIAL_GATE.get_or_init(|| {
         tokio::sync::Mutex::new(std::time::Instant::now() - OUTBOUND_DIAL_MIN_INTERVAL)
     });
@@ -12298,5 +12364,46 @@ mod browse_response_tests {
         let parsed = parse_browse_response(&legacy);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].3, None);
+    }
+}
+
+#[cfg(test)]
+mod new_connection_window_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_dials_wait_once_the_window_is_full() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            assert_eq!(admit_new_connection(&mut window, 3, t0, true), None);
+        }
+        let wait = admit_new_connection(&mut window, 3, t0 + std::time::Duration::from_secs(2), true);
+        assert_eq!(wait, Some(std::time::Duration::from_secs(3)));
+        // A new window opens after five seconds.
+        assert_eq!(admit_new_connection(&mut window, 3, t0 + NEW_CONN_WINDOW, true), None);
+    }
+
+    /// eMule counts accepts but never refuses them for rate: the peer has
+    /// already crossed the router. Refusing them is what could keep peers
+    /// from joining the upload queue under load.
+    #[test]
+    fn inbound_connections_are_counted_but_never_refused() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(admit_new_connection(&mut window, 3, t0, false), None);
+        }
+        // They still fill the window our own dials wait on.
+        assert!(admit_new_connection(&mut window, 3, t0, true).is_some());
+    }
+
+    #[test]
+    fn a_zero_budget_turns_the_limit_off() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(admit_new_connection(&mut window, 0, t0, true), None);
+        }
     }
 }

@@ -620,13 +620,6 @@ pub(super) struct NetworkState {
     pub(super) aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
     /// Shared max upload slots (updated on settings change, read by upload handler)
     pub(super) upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections_per_five_secs`, read by the upload
-    /// listener's accept path. Shared rather than captured by value so the
-    /// setting takes effect without a restart, like `upload_max_slots` beside
-    /// it. The connection *ceiling* needs no equivalent here: it lives in the
-    /// machine-wide budget both directions draw on
-    /// (`ed2k::multi_source::set_global_conn_limit`).
-    pub(super) upload_max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     /// Shared obfuscation flag mirroring `state.obfuscation_enabled`. The
     /// upload listener captures this `Arc` at spawn time and reads it on
     /// every Hello / EmuleInfo build, so toggling obfuscation in

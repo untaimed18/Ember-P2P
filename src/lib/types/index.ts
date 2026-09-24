@@ -895,8 +895,9 @@ export interface AppSettings {
   /** eMule `maxconnections`. One machine-wide budget shared by the upload
    *  listener and the outbound download sources. */
   max_connections: number;
-  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast the upload listener
-   *  opens new sockets; 0 disables the gate. */
+  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast we open new
+   *  connections; accepted ones count toward it but are never refused by it.
+   *  0 disables the gate. */
   max_connections_per_five_secs: number;
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;

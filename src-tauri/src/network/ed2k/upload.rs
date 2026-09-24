@@ -2347,12 +2347,6 @@ struct UploadHandler {
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections_per_five_secs`, live-updated. See
-    /// [`UploadHandler::accept_budget_allows`].
-    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
-    /// Rolling accept-rate window: when it started, and how many connections
-    /// have been accepted inside it.
-    accept_window: parking_lot::Mutex<(std::time::Instant, usize)>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
@@ -3691,7 +3685,6 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -3805,8 +3798,6 @@ pub async fn start_upload_server(
         advertise_udp_port,
         active_count,
         max_concurrent_uploads,
-        max_conn_per_five,
-        accept_window: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -4014,21 +4005,6 @@ pub async fn start_upload_server(
                             continue;
                         }
 
-                        // Accept-rate gate, ahead of the capacity check because
-                        // it is about how fast we open sockets rather than how
-                        // many we hold. The configured server is exempt: its
-                        // HighID port-test must never lose to a burst from
-                        // ordinary peers, which is the same carve-out eMule
-                        // makes for `serverconnect->IsConnecting()`
-                        // (`ListenSocket.cpp:2013`).
-                        if !is_server_port_test_ip && !server.accept_budget_allows() {
-                            debug!(
-                                "Rejecting connection from {peer_addr}: accept rate budget spent for this window"
-                            );
-                            drop(stream);
-                            continue;
-                        }
-
                         // Take one unit of the machine-wide budget, which the
                         // download side draws on too. The port-test headroom
                         // is the one thing allowed above the configured
@@ -4070,6 +4046,11 @@ pub async fn start_upload_server(
                             server.ip_connection_counts.clone(),
                             peer_addr.ip(),
                         );
+                        // Counted toward "New Connections / 5s" but never
+                        // refused by it: the peer has already crossed the
+                        // router, so turning it away protects nothing. See
+                        // `multi_source::NEW_CONNS_PER_FIVE`.
+                        super::multi_source::note_inbound_connection();
                         let _ = stream.set_nodelay(true);
                         // Cap the kernel TCP send buffer so our sender-side
                         // `uploaded` counter (which advances when bytes are
@@ -5006,38 +4987,6 @@ impl UploadHandler {
     /// per-slot rate is compared against the target: if existing slots are
     /// already starved (median < target * 0.5), we avoid opening more even
     /// if the formula would allow it.
-    /// eMule's `MaxConperFive` gate: at most N newly accepted connections in
-    /// any five-second window (`CListenSocket::TooManySockets`,
-    /// `ListenSocket.cpp:2182`, default `MAXCONPER5SEC` = 20).
-    ///
-    /// This bounds the rate at which we open sockets, not how many we hold —
-    /// the point is to stay friendly to NAT tables and to routers that choke on
-    /// connection bursts, which is why eMule ships it as a user-visible
-    /// preference. Returns false when the budget for the current window is
-    /// spent; the caller drops the connection and the peer retries, which is
-    /// the same outcome as eMule's `StopListening`.
-    ///
-    /// `0` disables the gate, for a user who would rather not have one.
-    fn accept_budget_allows(&self) -> bool {
-        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-        let budget = self
-            .max_conn_per_five
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if budget == 0 {
-            return true;
-        }
-        let now = std::time::Instant::now();
-        let mut window = self.accept_window.lock();
-        if now.duration_since(window.0) >= WINDOW {
-            *window = (now, 0);
-        }
-        if window.1 >= budget {
-            return false;
-        }
-        window.1 += 1;
-        true
-    }
-
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let max_configured = self
