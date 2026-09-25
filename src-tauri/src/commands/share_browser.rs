@@ -74,7 +74,13 @@ pub enum ShareBrowserStatus {
     /// The folder is shared, but an allowlist limits which files are offered.
     Partial,
     Already,
+    /// Inside a folder shared whole, so shared along with it: Ember shares a
+    /// folder and everything under it.
+    Inherited,
+    /// Inside a partly shared folder, and not among what it offers.
     Overlap,
+    /// Holds a folder that is already shared; shares cannot overlap.
+    ContainsShared,
     Blocked,
 }
 
@@ -374,11 +380,16 @@ fn share_status_for(
             };
         }
         if shared_paths_overlap(path, existing) {
-            // A folder offered whole through its share's allowlist.
-            if allowlist_contains(allowlists, existing, path) == Some(true) {
-                return ShareBrowserStatus::Already;
+            let existing_display = display_fs_path(existing);
+            if !crate::security::path_matches_dir(&display, &existing_display) {
+                return ShareBrowserStatus::ContainsShared;
             }
-            return ShareBrowserStatus::Overlap;
+            return match allowlist_contains(allowlists, existing, path) {
+                // A folder offered whole through its share's allowlist.
+                Some(true) => ShareBrowserStatus::Already,
+                Some(false) => ShareBrowserStatus::Overlap,
+                None => ShareBrowserStatus::Inherited,
+            };
         }
     }
     ShareBrowserStatus::Shareable
@@ -1350,7 +1361,7 @@ pub async fn share_browser_selection(
                 "Cannot share this location",
             ));
         }
-        if status == ShareBrowserStatus::Already {
+        if matches!(status, ShareBrowserStatus::Already | ShareBrowserStatus::Inherited) {
             if let Some(folder) = containing_share(path, &shared_folders) {
                 remember_once(&mut already_noted, display_fs_path(folder));
             } else {
@@ -1819,6 +1830,29 @@ mod tests {
             &HashSet::new(),
         );
         assert_eq!(file_status, ShareBrowserStatus::Already);
+    }
+
+    #[test]
+    fn a_subfolder_of_a_whole_share_reads_as_shared_with_it() {
+        let (parent, share, sub, data) = if cfg!(windows) {
+            (r"C:\Media", r"C:\Media\Music", r"C:\Media\Music\Album", r"D:\Ember")
+        } else {
+            ("/media", "/media/music", "/media/music/album", "/ember")
+        };
+        let shared = [PathBuf::from(share)];
+        let status = |path: &str| {
+            share_status_for(
+                Path::new(path),
+                ShareBrowserKind::Folder,
+                &shared,
+                Path::new(data),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(status(share), ShareBrowserStatus::Already);
+        assert_eq!(status(sub), ShareBrowserStatus::Inherited);
+        assert_eq!(status(parent), ShareBrowserStatus::ContainsShared);
     }
 
     #[test]

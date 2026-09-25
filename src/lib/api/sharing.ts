@@ -35,7 +35,17 @@ export type ShareBrowserKind =
   | 'folder'
   | 'file';
 
-export type ShareBrowserStatus = 'shareable' | 'partial' | 'already' | 'overlap' | 'blocked';
+/** `inherited`: inside a folder shared whole, so shared with it.
+ *  `overlap`: inside a partly shared folder and not among what it offers.
+ *  `contains_shared`: holds a folder that is already shared. */
+export type ShareBrowserStatus =
+  | 'shareable'
+  | 'partial'
+  | 'already'
+  | 'inherited'
+  | 'overlap'
+  | 'contains_shared'
+  | 'blocked';
 
 export interface ShareBrowserEntry {
   id: number;

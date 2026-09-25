@@ -127,6 +127,7 @@
     if (opts?.recordHistory !== false && currentEntry && movedFolder) {
       history = [...history, currentEntry.id];
     }
+    if (movedFolder) includeSubfolders = true;
     // A new folder starts at its first item. Keeping the old offset would
     // drop the user into the middle of a list they have not seen.
     if (movedFolder && listEl) listEl.scrollTop = 0;
@@ -244,6 +245,12 @@
     return entry.share_status === 'shareable' || entry.share_status === 'partial';
   }
 
+  /** Offered to peers: a share itself, or a folder inside one shared whole,
+   *  which Ember shares along with it. */
+  function isShared(entry: ShareBrowserEntry): boolean {
+    return entry.share_status === 'already' || entry.share_status === 'inherited';
+  }
+
   function toggleSelect(entry: ShareBrowserEntry, e?: Event) {
     e?.stopPropagation();
     if (!canCheck(entry) || !entry.path) return;
@@ -262,15 +269,44 @@
   let selectedFolderCount = $derived(selectedEntries.length - selectedFileCount);
   let currentShareable = $derived(currentEntry?.share_status === 'shareable');
   let currentPartial = $derived(currentEntry?.share_status === 'partial');
+
+  /**
+   * Sharing the open folder takes its subfolders too, as every Ember share
+   * does. Unticked, it shares the files directly in it instead, through the
+   * folder's allowlist the way a selection of files is shared, which is the
+   * nearest thing to eMule's one-folder share. Offered only when the whole
+   * listing is loaded, since the files have to be named one by one.
+   */
+  let includeSubfolders = $state(true);
+  let currentSubfolders = $derived(children.filter((entry) => entry.kind !== 'file').length);
+  let currentOwnFiles = $derived(children.filter((entry) => entry.kind === 'file' && canCheck(entry)));
+  /** `MAX_SHARE_SELECTION` in `share_browser.rs`: one selection names at most this many. */
+  const MAX_SHARE_SELECTION = 500;
+  let offerSubfolderChoice = $derived(
+    selectedCount === 0
+      && currentShareable
+      && currentSubfolders > 0
+      && currentOwnFiles.length <= MAX_SHARE_SELECTION
+      && !truncated
+      && !loading,
+  );
+  let ownFilesOnly = $derived(offerSubfolderChoice && !includeSubfolders);
+
   let shareIds = $derived.by(() => {
     if (selectedCount > 0) {
       return [...selectedPaths].map((path) => idByPath.get(path)).filter((id): id is number => id != null);
     }
+    if (ownFilesOnly) return currentOwnFiles.map((entry) => entry.id);
     return currentEntry && (currentShareable || currentPartial) ? [currentEntry.id] : [];
   });
   let shareDisabled = $derived(sharing || loading || shareIds.length === 0);
   let shareLabel = $derived.by(() => {
     if (sharing) return m.library_explorer_sharing();
+    if (ownFilesOnly) {
+      return currentOwnFiles.length === 1
+        ? m.library_explorer_share_file_one()
+        : m.library_explorer_share_file_other({ count: currentOwnFiles.length });
+    }
     if (selectedCount === 0) {
       if (currentPartial) return m.library_explorer_share_rest();
       if (currentShareable) return m.library_explorer_share_folder();
@@ -288,9 +324,15 @@
     return m.library_explorer_share_other({ count: selectedCount });
   });
   let shareOutcome = $derived.by(() => {
+    if (ownFilesOnly) {
+      return currentOwnFiles.length === 0
+        ? m.library_explorer_outcome_no_own_files()
+        : m.library_explorer_outcome_own_files({ count: currentOwnFiles.length });
+    }
     if (selectedCount === 0) {
       if (currentPartial) return m.library_explorer_outcome_rest();
       if (currentShareable) return m.library_explorer_outcome_folder();
+      if (currentEntry?.share_status === 'inherited') return m.library_explorer_outcome_inherited();
       return m.library_explorer_choose();
     }
     if (selectedFileCount > 0 && selectedFolderCount === 0) return m.library_explorer_outcome_files();
@@ -399,7 +441,9 @@
         if (count === 1) return m.library_explorer_partial_one();
         return m.library_explorer_partial_other({ count });
       }
+      case 'inherited': return m.library_explorer_inherited();
       case 'overlap': return m.library_explorer_overlap();
+      case 'contains_shared': return m.library_explorer_contains_shared();
       case 'blocked':
         // Drives are listed to be opened, never shared — every one of them
         // carrying a warning badge would be noise. Their checkbox is already
@@ -476,7 +520,7 @@
               class="tree-row"
               bind:this={treeRowEls[row.entry.id]}
               class:active={currentEntry?.id === row.entry.id}
-              class:shared={row.entry.share_status === 'already'}
+              class:shared={isShared(row.entry)}
               style="padding-left: {8 + row.depth * 14}px"
               role="treeitem"
               aria-level={row.depth + 1}
@@ -537,10 +581,10 @@
             </div>
             {#each children as entry (entry.id)}
               {@const badge = statusLabel(entry)}
-              <div class="list-row" class:shared={entry.share_status === 'already'} class:file={entry.kind === 'file'}>
+              <div class="list-row" class:shared={isShared(entry)} class:file={entry.kind === 'file'}>
                 <input
                   type="checkbox"
-                  checked={selectedPaths.has(entry.path) || entry.share_status === 'already'}
+                  checked={selectedPaths.has(entry.path) || isShared(entry)}
                   disabled={!canCheck(entry) || sharing}
                   onchange={() => toggleSelect(entry)}
                   aria-label={entryLabel(entry)}
@@ -566,9 +610,11 @@
                 {#if badge}
                   <span
                     class="badge"
-                    class:already={entry.share_status === 'already'}
+                    class:already={isShared(entry)}
                     class:partial={entry.share_status === 'partial'}
-                    class:warn={entry.share_status === 'overlap' || entry.share_status === 'blocked'}
+                    class:warn={entry.share_status === 'overlap'
+                      || entry.share_status === 'contains_shared'
+                      || entry.share_status === 'blocked'}
                   >{badge}</span>
                 {:else if entry.kind === 'file' && entry.size != null}
                   <span class="list-size">{formatBytes(entry.size)}</span>
@@ -585,6 +631,12 @@
       </div>
 
       <div class="modal-footer">
+        {#if offerSubfolderChoice}
+          <label class="subfolder-choice">
+            <input type="checkbox" bind:checked={includeSubfolders} disabled={sharing} />
+            <span>{m.library_explorer_include_subfolders({ count: currentSubfolders })}</span>
+          </label>
+        {/if}
         <p class="selection-meta">{shareOutcome}</p>
         <div class="footer-actions">
           <button type="button" class="ghost footer-fallback" onclick={useSystemDialog} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
@@ -898,5 +950,13 @@
     font-size: 12px;
     line-height: 1.4;
     color: var(--text-secondary);
+  }
+  .subfolder-choice {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--text-primary);
+    cursor: pointer;
   }
 </style>

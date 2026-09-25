@@ -4,6 +4,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { formatSize } from '$lib/utils';
+  import ToggleSwitch from './ToggleSwitch.svelte';
   import {
     detectEmuleInstalls,
     discardEmuleImport,
@@ -288,19 +289,72 @@
   });
 </script>
 
-<div class="emule-import">
+<div class="emule-import" class:settings={mode === 'settings'}>
   {#if mode === 'settings' && pending}
     <div class="notice" role="status">
-      <strong>{staged ? m.emule_import_staged_title() : m.emule_import_pending()}</strong>
-      <span>{m.emule_import_staged_message()}</span>
-      <div class="actions">
-        <button type="button" class="primary" onclick={() => onrestart?.()}>{m.settings_restart_now()}</button>
-        <button type="button" class="danger" onclick={discard}>{m.emule_import_discard()}</button>
+      <span class="notice-title">{staged ? m.emule_import_staged_title() : m.emule_import_pending()}</span>
+      <span class="hint">{m.emule_import_staged_message()}</span>
+      <div class="action-row">
+        <button type="button" class="action-btn primary" onclick={() => onrestart?.()}>{m.settings_restart_now()}</button>
+        <button type="button" class="action-btn danger" onclick={discard}>{m.emule_import_discard()}</button>
       </div>
     </div>
   {/if}
 
-  {#if detecting}
+  {#if mode === 'settings'}
+    <!-- The same read-only path and Browse pair as the download folder: the
+         folder comes from the picker or detection, never from typing. -->
+    <div class="group">
+      <h4 class="subsection-title">{m.emule_import_group_source()}</h4>
+      <div class="row">
+        <span class="row-label">{m.emule_import_folder_label()}</span>
+        <div class="folder-input">
+          <input
+            readonly
+            value={preview?.source.path ?? ''}
+            placeholder={detecting ? m.emule_import_detecting() : ''}
+            aria-label={m.emule_import_folder_label()}
+          />
+          <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
+            {m.settings_browse()}
+          </button>
+        </div>
+        {#if reading}
+          <span class="hint">{m.emule_import_reading()}</span>
+        {:else if preview}
+          <span class="hint">
+            {m.emule_import_found({ client: preview.source.client === 'amule' ? 'aMule' : 'eMule' })}
+          </span>
+        {:else if !detecting && installs.length === 0}
+          <span class="hint">{m.emule_import_none_found()}</span>
+        {/if}
+      </div>
+      {#if preview && emuleRunning}
+        {@render runningNotice(preview)}
+      {/if}
+      {#if installs.length > 1}
+        <ul class="item-list">
+          {#each installs as install (install.id)}
+            <li>
+              <label>
+                <input
+                  type="radio"
+                  name="emule-source"
+                  checked={preview?.source.id === install.id}
+                  onchange={() => load(install)}
+                  disabled={reading || staging}
+                />
+                <span class="item-text">
+                  <span class="item-name">{install.client === 'amule' ? 'aMule' : 'eMule'}</span>
+                  <span class="item-meta mono">{install.path}</span>
+                </span>
+              </label>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {:else if detecting}
     <p class="hint">{m.emule_import_detecting()}</p>
   {:else}
     {#if installs.length === 0}
@@ -329,175 +383,218 @@
     </div>
   {/if}
 
-  {#if reading && !preview}
+  {#if mode === 'wizard' && reading && !preview}
     <p class="hint">{m.emule_import_reading()}</p>
   {/if}
   {#if error}
     <p class="error" role="alert">{error}</p>
   {/if}
 
+  {#snippet runningNotice(preview: EmulePreview)}
+    <div class="notice running" role="alert">
+      <div class="notice-copy">
+        <span class="notice-title">{m.emule_import_running_title()}</span>
+        <span class="hint">{m.emule_import_running_desc()}</span>
+      </div>
+      <button type="button" class="action-btn" onclick={() => load(preview.source)} disabled={reading || staging}>
+        {reading ? m.emule_import_reading() : m.emule_import_check_again()}
+      </button>
+    </div>
+  {/snippet}
+
+  <!-- Laid out as the Settings page lays out its own sections: named groups,
+       a switch per thing to bring over, and a bordered row per folder or
+       download to pick from. -->
   {#snippet checklist(preview: EmulePreview)}
-    <div class="groups">
-      {#if mode === 'settings' && (preview.nickname || preview.tcp_port || preview.incoming_dir)}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantPreferences} />
-          <span>
-            <strong>{m.emule_import_preferences_title()}</strong>
-            <small>
-              {m.emule_import_preferences_desc({
-                nickname: preview.nickname ?? '—',
-                tcp: preview.tcp_port ?? '—',
-                udp: preview.udp_port ?? '—',
-              })}
-            </small>
-          </span>
-        </label>
-        {#if preview.incoming_dir}
-          <label class="group">
-            <input type="checkbox" bind:checked={wantIncoming} />
-            <span>
-              <strong>{m.emule_import_incoming()}</strong>
-              <small class="mono">{preview.incoming_dir}</small>
-            </span>
-          </label>
-        {/if}
-      {/if}
-
-      {#if preview.known_files > 0 || preview.known2_sets > 0}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantLibrary} />
-          <span>
-            <strong>{m.emule_import_library_title()}</strong>
-            <small>
-              {m.emule_import_library_desc({
-                files: preview.known_files,
-                sets: preview.known2_sets,
-                size: formatSize(preview.known2_bytes),
-              })}
-            </small>
-            {#if libraryShort}
-              <small class="warn">{m.emule_import_library_no_space({ size: formatSize(preview.free_data_dir ?? 0) })}</small>
-            {/if}
-          </span>
-        </label>
-      {/if}
-
-      {#if preview.shared_folders.length > 0}
-        <fieldset class="group-list">
-          <legend>{m.emule_import_folders_title()}</legend>
-          {#each preview.shared_folders as folder, i (i)}
-            <label class="item" class:disabled={!importableFolder(folder.status)}>
-              {#if folder.status === 'covered'}
-                <input type="checkbox" checked={includedWithParent(i)} disabled />
-              {:else}
-                <input
-                  type="checkbox"
-                  bind:checked={folderChoice[i]}
-                  disabled={!importableFolder(folder.status)}
-                />
-              {/if}
-              <span>
-                <span class="mono folder-path">{folder.path}</span>
-                {#if folderNote(folder.status)}
-                  <small class:warn={folder.status === 'drive_root'}>{folderNote(folder.status)}</small>
-                {/if}
-                {#if folder.newly_shared_subfolders > 0}
-                  <small class="warn">
-                    {folder.subfolder_count_capped
-                      ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
-                      : m.emule_import_folder_subfolders({ count: folder.newly_shared_subfolders })}
-                  </small>
-                {/if}
+    {#if preview.known_files > 0 || preview.known2_sets > 0 || preview.shared_folders.length > 0}
+      <div class="group">
+        <h4 class="subsection-title">{m.emule_import_stat_files()}</h4>
+        {#if preview.known_files > 0 || preview.known2_sets > 0}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_library_title()}</span>
+              <span class="hint">
+                {m.emule_import_library_desc({
+                  files: preview.known_files,
+                  sets: preview.known2_sets,
+                  size: formatSize(preview.known2_bytes),
+                })}
               </span>
-            </label>
-          {/each}
-        </fieldset>
-      {/if}
+              {#if libraryShort}
+                <span class="hint warn">{m.emule_import_library_no_space({ size: formatSize(preview.free_data_dir ?? 0) })}</span>
+              {/if}
+            </div>
+            <ToggleSwitch bind:checked={wantLibrary} ariaLabel={m.emule_import_library_title()} />
+          </div>
+        {/if}
+        {#if preview.shared_folders.length > 0}
+          <div class="row">
+            <span class="row-label">{m.emule_import_folders_title()}</span>
+            <ul class="item-list">
+              {#each preview.shared_folders as folder, i (i)}
+                <li class:disabled={!importableFolder(folder.status)}>
+                  <label>
+                    {#if folder.status === 'covered'}
+                      <input type="checkbox" checked={includedWithParent(i)} disabled />
+                    {:else}
+                      <input
+                        type="checkbox"
+                        bind:checked={folderChoice[i]}
+                        disabled={!importableFolder(folder.status)}
+                      />
+                    {/if}
+                    <span class="item-text">
+                      <span class="item-name mono">{folder.path}</span>
+                      {#if folderNote(folder.status)}
+                        <span class="item-meta" class:warn={folder.status === 'drive_root'}>{folderNote(folder.status)}</span>
+                      {/if}
+                      {#if folder.newly_shared_subfolders > 0}
+                        <span class="item-meta warn">
+                          {folder.subfolder_count_capped
+                            ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
+                            : m.emule_import_folder_subfolders({ count: folder.newly_shared_subfolders })}
+                        </span>
+                      {/if}
+                    </span>
+                  </label>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
-      <label class="group" class:disabled={!preview.identity}>
-        <input type="checkbox" bind:checked={wantIdentity} disabled={!preview.identity} />
-        <span>
-          <strong>{m.emule_import_identity_title()}</strong>
-          <small>{preview.identity ? m.emule_import_identity_desc() : m.emule_import_identity_missing()}</small>
-        </span>
-      </label>
-
+    <div class="group">
+      <h4 class="subsection-title">{m.emule_import_group_identity()}</h4>
+      <div class="toggle-row" class:disabled={!preview.identity}>
+        <div class="toggle-info">
+          <span class="toggle-title">{m.emule_import_identity_title()}</span>
+          <span class="hint">{preview.identity ? m.emule_import_identity_desc() : m.emule_import_identity_missing()}</span>
+          {#if wantIdentity && preview.identity}
+            <span class="hint warn">{m.emule_import_same_identity_warning()}</span>
+          {/if}
+        </div>
+        <ToggleSwitch bind:checked={wantIdentity} disabled={!preview.identity} ariaLabel={m.emule_import_identity_title()} />
+      </div>
       {#if preview.credits > 0}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantCredits} />
-          <span>
-            <strong>{m.emule_import_credits_title()}</strong>
-            <small>
+        <div class="toggle-row">
+          <div class="toggle-info">
+            <span class="toggle-title">{m.emule_import_credits_title()}</span>
+            <span class="hint">
               {m.emule_import_credits_desc({ count: preview.credits })}
               {#if preview.expired_credits > 0}
                 {m.emule_import_credits_expired({ count: preview.expired_credits })}
               {/if}
-            </small>
-          </span>
-        </label>
-      {/if}
-
-      {#if preview.downloads.length > 0}
-        <fieldset class="group-list">
-          <legend>{m.emule_import_downloads_title()}</legend>
-          <p class="hint">{m.emule_import_downloads_note()}</p>
-          {#each preview.downloads as download, i (i)}
-            <label class="item" class:disabled={download.status !== 'ready'}>
-              <input
-                type="checkbox"
-                bind:checked={downloadChoice[i]}
-                disabled={download.status !== 'ready'}
-              />
-              <span>
-                <span>{download.name}</span>
-                <small>
-                  {m.emule_import_download_done({ done: formatSize(download.done), size: formatSize(download.size) })}
-                  {#if downloadNote(download.status)}· {downloadNote(download.status)}
-                  {:else if copied(download)}· {m.emule_import_download_copied()}{/if}
-                </small>
-              </span>
-            </label>
-          {/each}
-          {#if copyBytes > 0}
-            <small class:warn={downloadFree !== null && copyBytes > downloadFree}>
-              {downloadFree !== null && copyBytes > downloadFree
-                ? m.emule_import_downloads_no_space({ size: formatSize(copyBytes), free: formatSize(downloadFree) })
-                : m.emule_import_downloads_copy_total({ size: formatSize(copyBytes) })}
-            </small>
-          {/if}
-        </fieldset>
-      {/if}
-
-      {#if preview.servers > 0}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantServers} />
-          <span><strong>{m.emule_import_servers({ count: preview.servers })}</strong></span>
-        </label>
-      {/if}
-      {#if preview.nodes > 0}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantNodes} />
-          <span><strong>{m.emule_import_nodes({ count: preview.nodes })}</strong></span>
-        </label>
-      {/if}
-      {#if preview.ipfilter}
-        <label class="group">
-          <input type="checkbox" bind:checked={wantIpfilter} />
-          <span>
-            <strong>{m.emule_import_ipfilter()}</strong>
-            <small>{m.emule_import_ipfilter_desc()}</small>
-          </span>
-        </label>
+            </span>
+          </div>
+          <ToggleSwitch bind:checked={wantCredits} ariaLabel={m.emule_import_credits_title()} />
+        </div>
       {/if}
     </div>
 
-    {#if wantIdentity && preview.identity}
-      <p class="hint">{m.emule_import_same_identity_warning()}</p>
+    {#if preview.downloads.length > 0}
+      <div class="group">
+        <h4 class="subsection-title">{m.emule_import_downloads_title()}</h4>
+        <div class="row">
+          <span class="hint">{m.emule_import_downloads_note()}</span>
+          <ul class="item-list">
+            {#each preview.downloads as download, i (i)}
+              <li class:disabled={download.status !== 'ready'}>
+                <label>
+                  <input
+                    type="checkbox"
+                    bind:checked={downloadChoice[i]}
+                    disabled={download.status !== 'ready'}
+                  />
+                  <span class="item-text">
+                    <span class="item-name">{download.name}</span>
+                    <span class="item-meta" class:warn={download.status === 'in_use'}>
+                      {m.emule_import_download_done({ done: formatSize(download.done), size: formatSize(download.size) })}
+                      {#if downloadNote(download.status)}· {downloadNote(download.status)}
+                      {:else if copied(download)}· {m.emule_import_download_copied()}{/if}
+                    </span>
+                  </span>
+                </label>
+              </li>
+            {/each}
+          </ul>
+          {#if copyBytes > 0}
+            <span class="hint" class:warn={downloadFree !== null && copyBytes > downloadFree}>
+              {downloadFree !== null && copyBytes > downloadFree
+                ? m.emule_import_downloads_no_space({ size: formatSize(copyBytes), free: formatSize(downloadFree) })
+                : m.emule_import_downloads_copy_total({ size: formatSize(copyBytes) })}
+            </span>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
+    {#if preview.servers > 0 || preview.nodes > 0 || preview.ipfilter}
+      <div class="group">
+        <h4 class="subsection-title">{m.emule_import_group_network()}</h4>
+        {#if preview.servers > 0}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_servers({ count: preview.servers })}</span>
+            </div>
+            <ToggleSwitch bind:checked={wantServers} ariaLabel={m.emule_import_report_servers()} />
+          </div>
+        {/if}
+        {#if preview.nodes > 0}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_nodes({ count: preview.nodes })}</span>
+            </div>
+            <ToggleSwitch bind:checked={wantNodes} ariaLabel={m.emule_import_report_nodes()} />
+          </div>
+        {/if}
+        {#if preview.ipfilter}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_ipfilter()}</span>
+              <span class="hint">{m.emule_import_ipfilter_desc()}</span>
+            </div>
+            <ToggleSwitch bind:checked={wantIpfilter} ariaLabel={m.emule_import_ipfilter()} />
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if mode === 'settings' && (preview.nickname || preview.tcp_port || preview.incoming_dir)}
+      <div class="group">
+        <h4 class="subsection-title">{m.emule_import_preferences_title()}</h4>
+        {#if preview.nickname || preview.tcp_port}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_preferences_toggle()}</span>
+              <span class="hint">
+                {m.emule_import_preferences_desc({
+                  nickname: preview.nickname ?? '—',
+                  tcp: preview.tcp_port ?? '—',
+                  udp: preview.udp_port ?? '—',
+                })}
+              </span>
+            </div>
+            <ToggleSwitch bind:checked={wantPreferences} ariaLabel={m.emule_import_preferences_toggle()} />
+          </div>
+        {/if}
+        {#if preview.incoming_dir}
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.emule_import_incoming()}</span>
+              <span class="hint mono">{preview.incoming_dir}</span>
+            </div>
+            <ToggleSwitch bind:checked={wantIncoming} ariaLabel={m.emule_import_incoming()} />
+          </div>
+        {/if}
+      </div>
     {/if}
   {/snippet}
 
   <!-- Kept on screen while "Check again" re-reads, rather than flickering out. -->
   {#if preview}
+    {#if mode === 'wizard'}
     <div class="found">
       <div class="found-head">
         <div>
@@ -526,17 +623,10 @@
         {/if}
       </ul>
     </div>
+    {/if}
 
-    {#if emuleRunning}
-      <div class="running" role="alert">
-        <div>
-          <strong>{m.emule_import_running_title()}</strong>
-          <span>{m.emule_import_running_desc()}</span>
-        </div>
-        <button type="button" class="ghost" onclick={() => preview && load(preview.source)} disabled={reading || staging}>
-          {reading ? m.emule_import_reading() : m.emule_import_check_again()}
-        </button>
-      </div>
+    {#if emuleRunning && mode === 'wizard'}
+      {@render runningNotice(preview)}
     {/if}
 
     {#if mode === 'wizard'}
@@ -574,24 +664,29 @@
       {/if}
     {:else}
       {@render checklist(preview)}
-      {#if !emuleRunning}
-        <p class="hint">{m.emule_import_close_emule()}</p>
-      {/if}
-      <div class="actions">
-        <button type="button" class="primary" onclick={stageNow} disabled={staging || reading}>
-          {staging ? progressText : m.emule_import_start()}
-        </button>
+      <div class="group">
+        <div class="action-row">
+          <button type="button" class="action-btn primary" onclick={stageNow} disabled={staging || reading}>
+            {staging ? progressText : m.emule_import_start()}
+          </button>
+          {#if !emuleRunning}
+            <span class="hint">{m.emule_import_close_emule()}</span>
+          {/if}
+        </div>
       </div>
     {/if}
   {/if}
 
   {#if mode === 'settings' && report}
-    <div class="report">
-      <strong>{m.emule_import_report_heading({ when: new Date(report.applied_at * 1000).toLocaleString() })}</strong>
-      <ul>
+    <div class="group">
+      <h4 class="subsection-title">
+        {m.emule_import_report_heading({ when: new Date(report.applied_at * 1000).toLocaleString() })}
+      </h4>
+      <ul class="item-list">
         {#each report.items as item (item.kind)}
-          <li class:failed={!item.ok}>
-            {reportLabel(item.kind)}: {reportOutcome(item)}
+          <li class="report-row">
+            <span class="item-name">{reportLabel(item.kind)}</span>
+            <span class="item-meta" class:failed={!item.ok}>{reportOutcome(item)}</span>
           </li>
         {/each}
       </ul>
@@ -600,32 +695,265 @@
 </div>
 
 <style>
+  /* Sizes and spacing follow the Settings page's own sections (`.settings-group`,
+     `.toggle-row`, `.folder-input`, `.action-btn`), which cannot reach inside
+     a component, so that this card reads as one of them. */
   .emule-import {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
   }
-  .hint,
-  small {
-    color: var(--text-muted);
-    font-size: 0.85em;
+  .emule-import.settings {
+    gap: 18px;
   }
-  small {
+  .hint {
     display: block;
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-muted);
   }
   .warn {
-    color: var(--warning, var(--accent));
+    color: var(--warning);
   }
   .error {
+    margin: 0;
+    font-size: 12px;
     color: var(--danger);
   }
   .mono {
     font-family: var(--font-mono, monospace);
     word-break: break-all;
   }
-  .folder-path {
-    font-size: 0.85em;
+
+  .group {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
   }
+  .group + .group {
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    margin-top: 2px;
+    padding-top: 20px;
+  }
+  .subsection-title {
+    margin: 0 0 -7px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+  .row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .row-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .toggle-row.disabled {
+    opacity: 0.6;
+  }
+  .toggle-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .toggle-title {
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.4;
+    color: var(--text-primary);
+  }
+
+  .item-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .item-list li {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+  .item-list li.disabled {
+    opacity: 0.6;
+  }
+  .item-list label {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 10px;
+    cursor: pointer;
+  }
+  .item-list li.disabled label {
+    cursor: default;
+  }
+  .item-list input {
+    margin: 2px 0 0;
+    flex-shrink: 0;
+  }
+  .item-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .item-name {
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+  }
+  .item-name.mono {
+    font-size: 12px;
+  }
+  .item-meta {
+    font-size: 11.5px;
+    color: var(--text-muted);
+  }
+  .item-meta.warn {
+    color: var(--warning);
+  }
+  .item-meta.failed {
+    color: var(--danger);
+  }
+  .report-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 10px;
+  }
+  .report-row .item-meta {
+    text-align: right;
+  }
+
+  .folder-input {
+    display: flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--bg-input);
+  }
+  .folder-input input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    padding: 7px 10px;
+    font-size: 13px;
+    color: var(--text-primary);
+    outline: none;
+    box-shadow: none;
+  }
+  .folder-btn {
+    border: none;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    padding: 0 14px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .folder-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--accent);
+  }
+
+  .action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .action-btn {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 14px;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .action-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .action-btn.primary {
+    background: var(--accent);
+    color: var(--on-accent);
+    border-color: var(--accent);
+  }
+  .action-btn.primary:hover:not(:disabled) {
+    filter: brightness(1.06);
+    color: var(--on-accent);
+  }
+  .action-btn.danger {
+    background: var(--danger);
+    color: var(--on-danger);
+    border-color: var(--danger);
+  }
+  .action-btn.danger:hover:not(:disabled) {
+    background: var(--danger-hover);
+    border-color: var(--danger-hover);
+    color: var(--on-danger);
+  }
+  .action-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  /* The pending-restore box in Backup, for the same kind of message. */
+  .notice {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+  }
+  .notice.running {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .notice-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .notice-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
   .sources {
     display: flex;
     flex-wrap: wrap;
@@ -707,24 +1035,6 @@
     font-size: 0.8em;
     color: var(--text-muted);
   }
-  .running {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 12px;
-    border: 1px solid var(--warning);
-    border-radius: var(--radius-md);
-  }
-  .running > div {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .running span {
-    color: var(--text-muted);
-    font-size: 0.85em;
-  }
   .choices {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -763,57 +1073,9 @@
     .choices {
       grid-template-columns: 1fr;
     }
-  }
-  .groups {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .group,
-  .item {
-    display: flex;
-    gap: 10px;
-    align-items: flex-start;
-    cursor: pointer;
-  }
-  .group.disabled,
-  .item.disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-  .group-list {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 8px 12px;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  legend {
-    font-weight: 600;
-    padding: 0 4px;
-  }
-  .actions {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .notice {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 10px 12px;
-    border: 1px solid var(--accent);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
-  }
-  .report ul {
-    margin: 6px 0 0;
-    padding-left: 18px;
-  }
-  .report li.failed {
-    color: var(--danger);
+    .notice.running {
+      flex-direction: column;
+      align-items: flex-start;
+    }
   }
 </style>
