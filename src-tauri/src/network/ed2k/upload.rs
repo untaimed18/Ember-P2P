@@ -1131,7 +1131,8 @@ const UPLOAD_SLOW_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::fr
 
 /// Max concurrent outbound HighID push-grant dials (AddUpNextClient).
 const MAX_PUSH_GRANT_DIALS: usize = 3;
-/// Backoff after a failed HighID push dial before retrying the same peer.
+/// Backoff after a HighID push dial that did not end in a grant before
+/// retrying the same peer.
 const PUSH_GRANT_BACKOFF_SECS: u64 = 30;
 
 /// Maximum concurrent TCP connections from a single IP address
@@ -1555,6 +1556,72 @@ fn keep_queue_row_after_slot_grant(
         || entry
             .current_addr
             .is_some_and(|bound| bound.ip() != grant_ip)
+}
+
+/// Drop every row of a banned user hash that no other live client holds.
+/// The ban is on the hash itself, so a peer replaying someone's hash cannot
+/// use this to evict anyone who is not banned already.
+fn remove_banned_hash_queue_rows(
+    queue: &mut Vec<QueueEntry>,
+    user_hash: [u8; 16],
+    peer_addr: SocketAddr,
+    session_tcp_port: u16,
+) {
+    let identity = QueueIdentity::UserHash(user_hash);
+    queue.retain(|e| {
+        e.identity != identity
+            || !queue_row_owned_by_session(e.current_addr, e.tcp_port, peer_addr, session_tcp_port)
+    });
+}
+
+/// Drop the waiting-list row of a peer the session refused outright for what
+/// it is (AntiLeech) or where it connects from (IP ban). Keeping it would
+/// leave the peer holding rank, and a HighID row would be redialled by
+/// `try_add_up_next_client` only to be refused again.
+///
+/// The refusal is about this session, but the row is keyed on the cleartext
+/// `OP_HELLO` user hash. An unbound row therefore goes only when this session
+/// could also have inherited its seniority ([`session_may_inherit_seniority`]):
+/// otherwise a replayed hash plus a leech mod string would evict the real
+/// waiter. Rows bound to a different client are left alone as well.
+fn remove_refused_queue_row(
+    queue: &mut Vec<QueueEntry>,
+    identity: &QueueIdentity,
+    peer_addr: SocketAddr,
+    session_tcp_port: u16,
+    session_ember_pubkey: Option<[u8; 32]>,
+    session_ember_verified: bool,
+) {
+    queue.retain(|e| {
+        if e.identity != *identity {
+            return true;
+        }
+        let owned = if e.current_addr.is_some() {
+            queue_row_owned_by_session(e.current_addr, e.tcp_port, peer_addr, session_tcp_port)
+        } else {
+            session_may_inherit_seniority(e, peer_addr, session_ember_pubkey, session_ember_verified)
+        };
+        !owned
+    });
+}
+
+/// Whether a disconnected waiter may be dialed for a HighID push-grant now.
+fn push_grant_dialable(
+    e: &QueueEntry,
+    in_flight: &HashSet<QueueIdentity>,
+    backoff: &HashMap<QueueIdentity, std::time::Instant>,
+    is_banned: impl Fn(&[u8; 16], &SocketAddr) -> bool,
+) -> bool {
+    let Some(ip) = e.last_ip else {
+        return false;
+    };
+    e.current_addr.is_none()
+        && e.is_high_id
+        && e.tcp_port != 0
+        && e.file_hash != [0u8; 16]
+        && !in_flight.contains(&e.identity)
+        && !backoff.contains_key(&e.identity)
+        && !is_banned(&e.user_hash, &SocketAddr::new(ip, e.tcp_port))
 }
 
 /// Shared handle to the upload queue so non-upload subsystems (e.g. the UDP
@@ -2527,7 +2594,7 @@ struct UploadHandler {
     slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
     /// Identities currently being dialed for HighID AddUpNextClient push-grants.
     push_grant_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<QueueIdentity>>>,
-    /// Per-identity backoff after a failed HighID push dial.
+    /// Per-identity backoff after a HighID push dial that did not grant.
     push_grant_backoff: Arc<tokio::sync::Mutex<HashMap<QueueIdentity, std::time::Instant>>>,
     /// Count of concurrent outbound HighID push-grant dials.
     push_grant_dials: Arc<std::sync::atomic::AtomicUsize>,
@@ -5372,19 +5439,16 @@ impl UploadHandler {
                     e.ember_pubkey.as_ref(),
                     e.ember_verified,
                 );
-                if e.current_addr.is_some() {
-                    if score > best_connected_score {
+                if let Some(bound) = e.current_addr {
+                    if !self.peer_is_banned(&e.user_hash, &bound) && score > best_connected_score
+                    {
                         best_connected_score = score;
                     }
                     continue;
                 }
-                if !e.is_high_id || e.tcp_port == 0 || e.last_ip.is_none() {
-                    continue;
-                }
-                if e.file_hash == [0u8; 16] {
-                    continue;
-                }
-                if in_flight.contains(&e.identity) || backoff.contains_key(&e.identity) {
+                if !push_grant_dialable(e, &in_flight, &backoff, |hash, addr| {
+                    self.peer_is_banned(hash, addr)
+                }) {
                     continue;
                 }
                 let better = match &best_dial {
@@ -5513,15 +5577,21 @@ impl UploadHandler {
             // NAT rebind of the peer that just got the slot.
             let mut queue = self.upload_queue.lock().await;
             queue.retain(|e| keep_queue_row_after_slot_grant(&identity, peer_addr.ip(), e));
-        } else if let Err(e) = result {
-            // Pre-grant failure: leave the queue entry (seniority intact) and backoff.
-            debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}");
+        } else {
+            // No grant, whether the dial failed or the session ended softly.
+            // Back off either way: the row is still the top scorer, so without
+            // this the 1 s slot tick redials it and starves everyone below.
+            // The row keeps its seniority; sessions that refuse the peer
+            // outright (ban / AntiLeech) have already removed it.
+            match result {
+                Err(e) => debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}"),
+                Ok(()) => debug!("AddUpNextClient dial to {peer_addr} ended without a grant"),
+            }
             self.push_grant_backoff.lock().await.insert(
                 identity,
                 std::time::Instant::now() + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
             );
         }
-        // Soft Ok(()) before grant (ban / AntiLeech / etc.) keeps seniority.
     }
 
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
@@ -6518,15 +6588,23 @@ impl UploadHandler {
         }
 
         if peer_user_hash != [0u8; 16] {
-            if let Ok(set) = self.banned_hashes.read() {
-                if set.contains(&peer_user_hash) {
-                    info!(
-                        "Rejecting upload session from banned user {} ({})",
-                        crate::security::short_hash(&peer_user_hash),
-                        peer_addr
-                    );
-                    return Ok(());
-                }
+            let banned = self
+                .banned_hashes
+                .read()
+                .is_ok_and(|set| set.contains(&peer_user_hash));
+            if banned {
+                info!(
+                    "Rejecting upload session from banned user {} ({})",
+                    crate::security::short_hash(&peer_user_hash),
+                    peer_addr
+                );
+                remove_banned_hash_queue_rows(
+                    &mut *self.upload_queue.lock().await,
+                    peer_user_hash,
+                    peer_addr,
+                    hello_caps.tcp_port,
+                );
+                return Ok(());
             }
         }
 
@@ -7115,6 +7193,14 @@ impl UploadHandler {
             // returning, and a TCP reply here would be read as
             // `OP_MULTIPACKETANSWER` and cost us the source — see the
             // `OP_QUEUEFULL` note in `messages.rs`.
+            remove_refused_queue_row(
+                &mut *self.upload_queue.lock().await,
+                &QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                peer_addr,
+                hello_caps.tcp_port,
+                hello_caps.ember_pubkey,
+                ember_auth_state.is_verified(),
+            );
             return Ok(());
         }
 
@@ -7816,6 +7902,14 @@ impl UploadHandler {
                             .await;
                     }
                 }
+                remove_refused_queue_row(
+                    &mut *self.upload_queue.lock().await,
+                    &queue_identity,
+                    peer_addr,
+                    hello_caps.tcp_port,
+                    hello_caps.ember_pubkey,
+                    ember_auth_state.is_verified(),
+                );
                 break;
             }
 
@@ -11963,18 +12057,14 @@ impl UploadHandler {
                             m.pattern,
                         );
                         // Refused in silence, as above.
-                        {
-                            let mut queue = self.upload_queue.lock().await;
-                            queue.retain(|e| {
-                                e.identity != queue_identity
-                                    || !queue_row_owned_by_session(
-                                        e.current_addr,
-                                        e.tcp_port,
-                                        peer_addr,
-                                        hello_caps.tcp_port,
-                                    )
-                            });
-                        }
+                        remove_refused_queue_row(
+                            &mut *self.upload_queue.lock().await,
+                            &queue_identity,
+                            peer_addr,
+                            hello_caps.tcp_port,
+                            hello_caps.ember_pubkey,
+                            ember_auth_state.is_verified(),
+                        );
                         break;
                     }
                 }
@@ -15269,6 +15359,102 @@ mod abuse_and_seniority_tests {
         let mut entry = queue_entry(Some(ip.parse().unwrap()), None);
         entry.udp_port = udp_port;
         entry
+    }
+
+    #[test]
+    fn push_grant_picker_skips_banned_backed_off_and_in_flight_rows() {
+        let e = waiter("203.0.113.7", 4672);
+        let none = HashSet::new();
+        let no_backoff = HashMap::new();
+        let never = |_: &[u8; 16], _: &SocketAddr| false;
+        assert!(push_grant_dialable(&e, &none, &no_backoff, never));
+
+        let banned_hash = |h: &[u8; 16], _: &SocketAddr| *h == [7u8; 16];
+        assert!(!push_grant_dialable(&e, &none, &no_backoff, banned_hash));
+        let banned_ip = |_: &[u8; 16], a: &SocketAddr| *a == addr("203.0.113.7");
+        assert!(!push_grant_dialable(&e, &none, &no_backoff, banned_ip));
+
+        let mut backoff = HashMap::new();
+        backoff.insert(
+            e.identity.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
+        );
+        assert!(!push_grant_dialable(&e, &none, &backoff, never));
+
+        let in_flight: HashSet<QueueIdentity> = [e.identity.clone()].into_iter().collect();
+        assert!(!push_grant_dialable(&e, &in_flight, &no_backoff, never));
+
+        let mut connected = e.clone();
+        connected.current_addr = Some(addr("203.0.113.7"));
+        assert!(!push_grant_dialable(&connected, &none, &no_backoff, never));
+    }
+
+    #[test]
+    fn a_refused_peer_loses_its_row_but_not_someone_elses() {
+        let refused = waiter("203.0.113.7", 4672);
+        let mut other = waiter("198.51.100.9", 4672);
+        other.identity = QueueIdentity::UserHash([9u8; 16]);
+        other.user_hash = [9u8; 16];
+        let mut queue = vec![refused.clone(), other.clone()];
+        remove_refused_queue_row(
+            &mut queue,
+            &refused.identity,
+            addr("203.0.113.7"),
+            4662,
+            None,
+            false,
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].identity, other.identity);
+
+        // A row bound live from another address is a different client using
+        // (or spoofing) the same identity; refusing this one must not evict it.
+        let mut bound_elsewhere = refused.clone();
+        bound_elsewhere.current_addr = Some(addr("192.0.2.1"));
+        let mut queue = vec![bound_elsewhere];
+        remove_refused_queue_row(
+            &mut queue,
+            &refused.identity,
+            addr("203.0.113.7"),
+            4662,
+            None,
+            false,
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// The row's identity is the cleartext Hello hash. A peer replaying a
+    /// waiter's hash from its own address, with a mod string AntiLeech refuses,
+    /// must not take the real waiter's disconnected row down with it.
+    #[test]
+    fn a_replayed_hash_refused_elsewhere_keeps_the_real_waiters_row() {
+        let victim = waiter("203.0.113.7", 4672);
+        let attacker = addr("198.51.100.66");
+        let mut queue = vec![victim.clone()];
+        remove_refused_queue_row(&mut queue, &victim.identity, attacker, 4662, None, false);
+        assert_eq!(queue.len(), 1, "an unverified claim from a new address evicts nothing");
+
+        // An unverified claim naming the row's key is still only a claim.
+        let key = [0x42u8; 32];
+        let mut ember_victim = queue_entry(Some("203.0.113.7".parse().unwrap()), Some(key));
+        ember_victim.udp_port = 4672;
+        let mut queue = vec![ember_victim.clone()];
+        remove_refused_queue_row(&mut queue, &ember_victim.identity, attacker, 4662, Some(key), false);
+        assert_eq!(queue.len(), 1);
+
+        // Proof of possession for the row's key is the same peer on a new address.
+        remove_refused_queue_row(&mut queue, &ember_victim.identity, attacker, 4662, Some(key), true);
+        assert!(queue.is_empty());
+    }
+
+    /// A banned hash is refused for the hash itself, so every unbound row it
+    /// holds goes wherever the refused session connects from.
+    #[test]
+    fn a_banned_hash_loses_its_row_from_any_address() {
+        let banned = waiter("203.0.113.7", 4672);
+        let mut queue = vec![banned.clone()];
+        remove_banned_hash_queue_rows(&mut queue, banned.user_hash, addr("198.51.100.66"), 4662);
+        assert!(queue.is_empty());
     }
 
     /// Every queued socket is released after `QUEUED_SOCKET_IDLE_SECS`, so a

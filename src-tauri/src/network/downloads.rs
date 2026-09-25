@@ -194,9 +194,133 @@ pub(super) fn remaining_download_bytes(file_size: u64, completed: u64) -> u64 {
     file_size.saturating_sub(completed)
 }
 
-pub(super) fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
+/// One reading of the download volume's free space. Every download that
+/// shares the folder is compared against the same reading, so a tick pays for
+/// one filesystem query rather than one per pending download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiskSpaceProbe {
+    Available(u64),
+    /// The query failed on a folder that is presumed usable, or there is no
+    /// fresh reading yet. Admitted: ENOSPC on write still fails the transfer
+    /// safely.
+    Unknown,
+    /// The download folder does not exist.
+    Missing,
+}
+
+/// A reading older than this is not trusted. The refresh behind it has been
+/// stuck on the volume for several ticks, so the space it reported says
+/// nothing about now.
+pub(super) const DISK_SPACE_READING_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Blocking: `fs2::available_space`, plus `Path::exists` when that fails.
+fn probe_disk_space(download_dir: &std::path::Path) -> DiskSpaceProbe {
     match fs2::available_space(download_dir) {
-        Ok(available) => {
+        Ok(available) => DiskSpaceProbe::Available(available),
+        Err(e) => {
+            // Fail closed only when the download folder is missing/unusable.
+            // Some cloud/mapped volumes reject available_space while still
+            // accepting writes — treating those as Insufficient blocked all
+            // downloads (R1). Admit with a warning when the path exists;
+            // ENOSPC on write still fails the transfer safely.
+            if download_dir.exists() {
+                warn!(
+                    "Could not check disk space on {}: {e}; allowing start (volume exists)",
+                    download_dir.display()
+                );
+                DiskSpaceProbe::Unknown
+            } else {
+                warn!(
+                    "Could not check disk space on {}: {e}; treating as insufficient (path missing)",
+                    download_dir.display()
+                );
+                DiskSpaceProbe::Missing
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct DiskSpaceCache {
+    last: Option<(std::path::PathBuf, DiskSpaceProbe, std::time::Instant)>,
+    refreshing: bool,
+}
+
+impl DiskSpaceCache {
+    fn reading(&self, download_dir: &std::path::Path, now: std::time::Instant) -> DiskSpaceProbe {
+        match &self.last {
+            Some((dir, probe, at))
+                if dir == download_dir
+                    && now.saturating_duration_since(*at) <= DISK_SPACE_READING_MAX_AGE =>
+            {
+                *probe
+            }
+            _ => DiskSpaceProbe::Unknown,
+        }
+    }
+}
+
+/// Free space of the download folder, queried on the blocking pool and
+/// cached, so the event loop never waits on `GetDiskFreeSpaceExW` — which
+/// takes seconds on a slow or dropped SMB share.
+///
+/// At most one query is outstanding: while one is stuck on a hung volume,
+/// later ticks reuse the cached reading instead of parking another
+/// blocking-pool thread behind it.
+#[derive(Clone, Default)]
+pub(super) struct DiskSpaceMonitor {
+    cache: Arc<parking_lot::Mutex<DiskSpaceCache>>,
+}
+
+impl DiskSpaceMonitor {
+    pub(super) fn global() -> &'static DiskSpaceMonitor {
+        static MONITOR: std::sync::OnceLock<DiskSpaceMonitor> = std::sync::OnceLock::new();
+        MONITOR.get_or_init(DiskSpaceMonitor::default)
+    }
+
+    /// The last reading for `download_dir`, or `Unknown` when there is none
+    /// yet, it is older than [`DISK_SPACE_READING_MAX_AGE`], or it was taken
+    /// for another folder. Starts a background refresh unless one is already
+    /// running, so the answer trails the volume by up to one call. Never
+    /// blocks on the filesystem.
+    pub(super) fn reading_and_refresh(&self, download_dir: &std::path::Path) -> DiskSpaceProbe {
+        let mut cache = self.cache.lock();
+        let reading = cache.reading(download_dir, std::time::Instant::now());
+        if !cache.refreshing {
+            cache.refreshing = true;
+            drop(cache);
+            self.spawn_refresh(download_dir.to_path_buf());
+        }
+        reading
+    }
+
+    fn spawn_refresh(&self, download_dir: std::path::PathBuf) {
+        // Moved into the task so `refreshing` is cleared even if the probe
+        // panics or the task is dropped unrun at runtime shutdown.
+        struct RefreshGuard(Arc<parking_lot::Mutex<DiskSpaceCache>>);
+        impl Drop for RefreshGuard {
+            fn drop(&mut self) {
+                self.0.lock().refreshing = false;
+            }
+        }
+        let guard = RefreshGuard(self.cache.clone());
+        tokio::task::spawn_blocking(move || {
+            let probe = probe_disk_space(&download_dir);
+            guard.0.lock().last = Some((download_dir, probe, std::time::Instant::now()));
+            drop(guard);
+        });
+    }
+}
+
+/// Whether `probe` leaves room for `needed_bytes` plus [`DISK_SPACE_BUFFER`].
+pub(super) fn disk_space_suffices(
+    probe: DiskSpaceProbe,
+    download_dir: &std::path::Path,
+    needed_bytes: u64,
+) -> bool {
+    match probe {
+        DiskSpaceProbe::Available(available) => {
             if available < needed_bytes.saturating_add(DISK_SPACE_BUFFER) {
                 warn!(
                     "Insufficient disk space: need {} bytes (+ {} buffer), only {} available in {}",
@@ -210,26 +334,8 @@ pub(super) fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64
                 true
             }
         }
-        Err(e) => {
-            // Fail closed only when the download folder is missing/unusable.
-            // Some cloud/mapped volumes reject available_space while still
-            // accepting writes — treating those as Insufficient blocked all
-            // downloads (R1). Admit with a warning when the path exists;
-            // ENOSPC on write still fails the transfer safely.
-            if download_dir.exists() {
-                warn!(
-                    "Could not check disk space on {}: {e}; allowing start (volume exists)",
-                    download_dir.display()
-                );
-                true
-            } else {
-                warn!(
-                    "Could not check disk space on {}: {e}; treating as insufficient (path missing)",
-                    download_dir.display()
-                );
-                false
-            }
-        }
+        DiskSpaceProbe::Unknown => true,
+        DiskSpaceProbe::Missing => false,
     }
 }
 
@@ -342,6 +448,30 @@ pub(crate) fn apply_transfer_status_write(
     last.insert(transfer_id.to_string(), seq);
     if let Err(e) = db.update_transfer_status(transfer_id, status) {
         warn!("DB update_transfer_status('{status}') failed for {transfer_id}: {e}");
+    }
+}
+
+impl TransferStatusWriteClock {
+    /// [`apply_transfer_status_write`] for many `(id, status, seq)` rows: the
+    /// same per-id stale check, but every fresh row lands in one transaction.
+    /// Holds the clock for the whole write, as the single-row path does, so no
+    /// other sequenced write can interleave with the batch.
+    pub(crate) fn apply_status_writes(&self, db: &Database, writes: &[(String, String, u64)]) {
+        let mut last = match self.last.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut fresh: Vec<(&str, &str)> = Vec::with_capacity(writes.len());
+        for (transfer_id, status, seq) in writes {
+            if transfer_status_write_is_stale(last.get(transfer_id.as_str()).copied(), *seq) {
+                continue;
+            }
+            last.insert(transfer_id.clone(), *seq);
+            fresh.push((transfer_id.as_str(), status.as_str()));
+        }
+        if let Err(e) = db.update_transfer_statuses(&fresh) {
+            warn!("DB update_transfer_statuses failed for {} transfer(s): {e}", fresh.len());
+        }
     }
 }
 
@@ -819,4 +949,93 @@ pub(super) async fn try_start_pending_download_from_known_sources(
     state.download_handles.insert(dl_tid2, handle);
 
     true
+}
+
+#[cfg(test)]
+mod disk_space_probe_tests {
+    use super::*;
+
+    #[test]
+    fn available_space_is_compared_with_the_buffer_included() {
+        let dir = std::path::Path::new("downloads");
+        let needed = 10 * 1024 * 1024;
+        let exact = needed + DISK_SPACE_BUFFER;
+        assert!(disk_space_suffices(DiskSpaceProbe::Available(exact), dir, needed));
+        assert!(!disk_space_suffices(DiskSpaceProbe::Available(exact - 1), dir, needed));
+        assert!(!disk_space_suffices(DiskSpaceProbe::Available(0), dir, u64::MAX));
+    }
+
+    #[test]
+    fn unknown_admits_and_missing_refuses() {
+        let dir = std::path::Path::new("downloads");
+        assert!(disk_space_suffices(DiskSpaceProbe::Unknown, dir, u64::MAX));
+        assert!(!disk_space_suffices(DiskSpaceProbe::Missing, dir, 0));
+    }
+
+    #[test]
+    fn cached_reading_is_ignored_when_stale_or_for_another_folder() {
+        let dir = std::path::PathBuf::from("downloads");
+        let taken = std::time::Instant::now();
+        let mut cache = DiskSpaceCache::default();
+        assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Unknown);
+
+        cache.last = Some((dir.clone(), DiskSpaceProbe::Available(123), taken));
+        assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Available(123));
+        assert_eq!(
+            cache.reading(&dir, taken + DISK_SPACE_READING_MAX_AGE),
+            DiskSpaceProbe::Available(123)
+        );
+        assert_eq!(
+            cache.reading(&dir, taken + DISK_SPACE_READING_MAX_AGE + std::time::Duration::from_secs(1)),
+            DiskSpaceProbe::Unknown
+        );
+        assert_eq!(
+            cache.reading(std::path::Path::new("elsewhere"), taken),
+            DiskSpaceProbe::Unknown
+        );
+
+        cache.last = Some((dir.clone(), DiskSpaceProbe::Missing, taken));
+        assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Missing);
+    }
+
+    async fn wait_for_refresh(monitor: &DiskSpaceMonitor) {
+        for _ in 0..500 {
+            if !monitor.cache.lock().refreshing {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("background disk-space refresh never finished");
+    }
+
+    #[tokio::test]
+    async fn monitor_answers_from_the_last_background_reading() {
+        let monitor = DiskSpaceMonitor::default();
+        let dir = std::env::temp_dir();
+
+        assert_eq!(monitor.reading_and_refresh(&dir), DiskSpaceProbe::Unknown);
+        assert!(monitor.cache.lock().refreshing);
+        wait_for_refresh(&monitor).await;
+
+        assert!(matches!(
+            monitor.reading_and_refresh(&dir),
+            DiskSpaceProbe::Available(_)
+        ));
+        wait_for_refresh(&monitor).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_never_starts_a_second_refresh_while_one_is_running() {
+        let monitor = DiskSpaceMonitor::default();
+        monitor.cache.lock().refreshing = true;
+
+        assert_eq!(
+            monitor.reading_and_refresh(&std::env::temp_dir()),
+            DiskSpaceProbe::Unknown
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let cache = monitor.cache.lock();
+        assert!(cache.refreshing);
+        assert!(cache.last.is_none());
+    }
 }

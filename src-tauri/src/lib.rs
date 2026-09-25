@@ -653,7 +653,10 @@ pub fn run() {
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
             emule_import::apply::root_additions_approved(&data_dir);
-            storage::share_intent::initialize(&data_dir)
+            // Only share_intent.json is read here; the known.met migration runs
+            // on its own thread, and every share-intent reader and known.met
+            // writer (including `migrate_aich_v2` below) blocks until it lands.
+            storage::share_intent::initialize_in_background(&data_dir)
                 .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
             // Load the persistent identity once before commands or the network
             // task can run. Re-reading/creating it independently at several
@@ -1149,9 +1152,25 @@ pub fn run() {
                     return;
                 }
 
-                let known_list = {
-                    let data_dir = storage::paths::resolve_data_dir_with_app(&startup_app);
-                    storage::known_files::KnownFileList::load(&data_dir.join("known.met"))
+                let known_path =
+                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
+                let known_list = match tokio::task::spawn_blocking(move || {
+                    let known_list = storage::known_files::KnownFileList::load(&known_path);
+                    // The per-file `effective_shared` calls below would
+                    // otherwise wait out the share-intent migration on this
+                    // runtime worker.
+                    storage::share_intent::wait_until_initialized();
+                    known_list
+                })
+                .await
+                {
+                    Ok(known_list) => known_list,
+                    Err(e) => {
+                        tracing::error!("Startup known.met load panicked: {e}");
+                        startup_cancel_flags.write().await.remove("__startup__");
+                        let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                        return;
+                    }
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();

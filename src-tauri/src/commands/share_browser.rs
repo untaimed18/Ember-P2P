@@ -8,11 +8,14 @@
 //!
 //! Sharing is still not "the renderer named a path": listings issue opaque
 //! entry ids bound to a short-lived session, and [`share_browser_selection`]
-//! only honours those ids. A compromised webview can still walk the tree and
-//! share anything the user could have browsed to — the same surface the OS
-//! picker exposed, without a native dialog in the way. Mitigations stay in
-//! [`super::sharing::add_shared_folder`]: no filesystem roots, no Ember data
-//! directory, no sensitive names, no overlapping shares.
+//! only honours those ids. But the renderer holds the session id and can list
+//! any typed path, so the ids are bookkeeping, not authorization. What
+//! authorizes a folder that is not shared yet is a native confirmation naming
+//! it, which the webview can neither draw nor answer; the add itself refuses
+//! any new root that confirmation did not name. The checks in
+//! [`super::sharing::add_shared_folder`] still apply on top: no system or
+//! profile drive, no Ember data directory, no sensitive names, no overlapping
+//! shares.
 //!
 //! Listing never follows symlinks, junctions or mount points, so expanding a
 //! folder cannot jump the tree to an unrelated location.
@@ -20,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,10 +32,11 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::commands::sharing::{
-    add_shared_folder_limited, batch_share, finish_pick, path_key_covers,
-    persist_folder_allowlists, share_all_in_folder, FolderAddOutcome, SharedFolderPick,
+    add_shared_folder_approved, batch_share, finish_pick, path_key_covers,
+    persist_folder_allowlists, share_all_in_folder, FolderAddOutcome, ShareApproval,
+    SharedFolderPick,
 };
-use crate::commands::settings::shared_paths_overlap;
+use crate::commands::settings::{elide_for_dialog, shared_paths_overlap};
 use crate::search::index::normalize_path_key;
 use crate::sharing::indexer::is_excluded_share_file_name;
 use crate::sharing::is_sensitive_dir_name;
@@ -285,7 +290,7 @@ fn is_filesystem_root(path: &Path) -> bool {
 }
 
 /// A volume root that may never be shared. Other drive roots are offered like
-/// folders, and `add_shared_folder_limited` asks before sharing one.
+/// folders, and sharing one whole takes the whole-drive warning first.
 fn root_share_refused(path: &Path) -> bool {
     crate::sharing::drive_root_share(path) == crate::sharing::DriveRootShare::Refused
 }
@@ -379,9 +384,9 @@ fn share_status_for(
                 ShareBrowserStatus::Already
             };
         }
-        if shared_paths_overlap(path, existing) {
-            let existing_display = display_fs_path(existing);
-            if !crate::security::path_matches_dir(&display, &existing_display) {
+        let existing_display = display_fs_path(existing);
+        if shared_paths_overlap(Path::new(&display), Path::new(&existing_display)) {
+            if !path_within(&display, &existing_display) {
                 return ShareBrowserStatus::ContainsShared;
             }
             return match allowlist_contains(allowlists, existing, path) {
@@ -400,9 +405,7 @@ fn containing_share<'a>(file: &Path, shared: &'a [PathBuf]) -> Option<&'a Path> 
     let display = display_fs_path(file);
     shared
         .iter()
-        .filter(|existing| {
-            crate::security::path_matches_dir(&display, &display_fs_path(existing))
-        })
+        .filter(|existing| path_within(&display, &display_fs_path(existing)))
         .max_by_key(|existing| display_fs_path(existing).len())
         .map(PathBuf::as_path)
 }
@@ -1189,7 +1192,7 @@ fn selection_plan(chosen: &[ChosenShare], shared: &[PathBuf]) -> (Vec<String>, V
         let covered = chosen.iter().any(|other| {
             !other.is_file
                 && !same_folder(&other.path, &item.path)
-                && crate::security::path_matches_dir(&item.path, &other.path)
+                && path_within(&item.path, &other.path)
         });
         if !covered {
             remember_once(&mut folders, item.path.clone());
@@ -1197,10 +1200,7 @@ fn selection_plan(chosen: &[ChosenShare], shared: &[PathBuf]) -> (Vec<String>, V
     }
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for item in chosen.iter().filter(|item| item.is_file) {
-        if folders
-            .iter()
-            .any(|folder| crate::security::path_matches_dir(&item.path, folder))
-        {
+        if folders.iter().any(|folder| path_within(&item.path, folder)) {
             continue;
         }
         let path = Path::new(&item.path);
@@ -1231,8 +1231,7 @@ fn selection_plan(chosen: &[ChosenShare], shared: &[PathBuf]) -> (Vec<String>, V
         let Some(group) = groups
             .iter_mut()
             .filter(|group| {
-                !same_folder(&group.folder, folder)
-                    && crate::security::path_matches_dir(folder, &group.folder)
+                !same_folder(&group.folder, folder) && path_within(folder, &group.folder)
             })
             .max_by_key(|group| group.folder.len())
         else {
@@ -1253,7 +1252,7 @@ fn collapse_nested_file_groups(grouped: &mut HashMap<String, Vec<String>>) {
     for key in keys {
         let parent = grouped
             .keys()
-            .filter(|other| *other != &key && crate::security::path_matches_dir(&key, other))
+            .filter(|other| *other != &key && path_within(&key, other))
             .max_by_key(|other| other.len())
             .cloned();
         let Some(parent) = parent else {
@@ -1272,11 +1271,281 @@ fn remember_once(list: &mut Vec<String>, path: String) {
     }
 }
 
+/// `path` is `dir` or lies inside it, compared component by component so a
+/// drive root contains what is on it. [`crate::security::path_matches_dir`]
+/// deliberately never treats a bare drive as a directory, which let a selected
+/// drive and something on it be planned as two separate shares.
+fn path_within(path: &str, dir: &str) -> bool {
+    let parts = |value: &str| -> Vec<String> {
+        Path::new(&display_fs_path(Path::new(value)))
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .map(|component| {
+                let part = component.as_os_str().to_string_lossy();
+                if cfg!(windows) {
+                    part.to_lowercase()
+                } else {
+                    part.into_owned()
+                }
+            })
+            .collect()
+    };
+    let dir = parts(dir);
+    !dir.is_empty() && parts(path).starts_with(&dir)
+}
+
+/// `root` is already shared, or overlaps a share, so adding it either changes
+/// nothing or is refused as an overlap.
+pub(crate) fn overlaps_share(root: &str, shared: &[PathBuf]) -> bool {
+    shared.iter().any(|existing| {
+        let existing = display_fs_path(existing);
+        same_folder(root, &existing) || shared_paths_overlap(Path::new(root), Path::new(&existing))
+    })
+}
+
+fn allowlist_for<'a>(
+    folder: &str,
+    allowlists: &'a HashMap<String, Vec<String>>,
+) -> Option<&'a Vec<String>> {
+    allowlists
+        .iter()
+        .find_map(|(key, list)| same_folder(key, folder).then_some(list))
+}
+
+/// Roots one native confirmation may carry. Every one is listed: the dialog is
+/// the only place the user sees what they are approving, so a selection that
+/// needs more is refused rather than summarised as "and N more".
+pub(crate) const MAX_CONFIRM_ROOTS: usize = 16;
+
+pub(crate) fn too_many_to_confirm() -> String {
+    coded_ctx(
+        "sharing_share_too_many_to_confirm",
+        format!("Too many folders to confirm at once (max {MAX_CONFIRM_ROOTS})"),
+        MAX_CONFIRM_ROOTS,
+    )
+}
+
+/// Set while a share confirmation is on screen. A selection arriving meanwhile
+/// is refused rather than queued behind it: a renderer that could stack
+/// prompts could keep asking until one is accepted by accident.
+static CONFIRMING: AtomicBool = AtomicBool::new(false);
+
+/// How much more of a folder a confirmation lets onto the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShareScope {
+    /// Not shared yet; shared whole.
+    Whole,
+    /// Shared for part of its contents; now shared whole.
+    Widened,
+    /// Not shared yet; shared for only this many selected entries.
+    Only(usize),
+    /// Shared for part of its contents; this many more selected entries join.
+    More(usize),
+}
+
+/// A folder a confirmation names.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NewShareRoot {
+    pub(crate) path: String,
+    pub(crate) scope: ShareScope,
+    pub(crate) whole_drive: bool,
+}
+
+impl NewShareRoot {
+    pub(crate) fn new(path: &str, scope: ShareScope) -> Self {
+        Self {
+            path: path.to_string(),
+            scope,
+            whole_drive: is_filesystem_root(Path::new(path)),
+        }
+    }
+
+    /// Every file on the drive, not a chosen few, would be offered.
+    fn offers_whole_drive(&self) -> bool {
+        self.whole_drive && matches!(self.scope, ShareScope::Whole | ShareScope::Widened)
+    }
+}
+
+/// What prompted a confirmation, which decides how its last line reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShareOrigin {
+    Browser,
+    Drop,
+}
+
+/// The roots of a [`selection_plan`] the user has to confirm, drives first:
+/// ones not shared yet, and partly shared ones the selection would widen,
+/// whether to the whole folder or to more of its entries. A partial share was
+/// only ever approved for what it lists, and the whole-drive warning was never
+/// shown for one limited to a few files.
+///
+/// Folders already shared whole are left out; so are ones overlapping a share,
+/// which the add refuses, since asking about a folder that cannot be added
+/// would only teach the user to click through.
+fn new_share_roots(
+    folders: &[String],
+    groups: &[FileGroup],
+    shared: &[PathBuf],
+    allowlists: &HashMap<String, Vec<String>>,
+) -> Vec<NewShareRoot> {
+    let is_share = |root: &str| {
+        shared
+            .iter()
+            .any(|existing| same_folder(root, &display_fs_path(existing)))
+    };
+    let mut roots = Vec::new();
+    for folder in folders {
+        let scope = if is_share(folder) {
+            if allowlist_for(folder, allowlists).is_none() {
+                continue;
+            }
+            ShareScope::Widened
+        } else if overlaps_share(folder, shared) {
+            continue;
+        } else {
+            ShareScope::Whole
+        };
+        roots.push(NewShareRoot::new(folder, scope));
+    }
+    for group in groups {
+        let entries = group.files.iter().chain(&group.dirs);
+        let scope = if is_share(&group.folder) {
+            let Some(list) = allowlist_for(&group.folder, allowlists) else {
+                continue;
+            };
+            let more = entries
+                .filter(|entry| {
+                    let key = normalize_path_key(entry);
+                    !list.iter().any(|item| path_key_covers(item, &key))
+                })
+                .count();
+            if more == 0 {
+                continue;
+            }
+            ShareScope::More(more)
+        } else if overlaps_share(&group.folder, shared) {
+            continue;
+        } else {
+            ShareScope::Only(group.files.len() + group.dirs.len())
+        };
+        roots.push(NewShareRoot::new(&group.folder, scope));
+    }
+    // Stable, so the rest keep the order the plan gave them.
+    roots.sort_by_key(|root| !root.whole_drive);
+    roots
+}
+
+/// Title and body of the native dialog confirming `roots`, every one listed.
+pub(crate) fn share_confirmation_text(
+    roots: &[NewShareRoot],
+    origin: ShareOrigin,
+) -> (&'static str, String) {
+    let single = roots.len() == 1;
+    let drive = roots.iter().any(NewShareRoot::offers_whole_drive);
+    let title = if drive {
+        "Share a whole drive?"
+    } else if single {
+        "Share this folder?"
+    } else {
+        "Share these folders?"
+    };
+    let mut body = if single {
+        "Ember will offer files from this folder to other peers on the network:\n\n".to_string()
+    } else {
+        format!(
+            "Ember will offer files from these {} folders to other peers on the network:\n\n",
+            roots.len()
+        )
+    };
+    for root in roots {
+        body.push_str(&elide_for_dialog(&root.path));
+        let note = match root.scope {
+            ShareScope::Whole if root.whole_drive => "  (the entire drive)".to_string(),
+            ShareScope::Whole => String::new(),
+            ShareScope::Widened if root.whole_drive => {
+                "  (the entire drive; only part of it is shared now)".to_string()
+            }
+            ShareScope::Widened => "  (all of it; only part of it is shared now)".to_string(),
+            ShareScope::Only(1) => "  (only the selected item)".to_string(),
+            ShareScope::Only(count) => format!("  (only the {count} selected items)"),
+            ShareScope::More(1) => "  (partly shared; adds the selected item)".to_string(),
+            ShareScope::More(count) => format!("  (partly shared; adds {count} selected items)"),
+        };
+        body.push_str(&note);
+        body.push('\n');
+    }
+    if drive {
+        body.push_str(
+            "\nSharing an entire drive offers every file on it, in every folder. \
+             Only do this for a drive that holds nothing but files you mean to share.\n",
+        );
+    }
+    body.push_str(match (origin, single) {
+        (ShareOrigin::Browser, true) => {
+            "\nShare it only if you just chose it in Ember's folder browser."
+        }
+        (ShareOrigin::Browser, false) => {
+            "\nShare them only if you just chose them in Ember's folder browser."
+        }
+        (ShareOrigin::Drop, true) => {
+            "\nShare it only if you just dropped it, or a file in it, onto Ember."
+        }
+        (ShareOrigin::Drop, false) => {
+            "\nShare them only if you just dropped them, or files in them, onto Ember."
+        }
+    });
+    (title, body)
+}
+
+/// Ask, in a dialog the renderer can neither draw nor dismiss, whether to share
+/// `roots`. False for a dismissed dialog, and while another is still open.
+pub(crate) async fn confirm_share_roots(
+    app: &tauri::AppHandle,
+    roots: &[NewShareRoot],
+    origin: ShareOrigin,
+) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            CONFIRMING.store(false, Ordering::Release);
+        }
+    }
+    if CONFIRMING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    // Moved into the dialog thread so the flag outlives the dialog itself
+    // even if this command's future is dropped while it is on screen.
+    let release = Release;
+    let (title, prompt) = share_confirmation_text(roots, origin);
+    let app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task.
+    tokio::task::spawn_blocking(move || {
+        let _release = release;
+        app.dialog()
+            .message(prompt)
+            .title(title)
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Share".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Share every selected browser entry. A folder is shared in full. Files are
 /// shared through their parent folder's allowlist, which is how a drop shares
 /// only the files that were dropped. Ids the session does not know are
 /// rejected; a selection that shares nothing and has no already-shared hits
 /// returns the first real add error, matching [`super::sharing::pick_shared_folder`].
+///
+/// Every folder the selection would newly share, or widen from a partial
+/// share, is put to the user in one native dialog first; declining shares
+/// nothing. Re-sharing a folder already shared whole does not ask.
 #[tauri::command]
 pub async fn share_browser_selection(
     app: tauri::AppHandle,
@@ -1377,6 +1646,22 @@ pub async fn share_browser_selection(
     }
 
     let (folders, file_groups) = selection_plan(&chosen, &shared_folders);
+    // Before anything below touches the shared list or an allowlist, so a
+    // declined selection changes nothing.
+    let new_roots = new_share_roots(&folders, &file_groups, &shared_folders, &allowlists);
+    if new_roots.len() > MAX_CONFIRM_ROOTS {
+        return Err(too_many_to_confirm());
+    }
+    if !new_roots.is_empty()
+        && !confirm_share_roots(&app, &new_roots, ShareOrigin::Browser).await
+    {
+        return Err(coded(
+            "sharing_share_not_confirmed",
+            "Nothing was shared because it was not confirmed",
+        ));
+    }
+    let approved: Vec<String> = new_roots.into_iter().map(|root| root.path).collect();
+    let approval = ShareApproval::Confirmed(&approved);
     let mut result = SharedFolderPick {
         already_shared: already_noted,
         ..Default::default()
@@ -1387,12 +1672,18 @@ pub async fn share_browser_selection(
     let promoted: Vec<String> = chosen
         .iter()
         .filter(|item| !item.is_file && item.was_partial)
+        .filter(|item| {
+            allowlist_for(&item.path, &allowlists).is_none()
+                || approved.iter().any(|root| same_folder(root, &item.path))
+        })
         .map(|item| item.path.clone())
         .collect();
+    // Only ones the dialog above named as widened (or new) may lose their
+    // allowlist; lifting it is what puts the rest of the folder on the network.
     let cleared: Vec<String> = folders
         .iter()
-        .filter(|folder| allowlists.contains_key(&normalize_path_key(folder)))
-        .cloned()
+        .filter(|folder| approved.iter().any(|root| same_folder(root, folder)))
+        .filter_map(|folder| allowlists.keys().find(|key| same_folder(key, folder)).cloned())
         .collect();
     if !cleared.is_empty() {
         persist_folder_allowlists(&state, &[], &cleared).await?;
@@ -1401,11 +1692,12 @@ pub async fn share_browser_selection(
     for group in file_groups {
         let parent = group.folder;
         let entries: Vec<String> = group.files.iter().chain(&group.dirs).cloned().collect();
-        let add = match add_shared_folder_limited(
+        let add = match add_shared_folder_approved(
             app.clone(),
             state.clone(),
             parent.clone(),
             Some(entries),
+            approval,
         )
         .await
         {
@@ -1459,7 +1751,9 @@ pub async fn share_browser_selection(
 
     for path in folders {
         let promoting = promoted.iter().any(|folder| same_folder(folder, &path));
-        match add_shared_folder_limited(app.clone(), state.clone(), path.clone(), None).await {
+        match add_shared_folder_approved(app.clone(), state.clone(), path.clone(), None, approval)
+            .await
+        {
             Ok(add) if add.outcome == FolderAddOutcome::Added => result.added.push(path),
             Ok(add) if promoting => {
                 match share_all_in_folder(app.clone(), state.inner(), &add.folder).await {
@@ -1970,6 +2264,254 @@ mod tests {
         assert_eq!(names, vec!["real", "song.mp3"]);
         let _ = std::fs::remove_dir(listed.join("link"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_folders_not_yet_shared_need_confirming() {
+        let (shared, inside, holder, fresh, fresh_parent, file) = if cfg!(windows) {
+            (
+                r"\\?\C:\Music",
+                r"C:\Music\Album",
+                r"C:\Media",
+                r"C:\Users\a\Documents",
+                r"C:\Photos",
+                r"C:\Photos\a.jpg",
+            )
+        } else {
+            (
+                "/music",
+                "/music/album",
+                "/media",
+                "/home/a/documents",
+                "/photos",
+                "/photos/a.jpg",
+            )
+        };
+        // The only volume root on Unix holds every share, so it is never new.
+        let drive = cfg!(windows).then_some(r"D:\");
+        let shared = [PathBuf::from(shared)];
+        let holder_child = Path::new(holder).join("Music");
+        let shared_under_holder = [shared[0].clone(), holder_child];
+        let mut folders = vec![
+            display_fs_path(&shared[0]),
+            inside.to_string(),
+            fresh.to_string(),
+        ];
+        folders.extend(drive.map(str::to_string));
+        let groups = vec![
+            FileGroup {
+                folder: display_fs_path(&shared[0]),
+                files: vec![format!("{}{}x.mp3", inside, std::path::MAIN_SEPARATOR)],
+                dirs: Vec::new(),
+            },
+            FileGroup {
+                folder: fresh_parent.to_string(),
+                files: vec![file.to_string()],
+                dirs: vec![format!("{fresh_parent}{}Trip", std::path::MAIN_SEPARATOR)],
+            },
+        ];
+        let roots = new_share_roots(&folders, &groups, &shared, &HashMap::new());
+        let mut expected: Vec<NewShareRoot> = drive
+            .map(|drive| NewShareRoot::new(drive, ShareScope::Whole))
+            .into_iter()
+            .collect();
+        expected.push(NewShareRoot::new(fresh, ShareScope::Whole));
+        expected.push(NewShareRoot::new(fresh_parent, ShareScope::Only(2)));
+        assert_eq!(
+            roots, expected,
+            "re-shares, folders inside a share and a group joining a whole share are not asked about"
+        );
+        let roots = new_share_roots(&[holder.to_string()], &[], &shared_under_holder, &HashMap::new());
+        assert!(roots.is_empty(), "a folder holding a share is refused, not asked about");
+    }
+
+    #[test]
+    fn widening_a_partial_share_needs_confirming() {
+        let (docs, listed, unlisted) = if cfg!(windows) {
+            (r"C:\Docs", r"C:\Docs\a.txt", r"C:\Docs\b.txt")
+        } else {
+            ("/docs", "/docs/a.txt", "/docs/b.txt")
+        };
+        let drive = cfg!(windows).then_some((r"E:\", r"E:\x.txt"));
+        let stored = |path: &str| {
+            if cfg!(windows) {
+                PathBuf::from(format!(r"\\?\{path}"))
+            } else {
+                PathBuf::from(path)
+            }
+        };
+        let mut shared = vec![stored(docs)];
+        let mut allowlists =
+            HashMap::from([(normalize_path_key(docs), vec![normalize_path_key(listed)])]);
+        let mut folders = vec![docs.to_string()];
+        if let Some((root, file)) = drive {
+            shared.push(stored(root));
+            allowlists.insert(normalize_path_key(root), vec![normalize_path_key(file)]);
+            folders.push(root.to_string());
+        }
+        let roots = new_share_roots(&folders, &[], &shared, &allowlists);
+        let mut expected: Vec<NewShareRoot> = drive
+            .map(|(root, _)| NewShareRoot::new(root, ShareScope::Widened))
+            .into_iter()
+            .collect();
+        expected.push(NewShareRoot::new(docs, ShareScope::Widened));
+        assert_eq!(roots, expected, "lifting an allowlist is a new approval");
+
+        let group = |files: &[&str]| FileGroup {
+            folder: docs.to_string(),
+            files: files.iter().map(|file| file.to_string()).collect(),
+            dirs: Vec::new(),
+        };
+        assert_eq!(
+            new_share_roots(&[], &[group(&[listed, unlisted])], &shared, &allowlists),
+            vec![NewShareRoot::new(docs, ShareScope::More(1))],
+            "only the entries the allowlist lacks count"
+        );
+        assert!(
+            new_share_roots(&[], &[group(&[listed])], &shared, &allowlists).is_empty(),
+            "re-offering what the allowlist already names widens nothing"
+        );
+    }
+
+    #[test]
+    fn a_widened_drive_carries_the_drive_warning() {
+        let drive = if cfg!(windows) { r"E:\" } else { "/" };
+        let (title, body) = share_confirmation_text(
+            &[NewShareRoot::new(drive, ShareScope::Widened)],
+            ShareOrigin::Browser,
+        );
+        assert_eq!(title, "Share a whole drive?");
+        assert!(
+            body.contains(&format!("{drive}  (the entire drive; only part of it is shared now)\n")),
+            "{body}"
+        );
+        assert!(body.contains("Sharing an entire drive offers every file"), "{body}");
+    }
+
+    #[test]
+    fn a_single_folder_confirmation_names_its_path() {
+        let path = if cfg!(windows) {
+            r"C:\Users\a\Documents"
+        } else {
+            "/home/a/documents"
+        };
+        let (title, body) = share_confirmation_text(
+            &[NewShareRoot::new(path, ShareScope::Whole)],
+            ShareOrigin::Browser,
+        );
+        assert_eq!(title, "Share this folder?");
+        assert!(body.contains(&format!("\n\n{path}\n")), "{body}");
+        assert!(!body.contains("entire drive"), "{body}");
+        assert!(body.ends_with("in Ember's folder browser."), "{body}");
+    }
+
+    #[test]
+    fn every_root_a_confirmation_carries_is_listed() {
+        let (drive, base) = if cfg!(windows) {
+            (r"D:\", r"C:\Shares\f")
+        } else {
+            ("/", "/shares/f")
+        };
+        let mut roots = vec![NewShareRoot::new(drive, ShareScope::Whole)];
+        roots.extend((1..MAX_CONFIRM_ROOTS).map(|i| {
+            let scope = match i {
+                1 => ShareScope::Only(3),
+                2 => ShareScope::More(1),
+                _ => ShareScope::Whole,
+            };
+            NewShareRoot::new(&format!("{base}{i:02}"), scope)
+        }));
+        let (title, body) = share_confirmation_text(&roots, ShareOrigin::Browser);
+        assert_eq!(title, "Share a whole drive?");
+        assert!(body.contains(&format!("these {MAX_CONFIRM_ROOTS} folders")), "{body}");
+        assert!(body.contains(&format!("{drive}  (the entire drive)\n")), "{body}");
+        assert!(body.contains(&format!("{base}01  (only the 3 selected items)\n")), "{body}");
+        assert!(
+            body.contains(&format!("{base}02  (partly shared; adds the selected item)\n")),
+            "{body}"
+        );
+        for root in &roots {
+            assert!(body.contains(&root.path), "{} is not named:\n{body}", root.path);
+        }
+        assert!(!body.contains("more folder"), "{body}");
+    }
+
+    #[test]
+    fn a_limited_drive_root_is_not_described_as_shared_whole() {
+        let drive = if cfg!(windows) { r"E:\" } else { "/" };
+        let (title, body) = share_confirmation_text(
+            &[NewShareRoot::new(drive, ShareScope::Only(1))],
+            ShareOrigin::Browser,
+        );
+        assert_eq!(title, "Share this folder?");
+        assert!(body.contains(&format!("{drive}  (only the selected item)\n")), "{body}");
+        assert!(!body.contains("entire drive"), "{body}");
+    }
+
+    #[test]
+    fn a_drop_confirmation_says_where_the_folders_came_from() {
+        let (a, b) = if cfg!(windows) {
+            (r"C:\Photos", r"C:\Scans")
+        } else {
+            ("/photos", "/scans")
+        };
+        let roots = [
+            NewShareRoot::new(a, ShareScope::Whole),
+            NewShareRoot::new(b, ShareScope::Whole),
+        ];
+        let (title, body) = share_confirmation_text(&roots, ShareOrigin::Drop);
+        assert_eq!(title, "Share these folders?");
+        assert!(body.ends_with("dropped them, or files in them, onto Ember."), "{body}");
+    }
+
+    #[test]
+    fn containment_counts_a_drive_root_as_holding_its_contents() {
+        let (drive, file, sub, music, musical) = if cfg!(windows) {
+            (r"E:\", r"e:\A.txt", r"\\?\E:\Sub", r"C:\Music", r"C:\Musical\a.mp3")
+        } else {
+            ("/", "/a.txt", "/sub", "/music", "/musical/a.mp3")
+        };
+        assert!(path_within(file, drive));
+        assert!(path_within(sub, drive));
+        assert!(path_within(drive, drive));
+        assert!(!path_within(drive, sub));
+        assert!(!path_within(musical, music));
+    }
+
+    #[test]
+    fn a_selected_drive_covers_what_is_selected_on_it() {
+        let (drive, file, sub) = if cfg!(windows) {
+            (r"E:\", r"E:\a.txt", r"E:\Sub")
+        } else {
+            ("/", "/a.txt", "/sub")
+        };
+        let chosen = vec![chosen_folder(drive), chosen_file(file), chosen_folder(sub)];
+        let (folders, groups) = selection_plan(&chosen, &[]);
+        assert_eq!(folders, vec![drive.to_string()]);
+        assert!(groups.is_empty(), "{groups:?}");
+    }
+
+    #[test]
+    fn a_folder_on_a_shared_drive_reads_as_shared_with_it() {
+        let (drive, stored, sub, file, data) = if cfg!(windows) {
+            (r"E:\", r"\\?\E:\", r"E:\Sub", r"E:\Sub\a.mp3", r"D:\Ember")
+        } else {
+            ("/", "/", "/sub", "/sub/a.mp3", "/ember")
+        };
+        let shared = [PathBuf::from(stored)];
+        assert_eq!(
+            containing_share(Path::new(file), &shared).map(display_fs_path),
+            Some(drive.to_string())
+        );
+        let status = share_status_for(
+            Path::new(sub),
+            ShareBrowserKind::Folder,
+            &shared,
+            Path::new(data),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(status, ShareBrowserStatus::Inherited);
     }
 
     fn chosen_file(path: &str) -> ChosenShare {

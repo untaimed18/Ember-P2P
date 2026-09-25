@@ -7,7 +7,7 @@
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
-    pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
+    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
@@ -36,6 +36,7 @@
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
+  import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -3176,47 +3177,52 @@
     });
   }
 
-  /** Run a per-id action in a bounded-concurrency loop so one bad id
-   *  doesn't block the rest of the batch. */
-  async function runBatchPerId(
+  /** Apply a batch command to `ids` in one round trip. The backend answers
+   *  for the whole batch rather than per row (it stops at the first network
+   *  send that fails), so a failure is reported as that error. Returns whether
+   *  the command succeeded. */
+  async function runBatchCommand(
     ids: string[],
-    fn: (id: string) => Promise<void>,
+    fn: (ids: string[]) => Promise<void>,
     label: string,
-  ): Promise<number> {
-    if (!ids.length) return 0;
-    const failed: { id: string; name: string; error: string }[] = [];
-    const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
-    for (const id of ids) {
-      try {
-        await fn(id);
-      } catch (e: unknown) {
-        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
-      }
+  ): Promise<boolean> {
+    if (!ids.length) return true;
+    try {
+      await fn(ids);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+      return false;
     }
-    summarizeBatchResult(label, ids.length, failed);
-    return failed.length;
+    summarizeBatchResult(label, ids.length, []);
+    return true;
   }
 
   async function handleBatchPauseDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canPause(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => pauseTransfer(id), m.transfers_batch_label_paused());
+    await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
   }
 
   async function handleBatchResumeDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canResume(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => resumeTransfer(id), m.transfers_batch_label_resumed());
+    await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
   }
 
   async function handleBatchStopDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canStop(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
   }
+
+  /** `remove_transfer` has no batch form and each call can wait up to 10 s on
+   *  the network task's cleanup ack, so run a few at a time: one after another
+   *  took minutes for a large selection, and all at once flooded the channel
+   *  the ack waits on. */
+  const REMOVE_CONCURRENCY = 4;
 
   /** Drop finished rows from the list. Same contract as the single-row
    *  "Remove from List" action: the file on disk is left alone, only the
    *  transfer record goes away, so this needs no confirmation. Rows leave
    *  the table immediately and come back if the backend refuses. */
-  async function removeTransfersBatch(ids: string[]): Promise<void> {
+  async function removeTransfersBatch(ids: string[], announceSuccess = true): Promise<void> {
     if (!ids.length) return;
     const idSet = new Set(ids);
     const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
@@ -3233,13 +3239,12 @@
     selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
     if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
     const failed: { id: string; name: string; error: string }[] = [];
-    for (const id of ids) {
-      try {
-        await removeTransfer(id);
-      } catch (e: unknown) {
-        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
+    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => removeTransfer(id));
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        failed.push({ id: ids[i], name: byId.get(ids[i]) ?? '', error: toErrorMsg(r.reason) });
       }
-    }
+    });
     if (failed.length) {
       const failedIds = new Set(failed.map((f) => f.id));
       for (const id of failedIds) clearDownloadRemoved(id);
@@ -3249,7 +3254,9 @@
         return toRestore.length ? [...list, ...toRestore] : list;
       });
     }
-    summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+    if (failed.length || announceSuccess) {
+      summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+    }
   }
 
   async function handleBatchRemoveDownloads() {
@@ -3303,9 +3310,9 @@
   async function handleStopAll() {
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
-    const failedCount = await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    const ok = await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
     const filter = transferFilter.trim();
-    if (filter && failedCount === 0) {
+    if (filter && ok) {
       showInfo(m.transfers_stopped_matching({ count: ids.length, filter }));
     }
   }
@@ -5890,7 +5897,7 @@
     ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); for (const id of ids) markDownloadRemoved(id); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { if (transferFilter.trim()) { await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->

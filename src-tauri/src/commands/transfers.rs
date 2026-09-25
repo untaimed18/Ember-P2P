@@ -325,7 +325,8 @@ async fn persist_transfer_status(state: &AppState, transfer_id: &str, status: &T
 /// while the IPC call itself did not return.
 ///
 /// Sequence numbers are taken up front so the relative order of these writes is
-/// fixed before any of them runs.
+/// fixed before any of them runs, and the rows that survive the per-id stale
+/// check commit in one transaction rather than one fsync each.
 async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, String)>) {
     if statuses.is_empty() {
         return;
@@ -340,9 +341,7 @@ async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, Stri
         })
         .collect();
     if let Err(e) = tokio::task::spawn_blocking(move || {
-        for (id, status, seq) in sequenced {
-            crate::network::apply_transfer_status_write(&clock, &db, &id, &status, seq);
-        }
+        clock.apply_status_writes(&db, &sequenced);
     })
     .await
     {
@@ -1078,10 +1077,9 @@ pub async fn pause_transfers_batch(
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
-    let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
-    for transfer_id in &transfer_ids {
-        let (status, promoted) = {
-            let mut manager = state.transfer_manager.write().await;
+    let (paused, promoted) = {
+        let mut manager = state.transfer_manager.write().await;
+        for transfer_id in &transfer_ids {
             if let Some(control) = manager.get_control(transfer_id) {
                 control.pause();
                 // Cancel too, exactly as the single-transfer pause does: pause
@@ -1092,17 +1090,17 @@ pub async fn pause_transfers_batch(
                 // registered and installs a fresh control.
                 control.cancel();
             }
-            let promoted = manager.pause_and_promote(transfer_id);
-            let status = manager.get_transfer(transfer_id).map(|t| t.status.clone());
-            (status, promoted)
-        };
-        for p in promoted {
-            promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
-        if let Some(status) = status {
-            persist_transfer_status(&state, transfer_id, &status).await;
-        }
-    }
+        manager.pause_and_promote_many(&transfer_ids)
+    };
+    persist_transfer_statuses(
+        &state,
+        paused
+            .into_iter()
+            .map(|id| (id, transfer_status_key(&TransferStatus::Paused).to_string()))
+            .collect(),
+    )
+    .await;
     let mut send_error = None;
     for transfer_id in &transfer_ids {
         // `bounded_send`, like the single-row sibling. A raw `send().await` on
@@ -1127,7 +1125,6 @@ pub async fn pause_transfers_batch(
             break;
         }
     }
-    let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
     match send_error {
         Some(e) => Err(e),
@@ -1141,55 +1138,32 @@ pub async fn resume_transfers_batch(
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
-    let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
-    let mut restart_ids: Vec<String> = Vec::new();
-    for transfer_id in transfer_ids {
-        let (was_paused_active, promoted) = {
-            let mut manager = state.transfer_manager.write().await;
-            // `Insufficient` belongs here alongside `Paused`, as it does in
-            // `resume_transfer` and `resume_all_transfers`. `resume` clears
-            // that state in place and returns no promotions (the row never
-            // left `active`), so without it nothing reaches `restart_ids`,
-            // `start_promoted_downloads` is never called, and no
-            // `PendingDownload` is re-inserted — `mark_download_insufficient`
-            // dropped it. The row then reads `Searching`, which
-            // `active_download_count` *does* count, so the cap is
-            // oversubscribed and the transfer never dials again: the retry
-            // timer only walks `pending_downloads`.
-            let was_paused_active = manager
-                .active
-                .get(&transfer_id)
-                .map(|t| {
-                    matches!(
-                        t.status,
-                        TransferStatus::Paused | TransferStatus::Insufficient
-                    )
-                })
-                .unwrap_or(false);
-            if manager.get_control(&transfer_id).is_none() {
-                manager.register_control(&transfer_id, TransferControl::new());
-            }
-            let promoted = manager.resume(&transfer_id);
-            (was_paused_active, promoted)
-        };
-        if was_paused_active && promoted.is_empty() {
-            restart_ids.push(transfer_id.clone());
-        }
-        for p in promoted {
-            promoted_by_id.entry(p.id.clone()).or_insert(p);
-        }
-        let status = {
-            let manager = state.transfer_manager.read().await;
-            manager.get_transfer(&transfer_id).map(|t| t.status.clone())
-        };
-        if let Some(status) = status {
-            persist_transfer_status(&state, &transfer_id, &status).await;
-        }
-    }
-    let mut to_start: Vec<Transfer> = promoted_by_id.into_values().collect();
+    // `restart_ids` holds `active` rows resumed from `Insufficient` as well as
+    // `Paused`, as in `resume_transfer` and `resume_all_transfers`. `resume`
+    // clears that state in place and returns no promotions (the row never
+    // left `active`), so without it `start_promoted_downloads` is never
+    // called and no `PendingDownload` is re-inserted —
+    // `mark_download_insufficient` dropped it. The row then reads `Searching`,
+    // which `active_download_count` *does* count, so the cap is oversubscribed
+    // and the transfer never dials again: the retry timer only walks
+    // `pending_downloads`.
+    let outcome = {
+        let mut manager = state.transfer_manager.write().await;
+        manager.resume_many(&transfer_ids, true)
+    };
+    persist_transfer_statuses(
+        &state,
+        outcome
+            .statuses
+            .iter()
+            .map(|(id, status)| (id.clone(), transfer_status_key(status).to_string()))
+            .collect(),
+    )
+    .await;
+    let mut to_start: Vec<Transfer> = outcome.promoted;
     {
         let manager = state.transfer_manager.read().await;
-        for id in restart_ids {
+        for id in outcome.restart_ids {
             if let Some(t) = manager.get_transfer(&id) {
                 to_start.push(t.clone());
             }
@@ -2166,7 +2140,7 @@ pub async fn pause_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (statuses, pause_ids) = {
+    let (paused, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
         let active_ids: Vec<String> = manager
             .active
@@ -2179,33 +2153,34 @@ pub async fn pause_all_transfers(
                 control.pause();
                 control.cancel();
             }
-            manager.pause(id);
         }
-        let queued_ids: Vec<String> = manager
-            .queue
+        let queued_ids = manager.queue.iter().filter(|t| {
+            t.direction == TransferDirection::Download
+                && t.status != TransferStatus::Paused
+                && t.status != TransferStatus::Stopped
+        });
+        let pause_ids: Vec<String> = active_ids
             .iter()
-            .filter(|t| {
-                t.direction == TransferDirection::Download
-                    && t.status != TransferStatus::Paused
-                    && t.status != TransferStatus::Stopped
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        for id in &queued_ids {
-            manager.pause(id);
-        }
-        let all_ids: Vec<String> = active_ids
-            .iter()
-            .chain(queued_ids.iter())
             .cloned()
+            .chain(queued_ids.map(|t| t.id.clone()))
             .collect();
-        let statuses = active_ids
-            .into_iter()
-            .chain(queued_ids)
-            .filter_map(|id| manager.get_transfer(&id).map(|t| (id, t.status.clone())))
-            .collect::<Vec<_>>();
-        (statuses, all_ids)
+        let paused = manager.pause_many(&pause_ids);
+        (paused, pause_ids)
     };
+    // Immediate UI feedback for every paused row (see pause_transfer).
+    for id in &paused {
+        emit_transfer_status(&app, id, &TransferStatus::Paused);
+    }
+    persist_transfer_statuses(
+        &state,
+        paused
+            .into_iter()
+            .map(|id| (id, transfer_status_key(&TransferStatus::Paused).to_string()))
+            .collect(),
+    )
+    .await;
+    // Last: with a full channel each send can wait up to `CMD_SEND_TIMEOUT`,
+    // and the UI and the database already reflect the pause.
     for id in &pause_ids {
         let _ = bounded_send(
             &state.network_tx,
@@ -2215,18 +2190,6 @@ pub async fn pause_all_transfers(
         )
         .await;
     }
-    // Immediate UI feedback for every paused row (see pause_transfer).
-    for (id, status) in &statuses {
-        emit_transfer_status(&app, id, status);
-    }
-    persist_transfer_statuses(
-        &state,
-        statuses
-            .into_iter()
-            .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
-            .collect(),
-    )
-    .await;
     Ok(())
 }
 
@@ -2237,79 +2200,51 @@ pub async fn resume_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (promoted, restart_ids, statuses) = {
+    let outcome = {
         let mut manager = state.transfer_manager.write().await;
-        let active_ids: Vec<String> = manager.active.keys().cloned().collect();
-        let mut promoted = Vec::new();
-        let mut restart_ids: Vec<String> = Vec::new();
-        for id in active_ids {
-            let was_active_resumable = manager
-                .active
-                .get(&id)
-                .map(|t| {
-                    matches!(
-                        t.status,
-                        TransferStatus::Paused | TransferStatus::Insufficient
-                    )
-                })
-                .unwrap_or(false);
-            let p = manager.resume(&id);
-            if was_active_resumable && p.is_empty() {
-                restart_ids.push(id.clone());
-            }
-            promoted.extend(p);
-        }
-        let queued_ids: Vec<String> = manager
-            .queue
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t.status,
-                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
-                )
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        for id in queued_ids {
-            promoted.extend(manager.resume(&id));
-        }
-        let statuses = manager
+        // Every active row goes through `resume`, not only paused ones, so
+        // each live control is resumed as before.
+        let queued_ids = manager.queue.iter().filter(|t| {
+            matches!(
+                t.status,
+                TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
+            )
+        });
+        let resume_ids: Vec<String> = manager
             .active
             .keys()
             .cloned()
-            .chain(manager.queue.iter().map(|t| t.id.clone()))
-            .filter_map(|id| manager.get_transfer(&id).map(|t| (id, t.status.clone())))
-            .collect::<Vec<_>>();
-        (promoted, restart_ids, statuses)
+            .chain(queued_ids.map(|t| t.id.clone()))
+            .collect();
+        manager.resume_many(&resume_ids, false)
     };
+    let resumed: Vec<(String, TransferStatus)> = outcome
+        .statuses
+        .into_iter()
+        .filter(|(_, status)| {
+            matches!(
+                status,
+                TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
+            )
+        })
+        .collect();
     // Immediate UI feedback: flip every resumed row off Paused/Stopped now
     // (see resume_transfer) rather than waiting for the next poll.
-    for (id, status) in &statuses {
-        if matches!(
-            status,
-            TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
-        ) {
-            emit_transfer_status(&app, id, status);
-        }
+    for (id, status) in &resumed {
+        emit_transfer_status(&app, id, status);
     }
     persist_transfer_statuses(
         &state,
-        statuses
+        resumed
             .into_iter()
-            .filter(|(_, status)| {
-                matches!(
-                    status,
-                    TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
-                )
-            })
             .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
             .collect(),
     )
     .await;
-    let mut to_start = promoted;
+    let mut to_start = outcome.promoted;
     {
         let manager = state.transfer_manager.read().await;
-        for id in restart_ids {
+        for id in outcome.restart_ids {
             if let Some(t) = manager.get_transfer(&id) {
                 to_start.push(t.clone());
             }

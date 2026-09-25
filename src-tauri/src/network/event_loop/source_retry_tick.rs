@@ -457,31 +457,40 @@ pub(in crate::network) async fn on_source_retry_tick(
     let mut insufficient_downloads: Vec<(String, String)> = Vec::new();
 
     let dl_dir = PathBuf::from(&settings.download_folder);
-    for (tid, pd) in &state.pending_downloads {
-        if pd.control.is_cancelled() || pd.control.is_paused() {
-            continue;
-        }
-        let completed = {
-            let mgr = transfer_manager.read().await;
+    let is_retry_candidate =
+        |pd: &PendingDownload| !pd.control.is_cancelled() && !pd.control.is_paused();
+    // Every download in the folder shares one volume, so one cached
+    // reading serves the whole tick, including the start paths below.
+    let disk_probe = if state.pending_downloads.values().any(is_retry_candidate) {
+        DiskSpaceMonitor::global().reading_and_refresh(&dl_dir)
+    } else {
+        DiskSpaceProbe::Unknown
+    };
+    {
+        let mgr = transfer_manager.read().await;
+        for (tid, pd) in &state.pending_downloads {
+            if !is_retry_candidate(pd) {
+                continue;
+            }
             // Bytes on disk only. This used to take
             // `transferred.max(completed_size)`, which was harmless
             // while the two were equal but now overstates progress —
             // `transferred` counts re-fetched bytes and can exceed the
             // file size, so the space still needed would come out too
             // small and let a download start that cannot fit.
-            mgr.get_transfer(tid)
+            let completed = mgr.get_transfer(tid)
                 .map(|t| t.completed_size)
-                .unwrap_or(0)
-        };
-        let needed = remaining_download_bytes(pd.file_size, completed);
-        if !check_disk_space(&dl_dir, needed) {
-            debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
-            insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
-            continue;
-        }
-        let retry_interval = pending_download_retry_interval(pd.search_count);
-        if now.saturating_sub(pd.last_search_at) >= retry_interval {
-            to_retry.push((tid.clone(), pd.priority));
+                .unwrap_or(0);
+            let needed = remaining_download_bytes(pd.file_size, completed);
+            if !disk_space_suffices(disk_probe, &dl_dir, needed) {
+                debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
+                insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
+                continue;
+            }
+            let retry_interval = pending_download_retry_interval(pd.search_count);
+            if now.saturating_sub(pd.last_search_at) >= retry_interval {
+                to_retry.push((tid.clone(), pd.priority));
+            }
         }
     }
     for (tid, file_name) in insufficient_downloads {
@@ -681,7 +690,6 @@ pub(in crate::network) async fn on_source_retry_tick(
                 insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                 continue;
             }
-            let dl_dir = PathBuf::from(&settings.download_folder);
             let completed = {
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(tid)
@@ -689,7 +697,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .unwrap_or(0)
             };
             let needed = remaining_download_bytes(pending.file_size, completed);
-            if !check_disk_space(&dl_dir, needed) {
+            if !disk_space_suffices(disk_probe, &dl_dir, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
                     transfer_manager,
@@ -895,7 +903,6 @@ pub(in crate::network) async fn on_source_retry_tick(
                 insert_pending_download_bounded(&mut state.pending_downloads, tid.clone(), pending);
                 continue;
             }
-            let dl_dir = PathBuf::from(&settings.download_folder);
             let completed = {
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(tid)
@@ -903,7 +910,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .unwrap_or(0)
             };
             let needed = remaining_download_bytes(pending.file_size, completed);
-            if !check_disk_space(&dl_dir, needed) {
+            if !disk_space_suffices(disk_probe, &dl_dir, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
                     transfer_manager,

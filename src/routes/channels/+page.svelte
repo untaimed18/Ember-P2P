@@ -661,7 +661,8 @@
       })
       .catch((e) => console.error('Failed to register channel-moderation listener:', e));
     let unlistenHandoff: UnlistenFn | undefined;
-    listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', (event) => {
+    listen<{ channel_id: string; successor_id?: string; phase?: string }>('ember:channel-handoff', (event) => {
+      if (event.payload?.phase === 'failed') toastError(m.error_channels_handoff_stuck());
       // Only the room that actually moved: wiping the map cleared the pending
       // banner for every other room too.
       const moved = event.payload?.channel_id;

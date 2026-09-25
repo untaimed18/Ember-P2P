@@ -1390,6 +1390,11 @@ impl KnownFileList {
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        // The share-intent migration reads known.met off-thread at startup. A
+        // replace-fallback save leaves no known.met for a moment, and a probe
+        // landing then records a previously seen catalog as lost, persisting
+        // fail-closed sharing across every future launch.
+        crate::storage::share_intent::wait_until_initialized();
         // Refuse to write a catalog that was never read off disk over one that
         // exists. The network task starts from `new()` and absorbs known.met
         // from a deferred background load, so quitting (or completing a

@@ -5,6 +5,7 @@
 //! way `command.rs` does.
 
 use super::*;
+use crate::storage::database::ChannelHandoffCommitOutcome;
 
 pub(super) const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -50,6 +51,17 @@ pub(super) fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16])
         &mut state.channel_gossip_seen_order,
         msg_id,
     );
+}
+
+/// Whether the roster already holds this member, unbanned.
+///
+/// What a frame opened under a retired key needs before anything in it is
+/// kept: such a frame can refresh a member, never introduce one.
+pub(super) fn channel_member_on_roster(db: &Database, channel_id_hex: &str, member_hex: &str) -> bool {
+    matches!(
+        db.channel_member_status(channel_id_hex, member_hex),
+        Ok(Some(false))
+    )
 }
 
 /// Most delivery verdicts held between ticks.
@@ -540,6 +552,17 @@ pub(super) async fn overlay_forward_channel_gossip(
     missing: &[[u8; 32]],
     roster: &[[u8; 32]],
 ) -> bool {
+    let (hops, via_members) = overlay_channel_hops(state, missing, roster);
+    overlay_send_channel_gossip(socket, state, channel_id, body, missing, &hops, via_members).await
+}
+
+/// Live-session hops an overlay relay for `missing` could go through, and
+/// whether they are room members rather than the non-member fallback.
+pub(super) fn overlay_channel_hops(
+    state: &NetworkState,
+    missing: &[[u8; 32]],
+    roster: &[[u8; 32]],
+) -> (Vec<ember::dht::EmberContact>, bool) {
     // After inbound CHANNEL_RELAY refuses hops that are not in this room,
     // random routing-table contacts drop the envelope. Prefer other members
     // we already have a live session with.
@@ -573,6 +596,18 @@ pub(super) async fn overlay_forward_channel_gossip(
             .take(3)
             .collect();
     }
+    (hops, via_members)
+}
+
+pub(super) async fn overlay_send_channel_gossip(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    channel_id: &[u8; 16],
+    body: &[u8],
+    missing: &[[u8; 32]],
+    hops: &[ember::dht::EmberContact],
+    via_members: bool,
+) -> bool {
     if hops.is_empty() {
         return false;
     }
@@ -581,7 +616,7 @@ pub(super) async fn overlay_forward_channel_gossip(
         let target = ember::channel::channel_id_from_pubkey(pk);
         let envelope = ember::channel::encode_channel_relay_envelope(channel_id, &target, body);
         let (_rid, frame) = state.ember_dht.build_channel_relay(envelope);
-        for hop in &hops {
+        for hop in hops {
             if send_ember_dht_frame_established(socket, state, hop, &frame).await {
                 sent = true;
             }
@@ -702,10 +737,17 @@ pub(super) async fn handle_inbound_channel_gossip(
     // Decrypt may succeed under an older epoch; that key is only used to
     // *read*. Replies (history sync) are sealed under the current epoch so a
     // banned member who still holds a retired key cannot be handed new chat.
-    let Some((_opened_key, plain)) = view
-        .content_keys
-        .into_iter()
-        .find_map(|candidate| gossip.decrypt(&candidate).map(|plain| (candidate, plain)))
+    //
+    // Which key it was decides the rest. An evicted member keeps every retired
+    // key and can mint a fresh identity the ban list has never heard of, so a
+    // frame opened under one is read-only: it may be shown, and may refresh a
+    // member the roster already holds, but it admits nobody, is not served
+    // history, cannot offer a transfer, and moves no moderation. Otherwise the
+    // owner's next key republish would seal the new epoch to that identity.
+    let Some((plain, opened)) =
+        ember::channel::open_with_content_keys(&view.content_keys, |candidate| {
+            gossip.decrypt(candidate)
+        })
     else {
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         forget_channel_gossip(state, &gossip.msg_id);
@@ -756,7 +798,16 @@ pub(super) async fn handle_inbound_channel_gossip(
         {
             apply_xfer_block_request(state, xfer_id, sender, offset, count);
         } else if let Some(offer) = ember::channel::decode_xfer_offer(body) {
-            apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
+            // The pairwise key already names the sender; under a retired key
+            // they must also be somebody the roster holds, since that is what
+            // an evicted member's fresh identity is not.
+            if opened == ember::channel::OpenedUnder::Current
+                || channel_member_on_roster(db, &channel_id_hex, &hex::encode(sender))
+            {
+                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
+            } else {
+                debug!("Ember Transfer: ignored an offer in {channel_id_hex} under a retired key");
+            }
         } else if let Some((_, _, _, reply)) = ember::channel::decode_xfer_reply(body) {
             apply_xfer_reply(state, app_handle, xfer_id, sender, reply).await;
         } else if let Some((_, _, _, reason)) = ember::channel::decode_xfer_cancel(body) {
@@ -775,12 +826,29 @@ pub(super) async fn handle_inbound_channel_gossip(
         ch.key_epoch,
         chrono::Utc::now().timestamp(),
     ) {
+        // Only a private room needs the proof: a public room's key is derived
+        // from its pubkey, so proving it would prove nothing.
+        let admission_key = (ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE)
+            .then(|| view.content_keys.first().copied())
+            .flatten();
         apply_channel_presence_beacons(
-            socket, state, db, app_handle, &ch, &gossip, beacons, from_id,
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &gossip,
+            beacons,
+            from_id,
+            admission_key,
         )
         .await;
         return;
     }
+    // Handoff frames are not gated on `opened`. Each carries its own authority —
+    // the room's signature on an offer, the pending nominee's on a ready — so
+    // the key that sealed it adds nothing, and a nominee who has not fetched
+    // the newest epoch yet must still be able to answer.
     let channel_pk = hex::decode(&ch.pubkey)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
@@ -843,6 +911,13 @@ pub(super) async fn handle_inbound_channel_gossip(
             &sender_pk,
             chrono::Utc::now().timestamp(),
         );
+        // Nothing we could send back would help: a reply is sealed under our
+        // current key, which a member still on a retired one cannot open, and
+        // the one asker who holds only retired keys by design is the member a
+        // rotation evicted.
+        if opened == ember::channel::OpenedUnder::Retired {
+            return;
+        }
         // Its own budget, and the tightest one here. Every other branch costs
         // the sender roughly what it costs us; this one answers a single small
         // request with up to `CHANNEL_HISTORY_SYNC_MAX` separately sealed
@@ -873,6 +948,11 @@ pub(super) async fn handle_inbound_channel_gossip(
         &gossip.msg_id,
         gossip.timestamp,
     ) {
+        // Not gated on `opened`: the action is signed by its moderator, and the
+        // moderator list comes from the owner's own signed snapshot, so a
+        // moderator still on the previous epoch is exactly as trustworthy as
+        // one on the current — and an evicted member's fresh identity is on
+        // neither list.
         let sender_hex = hex::encode(sender_pk);
         if db
             .channel_member_is_banned(&channel_id_hex, &sender_hex)
@@ -970,6 +1050,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             &channel_id_hex,
             edit,
             from_id,
+            opened,
         )
         .await;
         return;
@@ -984,6 +1065,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             &channel_id_hex,
             entries,
             from_id,
+            opened,
         )
         .await;
         return;
@@ -1014,6 +1096,21 @@ pub(super) async fn handle_inbound_channel_gossip(
         .channel_member_is_banned(&channel_id_hex, &sender_hex)
         .unwrap_or(false)
     {
+        return;
+    }
+    // A member already on the roster who is still on the previous epoch keeps
+    // talking while the rotation propagates. Anyone else under a retired key is
+    // indistinguishable from the member it evicted under a new name.
+    if opened == ember::channel::OpenedUnder::Retired
+        && !channel_member_on_roster(db, &channel_id_hex, &sender_hex)
+    {
+        // The same line may still arrive under the current key — a catch-up
+        // re-serve keeps its id — so it must not be burned as seen.
+        forget_channel_gossip(state, &gossip.msg_id);
+        debug!(
+            "Ember channel gossip: dropped a line in {channel_id_hex} from an unknown author \
+             under a retired key"
+        );
         return;
     }
     let cleaned = crate::security::sanitize_chat_text(&text);
@@ -1061,6 +1158,8 @@ pub(super) async fn handle_inbound_channel_gossip(
             note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
             if ember::channel::chat_author_joins_gossip_roster(
                 ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+                opened,
+                gossip.ttl,
             ) {
                 // First line from someone this device did not already hold: the
                 // roster has to grow, and XOR-neighbors may have changed, so do
@@ -1094,9 +1193,11 @@ pub(super) async fn handle_inbound_channel_gossip(
                     _ => {}
                 }
             } else {
-                // Public rooms do not INSERT strangers from chat (anti-eclipse).
-                // A line from someone already on the roster still refreshes
-                // last_seen so they do not age out while visibly talking.
+                // Public rooms do not INSERT strangers from chat (anti-eclipse),
+                // and no room does on a seal that is not the author's own under
+                // the current key. A line from someone already on the roster
+                // still refreshes last_seen so they do not age out while visibly
+                // talking.
                 note_channel_member_alive(state, gossip.channel_id, &sender_pk, now);
             }
             let _ = app_handle.emit(
@@ -1137,23 +1238,49 @@ pub(super) async fn apply_channel_handoff_offer(
     target_pk: [u8; 32],
     version: u64,
 ) {
+    // A lapsed offer is a replay: the owner will not accept a ready for it, and
+    // answering would only mint a seed over the one a live offer may need.
+    // Nobody passes it on, either.
+    if !ember::channel::handoff_offer_live_at_target(version, chrono::Utc::now().timestamp()) {
+        debug!("Ember channel handoff: ignored a lapsed offer for {}", ch.channel_id);
+        return;
+    }
     if target_pk == state.local_ed25519_pubkey {
+        // Never answer with a successor key that is not on disk: the owner
+        // publishes whatever pubkey the ready names, and a seed held only in
+        // memory is a room nobody can ever sign for again.
         let ident = match db.load_handoff_pending_row(&ch.channel_id) {
             Ok(Some((_pk, ver, seed))) if ver == version => {
-                ember::channel::ChannelIdentity::from_seed(&seed)
+                Some(ember::channel::ChannelIdentity::from_seed(&seed))
+            }
+            Ok(Some((_pk, ver, _seed))) if ver > version => {
+                debug!(
+                    "Ember channel handoff: ignored offer v{version} for {} behind held v{ver}",
+                    ch.channel_id
+                );
+                None
             }
             _ => {
                 let ident = ember::channel::ChannelIdentity::generate();
-                let _ = db.store_handoff_pending_seed(
+                match db.store_handoff_pending_seed(
                     &ch.channel_id,
                     version,
                     &hex::encode(ident.pubkey),
                     &ident.seed(),
-                );
-                ident
+                ) {
+                    Ok(true) => Some(ident),
+                    Ok(false) => None,
+                    Err(e) => {
+                        debug!(
+                            "Ember channel handoff: could not hold the successor seed for {}: {e}",
+                            ch.channel_id
+                        );
+                        None
+                    }
+                }
             }
         };
-        if let Some(key) = channel_content_key(db, ch) {
+        if let (Some(ident), Some(key)) = (ident, channel_content_key(db, ch)) {
             let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
             let plain = ember::channel::encode_channel_handoff_ready(
                 &signing,
@@ -1211,102 +1338,412 @@ pub(super) async fn apply_channel_handoff_ready(
                     .channel_member_is_banned(&ch.channel_id, &sender_hex)
                     .unwrap_or(true);
             if acceptable {
-                if let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) {
-                    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
-                    let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
-                    let record = ember::dht::publish::SignedRecord::channel_handoff(
-                        version,
-                        successor_pk,
-                        gossip.channel_id,
-                        ident.pubkey,
-                        private,
-                        &ident.signing_key,
-                    );
-                    if let Some(publish_id) = state
-                        .ember_publish
-                        .start_publish(record, state.ember_dht.routing())
-                    {
-                        drive_ember_publish(socket, state, publish_id).await;
+                // Committed before anything is published: from the first
+                // publish on, the record may be stored without our hearing so,
+                // and a second handoff beside it would split the room.
+                let now = chrono::Utc::now().timestamp();
+                match db.commit_channel_handoff(
+                    &ch.channel_id,
+                    &sender_hex,
+                    version,
+                    &hex::encode(successor_pk),
+                    now,
+                ) {
+                    Ok(ChannelHandoffCommitOutcome::Committed(commit)) => {
+                        publish_committed_channel_handoff(
+                            socket,
+                            state,
+                            db,
+                            app_handle,
+                            ch,
+                            gossip.channel_id,
+                            &commit,
+                        )
+                        .await;
                     }
-                    let keep = private;
-                    let successor_id = ember::channel::channel_id_from_pubkey(&successor_pk);
-                    // We are about to stop being this room's owner, and the
-                    // successor's key has never held our registry name. Hand it
-                    // over while we can still sign for it — after
-                    // `apply_channel_handoff` the seed is gone, and the new
-                    // owner cannot sign for a name that is still ours.
-                    //
-                    // This is the only chance, so a blip does not get to cost
-                    // the room its name for a year: retry while the registry is
-                    // merely unreachable, and give up at once on a refusal,
-                    // which retrying cannot change. The old seed lives in this
-                    // task for a few seconds longer than the request as a
-                    // result, and nowhere else.
-                    if !state.rendezvous_url.is_empty() {
-                        let url = state.rendezvous_url.clone();
-                        let old_id = gossip.channel_id;
-                        let old_pk = ident.pubkey;
-                        let old_seed = seed;
-                        tokio::spawn(async move {
-                            for backoff_secs in [0u64, 3, 12, 45] {
-                                if backoff_secs > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_secs(
-                                        backoff_secs,
-                                    ))
-                                    .await;
-                                }
-                                match crate::network::rendezvous::handover_channel_name(
-                                    &url,
-                                    &old_id,
-                                    &successor_id,
-                                    &successor_pk,
-                                    &old_pk,
-                                    &old_seed,
-                                )
-                                .await
-                                {
-                                    Ok(()) => return,
-                                    Err(
-                                        error @ crate::network::rendezvous::ChannelRegistryError::Unavailable,
-                                    ) => {
-                                        tracing::debug!(
-                                            ?error,
-                                            "name handover to the successor did not land; retrying"
-                                        );
-                                    }
-                                    Err(error) => {
-                                        tracing::debug!(
-                                            ?error,
-                                            "the registry refused to hand the channel name over"
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        });
+                    Ok(ChannelHandoffCommitOutcome::Held(commit)) => {
+                        if commit.confirmed {
+                            spawn_owned_channel_handoff_completion(
+                                state,
+                                db,
+                                app_handle.clone(),
+                                gossip.channel_id,
+                            );
+                        } else if !channel_handoff_publish_in_flight(state, gossip.channel_id) {
+                            // The nominee answering again re-drives a publish
+                            // that ran out of attempts.
+                            let _ = db.restart_channel_handoff_commit(&ch.channel_id, now);
+                            publish_committed_channel_handoff(
+                                socket,
+                                state,
+                                db,
+                                app_handle,
+                                ch,
+                                gossip.channel_id,
+                                &commit,
+                            )
+                            .await;
+                        }
                     }
-                    let _ = db.apply_channel_handoff(
-                        &ch.channel_id,
-                        &hex::encode(successor_pk),
-                        &hex::encode(successor_id),
-                        version,
-                        keep,
-                        None,
-                    );
-                    let _ = app_handle.emit(
-                        "ember:channel-handoff",
-                        serde_json::json!({
-                            "channel_id": ch.channel_id,
-                            "successor_id": hex::encode(successor_id),
-                            "phase": "published",
-                        }),
-                    );
+                    Ok(ChannelHandoffCommitOutcome::Conflict) => {
+                        debug!(
+                            "Ember channel handoff: ignored a ready for v{version} of {}; \
+                             committed to another",
+                            ch.channel_id
+                        );
+                    }
+                    Ok(ChannelHandoffCommitOutcome::NotPending) => {}
+                    Err(e) => {
+                        debug!(
+                            "Ember channel handoff: could not commit {} to its successor: {e}",
+                            ch.channel_id
+                        );
+                    }
                 }
             }
         }
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+/// Whether a publish of this room's handoff record is still out.
+pub(super) fn channel_handoff_publish_in_flight(state: &mut NetworkState, channel_id: [u8; 16]) -> bool {
+    let Some(publish_id) = state
+        .channel_handoff_publishes
+        .get(&channel_id)
+        .and_then(|(publish_id, _)| *publish_id)
+    else {
+        return false;
+    };
+    state.ember_publish.get_mut(publish_id).is_some()
+}
+
+/// Publish the handoff record a room we own is committed to.
+///
+/// Ownership is given up only once some node is known to hold the record:
+/// applying the handoff drops our seed, and a record stored nowhere tells
+/// nobody the room moved, which would leave it with no owner at all. Until
+/// then [`maybe_drive_channel_handoffs`] keeps republishing on its own
+/// schedule.
+pub(super) async fn publish_committed_channel_handoff(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    commit: &crate::storage::database::ChannelHandoffCommit,
+) {
+    let now = chrono::Utc::now().timestamp();
+    // Stamped before anything can fail, so a publish that cannot even start
+    // still waits out the schedule rather than being retried every tick.
+    state.channel_handoff_publishes.insert(channel_id, (None, now));
+    let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
+        return;
+    };
+    let Some(successor_pk) = hex::decode(&commit.successor_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        return;
+    };
+    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+    let record = ember::dht::publish::SignedRecord::channel_handoff(
+        commit.version,
+        successor_pk,
+        channel_id,
+        ident.pubkey,
+        ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+        &ident.signing_key,
+    );
+    let Some(publish_id) = state
+        .ember_publish
+        .start_publish(record, state.ember_dht.routing())
+    else {
+        debug!(
+            "Ember channel handoff: could not start publishing {}; still its owner",
+            ch.channel_id
+        );
+        return;
+    };
+    state
+        .channel_handoff_publishes
+        .insert(channel_id, (Some(publish_id), now));
+    let (tx, rx) = oneshot::channel();
+    state.ember_dht_pending_publishes.insert(publish_id, tx);
+    let finish_db = db.clone();
+    let finish_app = app_handle.clone();
+    let registry_url = (!state.rendezvous_url.is_empty()).then(|| state.rendezvous_url.clone());
+    let completing = state.channel_handoff_completing.clone();
+    let channel_hex = ch.channel_id.clone();
+    let version = commit.version;
+    let successor_hex = commit.successor_pubkey.clone();
+    tokio::spawn(async move {
+        // A dropped sender is a publish that went away without a verdict,
+        // which is not evidence it landed either.
+        if !rx.await.is_ok_and(|result| result.stored_on > 0) {
+            tracing::debug!(
+                channel_id = %channel_hex,
+                "handoff record stored on nobody yet; keeping ownership"
+            );
+            return;
+        }
+        let confirm_db = finish_db.clone();
+        let confirmed = tokio::task::spawn_blocking(move || {
+            confirm_db.confirm_channel_handoff(
+                &channel_hex,
+                version,
+                &successor_hex,
+                chrono::Utc::now().timestamp(),
+                false,
+            )
+        })
+        .await
+        .is_ok_and(|result| result.unwrap_or(false));
+        if confirmed {
+            complete_owned_channel_handoff(finish_db, finish_app, registry_url, completing, channel_id)
+                .await;
+        }
+    });
+    drive_ember_publish(socket, state, publish_id).await;
+}
+
+pub(super) fn spawn_owned_channel_handoff_completion(
+    state: &NetworkState,
+    db: &Arc<Database>,
+    app_handle: tauri::AppHandle,
+    channel_id: [u8; 16],
+) {
+    let registry_url = (!state.rendezvous_url.is_empty()).then(|| state.rendezvous_url.clone());
+    tokio::spawn(complete_owned_channel_handoff(
+        db.clone(),
+        app_handle,
+        registry_url,
+        state.channel_handoff_completing.clone(),
+        channel_id,
+    ));
+}
+
+/// Finish a handoff whose record is known to be stored: hand the registry name
+/// over, then give the room up.
+///
+/// In that order, and from whichever path learned of the record first — the
+/// publish's own acknowledgement or our handoff fetch finding it. The name can
+/// only be signed over with the seed the apply deletes, so doing it after, or
+/// letting a path that knows nothing of the name apply first, cost the room its
+/// name for good. With the seed still on disk until the apply, a crash between
+/// the two only means the next pass signs the name over again, which the
+/// registry answers the same way.
+async fn complete_owned_channel_handoff(
+    db: Arc<Database>,
+    app_handle: tauri::AppHandle,
+    registry_url: Option<String>,
+    completing: Arc<std::sync::Mutex<HashSet<[u8; 16]>>>,
+    channel_id: [u8; 16],
+) {
+    struct Completing(Arc<std::sync::Mutex<HashSet<[u8; 16]>>>, [u8; 16]);
+    impl Drop for Completing {
+        fn drop(&mut self) {
+            if let Ok(mut set) = self.0.lock() {
+                set.remove(&self.1);
+            }
+        }
+    }
+    {
+        let Ok(mut set) = completing.lock() else {
+            return;
+        };
+        if !set.insert(channel_id) {
+            return;
+        }
+    }
+    let _completing = Completing(completing.clone(), channel_id);
+    let channel_hex = hex::encode(channel_id);
+    let prepare_db = db.clone();
+    let prepare_hex = channel_hex.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let commit = prepare_db
+            .channel_handoff_commit(&prepare_hex)
+            .ok()
+            .flatten()
+            .filter(|commit| commit.confirmed)?;
+        prepare_db
+            .get_channel_lite(&prepare_hex)
+            .ok()
+            .flatten()
+            .filter(|row| row.is_owner && row.successor_id.is_empty())?;
+        let seed = prepare_db.load_channel_owner_seed(&prepare_hex).ok().flatten()?;
+        Some((commit, seed))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((commit, seed)) = prepared else {
+        return;
+    };
+    let Some(successor_pk) = hex::decode(&commit.successor_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        return;
+    };
+    let successor_id = ember::channel::channel_id_from_pubkey(&successor_pk);
+    if let Some(url) = registry_url {
+        let old_pk = ember::channel::ChannelIdentity::from_seed(&seed).pubkey;
+        hand_over_channel_name(&url, channel_id, successor_id, successor_pk, old_pk, seed).await;
+    }
+    let apply_db = db.clone();
+    let apply_hex = channel_hex.clone();
+    let applied = match tokio::task::spawn_blocking(move || {
+        apply_db.apply_owned_channel_handoff(&apply_hex)
+    })
+    .await
+    {
+        Ok(Ok(applied)) => applied,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                channel_id = %channel_hex,
+                %error,
+                "could not apply a handoff whose record is published"
+            );
+            false
+        }
+        Err(_) => false,
+    };
+    if applied {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": channel_hex,
+                "successor_id": hex::encode(successor_id),
+                "phase": "published",
+            }),
+        );
+    }
+}
+
+/// Keep every committed handoff moving: finish the confirmed ones, republish
+/// the rest on [`ember::channel::handoff_republish_due`]'s schedule, and tell
+/// the owner once when one has run out of attempts.
+pub(super) async fn maybe_drive_channel_handoffs(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+) {
+    let Ok(commits) = db.list_channel_handoff_commits() else {
+        return;
+    };
+    if commits.is_empty() {
+        state.channel_handoff_publishes.clear();
+        state.channel_handoff_failure_noted.clear();
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let app_handle = state.channel_delivery_sink.1.clone();
+    let mut live: HashSet<[u8; 16]> = HashSet::new();
+    for (channel_hex, commit) in commits {
+        let Some(channel_id) = hex::decode(&channel_hex)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        let Ok(Some(ch)) = db.get_channel_lite(&channel_hex) else {
+            let _ = db.drop_channel_handoff_commit(&channel_hex);
+            continue;
+        };
+        if !ch.is_owner || !ch.successor_id.is_empty() {
+            let _ = db.drop_channel_handoff_commit(&channel_hex);
+            continue;
+        }
+        live.insert(channel_id);
+        if commit.confirmed {
+            spawn_owned_channel_handoff_completion(state, db, app_handle.clone(), channel_id);
+            continue;
+        }
+        if channel_handoff_publish_in_flight(state, channel_id) {
+            continue;
+        }
+        let last = state
+            .channel_handoff_publishes
+            .get(&channel_id)
+            .map(|(_, at)| *at)
+            .unwrap_or(0);
+        match ember::channel::handoff_republish_due(commit.version, commit.committed_at, last, now) {
+            ember::channel::HandoffRepublish::Publish => {
+                state.channel_handoff_failure_noted.remove(&channel_id);
+                publish_committed_channel_handoff(
+                    socket,
+                    state,
+                    db,
+                    &app_handle,
+                    &ch,
+                    channel_id,
+                    &commit,
+                )
+                .await;
+            }
+            ember::channel::HandoffRepublish::Wait => {
+                state.channel_handoff_failure_noted.remove(&channel_id);
+            }
+            ember::channel::HandoffRepublish::GiveUp => {
+                if state.channel_handoff_failure_noted.insert(channel_id) {
+                    let _ = app_handle.emit(
+                        "ember:channel-handoff",
+                        serde_json::json!({
+                            "channel_id": channel_hex,
+                            "phase": "failed",
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    state.channel_handoff_publishes.retain(|id, _| live.contains(id));
+    state.channel_handoff_failure_noted.retain(|id| live.contains(id));
+}
+
+/// Move the room's registry name to the successor, signing with the old seed.
+///
+/// The successor's key has never held our name, and the new owner cannot sign
+/// for one that is still ours, so this is the name's only way across.
+///
+/// Being the only chance, a blip does not get to cost the room its name for a
+/// year: retry while the registry is merely unreachable, and give up at once on
+/// a refusal, which retrying cannot change.
+async fn hand_over_channel_name(
+    url: &str,
+    old_id: [u8; 16],
+    successor_id: [u8; 16],
+    successor_pk: [u8; 32],
+    old_pk: [u8; 32],
+    old_seed: [u8; 32],
+) {
+    for backoff_secs in [0u64, 3, 12, 45] {
+        if backoff_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        }
+        match crate::network::rendezvous::handover_channel_name(
+            url,
+            &old_id,
+            &successor_id,
+            &successor_pk,
+            &old_pk,
+            &old_seed,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(error @ crate::network::rendezvous::ChannelRegistryError::Unavailable) => {
+                tracing::debug!(?error, "name handover to the successor did not land; retrying");
+            }
+            Err(error) => {
+                tracing::debug!(?error, "the registry refused to hand the channel name over");
+                return;
+            }
+        }
     }
 }
 
@@ -1317,14 +1754,17 @@ pub(super) async fn send_channel_gossip_unicast(
     channel_id: [u8; 16],
     peer: [u8; 32],
     body: Vec<u8>,
-) -> bool {
+) -> ChannelUnicast {
     // History catch-up, in both directions: automated mesh traffic rather than
     // anything the user typed, and it retries on its own timer, so it belongs
     // on the shared allowance and not the one reserved for a line that gets no
     // second attempt.
-    if !channel_gossip_rate_ok(state, false) {
-        return false;
-    }
+    //
+    // Charged once, and only when some rung has a live path to try: this is
+    // the allowance relaying the room's chat runs on, and a catch-up aimed at
+    // an unreachable neighbor must not spend it on frames that never leave
+    // this machine.
+    let mut charged = false;
     // Same ladder as `send_xfer_frame`: a routing-table hit (including the
     // unverified replacement cache) is not a live path. History catch-up used
     // to return here after `get_contact`, which skipped overlay and the
@@ -1332,19 +1772,56 @@ pub(super) async fn send_channel_gossip_unicast(
     let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
     if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
         if ember_has_live_session(state, &contact) {
+            if !channel_gossip_rate_ok(state, false) {
+                return ChannelUnicast::RateLimited;
+            }
+            charged = true;
             let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
             if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
-                return true;
+                return ChannelUnicast::Sent;
             }
         }
     }
-    if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
-        if tx.try_send(body.clone()).is_ok() {
-            return true;
+    if state.channel_relay_outboxes.contains_key(&peer) {
+        if !charged && !channel_gossip_rate_ok(state, false) {
+            return ChannelUnicast::RateLimited;
+        }
+        charged = true;
+        if let Some((_, tx)) = state.channel_relay_outboxes.get(&peer) {
+            if tx.try_send(body.clone()).is_ok() {
+                return ChannelUnicast::Sent;
+            }
         }
     }
+    // Member hops only. The non-member fallback the fanout keeps is a frame to
+    // a node that current builds make drop it, so here it would be charged to
+    // the relay allowance and counted as a path for nothing.
     let roster = channel_member_pubkeys(db, &hex::encode(channel_id));
-    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+    let (hops, via_members) = overlay_channel_hops(state, &[peer], &roster);
+    if hops.is_empty() || !via_members {
+        return ChannelUnicast::NoPath;
+    }
+    if !charged && !channel_gossip_rate_ok(state, false) {
+        return ChannelUnicast::RateLimited;
+    }
+    if overlay_send_channel_gossip(socket, state, &channel_id, &body, &[peer], &hops, via_members)
+        .await
+    {
+        ChannelUnicast::Sent
+    } else {
+        ChannelUnicast::NoPath
+    }
+}
+
+/// What became of one [`send_channel_gossip_unicast`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChannelUnicast {
+    Sent,
+    /// No live session, relay tunnel or member hop reaches the peer.
+    NoPath,
+    /// A path exists but the shared relay allowance is spent for this second.
+    /// Says nothing about the peer, so it must not count against them.
+    RateLimited,
 }
 
 // --- Ember Transfer -------------------------------------------------------
@@ -1367,6 +1844,7 @@ pub(super) async fn handle_inbound_channel_edit(
     channel_id_hex: &str,
     edit: ember::channel::ChannelChatEdit,
     from_id: ember::dht::EmberNodeId,
+    opened: ember::channel::OpenedUnder,
 ) {
     if !channel_author_gossip_ok(state, gossip.channel_id, &edit.sender) {
         forget_channel_gossip(state, &gossip.msg_id);
@@ -1378,6 +1856,14 @@ pub(super) async fn handle_inbound_channel_edit(
         .channel_member_is_banned(channel_id_hex, &sender_hex)
         .unwrap_or(false)
     {
+        return;
+    }
+    // A catch-up revision can create the line it revises, so it is held to the
+    // same rule as a chat line under a retired key.
+    if opened == ember::channel::OpenedUnder::Retired
+        && !channel_member_on_roster(db, channel_id_hex, &sender_hex)
+    {
+        forget_channel_gossip(state, &gossip.msg_id);
         return;
     }
     let cleaned = crate::security::sanitize_chat_text(&edit.text);
@@ -1469,6 +1955,7 @@ pub(super) async fn handle_inbound_channel_reactions(
     channel_id_hex: &str,
     entries: Vec<ember::channel::ChannelReaction>,
     from_id: ember::dht::EmberNodeId,
+    opened: ember::channel::OpenedUnder,
 ) {
     let now = chrono::Utc::now().timestamp();
     let mut changed = false;
@@ -1502,6 +1989,11 @@ pub(super) async fn handle_inbound_channel_reactions(
         if db
             .channel_member_is_banned(channel_id_hex, &member_hex)
             .unwrap_or(false)
+        {
+            continue;
+        }
+        if opened == ember::channel::OpenedUnder::Retired
+            && !channel_member_on_roster(db, channel_id_hex, &member_hex)
         {
             continue;
         }
@@ -1648,7 +2140,12 @@ pub(super) async fn reply_channel_history_sync(
             1,
             row.timestamp,
         );
-        send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
+        // Every later frame would meet the same missing path or spent budget.
+        if send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await
+            != ChannelUnicast::Sent
+        {
+            break;
+        }
         budget -= 1;
         served.push(row.msg_id);
     }
@@ -1745,8 +2242,8 @@ pub(super) async fn send_channel_reaction_batch(
         1,
         now,
     );
-    send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
-    true
+    send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await
+        == ChannelUnicast::Sent
 }
 
 /// How long this neighbor's last ask holds before we may ask again.
@@ -1755,6 +2252,10 @@ pub(super) async fn send_channel_reaction_batch(
 /// them — a backlog is being fed to us and the next batch is waiting — and the
 /// idle interval otherwise. Falling back to `interval` when no mark is
 /// recorded keeps a fresh stamp behaving exactly as it did before.
+///
+/// A neighbor whose last attempts found no path at all is on its own backoff
+/// instead: short at first, since a session may be moments from coming up,
+/// and doubling until it is no more often than an idle neighbor.
 pub(super) fn history_sync_gate(
     state: &NetworkState,
     channel_id: [u8; 16],
@@ -1762,6 +2263,15 @@ pub(super) fn history_sync_gate(
     interval: std::time::Duration,
     walk: std::time::Duration,
 ) -> std::time::Duration {
+    if let Some(failures) = state
+        .channel_history_sync_failures
+        .get(&(channel_id, *peer))
+        .copied()
+        .filter(|failures| *failures > 0)
+    {
+        return std::time::Duration::from_secs(ember::channel::history_sync_retry_secs(failures))
+            .min(interval);
+    }
     let ingested = state
         .channel_history_sync_ingested
         .get(&channel_id)
@@ -1815,9 +2325,10 @@ pub(super) async fn maybe_sync_channel_history(
             1
         }
     });
-    let mut sent = 0usize;
-    for ch in rooms {
-        if sent >= 4 {
+    prune_channel_history_sync_stamps(state, &rooms, now, interval);
+    let mut attempts = 0usize;
+    'rooms: for ch in rooms {
+        if attempts >= ember::channel::CHANNEL_HISTORY_SYNC_ATTEMPTS_PER_TICK {
             break;
         }
         let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
@@ -1891,7 +2402,7 @@ pub(super) async fn maybe_sync_channel_history(
         let since = latest;
         let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
         for pk in due {
-            if sent >= 4 {
+            if attempts >= ember::channel::CHANNEL_HISTORY_SYNC_ATTEMPTS_PER_TICK {
                 break;
             }
             let stamp_key = (channel_id, pk);
@@ -1915,16 +2426,84 @@ pub(super) async fn maybe_sync_channel_history(
                 1,
                 ts,
             );
-            if send_channel_gossip_unicast(socket, state, db, channel_id, pk, gossip.encode())
+            // Stamped on the attempt, not the send: this runs every second, and
+            // an unreachable neighbor must wait out its backoff rather than be
+            // due again on the next tick.
+            attempts += 1;
+            let previous = state.channel_history_sync_at.insert(stamp_key, now);
+            match send_channel_gossip_unicast(socket, state, db, channel_id, pk, gossip.encode())
                 .await
             {
-                state.channel_history_sync_at.insert(stamp_key, now);
-                // Catch-up progress as it stood when we asked. If more has
-                // landed by the next pass, a reply brought lines and the walk
-                // interval applies instead of the idle one.
-                state.channel_history_sync_mark.insert(stamp_key, ingested);
-                sent += 1;
+                ChannelUnicast::Sent => {
+                    state.channel_history_sync_failures.remove(&stamp_key);
+                    // Catch-up progress as it stood when we asked. If more has
+                    // landed by the next pass, a reply brought lines and the
+                    // walk interval applies instead of the idle one.
+                    state.channel_history_sync_mark.insert(stamp_key, ingested);
+                }
+                ChannelUnicast::NoPath => {
+                    let failures = state
+                        .channel_history_sync_failures
+                        .entry(stamp_key)
+                        .or_insert(0);
+                    *failures = failures.saturating_add(1);
+                }
+                // Our budget, not their reachability: the ask never happened,
+                // so it stays due, and nothing else this tick will fare better.
+                ChannelUnicast::RateLimited => {
+                    match previous {
+                        Some(at) => state.channel_history_sync_at.insert(stamp_key, at),
+                        None => state.channel_history_sync_at.remove(&stamp_key),
+                    };
+                    break 'rooms;
+                }
             }
         }
     }
+}
+
+/// Drop catch-up bookkeeping that can no longer gate anything.
+///
+/// A stamp past `interval` is due under every gate, so it only still matters
+/// while it carries a failure count — that is what keeps a neighbor that
+/// stays unreachable at the top of its backoff rather than starting over.
+/// Twice the interval covers that, since an attempt at the capped backoff
+/// re-stamps it well before then. Rooms we have left go at once. The walk
+/// marks and failure counts mean nothing without their stamp.
+pub(super) fn prune_channel_history_sync_stamps(
+    state: &mut NetworkState,
+    rooms: &[&crate::storage::database::StoredChannel],
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) {
+    if state.channel_history_sync_at.is_empty()
+        && state.channel_history_sync_mark.is_empty()
+        && state.channel_history_sync_failures.is_empty()
+    {
+        return;
+    }
+    let joined: HashSet<[u8; 16]> = rooms
+        .iter()
+        .filter_map(|ch| {
+            hex::decode(&ch.channel_id)
+                .ok()
+                .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        })
+        .collect();
+    let failures = &state.channel_history_sync_failures;
+    state.channel_history_sync_at.retain(|key, at| {
+        let keep_for = if failures.get(key).is_some_and(|n| *n > 0) {
+            interval.saturating_mul(2)
+        } else {
+            interval
+        };
+        joined.contains(&key.0) && now.saturating_duration_since(*at) < keep_for
+    });
+    let stamps = &state.channel_history_sync_at;
+    state
+        .channel_history_sync_mark
+        .retain(|key, _| stamps.contains_key(key));
+    state
+        .channel_history_sync_failures
+        .retain(|key, _| stamps.contains_key(key));
 }

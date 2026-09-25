@@ -146,6 +146,198 @@ pub(super) fn corrupt_part_indices_on_disk(
     Ok(corrupt)
 }
 
+/// Parts of a `.part` that cannot be read back, or that read back wrong.
+///
+/// Unlike [`corrupt_part_indices_on_disk`], a read error costs only the part
+/// it falls in rather than the whole diagnosis: re-downloading that part
+/// rewrites its sectors, which is what lets a drive remap a bad one. Parts are
+/// only compared when a full hashset is known. `Err` only when the file cannot
+/// be opened or sized at all.
+pub(super) fn unreadable_or_corrupt_parts_on_disk(
+    path: &std::path::Path,
+    file_size: u64,
+    expected_part_hashes: &[[u8; 16]],
+) -> anyhow::Result<Vec<usize>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let part_count = file_size.div_ceil(super::hash::PARTSIZE) as usize;
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != file_size {
+        return Ok((0..part_count).collect());
+    }
+    let hashes = (expected_part_hashes.len() >= part_count).then_some(expected_part_hashes);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut bad = Vec::new();
+    for part_idx in 0..part_count {
+        let start = part_idx as u64 * super::hash::PARTSIZE;
+        let mut remaining = (file_size - start).min(super::hash::PARTSIZE);
+        let mut hasher = Md4::new();
+        let mut readable = file.seek(SeekFrom::Start(start)).is_ok();
+        while readable && remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            match file.read(&mut buf[..want]) {
+                Ok(0) => readable = false,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => readable = false,
+            }
+        }
+        let wrong = readable
+            && hashes.is_some_and(|h| <[u8; 16]>::from(hasher.finalize()) != h[part_idx]);
+        if !readable || wrong {
+            bad.push(part_idx);
+        }
+    }
+    Ok(bad)
+}
+
+/// Inconclusive final verifications in a row before the `.part` is re-read
+/// part by part, tolerating read errors, instead of verified again.
+pub(super) const FINAL_VERIFY_INCONCLUSIVE_LIMIT: u32 = 3;
+/// Wait before re-verifying after the first inconclusive attempt; doubles for
+/// each further one below [`FINAL_VERIFY_INCONCLUSIVE_LIMIT`].
+pub(super) const FINAL_VERIFY_RETRY_BASE_SECS: u64 = 30;
+
+/// Consecutive inconclusive final verifications per transfer id. Kept here
+/// rather than on the worker because each attempt ends the worker and
+/// re-queues the download.
+fn final_verify_inconclusive_runs() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static RUNS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    RUNS.get_or_init(Default::default)
+}
+
+pub(super) fn prior_inconclusive_final_verifies(transfer_id: &str) -> u32 {
+    final_verify_inconclusive_runs()
+        .lock()
+        .map(|runs| runs.get(transfer_id).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn note_inconclusive_final_verify(transfer_id: &str) -> u32 {
+    let Ok(mut runs) = final_verify_inconclusive_runs().lock() else {
+        return FINAL_VERIFY_INCONCLUSIVE_LIMIT;
+    };
+    let n = runs.entry(transfer_id.to_string()).or_insert(0);
+    *n = n.saturating_add(1);
+    *n
+}
+
+pub(super) fn clear_inconclusive_final_verifies(transfer_id: &str) {
+    if let Ok(mut runs) = final_verify_inconclusive_runs().lock() {
+        runs.remove(transfer_id);
+    }
+}
+
+/// How long to wait before a final verification that follows `prior`
+/// inconclusive ones. None before the first, and none once the part-by-part
+/// fallback has run: that re-opened parts, so this attempt follows a download.
+pub(super) fn final_verify_retry_delay(prior: u32) -> std::time::Duration {
+    if prior == 0 || prior >= FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs(FINAL_VERIFY_RETRY_BASE_SECS << (prior - 1))
+}
+
+/// What a failed final whole-file check does to the gap list.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FinalVerifyRecovery {
+    /// These parts are wrong on disk; re-open them for download.
+    Reopen(Vec<usize>),
+    /// Nothing shows the bytes are wrong. Keep every part and verify again
+    /// on the next attempt.
+    Reverify,
+    /// Even a part-by-part re-read cannot find what to re-download. Retrying
+    /// cannot help; the user has to look at the drive.
+    Unreadable,
+}
+
+/// Recovery once the part-by-part fallback has run: re-open what it found,
+/// or give up if it found nothing (or could not open the file).
+pub(super) fn tolerant_final_verify_recovery(diagnosis: Option<Vec<usize>>) -> FinalVerifyRecovery {
+    match diagnosis {
+        Some(parts) if !parts.is_empty() => FinalVerifyRecovery::Reopen(parts),
+        _ => FinalVerifyRecovery::Unreadable,
+    }
+}
+
+/// Count `recovery` against this transfer's run of inconclusive verifications
+/// and escalate once the run reaches [`FINAL_VERIFY_INCONCLUSIVE_LIMIT`].
+///
+/// A digest that was actually computed ends the run. The count survives the
+/// fallback's own re-open, so a part that still cannot be read after being
+/// downloaded again goes straight back to the fallback, and a `.part` that
+/// reads fine part by part but never as a whole ends as `Unreadable` rather
+/// than cycling.
+pub(super) async fn settle_final_verify_recovery(
+    transfer_id: &str,
+    recovery: FinalVerifyRecovery,
+    part_path: PathBuf,
+    file_size: u64,
+    expected_part_hashes: Vec<[u8; 16]>,
+) -> FinalVerifyRecovery {
+    if recovery != FinalVerifyRecovery::Reverify {
+        clear_inconclusive_final_verifies(transfer_id);
+        return recovery;
+    }
+    if note_inconclusive_final_verify(transfer_id) < FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+        return FinalVerifyRecovery::Reverify;
+    }
+    let diagnosis = tokio::task::spawn_blocking(move || {
+        unreadable_or_corrupt_parts_on_disk(&part_path, file_size, &expected_part_hashes)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let settled = tolerant_final_verify_recovery(diagnosis);
+    if settled == FinalVerifyRecovery::Unreadable {
+        clear_inconclusive_final_verifies(transfer_id);
+    }
+    settled
+}
+
+/// Decide the recovery after the whole-file ed2k digest mismatched.
+///
+/// `diagnosis` is [`corrupt_part_indices_on_disk`]'s answer, `None` when that
+/// re-read failed. An empty diagnosis only re-opens everything when the
+/// hashset it was checked against does not reproduce the file hash: when it
+/// does, parts that all match imply a file that matches, so the mismatch came
+/// from the read, not the data.
+pub(super) fn final_verify_recovery(
+    diagnosis: Option<Vec<usize>>,
+    hashset_reproduces_file_hash: bool,
+    part_count: usize,
+) -> FinalVerifyRecovery {
+    match diagnosis {
+        None => FinalVerifyRecovery::Reverify,
+        Some(parts) if !parts.is_empty() => FinalVerifyRecovery::Reopen(parts),
+        Some(_) if hashset_reproduces_file_hash => FinalVerifyRecovery::Reverify,
+        Some(_) => FinalVerifyRecovery::Reopen((0..part_count).collect()),
+    }
+}
+
+/// Re-read the `.part` part by part after a whole-file digest mismatch and
+/// decide what to re-open. See [`final_verify_recovery`].
+pub(super) async fn diagnose_final_hash_mismatch(
+    part_path: PathBuf,
+    file_hash: [u8; 16],
+    file_size: u64,
+    expected_part_hashes: Vec<[u8; 16]>,
+) -> FinalVerifyRecovery {
+    let part_count = file_size.div_ceil(super::hash::PARTSIZE) as usize;
+    let hashset_ok =
+        super::transfer::verify_hashset(&file_hash, &expected_part_hashes, file_size);
+    let diagnosis = tokio::task::spawn_blocking(move || {
+        corrupt_part_indices_on_disk(&part_path, file_size, &expected_part_hashes)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    final_verify_recovery(diagnosis, hashset_ok, part_count)
+}
+
 /// Record that peer `(ip, port)` dropped the TCP connection immediately
 /// after accepting our upload request, with zero bytes of part data
 /// received. Marks `part_idx` (and optionally a list of any other
@@ -4468,6 +4660,24 @@ impl MultiSourceDownload {
         };
 
         if all_done {
+            let retry_delay =
+                final_verify_retry_delay(prior_inconclusive_final_verifies(&self.transfer_id));
+            if !retry_delay.is_zero() {
+                info!(
+                    "Waiting {}s before re-verifying {} after an unreadable attempt",
+                    retry_delay.as_secs(),
+                    self.file_name
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    _ = self.control.wait_cancelled() => {
+                        if let Some(ref registry) = self.tracker_registry {
+                            unregister_own_tracker(registry, &self.transfer_id, &tracker);
+                        }
+                        anyhow::bail!("cancelled by user");
+                    }
+                }
+            }
             let _ = event_tx
                 .send(DownloadEvent::Verifying {
                     transfer_id: self.transfer_id.clone(),
@@ -4502,6 +4712,7 @@ impl MultiSourceDownload {
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
             let mut ember_pin_failed = false;
+            let mut could_not_verify = false;
             // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or
             // Pause during "Verifying" would otherwise leave a thread reading a
             // multi-GB file for minutes. `TransferControl` does not expose its
@@ -4577,16 +4788,18 @@ impl MultiSourceDownload {
                             self.file_name
                         );
                     } else {
+                        could_not_verify = true;
                         warn!(
-                            "Multi-source download hash verification failed for {}: {e}",
+                            "Could not read {} for final verification: {e} — keeping progress",
                             self.file_name
                         );
                     }
                     None
                 }
                 Err(e) => {
+                    could_not_verify = true;
                     warn!(
-                        "Hash verification task failed for {}: {e} — treating as failed",
+                        "Hash verification task failed for {}: {e} — keeping progress",
                         self.file_name
                     );
                     None
@@ -4606,6 +4819,7 @@ impl MultiSourceDownload {
             }
 
             if ember_pin_failed {
+                clear_inconclusive_final_verifies(&self.transfer_id);
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
@@ -4616,6 +4830,7 @@ impl MultiSourceDownload {
             } else if let Some((verified_identity, actual_aich, verified_part_hashes)) =
                 verified_result
             {
+                clear_inconclusive_final_verifies(&self.transfer_id);
                 if let Some(expected_aich) = self.expected_aich_master {
                     let computed = actual_aich.ok_or_else(|| {
                         anyhow::anyhow!("AICH verification did not produce a root")
@@ -4688,64 +4903,108 @@ impl MultiSourceDownload {
                     .await;
             } else {
                 let expected_part_hashes = part_hashes.read().await.clone();
-                let diagnose_path = part_path.clone();
-                let diagnose_size = self.file_size;
-                let corrupt_parts = tokio::task::spawn_blocking(move || {
-                    corrupt_part_indices_on_disk(
-                        &diagnose_path,
-                        diagnose_size,
-                        &expected_part_hashes,
+                let recovery = if could_not_verify {
+                    FinalVerifyRecovery::Reverify
+                } else {
+                    diagnose_final_hash_mismatch(
+                        part_path.clone(),
+                        self.file_hash,
+                        self.file_size,
+                        expected_part_hashes.clone(),
                     )
-                })
-                .await
-                .ok()
-                .and_then(Result::ok);
-
-                let (corrected_bytes, corrected_wire, snap) = {
-                    let mut t = tracker.write().await;
-                    let mut parts_to_reopen = corrupt_parts.unwrap_or_default();
-                    if parts_to_reopen.is_empty() {
-                        parts_to_reopen = (0..t.part_count).collect();
-                    }
-                    for &i in &parts_to_reopen {
-                        if i < t.part_count {
-                            t.mark_incomplete(i);
-                        }
-                    }
-                    warn!(
-                        "Final hash failed for {} — re-opened {}/{} part(s) for retry",
-                        self.file_name,
-                        parts_to_reopen.len(),
-                        t.part_count
-                    );
-                    (t.completed_bytes(), t.transferred(), t.snapshot_for_save())
+                    .await
                 };
-                // Awaited save here: this is a terminal failure path and
-                // we want the .part.met on disk to reflect the reset
-                // before signaling the failure (so a quick restart picks
-                // up the corrected gap list).
-                super::part_tracker::save_snapshot_async(snap).await;
-                let _ = event_tx
-                    .send(DownloadEvent::Progress {
-                        transfer_id: self.transfer_id.clone(),
-                        downloaded: corrected_bytes.min(self.file_size),
-                        // The re-open dropped Completed back by the failed
-                        // part(s); Transferred keeps every byte those parts cost,
-                        // which is the point of having both numbers.
-                        transferred: Some(corrected_wire),
-                        total: self.file_size,
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(DownloadEvent::Failed {
-                        transfer_id: self.transfer_id.clone(),
-                        error: "Final hash verification failed — .part preserved for retry"
-                            .to_string(),
-                        // Transient: parts were reopened and .part.met saved;
-                        // the network loop re-queues Searching so recovery continues.
-                        failure_kind: super::transfer::SourceFailureKind::Transient,
-                    })
-                    .await;
+                let inconclusive = recovery == FinalVerifyRecovery::Reverify;
+                let recovery = settle_final_verify_recovery(
+                    &self.transfer_id,
+                    recovery,
+                    part_path.clone(),
+                    self.file_size,
+                    expected_part_hashes,
+                )
+                .await;
+                match recovery {
+                    FinalVerifyRecovery::Reopen(parts_to_reopen) => {
+                        let (corrected_bytes, corrected_wire, snap) = {
+                            let mut t = tracker.write().await;
+                            for &i in &parts_to_reopen {
+                                if i < t.part_count {
+                                    t.mark_incomplete(i);
+                                }
+                            }
+                            warn!(
+                                "Final hash failed for {} — re-opened {}/{} part(s) for retry",
+                                self.file_name,
+                                parts_to_reopen.len(),
+                                t.part_count
+                            );
+                            (t.completed_bytes(), t.transferred(), t.snapshot_for_save())
+                        };
+                        // Awaited save here: this is a terminal failure path and
+                        // we want the .part.met on disk to reflect the reset
+                        // before signaling the failure (so a quick restart picks
+                        // up the corrected gap list).
+                        super::part_tracker::save_snapshot_async(snap).await;
+                        let _ = event_tx
+                            .send(DownloadEvent::Progress {
+                                transfer_id: self.transfer_id.clone(),
+                                downloaded: corrected_bytes.min(self.file_size),
+                                // The re-open dropped Completed back by the failed
+                                // part(s); Transferred keeps every byte those parts
+                                // cost, which is the point of having both numbers.
+                                transferred: Some(corrected_wire),
+                                total: self.file_size,
+                            })
+                            .await;
+                        // A re-open after read errors is still our drive's
+                        // fault, not a source's, and must read that way.
+                        let error = if inconclusive {
+                            super::transfer::FINAL_VERIFY_INCONCLUSIVE_MSG
+                        } else {
+                            "Final hash verification failed — .part preserved for retry"
+                        };
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: error.to_string(),
+                                // Transient: parts were reopened and .part.met saved;
+                                // the network loop re-queues Searching so recovery
+                                // continues.
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                    FinalVerifyRecovery::Unreadable => {
+                        warn!(
+                            "{} still cannot be read after {FINAL_VERIFY_INCONCLUSIVE_LIMIT} \
+                             verification attempts and a part-by-part re-read — giving up",
+                            self.file_name
+                        );
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: super::transfer::LOCAL_READ_FAILED_MSG.to_string(),
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                    FinalVerifyRecovery::Reverify => {
+                        warn!(
+                            "Final verification of {} was inconclusive — gap list kept, will re-verify",
+                            self.file_name
+                        );
+                        // Transient re-queues the download with its gap list
+                        // intact, so the next attempt re-runs this verification
+                        // rather than downloading anything again.
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: super::transfer::FINAL_VERIFY_INCONCLUSIVE_MSG.to_string(),
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                }
             }
         } else {
             let remaining = {
@@ -12461,5 +12720,240 @@ mod new_connection_window_tests {
         assert_eq!(wait, Some(std::time::Duration::from_secs(4)));
         assert_eq!(new_connection_window_wait(&window, 2, t0 + NEW_CONN_WINDOW), None);
         assert_eq!(new_connection_window_wait(&window, 0, t0), None, "no limit, no wait");
+    }
+}
+
+#[cfg(test)]
+mod final_verify_recovery_tests {
+    use super::*;
+    use crate::network::ed2k::hash::{ed2k_hash_bytes, PARTSIZE};
+
+    #[test]
+    fn a_failed_re_read_keeps_every_part() {
+        assert_eq!(final_verify_recovery(None, true, 5), FinalVerifyRecovery::Reverify);
+        assert_eq!(final_verify_recovery(None, false, 5), FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn diagnosed_parts_are_the_only_ones_reopened() {
+        assert_eq!(
+            final_verify_recovery(Some(vec![1, 3]), true, 5),
+            FinalVerifyRecovery::Reopen(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn no_bad_part_against_a_trusted_hashset_is_not_a_mismatch() {
+        assert_eq!(final_verify_recovery(Some(Vec::new()), true, 5), FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn no_bad_part_against_an_untrusted_hashset_reopens_everything() {
+        assert_eq!(
+            final_verify_recovery(Some(Vec::new()), false, 3),
+            FinalVerifyRecovery::Reopen(vec![0, 1, 2])
+        );
+    }
+
+    struct TwoPartFile {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        file_hash: [u8; 16],
+        part_hashes: Vec<[u8; 16]>,
+        size: u64,
+    }
+
+    impl TwoPartFile {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ember-final-verify-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("f.part");
+            let data: Vec<u8> = (0..PARTSIZE as usize + 500).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            let mut file_hash = [0u8; 16];
+            file_hash.copy_from_slice(&hex::decode(ed2k_hash_bytes(&data)).unwrap());
+            let split = PARTSIZE as usize;
+            let part_hashes = vec![
+                Md4::digest(&data[..split]).into(),
+                Md4::digest(&data[split..]).into(),
+            ];
+            Self { dir, path, file_hash, part_hashes, size: data.len() as u64 }
+        }
+    }
+
+    impl Drop for TwoPartFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn intact_parts_under_a_verified_hashset_are_reverified_not_reopened() {
+        let f = TwoPartFile::new("intact");
+        let got = diagnose_final_hash_mismatch(
+            f.path.clone(),
+            f.file_hash,
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reverify);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_part_is_the_only_one_reopened() {
+        let f = TwoPartFile::new("corrupt");
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        let got = diagnose_final_hash_mismatch(
+            f.path.clone(),
+            f.file_hash,
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_part_file_keeps_progress() {
+        let f = TwoPartFile::new("missing");
+        let missing = f.dir.join("gone.part");
+        let got =
+            diagnose_final_hash_mismatch(missing, f.file_hash, f.size, f.part_hashes.clone())
+                .await;
+        assert_eq!(got, FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn re_verification_waits_grow_and_stop_at_the_fallback() {
+        let secs = |prior| final_verify_retry_delay(prior).as_secs();
+        assert_eq!(secs(0), 0, "the first attempt never waits");
+        assert_eq!(secs(1), FINAL_VERIFY_RETRY_BASE_SECS);
+        assert_eq!(secs(2), FINAL_VERIFY_RETRY_BASE_SECS * 2);
+        assert_eq!(
+            secs(FINAL_VERIFY_INCONCLUSIVE_LIMIT),
+            0,
+            "past the limit the fallback re-opened parts; this attempt follows a download"
+        );
+    }
+
+    #[test]
+    fn the_fallback_reopens_what_it_found_or_gives_up() {
+        assert_eq!(
+            tolerant_final_verify_recovery(Some(vec![2])),
+            FinalVerifyRecovery::Reopen(vec![2])
+        );
+        assert_eq!(tolerant_final_verify_recovery(Some(Vec::new())), FinalVerifyRecovery::Unreadable);
+        assert_eq!(tolerant_final_verify_recovery(None), FinalVerifyRecovery::Unreadable);
+    }
+
+    #[test]
+    fn the_tolerant_re_read_names_only_bad_parts() {
+        let f = TwoPartFile::new("tolerant");
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &f.part_hashes).unwrap(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &[]).unwrap(),
+            Vec::<usize>::new(),
+            "readable parts with nothing to compare against are kept"
+        );
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &f.part_hashes).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size + 1, &f.part_hashes).unwrap(),
+            vec![0, 1],
+            "a size that disagrees re-opens everything"
+        );
+        assert!(unreadable_or_corrupt_parts_on_disk(&f.dir.join("gone"), f.size, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn inconclusive_runs_escalate_then_give_up_on_a_file_that_reads_fine() {
+        let f = TwoPartFile::new("escalate");
+        let id = "final-verify-escalation-test";
+        clear_inconclusive_final_verifies(id);
+        for run in 1..FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+            let got = settle_final_verify_recovery(
+                id,
+                FinalVerifyRecovery::Reverify,
+                f.path.clone(),
+                f.size,
+                f.part_hashes.clone(),
+            )
+            .await;
+            assert_eq!(got, FinalVerifyRecovery::Reverify);
+            assert_eq!(prior_inconclusive_final_verifies(id), run);
+        }
+        let got = settle_final_verify_recovery(
+            id,
+            FinalVerifyRecovery::Reverify,
+            f.path.clone(),
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Unreadable, "nothing to re-download");
+        assert_eq!(prior_inconclusive_final_verifies(id), 0, "a later resume starts afresh");
+    }
+
+    #[tokio::test]
+    async fn the_fallback_reopens_bad_parts_and_keeps_counting() {
+        let f = TwoPartFile::new("fallback");
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        let id = "final-verify-fallback-test";
+        clear_inconclusive_final_verifies(id);
+        let mut got = FinalVerifyRecovery::Reverify;
+        for _ in 0..FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+            got = settle_final_verify_recovery(
+                id,
+                FinalVerifyRecovery::Reverify,
+                f.path.clone(),
+                f.size,
+                f.part_hashes.clone(),
+            )
+            .await;
+        }
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![1]));
+        assert_eq!(prior_inconclusive_final_verifies(id), FINAL_VERIFY_INCONCLUSIVE_LIMIT);
+
+        // A digest that was actually computed ends the run.
+        let got = settle_final_verify_recovery(
+            id,
+            FinalVerifyRecovery::Reopen(vec![0]),
+            f.path.clone(),
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![0]));
+        assert_eq!(prior_inconclusive_final_verifies(id), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_hashset_every_part_is_reopened() {
+        let f = TwoPartFile::new("nohashset");
+        let got = diagnose_final_hash_mismatch(f.path.clone(), f.file_hash, f.size, Vec::new())
+            .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![0, 1]));
     }
 }

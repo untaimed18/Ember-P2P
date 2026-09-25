@@ -183,16 +183,28 @@ export async function pauseAllTransfers(): Promise<void> {
   return invoke('pause_all_transfers');
 }
 
+/** `MAX_BATCH_TRANSFER_IDS` in `commands/transfers.rs`: a larger request is
+ *  refused outright with `transfers_batch_too_large`. */
+const MAX_BATCH_TRANSFER_IDS = 500;
+
+/** Send `transferIds` through a batch command in backend-sized chunks, in
+ *  order, stopping at the first chunk that fails. */
+async function invokeChunked(command: string, transferIds: string[]): Promise<void> {
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    await invoke<void>(command, { transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
+  }
+}
+
 export async function pauseTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('pause_transfers_batch', { transferIds });
+  return invokeChunked('pause_transfers_batch', transferIds);
 }
 
 export async function resumeTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('resume_transfers_batch', { transferIds });
+  return invokeChunked('resume_transfers_batch', transferIds);
 }
 
 export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('stop_transfers_batch', { transferIds });
+  return invokeChunked('stop_transfers_batch', transferIds);
 }
 
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {

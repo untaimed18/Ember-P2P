@@ -1012,6 +1012,19 @@ pub fn is_expected_aich_mismatch(err: &str) -> bool {
 pub const EMBER_BLAKE3_MISMATCH_MSG: &str =
     "ember blake3 mismatch: content did not match the expected Ember hash";
 
+/// Error for a completed download whose final check neither passed nor showed
+/// bad bytes: the `.part` could not be read, or a re-read found every part
+/// intact. Neither this nor [`LOCAL_READ_FAILED_MSG`] is evidence against a
+/// source, so both must classify as Transient and must not contain "hash
+/// mismatch" or "hash verification failed".
+pub const FINAL_VERIFY_INCONCLUSIVE_MSG: &str =
+    "Final verification inconclusive — .part and progress kept, will re-verify";
+
+/// Terminal error once repeated verifications and a part-by-part re-read still
+/// cannot read the finished `.part`. The event loop does not re-queue it.
+pub const LOCAL_READ_FAILED_MSG: &str =
+    "Finished .part cannot be read back from the local drive — not retrying";
+
 /// Classify an error string into transient vs permanent failure.
 pub fn classify_error(err: &str) -> SourceFailureKind {
     let lower = err.to_lowercase();
@@ -1164,6 +1177,10 @@ transfer_failure_codes! {
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
         "Persisted AICH pin was corrupt; cancel and re-add the AICH link";
+    FinalVerifyInconclusive => "final_verify_inconclusive",
+        "Couldn't read the finished file to verify it";
+    LocalReadFailed => "local_read_failed",
+        "The finished file can't be read from the drive";
 }
 
 /// Reduce a raw error to the canned failure the UI shows.
@@ -1179,6 +1196,12 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
     }
     if is_download_folder_error(error) {
         return TransferFailureCode::DownloadFolderUnavailable;
+    }
+    if error.contains(LOCAL_READ_FAILED_MSG) {
+        return TransferFailureCode::LocalReadFailed;
+    }
+    if error.contains(FINAL_VERIFY_INCONCLUSIVE_MSG) {
+        return TransferFailureCode::FinalVerifyInconclusive;
     }
     if lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
@@ -1441,6 +1464,8 @@ mod tests {
                 Transient,
                 C::DownloadFolderUnavailable,
             ),
+            (FINAL_VERIFY_INCONCLUSIVE_MSG, Transient, C::FinalVerifyInconclusive),
+            (LOCAL_READ_FAILED_MSG, Transient, C::LocalReadFailed),
             ("unrecognised", Permanent, C::PermanentFailure),
             ("unrecognised", Transient, C::TransientFailure),
             ("unrecognised", DownloadTimeout, C::DownloadTimedOut),
@@ -1763,6 +1788,25 @@ mod tests {
             !is_ember_blake3_mismatch("Download hash mismatch for file: expected=x, got=y"),
             "ed2k mismatch must not be classified as an Ember pin failure"
         );
+    }
+
+    /// An unreadable `.part` must not blame the source, and must not look like
+    /// a user cancel, a full disk, or a pin failure — each of which the event
+    /// loop handles differently.
+    #[test]
+    fn local_read_failures_are_transient_and_keep_their_own_codes() {
+        for (msg, code) in [
+            (FINAL_VERIFY_INCONCLUSIVE_MSG, TransferFailureCode::FinalVerifyInconclusive),
+            (LOCAL_READ_FAILED_MSG, TransferFailureCode::LocalReadFailed),
+        ] {
+            let kind = classify_error(msg);
+            assert_eq!(kind, SourceFailureKind::Transient, "{msg}");
+            assert_eq!(classify_failure(msg, &kind), code);
+            assert!(!is_user_cancel_error(msg));
+            assert!(!is_disk_full_error(msg));
+            assert!(!is_ember_blake3_mismatch(msg));
+            assert!(!is_expected_aich_mismatch(msg));
+        }
     }
 
     #[test]
@@ -6098,6 +6142,21 @@ impl Ed2kDownload {
             .map_err(|e| anyhow::anyhow!("part file fsync: {e}"))?;
         drop(output);
 
+        let retry_delay = super::multi_source::final_verify_retry_delay(
+            super::multi_source::prior_inconclusive_final_verifies(&self.transfer_id),
+        );
+        if !retry_delay.is_zero() {
+            info!(
+                "Waiting {}s before re-verifying {} after an unreadable attempt",
+                retry_delay.as_secs(),
+                self.file_name
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay) => {}
+                _ = self.control.wait_cancelled() => anyhow::bail!("cancelled by user"),
+            }
+        }
+
         let _ = event_tx
             .send(DownloadEvent::Verifying {
                 transfer_id: self.transfer_id.clone(),
@@ -6114,6 +6173,7 @@ impl Ed2kDownload {
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
+        let mut could_not_verify = false;
         // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or Pause
         // during "Verifying" would otherwise leave a thread reading a multi-GB
         // file for minutes. `TransferControl` does not expose its inner atomic,
@@ -6194,16 +6254,18 @@ impl Ed2kDownload {
                         self.file_name
                     );
                 } else {
+                    could_not_verify = true;
                     warn!(
-                        "Could not verify hash for {}: {e} — treating as failed",
+                        "Could not verify hash for {}: {e} — keeping progress",
                         self.file_name
                     );
                 }
                 None
             }
             Err(e) => {
+                could_not_verify = true;
                 warn!(
-                    "Hash verification task failed for {}: {e} — treating as failed",
+                    "Hash verification task failed for {}: {e} — keeping progress",
                     self.file_name
                 );
                 None
@@ -6213,6 +6275,7 @@ impl Ed2kDownload {
 
         let Some((verified_identity, actual_aich, verified_part_hashes)) = verified_result else {
             if ember_pin_failed {
+                super::multi_source::clear_inconclusive_final_verifies(&self.transfer_id);
                 anyhow::bail!(EMBER_BLAKE3_MISMATCH_MSG);
             }
             // A Stop aborts the verification read part-way through the file.
@@ -6225,49 +6288,66 @@ impl Ed2kDownload {
             // path does. Re-opening every part cost a full re-download of a
             // multi-GB file for one bad 9.28 MB chunk — and the per-part MD4s
             // all passed during transfer, so the usual causes (a write lost to
-            // a crash, external modification of `Temp/`) are localized. Falls
-            // back to every part when there is no hashset to diagnose with, or
-            // the re-read itself fails.
-            let diagnosed = if part_hashes.is_empty() {
-                None
+            // a crash, external modification of `Temp/`) are localized. With no
+            // hashset to diagnose with, every part is re-opened.
+            use super::multi_source::FinalVerifyRecovery;
+            let recovery = if could_not_verify {
+                FinalVerifyRecovery::Reverify
             } else {
-                let diagnose_path = part_path.clone();
-                let diagnose_size = self.file_size;
-                let expected = part_hashes.clone();
-                tokio::task::spawn_blocking(move || {
-                    super::multi_source::corrupt_part_indices_on_disk(
-                        &diagnose_path,
-                        diagnose_size,
-                        &expected,
-                    )
-                })
+                super::multi_source::diagnose_final_hash_mismatch(
+                    part_path.clone(),
+                    self.file_hash,
+                    self.file_size,
+                    part_hashes.clone(),
+                )
                 .await
-                .ok()
-                .and_then(Result::ok)
             };
-            let reopened = match diagnosed {
-                Some(parts) if !parts.is_empty() => {
-                    for i in &parts {
-                        tracker.mark_incomplete(*i);
-                    }
-                    parts.len()
+            let inconclusive = recovery == FinalVerifyRecovery::Reverify;
+            let recovery = super::multi_source::settle_final_verify_recovery(
+                &self.transfer_id,
+                recovery,
+                part_path.clone(),
+                self.file_size,
+                part_hashes.clone(),
+            )
+            .await;
+            let parts = match recovery {
+                FinalVerifyRecovery::Reopen(parts) => parts,
+                FinalVerifyRecovery::Reverify => {
+                    warn!(
+                        "Final verification of {} was inconclusive — gap list kept, will re-verify",
+                        self.file_name
+                    );
+                    anyhow::bail!(FINAL_VERIFY_INCONCLUSIVE_MSG);
                 }
-                _ => {
-                    for i in 0..tracker.part_count {
-                        tracker.mark_incomplete(i);
-                    }
-                    tracker.part_count
+                FinalVerifyRecovery::Unreadable => {
+                    warn!(
+                        "{} still cannot be read after repeated verification attempts and a \
+                         part-by-part re-read — giving up",
+                        self.file_name
+                    );
+                    anyhow::bail!(LOCAL_READ_FAILED_MSG);
                 }
             };
+            for &i in &parts {
+                if i < tracker.part_count {
+                    tracker.mark_incomplete(i);
+                }
+            }
+            let reopened = parts.len();
             super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             warn!(
                 "Final hash failed for {} — re-opened {} of {} parts for retry",
                 self.file_name, reopened, tracker.part_count
             );
+            if inconclusive {
+                anyhow::bail!(FINAL_VERIFY_INCONCLUSIVE_MSG);
+            }
             anyhow::bail!(
                 "Final hash verification failed — .part and .part.met preserved for retry"
             );
         };
+        super::multi_source::clear_inconclusive_final_verifies(&self.transfer_id);
         if let Some(expected_aich) = self.expected_aich_master {
             let actual = actual_aich
                 .ok_or_else(|| anyhow::anyhow!("AICH verification did not produce a root"))?;

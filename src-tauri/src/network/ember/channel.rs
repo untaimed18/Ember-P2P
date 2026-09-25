@@ -129,6 +129,12 @@ pub const PRESENCE_MESH_FRESH_SECS: i64 = PRESENCE_BEAT_SECS * 3 + 15;
 /// Beacons carried in one digest frame. See
 /// `a_full_presence_digest_fits_one_unfragmented_datagram`.
 pub const PRESENCE_BEACON_BATCH_MAX: usize = 10;
+/// Beacons carried in one digest frame that also carries key proofs.
+///
+/// One fewer than [`PRESENCE_BEACON_BATCH_MAX`]: the proof trailer does not fit
+/// beside a full batch inside one unfragmented datagram. Decoding still admits
+/// the larger count, which is what builds without proofs send.
+pub const PRESENCE_BEACON_PROVEN_BATCH_MAX: usize = PRESENCE_BEACON_BATCH_MAX - 1;
 
 /// Smallest gap between two *flooded* announcements from one member.
 ///
@@ -331,6 +337,29 @@ pub fn gossip_is_catch_up_shaped(ttl: u8) -> bool {
 pub fn history_sync_walking(mark: Option<i64>, ingested: i64) -> bool {
     mark.is_some_and(|mark| ingested > mark)
 }
+/// Catch-up requests one tick may attempt, sent or not.
+///
+/// Counted per attempt rather than per success, so a tick whose neighbors are
+/// all unreachable still stops after this many instead of walking every
+/// room's roster.
+pub const CHANNEL_HISTORY_SYNC_ATTEMPTS_PER_TICK: usize = 4;
+/// First retry after a catch-up request found no path to its neighbor.
+pub const CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS: u64 = 5;
+/// How long to wait before asking a neighbor again after `failures` attempts
+/// in a row found no way to reach them.
+///
+/// Doubles per failure and stops at [`CHANNEL_HISTORY_SYNC_SECS`], so a
+/// neighbor that is simply offline costs no more than an idle one does. Zero
+/// failures has no backoff of its own; the caller's ordinary gate applies.
+pub fn history_sync_retry_secs(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    let shift = (failures - 1).min(16);
+    CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(CHANNEL_HISTORY_SYNC_SECS)
+}
 /// How soon opening a room may re-ask for its history ahead of that gate.
 ///
 /// Focusing a room drops its catch-up stamps so the next tick asks straight
@@ -393,6 +422,55 @@ pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
 pub fn handoff_offer_live(version: u64, now: i64) -> bool {
     let offered_at = i64::try_from(version).unwrap_or(i64::MAX);
     (0..HANDOFF_PENDING_TTL_SECS).contains(&now.saturating_sub(offered_at))
+}
+
+/// [`handoff_offer_live`] as the nominee applies it, on a clock that is not
+/// the owner's.
+///
+/// The version was stamped by the owner, so a nominee running a little slow
+/// sees a fresh offer dated in its future — which the owner-side rule rightly
+/// treats as lapsed, and which would refuse an honest offer here. The same
+/// skew the gossip envelope is allowed is allowed here; the window closes that
+/// much earlier on the nominee's side as a result, never later.
+pub fn handoff_offer_live_at_target(version: u64, now: i64) -> bool {
+    handoff_offer_live(version, now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS))
+}
+
+/// Least gap between two publishes of a committed handoff record.
+pub const HANDOFF_REPUBLISH_SECS: i64 = 60;
+/// How long after a handoff is committed (or re-driven) its record keeps
+/// being published before the owner is told it did not land. Ten attempts at
+/// [`HANDOFF_REPUBLISH_SECS`].
+pub const HANDOFF_REPUBLISH_WINDOW_SECS: i64 = 10 * 60;
+
+/// What the owner should do about a handoff it has committed to but has not
+/// seen stored anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffRepublish {
+    Publish,
+    Wait,
+    /// Out of attempts, or the offer it answers has lapsed. The commitment
+    /// stands — the record may yet be found stored — but nothing more is sent
+    /// until the owner re-drives it.
+    GiveUp,
+}
+
+pub fn handoff_republish_due(
+    version: u64,
+    committed_at: i64,
+    last_attempt: i64,
+    now: i64,
+) -> HandoffRepublish {
+    if !handoff_offer_live(version, now)
+        || now.saturating_sub(committed_at) >= HANDOFF_REPUBLISH_WINDOW_SECS
+        || committed_at > now
+    {
+        return HandoffRepublish::GiveUp;
+    }
+    if last_attempt > 0 && now.saturating_sub(last_attempt) < HANDOFF_REPUBLISH_SECS {
+        return HandoffRepublish::Wait;
+    }
+    HandoffRepublish::Publish
 }
 // --- Ember Transfer -------------------------------------------------------
 //
@@ -785,9 +863,56 @@ pub fn derive_channel_presence_capability(
 /// public content key can mint a chat line, so treating every author as a
 /// mesh neighbor is how a public room gets eclipsed. Private rooms fold a
 /// secret into the content key, so a chat line is already evidence of
-/// membership. Chat display can still show the author either way.
-pub fn chat_author_joins_gossip_roster(private: bool) -> bool {
-    private
+/// membership — but only under the key the room seals with *now*, and only
+/// when the seal is the author's own. A retired epoch is still held by whoever
+/// a rotation evicted, so a line under one is evidence of nothing but having
+/// once been here.
+///
+/// The seal is the author's for a live line: relays pass the original body on
+/// with only its TTL lowered. It is not for a catch-up re-serve, which the
+/// responder seals afresh under *its* current key around a line it may have
+/// stored while it was the one lagging — so a line the evicted member wrote
+/// under the old epoch would reach us looking current. Those go out at TTL 1
+/// ([`gossip_is_catch_up_shaped`]), and a TTL-1 frame is never taken as
+/// evidence, which costs only a live line on its final hop that presence will
+/// vouch for anyway. Chat display can still show the author either way.
+pub fn chat_author_joins_gossip_roster(private: bool, opened: OpenedUnder, ttl: u8) -> bool {
+    private && opened == OpenedUnder::Current && !gossip_is_catch_up_shaped(ttl)
+}
+
+/// Which of a room's content keys opened a frame.
+///
+/// [`OpenedUnder::Retired`] is every key but the head of the list: an older
+/// epoch, or the original invite secret once a room has rotated. Those stay
+/// readable so in-flight traffic and lagging members are not lost, but they
+/// are also exactly what an evicted member still holds, so a frame opened
+/// under one is read-only — it may be displayed, and may refresh a member the
+/// roster already has, but it must not admit anyone or change anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenedUnder {
+    Current,
+    Retired,
+}
+
+/// Try `keys` in order and report which one `open` succeeded under.
+///
+/// `keys` is newest-first, as `channel_content_keys` builds it, so the head is
+/// the key this device seals new traffic with and is the only one that counts
+/// as current.
+pub fn open_with_content_keys<T>(
+    keys: &[[u8; 32]],
+    mut open: impl FnMut(&[u8; 32]) -> Option<T>,
+) -> Option<(T, OpenedUnder)> {
+    keys.iter().enumerate().find_map(|(index, key)| {
+        open(key).map(|value| {
+            let opened = if index == 0 {
+                OpenedUnder::Current
+            } else {
+                OpenedUnder::Retired
+            };
+            (value, opened)
+        })
+    })
 }
 
 /// Presence timestamps more than this far ahead of wall clock are dropped.
@@ -1378,10 +1503,25 @@ pub struct PresenceBeacon {
     /// that one nobody has to be trusted about.
     pub departed: bool,
     pub signature: [u8; 64],
+    /// The author's proof that they hold the content key they sealed their
+    /// own beacon under. See [`PresenceBeacon::proves_key`].
+    ///
+    /// Carried verbatim by relays, like the signature. It is the only part of a
+    /// beacon that says anything about the room's key: the signed epoch is a
+    /// number the author picks, and the frame's own seal belongs to whoever
+    /// assembled the digest — a member who may have picked the beacon up while
+    /// still on an epoch its author was later evicted from.
+    pub key_proof: Option<[u8; PRESENCE_BEACON_PROOF_LEN]>,
 }
 
 /// `flags(1) || pubkey(32) || timestamp(8) || signature(64)`.
 pub const PRESENCE_BEACON_ENTRY_LEN: usize = 1 + 32 + 8 + 64;
+/// Bytes of key proof per beacon, in a trailer after the entries.
+///
+/// Short because it only has to resist online guessing — checking one needs
+/// the key it proves — and a full digest has to stay one datagram.
+pub const PRESENCE_BEACON_PROOF_LEN: usize = 8;
+const PRESENCE_BEACON_PROOF_DOMAIN: &[u8] = b"ember-channel-presence-key-proof-v1\0";
 /// `flags` bit 0: this is a leave rather than an announcement.
 const PRESENCE_BEACON_FLAG_DEPARTED: u8 = 0x01;
 
@@ -1434,10 +1574,66 @@ pub fn sign_presence_beacon(
             signing_key,
             &presence_beacon_preimage(channel_id, key_epoch, member, timestamp, departed),
         ),
+        key_proof: None,
     }
 }
 
+fn presence_beacon_key_proof(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    member: &[u8; 32],
+    timestamp: i64,
+    departed: bool,
+) -> [u8; PRESENCE_BEACON_PROOF_LEN] {
+    let mut input = Vec::with_capacity(PRESENCE_BEACON_PROOF_DOMAIN.len() + 16 + 32 + 8 + 1);
+    input.extend_from_slice(PRESENCE_BEACON_PROOF_DOMAIN);
+    input.extend_from_slice(channel_id);
+    input.extend_from_slice(member);
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    input.push(u8::from(departed));
+    let full = blake3::keyed_hash(content_key, &input);
+    let mut out = [0u8; PRESENCE_BEACON_PROOF_LEN];
+    out.copy_from_slice(&full.as_bytes()[..PRESENCE_BEACON_PROOF_LEN]);
+    out
+}
+
 impl PresenceBeacon {
+    /// Attach the author's proof of `content_key`. Only ever called on our own
+    /// beacon, with the key we seal new traffic under.
+    pub fn with_key_proof(mut self, channel_id: &[u8; 16], content_key: &[u8; 32]) -> Self {
+        self.key_proof = Some(presence_beacon_key_proof(
+            content_key,
+            channel_id,
+            &self.member,
+            self.timestamp,
+            self.departed,
+        ));
+        self
+    }
+
+    /// Whether this beacon's author held `content_key` when they minted it.
+    ///
+    /// Bound to the member, timestamp and departure bit, so a proof cannot be
+    /// lifted onto another beacon. It is not inside the signature — builds
+    /// that predate it still verify beacons that carry one — which costs
+    /// nothing: anyone able to mint a valid proof holds the key already, and
+    /// could as easily have handed it to whoever they meant to vouch for.
+    pub fn proves_key(&self, channel_id: &[u8; 16], content_key: &[u8; 32]) -> bool {
+        self.key_proof.is_some_and(|proof| {
+            let expected = presence_beacon_key_proof(
+                content_key,
+                channel_id,
+                &self.member,
+                self.timestamp,
+                self.departed,
+            );
+            proof
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                == 0
+        })
+    }
     /// The roster `last_seen` this beacon supports, or nothing if its clock is
     /// unusable. Clamped by [`clamp_presence_timestamp`] so a member running
     /// slightly fast cannot sort ahead of honest peers, and one running wildly
@@ -1448,9 +1644,24 @@ impl PresenceBeacon {
 }
 
 /// Pack beacons for the wire. A join announcement is a batch of one.
+///
+/// Key proofs ride in a trailer of one fixed-size slot per entry, zeroed for a
+/// beacon that has none, after entries laid out exactly as before. Builds that
+/// predate the trailer only check the frame is *at least* as long as its
+/// entries, so they read the batch and ignore it.
 pub fn encode_channel_presence_beacons(beacons: &[PresenceBeacon]) -> Vec<u8> {
-    let count = beacons.len().min(PRESENCE_BEACON_BATCH_MAX);
-    let mut out = Vec::with_capacity(2 + count * PRESENCE_BEACON_ENTRY_LEN);
+    let proven = beacons
+        .iter()
+        .take(PRESENCE_BEACON_PROVEN_BATCH_MAX)
+        .any(|b| b.key_proof.is_some());
+    let cap = if proven {
+        PRESENCE_BEACON_PROVEN_BATCH_MAX
+    } else {
+        PRESENCE_BEACON_BATCH_MAX
+    };
+    let count = beacons.len().min(cap);
+    let trailer = if proven { count * PRESENCE_BEACON_PROOF_LEN } else { 0 };
+    let mut out = Vec::with_capacity(2 + count * PRESENCE_BEACON_ENTRY_LEN + trailer);
     out.push(PRESENCE_BEACON_PLAIN_VERSION);
     out.push(count as u8);
     for beacon in beacons.iter().take(count) {
@@ -1462,6 +1673,11 @@ pub fn encode_channel_presence_beacons(beacons: &[PresenceBeacon]) -> Vec<u8> {
         out.extend_from_slice(&beacon.member);
         out.extend_from_slice(&beacon.timestamp.to_le_bytes());
         out.extend_from_slice(&beacon.signature);
+    }
+    if proven {
+        for beacon in beacons.iter().take(count) {
+            out.extend_from_slice(&beacon.key_proof.unwrap_or([0u8; PRESENCE_BEACON_PROOF_LEN]));
+        }
     }
     out
 }
@@ -1497,6 +1713,8 @@ pub fn decode_channel_presence_beacons(
     if count > PRESENCE_BEACON_BATCH_MAX || bytes.len() < 2 + count * PRESENCE_BEACON_ENTRY_LEN {
         return Some(Vec::new());
     }
+    let proofs_at = 2 + count * PRESENCE_BEACON_ENTRY_LEN;
+    let has_proofs = bytes.len() == proofs_at + count * PRESENCE_BEACON_PROOF_LEN && count > 0;
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let at = 2 + index * PRESENCE_BEACON_ENTRY_LEN;
@@ -1508,11 +1726,20 @@ pub fn decode_channel_presence_beacons(
         let timestamp = i64::from_le_bytes(stamp);
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&bytes[at + 41..at + PRESENCE_BEACON_ENTRY_LEN]);
+        let key_proof = if has_proofs {
+            let slot = proofs_at + index * PRESENCE_BEACON_PROOF_LEN;
+            let mut proof = [0u8; PRESENCE_BEACON_PROOF_LEN];
+            proof.copy_from_slice(&bytes[slot..slot + PRESENCE_BEACON_PROOF_LEN]);
+            (proof != [0u8; PRESENCE_BEACON_PROOF_LEN]).then_some(proof)
+        } else {
+            None
+        };
         let beacon = PresenceBeacon {
             member,
             timestamp,
             departed,
             signature,
+            key_proof,
         };
         if beacon.last_seen_at(now).is_none() {
             continue;
@@ -1603,8 +1830,18 @@ pub fn beacon_superseded(held: Option<&PresenceBeacon>, incoming: &PresenceBeaco
 /// duplicates are the normal case rather than an anomaly. Keeping the newest is
 /// what makes the layer converge instead of flapping between whichever copy
 /// happened to be processed last.
+///
+/// A copy of the same beacon that has lost its key proof — re-packed by a
+/// build that predates the trailer — does not displace one that still has it.
 pub fn keep_latest_beacon(latest: &mut HashMap<[u8; 32], PresenceBeacon>, beacon: PresenceBeacon) {
-    if !beacon_superseded(latest.get(&beacon.member), &beacon) {
+    let held = latest.get(&beacon.member);
+    let loses_proof = held.is_some_and(|prev| {
+        prev.timestamp == beacon.timestamp
+            && prev.departed == beacon.departed
+            && prev.key_proof.is_some()
+            && beacon.key_proof.is_none()
+    });
+    if !loses_proof && !beacon_superseded(held, &beacon) {
         latest.insert(beacon.member, beacon);
     }
 }
@@ -3596,14 +3833,93 @@ mod tests {
     }
 
     #[test]
+    fn a_line_under_a_retired_key_is_read_but_admits_nobody() {
+        let channel_id = [0x42u8; 16];
+        let current = content_key(&[0x01u8; 32]);
+        let retired = content_key(&[0x02u8; 32]);
+        let legacy = content_key(&[0x03u8; 32]);
+        let keys = [current, retired, legacy];
+        let open = |sealed_with: &[u8; 32]| {
+            let gossip = ChannelGossip::new_plaintext(channel_id, sealed_with, 1, b"hi", 1);
+            open_with_content_keys(&keys, |candidate| gossip.decrypt(candidate))
+        };
+
+        let (plain, opened) = open(&current).expect("current key opens");
+        assert_eq!(plain, b"hi");
+        assert_eq!(opened, OpenedUnder::Current);
+        for old in [retired, legacy] {
+            let (plain, opened) = open(&old).expect(
+                "a retired key still reads, or in-flight traffic is lost across a rotation",
+            );
+            assert_eq!(plain, b"hi");
+            assert_eq!(opened, OpenedUnder::Retired);
+            assert!(
+                !chat_author_joins_gossip_roster(true, opened, CHANNEL_MSG_TTL_DEFAULT),
+                "an evicted member holds every retired key; a line under one \
+                 must not put a fresh identity on the roster"
+            );
+        }
+        assert!(
+            !chat_author_joins_gossip_roster(true, OpenedUnder::Current, 1),
+            "a catch-up re-serve is sealed by the responder, not the author, so \
+             its current-key seal says nothing about who wrote the line"
+        );
+        assert!(open(&content_key(&[0x04u8; 32])).is_none());
+        assert!(open_with_content_keys::<()>(&[], |_| Some(())).is_none());
+    }
+
+    #[test]
+    fn a_nominee_tolerates_owner_clock_skew_but_not_a_stale_offer() {
+        let now = 1_800_000_000i64;
+        assert!(handoff_offer_live_at_target(now as u64, now));
+        assert!(
+            handoff_offer_live_at_target((now + 60) as u64, now),
+            "an owner a minute fast still gets an answer"
+        );
+        assert!(!handoff_offer_live_at_target(
+            (now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1) as u64,
+            now
+        ));
+        assert!(!handoff_offer_live_at_target(
+            (now - HANDOFF_PENDING_TTL_SECS) as u64,
+            now
+        ));
+        assert!(
+            !handoff_offer_live_at_target(
+                (now - HANDOFF_PENDING_TTL_SECS + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS) as u64,
+                now
+            ),
+            "the nominee's window closes early by the skew, never late"
+        );
+        assert!(!handoff_offer_live_at_target(u64::MAX, now));
+        assert!(!handoff_offer_live_at_target(1, now));
+    }
+
+    #[test]
+    fn unreachable_catch_up_neighbors_back_off_to_the_idle_interval() {
+        assert_eq!(history_sync_retry_secs(0), 0);
+        assert_eq!(history_sync_retry_secs(1), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS);
+        assert_eq!(history_sync_retry_secs(2), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS * 2);
+        assert_eq!(history_sync_retry_secs(3), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS * 4);
+        let mut last = 0;
+        for failures in 1..64 {
+            let wait = history_sync_retry_secs(failures);
+            assert!(wait >= last, "backoff never shrinks while failures grow");
+            assert!(wait <= CHANNEL_HISTORY_SYNC_SECS);
+            last = wait;
+        }
+        assert_eq!(history_sync_retry_secs(u32::MAX), CHANNEL_HISTORY_SYNC_SECS);
+    }
+
+    #[test]
     fn a_public_chat_line_does_not_insert_a_stranger_into_the_neighbor_set() {
         assert!(
-            !chat_author_joins_gossip_roster(false),
+            !chat_author_joins_gossip_roster(false, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
             "public rooms take neighbors from presence, not from chat authors"
         );
         assert!(
-            chat_author_joins_gossip_roster(true),
-            "a private chat line is already evidence of membership"
+            chat_author_joins_gossip_roster(true, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
+            "a live private chat line is already evidence of membership"
         );
 
         let self_pk = [1u8; 32];
@@ -5067,15 +5383,164 @@ mod tests {
     #[test]
     fn a_full_presence_digest_fits_one_unfragmented_datagram() {
         let budget = crate::network::ember::dht::messages::MAX_UNFRAGMENTED_PAYLOAD;
-        let framed = 2
-            + PRESENCE_BEACON_BATCH_MAX * PRESENCE_BEACON_ENTRY_LEN
-            + GOSSIP_HEADER_LEN
-            + GOSSIP_ENVELOPE_OVERHEAD
-            + CHANNEL_RELAY_ENVELOPE_HEADER;
+        let around = GOSSIP_HEADER_LEN + GOSSIP_ENVELOPE_OVERHEAD + CHANNEL_RELAY_ENVELOPE_HEADER;
+        let framed = 2 + PRESENCE_BEACON_BATCH_MAX * PRESENCE_BEACON_ENTRY_LEN + around;
         assert!(
             framed <= budget,
             "a full digest is {framed} bytes, over the {budget}-byte unfragmented budget — \
              lower PRESENCE_BEACON_BATCH_MAX rather than letting digests fragment"
+        );
+        let proven = 2
+            + PRESENCE_BEACON_PROVEN_BATCH_MAX
+                * (PRESENCE_BEACON_ENTRY_LEN + PRESENCE_BEACON_PROOF_LEN)
+            + around;
+        assert!(
+            proven <= budget,
+            "a full digest with key proofs is {proven} bytes, over the {budget}-byte budget — \
+             lower PRESENCE_BEACON_PROVEN_BATCH_MAX"
+        );
+
+        let room = [0x11u8; 16];
+        let key = content_key(&[0x33u8; 32]);
+        let many: Vec<PresenceBeacon> = (0..PRESENCE_BEACON_BATCH_MAX as u8)
+            .map(|seed| test_beacon(seed + 1, &room, 0, 1_700_000_000).1.with_key_proof(&room, &key))
+            .collect();
+        assert_eq!(
+            encode_channel_presence_beacons(&many).len(),
+            proven - around,
+            "the encoder must hold a proven digest to the smaller batch"
+        );
+    }
+
+    /// The eviction bypass this closes: a member who picked up an evicted
+    /// member's fresh identity while still on the old epoch later relays it
+    /// inside a digest sealed under the new one. The frame's seal is theirs;
+    /// only the proof speaks for the author.
+    #[test]
+    fn only_the_authors_own_proof_of_the_current_key_vouches_for_a_beacon() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let retired = content_key(&[0x01u8; 32]);
+        let current = content_key(&[0x02u8; 32]);
+
+        let (_, evicted) = test_beacon(7, &room, 3, now);
+        let evicted = evicted.with_key_proof(&room, &retired);
+        let (_, honest) = test_beacon(8, &room, 4, now);
+        let honest = honest.with_key_proof(&room, &current);
+        let (_, legacy) = test_beacon(9, &room, 4, now);
+
+        let frame = encode_channel_presence_beacons(&[honest, evicted, legacy]);
+        let got = decode_channel_presence_beacons(&frame, &room, 4, now).expect("a beacon frame");
+        assert_eq!(got, vec![honest, evicted, legacy], "proofs survive the round trip");
+        assert!(got[0].proves_key(&room, &current));
+        assert!(
+            !got[1].proves_key(&room, &current),
+            "a proof under a retired key is no proof of the current one"
+        );
+        assert!(!got[2].proves_key(&room, &current), "no proof proves nothing");
+
+        let lifted = PresenceBeacon {
+            member: evicted.member,
+            timestamp: evicted.timestamp,
+            departed: evicted.departed,
+            signature: evicted.signature,
+            key_proof: honest.key_proof,
+        };
+        assert!(
+            !lifted.proves_key(&room, &current),
+            "a proof is bound to its own beacon and cannot be moved onto another"
+        );
+        let redated = PresenceBeacon {
+            timestamp: now - 1,
+            ..honest
+        };
+        assert!(!redated.proves_key(&room, &current));
+        assert!(!honest.proves_key(&[0x22u8; 16], &current));
+    }
+
+    /// A build that predates the trailer must still read a proven digest, and
+    /// this build must still read theirs.
+    #[test]
+    fn the_key_proof_trailer_is_invisible_to_older_builds() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let key = content_key(&[0x02u8; 32]);
+        let (_, a) = test_beacon(1, &room, 0, now);
+        let (_, b) = test_beacon(2, &room, 0, now);
+        let proven = encode_channel_presence_beacons(&[a.with_key_proof(&room, &key), b]);
+        let legacy = encode_channel_presence_beacons(&[a, b]);
+        assert_eq!(
+            &proven[..legacy.len()],
+            legacy.as_slice(),
+            "the entries are laid out exactly as before; only a trailer follows"
+        );
+        let got = decode_channel_presence_beacons(&legacy, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got, vec![a, b]);
+        assert!(got.iter().all(|beacon| beacon.key_proof.is_none()));
+
+        let mut odd = proven.clone();
+        odd.push(0);
+        let got = decode_channel_presence_beacons(&odd, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got.len(), 2, "a trailer of the wrong size is ignored, not fatal");
+        assert!(got.iter().all(|beacon| beacon.key_proof.is_none()));
+    }
+
+    #[test]
+    fn a_relayed_copy_without_its_proof_does_not_displace_the_proven_one() {
+        let room = [0x11u8; 16];
+        let key = content_key(&[0x02u8; 32]);
+        let (pk, plain) = test_beacon(1, &room, 0, 1_700_000_000);
+        let proven = plain.with_key_proof(&room, &key);
+        let mut latest = HashMap::new();
+        keep_latest_beacon(&mut latest, proven);
+        keep_latest_beacon(&mut latest, plain);
+        assert_eq!(latest.get(&pk), Some(&proven));
+        let (_, newer) = test_beacon(1, &room, 0, 1_700_000_001);
+        keep_latest_beacon(&mut latest, newer);
+        assert_eq!(latest.get(&pk), Some(&newer), "a newer beacon still wins");
+    }
+
+    #[test]
+    fn a_committed_handoff_is_republished_on_a_bounded_schedule() {
+        let offered = 1_800_000_000i64;
+        let committed = offered + 30;
+        let version = offered as u64;
+        assert_eq!(
+            handoff_republish_due(version, committed, 0, committed),
+            HandoffRepublish::Publish
+        );
+        assert_eq!(
+            handoff_republish_due(version, committed, committed, committed + 10),
+            HandoffRepublish::Wait
+        );
+        assert_eq!(
+            handoff_republish_due(
+                version,
+                committed,
+                committed,
+                committed + HANDOFF_REPUBLISH_SECS
+            ),
+            HandoffRepublish::Publish
+        );
+        assert_eq!(
+            handoff_republish_due(
+                version,
+                committed,
+                0,
+                committed + HANDOFF_REPUBLISH_WINDOW_SECS
+            ),
+            HandoffRepublish::GiveUp,
+            "attempts are bounded by the window"
+        );
+        assert_eq!(
+            handoff_republish_due(version, offered + HANDOFF_PENDING_TTL_SECS - 1, 0, offered + HANDOFF_PENDING_TTL_SECS),
+            HandoffRepublish::GiveUp,
+            "a re-driven commit still stops when the offer it answers lapses"
+        );
+        assert_eq!(
+            handoff_republish_due(version, committed + 100, 0, committed),
+            HandoffRepublish::GiveUp,
+            "a clock that moved backwards cannot keep a commit publishing forever"
         );
     }
 
@@ -5241,6 +5706,7 @@ mod tests {
             timestamp: now,
             departed: false,
             signature: [0xBBu8; 64],
+            key_proof: None,
         };
         let frame = encode_channel_presence_beacons(&[first, junk, second]);
         let got = decode_channel_presence_beacons(&frame, &room, 0, now).expect("a beacon frame");

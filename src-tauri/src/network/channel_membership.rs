@@ -946,7 +946,7 @@ pub(super) fn channel_presence_digest(
     out.extend(
         others
             .into_iter()
-            .take(ember::channel::PRESENCE_BEACON_BATCH_MAX - 1),
+            .take(ember::channel::PRESENCE_BEACON_PROVEN_BATCH_MAX - 1),
     );
     out
 }
@@ -1042,7 +1042,8 @@ pub(super) async fn maybe_beat_channel_presence(
             ch.key_epoch,
             now,
             false,
-        );
+        )
+        .with_key_proof(&channel_id, &key);
         remember_channel_beacon(state, channel_id, ours);
         let digest = channel_presence_digest(state, channel_id, ours, now);
         let body = seal_channel_beacons(channel_id, &key, &digest, 1, now);
@@ -1080,7 +1081,8 @@ pub(super) async fn flood_channel_presence_beacon(
         ch.key_epoch,
         now,
         departed,
-    );
+    )
+    .with_key_proof(&channel_id, &key);
     let body = seal_channel_beacons(
         channel_id,
         &key,
@@ -1165,6 +1167,17 @@ pub(super) fn channel_beacon_insert_ok(
 /// that says "X is gone": absence of a fresh beacon is how a member goes
 /// offline, and a leave is a member's own signed departure record. Accepting a
 /// third party's word for either would let any member evict anyone.
+///
+/// With an `admission_key` — a private room's current content key — a member
+/// the roster does not hold is admitted only on their own proof of that key
+/// ([`ember::channel::PresenceBeacon::proves_key`]). Neither the frame's seal
+/// nor the signed epoch will do: a digest is sealed by whoever assembled it,
+/// possibly a member who picked the beacon up while still on an epoch its
+/// author was then evicted from, and the epoch is a number the author picks.
+/// Admitting on either would let an evicted member's fresh identity onto the
+/// roster the owner re-seals each new epoch to. Members already on the roster
+/// need no proof.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_channel_presence_beacons(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -1174,6 +1187,7 @@ pub(super) async fn apply_channel_presence_beacons(
     gossip: &ember::channel::ChannelGossip,
     beacons: Vec<ember::channel::PresenceBeacon>,
     from_id: ember::dht::EmberNodeId,
+    admission_key: Option<[u8; 32]>,
 ) {
     let now = chrono::Utc::now().timestamp();
     let channel_id = gossip.channel_id;
@@ -1197,6 +1211,11 @@ pub(super) async fn apply_channel_presence_beacons(
             .channel_member_status(&ch.channel_id, &member_hex)
             .unwrap_or(None);
         if status == Some(true) {
+            continue;
+        }
+        if status.is_none()
+            && admission_key.is_some_and(|key| !beacon.proves_key(&channel_id, &key))
+        {
             continue;
         }
         // Anything we already hold that outranks this one settles it. Without
@@ -2045,6 +2064,23 @@ pub(super) fn rotate_owned_channel_key(db: &Database, channel_id_hex: &str, from
 /// Skips banned members and ourselves, exactly as the rotation did. Reads the
 /// `banned` flag from the database, which is safe here because any ban that
 /// triggered a rotation was committed long before this timer runs.
+///
+/// Every unbanned row is taken as entitled, which holds only because a new row
+/// needs evidence that its *author* held the current key — not merely that
+/// whoever sealed the frame did:
+/// - a DHT presence record, whose extra the member seals themselves and
+///   storers only hold;
+/// - a beacon carrying the member's own key proof, checked against our current
+///   key in [`apply_channel_presence_beacons`];
+/// - a live chat line opened under the current key, whose seal is the author's
+///   because relays forward the original body. Catch-up re-serves are sealed
+///   by the responder and never admit ([`ember::channel::chat_author_joins_gossip_roster`]).
+///
+/// The remaining writers are the owner's own snapshot, a moderator's signed
+/// action, and a handoff copying the old roster — each an authority over who
+/// is in the room. What this does not cover is a member who holds the current
+/// key and chooses to vouch for someone: they could as easily hand that
+/// someone the key.
 pub(super) async fn republish_channel_key_epoch(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -2273,6 +2309,10 @@ pub(super) async fn maybe_refresh_channel_handoff(
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
     }
+    // Rides this timer because it is the handoff loop's own: our committed
+    // handoffs are republished here, and finished once this fetch or a
+    // publish acknowledgement confirms one is stored.
+    maybe_drive_channel_handoffs(socket, state, db).await;
     let now = chrono::Utc::now().timestamp();
     let Some(channels) = channels_lite_cached(state, db) else {
         return;
@@ -2402,6 +2442,20 @@ pub(super) fn ingest_channel_handoff_records(
     let keep = handoff.flags & ember::channel::HANDOFF_FLAG_KEEP_JOIN_SECRET != 0;
     let successor_pk = hex::encode(handoff.successor_pubkey);
     let successor_id = hex::encode(handoff.successor_channel_id);
+    // Our own record, found stored — possibly one whose acknowledgement never
+    // came back. It is not applied here: that would drop our seed before the
+    // registry name was signed over to the successor. Confirming it hands the
+    // rest to `maybe_drive_channel_handoffs`, which does both in order.
+    if ch.is_owner {
+        let _ = db.confirm_channel_handoff(
+            &channel_id_hex,
+            handoff.version,
+            &successor_pk,
+            chrono::Utc::now().timestamp(),
+            true,
+        );
+        return None;
+    }
     let seed = db
         .load_handoff_pending_seed(&channel_id_hex, &successor_pk, handoff.version)
         .ok()
@@ -2577,16 +2631,26 @@ pub(super) fn ingest_channel_presence_records(
     let now = chrono::Utc::now().timestamp();
     let mut latest: HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember> =
         HashMap::new();
+    // Publishers with at least one record sealed under the current key. Only
+    // they may be added to the roster: a retired key is also what a rotation's
+    // evicted member holds, and a record under one from a key the roster has
+    // never seen is that member under a new name.
+    let mut current: HashSet<[u8; 32]> = HashSet::new();
     for blob in records {
-        let Some(member) = content_keys.iter().find_map(|candidate| {
-            ember::dht::publish::SignedRecord::parse_channel_presence_member(
-                blob,
-                &channel_id,
-                Some(candidate),
-            )
-        }) else {
+        let Some((member, opened)) =
+            ember::channel::open_with_content_keys(&content_keys, |candidate| {
+                ember::dht::publish::SignedRecord::parse_channel_presence_member(
+                    blob,
+                    &channel_id,
+                    Some(candidate),
+                )
+            })
+        else {
             continue;
         };
+        if opened == ember::channel::OpenedUnder::Current {
+            current.insert(member.publisher_key);
+        }
         let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {
             continue;
         };
@@ -2624,6 +2688,11 @@ pub(super) fn ingest_channel_presence_records(
                 }
             }
             state.ember_channel_noise_keys.remove(&member.publisher_key);
+            continue;
+        }
+        if !current.contains(&member.publisher_key)
+            && !matches!(db.channel_member_status(&channel_id_hex, &pk_hex), Ok(Some(_)))
+        {
             continue;
         }
         let nick = crate::security::sanitize_display_name(&member.nickname);

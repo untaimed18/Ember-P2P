@@ -1018,6 +1018,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_view_cache: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
+        channel_history_sync_failures: HashMap::new(),
+        channel_handoff_publishes: HashMap::new(),
+        channel_handoff_completing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        channel_handoff_failure_noted: HashSet::new(),
         channel_history_sync_mark: HashMap::new(),
         channel_history_sync_ingested: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
@@ -1522,21 +1526,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let secident_status = cm.secident_status();
         let crypto_unreadable = cm.crypto_unreadable();
         let arc = Arc::new(RwLock::new(cm));
-        // L6: pair the startup prune with an immediate disk flush so
-        // a crash inside the first 60-s save tick can't reload the
-        // pre-prune rows from the DB on next start. Skip the flush
-        // when nothing was pruned to avoid paying for a full-table
-        // rewrite on every cold boot. Fire-and-forget on the credit
-        // flush path so we don't stall event-loop entry on SQLite I/O.
-        if any_pruned {
-            spawn_credit_flush(
-                arc.clone(),
-                db.clone(),
-                data_dir.clone(),
-                false,
-                credit_save_ownership.clone(),
-            );
-        }
+        // L6: the startup prune reaches disk through the first
+        // `credit_save_timer` tick, which completes immediately on loop entry
+        // (the prune marked the manager dirty). No flush is spawned here:
+        // one outside `credit_flush_handle` could overlap the periodic and
+        // shutdown flushes instead of being serialized with them.
         (arc, secident_status, crypto_unreadable)
     };
 
@@ -3609,6 +3603,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &connect_serve_tx,
                     &mut last_server_activity_at,
                     &spam_filter,
+                    &mut pending_lowid_callback_queue,
                 ))
                 .catch_unwind()
                 .await;

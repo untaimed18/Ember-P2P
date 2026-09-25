@@ -9,6 +9,7 @@
   import { formatBytes, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
+  import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import * as m from '$lib/paraglide/messages';
 
   // Count / total size of files the user is actively sharing (the `shared`
@@ -105,12 +106,23 @@
 
   onMount(() => {
     let active = true;
+    // `getSharedFileCount` walks the whole library, so a burst of events costs
+    // at most the call in flight plus one more after it, and nothing while
+    // the window is hidden — the `visibilitychange` handler catches up.
+    let sharedRefreshInFlight = false;
+    let sharedRefreshDirty = false;
 
     async function refreshSharedCount() {
+      if (!active) return;
+      if (sharedRefreshInFlight || document.visibilityState !== 'visible') {
+        sharedRefreshDirty = true;
+        return;
+      }
+      sharedRefreshInFlight = true;
+      sharedRefreshDirty = false;
       const gen = ++sharedRefreshGen;
       try {
         const stats = await getSharedFileCount();
-        // Ignore stale responses from overlapping shared-files-changed bursts.
         if (active && gen === sharedRefreshGen) {
           sharedCount = stats.count;
           sharedBytes = stats.total_bytes;
@@ -121,15 +133,26 @@
           sharedRefreshFailedToast = true;
           addToast('warning', m.statusbar_shared_refresh_failed());
         }
+      } finally {
+        sharedRefreshInFlight = false;
+        if (sharedRefreshDirty) void refreshSharedCount();
       }
     }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && sharedRefreshDirty) {
+        void refreshSharedCount();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     void refreshSharedCount();
 
     // The library indexer emits this whenever files are shared, unshared,
     // added, removed, or finish hashing, so the bottom-bar count stays in
-    // sync without polling.
-    const unlistenPromise = listen('shared-files-changed', () => {
+    // sync without polling. Upload counters never change the count or size.
+    const unlistenPromise = listen('shared-files-changed', (event) => {
+      if (isUploadCounterPhase(event.payload)) return;
       void refreshSharedCount();
     }).catch((e) => {
       console.warn('StatusBar: shared-files-changed listen failed', e);
@@ -142,6 +165,7 @@
 
     return () => {
       active = false;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       if (emberJoinTimer) {
         clearTimeout(emberJoinTimer);
         emberJoinTimer = null;

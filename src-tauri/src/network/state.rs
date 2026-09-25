@@ -1262,8 +1262,23 @@ pub(super) struct NetworkState {
     /// the asker spends less than we do.
     pub(super) channel_history_sync_times:
         HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
-    /// Last history-sync request per (channel_id, neighbor pubkey).
+    /// Last history-sync request per (channel_id, neighbor pubkey), stamped on
+    /// the attempt whether or not any path to the neighbor was found.
     pub(super) channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
+    /// Latest publish of each owned room's committed handoff record: the
+    /// publish id while one is out, and when it was started.
+    pub(super) channel_handoff_publishes: HashMap<[u8; 16], (Option<u32>, i64)>,
+    /// Rooms whose handoff is being finished right now. Shared with the tasks
+    /// that do it, so the publish acknowledgement and the periodic driver
+    /// cannot both hand the registry name over.
+    pub(super) channel_handoff_completing: Arc<std::sync::Mutex<HashSet<[u8; 16]>>>,
+    /// Rooms whose committed handoff has already been reported as not landing,
+    /// so the report goes out once per window rather than every pass.
+    pub(super) channel_handoff_failure_noted: HashSet<[u8; 16]>,
+    /// Consecutive history-sync attempts that found no path to the neighbor,
+    /// per (channel_id, neighbor pubkey). Cleared on a send; drives
+    /// [`ember::channel::history_sync_retry_secs`].
+    pub(super) channel_history_sync_failures: HashMap<([u8; 16], [u8; 32]), u32>,
     /// The room's [`Self::channel_history_sync_ingested`] count when we last
     /// asked this neighbor.
     ///

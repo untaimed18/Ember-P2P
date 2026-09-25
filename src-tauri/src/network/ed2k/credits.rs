@@ -462,8 +462,8 @@ pub struct CreditManager {
     crypto_unreadable: bool,
     /// Whether anything has changed since the last successful flush.
     ///
-    /// Persisting credits is expensive — `DELETE`+re-`INSERT` of both tables,
-    /// an `incremental_vacuum`, and a full `clients.met` rewrite with an
+    /// Persisting credits is expensive — a SQLite transaction, an
+    /// `incremental_vacuum`, and a full `clients.met` rewrite with an
     /// fsync — and the 60s flush timer used to pay all of it unconditionally,
     /// rewriting identical bytes ~1,440 times a day on a node whose peers had
     /// gone quiet. Mirrors the `KnownFileList` dirty/generation pair so an
@@ -472,6 +472,49 @@ pub struct CreditManager {
     dirty: bool,
     #[zeroize(skip)]
     dirty_generation: u64,
+    /// Keys whose SQLite row may differ from memory: created, mutated, or
+    /// evicted since they were last handed to a flush. A key absent from its
+    /// map at flush time is a row to delete.
+    #[zeroize(skip)]
+    unsaved_credit_keys: HashSet<[u8; 16]>,
+    #[zeroize(skip)]
+    unsaved_ember_keys: HashSet<[u8; 32]>,
+    /// Keys handed to a flush that has not confirmed success. They stay here
+    /// until [`Self::finish_flush`], so a failed, panicked or aborted flush is
+    /// retried by the next one instead of dropping the rows.
+    #[zeroize(skip)]
+    in_flight_credit_keys: HashSet<[u8; 16]>,
+    #[zeroize(skip)]
+    in_flight_ember_keys: HashSet<[u8; 32]>,
+    /// Until one flush has succeeded, which rows on disk match memory is
+    /// unknown: startup loads every record through `get_or_create` (marking
+    /// it) and may fall back to `clients.met`. The first flush reconciles the
+    /// whole table against SQLite instead of upserting every key.
+    #[zeroize(skip)]
+    needs_full_sync: bool,
+    /// Bumped by every [`Self::begin_flush`]; see [`Self::finish_flush`].
+    #[zeroize(skip)]
+    flush_epoch: u64,
+}
+
+/// What the next credit flush must write, from [`CreditManager::begin_flush`].
+///
+/// With `full_sync` the key lists are empty and the caller reconciles every
+/// record. Otherwise each key is either upserted (still in the map) or
+/// deleted (gone from it).
+#[derive(Debug, Default)]
+pub struct CreditFlushKeys {
+    pub full_sync: bool,
+    pub credit_keys: Vec<[u8; 16]>,
+    pub ember_keys: Vec<[u8; 32]>,
+    epoch: u64,
+}
+
+impl CreditFlushKeys {
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        !self.full_sync && self.credit_keys.is_empty() && self.ember_keys.is_empty()
+    }
 }
 
 impl CreditManager {
@@ -485,13 +528,20 @@ impl CreditManager {
             crypto_unreadable: false,
             dirty: false,
             dirty_generation: 0,
+            unsaved_credit_keys: HashSet::new(),
+            unsaved_ember_keys: HashSet::new(),
+            in_flight_credit_keys: HashSet::new(),
+            in_flight_ember_keys: HashSet::new(),
+            needs_full_sync: true,
+            flush_epoch: 0,
         }
     }
 
     /// Mark the in-memory credit state as needing a flush.
     ///
-    /// Called from `get_or_create` / `get_or_create_ember` — the only two
-    /// methods that hand out `&mut` to a record, and therefore the choke point
+    /// Reached (through `mark_credit_unsaved` / `mark_ember_unsaved`, which
+    /// also record the key) from `get_or_create` / `get_or_create_ember` — the
+    /// only two methods that hand out `&mut` to a record, and therefore the choke point
     /// every mutating operation (`add_uploaded`, `set_public_key`,
     /// `set_ident_state`, `record_ember_session`, …) already routes through.
     /// Deliberately over-approximates: a caller that takes `&mut` and changes
@@ -519,6 +569,57 @@ impl CreditManager {
     pub fn mark_saved_if_generation(&mut self, generation: u64) {
         if self.dirty_generation == generation {
             self.dirty = false;
+        }
+    }
+
+    fn mark_credit_unsaved(&mut self, user_hash: [u8; 16]) {
+        self.unsaved_credit_keys.insert(user_hash);
+        self.touch_dirty();
+    }
+
+    fn mark_ember_unsaved(&mut self, pub_key: [u8; 32]) {
+        self.unsaved_ember_keys.insert(pub_key);
+        self.touch_dirty();
+    }
+
+    /// Hand the rows the next flush must write to the caller, which snapshots
+    /// them under the same lock. Keys from an earlier flush that never
+    /// reported success are included again.
+    pub fn begin_flush(&mut self) -> CreditFlushKeys {
+        self.in_flight_credit_keys
+            .extend(self.unsaved_credit_keys.drain());
+        self.in_flight_ember_keys
+            .extend(self.unsaved_ember_keys.drain());
+        self.flush_epoch = self.flush_epoch.wrapping_add(1);
+        if self.needs_full_sync {
+            return CreditFlushKeys {
+                full_sync: true,
+                epoch: self.flush_epoch,
+                ..CreditFlushKeys::default()
+            };
+        }
+        CreditFlushKeys {
+            full_sync: false,
+            credit_keys: self.in_flight_credit_keys.iter().copied().collect(),
+            ember_keys: self.in_flight_ember_keys.iter().copied().collect(),
+            epoch: self.flush_epoch,
+        }
+    }
+
+    /// The flush that `keys` came from reached SQLite. Edits made since its
+    /// [`Self::begin_flush`] are in the unsaved sets and are not affected.
+    pub fn finish_flush(&mut self, keys: &CreditFlushKeys) {
+        // A later `begin_flush` merged everything in flight into its own
+        // batch, and the in-flight sets are that batch's only retry record.
+        // Clearing them (or `needs_full_sync`) here would lose those keys if
+        // the later flush then fails, so only the latest flush settles them.
+        if keys.epoch != self.flush_epoch {
+            return;
+        }
+        self.in_flight_credit_keys.clear();
+        self.in_flight_ember_keys.clear();
+        if keys.full_sync {
+            self.needs_full_sync = false;
         }
     }
 
@@ -780,11 +881,12 @@ impl CreditManager {
                 .map(|(k, _)| *k)
             {
                 self.credits.remove(&oldest);
+                self.mark_credit_unsaved(oldest);
             }
         }
         // Before handing out `&mut`: the caller may mutate any field, and once
         // `record` is borrowed from `self` we can no longer touch the flag.
-        self.touch_dirty();
+        self.mark_credit_unsaved(user_hash);
         let record = self
             .credits
             .entry(user_hash)
@@ -1306,12 +1408,26 @@ impl CreditManager {
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
         let before = self.credits.len() + self.ember_credits.len();
-        self.credits.retain(|_, r| r.last_seen > cutoff);
+        let unsaved_credit_keys = &mut self.unsaved_credit_keys;
+        self.credits.retain(|k, r| {
+            let keep = r.last_seen > cutoff;
+            if !keep {
+                unsaved_credit_keys.insert(*k);
+            }
+            keep
+        });
         // Same cutoff for Ember records so the two tables age in
         // lockstep. `last_seen` on EmberCreditRecord is bumped by
         // every credit-granting or session-recording operation, so
         // active peers stay regardless of their public-key format.
-        self.ember_credits.retain(|_, r| r.last_seen > cutoff);
+        let unsaved_ember_keys = &mut self.unsaved_ember_keys;
+        self.ember_credits.retain(|k, r| {
+            let keep = r.last_seen > cutoff;
+            if !keep {
+                unsaved_ember_keys.insert(*k);
+            }
+            keep
+        });
         // Only dirty when the sweep actually evicted something. This runs on
         // the same 60s tick as the flush, so bumping unconditionally would
         // re-dirty the state every tick and defeat the gate entirely.
@@ -1342,10 +1458,11 @@ impl CreditManager {
                 .map(|(k, _)| *k)
             {
                 self.ember_credits.remove(&oldest);
+                self.mark_ember_unsaved(oldest);
             }
         }
         // Same reason as `get_or_create`: flag before the borrow escapes.
-        self.touch_dirty();
+        self.mark_ember_unsaved(pub_key);
         let record = self
             .ember_credits
             .entry(pub_key)
@@ -1354,7 +1471,6 @@ impl CreditManager {
         record
     }
 
-    #[allow(dead_code)]
     pub fn get_ember_record(&self, pub_key: &[u8; 32]) -> Option<&EmberCreditRecord> {
         self.ember_credits.get(pub_key)
     }
@@ -1735,6 +1851,7 @@ impl CreditManager {
                 seen_ip: 0,
             };
             self.credits.insert(user_hash, record);
+            self.unsaved_credit_keys.insert(user_hash);
             loaded_hashes.push(user_hash);
             loaded += 1;
         }
@@ -2844,6 +2961,79 @@ mod tests {
             cm.is_dirty(),
             "an eviction changes what belongs on disk and must be flushed"
         );
+    }
+
+    /// The first flush reconciles everything; later ones carry only the keys
+    /// touched since, and a flush that never confirms success hands its keys
+    /// to the next one rather than losing them.
+    #[test]
+    fn flush_keys_cover_edits_and_evictions_and_survive_a_failed_flush() {
+        let mut cm = CreditManager::new();
+        let first = cm.begin_flush();
+        assert!(first.full_sync, "nothing is known about disk before one flush lands");
+        cm.finish_flush(&first);
+        assert!(cm.begin_flush().is_empty(), "a clean manager owes no rows");
+
+        let a = [0x11u8; 16];
+        let b = [0x12u8; 16];
+        let pk = [0x21u8; 32];
+        cm.add_uploaded(a, 10);
+        cm.add_ember_uploaded(pk, 10, true);
+        let failed = cm.begin_flush();
+        assert!(!failed.full_sync);
+        assert_eq!(failed.credit_keys, vec![a]);
+        assert_eq!(failed.ember_keys, vec![pk]);
+
+        // That flush failed (no `finish_flush`); a later edit joins the retry.
+        cm.add_uploaded(b, 10);
+        let retry = cm.begin_flush();
+        let mut keys = retry.credit_keys.clone();
+        keys.sort();
+        assert_eq!(keys, vec![a, b], "a failed flush must not drop its rows");
+        assert_eq!(retry.ember_keys, vec![pk]);
+        cm.finish_flush(&retry);
+        assert!(cm.begin_flush().is_empty());
+
+        cm.get_or_create(a).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        cm.get_or_create_ember(pk).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        let edited = cm.begin_flush();
+        cm.finish_flush(&edited);
+        cm.cleanup_stale(90);
+        let evicted = cm.begin_flush();
+        assert_eq!(evicted.credit_keys, vec![a], "an evicted row must be deleted on disk");
+        assert_eq!(evicted.ember_keys, vec![pk]);
+        assert!(cm.get_record(&a).is_none() && cm.get_ember_record(&pk).is_none());
+    }
+
+    /// A flush that finishes after a newer one has begun must not settle the
+    /// newer one's keys: if the newer flush then fails, they would be in
+    /// neither set and never reach SQLite.
+    #[test]
+    fn an_older_flush_finishing_late_cannot_settle_a_newer_ones_keys() {
+        let mut cm = CreditManager::new();
+        let a = [0x31u8; 16];
+        let b = [0x32u8; 16];
+
+        let startup = cm.begin_flush();
+        cm.add_uploaded(a, 10);
+        let periodic = cm.begin_flush();
+        assert!(periodic.full_sync, "nothing has confirmed the first sync yet");
+        cm.finish_flush(&startup);
+        // `periodic` fails: no `finish_flush`.
+        let retry = cm.begin_flush();
+        assert!(retry.full_sync, "a stale finish must not cancel the pending full sync");
+        cm.finish_flush(&retry);
+        assert!(cm.begin_flush().is_empty(), "the latest flush settles everything");
+
+        cm.add_uploaded(a, 10);
+        let older = cm.begin_flush();
+        cm.add_uploaded(b, 10);
+        let _newer = cm.begin_flush();
+        cm.finish_flush(&older);
+        // `newer` fails.
+        let mut keys = cm.begin_flush().credit_keys;
+        keys.sort();
+        assert_eq!(keys, vec![a, b], "keys handed to the failed newer flush must survive");
     }
 
     /// The credit map must stay bounded under user_hash churn (a peer

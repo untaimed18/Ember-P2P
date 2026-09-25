@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const STATE_FILE: &str = "share_intent.json";
@@ -46,7 +46,65 @@ pub struct ShareIntentStore {
     state: parking_lot::RwLock<PersistedShareIntent>,
 }
 
-static SHARE_INTENT: OnceLock<parking_lot::RwLock<Option<Arc<ShareIntentStore>>>> = OnceLock::new();
+enum Slot {
+    Uninitialized,
+    /// share_intent.json is loaded but known.met has not been folded in yet.
+    /// Readers wait: acting on this state would miss the catalog's unshared
+    /// records and could publish a file the user unshared. The generation ties
+    /// the state to one [`PendingInit`], so a guard outliving its
+    /// initialization cannot settle a newer one.
+    Pending(u64),
+    Ready(Arc<ShareIntentStore>),
+    Failed,
+}
+
+static NEXT_INIT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+struct GlobalSlot {
+    slot: parking_lot::RwLock<Slot>,
+    /// Held while `slot` changes so a waiter cannot miss the notification
+    /// between its check and its wait.
+    settle: parking_lot::Mutex<()>,
+    settled: parking_lot::Condvar,
+}
+
+impl GlobalSlot {
+    fn set(&self, value: Slot) {
+        let _settle = self.settle.lock();
+        *self.slot.write() = value;
+        self.settled.notify_all();
+    }
+
+    /// Replace `Pending(generation)` with `value`; any other state is left
+    /// alone. Returns whether the replacement happened.
+    fn settle_pending(&self, generation: u64, value: Slot) -> bool {
+        let _settle = self.settle.lock();
+        let mut slot = self.slot.write();
+        if !matches!(*slot, Slot::Pending(current) if current == generation) {
+            return false;
+        }
+        *slot = value;
+        self.settled.notify_all();
+        true
+    }
+
+    fn resolved(&self) -> Option<io::Result<Arc<ShareIntentStore>>> {
+        match &*self.slot.read() {
+            Slot::Ready(store) => Some(Ok(store.clone())),
+            Slot::Pending(_) => None,
+            Slot::Uninitialized => Some(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "share-intent store is not initialized",
+            ))),
+            Slot::Failed => Some(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "share-intent store failed to initialize",
+            ))),
+        }
+    }
+}
+
+static SHARE_INTENT: OnceLock<GlobalSlot> = OnceLock::new();
 
 #[cfg(test)]
 static SHARE_INTENT_TEST_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
@@ -59,8 +117,12 @@ pub(crate) fn test_store_lock() -> parking_lot::MutexGuard<'static, ()> {
         .lock()
 }
 
-fn global_slot() -> &'static parking_lot::RwLock<Option<Arc<ShareIntentStore>>> {
-    SHARE_INTENT.get_or_init(|| parking_lot::RwLock::new(None))
+fn global_slot() -> &'static GlobalSlot {
+    SHARE_INTENT.get_or_init(|| GlobalSlot {
+        slot: parking_lot::RwLock::new(Slot::Uninitialized),
+        settle: parking_lot::Mutex::new(()),
+        settled: parking_lot::Condvar::new(),
+    })
 }
 
 fn normalize_hash(hash: &[u8; 16]) -> String {
@@ -71,11 +133,15 @@ fn io_other(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
+fn write_state(path: &Path, state: &PersistedShareIntent) -> io::Result<()> {
+    let data = serde_json::to_vec_pretty(state)
+        .map_err(|error| io_other(format!("serialize share intent: {error}")))?;
+    crate::security::atomic_write(path, &data, true)
+}
+
 impl ShareIntentStore {
     fn persist_state(&self, state: &PersistedShareIntent) -> io::Result<()> {
-        let data = serde_json::to_vec_pretty(state)
-            .map_err(|error| io_other(format!("serialize share intent: {error}")))?;
-        crate::security::atomic_write(&self.path, &data, true)
+        write_state(&self.path, state)
     }
 
     fn mutate(
@@ -171,18 +237,92 @@ impl ShareIntentStore {
     }
 }
 
+/// Synchronous form of [`initialize_in_background`].
+#[cfg(test)]
+pub fn initialize(data_dir: &Path) -> io::Result<Arc<ShareIntentStore>> {
+    let path = data_dir.join(STATE_FILE);
+    let mut state = read_persisted(&path)?;
+    absorb_known_catalog(data_dir, &mut state);
+    install(path, state)
+}
+
 /// Initialize the independent share-intent store and migrate every existing
 /// known.met `is_shared=false` record. If known.met existed previously but is
 /// now absent or corrupt, the durable store enters fail-closed mode.
-pub fn initialize(data_dir: &Path) -> io::Result<Arc<ShareIntentStore>> {
+///
+/// share_intent.json is read and rewritten on the calling thread, so an
+/// unreadable or unwritable store stays fatal to startup. The known.met
+/// migration (a parse of up to 256 MiB) runs on its own thread; until it lands,
+/// [`global`] — and with it every share-state read and write — blocks rather
+/// than answer from a state missing the catalog's unshared records. If the
+/// migration cannot be persisted, the store settles as failed and sharing
+/// stays fail-closed for the session.
+pub fn initialize_in_background(data_dir: &Path) -> io::Result<()> {
     let path = data_dir.join(STATE_FILE);
+    let mut state = read_persisted(&path)?;
+    write_state(&path, &state)?;
+    let pending = PendingInit::begin();
+    let data_dir = data_dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("share-intent-init".into())
+        .spawn(move || {
+            absorb_known_catalog(&data_dir, &mut state);
+            match install_pending(pending.generation, path, state) {
+                Ok(()) => pending.disarm(),
+                Err(error) => {
+                    tracing::error!("Failed to persist migrated share intent: {error}")
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Block until a background [`initialize_in_background`] has settled. Returns
+/// immediately when none is in flight. Lets blocking-pool callers absorb the
+/// wait before they reach per-file [`effective_shared`] calls on an async task.
+pub fn wait_until_initialized() {
+    let _ = global();
+}
+
+/// Settles a background initialization that ends without installing a store
+/// (persist failure, panic, or a thread that never started) as failed, so
+/// waiters in [`global`] fall through to the fail-closed path instead of
+/// hanging.
+struct PendingInit {
+    generation: u64,
+}
+
+impl PendingInit {
+    fn begin() -> Self {
+        let generation = NEXT_INIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        global_slot().set(Slot::Pending(generation));
+        Self { generation }
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingInit {
+    fn drop(&mut self) {
+        if global_slot().settle_pending(self.generation, Slot::Failed) {
+            FORCE_UNSHARED.store(true, Ordering::Release);
+            tracing::error!(
+                "Share-intent initialization did not complete; sharing is disabled for this session"
+            );
+        }
+    }
+}
+
+fn read_persisted(path: &Path) -> io::Result<PersistedShareIntent> {
     // Same interrupt window as identity/cryptkey: a parked backup with nothing
-    // at `path` looks like a first run, and `persist_state` below would then
+    // at `path` looks like a first run, and the persist that follows would then
     // restore the bak only to overwrite it with empty denied/allow sets.
-    crate::security::recover_interrupted_replace(&path);
+    crate::security::recover_interrupted_replace(path);
     let state_existed = path.exists();
-    let mut state = if state_existed {
-        let data = std::fs::read(&path)?;
+    let state = if state_existed {
+        let data = std::fs::read(path)?;
         let parsed: PersistedShareIntent = serde_json::from_slice(&data)
             .map_err(|error| io_other(format!("parse share intent: {error}")))?;
         if parsed.version != STATE_VERSION {
@@ -206,8 +346,15 @@ pub fn initialize(data_dir: &Path) -> io::Result<Arc<ShareIntentStore>> {
     } else {
         PersistedShareIntent::default()
     };
+    Ok(state)
+}
 
+fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
     let known_path = data_dir.join("known.met");
+    // `load_checked` restores a parked replace backup itself, but only after
+    // the existence probe below. Probing first would read a restored catalog
+    // as missing and, with `catalog_seen`, persist fail-closed for good.
+    crate::security::recover_interrupted_replace(&known_path);
     let known_existed = known_path.exists();
     match crate::storage::known_files::KnownFileList::load_checked(&known_path) {
         Ok(known) if known_existed => {
@@ -235,23 +382,59 @@ pub fn initialize(data_dir: &Path) -> io::Result<Arc<ShareIntentStore>> {
             }
         }
     }
+}
 
+fn persisted_store(
+    path: std::path::PathBuf,
+    state: PersistedShareIntent,
+) -> io::Result<Arc<ShareIntentStore>> {
     let store = Arc::new(ShareIntentStore {
         path,
         state: parking_lot::RwLock::new(state),
     });
     store.persist_state(&store.state.read())?;
-    *global_slot().write() = Some(store.clone());
     Ok(store)
 }
 
+#[cfg(test)]
+fn install(
+    path: std::path::PathBuf,
+    state: PersistedShareIntent,
+) -> io::Result<Arc<ShareIntentStore>> {
+    let store = persisted_store(path, state)?;
+    global_slot().set(Slot::Ready(store.clone()));
+    Ok(store)
+}
+
+/// Persist and install the store for `generation`. A superseded
+/// initialization neither writes nor installs.
+fn install_pending(
+    generation: u64,
+    path: std::path::PathBuf,
+    state: PersistedShareIntent,
+) -> io::Result<()> {
+    if !matches!(*global_slot().slot.read(), Slot::Pending(current) if current == generation) {
+        return Ok(());
+    }
+    let store = persisted_store(path, state)?;
+    global_slot().settle_pending(generation, Slot::Ready(store));
+    Ok(())
+}
+
+/// The installed store. While [`initialize_in_background`] is still migrating
+/// known.met this blocks until it settles.
 pub fn global() -> io::Result<Arc<ShareIntentStore>> {
-    global_slot().read().clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "share-intent store is not initialized",
-        )
-    })
+    let global = global_slot();
+    if let Some(result) = global.resolved() {
+        return result;
+    }
+    let mut settle = global.settle.lock();
+    loop {
+        if let Some(result) = global.resolved() {
+            return result;
+        }
+        global.settled.wait(&mut settle);
+    }
 }
 
 pub fn effective_shared(hash: &[u8; 16], catalog_value: bool) -> bool {
@@ -339,6 +522,7 @@ mod tests {
 
     #[test]
     fn force_unshared_blocks_even_without_durable_fail_closed() {
+        let _lock = test_store_lock();
         clear_force_unshared_for_tests();
         let store = test_store(false);
         let hash = [0x11; 16];
@@ -349,17 +533,8 @@ mod tests {
         let _ = std::fs::remove_file(&store.path);
     }
 
-    #[test]
-    fn migrates_unshared_known_record_and_detects_later_loss() {
+    fn save_catalog_with_unshared(base: &Path, hash: [u8; 16]) {
         use crate::storage::known_files::{KnownFileList, KnownFileRecord};
-        let _lock = test_store_lock();
-        let base = std::env::temp_dir().join(format!(
-            "ember-share-intent-migration-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let hash = [0x5a; 16];
         let mut known = KnownFileList::new();
         known.add_or_update(KnownFileRecord {
             file_hash: hash,
@@ -385,6 +560,24 @@ mod tests {
             media_scanned: false,
         });
         known.save(&base.join("known.met")).unwrap();
+    }
+
+    fn temp_base(label: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "ember-share-intent-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn migrates_unshared_known_record_and_detects_later_loss() {
+        let _lock = test_store_lock();
+        let base = temp_base("migration");
+        let hash = [0x5a; 16];
+        save_catalog_with_unshared(&base, hash);
 
         let migrated = initialize(&base).unwrap();
         assert!(!migrated.effective_shared(&hash, true));
@@ -416,6 +609,136 @@ mod tests {
             !restored.effective_shared(&hash, true),
             "denied hashes parked in the replace backup must survive a missing live file"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn background_initialize_migrates_catalog_before_readers_see_it() {
+        let _lock = test_store_lock();
+        let base = temp_base("background");
+        let hash = [0x3c; 16];
+        save_catalog_with_unshared(&base, hash);
+
+        initialize_in_background(&base).unwrap();
+        let store = global().unwrap();
+        assert!(!store.effective_shared(&hash, true));
+        assert!(!effective_shared(&hash, true));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Tests that drive the slot by hand must not leave it `Pending` when they
+    /// fail: every later `global()` caller in the test binary would hang.
+    struct SlotReset;
+
+    impl Drop for SlotReset {
+        fn drop(&mut self) {
+            global_slot().set(Slot::Uninitialized);
+            clear_force_unshared_for_tests();
+        }
+    }
+
+    #[test]
+    fn global_waits_for_pending_initialization() {
+        let _lock = test_store_lock();
+        let _reset = SlotReset;
+        let base = temp_base("pending");
+        let pending = PendingInit::begin();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || tx.send(global().is_ok()).unwrap());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "readers must not observe a store before the catalog migration lands"
+        );
+        install_pending(
+            pending.generation,
+            base.join(STATE_FILE),
+            PersistedShareIntent::default(),
+        )
+        .unwrap();
+        pending.disarm();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn abandoned_initialization_settles_fail_closed() {
+        let _lock = test_store_lock();
+        let _reset = SlotReset;
+        drop(PendingInit::begin());
+        assert!(global().is_err());
+        assert!(!effective_shared(&[0x19; 16], true));
+    }
+
+    #[test]
+    fn stale_pending_guard_cannot_settle_a_newer_initialization() {
+        let _lock = test_store_lock();
+        let _reset = SlotReset;
+        let base = temp_base("stale");
+        let stale = PendingInit::begin();
+        let current = PendingInit::begin();
+        drop(stale);
+        assert!(
+            matches!(*global_slot().slot.read(), Slot::Pending(g) if g == current.generation)
+        );
+        install_pending(
+            current.generation,
+            base.join(STATE_FILE),
+            PersistedShareIntent::default(),
+        )
+        .unwrap();
+        current.disarm();
+        assert!(global().is_ok());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn known_met_writes_wait_for_pending_initialization() {
+        let _lock = test_store_lock();
+        let _reset = SlotReset;
+        let base = temp_base("write-gate");
+        let pending = PendingInit::begin();
+        let writer_base = base.clone();
+        let writer = std::thread::spawn(move || {
+            crate::storage::known_files::KnownFileList::new()
+                .save(&writer_base.join("known.met"))
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !base.join("known.met").exists(),
+            "known.met must not be rewritten while the migration may be reading it"
+        );
+        install_pending(
+            pending.generation,
+            base.join(STATE_FILE),
+            PersistedShareIntent::default(),
+        )
+        .unwrap();
+        pending.disarm();
+        writer.join().unwrap();
+        assert!(base.join("known.met").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn parked_catalog_backup_is_restored_before_the_missing_check() {
+        let _lock = test_store_lock();
+        let base = temp_base("parked-catalog");
+        let hash = [0x6b; 16];
+        save_catalog_with_unshared(&base, hash);
+        initialize(&base).unwrap();
+        std::fs::rename(
+            base.join("known.met"),
+            base.join("known.met.ember-replace-bak"),
+        )
+        .unwrap();
+        let reopened = initialize(&base).unwrap();
+        assert!(
+            !reopened.is_fail_closed(),
+            "a restorable catalog is not a lost one"
+        );
+        assert!(!reopened.effective_shared(&hash, true));
         let _ = std::fs::remove_dir_all(base);
     }
 }

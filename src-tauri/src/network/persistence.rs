@@ -93,12 +93,12 @@ pub(super) async fn flush_credit_state(
     }
 
     // Skip the whole sequence when nothing has changed since the last
-    // successful flush. It is expensive — DELETE plus full re-INSERT of both
-    // credit tables, an `incremental_vacuum`, a `clients.met` copy and an
-    // fsync'd rewrite — and this ran unconditionally every 60s, rewriting
-    // byte-identical state ~1,440 times a day on a node whose peers had gone
-    // quiet. The sweep above marks dirty when it evicts, so ageing still gets
-    // persisted; the generation is captured after it for that reason.
+    // successful flush. It is expensive — a SQLite transaction, an
+    // `incremental_vacuum`, a `clients.met` copy and an fsync'd rewrite — and
+    // this ran unconditionally every 60s, rewriting byte-identical state
+    // ~1,440 times a day on a node whose peers had gone quiet. The sweep
+    // above marks dirty when it evicts, so ageing still gets persisted; the
+    // generation is captured after it for that reason.
     let flush_generation = {
         let cm = credit_manager.read().await;
         if !cm.is_dirty() {
@@ -107,61 +107,85 @@ pub(super) async fn flush_credit_state(
         cm.dirty_generation()
     };
 
-    let (serialized_bytes, owned, ember_owned) = {
-        let cm = credit_manager.read().await;
+    type EmberCreditRow = ([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
+    fn credit_row(r: &ed2k::credits::CreditRecord) -> crate::storage::database::CreditRow {
+        (
+            r.user_hash,
+            r.uploaded,
+            r.downloaded,
+            r.last_seen,
+            r.public_key.clone(),
+            r.ident_ip,
+            r.ident_state.to_u8(),
+            r.ember_hash,
+            r.crypto_verified_once,
+            r.peer_name.clone(),
+            r.client_software.clone(),
+            r.seen_ip,
+        )
+    }
+    fn ember_credit_row(r: &ed2k::credits::EmberCreditRecord) -> EmberCreditRow {
+        (
+            r.pub_key,
+            r.uploaded,
+            r.downloaded,
+            r.last_upload_time,
+            r.last_download_time,
+            r.completed_sessions,
+            r.total_sessions,
+            r.avg_upload_speed,
+            r.last_seen,
+            r.ident_verified,
+        )
+    }
+
+    // Only the rows touched since the last successful flush are written: a
+    // key still in the map is upserted, one that is gone is deleted. The
+    // keys are taken under the write lock, which is then downgraded so the
+    // row copies and the `clients.met` serialization see exactly that state
+    // while readers (the upload dispatcher) keep running.
+    let (serialized_bytes, flush_keys, owned, removed, ember_owned, ember_removed) = {
+        let mut cm_w = credit_manager.write().await;
+        let flush_keys = cm_w.begin_flush();
+        let cm = cm_w.downgrade();
         let bytes = cm.serialize();
-        let records: Vec<crate::storage::database::CreditRow> = cm
-            .all_records()
-            .iter()
-            .map(|r| {
-                (
-                    r.user_hash,
-                    r.uploaded,
-                    r.downloaded,
-                    r.last_seen,
-                    r.public_key.clone(),
-                    r.ident_ip,
-                    r.ident_state.to_u8(),
-                    r.ember_hash,
-                    r.crypto_verified_once,
-                    r.peer_name.clone(),
-                    r.client_software.clone(),
-                    r.seen_ip,
-                )
-            })
-            .collect();
-        // Snapshot the Ember table too. The columns are plain scalars
-        // so an owned copy is cheap; holding the read lock only long
-        // enough to clone keeps the upload dispatcher un-blocked
-        // while the disk write runs below.
-        let ember_records: Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = cm
-            .all_ember_records()
-            .iter()
-            .map(|r| {
-                (
-                    r.pub_key,
-                    r.uploaded,
-                    r.downloaded,
-                    r.last_upload_time,
-                    r.last_download_time,
-                    r.completed_sessions,
-                    r.total_sessions,
-                    r.avg_upload_speed,
-                    r.last_seen,
-                    r.ident_verified,
-                )
-            })
-            .collect();
-        (bytes, records, ember_records)
+        let mut records: Vec<crate::storage::database::CreditRow> = Vec::new();
+        let mut removed: Vec<[u8; 16]> = Vec::new();
+        let mut ember_records: Vec<EmberCreditRow> = Vec::new();
+        let mut ember_removed: Vec<[u8; 32]> = Vec::new();
+        if flush_keys.full_sync {
+            records = cm.all_records().into_iter().map(credit_row).collect();
+            ember_records = cm
+                .all_ember_records()
+                .into_iter()
+                .map(ember_credit_row)
+                .collect();
+        } else {
+            for key in &flush_keys.credit_keys {
+                match cm.get_record(key) {
+                    Some(r) => records.push(credit_row(r)),
+                    None => removed.push(*key),
+                }
+            }
+            for key in &flush_keys.ember_keys {
+                match cm.get_ember_record(key) {
+                    Some(r) => ember_records.push(ember_credit_row(r)),
+                    None => ember_removed.push(*key),
+                }
+            }
+        }
+        (bytes, flush_keys, records, removed, ember_records, ember_removed)
     };
+    let full_sync = flush_keys.full_sync;
     // Own the save slot through the blocking DB/cache write itself. If the
     // async parent is aborted while spawn_blocking is running, this owned
     // guard remains inside the blocking closure, so shutdown cannot race a
-    // newer snapshot against the still-running periodic write.
+    // newer snapshot against the still-running periodic write. The closure
+    // hands the guard back so it is held until `finish_flush` below has run:
+    // released earlier, the next flush could `begin_flush` in between.
     let db_ref = db.clone();
     let data_dir = data_dir.to_path_buf();
     let save_result = tokio::task::spawn_blocking(move || {
-        let _ownership = ownership;
         let refs: Vec<crate::storage::database::CreditRowRef<'_>> = owned
             .iter()
             .map(|(h, u, d, l, p, ip, st, eh, cv, name, software, seen)| {
@@ -183,17 +207,20 @@ pub(super) async fn flush_credit_state(
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
         // never diverge across a crash or partial failure.
-        let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> =
-            ember_owned
-                .iter()
-                .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| {
-                    (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v)
-                })
-                .collect();
+        let ember_refs: Vec<crate::storage::database::EmberCreditRowRef<'_>> = ember_owned
+            .iter()
+            .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
+            .collect();
         // Persist SQLite first: it is authoritative on load. Only refresh the
         // clients.met cache after that transaction succeeds.
-        let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
-        db_ref.incremental_vacuum();
+        let result = if full_sync {
+            db_ref.sync_all_credits_with_ember(&refs, &ember_refs)
+        } else {
+            db_ref.save_credit_changes(&refs, &removed, &ember_refs, &ember_removed)
+        };
+        if result.is_ok() && (full_sync || !removed.is_empty() || !ember_removed.is_empty()) {
+            db_ref.incremental_vacuum();
+        }
         let mut cache_written = false;
         if result.is_ok() {
             let clients_met = data_dir.join("clients.met");
@@ -208,30 +235,32 @@ pub(super) async fn flush_credit_state(
                 Err(e) => debug!("Failed to finalize clients.met: {e}"),
             }
         }
-        (result, cache_written)
+        (result, cache_written, ownership)
     })
     .await;
     match &save_result {
-        Ok((Ok(()), cache_written)) => {
+        Ok((Ok(()), cache_written, _)) => {
+            let mut cm = credit_manager.write().await;
+            // SQLite holds this flush's rows. Keys marked while the blocking
+            // write ran are in the unsaved set, untouched by this.
+            cm.finish_flush(&flush_keys);
             if *cache_written {
                 // Disk now matches the snapshot. A mutation that landed while
                 // the blocking write ran bumped the generation, so the flag
                 // stays set and the next tick persists it instead of dropping
                 // it.
-                credit_manager
-                    .write()
-                    .await
-                    .mark_saved_if_generation(flush_generation);
+                cm.mark_saved_if_generation(flush_generation);
             } else {
                 debug!("clients.met cache write failed; keeping credits dirty for the next tick");
             }
         }
-        Ok((Err(e), _)) => error!("Failed to save credits: {e}"),
+        Ok((Err(e), _, _)) => error!("Failed to save credits: {e}"),
         Err(e) => error!("Credit save task failed: {e}"),
     }
-    if !matches!(save_result, Ok((Ok(()), _))) {
+    if !matches!(save_result, Ok((Ok(()), _, _))) {
         debug!("Skipping clients.met cache write because the DB credit flush failed");
     }
+    drop(save_result);
 }
 
 pub(super) fn spawn_credit_flush(

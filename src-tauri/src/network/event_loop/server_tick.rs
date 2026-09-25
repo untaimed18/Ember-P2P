@@ -30,6 +30,7 @@ pub(in crate::network) async fn on_server_tick(
     connect_serve_tx: &mpsc::Sender<upload_server::ConnectServeRequest>,
     last_server_activity_at: &mut i64,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
+    pending_lowid_callback_queue: &mut VecDeque<([u8; 16], u32)>,
 ) {
     if state.server_connected {
         let mut pending_lowid_callbacks: Vec<([u8; 16], u32)> = Vec::new();
@@ -38,14 +39,23 @@ pub(in crate::network) async fn on_server_tick(
         let mut server_disconnect_reason: Option<String> = None;
         let mut conn_to_restore: Option<Ed2kServerConnection> = None;
         if let Some(mut conn) = state.server_connection.take() {
+            // Any holder of the connection (commands, the callback drain,
+            // download events) may have left it unwritable since the last
+            // tick; its writes already fail fast, so this is where the
+            // session actually gets dropped.
+            server_disconnect_reason = server_write_failure_reason(&conn);
             // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.).
             // poll_messages() decodes untrusted server bytes inline on the
             // event loop, so wrap it in catch_unwind and treat a parse panic
             // as a disconnect — the connection is suspect anyway, and one
             // malformed packet must not unwind the whole network loop.
-            let poll_result = std::panic::AssertUnwindSafe(conn.poll_messages())
-                .catch_unwind()
-                .await;
+            let poll_result = if server_disconnect_reason.is_none() {
+                std::panic::AssertUnwindSafe(conn.poll_messages())
+                    .catch_unwind()
+                    .await
+            } else {
+                Ok(Ok(Vec::new()))
+            };
             let events = match poll_result {
                 Ok(Ok(events)) => events,
                 Ok(Err(e)) => {
@@ -1020,17 +1030,21 @@ pub(in crate::network) async fn on_server_tick(
                     }
                 }
             }
+            if server_disconnect_reason.is_none() {
+                server_disconnect_reason = server_write_failure_reason(&conn);
+            }
+            // Handed to the rate-limited drain in the event loop, which sends
+            // at most MAX_LOWID_CALLBACKS_PER_TURN per turn, stops at the first
+            // failure and marks only what it got out as sent. One
+            // OP_FOUNDSOURCES reply can carry hundreds of LowID sources, each
+            // a server write bounded only by SERVER_WRITE_TIMEOUT_SECS.
             if server_disconnect_reason.is_none() && state.server_connected && !pending_lowid_callbacks.is_empty() && !state.low_id {
-                let mut sent_count = 0u32;
-                for (fh, cid) in &pending_lowid_callbacks {
-                    if conn.request_callback(*cid).await.is_ok() {
-                        let mut sm = source_manager.write().await;
-                        sm.mark_callback_sent(fh, *cid);
-                        sent_count += 1;
-                    }
-                }
-                if sent_count > 0 {
-                    debug!("Sent {sent_count} LowID callback requests from server poll");
+                let queued = queue_lowid_callbacks(
+                    pending_lowid_callback_queue,
+                    pending_lowid_callbacks,
+                );
+                if queued > 0 {
+                    debug!("Queued {queued} LowID callback requests from server poll");
                 }
             }
             if state.server_connected {
@@ -1234,4 +1248,9 @@ pub(in crate::network) async fn on_server_tick(
         } // elapsed_ok
         } // else: failures < MAX
     }
+}
+
+fn server_write_failure_reason(conn: &Ed2kServerConnection) -> Option<String> {
+    conn.write_failure()
+        .map(|reason| format!("server write failed, stream unusable: {reason}"))
 }

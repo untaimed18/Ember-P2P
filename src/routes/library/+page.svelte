@@ -63,6 +63,12 @@
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
+  import { createMaxWaitDebounce } from '$lib/debounce';
+  import {
+    applySharedFileStats,
+    isUploadCounterPhase,
+    type SharedFileStats,
+  } from '$lib/sharedFileStats';
 
   // All three are replace-only — never mutated in place — so `$state.raw`
   // avoids building a deep proxy with a signal per property. That matters here:
@@ -668,7 +674,7 @@
   let initialLoadDone = $state(false);
   let firstLoadSlow = $state(false);
   let pendingRefresh = false;
-  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const refreshDebounce = createMaxWaitDebounce(() => { refresh(); });
   let loadGen = 0;
 
   /** Coalescing window for `shared-files-changed` while a scan is running.
@@ -680,14 +686,34 @@
    *  library was serialised, transferred and re-derived three times a second
    *  for the whole run. Nothing on screen changes usefully at that rate: the
    *  scan banner has its own progress events, and the scan-completion poll
-   *  pulls a final snapshot regardless. */
+   *  pulls a final snapshot regardless.
+   *
+   *  Each window also has a max-wait: a pure trailing debounce never fires
+   *  while events keep landing inside it, so a steady stream left the list
+   *  stale until the stream stopped. */
   const SCAN_REFRESH_DEBOUNCE_MS = 3000;
+  const SCAN_REFRESH_MAX_WAIT_MS = 15_000;
   const IDLE_REFRESH_DEBOUNCE_MS = 300;
+  const IDLE_REFRESH_MAX_WAIT_MS = 2000;
 
   function debouncedRefresh() {
-    if (refreshTimer) clearTimeout(refreshTimer);
-    const delay = scanning ? SCAN_REFRESH_DEBOUNCE_MS : IDLE_REFRESH_DEBOUNCE_MS;
-    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, delay);
+    if (scanning) refreshDebounce.schedule(SCAN_REFRESH_DEBOUNCE_MS, SCAN_REFRESH_MAX_WAIT_MS);
+    else refreshDebounce.schedule(IDLE_REFRESH_DEBOUNCE_MS, IDLE_REFRESH_MAX_WAIT_MS);
+  }
+
+  /** Upload counters arrive on their own event so they can be patched into the
+   *  affected rows without the full re-read `refresh()` does. The header total
+   *  is advanced by the same growth until the next refresh re-reads it. */
+  function applyUploadStats(stats: SharedFileStats[]) {
+    const applied = applySharedFileStats(files, stats);
+    if (!applied.changed) return;
+    files = applied.rows;
+    if (applied.uploadedDelta > 0 && aggregateStats) {
+      aggregateStats = {
+        ...aggregateStats,
+        session_uploaded: aggregateStats.session_uploaded + applied.uploadedDelta,
+      };
+    }
   }
 
   async function refresh(force = false) {
@@ -2646,11 +2672,20 @@
       let u3: (() => void) | null = null;
       let u4: (() => void) | null = null;
       let u5: (() => void) | null = null;
+      let u6: (() => void) | null = null;
       try {
         u1 = await listen<{ phase: string; count: number }>(
-          'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
+          'shared-files-changed', (event) => {
+            if (!mounted || isUploadCounterPhase(event.payload)) return;
+            debouncedRefresh();
+          }
         );
         if (destroyed) { u1(); return; }
+        u6 = await listen<SharedFileStats[]>('shared-file-stats', (event) => {
+          if (!mounted || !Array.isArray(event.payload)) return;
+          applyUploadStats(event.payload);
+        });
+        if (destroyed) { u1(); u6(); return; }
         u2 = await listen<{ current: number; total: number; file_name: string; done?: boolean; upgrading?: number }>(
           'file-hash-progress', (event) => {
             if (!mounted || stoppedByUser) return;
@@ -2669,12 +2704,12 @@
             }
           }
         );
-        if (destroyed) { u1(); u2(); return; }
+        if (destroyed) { u1(); u6(); u2(); return; }
         u3 = await listen<{ folder?: string; folders?: string[]; limit: number }>(
           'shared-files-scan-truncated',
           () => { if (mounted) scanTruncated = true; },
         );
-        if (destroyed) { u1(); u2(); u3(); return; }
+        if (destroyed) { u1(); u6(); u2(); u3(); return; }
         // "Sent" only ever meant the invitation reached the network task. The
         // recipient's answer arrives here, and a refusal was going unreported
         // entirely — nothing in the app listened for this event — so a friend
@@ -2705,11 +2740,12 @@
           scanTruncated = false;
           void refresh();
         });
-        if (destroyed) { u1(); u2(); u3(); u4(); u5(); return; }
-        unlisteners.push(u1, u2, u3, u4, u5);
+        if (destroyed) { u1(); u6(); u2(); u3(); u4(); u5(); return; }
+        unlisteners.push(u1, u6, u2, u3, u4, u5);
       } catch (e) {
         console.warn('library: failed to register file-system event listeners', e);
         if (u1) u1();
+        if (u6) u6();
         if (u2) u2();
         if (u3) u3();
         if (u4) u4();
@@ -2760,7 +2796,7 @@
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onScanVisibilityChange);
       }
-      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+      refreshDebounce.cancel();
       if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
       if (commentSaveTimer) {
         clearTimeout(commentSaveTimer);

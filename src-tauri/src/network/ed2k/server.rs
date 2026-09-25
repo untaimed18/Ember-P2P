@@ -197,6 +197,13 @@ pub struct Ed2kServerConnection {
     /// Connected server's soft per-client file limit (`GetSoftFiles()` in
     /// eMule). 0 = unknown. Used to cap `OP_OFFERFILES` like eMule does.
     soft_files: u32,
+    /// Set by the first failed or timed-out write and never cleared. A write
+    /// abandoned part-way leaves a partial frame on the wire and, on an
+    /// obfuscated connection, an RC4 send keystream the server no longer
+    /// agrees with, so nothing written afterwards can be parsed. Every later
+    /// write fails immediately instead of paying `SERVER_WRITE_TIMEOUT_SECS`
+    /// again, and the server tick drops the session when it sees this.
+    write_failure: Option<String>,
 }
 
 #[derive(Debug)]
@@ -247,6 +254,7 @@ impl Ed2kServerConnection {
             },
             session: None,
             soft_files: 0,
+            write_failure: None,
         })
     }
 
@@ -256,7 +264,35 @@ impl Ed2kServerConnection {
             transport: ServerTransport::Encrypted(stream),
             session: None,
             soft_files: 0,
+            write_failure: None,
         })
+    }
+
+    /// Why this connection can no longer be written to, if a write has
+    /// failed or timed out. Once set the session is unusable and should be
+    /// dropped.
+    pub fn write_failure(&self) -> Option<&str> {
+        self.write_failure.as_deref()
+    }
+
+    fn ensure_writable(&self) -> io::Result<()> {
+        match &self.write_failure {
+            Some(reason) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("server connection unusable after earlier write failure: {reason}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn record_write_result(&mut self, result: io::Result<()>) -> io::Result<()> {
+        if let Err(e) = &result {
+            if self.write_failure.is_none() {
+                warn!("Server write failed ({e}); connection marked unusable");
+                self.write_failure = Some(e.to_string());
+            }
+        }
+        result
     }
 
     /// Record the connected server's soft per-client file limit so
@@ -312,7 +348,8 @@ impl Ed2kServerConnection {
         let login_deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(SERVER_LOGIN_TIMEOUT_SECS);
 
-        tokio::time::timeout(
+        self.ensure_writable()?;
+        let login_write = tokio::time::timeout(
             std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
             async {
                 match &mut self.transport {
@@ -330,7 +367,8 @@ impl Ed2kServerConnection {
                 io::ErrorKind::TimedOut,
                 "server login write timed out",
             ))
-        })?;
+        });
+        self.record_write_result(login_write)?;
 
         let mut session = ServerSession {
             client_id: 0,
@@ -509,6 +547,18 @@ impl Ed2kServerConnection {
         opcode: u8,
         compressed_payload: &[u8],
     ) -> io::Result<()> {
+        self.ensure_writable()?;
+        let result = self
+            .write_packet_compressed_unguarded(opcode, compressed_payload)
+            .await;
+        self.record_write_result(result)
+    }
+
+    async fn write_packet_compressed_unguarded(
+        &mut self,
+        opcode: u8,
+        compressed_payload: &[u8],
+    ) -> io::Result<()> {
         const OP_PACKEDPROT: u8 = 0xD4;
         let wire_len = u32::try_from(1 + compressed_payload.len()).map_err(|_| {
             io::Error::new(
@@ -553,7 +603,15 @@ impl Ed2kServerConnection {
         })
     }
 
+    /// Every post-login write funnels through here or
+    /// `write_packet_compressed`, which is what makes `write_failure` sticky.
     async fn write_packet(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        self.ensure_writable()?;
+        let result = self.write_packet_unguarded(opcode, payload).await;
+        self.record_write_result(result)
+    }
+
+    async fn write_packet_unguarded(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         match &mut self.transport {
             ServerTransport::Plain { writer, .. } => {
                 write_server_packet(writer, opcode, payload).await
@@ -1436,6 +1494,67 @@ mod tests {
             events.as_slice(),
             [ServerEvent::Message(msg)] if msg == "hi"
         ));
+    }
+
+    async fn loopback_connection() -> (Ed2kServerConnection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let conn = Ed2kServerConnection::connect(addr).await.unwrap();
+        (conn, accept.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn failed_write_makes_every_later_write_fail_fast_without_touching_the_wire() {
+        let (mut conn, mut peer) = loopback_connection().await;
+        assert!(conn.write_failure().is_none());
+
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "server write timed out");
+        assert!(conn.record_write_result(Err(timed_out)).is_err());
+        assert_eq!(conn.write_failure(), Some("server write timed out"));
+
+        let started = std::time::Instant::now();
+        let err = conn.keep_alive().await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        assert!(conn.request_callback(0x00AB_CDEF).await.is_err());
+        assert!(conn.request_more_results().await.is_err());
+        assert!(conn.send_get_sources(&[7u8; 16], 1024).await.is_err());
+        assert!(conn.offer_files(&[], 4662).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // A later failure does not overwrite the first, root-cause reason.
+        assert_eq!(conn.write_failure(), Some("server write timed out"));
+
+        drop(conn);
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), peer.read(&mut buf))
+            .await
+            .expect("peer read timed out")
+            .unwrap();
+        assert_eq!(n, 0, "a broken connection must not put further frames on the wire");
+    }
+
+    #[tokio::test]
+    async fn socket_write_error_marks_connection_unusable() {
+        let (mut conn, peer) = loopback_connection().await;
+        drop(peer);
+
+        let mut first_err = None;
+        for _ in 0..100 {
+            if let Err(e) = conn.keep_alive().await {
+                first_err = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let first_err = first_err.expect("writes to a closed peer never failed");
+        assert!(!first_err.to_string().contains("earlier write failure"));
+        assert!(conn.write_failure().is_some());
+
+        let err = conn.keep_alive().await.unwrap_err();
+        assert!(err.to_string().contains("earlier write failure"));
     }
 
     // ---- Boolean search tree tests (L12) ----

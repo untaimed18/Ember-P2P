@@ -1338,9 +1338,26 @@ async fn persist_share_mutation(
     Ok(())
 }
 
-fn load_known_files() -> KnownFileList {
+/// known.met is up to 256 MiB, so the read and parse stay off the async
+/// runtime.
+async fn load_known_files() -> Result<KnownFileList, String> {
     let data_dir = crate::storage::paths::resolve_data_dir();
-    KnownFileList::load(&data_dir.join("known.met"))
+    tokio::task::spawn_blocking(move || {
+        let known = KnownFileList::load(&data_dir.join("known.met"));
+        // Callers go straight on to resolve share state per file; wait out a
+        // startup share-intent migration here rather than on a runtime
+        // worker.
+        crate::storage::share_intent::wait_until_initialized();
+        known
+    })
+    .await
+    .map_err(|e| {
+        coded_ctx(
+            "sharing_known_files_load_error",
+            "Could not read the known-file catalog",
+            e,
+        )
+    })
 }
 
 pub(crate) fn shared_access_dirs(config: &crate::storage::config::AppConfig) -> Vec<String> {
@@ -2679,34 +2696,56 @@ fn set_added_folder_allowlist(
 
 /// Merge `entries` into an already-shared folder's allowlist. A folder with no
 /// allowlist is a full share and already offers them. Returns whether the
-/// list grew.
+/// list grew. With `may_grow` false, a list that would grow is left alone and
+/// the add is refused; one that already covers `entries` is fine either way.
 async fn extend_folder_allowlist(
     state: &AppState,
     folder: &str,
     entries: &[String],
+    may_grow: bool,
 ) -> Result<bool, String> {
     let key = crate::search::index::normalize_path_key(folder);
     let mut grew = false;
+    let mut refused = false;
     edit_folder_allowlists(state, |lists| {
         let Some(list) = lists.get_mut(&key) else {
             return false;
         };
-        for entry in entries {
-            let entry = crate::search::index::normalize_path_key(entry);
+        let missing: Vec<String> = entries
+            .iter()
+            .map(|entry| crate::search::index::normalize_path_key(entry))
+            .filter(|entry| !list.iter().any(|item| path_key_covers(item, entry)))
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        if !may_grow {
+            refused = true;
+            return false;
+        }
+        for entry in missing {
             if !list.iter().any(|item| path_key_covers(item, &entry)) {
                 list.push(entry);
-                grew = true;
             }
         }
-        grew
+        grew = true;
+        true
     })
     .await?;
+    if refused {
+        return Err(coded(
+            "sharing_share_not_confirmed",
+            "Nothing was shared because it was not confirmed",
+        ));
+    }
     Ok(grew)
 }
 
 /// Ask, in a dialog the renderer can neither draw nor dismiss, whether to share
-/// a whole drive. Every way of adding a folder (picker, in-app browser, drop)
-/// arrives here, so this is the one place the question is asked.
+/// a whole drive. Every add whose folder the OS handed us (picker, drop)
+/// arrives here. The in-app browser asks once for its whole selection instead,
+/// drive warning included, so it is not asked a second time; see
+/// [`ShareApproval::Confirmed`].
 pub(crate) async fn confirm_drive_root_share(app: &tauri::AppHandle, root: &std::path::Path) -> bool {
     use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
     let shown = crate::commands::share_browser::display_fs_path(root);
@@ -2746,11 +2785,53 @@ pub(crate) async fn confirm_drive_root_share(app: &tauri::AppHandle, root: &std:
 /// not added again: `only` joins that share's allowlist when it has one, and a
 /// full share offers them already. Either way the caller still has to offer
 /// any of `files` that are indexed but unshared.
+///
+/// Only for a folder the OS itself handed the backend: one chosen in the
+/// native folder picker, or a directory dropped on the native window. Not the
+/// folder holding a dropped file, which the OS never handed over, and not a
+/// path the renderer named; those go through [`add_shared_folder_approved`]
+/// with the roots the user confirmed natively.
 pub(crate) async fn add_shared_folder_limited(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     only: Option<Vec<String>>,
+) -> Result<FolderAdd, String> {
+    add_shared_folder_approved(app, state, path, only, ShareApproval::Native).await
+}
+
+/// Who vouches for an add that would put a folder on the shared list, or let
+/// more of an already partly shared folder onto the network.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ShareApproval<'a> {
+    /// The OS handed the backend this path, so the gesture is the user's
+    /// answer. Only a whole drive is still asked about.
+    Native,
+    /// Only these roots, which the user approved in a native dialog that also
+    /// carried any whole-drive warning, may become new shares or have their
+    /// allowlist grow. Anything else is refused where the add commits, so a
+    /// folder unshared between that dialog and the add cannot slip in unasked.
+    Confirmed(&'a [String]),
+}
+
+impl ShareApproval<'_> {
+    fn permits(&self, root: &str) -> bool {
+        match self {
+            ShareApproval::Native => true,
+            ShareApproval::Confirmed(approved) => approved
+                .iter()
+                .any(|approved| paths_equal_ignore_case(approved, root)),
+        }
+    }
+}
+
+/// [`add_shared_folder_limited`] under an explicit [`ShareApproval`].
+pub(crate) async fn add_shared_folder_approved(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    only: Option<Vec<String>>,
+    approval: ShareApproval<'_>,
 ) -> Result<FolderAdd, String> {
     if path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
@@ -2837,16 +2918,25 @@ pub(crate) async fn add_shared_folder_limited(
     }
 
     let canonical_str = canonical.to_string_lossy().to_string();
-    if drive_root == crate::sharing::DriveRootShare::NeedsConfirmation {
-        let already_shared = state
-            .config
-            .read()
-            .await
-            .settings
-            .shared_folders
-            .iter()
-            .any(|f| paths_equal_ignore_case(f, &canonical_str));
-        if !already_shared && !confirm_drive_root_share(&app, &canonical).await {
+    if drive_root == crate::sharing::DriveRootShare::NeedsConfirmation
+        && matches!(approval, ShareApproval::Native)
+    {
+        // A drive shared in part never carried the whole-drive warning, and a
+        // whole-folder add is how the picker goes on to lift its allowlist.
+        let asked_before = {
+            let config = state.config.read().await;
+            let settings = &config.settings;
+            let shared = settings
+                .shared_folders
+                .iter()
+                .any(|f| paths_equal_ignore_case(f, &canonical_str));
+            let limited = settings
+                .pending_folder_allowlists
+                .keys()
+                .any(|key| paths_equal_ignore_case(key, &canonical_str));
+            shared && (!limited || resolved_only.is_some())
+        };
+        if !asked_before && !confirm_drive_root_share(&app, &canonical).await {
             return Err(coded_ctx(
                 "sharing_drive_root_declined",
                 "The drive was not shared",
@@ -2911,6 +3001,14 @@ pub(crate) async fn add_shared_folder_limited(
                     format!("{existing} and {canonical_str}"),
                 ));
             }
+            // Checked under the save lock, against the list this add commits
+            // to, so "not new when the dialog was drawn" cannot go stale.
+            if !approval.permits(&canonical_str) {
+                return Err(coded(
+                    "sharing_share_not_confirmed",
+                    "Nothing was shared because it was not confirmed",
+                ));
+            }
             let mut new_settings = config.settings.clone();
             new_settings.shared_folders.push(canonical_str.clone());
             set_added_folder_allowlist(
@@ -2934,7 +3032,8 @@ pub(crate) async fn add_shared_folder_limited(
             let allowlist_grew = if entries.is_empty() {
                 false
             } else {
-                extend_folder_allowlist(&state, &existing, &entries).await?
+                extend_folder_allowlist(&state, &existing, &entries, approval.permits(&existing))
+                    .await?
             };
             return Ok(FolderAdd {
                 outcome: FolderAddOutcome::AlreadyShared,
@@ -3038,8 +3137,11 @@ pub(crate) async fn add_shared_folder_limited(
                 .settings
                 .pending_folder_allowlists
                 .clone();
-            let withheld =
-                known_hashes_outside_allowlist(&load_known_files(), &canonical_str, &allowlists);
+            let withheld = known_hashes_outside_allowlist(
+                &load_known_files().await?,
+                &canonical_str,
+                &allowlists,
+            );
             if let Err(error) = persist_shared_states(&state.network_tx, &withheld, false).await {
                 warn!(
                     "Files outside the new allowlist on {canonical_str} were not unshared: {error}"
@@ -3120,7 +3222,14 @@ pub(crate) async fn add_shared_folder_limited(
             return;
         }
 
-        let known_list = load_known_files();
+        let known_list = match load_known_files().await {
+            Ok(known_list) => known_list,
+            Err(e) => {
+                tracing::error!("known.met load failed for {path}: {e}");
+                remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
+                return;
+            }
+        };
         let ResolvedWork {
             needs_hashing: mut files_to_hash,
             needs_top_up,
@@ -3830,6 +3939,17 @@ async fn queue_drop_confirmation(
                 .unwrap_or_else(|| p.clone())
         })
         .collect();
+    let parents: Vec<String> = folders
+        .iter()
+        .filter(|folder| {
+            files.iter().any(|file| {
+                std::path::Path::new(file)
+                    .parent()
+                    .is_some_and(|parent| paths_equal_ignore_case(&parent.to_string_lossy(), folder))
+            })
+        })
+        .cloned()
+        .collect();
     let kept_files = if reason == "files" { files } else { Vec::new() };
     {
         let mut pending = state.pending_folder_drop.lock().await;
@@ -3839,6 +3959,7 @@ async fn queue_drop_confirmation(
             token,
             folders,
             files: kept_files,
+            parents,
         });
     }
     let _ = app.emit(
@@ -3850,6 +3971,11 @@ async fn queue_drop_confirmation(
 /// Approve the folders a dropped file asked about, identified by the token the
 /// backend issued. Nothing here trusts a path from the renderer: a stale or
 /// invented token simply finds no pending drop.
+///
+/// The renderer's answer is enough only for what the OS handed over. Sharing
+/// the whole folder a dropped file sits in, or a whole drive, is put to the
+/// user again in a native dialog first, since the renderer could otherwise
+/// pick "the whole folder" on the user's behalf.
 #[tauri::command]
 pub async fn confirm_dropped_folders(
     app: tauri::AppHandle,
@@ -3871,28 +3997,94 @@ pub async fn confirm_dropped_folders(
     };
     let folders = outermost_folders(pending.folders);
     let files = pending.files;
+    let parents = pending.parents;
     let only_files = only_dropped_files == Some(true) && !files.is_empty();
+    let plan: Vec<(String, Option<Vec<String>>, bool)> = folders
+        .into_iter()
+        .map(|folder| {
+            let only = if only_files {
+                let in_folder: Vec<String> = files
+                    .iter()
+                    .filter(|file| crate::security::path_matches_dir(file, &folder))
+                    .cloned()
+                    .collect();
+                if in_folder.is_empty() {
+                    tracing::warn!(
+                        "No dropped files matched folder {folder}; sharing the whole folder"
+                    );
+                    None
+                } else {
+                    Some(in_folder)
+                }
+            } else {
+                None
+            };
+            let handed_over = !parents
+                .iter()
+                .any(|parent| paths_equal_ignore_case(parent, &folder));
+            (folder, only, handed_over)
+        })
+        .collect();
+    // Spelled the way the add stores a folder, which is what the approval
+    // below is matched against and the shared list is compared in.
+    let plan = tokio::task::spawn_blocking(move || {
+        plan.into_iter()
+            .map(|(folder, only, handed_over)| {
+                let stored = std::path::Path::new(&folder)
+                    .canonicalize()
+                    .map(|canonical| crate::commands::share_browser::display_fs_path(&canonical))
+                    .unwrap_or(folder);
+                (stored, only, handed_over)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+    let shared: Vec<std::path::PathBuf> = state
+        .config
+        .read()
+        .await
+        .settings
+        .shared_folders
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let to_confirm = drop_roots_to_confirm(
+        plan.iter()
+            .map(|(folder, only, handed_over)| (folder.as_str(), only.is_none(), *handed_over)),
+        &shared,
+    );
+    if to_confirm.len() > crate::commands::share_browser::MAX_CONFIRM_ROOTS {
+        return Err(crate::commands::share_browser::too_many_to_confirm());
+    }
+    if !to_confirm.is_empty()
+        && !crate::commands::share_browser::confirm_share_roots(
+            &app,
+            &to_confirm,
+            crate::commands::share_browser::ShareOrigin::Drop,
+        )
+        .await
+    {
+        return Err(coded(
+            "sharing_share_not_confirmed",
+            "Nothing was shared because it was not confirmed",
+        ));
+    }
+    // Every folder shared whole is now either handed over by the OS or
+    // confirmed above. One limited to the dropped files offers only what the OS
+    // handed over, wherever its allowlist ends up, so it keeps native standing.
+    let approved: Vec<String> = plan.iter().map(|(folder, ..)| folder.clone()).collect();
     let mut added = 0usize;
     let mut failed = 0usize;
-    for folder in folders {
-        let only = if only_files {
-            let in_folder: Vec<String> = files
-                .iter()
-                .filter(|file| crate::security::path_matches_dir(file, &folder))
-                .cloned()
-                .collect();
-            if in_folder.is_empty() {
-                tracing::warn!(
-                    "No dropped files matched folder {folder}; sharing the whole folder"
-                );
-                None
-            } else {
-                Some(in_folder)
-            }
+    for (folder, only, _) in plan {
+        let approval = if only.is_some() {
+            ShareApproval::Native
         } else {
-            None
+            ShareApproval::Confirmed(&approved)
         };
-        match add_shared_folder_limited(app.clone(), state.clone(), folder.clone(), only).await {
+        match add_shared_folder_approved(app.clone(), state.clone(), folder.clone(), only, approval)
+            .await
+        {
             // See the folder-drop path: an already-shared folder is a success.
             Ok(add) => {
                 if add.outcome == FolderAddOutcome::AlreadyShared && !add.files.is_empty() {
@@ -3916,6 +4108,64 @@ pub async fn confirm_dropped_folders(
     }
     emit_drop_result(&app, added, failed);
     Ok(added)
+}
+
+/// The folders of a confirmed drop, as `(folder, shared whole, handed over by
+/// the OS)`, that still need a native confirmation: any shared whole that the
+/// OS did not hand over, and any whole drive, which the add does not ask about
+/// itself under a [`ShareApproval::Confirmed`]. One already shared, or
+/// overlapping a share, changes nothing or is refused, so it is not asked about.
+fn drop_roots_to_confirm<'a>(
+    plan: impl Iterator<Item = (&'a str, bool, bool)>,
+    shared: &[std::path::PathBuf],
+) -> Vec<crate::commands::share_browser::NewShareRoot> {
+    use crate::commands::share_browser::{overlaps_share, NewShareRoot, ShareScope};
+    let mut roots: Vec<NewShareRoot> = plan
+        .filter(|(folder, whole, _)| *whole && !overlaps_share(folder, shared))
+        .filter_map(|(folder, _, handed_over)| {
+            let root = NewShareRoot::new(folder, ShareScope::Whole);
+            (!handed_over || root.whole_drive).then_some(root)
+        })
+        .collect();
+    roots.sort_by_key(|root| !root.whole_drive);
+    roots
+}
+
+#[cfg(test)]
+mod drop_confirmation_tests {
+    use super::drop_roots_to_confirm;
+    use std::path::PathBuf;
+
+    #[test]
+    fn only_a_parent_shared_whole_or_a_drive_needs_confirming() {
+        let (parent, dropped, limited, shared, inside, drive) = if cfg!(windows) {
+            (
+                r"C:\Photos",
+                r"C:\Music",
+                r"C:\Docs",
+                r"\\?\C:\Shared",
+                r"C:\Shared\Sub",
+                Some(r"E:\"),
+            )
+        } else {
+            ("/photos", "/music", "/docs", "/shared", "/shared/sub", None)
+        };
+        let mut plan = vec![
+            (parent, true, false),
+            (dropped, true, true),
+            (limited, false, false),
+            (inside, true, false),
+        ];
+        plan.extend(drive.map(|drive| (drive, true, true)));
+        let roots = drop_roots_to_confirm(plan.into_iter(), &[PathBuf::from(shared)]);
+        let paths: Vec<&str> = roots.iter().map(|root| root.path.as_str()).collect();
+        let mut expected: Vec<&str> = drive.into_iter().collect();
+        expected.push(parent);
+        assert_eq!(
+            paths, expected,
+            "a dropped folder, one limited to dropped files and one inside a share are not asked about"
+        );
+    }
 }
 
 /// `folders` without any that sit inside another of them, or repeat one.
@@ -4918,7 +5168,14 @@ async fn reload_shared_files_page(
             return;
         }
 
-        let known_list = load_known_files();
+        let known_list = match load_known_files().await {
+            Ok(known_list) => known_list,
+            Err(e) => {
+                tracing::error!("Reload known.met load failed: {e}");
+                remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
+                return;
+            }
+        };
         let ResolvedWork {
             needs_hashing: mut files_to_hash,
             needs_top_up,
@@ -5968,6 +6225,12 @@ pub async fn open_shared_folder(
         // different code than the containment failure.
         let canonical = crate::security::filesystem::verify_existing_path(folder, &allowed_dirs)
             .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        // `verify_existing_path` accepts regular files too, and a renderer
+        // path of `<file>\_` has that file as its parent. Handing a file to
+        // the default-app launcher executes it, so only a directory may pass.
+        if !canonical.is_dir() {
+            return Err(coded("sharing_invalid_path", "Invalid or changed path"));
+        }
         // Opened, not revealed. `reveal_in_file_manager` selects its argument
         // *inside the argument's own parent*, so handing it the containing
         // folder opened the grandparent with the folder merely highlighted —

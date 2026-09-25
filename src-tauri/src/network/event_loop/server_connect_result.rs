@@ -398,6 +398,12 @@ pub(in crate::network) async fn on_server_connect_result(
             state.stats.server_status = "connected".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connected" }));
 
+            // Whatever is still queued was addressed to the previous
+            // session: a LowID client id only means something to the server
+            // that issued it, and a write-failure disconnect leaves the
+            // drain's unsent tail behind.
+            pending_lowid_callback_queue.clear();
+
             // L-2: flush LowID callback requests for any
             // sources we previously learned about via UDP
             // from this server. Without this, UDP-discovered

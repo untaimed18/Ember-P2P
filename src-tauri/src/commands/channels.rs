@@ -4512,6 +4512,44 @@ pub async fn transfer_channel_ownership(
             "This room has already been transferred",
         ));
     }
+    // Once the nominee has answered and a handoff record has gone out, the room
+    // is spoken for: that record may be stored even though no acknowledgement
+    // said so, and a second offer would put a rival record beside it and split
+    // the members between two successors. Transferring to the same member
+    // again re-drives the publish instead. Only once the offer it answered has
+    // lapsed — long enough for our own handoff fetch to have found a record
+    // that did land — may an unconfirmed commitment be given up.
+    let db = state.db.clone();
+    let commit_id = channel_id.clone();
+    let commit = tokio::task::spawn_blocking(move || db.channel_handoff_commit(&commit_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
+    if let Some(commit) = commit {
+        let now = chrono::Utc::now().timestamp();
+        let publishing = || {
+            coded(
+                "channels_handoff_publishing",
+                "This room's ownership transfer is still being published",
+            )
+        };
+        if commit.confirmed {
+            return Err(publishing());
+        }
+        if channel::handoff_offer_live(commit.version, now) {
+            if !commit.nominee.eq_ignore_ascii_case(&hex::encode(pk)) {
+                return Err(publishing());
+            }
+            let db = state.db.clone();
+            let id = channel_id.clone();
+            tokio::task::spawn_blocking(move || db.restart_channel_handoff_commit(&id, now))
+                .await
+                .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+                .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
+            return Ok(());
+        }
+        clear_channel_pending_handoff(&state, &channel_id).await?;
+    }
     // `set_channel_pending_handoff` overwrites, so a second offer to a
     // different member would orphan the first and leave the room in an
     // ambiguous handoff. Re-offering to the same member stays allowed, since a

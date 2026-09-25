@@ -28,6 +28,60 @@ fn emit_download_folder_unavailable(app_handle: &tauri::AppHandle) {
     let _ = app_handle.emit("download-folder-unavailable", ());
 }
 
+/// Per transfer: re-queues in a row without gaining bytes, and the completed
+/// size at the last one.
+///
+/// `PendingDownload::search_count` cannot carry this across a restart: every
+/// start path removes the pending entry, so each failure re-queued at count 1.
+fn requeue_history() -> &'static std::sync::Mutex<HashMap<String, (u32, u64)>> {
+    static HISTORY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u32, u64)>>> =
+        std::sync::OnceLock::new();
+    HISTORY.get_or_init(Default::default)
+}
+
+/// Search count for a re-queue. It grows while failures arrive without
+/// progress, which backs off `pending_download_retry_interval`; bytes gained
+/// since the last re-queue restart it, so a download that was working keeps
+/// the quick first retry it always had.
+fn next_requeue_search_count(
+    prev_pending: Option<u32>,
+    last: Option<(u32, u64)>,
+    completed_now: u64,
+) -> u32 {
+    let carried = match last {
+        Some((count, completed_then)) if completed_now <= completed_then => count,
+        _ => 0,
+    };
+    carried.max(prev_pending.unwrap_or(0)).saturating_add(1)
+}
+
+/// `last_search_at` for a re-queued download. The first re-queue after
+/// progress retries at once, as before; later ones wait out the interval
+/// their count earned instead of retrying on the next tick.
+fn requeue_last_search_at(search_count: u32, now: i64) -> i64 {
+    if search_count <= 1 {
+        0
+    } else {
+        now
+    }
+}
+
+fn note_requeue(transfer_id: &str, prev_pending: Option<u32>, completed_now: u64) -> u32 {
+    let Ok(mut history) = requeue_history().lock() else {
+        return prev_pending.unwrap_or(0).saturating_add(1);
+    };
+    let count =
+        next_requeue_search_count(prev_pending, history.get(transfer_id).copied(), completed_now);
+    history.insert(transfer_id.to_string(), (count, completed_now));
+    count
+}
+
+fn forget_requeue_history(transfer_id: &str) {
+    if let Ok(mut history) = requeue_history().lock() {
+        history.remove(transfer_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -152,6 +206,7 @@ pub(in crate::network) async fn on_download_event(
         state.active_kad_search_state.remove(transfer_id);
         state.per_file_sources.remove(transfer_id);
         state.download_handles.remove(transfer_id);
+        forget_requeue_history(transfer_id);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -656,6 +711,14 @@ pub(in crate::network) async fn on_download_event(
             warn!("Download {transfer_id} cannot use its download folder: {error}");
             emit_download_folder_unavailable(app_handle);
         }
+        // The finished `.part` could not be read back. Also local: no source
+        // is blamed, the same as a folder error.
+        let is_local_read_error = matches!(
+            failure_code,
+            ed2k::transfer::TransferFailureCode::FinalVerifyInconclusive
+                | ed2k::transfer::TransferFailureCode::LocalReadFailed
+        );
+        let blames_source = !is_folder_error && !is_local_read_error;
 
         // Prefer is_user_cancel_error for source-failure classification;
         // also honour an already-cancelled control (cancel race).
@@ -684,7 +747,7 @@ pub(in crate::network) async fn on_download_event(
             )
         };
 
-        if !is_user_cancel && !settled_by_user && !is_folder_error {
+        if !is_user_cancel && !settled_by_user && blames_source {
             let _ = app_handle.emit("transfer:source-failed", serde_json::json!({
                 "transfer_id": transfer_id,
                 "source": peer_id_str,
@@ -699,7 +762,7 @@ pub(in crate::network) async fn on_download_event(
         // SourceDetail "failed" events (which carry the actual IP/port).
         // For single-source downloads that set peer_id, apply a
         // belt-and-suspenders mark here as well.
-        if !is_folder_error {
+        if blames_source {
             // Sources retired below are also dropped from the
             // registry, which is what makes the count honest — see
             // `retire_dead_source_from_registry`. Collected while the
@@ -798,6 +861,15 @@ pub(in crate::network) async fn on_download_event(
                 "{} pin failed for {transfer_id} — not re-queuing",
                 if is_ember_pin_fail { "Ember BLAKE3" } else { "AICH" }
             );
+        } else if failure_code == ed2k::transfer::TransferFailureCode::LocalReadFailed
+            && !is_user_cancel
+        {
+            // The worker already retried and re-read part by part; another
+            // attempt would read the same drive. Falls through to Failed so
+            // the row says why, and a manual resume starts the count afresh.
+            state.pending_downloads.remove(transfer_id);
+            forget_requeue_history(transfer_id);
+            warn!("Download {transfer_id} cannot be read back from disk — not re-queuing");
         } else if is_disk_full && !is_user_cancel {
             let file_name = {
                 let mgr = transfer_manager.read().await;
@@ -968,8 +1040,8 @@ pub(in crate::network) async fn on_download_event(
                 }
                 let prev_search_count = state.pending_downloads
                     .get(transfer_id)
-                    .map(|pd| pd.search_count)
-                    .unwrap_or(0);
+                    .map(|pd| pd.search_count);
+                let search_count = note_requeue(transfer_id, prev_search_count, t.completed_size);
                 insert_pending_download_bounded(&mut state.pending_downloads, transfer_id.clone(), PendingDownload {
                     transfer_id: transfer_id.clone(),
                     file_hash: t.file_hash.clone(),
@@ -977,8 +1049,8 @@ pub(in crate::network) async fn on_download_event(
                     file_size: t.total_size,
                     expected_aich: t.expected_aich.clone(),
                     control,
-                    search_count: prev_search_count.saturating_add(1),
-                    last_search_at: 0,
+                    search_count,
+                    last_search_at: requeue_last_search_at(search_count, chrono::Utc::now().timestamp()),
                     priority: priority_str_to_u32(&t.priority),
                 });
                 info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
@@ -1008,6 +1080,7 @@ pub(in crate::network) async fn on_download_event(
             // row and recorded history as "cancelled". Falling
             // through would emit transfer-failed and paint the
             // download bar red for a moment before the UI drops it.
+            forget_requeue_history(transfer_id);
             return;
         }
         } // end else (!is_disk_full)
@@ -1675,4 +1748,44 @@ pub(in crate::network) async fn on_download_event(
     // Do not auto-resume user-paused downloads when a transfer
     // completes — Pausing is an explicit user action. Concurrent
     // slot refill for queued (not paused) work is handled elsewhere.
+}
+
+#[cfg(test)]
+mod requeue_tests {
+    use super::*;
+
+    #[test]
+    fn failures_without_progress_back_off_across_restarts() {
+        let first = next_requeue_search_count(None, None, 500);
+        assert_eq!(first, 1);
+        let second = next_requeue_search_count(None, Some((first, 500)), 500);
+        let third = next_requeue_search_count(None, Some((second, 500)), 500);
+        assert_eq!((second, third), (2, 3));
+        assert_eq!(requeue_last_search_at(first, 1_000), 0, "first retry is immediate");
+        assert_eq!(requeue_last_search_at(third, 1_000), 1_000, "later ones wait");
+    }
+
+    #[test]
+    fn progress_since_the_last_requeue_restarts_the_count() {
+        assert_eq!(next_requeue_search_count(None, Some((7, 500)), 900), 1);
+        // Re-opened parts lower the completed size; that is not progress.
+        assert_eq!(next_requeue_search_count(None, Some((7, 500)), 200), 8);
+    }
+
+    #[test]
+    fn a_surviving_pending_count_is_never_lowered() {
+        assert_eq!(next_requeue_search_count(Some(12), Some((2, 500)), 500), 13);
+        assert_eq!(next_requeue_search_count(Some(4), None, 0), 5);
+    }
+
+    #[test]
+    fn history_is_per_transfer_and_forgettable() {
+        let id = "requeue-tests-history";
+        forget_requeue_history(id);
+        assert_eq!(note_requeue(id, None, 10), 1);
+        assert_eq!(note_requeue(id, None, 10), 2);
+        forget_requeue_history(id);
+        assert_eq!(note_requeue(id, None, 10), 1);
+        forget_requeue_history(id);
+    }
 }

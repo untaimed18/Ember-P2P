@@ -5,6 +5,71 @@
 
 use super::*;
 
+/// Per-file upload counters as the Library shows them, sent on
+/// `shared-file-stats` instead of `shared-files-changed`. Upload progress
+/// arrives up to every 200 ms per slot, and every `shared-files-changed`
+/// makes its listeners re-read the whole library, so these are coalesced
+/// per hash (latest absolute values win) and flushed at most once per
+/// [`SHARED_FILE_STATS_INTERVAL`] across all files.
+#[derive(Clone, serde::Serialize)]
+struct SharedFileStats {
+    hash: String,
+    requests: u32,
+    accepted: u32,
+    bytes_transferred: u64,
+    alltime_requests: u32,
+    alltime_accepted: u32,
+    alltime_transferred: u64,
+}
+
+impl SharedFileStats {
+    fn of(file: &FileInfo) -> Self {
+        Self {
+            hash: file.hash.clone(),
+            requests: file.requests,
+            accepted: file.accepted,
+            bytes_transferred: file.bytes_transferred,
+            alltime_requests: file.alltime_requests,
+            alltime_accepted: file.alltime_accepted,
+            alltime_transferred: file.alltime_transferred,
+        }
+    }
+}
+
+const SHARED_FILE_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `Some` while a flush is scheduled; the flush task takes the batch.
+static PENDING_SHARED_FILE_STATS: std::sync::Mutex<Option<HashMap<String, SharedFileStats>>> =
+    std::sync::Mutex::new(None);
+
+fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats) {
+    let key = stats.hash.to_ascii_lowercase();
+    {
+        let mut pending = PENDING_SHARED_FILE_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(batch) = pending.as_mut() {
+            batch.insert(key, stats);
+            return;
+        }
+        *pending = Some(HashMap::from([(key, stats)]));
+    }
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SHARED_FILE_STATS_INTERVAL).await;
+        let batch = PENDING_SHARED_FILE_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(batch) = batch.filter(|b| !b.is_empty()) {
+            let _ = app_handle.emit(
+                "shared-file-stats",
+                batch.into_values().collect::<Vec<_>>(),
+            );
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_upload_event(
     event: UploadEvent,
@@ -93,8 +158,9 @@ pub(in crate::network) async fn on_upload_event(
                         persisted_alltime,
                     );
                 }
-                {
+                let updated = {
                     let mut cached = shared_files.write().await;
+                    let mut updated = None;
                     for file in cached.iter_mut() {
                         if file.hash.eq_ignore_ascii_case(&hash_hex) {
                             file.bytes_transferred = file
@@ -105,16 +171,14 @@ pub(in crate::network) async fn on_upload_event(
                                     .alltime_transferred
                                     .saturating_add(uploaded_bytes);
                             }
+                            updated = Some(SharedFileStats::of(file));
                         }
                     }
+                    updated
+                };
+                if let Some(stats) = updated {
+                    queue_shared_file_stats(app_handle, stats);
                 }
-                let _ = app_handle.emit(
-                    "shared-files-changed",
-                    serde_json::json!({
-                        "phase": "upload-progress",
-                        "count": 1,
-                    }),
-                );
             }
         }
     }
@@ -179,8 +243,9 @@ pub(in crate::network) async fn on_upload_event(
                     // of entries with strings) for every peer file
                     // request; counters on the one file that
                     // changed are all the UI needs.
-                    {
+                    let updated = {
                         let mut cached = shared_files.write().await;
+                        let mut updated = None;
                         for f in cached.iter_mut() {
                             if f.hash == *file_hash {
                                 f.requests = f.requests.saturating_add(inc_requests);
@@ -193,13 +258,14 @@ pub(in crate::network) async fn on_upload_event(
                                         .alltime_accepted
                                         .saturating_add(inc_accepted);
                                 }
+                                updated = Some(SharedFileStats::of(f));
                             }
                         }
+                        updated
+                    };
+                    if let Some(stats) = updated {
+                        queue_shared_file_stats(app_handle, stats);
                     }
-                    let _ = app_handle.emit("shared-files-changed", serde_json::json!({
-                        "phase": "upload-stats",
-                        "count": 1,
-                    }));
                 }
             }
         }
