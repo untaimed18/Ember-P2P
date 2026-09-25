@@ -857,6 +857,7 @@ fn registry_error_status(err: registry::RegistryError) -> StatusCode {
         // Not the caller's fault and not about the name they asked for, so
         // neither 400 nor 409: the server has no capacity to record it.
         registry::RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
+        registry::RegistryError::ReadOnly => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -906,7 +907,8 @@ const PUNCH_TTL: Duration = Duration::from_secs(30);
 /// realistic worst case (2 downloads × 8 peers × 2 retries within a
 /// minute = 32) with comfortable headroom.
 const MAX_PUNCH_PER_MINUTE: u64 = 60;
-/// New channel names one IP may claim per hour.
+/// New channel names, usernames and tombstones one [`rate_key`] (an IPv4
+/// address or an IPv6 /64) may create per hour.
 ///
 /// A room name is reserved the moment it is claimed and held for a long time
 /// afterwards, so mass creation is not a load problem — it is a land grab that
@@ -919,6 +921,16 @@ const MAX_PUNCH_PER_MINUTE: u64 = 60;
 /// like creation. Retries after a failed create do spend budget, which is
 /// intended: a client looping on create is exactly what this bounds.
 const MAX_CHANNEL_CREATES_PER_HOUR: u64 = 6;
+/// The same budget pooled across one [`client_network`] (/24 or /64).
+///
+/// What this budget guards is permanent: usernames are held for a year and
+/// tombstones forever, and the registry refuses every new claim once a map is
+/// full. Per-address alone, one rented /24 bought 256 x 6 of those an hour.
+/// The pool is deliberately larger than one address's share rather than equal
+/// to it, because carrier-grade NAT puts many unrelated subscribers in one
+/// /24; refreshes are never charged, so only genuinely new names compete for
+/// it. For IPv6 both tiers key on the /64, so this adds nothing there.
+const MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR: u64 = 24;
 const CHANNEL_CREATE_WINDOW: Duration = Duration::from_secs(3600);
 /// Cap on simultaneous pending punch entries per `target_id`. Bounds
 /// the impact of `punch_register` spam against a victim once the
@@ -929,7 +941,7 @@ const MAX_PUNCH_PER_TARGET: usize = 8;
 /// Of [`MAX_PUNCH_PER_TARGET`], how many slots requesters authorized only by a
 /// public friend-code intro capability may hold at once. Everyone else's claim
 /// rests on a pairwise capability the target itself handed out, so reserving the
-/// remainder keeps a stranger with the target's `ember2:` code from crowding its
+/// remainder keeps a stranger with the target's friend code from crowding its
 /// actual friends out of the queue.
 const MAX_PUNCH_PER_TARGET_OPEN_INTRO: usize = 2;
 const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
@@ -1087,7 +1099,8 @@ struct PairwisePresenceEntry {
     /// Ignored when `open_intro` is set (friend-code intro presence).
     peer_pubkey: [u8; 32],
     /// When true, any currently-registered requester may look up / punch this
-    /// capability. Used for friend-code intro presence (holders of `ember2:`).
+    /// capability. Used for friend-code intro presence (holders of the owner's
+    /// `ember3:` code, or of any identifier for an older client).
     open_intro: bool,
     pubkey: [u8; 32],
     epoch: i64,
@@ -1146,25 +1159,144 @@ fn derive_intro_presence_capability(owner_pubkey: &[u8; 32], epoch: i64) -> [u8;
     blake3::derive_key(&context, owner_pubkey)
 }
 
+/// Recompute a sealed (`ember3:`) intro capability from the owner's public key
+/// and the per-epoch key it sent with the registration.
+///
+/// Must stay byte-identical to the client's
+/// `derive_sealed_intro_capability_from_key`. The epoch key comes from a secret
+/// only the owner and holders of its friend code know, so the capability can no
+/// longer be derived from a roster-visible public key — but the server still
+/// binds the namespace to the registering key exactly as for the legacy form,
+/// without ever learning the long-lived secret.
+fn derive_sealed_intro_presence_capability(
+    owner_pubkey: &[u8; 32],
+    epoch_key: &[u8; 32],
+    epoch: i64,
+) -> [u8; 32] {
+    let context = format!("ember-intro-presence-v2:{epoch}");
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(owner_pubkey);
+    input[32..].copy_from_slice(epoch_key);
+    blake3::derive_key(&context, &input)
+}
+
+/// Status for a sealed intro registration whose `intro_key` is malformed,
+/// misplaced, or does not derive the capability. Deliberately unused by any
+/// other check: clients treat it — and only it — as "this server will not take
+/// my sealed intro" and fall back to the legacy one, while the 400s and 403s
+/// shared with every registration (stale timestamp, owner not registered after
+/// a restart) are retried as sealed on the next heartbeat.
+const SEALED_INTRO_REJECTED: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
+
+/// The intro capability `pubkey` is entitled to register for `epoch`: sealed
+/// when the request carries an epoch key, legacy otherwise (older clients).
+fn expected_intro_capability(
+    pubkey: &[u8; 32],
+    intro_key: Option<&[u8; 32]>,
+    epoch: i64,
+) -> [u8; 32] {
+    match intro_key {
+        Some(epoch_key) => derive_sealed_intro_presence_capability(pubkey, epoch_key, epoch),
+        None => derive_intro_presence_capability(pubkey, epoch),
+    }
+}
+
 #[derive(Clone)]
 struct RateEntry {
     count: u64,
     window_start: Instant,
 }
 
-/// Shortest gap between two runs of the inline purge in
-/// [`check_rate_limit_bucket_in`]. The periodic sweeper is the primary reaper;
-/// this only has to keep a map full of old churn from 429-ing every
-/// first-time caller in between sweeps.
-const RATE_PURGE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Key a general rate-limit bucket charges: the exact address for IPv4, the
+/// /64 for IPv6.
+///
+/// IPv4 stays per-address because carrier-grade NAT puts many unrelated
+/// subscribers in one /24, and a per-minute request budget shared across them
+/// would 429 ordinary users. IPv6 cannot stay per-address: a single host
+/// usually owns its whole /64, so an exact-address key handed it 2^64 fresh
+/// budgets and let it fill a bucket's map on its own.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match canonical_ip(ip) {
+        v4 @ IpAddr::V4(_) => v4,
+        v6 @ IpAddr::V6(_) => client_network(v6),
+    }
+}
 
-/// One rate-limit bucket: the per-IP windows, plus the clock that paces the
-/// inline purge.
+/// One rate-limit bucket: the per-key windows (see [`rate_key`]), plus an age
+/// index over them.
+///
+/// At capacity the bucket evicts its oldest window instead of refusing the
+/// newcomer. Refusing meant a flood of distinct keys, once it filled the map,
+/// 429'd every legitimate client the server had not already seen until the
+/// flood's entries aged out. Evicting only ever hands a key a fresh budget,
+/// which any unseen key already gets, so it grants the flood nothing extra.
+/// The index keeps that eviction O(log n): a scan for the oldest entry, run
+/// on every request from an unseen key under exactly that flood, would turn
+/// the limiter into the amplifier.
 #[derive(Default)]
 struct RateBucket {
     entries: HashMap<IpAddr, RateEntry>,
-    /// When the inline purge last ran, or `None` if it never has.
-    last_purge: Option<Instant>,
+    /// Exactly one `(window_start, key)` per entry in `entries`.
+    by_age: std::collections::BTreeSet<(Instant, IpAddr)>,
+}
+
+impl RateBucket {
+    fn charge(
+        &mut self,
+        key: IpAddr,
+        max_requests: u64,
+        window: Duration,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        match self.entries.get_mut(&key) {
+            Some(entry) if now.duration_since(entry.window_start) >= window => {
+                self.by_age.remove(&(entry.window_start, key));
+                entry.count = 1;
+                entry.window_start = now;
+                self.by_age.insert((now, key));
+                true
+            }
+            Some(entry) => {
+                entry.count += 1;
+                entry.count <= max_requests
+            }
+            None => {
+                while self.entries.len() >= max_entries.max(1) {
+                    let Some((_, oldest)) = self.by_age.pop_first() else {
+                        break;
+                    };
+                    self.entries.remove(&oldest);
+                }
+                self.entries.insert(
+                    key,
+                    RateEntry {
+                        count: 1,
+                        window_start: now,
+                    },
+                );
+                self.by_age.insert((now, key));
+                max_requests >= 1
+            }
+        }
+    }
+
+    fn exhausted(&self, key: IpAddr, max_requests: u64, window: Duration, now: Instant) -> bool {
+        self.entries.get(&key).is_some_and(|entry| {
+            now.duration_since(entry.window_start) < window && entry.count >= max_requests
+        })
+    }
+
+    /// Drop every window that started at least `retain_for` ago.
+    fn prune(&mut self, now: Instant, retain_for: Duration) {
+        while let Some(&(started, key)) = self.by_age.first() {
+            if now.duration_since(started) < retain_for {
+                break;
+            }
+            self.by_age.pop_first();
+            self.entries.remove(&key);
+        }
+    }
 }
 
 type RateLimitBucket = Arc<RwLock<RateBucket>>;
@@ -1801,8 +1933,9 @@ struct AppState {
     /// Public reachability is indexed only by rotating pairwise capability,
     /// never by the stable Friend ID kept in `store` for mailbox auth.
     capability_store: Arc<RwLock<HashMap<String, PairwisePresenceEntry>>>,
-    /// Per-IP rate-limit window for the **general** API surface
-    /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.).
+    /// Rate-limit window for the **general** API surface
+    /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.). Every
+    /// bucket here is keyed by [`rate_key`].
     /// Punch traffic now lives in `punch_rate_limits` so a flood of
     /// punch registrations no longer steals the budget from unrelated
     /// endpoints — earlier this map was shared, and a single LowID
@@ -1822,11 +1955,15 @@ struct AppState {
     /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
     /// punch attempts.
     punch_rate_limits: RateLimitBucket,
-    /// Per-IP, per-*hour* budget for first-time channel name claims. Separate
+    /// Per-*hour* budget for first-time channel name claims. Separate
     /// map because it is the only bucket measured over an hour rather than a
     /// minute; sharing one would either let a minute's worth of room creation
     /// through unchecked or throttle ordinary traffic to a creation rate.
     channel_create_rate_limits: RateLimitBucket,
+    /// The pooled tier of the same budget, keyed by [`client_network`]. Its
+    /// own map because a /24 key would collide with the exact address that
+    /// ends in `.0` in the per-address tier.
+    channel_create_network_rate_limits: RateLimitBucket,
     /// Pending hole-punch registrations, keyed by `(target_id, from_id)`.
     /// Keying by both IDs (rather than just `target_id`) prevents an
     /// unauthenticated attacker from overwriting a legit registrant's
@@ -1914,6 +2051,10 @@ struct CapabilityRegisterRequest {
     /// logical/rate-limited admission, avoiding a second mutation request.
     #[serde(default)]
     legacy_sig: Option<String>,
+    /// Per-epoch key proving a sealed (`ember3:`) intro capability belongs to
+    /// `pubkey`. Absent on legacy intro registrations; refused without `intro`.
+    #[serde(default)]
+    intro_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2152,47 +2293,13 @@ async fn check_rate_limit_bucket_in(
     max_requests: u64,
     window: Duration,
 ) -> bool {
-    let mut limits = limits.write().await;
-    let now = Instant::now();
-    if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
-        // Same rationale as the store cap in `register`: purge
-        // entries that are stale by the sweep's own definition before
-        // failing closed on a brand-new IP, so a map that's merely
-        // full of old churn doesn't 429 every first-time caller until
-        // the next sweep cycle happens to run.
-        //
-        // Paced, because the condition that gets us here is a flood from many
-        // distinct addresses — exactly what the map exists to mitigate. In
-        // that state every entry is fresh, so the retain frees nothing and
-        // without the pacing it ran for *every* request from an unseen IP: a
-        // 200,000-element scan holding the exclusive lock that gates every
-        // rate-limited endpoint, bought with a single HTTP request. That turns
-        // the mitigation into the amplifier.
-        let due = limits
-            .last_purge
-            .is_none_or(|at| now.duration_since(at) >= RATE_PURGE_MIN_INTERVAL);
-        if due {
-            limits.last_purge = Some(now);
-            limits
-                .entries
-                .retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
-        }
-        if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
-            return false;
-        }
-    }
-    let entry = limits.entries.entry(ip).or_insert(RateEntry {
-        count: 0,
-        window_start: now,
-    });
-    if now.duration_since(entry.window_start) >= window {
-        entry.count = 1;
-        entry.window_start = now;
-        true
-    } else {
-        entry.count += 1;
-        entry.count <= max_requests
-    }
+    limits.write().await.charge(
+        rate_key(ip),
+        max_requests,
+        window,
+        Instant::now(),
+        MAX_RATE_ENTRIES,
+    )
 }
 
 async fn check_rate_limit_bucket(
@@ -2210,10 +2317,10 @@ async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
 /// Read-only counterpart of [`check_rate_limit_bucket`]: whether `ip` has
 /// already spent this window's budget. Never charges the bucket.
 async fn rate_budget_exhausted(limits: &RateLimitBucket, ip: IpAddr, max_requests: u64) -> bool {
-    let now = Instant::now();
-    limits.read().await.entries.get(&ip).is_some_and(|entry| {
-        now.duration_since(entry.window_start) < RATE_WINDOW && entry.count >= max_requests
-    })
+    limits
+        .read()
+        .await
+        .exhausted(rate_key(ip), max_requests, RATE_WINDOW, Instant::now())
 }
 
 /// Which bucket a JSON route's handler charges, so the pre-body gate peeks at
@@ -2275,14 +2382,54 @@ async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
 /// Budget for standing up a room nobody has claimed before. Charged only once
 /// the request has proved itself genuine, so a bad signature cannot spend the
 /// allowance of the address it was sent from.
+///
+/// Two tiers: [`MAX_CHANNEL_CREATES_PER_HOUR`] per [`rate_key`], then
+/// [`MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR`] per [`client_network`].
 async fn check_channel_create_rate_limit(state: &AppState, ip: IpAddr) -> bool {
-    check_rate_limit_bucket_in(
-        &state.channel_create_rate_limits,
-        ip,
+    // Always taken in this order; nothing else holds both.
+    let mut per_address = state.channel_create_rate_limits.write().await;
+    let mut per_network = state.channel_create_network_rate_limits.write().await;
+    admit_channel_create(&mut per_address, &mut per_network, ip, Instant::now())
+}
+
+/// Charges both tiers only when both admit. Charging one tier for a request
+/// the other refuses spends budget on nothing: an over-limit address retrying
+/// would drain its network's pool, and an address retrying against an
+/// exhausted pool would burn its own allowance and stay locked out after the
+/// pool recovers.
+fn admit_channel_create(
+    per_address: &mut RateBucket,
+    per_network: &mut RateBucket,
+    ip: IpAddr,
+    now: Instant,
+) -> bool {
+    let address_key = rate_key(ip);
+    let network_key = rate_key(client_network(ip));
+    if per_address.exhausted(address_key, MAX_CHANNEL_CREATES_PER_HOUR, CHANNEL_CREATE_WINDOW, now)
+        || per_network.exhausted(
+            network_key,
+            MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+            CHANNEL_CREATE_WINDOW,
+            now,
+        )
+    {
+        return false;
+    }
+    let address_ok = per_address.charge(
+        address_key,
         MAX_CHANNEL_CREATES_PER_HOUR,
         CHANNEL_CREATE_WINDOW,
-    )
-    .await
+        now,
+        MAX_RATE_ENTRIES,
+    );
+    let network_ok = per_network.charge(
+        network_key,
+        MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+        CHANNEL_CREATE_WINDOW,
+        now,
+        MAX_RATE_ENTRIES,
+    );
+    address_ok && network_ok
 }
 
 #[cfg(test)]
@@ -2932,6 +3079,10 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         "version": 4,
         "domain": "ember-rdv-v4",
         "legacy_v3_rollout": true,
+        // Clients only register an `ember3:` intro (proved with `intro_key`)
+        // where this is advertised, and fall back to the legacy intro
+        // elsewhere, since older servers refuse the sealed form.
+        "sealed_intro": true,
     }))
 }
 
@@ -3498,15 +3649,28 @@ async fn capability_register_impl(
     if body.intro && peer_pubkey != pubkey {
         return StatusCode::BAD_REQUEST;
     }
-    // An intro capability is derived from the owner's public key and the epoch,
-    // both of which travel in a public `ember2:` friend code. Anyone holding
-    // that code can therefore derive a victim's current capability and sign a
-    // valid registration for it with their own key. Recomputing the derivation
-    // binds the namespace to its owner, so a stranger cannot claim it at all —
-    // neither to replace a live entry nor to squat an epoch before the owner
-    // registers, which the owner pin alone would still permit.
-    if body.intro && capability != derive_intro_presence_capability(&pubkey, body.epoch) {
-        return StatusCode::FORBIDDEN;
+    let intro_key = match body.intro_key.as_deref() {
+        None => None,
+        Some(value) if body.intro && validate_hex_id(value) => decode_hex_id(value),
+        Some(_) => return SEALED_INTRO_REJECTED,
+    };
+    // A legacy intro capability is derived from the owner's public key and the
+    // epoch, both public; a sealed one also from the owner's intro secret,
+    // which every holder of its `ember3:` code knows. Either way someone other
+    // than the owner can derive the current capability and sign a valid
+    // registration for it with their own key. Recomputing the derivation under
+    // the registrant's key binds the namespace to its owner, so nobody else
+    // can claim it at all — neither to replace a live entry nor to squat an
+    // epoch before the owner registers, which the owner pin alone would still
+    // permit.
+    if body.intro
+        && capability != expected_intro_capability(&pubkey, intro_key.as_ref(), body.epoch)
+    {
+        return if intro_key.is_some() {
+            SEALED_INTRO_REJECTED
+        } else {
+            StatusCode::FORBIDDEN
+        };
     }
     let Ok(ip) = body.ip.parse::<IpAddr>() else {
         return StatusCode::BAD_REQUEST;
@@ -5105,6 +5269,7 @@ async fn stats_handler(
     let relay_ip_count = state.relay_network_counts.read().await.len();
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let channels_registry_read_only = state.channels_registry.read().await.is_read_only();
 
     Ok(Json(serde_json::json!({
         "active_relay_sessions": relay_count,
@@ -5113,6 +5278,7 @@ async fn stats_handler(
         "registered_peers": presence_count,
         "uptime_seconds": uptime_secs,
         "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
+        "channels_registry_read_only": channels_registry_read_only,
     })))
 }
 
@@ -5134,35 +5300,36 @@ async fn sweep_expired(state: AppState) {
         // whole sweep cycle. Scoping keeps the critical sections
         // minimal and lets register/lookup/punch requests interleave
         // with the sweep.
-        {
-            let mut limits = state.rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
-        {
-            let mut limits = state.legacy_identity_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
-        {
-            let mut limits = state.ticket_read_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
+        state.rate_limits.write().await.prune(now, RATE_WINDOW * 2);
+        state
+            .legacy_identity_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
+        state
+            .ticket_read_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
 
         // Sweep the punch-specific rate-limit map on the same cadence
         // as the general one so the per-IP entries don't pile up after
         // a punch burst goes quiet.
-        {
-            let mut limits = state.punch_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
+        state.punch_rate_limits.write().await.prune(now, RATE_WINDOW * 2);
 
         // Swept against its own hour-long window. Using the general one here
         // would drop entries that are still inside their budget and hand the
         // creator a fresh six rooms every couple of minutes.
-        {
-            let mut limits = state.channel_create_rate_limits.write().await;
-            limits
-                .entries.retain(|_, entry| now.duration_since(entry.window_start) < CHANNEL_CREATE_WINDOW);
-        }
+        state
+            .channel_create_rate_limits
+            .write()
+            .await
+            .prune(now, CHANNEL_CREATE_WINDOW);
+        state
+            .channel_create_network_rate_limits
+            .write()
+            .await
+            .prune(now, CHANNEL_CREATE_WINDOW);
 
         {
             let mut replay = state.replay_cache.write().await;
@@ -5341,6 +5508,7 @@ async fn main() {
         ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        channel_create_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -5545,6 +5713,7 @@ mod relay_ticket_tests {
             ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            channel_create_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -5694,6 +5863,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(bob.sign(&register_message).to_bytes()),
                     intro: true,
                     legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5769,6 +5939,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(alice.sign(&attacker_message).to_bytes()),
                     intro: true,
                     legacy_sig: Some(hex::encode(alice.sign(&attacker_legacy_message).to_bytes(),)),
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5824,6 +5995,7 @@ mod relay_ticket_tests {
                 // Skipping the derivation proof is the whole point of the squat.
                 intro: false,
                 legacy_sig: None,
+                intro_key: None,
             }
         };
 
@@ -5864,6 +6036,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(victim.sign(&owner_message).to_bytes()),
                     intro: true,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5934,6 +6107,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(alice.sign(&squat_message).to_bytes()),
                     intro: true,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5944,6 +6118,292 @@ mod relay_ticket_tests {
             state.capability_store.read().await.is_empty(),
             "a refused squat must not leave presence behind"
         );
+    }
+
+    /// The client's per-epoch key derivation, kept here only so the tests can
+    /// produce what a real `ember3:` owner sends.
+    fn client_intro_epoch_key(owner: &[u8; 32], intro_secret: &[u8; 16], epoch: i64) -> [u8; 32] {
+        let mut input = [0u8; 48];
+        input[..32].copy_from_slice(owner);
+        input[32..].copy_from_slice(intro_secret);
+        blake3::derive_key(&format!("ember-intro-epoch-key-v2:{epoch}"), &input)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn intro_register_request(
+        key: &ed25519_dalek::SigningKey,
+        capability: &[u8; 32],
+        epoch: i64,
+        port: u16,
+        octet: u8,
+        intro: bool,
+        intro_key: Option<String>,
+    ) -> CapabilityRegisterRequest {
+        let pubkey = key.verifying_key().to_bytes();
+        let ts = now_unix_secs();
+        let message = build_capability_register_v4_msg(
+            capability,
+            epoch,
+            port,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(octet, 8, 4, 4))),
+            &pubkey,
+            &pubkey,
+            ts,
+        );
+        CapabilityRegisterRequest {
+            capability: hex::encode(capability),
+            epoch,
+            port,
+            ip: format!("{octet}.8.4.4"),
+            pubkey: hex::encode(pubkey),
+            peer_pubkey: hex::encode(pubkey),
+            ts,
+            sig: hex::encode(key.sign(&message).to_bytes()),
+            intro,
+            legacy_sig: None,
+            intro_key,
+        }
+    }
+
+    async fn register_v4(state: &AppState, request: CapabilityRegisterRequest) -> StatusCode {
+        capability_register_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_protocol_probe_advertises_sealed_intro() {
+        let Json(body) = protocol_v4().await;
+        assert_eq!(body["version"], 4);
+        assert_eq!(body["sealed_intro"], true);
+    }
+
+    #[test]
+    fn sealed_intro_derivation_matches_the_client() {
+        let owner = [0x42u8; 32];
+        let epoch_key = client_intro_epoch_key(&owner, &[0x07; 16], 9);
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&owner);
+        input[32..].copy_from_slice(&epoch_key);
+        assert_eq!(
+            derive_sealed_intro_presence_capability(&owner, &epoch_key, 9),
+            blake3::derive_key("ember-intro-presence-v2:9", &input)
+        );
+        assert_ne!(
+            derive_sealed_intro_presence_capability(&owner, &epoch_key, 9),
+            derive_intro_presence_capability(&owner, 9)
+        );
+    }
+
+    /// An `ember3:` owner registers a capability the server cannot derive from
+    /// the public key, proves it with the epoch key, and gets open-intro
+    /// presence any registered peer can resolve.
+    #[tokio::test]
+    async fn sealed_intro_registration_is_accepted_as_open_intro() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("sealed intro stored");
+        assert!(entry.open_intro);
+        assert_eq!(entry.pubkey, bob_pubkey);
+
+        let nonce = [0x2B; 16];
+        let lookup_ts = now_unix_secs();
+        let alice_raw = decode_hex_id(&alice_id).unwrap();
+        let lookup_message = build_capability_lookup_v4_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &nonce,
+            lookup_ts,
+        );
+        let response = capability_lookup_v4(
+            State(state.clone()),
+            ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(nonce),
+                ts: lookup_ts,
+                sig: hex::encode(alice.sign(&lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("a code holder can resolve the sealed intro");
+        assert_eq!(response.0.pubkey, hex::encode(bob_pubkey));
+        assert_eq!(response.0.port, 4662);
+    }
+
+    /// Holding someone's `ember3:` code yields their secret and so their
+    /// capability, but not a claim to it: the proof is recomputed under the
+    /// registrant's own key.
+    #[tokio::test]
+    async fn a_code_holder_cannot_claim_a_sealed_intro() {
+        let state = test_state();
+        let (_bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, _alice_id, _alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4663, 1, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4664, 1, true, None),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a sealed capability is not a valid legacy intro either"
+        );
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_misplaced_intro_keys_are_refused() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, false, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED,
+            "an intro key on a pairwise registration is refused"
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4663, 8, true, Some("zz".repeat(32))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4664, 8, true, Some(hex::encode([0u8; 16]))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4665, 8, true, Some(hex::encode([0x11u8; 32]))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED,
+            "a key that does not derive the capability is no proof"
+        );
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    /// Only a sealed-intro-specific refusal uses `SEALED_INTRO_REJECTED`; the
+    /// generic failures a correct sealed registration can still hit keep
+    /// their own statuses, so the client does not mistake them for "sealed
+    /// intro unsupported" and downgrade.
+    #[tokio::test]
+    async fn generic_rejections_of_a_valid_sealed_intro_keep_their_own_status() {
+        let state = test_state();
+        let bob = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let bob_pubkey = bob.verifying_key().to_bytes();
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        // Owner not registered, as after a server restart.
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        insert_test_identity(&state, 5).await;
+        let mut stale =
+            intro_register_request(&bob, &capability, epoch, 4663, 8, true, Some(hex::encode(epoch_key)));
+        stale.ts -= 24 * 3600;
+        assert_eq!(register_v4(&state, stale).await, StatusCode::BAD_REQUEST);
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    /// Same reclaim guarantee as the legacy intro: a code holder can squat the
+    /// namespace as a pairwise entry, and the proved owner takes it back.
+    #[tokio::test]
+    async fn a_sealed_intro_owner_reclaims_a_namespace_squatted_as_pairwise() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, _alice_id, _alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4663, 1, false, None),
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("reclaimed");
+        assert_eq!(entry.pubkey, bob_pubkey);
+        assert!(entry.open_intro);
     }
 
     #[tokio::test]
@@ -5987,6 +6447,7 @@ mod relay_ticket_tests {
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
                 intro: false,
                 legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
+                intro_key: None,
             }),
         )
         .await;
@@ -6093,6 +6554,7 @@ mod relay_ticket_tests {
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
                 intro: false,
                 legacy_sig: None,
+                intro_key: None,
             }),
         )
         .await;
@@ -6355,6 +6817,228 @@ mod relay_ticket_tests {
         );
     }
 
+    #[test]
+    fn rate_key_is_the_address_for_ipv4_and_the_slash_64_for_ipv6() {
+        let v4: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(rate_key(v4), v4, "IPv4 is not grouped, to spare CGNAT neighbours");
+        assert_eq!(
+            rate_key("::ffff:203.0.113.9".parse().unwrap()),
+            v4,
+            "a mapped IPv4 address is the same client as the plain one"
+        );
+        assert_eq!(
+            rate_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap()),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(
+            rate_key("2001:db8:1:2::1".parse().unwrap()),
+            rate_key("2001:db8:1:3::1".parse().unwrap()),
+            "neighbouring /64s stay separate"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_ipv6_slash_64_shares_a_single_general_budget() {
+        let state = test_state();
+        for i in 0..MAX_REQUESTS_PER_MINUTE {
+            let ip: IpAddr = format!("2001:db8:7:7::{:x}", i + 1).parse().unwrap();
+            assert!(check_rate_limit(&state, ip).await);
+        }
+        let rotated: IpAddr = "2001:db8:7:7:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert!(
+            !check_rate_limit(&state, rotated).await,
+            "rotating the interface id must not buy a fresh budget"
+        );
+        assert!(
+            rate_budget_exhausted(&state.rate_limits, rotated, MAX_REQUESTS_PER_MINUTE).await,
+            "the pre-body gate must see the same /64 bucket"
+        );
+        assert!(check_rate_limit(&state, "2001:db8:7:8::1".parse().unwrap()).await);
+        assert_eq!(state.rate_limits.read().await.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_full_rate_bucket_evicts_its_oldest_window_instead_of_refusing() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        let c: IpAddr = "198.51.100.3".parse().unwrap();
+        assert!(bucket.charge(a, 5, RATE_WINDOW, t0, 2));
+        assert!(bucket.charge(b, 5, RATE_WINDOW, t0 + Duration::from_secs(1), 2));
+        assert!(
+            bucket.charge(c, 5, RATE_WINDOW, t0 + Duration::from_secs(2), 2),
+            "a newcomer is admitted at capacity"
+        );
+        assert_eq!(bucket.entries.len(), 2);
+        assert!(!bucket.entries.contains_key(&a), "the oldest window went");
+        assert!(bucket.entries.contains_key(&b) && bucket.entries.contains_key(&c));
+        assert_eq!(bucket.by_age.len(), bucket.entries.len());
+    }
+
+    #[test]
+    fn a_rate_window_reset_moves_the_entry_to_the_young_end() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        let c: IpAddr = "198.51.100.3".parse().unwrap();
+        assert!(bucket.charge(a, 5, RATE_WINDOW, t0, 2));
+        assert!(bucket.charge(b, 5, RATE_WINDOW, t0 + Duration::from_secs(1), 2));
+        // `a`'s window lapses and restarts, so `b` is now the oldest.
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        assert!(bucket.charge(a, 5, RATE_WINDOW, later, 2));
+        assert!(bucket.charge(c, 5, RATE_WINDOW, later, 2));
+        assert!(bucket.entries.contains_key(&a));
+        assert!(!bucket.entries.contains_key(&b));
+        assert_eq!(bucket.by_age.len(), bucket.entries.len());
+    }
+
+    #[test]
+    fn rate_bucket_prune_drops_only_lapsed_windows_and_keeps_the_index_in_step() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let old: IpAddr = "198.51.100.1".parse().unwrap();
+        let fresh: IpAddr = "198.51.100.2".parse().unwrap();
+        assert!(bucket.charge(old, 5, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        assert!(bucket.charge(
+            fresh,
+            5,
+            RATE_WINDOW,
+            t0 + RATE_WINDOW,
+            MAX_RATE_ENTRIES
+        ));
+        bucket.prune(t0 + RATE_WINDOW * 2, RATE_WINDOW * 2);
+        assert!(!bucket.entries.contains_key(&old));
+        assert!(bucket.entries.contains_key(&fresh));
+        assert_eq!(bucket.by_age.len(), 1);
+    }
+
+    #[test]
+    fn a_rate_bucket_still_counts_within_a_window() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        for _ in 0..3 {
+            assert!(bucket.charge(ip, 3, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        }
+        assert!(!bucket.charge(ip, 3, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        assert!(bucket.exhausted(ip, 3, RATE_WINDOW, t0));
+        assert!(!bucket.exhausted(ip, 3, RATE_WINDOW, t0 + RATE_WINDOW));
+    }
+
+    #[tokio::test]
+    async fn the_create_budget_is_pooled_per_slash_24_on_top_of_per_address() {
+        let state = test_state();
+        let per_addr = MAX_CHANNEL_CREATES_PER_HOUR;
+        let addresses = MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR / per_addr;
+        for host in 1..=addresses {
+            let ip: IpAddr = format!("203.0.113.{host}").parse().unwrap();
+            for _ in 0..per_addr {
+                assert!(check_channel_create_rate_limit(&state, ip).await);
+            }
+            assert!(
+                !check_channel_create_rate_limit(&state, ip).await,
+                "each address still has its own ceiling"
+            );
+        }
+        assert_eq!(
+            state
+                .channel_create_network_rate_limits
+                .read()
+                .await
+                .entries
+                .get(&"203.0.113.0".parse::<IpAddr>().unwrap())
+                .unwrap()
+                .count,
+            MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+            "refusals at the per-address tier must not drain the shared pool"
+        );
+        let next: IpAddr = format!("203.0.113.{}", addresses + 1).parse().unwrap();
+        assert!(
+            !check_channel_create_rate_limit(&state, next).await,
+            "a fresh address in an exhausted /24 gets nothing"
+        );
+        assert!(
+            check_channel_create_rate_limit(&state, "203.0.114.1".parse().unwrap()).await,
+            "a neighbouring /24 is unaffected"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_pool_does_not_spend_the_address_allowance() {
+        let mut per_address = RateBucket::default();
+        let mut per_network = RateBucket::default();
+        let t0 = Instant::now();
+        let hosts = MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR / MAX_CHANNEL_CREATES_PER_HOUR;
+        for host in 1..=hosts {
+            let ip: IpAddr = format!("203.0.113.{host}").parse().unwrap();
+            for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+                assert!(admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+            }
+        }
+
+        let latecomer: IpAddr = "203.0.113.200".parse().unwrap();
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR * 2 {
+            assert!(
+                !admit_channel_create(&mut per_address, &mut per_network, latecomer, t0),
+                "the pool is exhausted"
+            );
+        }
+        assert!(
+            !per_address.entries.contains_key(&latecomer),
+            "refused retries must not touch the address's own count"
+        );
+
+        let pool_reset = t0 + CHANNEL_CREATE_WINDOW;
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            assert!(
+                admit_channel_create(&mut per_address, &mut per_network, latecomer, pool_reset),
+                "the full personal allowance survives the pool's recovery"
+            );
+        }
+        assert!(!admit_channel_create(
+            &mut per_address,
+            &mut per_network,
+            latecomer,
+            pool_reset
+        ));
+    }
+
+    #[test]
+    fn an_over_limit_address_does_not_drain_the_pool() {
+        let mut per_address = RateBucket::default();
+        let mut per_network = RateBucket::default();
+        let t0 = Instant::now();
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            assert!(admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+        }
+        for _ in 0..10 {
+            assert!(!admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+        }
+        assert_eq!(
+            per_network
+                .entries
+                .get(&"203.0.113.0".parse::<IpAddr>().unwrap())
+                .unwrap()
+                .count,
+            MAX_CHANNEL_CREATES_PER_HOUR
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_budget_is_per_slash_64_for_ipv6() {
+        let state = test_state();
+        for i in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            let ip: IpAddr = format!("2001:db8:9:9::{:x}", i + 1).parse().unwrap();
+            assert!(check_channel_create_rate_limit(&state, ip).await);
+        }
+        assert!(
+            !check_channel_create_rate_limit(&state, "2001:db8:9:9::beef".parse().unwrap()).await
+        );
+    }
+
     #[tokio::test]
     async fn ticket_read_budget_is_isolated_from_general_requests() {
         let state = test_state();
@@ -6458,6 +7142,7 @@ mod relay_ticket_tests {
                         sig: hex::encode(owner.sign(&v4).to_bytes()),
                         intro: false,
                         legacy_sig: Some(hex::encode(owner.sign(&legacy).to_bytes())),
+                        intro_key: None,
                     }),
                 )
                 .await,
@@ -6510,6 +7195,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(owner.sign(&legacy).to_bytes()),
                     intro: false,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,

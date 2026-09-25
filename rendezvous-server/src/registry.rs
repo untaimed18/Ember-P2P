@@ -27,7 +27,17 @@ pub const CHANNEL_DIRECTORY_STALE_SECS: i64 = 7 * 24 * 60 * 60;
 /// Free an abandoned room name after this long without an owner refresh, so a
 /// dead room cannot reserve a word forever. Matches the longest succession
 /// window, which is the most silence an owner can ask members to tolerate.
+/// A room with a nominee is held longer; see [`NOMINEE_GRACE_SECS`].
 pub const NAME_RELEASE_SECS: i64 = 365 * 24 * 60 * 60;
+/// How long a nominated room's name outlives the moment its nominee becomes
+/// eligible to take it.
+///
+/// Without it a [`CLAIM_AFTER_DAYS_MAX`] nomination became eligible at the
+/// same second the record was reaped, and every claim reaps first, so any
+/// stranger's claim could free and take the name before the nominee's
+/// handover landed. The grace gives the nominee's client time to notice the
+/// owner has gone quiet and act.
+pub const NOMINEE_GRACE_SECS: i64 = 30 * 24 * 60 * 60;
 /// Free a Channel username that has not been seen in a room for this long.
 pub const USERNAME_IDLE_SECS: i64 = 365 * 24 * 60 * 60;
 /// Silence windows a nomination may carry, mirroring the range the clients
@@ -83,6 +93,21 @@ pub struct ChannelNameRecord {
     pub claim_after_days: u32,
 }
 
+impl ChannelNameRecord {
+    fn has_nominee(&self) -> bool {
+        self.claim_after_days > 0 && !self.nominee.is_empty()
+    }
+
+    /// Owner silence after which [`ChannelRegistry::reap_stale`] frees the name.
+    fn release_after_secs(&self) -> i64 {
+        if !self.has_nominee() {
+            return NAME_RELEASE_SECS;
+        }
+        let eligible_after = i64::from(self.claim_after_days).saturating_mul(86_400);
+        NAME_RELEASE_SECS.max(eligible_after.saturating_add(NOMINEE_GRACE_SECS))
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DirectoryListing {
     pub channel_id: String,
@@ -135,6 +160,9 @@ pub struct ChannelRegistry {
     /// Ticket dispenser and completion gate for [`Self::persist`]. See
     /// [`PersistGate`].
     persist_gate: Arc<PersistGate>,
+    /// Set when the file on disk could not be read and no backup could stand
+    /// in for it. See [`load_registry_file`].
+    read_only: bool,
 }
 
 /// Serialises the registry's disk writes and keeps them off the request path.
@@ -173,6 +201,9 @@ pub enum RegistryError {
     /// handler can answer 503 rather than 409: nothing is wrong with the name
     /// the caller asked for, the server simply has no room to record it.
     Full,
+    /// The registry on disk could not be loaded, so nothing may be written
+    /// until an operator restores it. Answered with 503.
+    ReadOnly,
 }
 
 impl ChannelRegistry {
@@ -185,6 +216,7 @@ impl ChannelRegistry {
             deleted: HashSet::new(),
             username_activity: HashMap::new(),
             persist_gate: Arc::new(PersistGate::new()),
+            read_only: false,
         }
     }
 
@@ -192,14 +224,7 @@ impl ChannelRegistry {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        // A previous run may have been interrupted between moving the old
-        // registry aside and renaming the new one into place. Reading that as
-        // a first run would silently release every claim on record.
-        recover_interrupted_write(&path);
-        let parsed = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<RegistryFile>(&bytes).ok())
-            .unwrap_or_default();
+        let (parsed, read_only) = load_registry_file(&path);
         let mut by_pubkey = HashMap::new();
         for (name, pubkey) in &parsed.usernames {
             by_pubkey.insert(pubkey.to_ascii_lowercase(), name.clone());
@@ -212,6 +237,7 @@ impl ChannelRegistry {
             deleted: parsed.deleted,
             username_activity: parsed.username_activity,
             persist_gate: Arc::new(PersistGate::new()),
+            read_only,
         };
         if reg.grandfather_legacy_timestamps(unix_now()) {
             reg.persist();
@@ -219,7 +245,24 @@ impl ChannelRegistry {
         reg
     }
 
+    /// Whether [`Self::load`] could not read the registry and is refusing
+    /// every write for the life of the process.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn writable(&self) -> Result<(), RegistryError> {
+        if self.read_only {
+            Err(RegistryError::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
+
     fn persist(&self) {
+        if self.read_only {
+            return;
+        }
         let Some(path) = &self.path else {
             return;
         };
@@ -258,6 +301,7 @@ impl ChannelRegistry {
         name: &str,
         now: i64,
     ) -> Result<(), RegistryError> {
+        self.writable()?;
         self.reap_stale(now);
         let normalized = normalize_username(name).ok_or(RegistryError::InvalidName)?;
         let pk = pubkey_hex.to_ascii_lowercase();
@@ -338,6 +382,7 @@ impl ChannelRegistry {
         private: bool,
         now: i64,
     ) -> Result<(), RegistryError> {
+        self.writable()?;
         self.reap_stale(now);
         let display = strip_invisible(name);
         let normalized = normalize_channel_name(name).ok_or(RegistryError::InvalidName)?;
@@ -432,6 +477,7 @@ impl ChannelRegistry {
         nominee_hex: &str,
         claim_after_days: u32,
     ) -> Result<(), RegistryError> {
+        self.writable()?;
         let id = channel_id.to_ascii_lowercase();
         let pk = pubkey_hex.to_ascii_lowercase();
         let nominee = nominee_hex.to_ascii_lowercase();
@@ -480,6 +526,7 @@ impl ChannelRegistry {
         signer_hex: &str,
         now: i64,
     ) -> Result<(), RegistryError> {
+        self.writable()?;
         let old_id = old_channel_id.to_ascii_lowercase();
         let new_id = new_channel_id.to_ascii_lowercase();
         let new_pk = new_pubkey_hex.to_ascii_lowercase();
@@ -515,8 +562,7 @@ impl ChannelRegistry {
             return Err(RegistryError::InvalidName);
         };
         let by_owner = rec.pubkey.eq_ignore_ascii_case(&signer);
-        let by_nominee = rec.claim_after_days > 0
-            && !rec.nominee.is_empty()
+        let by_nominee = rec.has_nominee()
             && rec.nominee.eq_ignore_ascii_case(&signer)
             && now.saturating_sub(rec.refreshed_at)
                 >= i64::from(rec.claim_after_days).saturating_mul(86_400);
@@ -540,6 +586,7 @@ impl ChannelRegistry {
         channel_id: &str,
         pubkey_hex: &str,
     ) -> Result<(), RegistryError> {
+        self.writable()?;
         let id = channel_id.to_ascii_lowercase();
         let pk = pubkey_hex.to_ascii_lowercase();
         let mut found = false;
@@ -618,6 +665,9 @@ impl ChannelRegistry {
     /// the directory without evicting anyone, and it keeps the tombstone list
     /// bounded by real deletions instead of growing forever.
     pub fn reap_stale(&mut self, now: i64) -> bool {
+        if self.read_only {
+            return false;
+        }
         let mut changed = self.grandfather_legacy_timestamps(now);
         let idle_names: Vec<String> = self
             .usernames
@@ -646,7 +696,7 @@ impl ChannelRegistry {
                 } else {
                     now
                 };
-                (now.saturating_sub(ts) > NAME_RELEASE_SECS).then(|| name.clone())
+                (now.saturating_sub(ts) > rec.release_after_secs()).then(|| name.clone())
             })
             .collect();
         for name in abandoned {
@@ -729,26 +779,120 @@ fn backup_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
-/// Restore a registry left behind by an interrupted [`atomic_write`].
+/// `Ok(None)` only when the file does not exist; every other failure to read
+/// or parse it is an error.
+fn read_registry_file(path: &Path) -> Result<Option<RegistryFile>, String> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| format!("parse: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read: {e}")),
+    }
+}
+
+/// Copy an unreadable registry file aside so the evidence survives whatever
+/// an operator does next.
+fn quarantine(path: &Path) {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".corrupt-{}", unix_now()));
+    let aside = path.with_file_name(name);
+    match fs::copy(path, &aside) {
+        Ok(_) => tracing::error!(
+            path = %path.display(),
+            copy = %aside.display(),
+            "kept a copy of the unreadable channels registry"
+        ),
+        Err(e) => tracing::error!(
+            path = %path.display(),
+            error = %e,
+            "could not copy the unreadable channels registry aside"
+        ),
+    }
+}
+
+/// Decide what the registry starts with, and whether it may ever be written.
 ///
-/// Only ever fires on Windows, and only for the narrow window in which the
-/// destination has been moved aside but the replacement has not landed. A
-/// backup sitting next to a destination that already exists is ordinary
-/// leftover and is cleaned up rather than restored.
-pub(crate) fn recover_interrupted_write(dest: &Path) {
+/// Only a missing file with no backup is a first run. Anything else that
+/// fails to load used to be read as an empty registry, and the next claim
+/// then persisted that emptiness over the file — releasing every username and
+/// room name on record to whoever asked next.
+///
+/// When neither the file nor its backup can be read, the registry comes up
+/// empty and read-only instead of refusing to start: every other endpoint on
+/// this server works without it, and on Fly an exit is a restart loop that
+/// would take presence, punching and the relay down over a problem confined
+/// to channel names. Read-only never touches the file, so an operator can
+/// restore it and restart; until then channel writes answer 503.
+fn load_registry_file(dest: &Path) -> (RegistryFile, bool) {
     let backup = backup_path(dest);
-    if !backup.exists() {
-        return;
-    }
-    if dest.exists() {
-        let _ = fs::remove_file(&backup);
-        return;
-    }
-    if fs::rename(&backup, dest).is_ok() {
-        tracing::warn!(
-            path = %dest.display(),
-            "restored the channels registry from its backup after an interrupted write"
-        );
+    match read_registry_file(dest) {
+        Ok(Some(file)) => {
+            // Leftover from a completed write; the destination is current.
+            if backup.exists() {
+                let _ = fs::remove_file(&backup);
+            }
+            (file, false)
+        }
+        // `atomic_write` on Windows was interrupted after moving the old copy
+        // aside and before the new one landed.
+        Ok(None) => match read_registry_file(&backup) {
+            Ok(None) => (RegistryFile::default(), false),
+            Ok(Some(file)) => {
+                if let Err(e) = fs::rename(&backup, dest) {
+                    tracing::warn!(error = %e, "could not move the channels registry backup back into place");
+                }
+                tracing::warn!(
+                    path = %dest.display(),
+                    "restored the channels registry from its backup after an interrupted write"
+                );
+                (file, false)
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %backup.display(),
+                    error = %err,
+                    "channels registry is missing and its backup is unreadable; refusing all channel writes"
+                );
+                quarantine(&backup);
+                (RegistryFile::default(), true)
+            }
+        },
+        Err(err) => {
+            tracing::error!(path = %dest.display(), error = %err, "channels registry is unreadable");
+            quarantine(dest);
+            match read_registry_file(&backup) {
+                Ok(Some(file)) => {
+                    // Overwrite the bad copy now, while the backup is intact,
+                    // rather than leaving it for `atomic_write` — which on
+                    // Windows deletes the backup before it replaces `dest`.
+                    if let Err(e) = fs::copy(&backup, dest) {
+                        tracing::warn!(error = %e, "could not restore the channels registry from its backup");
+                    }
+                    tracing::warn!(
+                        path = %backup.display(),
+                        "loaded the channels registry from its backup"
+                    );
+                    (file, false)
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        path = %dest.display(),
+                        "no channels registry backup to fall back on; refusing all channel writes"
+                    );
+                    (RegistryFile::default(), true)
+                }
+                Err(backup_err) => {
+                    tracing::error!(
+                        path = %backup.display(),
+                        error = %backup_err,
+                        "channels registry backup is unreadable too; refusing all channel writes"
+                    );
+                    quarantine(&backup);
+                    (RegistryFile::default(), true)
+                }
+            }
+        }
     }
 }
 
@@ -803,8 +947,8 @@ fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     //
     // So move the old copy aside instead of destroying it: at every point
     // between here and the end of the function, the previous registry exists
-    // under either `dest` or `backup`, and `recover_interrupted_write` picks
-    // it up on the next load.
+    // under either `dest` or `backup`, and `load_registry_file` picks it up
+    // on the next load.
     #[cfg(windows)]
     {
         let backup = backup_path(dest);
@@ -1547,5 +1691,254 @@ mod tests {
             reg.claim_username_at(&bob, "Ada", released).is_ok(),
             "a year without activity frees the handle"
         );
+    }
+
+    fn nominated_lobby(reg: &mut ChannelRegistry, days: u32, t0: i64) -> (String, String, String) {
+        let old_id = "11".repeat(16);
+        let old_pk = "22".repeat(32);
+        let nominee = "55".repeat(32);
+        assert!(reg.claim_channel_name_at(&old_id, &old_pk, "Lobby", false, t0).is_ok());
+        assert!(reg.set_channel_nominee(&old_id, &old_pk, &nominee, days).is_ok());
+        (old_id, old_pk, nominee)
+    }
+
+    /// At the longest window the nominee became eligible in the same second
+    /// the record was reaped, and every claim reaps first — so a stranger
+    /// could free and take the name one second into the nominee's turn.
+    #[test]
+    fn a_max_window_nominee_is_not_raced_by_the_reaper() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let (old_id, _, nominee) = nominated_lobby(&mut reg, CLAIM_AFTER_DAYS_MAX, t0);
+        let eligible = t0 + i64::from(CLAIM_AFTER_DAYS_MAX) * 86_400;
+        assert_eq!(eligible, t0 + NAME_RELEASE_SECS, "the boundary this pins");
+
+        let stranger_id = "99".repeat(16);
+        let stranger_pk = "88".repeat(32);
+        for at in [eligible, eligible + 1, eligible + NOMINEE_GRACE_SECS] {
+            assert_eq!(
+                reg.claim_channel_name_at(&stranger_id, &stranger_pk, "Lobby", false, at),
+                Err(RegistryError::Taken),
+                "the name must stay reserved for the nominee at {}",
+                at - t0
+            );
+        }
+        assert!(
+            reg.handover_channel_name(
+                &old_id,
+                &"33".repeat(16),
+                &"44".repeat(32),
+                &nominee,
+                eligible + NOMINEE_GRACE_SECS
+            )
+            .is_ok(),
+            "the nominee can still take it on the last second of the grace"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_nomination_is_reaped_after_its_grace() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        nominated_lobby(&mut reg, CLAIM_AFTER_DAYS_MAX, t0);
+        let deadline = t0 + i64::from(CLAIM_AFTER_DAYS_MAX) * 86_400 + NOMINEE_GRACE_SECS;
+        assert!(!reg.reap_stale(deadline));
+        assert!(reg.reap_stale(deadline + 1));
+        assert!(reg
+            .claim_channel_name_at(&"99".repeat(16), &"88".repeat(32), "Lobby", false, deadline + 1)
+            .is_ok());
+    }
+
+    /// The grace only ever extends a hold: a short window still keeps the
+    /// name for the full release period, and an unnominated room is reaped
+    /// exactly as before.
+    #[test]
+    fn a_short_nomination_or_none_keeps_the_ordinary_release_time() {
+        let t0 = 1_700_000_000;
+        let mut nominated = ChannelRegistry::in_memory();
+        nominated_lobby(&mut nominated, CLAIM_AFTER_DAYS_MIN, t0);
+        assert!(!nominated.reap_stale(t0 + NAME_RELEASE_SECS));
+        assert!(nominated.reap_stale(t0 + NAME_RELEASE_SECS + 1));
+
+        let mut plain = ChannelRegistry::in_memory();
+        assert!(plain
+            .claim_channel_name_at(&"11".repeat(16), &"22".repeat(32), "Lobby", false, t0)
+            .is_ok());
+        assert!(!plain.reap_stale(t0 + NAME_RELEASE_SECS));
+        assert!(plain.reap_stale(t0 + NAME_RELEASE_SECS + 1));
+    }
+
+    /// A fresh directory per test, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ember-registry-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn registry(&self) -> PathBuf {
+            self.0.join("channels.json")
+        }
+
+        fn corrupt_copies(&self) -> usize {
+            fs::read_dir(&self.0)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".corrupt-")
+                })
+                .count()
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Writes a registry holding the username "Ada" through the real path.
+    fn seed_registry(path: &Path) {
+        let mut reg = ChannelRegistry::load(path.to_path_buf());
+        assert!(!reg.is_read_only());
+        assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+    }
+
+    fn holds_ada(reg: &ChannelRegistry) -> bool {
+        reg.holds_username(&"aa".repeat(32), "Ada")
+    }
+
+    #[test]
+    fn a_missing_registry_with_no_backup_is_a_writable_first_run() {
+        let dir = ScratchDir::new("fresh");
+        let mut reg = ChannelRegistry::load(dir.registry());
+        assert!(!reg.is_read_only());
+        assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+        assert!(dir.registry().exists());
+        assert_eq!(dir.corrupt_copies(), 0);
+    }
+
+    #[test]
+    fn a_corrupt_registry_with_no_backup_goes_read_only_and_is_never_overwritten() {
+        let dir = ScratchDir::new("corrupt");
+        let garbage = b"{\"usernames\": {\"ada\": \"aa";
+        fs::write(dir.registry(), garbage).unwrap();
+
+        let mut reg = ChannelRegistry::load(dir.registry());
+        assert!(reg.is_read_only());
+        assert_eq!(
+            reg.claim_username(&"bb".repeat(32), "Ada"),
+            Err(RegistryError::ReadOnly),
+            "an unreadable registry must not hand out names it may already hold"
+        );
+        assert_eq!(
+            reg.claim_channel_name(&"11".repeat(16), &"22".repeat(32), "Lobby", false),
+            Err(RegistryError::ReadOnly)
+        );
+        assert_eq!(
+            reg.delete_channel(&"11".repeat(16), &"22".repeat(32)),
+            Err(RegistryError::ReadOnly)
+        );
+        assert_eq!(
+            reg.set_channel_nominee(&"11".repeat(16), &"22".repeat(32), &"55".repeat(32), 7),
+            Err(RegistryError::ReadOnly)
+        );
+        assert_eq!(
+            reg.handover_channel_name(
+                &"11".repeat(16),
+                &"33".repeat(16),
+                &"44".repeat(32),
+                &"22".repeat(32),
+                unix_now()
+            ),
+            Err(RegistryError::ReadOnly)
+        );
+        assert!(!reg.reap_stale(unix_now()));
+
+        assert_eq!(
+            fs::read(dir.registry()).unwrap(),
+            garbage,
+            "the original must be left exactly as found"
+        );
+        assert_eq!(dir.corrupt_copies(), 1, "and a copy kept aside");
+    }
+
+    #[test]
+    fn a_corrupt_registry_falls_back_to_its_backup() {
+        let dir = ScratchDir::new("backup");
+        seed_registry(&dir.registry());
+        fs::copy(dir.registry(), backup_path(&dir.registry())).unwrap();
+        fs::write(dir.registry(), b"not json").unwrap();
+
+        let reg = ChannelRegistry::load(dir.registry());
+        assert!(!reg.is_read_only());
+        assert!(holds_ada(&reg), "claims come back from the backup");
+        assert_eq!(dir.corrupt_copies(), 1);
+        assert!(
+            matches!(read_registry_file(&dir.registry()), Ok(Some(_))),
+            "the good copy is put back under the real name"
+        );
+
+        let reloaded = ChannelRegistry::load(dir.registry());
+        assert!(holds_ada(&reloaded));
+        assert!(
+            !backup_path(&dir.registry()).exists(),
+            "once the destination reads cleanly the backup is ordinary leftover"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_registry_and_a_corrupt_backup_go_read_only() {
+        let dir = ScratchDir::new("both");
+        fs::write(dir.registry(), b"not json").unwrap();
+        fs::write(backup_path(&dir.registry()), b"nor this").unwrap();
+
+        let reg = ChannelRegistry::load(dir.registry());
+        assert!(reg.is_read_only());
+        assert_eq!(dir.corrupt_copies(), 2, "both unreadable files are kept aside");
+        assert_eq!(fs::read(dir.registry()).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn an_interrupted_write_is_recovered_from_the_backup() {
+        let dir = ScratchDir::new("interrupted");
+        seed_registry(&dir.registry());
+        fs::rename(dir.registry(), backup_path(&dir.registry())).unwrap();
+
+        let reg = ChannelRegistry::load(dir.registry());
+        assert!(!reg.is_read_only());
+        assert!(holds_ada(&reg));
+        assert!(dir.registry().exists());
+        assert!(!backup_path(&dir.registry()).exists());
+    }
+
+    #[test]
+    fn a_missing_registry_with_a_corrupt_backup_goes_read_only() {
+        let dir = ScratchDir::new("badbackup");
+        fs::write(backup_path(&dir.registry()), b"not json").unwrap();
+
+        let reg = ChannelRegistry::load(dir.registry());
+        assert!(reg.is_read_only(), "a backup on disk means there was a registry");
+        assert!(!dir.registry().exists(), "and nothing is written in its place");
+        assert_eq!(dir.corrupt_copies(), 1);
+    }
+
+    #[test]
+    fn an_empty_registry_file_is_treated_as_corrupt() {
+        let dir = ScratchDir::new("empty");
+        fs::write(dir.registry(), b"").unwrap();
+        assert!(ChannelRegistry::load(dir.registry()).is_read_only());
     }
 }
