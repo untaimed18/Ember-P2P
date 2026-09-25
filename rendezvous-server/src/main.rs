@@ -35,6 +35,18 @@ mod registry;
 
 const MAX_HTTP_CONNECTIONS: usize = 256;
 const RESERVED_HEALTH_CONNECTIONS: usize = 16;
+/// Ordinary connections one client network (see [`client_network`]) may hold
+/// at once: a tenth of the ordinary pool, so starving it takes at least ten
+/// distinct /24s or /64s. Every non-upgrade response closes its connection, so
+/// a household NAT full of well-behaved clients holds a slot only for the
+/// duration of each request and stays far below this.
+///
+/// The client is whatever [`extract_client_ip`] derives, so this (like every
+/// per-network limit) is only meaningful when `TRUST_PROXY`/`TRUSTED_PROXY_HOPS`
+/// match the deployment: behind an unconfigured reverse proxy, all traffic is
+/// one network. Loopback is exempt so a local reverse proxy is not capped as a
+/// single client, and `/health` is exempt so monitoring is never refused here.
+const MAX_HTTP_CONNECTIONS_PER_NETWORK: usize = 24;
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A body can make byte-level progress forever, so the idle timeout alone
@@ -45,6 +57,80 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn http_path_admitted(reserve_only: bool, path: &str) -> bool {
     !reserve_only || path == "/health"
+}
+
+/// Concurrent ordinary connections per client network. A slot is released
+/// when its [`NetworkConnectionSlot`] drops, which for an upgraded WebSocket
+/// is as soon as the upgrade completes — exactly like the admission permits.
+/// Relay sockets are bounded by [`MAX_RELAY_SESSIONS_PER_NETWORK`] instead.
+#[derive(Clone, Default)]
+struct NetworkConnectionLimiter {
+    counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+}
+
+struct NetworkConnectionSlot {
+    limiter: NetworkConnectionLimiter,
+    network: IpAddr,
+}
+
+impl NetworkConnectionLimiter {
+    fn try_acquire(&self, client_ip: IpAddr, limit: usize) -> Option<NetworkConnectionSlot> {
+        let network = client_network(client_ip);
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if counts.get(&network).copied().unwrap_or(0) >= limit {
+            return None;
+        }
+        *counts.entry(network).or_insert(0) += 1;
+        Some(NetworkConnectionSlot {
+            limiter: self.clone(),
+            network,
+        })
+    }
+}
+
+/// Charges a connection to the client network its first request names. This
+/// waits for headers even for direct peers: behind the trusted proxy the peer
+/// address is the proxy's, and charging at accept would refuse `/health`
+/// before its path is known.
+fn admit_client_network(
+    limiter: &NetworkConnectionLimiter,
+    slot: &std::sync::Mutex<Option<NetworkConnectionSlot>>,
+    path: &str,
+    client_ip: IpAddr,
+) -> bool {
+    if path == "/health" || canonical_ip(client_ip).is_loopback() {
+        return true;
+    }
+    let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    if slot.is_some() {
+        return true;
+    }
+    match limiter.try_acquire(client_ip, MAX_HTTP_CONNECTIONS_PER_NETWORK) {
+        Some(acquired) => {
+            *slot = Some(acquired);
+            true
+        }
+        None => false,
+    }
+}
+
+impl Drop for NetworkConnectionSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .limiter
+            .counts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(count) = counts.get_mut(&self.network) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.network);
+            }
+        }
+    }
 }
 
 struct IdleTimeoutStream {
@@ -197,6 +283,25 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(v6)),
         IpAddr::V4(_) => ip,
+    }
+}
+
+/// Prefix lengths treated as one client for per-client caps: a /24 is the
+/// smallest IPv4 block routed on the internet, and a /64 is one IPv6 subnet,
+/// which a single host usually controls in its entirety. Keying on the exact
+/// address let one operator multiply every per-client cap by rotating
+/// addresses inside a block it already holds.
+const CLIENT_NETWORK_V4_PREFIX: u32 = 24;
+const CLIENT_NETWORK_V6_PREFIX: u32 = 64;
+
+fn client_network(ip: IpAddr) -> IpAddr {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(Ipv4Addr::from(
+            u32::from(v4) & (u32::MAX << (32 - CLIENT_NETWORK_V4_PREFIX)),
+        )),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(
+            u128::from(v6) & (u128::MAX << (128 - CLIENT_NETWORK_V6_PREFIX)),
+        )),
     }
 }
 
@@ -828,7 +933,7 @@ const MAX_PUNCH_PER_TARGET: usize = 8;
 /// actual friends out of the queue.
 const MAX_PUNCH_PER_TARGET_OPEN_INTRO: usize = 2;
 const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
-/// Per-IP relay session cap. Was `2`, which was the cause of every
+/// Relay session cap per client network. Was `2`, which was the cause of every
 /// `WebSocket protocol error: Sending after closing is not allowed`
 /// failure the Ember client saw on adoption: the server accepts the
 /// WS handshake (so `connect_async` returns Ok), THEN this check
@@ -845,7 +950,14 @@ const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
 /// IP. `32` covers that with a small buffer; the global cap
 /// (`MAX_GLOBAL_RELAY_SESSIONS = 200`) still bounds total resource
 /// consumption to ~6 maxed-out clients before backpressure kicks in.
-const MAX_RELAY_SESSIONS_PER_IP: usize = 32;
+///
+/// Counted per [`client_network`] rather than per address, so those ~6
+/// clients must sit in distinct /24s or /64s: identities are free, and an
+/// exact-address key let one IPv6 host (or a handful of IPv4 addresses in one
+/// rented block) hold every relay slot. Not lowered below `32` because
+/// carrier-grade NAT puts many subscribers in one /24, and they are the users
+/// most likely to need the relay.
+const MAX_RELAY_SESSIONS_PER_NETWORK: usize = 32;
 const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 /// Combined (both directions summed) byte ceiling for a single relay
 /// session — see `RelaySessionEntry` for why both directions share one
@@ -1353,7 +1465,7 @@ impl RelayTicketStore {
             }
             if ticket.initiator_reservation.is_some() || ticket.responder_reservation.is_some() {
                 // A pre-upgrade capacity reservation is outstanding. Removing
-                // the ticket now would strand its `relay_ip_counts` increment
+                // the ticket now would strand its `relay_network_counts` increment
                 // forever, because `rollback_relay_ticket_reservation` bails
                 // out when the ticket is gone and never decrements the count.
                 // Retain the ticket until the reservation watchdog window has
@@ -1725,7 +1837,8 @@ struct AppState {
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     bridged_relays: Arc<RwLock<HashMap<String, BridgedRelayEntry>>>,
     relay_admissions: Arc<RwLock<HashMap<(String, RelayRole), IpAddr>>>,
-    relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    /// Joined or reserved relay sockets, keyed by [`client_network`].
+    relay_network_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
     next_relay_reservation_id: Arc<AtomicU64>,
     relay_tickets: Arc<RwLock<RelayTicketStore>>,
     /// Process-lifetime secret used to issue role tokens on demand. Ticket
@@ -1995,6 +2108,12 @@ impl ProxyConfig {
     fn trusts_hop(&self, ip: IpAddr) -> bool {
         self.trusted_hops.iter().any(|network| network.contains(ip))
     }
+
+    /// Whether a connection from `peer` names its real client in
+    /// `Fly-Client-IP`, so the client is unknown until request headers arrive.
+    fn forwards_client_ip(&self, peer: IpAddr) -> bool {
+        self.mode == ProxyMode::Fly && self.trusts_hop(peer)
+    }
 }
 
 fn proxy_config() -> &'static ProxyConfig {
@@ -2011,7 +2130,7 @@ fn extract_client_ip_with_config(
     // deployment explicitly selected Fly mode, and the immediate TCP peer is
     // in the operator-configured proxy allowlist. This prevents a public
     // client from supplying Fly-Client-IP directly to evade rate/session caps.
-    if config.mode == ProxyMode::Fly && config.trusts_hop(addr.ip()) {
+    if config.forwards_client_ip(addr.ip()) {
         if let Some(val) = headers.get("fly-client-ip") {
             if let Ok(s) = val.to_str() {
                 if let Ok(ip) = s.trim().parse::<IpAddr>() {
@@ -2086,6 +2205,62 @@ async fn check_rate_limit_bucket(
 
 async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     check_rate_limit_bucket(&state.rate_limits, ip, MAX_REQUESTS_PER_MINUTE).await
+}
+
+/// Read-only counterpart of [`check_rate_limit_bucket`]: whether `ip` has
+/// already spent this window's budget. Never charges the bucket.
+async fn rate_budget_exhausted(limits: &RateLimitBucket, ip: IpAddr, max_requests: u64) -> bool {
+    let now = Instant::now();
+    limits.read().await.entries.get(&ip).is_some_and(|entry| {
+        now.duration_since(entry.window_start) < RATE_WINDOW && entry.count >= max_requests
+    })
+}
+
+/// Which bucket a JSON route's handler charges, so the pre-body gate peeks at
+/// the same one.
+#[derive(Clone, Copy)]
+enum BodyRateGate {
+    General,
+    TicketRead,
+    Punch,
+}
+
+/// Handlers charge their bucket only after the `Json` extractor has read the
+/// body, which a slow sender can stretch to `HTTP_REQUEST_TIMEOUT`. An address
+/// that is already over budget is refused before that read. Charging stays in
+/// the handlers, so malformed requests still cost nothing.
+async fn reject_exhausted_rate_budget(
+    State((state, gate)): State<(AppState, BodyRateGate)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let client_ip = extract_client_ip(request.headers(), addr);
+    let exhausted = match gate {
+        BodyRateGate::General => {
+            rate_budget_exhausted(&state.rate_limits, client_ip, MAX_REQUESTS_PER_MINUTE).await
+        }
+        BodyRateGate::TicketRead => {
+            rate_budget_exhausted(
+                &state.ticket_read_rate_limits,
+                client_ip,
+                MAX_TICKET_READS_PER_MINUTE,
+            )
+            .await
+        }
+        BodyRateGate::Punch => {
+            rate_budget_exhausted(
+                &state.punch_rate_limits,
+                canonical_ip(client_ip),
+                MAX_PUNCH_PER_MINUTE,
+            )
+            .await
+        }
+    };
+    if exhausted {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    next.run(request).await
 }
 
 async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
@@ -2471,7 +2646,7 @@ async fn reserve_relay_ticket_join(
     if ticket.expires_at <= now {
         // The prune above retains an expired ticket only while a pre-upgrade
         // reservation is outstanding (so its rollback can still release the
-        // per-IP count). That retention must not admit new joins past expiry.
+        // per-network count). That retention must not admit new joins past expiry.
         return Err(StatusCode::GONE);
     }
     if !ticket.accepted {
@@ -2499,16 +2674,17 @@ async fn reserve_relay_ticket_join(
     if *already_joined || reservation.is_some() {
         return Err(StatusCode::CONFLICT);
     }
+    let network = client_network(client_ip);
 
     // The ticket lock stays held until capacity is reserved so a failed
     // pre-upgrade check neither burns the token nor returns a false 101.
-    let mut counts = state.relay_ip_counts.write().await;
+    let mut counts = state.relay_network_counts.write().await;
     let global_total: usize = counts.values().sum();
     if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let count = counts.entry(client_ip).or_insert(0);
-    if *count >= MAX_RELAY_SESSIONS_PER_IP {
+    let count = counts.entry(network).or_insert(0);
+    if *count >= MAX_RELAY_SESSIONS_PER_NETWORK {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     *count += 1;
@@ -2571,13 +2747,7 @@ async fn rollback_relay_ticket_reservation(state: &AppState, reservation: &Relay
         }
     };
     if released {
-        let mut counts = state.relay_ip_counts.write().await;
-        if let Some(count) = counts.get_mut(&reservation.client_ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&reservation.client_ip);
-            }
-        }
+        release_relay_network_slots(state, [reservation.client_ip]).await;
     }
 }
 
@@ -4879,14 +5049,23 @@ async fn cleanup_relay(state: &AppState, session_id: &str, role: RelayRole) {
         .write()
         .await
         .remove(&(session_id.to_owned(), role));
-    let Some(client_ip) = client_ip else {
-        return;
-    };
-    let mut counts = state.relay_ip_counts.write().await;
-    if let Some(count) = counts.get_mut(&client_ip) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            counts.remove(&client_ip);
+    if let Some(client_ip) = client_ip {
+        release_relay_network_slots(state, [client_ip]).await;
+    }
+}
+
+async fn release_relay_network_slots(
+    state: &AppState,
+    client_ips: impl IntoIterator<Item = IpAddr>,
+) {
+    let mut counts = state.relay_network_counts.write().await;
+    for client_ip in client_ips {
+        let network = client_network(client_ip);
+        if let Some(count) = counts.get_mut(&network) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&network);
+            }
         }
     }
 }
@@ -4908,15 +5087,7 @@ async fn cleanup_relay_session_all(state: &AppState, session_id: &str) {
     if removed_ips.is_empty() {
         return;
     }
-    let mut counts = state.relay_ip_counts.write().await;
-    for ip in removed_ips {
-        if let Some(count) = counts.get_mut(&ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&ip);
-            }
-        }
-    }
+    release_relay_network_slots(state, removed_ips).await;
 }
 
 async fn stats_handler(
@@ -4931,7 +5102,7 @@ async fn stats_handler(
     let relay_count =
         state.relay_sessions.read().await.len() + state.bridged_relays.read().await.len();
     let punch_count = state.punch_requests.read().await.len();
-    let relay_ip_count = state.relay_ip_counts.read().await.len();
+    let relay_ip_count = state.relay_network_counts.read().await.len();
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
@@ -5079,6 +5250,80 @@ async fn sweep_expired(state: AppState) {
     }
 }
 
+fn build_router(state: AppState) -> Router {
+    let rate_gate = |gate| {
+        axum::middleware::from_fn_with_state((state.clone(), gate), reject_exhausted_rate_budget)
+    };
+    // Every route that extracts a JSON body sits in exactly one of these three
+    // groups, matching the bucket its handler charges.
+    let general_body_routes = Router::new()
+        .route("/register", post(register))
+        .route("/unregister", delete(unregister))
+        .route("/v3/presence/register", post(capability_register_v3))
+        .route("/v3/presence/lookup", post(capability_lookup_v3))
+        .route("/v4/identity/lookup", post(identity_lookup_v4))
+        .route("/v4/presence/register", post(capability_register_v4))
+        .route("/v4/presence/lookup", post(capability_lookup_v4))
+        .route("/v3/punch/poll", post(punch_poll_v3))
+        .route("/v3/punch/ack", post(punch_ack_v3))
+        .route("/v4/punch/poll", post(punch_poll_v4))
+        .route("/v4/punch/ack", post(punch_ack_v4))
+        .route("/v4/channels/username", post(claim_channel_username_v4))
+        .route("/v4/channels/name", post(claim_channel_name_v4))
+        .route("/v4/channels/delete", post(delete_channel_v4))
+        .route("/v4/channels/nominee", post(set_channel_nominee_v4))
+        .route("/v4/channels/handover", post(handover_channel_name_v4))
+        .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
+        .route(
+            "/v2/relay-tickets/{ticket_id}/accept",
+            post(relay_ticket_accept),
+        )
+        .route_layer(rate_gate(BodyRateGate::General));
+    let ticket_read_body_routes = Router::new()
+        .route("/v4/relay-mailbox/poll", post(relay_mailbox_poll))
+        .route(
+            "/v2/relay-tickets/{ticket_id}/status",
+            post(relay_ticket_status),
+        )
+        .route_layer(rate_gate(BodyRateGate::TicketRead));
+    let punch_body_routes = Router::new()
+        .route("/v3/punch/register", post(punch_register_v3))
+        .route("/v4/punch/register", post(punch_register_v4))
+        .route_layer(rate_gate(BodyRateGate::Punch));
+
+    Router::new()
+        .merge(general_body_routes)
+        .merge(ticket_read_body_routes)
+        .merge(punch_body_routes)
+        .route("/lookup/{id}", get(legacy_presence_lookup_gone))
+        .route("/v3/identity/{id}", get(legacy_identity_lookup))
+        .route("/v4/protocol", get(protocol_v4))
+        .route("/punch", post(legacy_punch_gone))
+        .route("/punch/{id}", get(legacy_punch_gone))
+        .route("/v2/punch/register", post(legacy_punch_gone))
+        .route("/v2/punch/poll", post(legacy_punch_gone))
+        .route("/v2/punch/ack", post(legacy_punch_gone))
+        .route("/v4/channels/directory", get(channel_directory_v4))
+        .route("/v4/channels/deleted", get(channel_deleted_v4))
+        .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
+        .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
+        .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
+        .route("/v2/relay/{ticket_id}", get(relay_ws))
+        .route("/relay/{session_id}", get(legacy_relay_gone))
+        .route("/relay-invite", post(legacy_relay_gone))
+        .route("/relay-invites/{id}", get(legacy_relay_gone))
+        // No `/bootstrap`: the Ember DHT joins through the KAD bridge, peer
+        // exchange, DHT gossip, and its persisted contact file, so the
+        // rendezvous never learns a node's DHT identity or address. Keeping a
+        // central pool would have handed the operator an identity-to-IP map
+        // for every participant, which is the opposite of what the overlay is
+        // for.
+        .route("/health", get(health))
+        .route("/stats", get(stats_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -5100,7 +5345,7 @@ async fn main() {
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         bridged_relays: Arc::new(RwLock::new(HashMap::new())),
         relay_admissions: Arc::new(RwLock::new(HashMap::new())),
-        relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+        relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
         next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
         relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
         relay_token_key: {
@@ -5117,62 +5362,7 @@ async fn main() {
 
     tokio::spawn(sweep_expired(state.clone()));
 
-    let app = Router::new()
-        .route("/register", post(register))
-        .route("/lookup/{id}", get(legacy_presence_lookup_gone))
-        .route("/unregister", delete(unregister))
-        .route("/v3/identity/{id}", get(legacy_identity_lookup))
-        .route("/v3/presence/register", post(capability_register_v3))
-        .route("/v3/presence/lookup", post(capability_lookup_v3))
-        .route("/v4/protocol", get(protocol_v4))
-        .route("/v4/identity/lookup", post(identity_lookup_v4))
-        .route("/v4/presence/register", post(capability_register_v4))
-        .route("/v4/presence/lookup", post(capability_lookup_v4))
-        .route("/punch", post(legacy_punch_gone))
-        .route("/punch/{id}", get(legacy_punch_gone))
-        .route("/v2/punch/register", post(legacy_punch_gone))
-        .route("/v2/punch/poll", post(legacy_punch_gone))
-        .route("/v2/punch/ack", post(legacy_punch_gone))
-        .route("/v3/punch/register", post(punch_register_v3))
-        .route("/v3/punch/poll", post(punch_poll_v3))
-        .route("/v3/punch/ack", post(punch_ack_v3))
-        .route("/v4/punch/register", post(punch_register_v4))
-        .route("/v4/punch/poll", post(punch_poll_v4))
-        .route("/v4/punch/ack", post(punch_ack_v4))
-        .route("/v4/channels/username", post(claim_channel_username_v4))
-        .route("/v4/channels/name", post(claim_channel_name_v4))
-        .route("/v4/channels/delete", post(delete_channel_v4))
-        .route("/v4/channels/nominee", post(set_channel_nominee_v4))
-        .route("/v4/channels/handover", post(handover_channel_name_v4))
-        .route("/v4/channels/directory", get(channel_directory_v4))
-        .route("/v4/channels/deleted", get(channel_deleted_v4))
-        .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
-        .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
-        .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
-        .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
-        .route("/v4/relay-mailbox/poll", post(relay_mailbox_poll))
-        .route(
-            "/v2/relay-tickets/{ticket_id}/accept",
-            post(relay_ticket_accept),
-        )
-        .route(
-            "/v2/relay-tickets/{ticket_id}/status",
-            post(relay_ticket_status),
-        )
-        .route("/v2/relay/{ticket_id}", get(relay_ws))
-        .route("/relay/{session_id}", get(legacy_relay_gone))
-        .route("/relay-invite", post(legacy_relay_gone))
-        .route("/relay-invites/{id}", get(legacy_relay_gone))
-        // No `/bootstrap`: the Ember DHT joins through the KAD bridge, peer
-        // exchange, DHT gossip, and its persisted contact file, so the
-        // rendezvous never learns a node's DHT identity or address. Keeping a
-        // central pool would have handed the operator an identity-to-IP map
-        // for every participant, which is the opposite of what the overlay is
-        // for.
-        .route("/health", get(health))
-        .route("/stats", get(stats_handler))
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(state);
+    let app = build_router(state);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -5193,6 +5383,7 @@ async fn main() {
         MAX_HTTP_CONNECTIONS - RESERVED_HEALTH_CONNECTIONS,
     ));
     let health_reserve = Arc::new(tokio::sync::Semaphore::new(RESERVED_HEALTH_CONNECTIONS));
+    let network_limiter = NetworkConnectionLimiter::default();
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -5205,6 +5396,7 @@ async fn main() {
                         continue;
                     }
                 };
+                let network_slot = Arc::new(std::sync::Mutex::new(None));
                 let (permit, reserve_only) = match ordinary.clone().try_acquire_owned() {
                     Ok(permit) => (permit, false),
                     Err(_) => match health_reserve.clone().try_acquire_owned() {
@@ -5216,12 +5408,15 @@ async fn main() {
                     },
                 };
                 let app = app.clone();
+                let network_limiter = network_limiter.clone();
                 tokio::spawn(async move {
                     use tower::ServiceExt;
                     let _permit = permit;
                     let service = hyper::service::service_fn(
                         move |request: hyper::Request<hyper::body::Incoming>| {
                             let app = app.clone();
+                            let network_limiter = network_limiter.clone();
+                            let network_slot = network_slot.clone();
                             async move {
                                 let path = request.uri().path().to_owned();
                                 if !http_path_admitted(reserve_only, &path) {
@@ -5229,6 +5424,21 @@ async fn main() {
                                         .status(StatusCode::SERVICE_UNAVAILABLE)
                                         .header("connection", "close")
                                         .body(axum::body::Body::from("reserved for health"))
+                                        .expect("static HTTP response is valid");
+                                    return Ok::<_, std::convert::Infallible>(response);
+                                }
+                                if !admit_client_network(
+                                    &network_limiter,
+                                    &network_slot,
+                                    &path,
+                                    extract_client_ip(request.headers(), peer_addr),
+                                ) {
+                                    let response = hyper::Response::builder()
+                                        .status(StatusCode::TOO_MANY_REQUESTS)
+                                        .header("connection", "close")
+                                        .body(axum::body::Body::from(
+                                            "too many connections from this network",
+                                        ))
                                         .expect("static HTTP response is valid");
                                     return Ok::<_, std::convert::Infallible>(response);
                                 }
@@ -5339,7 +5549,7 @@ mod relay_ticket_tests {
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
             relay_admissions: Arc::new(RwLock::new(HashMap::new())),
-            relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+            relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
             next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
             relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
             relay_token_key: [0x5a; 32],
@@ -6049,6 +6259,15 @@ mod relay_ticket_tests {
             },
         );
         (initiator_token, responder_token)
+    }
+
+    async fn join_from(
+        state: &AppState,
+        ticket_id: &str,
+        token: &str,
+        ip: &str,
+    ) -> Result<RelayRole, StatusCode> {
+        admit_relay_ticket_join(state, ticket_id, token, ip.parse().unwrap()).await
     }
 
     fn ticket_for_test(responder_id: &str, accepted: bool) -> RelayTicket {
@@ -6767,9 +6986,16 @@ mod relay_ticket_tests {
             reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
                 .await
                 .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
         rollback_relay_ticket_reservation(&state, &reservation).await;
-        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert!(state.relay_network_counts.read().await.is_empty());
         assert_eq!(
             state
                 .relay_tickets
@@ -6789,7 +7015,14 @@ mod relay_ticket_tests {
         commit_relay_ticket_reservation(&state, &reservation)
             .await
             .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
     }
 
     #[tokio::test]
@@ -6855,7 +7088,14 @@ mod relay_ticket_tests {
             reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
                 .await
                 .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
 
         // The ticket expires while the pre-upgrade reservation is still
         // outstanding. Pruning must retain it so the reservation's rollback
@@ -6872,7 +7112,7 @@ mod relay_ticket_tests {
 
         rollback_relay_ticket_reservation(&state, &reservation).await;
         assert!(
-            state.relay_ip_counts.read().await.is_empty(),
+            state.relay_network_counts.read().await.is_empty(),
             "rollback must release the reserved per-IP count"
         );
 
@@ -6915,8 +7155,16 @@ mod relay_ticket_tests {
             .write()
             .await
             .insert((session.clone(), RelayRole::Responder), second);
-        state.relay_ip_counts.write().await.insert(first, 1);
-        state.relay_ip_counts.write().await.insert(second, 1);
+        state
+            .relay_network_counts
+            .write()
+            .await
+            .insert(client_network(first), 1);
+        state
+            .relay_network_counts
+            .write()
+            .await
+            .insert(client_network(second), 1);
         state.bridged_relays.write().await.insert(
             session.clone(),
             BridgedRelayEntry {
@@ -6927,8 +7175,180 @@ mod relay_ticket_tests {
         cleanup_relay_session_all(&state, &session).await;
         cleanup_relay_session_all(&state, &session).await;
         assert!(state.relay_admissions.read().await.is_empty());
-        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert!(state.relay_network_counts.read().await.is_empty());
         assert!(state.bridged_relays.read().await.is_empty());
+    }
+
+    #[test]
+    fn client_network_groups_ipv4_by_24_and_ipv6_by_64() {
+        let network = |ip: &str| client_network(ip.parse().unwrap());
+        let parsed = |ip: &str| ip.parse::<IpAddr>().unwrap();
+        assert_eq!(network("203.0.113.7"), network("203.0.113.250"));
+        assert_eq!(network("203.0.113.7"), parsed("203.0.113.0"));
+        assert_ne!(network("203.0.113.7"), network("203.0.114.7"));
+        assert_eq!(network("::ffff:203.0.113.9"), network("203.0.113.7"));
+
+        assert_eq!(network("2001:db8:1:2::1"), network("2001:db8:1:2:ffff::1"));
+        assert_eq!(network("2001:db8:1:2::1"), parsed("2001:db8:1:2::"));
+        assert_ne!(network("2001:db8:1:2::1"), network("2001:db8:1:3::1"));
+    }
+
+    #[tokio::test]
+    async fn relay_cap_counts_every_address_in_a_network_together() {
+        let state = test_state();
+        let mut joined = 0usize;
+        for index in 0..=MAX_RELAY_SESSIONS_PER_NETWORK {
+            let ticket_id = format!("{index:064x}");
+            let (initiator_token, _) =
+                insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+            let address = IpAddr::V6(Ipv6Addr::from(
+                0x2001_0db8_0009_0009_0000_0000_0000_0001_u128 + index as u128,
+            ));
+            match admit_relay_ticket_join(&state, &ticket_id, &initiator_token, address).await {
+                Ok(RelayRole::Initiator) => joined += 1,
+                result => {
+                    assert_eq!(result, Err(StatusCode::TOO_MANY_REQUESTS));
+                    assert_eq!(index, MAX_RELAY_SESSIONS_PER_NETWORK);
+                }
+            }
+        }
+        assert_eq!(joined, MAX_RELAY_SESSIONS_PER_NETWORK);
+
+        let ticket_id = "f0".repeat(32);
+        let (initiator_token, _) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        assert_eq!(
+            join_from(&state, &ticket_id, &initiator_token, "2001:db8:9:a::1").await,
+            Ok(RelayRole::Initiator),
+            "a neighbouring /64 has its own budget"
+        );
+    }
+
+    #[test]
+    fn network_connection_limiter_caps_each_network() {
+        let limiter = NetworkConnectionLimiter::default();
+        let limit = MAX_HTTP_CONNECTIONS_PER_NETWORK;
+        let mut held: Vec<_> = (0..limit)
+            .map(|host| {
+                limiter
+                    .try_acquire(IpAddr::V4(Ipv4Addr::new(203, 0, 113, host as u8)), limit)
+                    .expect("under the per-network cap")
+            })
+            .collect();
+        let refused = |ip: &str| limiter.try_acquire(ip.parse().unwrap(), limit).is_none();
+        assert!(refused("203.0.113.250"));
+        assert!(refused("::ffff:203.0.113.251"));
+        let neighbour = limiter
+            .try_acquire("203.0.114.1".parse().unwrap(), limit)
+            .expect("another /24 is not affected");
+
+        held.pop();
+        let replacement = limiter
+            .try_acquire("203.0.113.250".parse().unwrap(), limit)
+            .expect("a released slot is reusable");
+
+        drop((held, neighbour, replacement));
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connection_is_charged_once_to_its_named_client() {
+        let limiter = NetworkConnectionLimiter::default();
+        let client: IpAddr = "2001:db8:7:7::1".parse().unwrap();
+        let connections: Vec<_> = (0..MAX_HTTP_CONNECTIONS_PER_NETWORK)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        for slot in &connections {
+            assert!(admit_client_network(&limiter, slot, "/register", client));
+            // Later requests on the same connection reuse its slot.
+            assert!(admit_client_network(&limiter, slot, "/register", client));
+        }
+        let admit =
+            |slot, path, ip: &str| admit_client_network(&limiter, slot, path, ip.parse().unwrap());
+        let extra = std::sync::Mutex::new(None);
+        assert!(!admit(&extra, "/register", "2001:db8:7:7::2"));
+        assert!(extra.lock().unwrap().is_none());
+        assert!(admit(&extra, "/register", "2001:db8:7:8::1"));
+
+        let trusted = ProxyConfig {
+            mode: ProxyMode::Fly,
+            trusted_hops: vec![TrustedProxyNet::parse("10.0.0.0/8").unwrap()],
+        };
+        assert!(trusted.forwards_client_ip("10.1.2.3".parse().unwrap()));
+        assert!(!trusted.forwards_client_ip("9.9.9.9".parse().unwrap()));
+        let disabled = ProxyConfig {
+            mode: ProxyMode::Disabled,
+            ..trusted
+        };
+        assert!(!disabled.forwards_client_ip("10.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn health_and_loopback_bypass_the_network_cap() {
+        let limiter = NetworkConnectionLimiter::default();
+        let full: Vec<_> = (0..MAX_HTTP_CONNECTIONS_PER_NETWORK)
+            .map(|host| {
+                let slot = std::sync::Mutex::new(None);
+                let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, host as u8));
+                assert!(admit_client_network(&limiter, &slot, "/register", ip));
+                slot
+            })
+            .collect();
+        let admit = |path, ip: &str| {
+            let slot = std::sync::Mutex::new(None);
+            let admitted = admit_client_network(&limiter, &slot, path, ip.parse().unwrap());
+            (admitted, slot.into_inner().unwrap().is_some())
+        };
+
+        assert_eq!(admit("/register", "203.0.113.200"), (false, false));
+        assert_eq!(admit("/health", "203.0.113.200"), (true, false));
+
+        // A local reverse proxy without TRUST_PROXY makes every client look
+        // like loopback; none of them may be charged to one shared network.
+        for _ in 0..=MAX_HTTP_CONNECTIONS_PER_NETWORK {
+            assert_eq!(admit("/register", "127.0.0.1"), (true, false));
+            assert_eq!(admit("/register", "::1"), (true, false));
+            assert_eq!(admit("/register", "::ffff:127.0.0.1"), (true, false));
+        }
+        drop(full);
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_is_refused_before_the_body_is_read() {
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let exhausted: SocketAddr = "8.8.8.8:4000".parse().unwrap();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            assert!(check_rate_limit(&state, exhausted.ip()).await);
+        }
+        let app = build_router(state.clone());
+        let send = |path: &'static str, addr: SocketAddr| {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .extension(ConnectInfo(addr))
+                .body(axum::body::Body::from("not json"))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        let limited = StatusCode::TOO_MANY_REQUESTS;
+        assert_eq!(send("/register", exhausted).await, limited);
+        assert_eq!(send("/v4/relay-mailbox/offer", exhausted).await, limited);
+        // Other addresses, and routes billed to other buckets, reach the
+        // handler's own body rejection.
+        let fresh: SocketAddr = "1.1.1.1:4000".parse().unwrap();
+        assert_ne!(send("/register", fresh).await, limited);
+        assert_ne!(send("/v4/relay-mailbox/poll", exhausted).await, limited);
+        assert_ne!(send("/v4/punch/register", exhausted).await, limited);
+        // Peeking never charges the bucket.
+        assert_eq!(
+            state.rate_limits.read().await.entries[&exhausted.ip()].count,
+            MAX_REQUESTS_PER_MINUTE
+        );
     }
 
     #[tokio::test]

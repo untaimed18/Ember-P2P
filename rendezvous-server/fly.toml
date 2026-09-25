@@ -30,6 +30,17 @@ primary_region = 'iad'
   auto_start_machines = true
   min_machines_running = 1
 
+  # The server admits 240 ordinary connections itself
+  # (MAX_HTTP_CONNECTIONS - RESERVED_HEALTH_CONNECTIONS). A relay WebSocket
+  # gives its permit back once it upgrades but still counts here for its whole
+  # life, so the proxy must also leave room for every relay join
+  # (MAX_GLOBAL_RELAY_SESSIONS = 200). With Fly's much smaller defaults, a few
+  # relays could pin the machine at this layer. Keep in sync with main.rs.
+  [http_service.concurrency]
+    type = 'connections'
+    hard_limit = 440
+    soft_limit = 400
+
 [[vm]]
   memory = '256mb'
   cpu_kind = 'shared'
