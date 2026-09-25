@@ -276,6 +276,7 @@
   "chat_attach_waiting": "Warten, bis {name} annimmt",
   "chat_attach_offer_prompt": "{name} möchte Ihnen diese Datei senden",
   "chat_attach_starting": "Wird gestartet…",
+  "chat_attach_connecting": "Verbindung wird hergestellt…",
   "chat_attach_sending": "Wird gesendet · {percent} %",
   "chat_attach_receiving": "Wird empfangen · {percent} %",
   "chat_attach_sent": "Gesendet",

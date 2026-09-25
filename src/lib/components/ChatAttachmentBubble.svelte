@@ -44,9 +44,12 @@
       case 'accepted':
         return m.chat_attach_starting();
       case 'active':
-        return sent
-          ? m.chat_attach_sending({ percent })
-          : m.chat_attach_receiving({ percent });
+        if (sent) return m.chat_attach_sending({ percent });
+        // Accepted, but no byte yet: the dial to the sender, and its check of
+        // the file, come first. "Receiving 0%" read as a stall.
+        return attachment.transferred > 0
+          ? m.chat_attach_receiving({ percent })
+          : m.chat_attach_connecting();
       case 'complete':
         return sent ? m.chat_attach_sent() : m.chat_attach_received();
       case 'declined':

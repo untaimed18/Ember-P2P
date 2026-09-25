@@ -192,6 +192,46 @@ fn dial_target(ip: IpAddr, port: u16) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
+/// A friend at this address reaches us without crossing our NAT: on the same
+/// network, on this machine, or across a VPN mesh (100.64/10, which Tailscale
+/// uses). Behind a CGNAT the address is not ours either, and neither port is
+/// right there, so treating it as direct costs nothing.
+fn reached_directly(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || crate::security::is_lan_or_cgnat_v4(v4),
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || first & 0xFE00 == 0xFC00 || first & 0xFFC0 == 0xFE80
+        }
+    }
+}
+
+/// The QUIC port to name to a friend connected from `peer`.
+///
+/// The public port STUN reports is the one our NAT maps the endpoint to, and it
+/// only exists on the far side of the router. A friend on our own network dials
+/// our local address, where the endpoint listens on its own port; naming the
+/// mapped one there sent every dial of a LAN transfer to a port nothing
+/// listened on, until the receiver gave up.
+fn quic_port_for(state: &NetworkState, peer: Option<SocketAddr>) -> Option<u16> {
+    choose_quic_port(state.quic_port, super::advertised_quic_port(state), peer)
+}
+
+fn choose_quic_port(
+    local: Option<u16>,
+    advertised: Option<u16>,
+    peer: Option<SocketAddr>,
+) -> Option<u16> {
+    match local.filter(|p| *p != 0) {
+        Some(port) if peer.is_some_and(|addr| reached_directly(addr.ip())) => Some(port),
+        _ => advertised,
+    }
+}
+
 /// What accepting an offer needs, held from the offer until it is answered.
 pub(crate) struct InboundAttach {
     friend: [u8; 16],
@@ -258,9 +298,6 @@ pub(super) async fn offer_preflight(
             "Chatting with friends is turned off in Settings",
         ));
     }
-    let Some(quic_port) = super::advertised_quic_port(state) else {
-        return Err(unavailable());
-    };
     if quic_endpoint(state).is_none() {
         return Err(unavailable());
     }
@@ -277,7 +314,7 @@ pub(super) async fn offer_preflight(
     if session.is_relayed() {
         return Err(relayed());
     }
-    Ok(quic_port)
+    quic_port_for(state, session.peer_addr()).ok_or_else(unavailable)
 }
 
 async fn session_pubkey(state: &NetworkState, friend: &[u8; 16]) -> Option<[u8; 32]> {
@@ -858,10 +895,11 @@ async fn accept_offer(
         emit_by_id(app, db, &xfer_hex);
         return Err(relayed());
     };
+    // The port the sender punches toward, chosen for how it reaches us.
     let reply = attach::encode_attach_reply(
         &xfer_id,
         AttachReply::Accept,
-        super::advertised_quic_port(state),
+        quic_port_for(state, inbound.peer_addr),
     );
     if let Err(e) = send_ext(state, &inbound.friend, EMBER_EXT_ATTACH_REPLY, &reply).await {
         // Put it back: the user can try again once the friend reconnects, until
@@ -1083,10 +1121,20 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         let conn = match dialled {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
+                info!(
+                    "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} failed: {e}",
+                    attempt + 1,
+                    ctx.dial
+                );
                 last = ReceiveFailure::Unreachable(e.to_string());
                 continue;
             }
             Err(_) => {
+                info!(
+                    "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} timed out",
+                    attempt + 1,
+                    ctx.dial
+                );
                 last = ReceiveFailure::Unreachable("the connection timed out".into());
                 continue;
             }
@@ -1286,6 +1334,35 @@ mod tests {
             Some("203.0.113.7:41330".parse().unwrap())
         );
         assert!(dial_target("2001:db8::1".parse().unwrap(), 41330).is_none());
+    }
+
+    /// A NAT that re-maps ports gives the endpoint a public port different
+    /// from the one it listens on. A friend across the internet needs the
+    /// public one; a friend on the same network can only reach the local one.
+    #[test]
+    fn a_friend_on_the_same_network_is_given_the_local_port() {
+        let (local, public) = (Some(48545), Some(63786));
+        let port = |peer: &str| choose_quic_port(local, public, Some(peer.parse().unwrap()));
+        for lan in [
+            "192.168.1.20:48544",
+            "10.0.0.5:48544",
+            "172.20.1.9:48544",
+            "169.254.3.4:48544",
+            "127.0.0.1:48544",
+            "100.101.102.103:48544",
+            "[::ffff:192.168.1.20]:48544",
+            "[fd12:3456::1]:48544",
+            "[fe80::1]:48544",
+        ] {
+            assert_eq!(port(lan), Some(48545), "{lan}");
+        }
+        assert_eq!(port("203.0.113.7:48544"), Some(63786));
+        assert_eq!(choose_quic_port(local, public, None), Some(63786), "no direct address");
+        assert_eq!(
+            choose_quic_port(None, public, Some("192.168.1.20:1".parse().unwrap())),
+            Some(63786),
+            "no local port known yet"
+        );
     }
 
     #[test]

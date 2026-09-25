@@ -486,7 +486,8 @@ pub async fn run_friend_session_over_transport(
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let ember_session_handle =
         EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash)
-            .via_relay(relayed);
+            .via_relay(relayed)
+            .with_peer_addr((!relayed).then_some(addr));
     {
         let mut sessions = ember_sessions.write().await;
         // The user may have gone offline while this dial was in flight.

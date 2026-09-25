@@ -67,6 +67,10 @@ pub struct EmberSessionHandle {
     /// friend behind it. Chat attachments need one: their bytes go over a
     /// direct QUIC connection, never through the session.
     relayed: bool,
+    /// Where the friend is connected from, when directly. Tells a chat
+    /// attachment which of our QUIC ports to name: a friend on our own network
+    /// cannot reach the public one the NAT maps.
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -145,6 +149,7 @@ impl EmberSessionHandle {
             peer_ember_pubkey,
             secure_registration: None,
             relayed: false,
+            peer_addr: None,
         }
     }
 
@@ -155,6 +160,16 @@ impl EmberSessionHandle {
 
     pub fn is_relayed(&self) -> bool {
         self.relayed
+    }
+
+    /// `None` for a relayed session, which has no direct address.
+    pub fn with_peer_addr(mut self, peer_addr: Option<std::net::SocketAddr>) -> Self {
+        self.peer_addr = peer_addr;
+        self
+    }
+
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr
     }
 
     pub fn new_secure(
@@ -7280,8 +7295,9 @@ impl UploadHandler {
                 // revocation, even when another connection already owns the
                 // canonical outbound-routing slot.  Chat/browse authorization
                 // on this socket does not require owns_ember_slot.
-                let handle =
-                    EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh).via_relay(relayed);
+                let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh)
+                    .via_relay(relayed)
+                    .with_peer_addr(attach_addr);
                 ember_shutdown_rx = Some(handle.subscribe_shutdown());
                 ember_session_handle = Some(handle.clone());
 

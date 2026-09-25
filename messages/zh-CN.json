@@ -276,6 +276,7 @@
   "chat_attach_waiting": "等待 {name} 接受",
   "chat_attach_offer_prompt": "{name} 想给你发送这个文件",
   "chat_attach_starting": "正在开始…",
+  "chat_attach_connecting": "正在连接…",
   "chat_attach_sending": "正在发送 · {percent}%",
   "chat_attach_receiving": "正在接收 · {percent}%",
   "chat_attach_sent": "已发送",

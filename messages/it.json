@@ -276,6 +276,7 @@
   "chat_attach_waiting": "In attesa che {name} accetti",
   "chat_attach_offer_prompt": "{name} vuole inviarti questo file",
   "chat_attach_starting": "Avvio…",
+  "chat_attach_connecting": "Connessione…",
   "chat_attach_sending": "Invio · {percent}%",
   "chat_attach_receiving": "Ricezione · {percent}%",
   "chat_attach_sent": "Inviato",
