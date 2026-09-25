@@ -731,9 +731,11 @@ pub(in crate::network) async fn on_bootstrap_tick(
             state.rendezvous_register_generation =
                 state.rendezvous_register_generation.saturating_add(1);
             let generation = state.rendezvous_register_generation;
+            let rv_db = db.clone();
             tokio::spawn(async move {
                 let result =
-                    rendezvous::register(
+                    crate::network::friends::register_presence(
+                        rv_db,
                         &rv_url,
                         &rv_hash,
                         rv_port,
@@ -805,8 +807,10 @@ pub(in crate::network) async fn on_bootstrap_tick(
             state.rendezvous_register_generation =
                 state.rendezvous_register_generation.saturating_add(1);
             let generation = state.rendezvous_register_generation;
+            let rv_db = db.clone();
             tokio::spawn(async move {
-                let result = rendezvous::register(
+                let result = crate::network::friends::register_presence(
+                    rv_db,
                     &rv_url,
                     &rv_hash,
                     rv_port,

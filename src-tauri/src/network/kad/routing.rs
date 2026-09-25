@@ -1321,6 +1321,18 @@ impl RoutingTable {
         false
     }
 
+    /// Verify `id` only when its stored address is `sender_ip`. A valid
+    /// receiver key proves the sender owns the IP it sent from, not the
+    /// address of whatever contact id it claims.
+    pub fn mark_verified_from(&mut self, id: &KadId, sender_ip: Ipv4Addr) -> bool {
+        if self.get_contact(id).is_some_and(|c| c.ip == sender_ip) {
+            self.mark_verified(id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn mark_verified(&mut self, id: &KadId) {
         let distance = self.local_id.xor_distance(id);
         if let Some(bin) = self.root.find_bin_mut(&distance) {
@@ -1943,6 +1955,29 @@ mod find_closest_tests {
             closest.iter().any(|c| c.id == unverified.id),
             "cold start may seed from unverified contacts"
         );
+    }
+
+    #[test]
+    fn kad_mark_verified_from_mismatched_ip_stays_unverified() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut victim = contact(0x03, 3);
+        victim.verified = false;
+        assert!(rt.insert(victim.clone()));
+
+        let attacker_ip = Ipv4Addr::new(9, 9, 9, 9);
+        assert!(!rt.mark_verified_from(&victim.id, attacker_ip));
+        assert!(!rt.get_contact(&victim.id).unwrap().verified);
+        assert_eq!(rt.verified_len(), 0);
+
+        assert!(rt.mark_verified_from(&victim.id, victim.ip));
+        assert!(rt.get_contact(&victim.id).unwrap().verified);
+    }
+
+    #[test]
+    fn kad_mark_verified_from_unknown_contact_is_noop() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        assert!(!rt.mark_verified_from(&KadId([0x04; 16]), Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(rt.len(), 0);
     }
 
     #[test]

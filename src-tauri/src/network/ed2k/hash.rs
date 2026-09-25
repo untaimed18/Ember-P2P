@@ -764,7 +764,8 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
     if raw_name.len() > 4096 {
         return Err("ed2k file name is too long");
     }
-    let name = percent_decode_str(raw_name);
+    // Sanitize after decoding: `%E2%80%AE` only becomes an RLO here.
+    let name = crate::security::sanitize_remote_text(&percent_decode_str(raw_name), 4096);
     let size = parts
         .next()
         .ok_or("Missing ed2k file size")?
@@ -991,6 +992,20 @@ mod link_tests {
         assert_eq!(name, "Track|01.mp3");
         assert_eq!(size, 4096);
         assert_eq!(hash, HASH);
+    }
+
+    #[test]
+    fn link_name_strips_percent_encoded_and_raw_bidi_controls() {
+        for link in [
+            format!("ed2k://|file|Holiday%E2%80%AEgpj.exe|9|{HASH}|/"),
+            format!("ed2k://|file|Holiday\u{202E}gpj.exe|9|{HASH}|/"),
+            format!("ed2k://%7Cfile%7CHoliday%E2%80%8Bgpj%0A.exe%7C9%7C{HASH}%7C/"),
+        ] {
+            let (name, size, hash, _, _) = parse_ed2k_link_strict(&link).expect(&link);
+            assert_eq!(name, "Holidaygpj.exe", "{link}");
+            assert_eq!(size, 9);
+            assert_eq!(hash, HASH);
+        }
     }
 
     #[test]

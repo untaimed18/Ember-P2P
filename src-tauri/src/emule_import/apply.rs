@@ -942,5 +942,6 @@ fn imported_transfer(download: &StagedDownload) -> crate::types::Transfer {
         up_part_count: None,
         up_peer_part_status: None,
         ember_verified: false,
+        friends_only: false,
     }
 }

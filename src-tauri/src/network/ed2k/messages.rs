@@ -307,6 +307,17 @@ pub const EMBER_EXT_ATTACH_REPLY: u8 = 0x09;
 /// transfer until it lapses.
 pub const EMBER_EXT_ATTACH_CANCEL: u8 = 0x0A;
 
+/// [`OP_EMBER_EXT`] sub-type: which entries of the browse answer that follows
+/// on the same session are friends-only. Body is
+/// `crate::network::browse::encode_browse_scope`.
+///
+/// Its own frame rather than a field of [`OP_EMBER_BROWSE_RES`] because the v1
+/// browse body has no room left: the Ember digest trailer is only accepted
+/// when it ends the payload exactly, so appending anything would strip every
+/// digest for peers already in the field. A peer that predates this sub-type
+/// ignores it and treats the listing as unrestricted, as it always did.
+pub const EMBER_EXT_BROWSE_SCOPE: u8 = 0x0B;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -1330,7 +1341,14 @@ pub struct EmberFileOffer {
     /// 32-byte trailer after the v1 name so pre-1.5.5 parsers (which stop at
     /// the declared name length) ignore it.
     pub ember_file_hash: Option<[u8; 32]>,
+    /// The sender restricts this file to friends, so the recipient must not
+    /// advertise or serve its copy on the open network. Carried in a flags
+    /// byte after the digest slot; absent means unrestricted.
+    pub friends_only: bool,
 }
+
+/// [`EmberFileOffer`] flags bit: the offered file is friends-only.
+const EMBER_OFFER_FLAG_FRIENDS_ONLY: u8 = 0x01;
 
 /// Build an [`OP_EMBER_FILE_OFFER`] payload. Rides the friend session's Noise
 /// encryption, so like the XFER messages it carries no signature of its own.
@@ -1353,7 +1371,12 @@ pub fn build_ember_file_offer(offer: &EmberFileOffer) -> Vec<u8> {
     buf.extend_from_slice(&offer.file_size.to_le_bytes());
     buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
     buf.extend_from_slice(name);
-    if let Some(digest) = offer.ember_file_hash {
+    if offer.friends_only {
+        // The flags byte sits after a fixed digest slot; zeros read as
+        // "no digest" to every parser that knows the slot.
+        buf.extend_from_slice(&offer.ember_file_hash.unwrap_or([0u8; 32]));
+        buf.push(EMBER_OFFER_FLAG_FRIENDS_ONLY);
+    } else if let Some(digest) = offer.ember_file_hash {
         buf.extend_from_slice(&digest);
     }
     buf
@@ -1388,11 +1411,15 @@ pub fn parse_ember_file_offer(payload: &[u8]) -> Option<EmberFileOffer> {
     } else {
         None
     };
+    let friends_only = payload
+        .get(end + 32)
+        .is_some_and(|flags| flags & EMBER_OFFER_FLAG_FRIENDS_ONLY != 0);
     Some(EmberFileOffer {
         file_hash,
         file_size,
         file_name,
         ember_file_hash,
+        friends_only,
     })
 }
 
@@ -3299,6 +3326,7 @@ mod tests {
             EMBER_EXT_ATTACH_OFFER,
             EMBER_EXT_ATTACH_REPLY,
             EMBER_EXT_ATTACH_CANCEL,
+            EMBER_EXT_BROWSE_SCOPE,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {
@@ -3635,6 +3663,7 @@ mod tests {
             file_size: 4_294_967_296, // deliberately over u32 to prove 64-bit sizing
             file_name: "holiday video.mkv".to_string(),
             ember_file_hash: None,
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         assert_eq!(parse_ember_file_offer(&payload), Some(offer));
@@ -3647,6 +3676,7 @@ mod tests {
             file_size: 12,
             file_name: "clip.mp4".to_string(),
             ember_file_hash: Some([0xABu8; 32]),
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         assert_eq!(parse_ember_file_offer(&payload), Some(offer));
@@ -3655,6 +3685,49 @@ mod tests {
         let parsed = parse_ember_file_offer(without).expect("legacy body still parses");
         assert_eq!(parsed.file_name, "clip.mp4");
         assert_eq!(parsed.ember_file_hash, None);
+    }
+
+    #[test]
+    fn ember_file_offer_friends_only_flag_round_trips_with_and_without_digest() {
+        for digest in [None, Some([0xCDu8; 32])] {
+            let offer = EmberFileOffer {
+                file_hash: [0x66u8; 16],
+                file_size: 99,
+                file_name: "private.flac".to_string(),
+                ember_file_hash: digest,
+                friends_only: true,
+            };
+            let payload = build_ember_file_offer(&offer);
+            assert_eq!(parse_ember_file_offer(&payload), Some(offer));
+        }
+    }
+
+    /// A parser that predates the flags byte reads the same hash, name and
+    /// digest; one that knows it reads a flagless offer as unrestricted.
+    #[test]
+    fn ember_file_offer_flag_is_invisible_to_older_parsers() {
+        let restricted = EmberFileOffer {
+            file_hash: [0x77u8; 16],
+            file_size: 5,
+            file_name: "x.bin".to_string(),
+            ember_file_hash: None,
+            friends_only: true,
+        };
+        let payload = build_ember_file_offer(&restricted);
+        // What a pre-flag build sees: everything up to the digest slot.
+        let pre_flag = &payload[..payload.len() - 1];
+        let parsed = parse_ember_file_offer(pre_flag).expect("pre-flag body parses");
+        assert_eq!(parsed.file_hash, restricted.file_hash);
+        assert_eq!(parsed.ember_file_hash, None);
+        assert!(!parsed.friends_only);
+
+        let public = EmberFileOffer {
+            friends_only: false,
+            ..restricted
+        };
+        let public_payload = build_ember_file_offer(&public);
+        assert_eq!(public_payload.len(), EMBER_FILE_OFFER_MIN_LEN + "x.bin".len());
+        assert!(!parse_ember_file_offer(&public_payload).unwrap().friends_only);
     }
 
     #[test]
@@ -3678,6 +3751,7 @@ mod tests {
             file_size: 10,
             file_name: "a.bin".to_string(),
             ember_file_hash: None,
+            friends_only: false,
         };
         let good = build_ember_file_offer(&offer);
 
@@ -3711,6 +3785,7 @@ mod tests {
             // 3 bytes per char, so the cap lands mid-character if unguarded.
             file_name: "日".repeat(400),
             ember_file_hash: None,
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         let parsed = parse_ember_file_offer(&payload).expect("truncated name still parses");

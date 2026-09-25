@@ -18,6 +18,7 @@ mod ember_publishing;
 mod ember_search;
 mod ember_udp;
 mod event_loop;
+pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;
 mod health;
@@ -953,6 +954,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         rendezvous_last_register: None,
         rendezvous_last_attempt: None,
         rendezvous_register_fail_streak: 0,
+        rendezvous_force_register_at: None,
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
         friend_search_initial_queue: Vec::new(),

@@ -201,6 +201,17 @@ impl AppConfig {
                         );
                         config_changed = true;
                     }
+                    if !s.preview_player.is_empty()
+                        && !crate::network::ed2k::preview::player_path_is_local(
+                            std::path::Path::new(&s.preview_player),
+                        )
+                    {
+                        tracing::warn!(
+                            "Cleared a configured media player that is not on a local drive"
+                        );
+                        s.preview_player.clear();
+                        config_changed = true;
+                    }
                     match crate::commands::settings::validate_settings(&s) {
                         Ok(()) => s,
                         Err(e) => {

@@ -341,13 +341,74 @@ pub fn derive_pairwise_presence_capability(
     derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, epoch)
 }
 
-/// Friend-code intro presence: holders of an `ember2:` code (owner pubkey)
-/// can compute this without a DH. The owner registers it on every rendezvous
-/// heartbeat so a one-sided Add Friend can locate them before pairwise
-/// capabilities exist for both sides.
-pub fn derive_intro_presence_capability(owner_ed25519_pubkey: &[u8; 32], epoch: i64) -> [u8; 32] {
+/// Legacy friend-code intro presence, computable from the owner's public key
+/// alone. Public keys are visible in every room roster, so this build no
+/// longer registers it; it is only looked up, to reach peers on older builds.
+/// Must stay byte-identical to the rendezvous server's copy.
+pub fn derive_legacy_intro_presence_capability(
+    owner_ed25519_pubkey: &[u8; 32],
+    epoch: i64,
+) -> [u8; 32] {
     let context = format!("ember-intro-presence-v1:{epoch}");
     blake3::derive_key(&context, owner_ed25519_pubkey)
+}
+
+/// Length of the per-identity intro secret carried in an `ember3:` code.
+pub const INTRO_SECRET_LEN: usize = 16;
+
+/// Per-epoch intro key for `owner_ed25519_pubkey`. The owner sends it to the
+/// rendezvous server with each intro registration so the server can confirm
+/// the capability belongs to the registering key, without ever learning the
+/// long-lived secret: one epoch's key only opens that epoch's capability.
+pub fn derive_intro_epoch_key(
+    owner_ed25519_pubkey: &[u8; 32],
+    intro_secret: &[u8; INTRO_SECRET_LEN],
+    epoch: i64,
+) -> [u8; 32] {
+    let context = format!("ember-intro-epoch-key-v2:{epoch}");
+    let mut input = [0u8; 32 + INTRO_SECRET_LEN];
+    input[..32].copy_from_slice(owner_ed25519_pubkey);
+    input[32..].copy_from_slice(intro_secret);
+    let key = blake3::derive_key(&context, &input);
+    input.zeroize();
+    key
+}
+
+/// Intro capability from an epoch key. Must stay byte-identical to the
+/// rendezvous server's `derive_sealed_intro_presence_capability`.
+pub fn derive_sealed_intro_capability_from_key(
+    owner_ed25519_pubkey: &[u8; 32],
+    epoch_key: &[u8; 32],
+    epoch: i64,
+) -> [u8; 32] {
+    let context = format!("ember-intro-presence-v2:{epoch}");
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(owner_ed25519_pubkey);
+    input[32..].copy_from_slice(epoch_key);
+    blake3::derive_key(&context, &input)
+}
+
+/// Friend-code intro presence: only holders of the owner's `ember3:` code
+/// (public key plus intro secret) can compute it. The owner registers it on
+/// every heartbeat so a one-sided Add Friend can locate them before pairwise
+/// capabilities exist for both sides. Returns `(capability, epoch_key)`.
+pub fn derive_sealed_intro_presence_capability(
+    owner_ed25519_pubkey: &[u8; 32],
+    intro_secret: &[u8; INTRO_SECRET_LEN],
+    epoch: i64,
+) -> ([u8; 32], [u8; 32]) {
+    let epoch_key = derive_intro_epoch_key(owner_ed25519_pubkey, intro_secret, epoch);
+    (
+        derive_sealed_intro_capability_from_key(owner_ed25519_pubkey, &epoch_key, epoch),
+        epoch_key,
+    )
+}
+
+/// A fresh random intro secret.
+pub fn generate_intro_secret() -> [u8; INTRO_SECRET_LEN] {
+    let mut secret = [0u8; INTRO_SECRET_LEN];
+    OsRng.fill_bytes(&mut secret);
+    secret
 }
 
 /// Encrypt a friend-chat plaintext with a fresh random nonce.
@@ -767,20 +828,103 @@ mod tests {
     }
 
     #[test]
-    fn intro_presence_is_public_and_epoch_bound() {
+    fn legacy_intro_presence_is_public_and_epoch_bound() {
         let alice_pub = signing_key_from_bytes(&gen_seed())
             .verifying_key()
             .to_bytes();
         let bob_pub = signing_key_from_bytes(&gen_seed())
             .verifying_key()
             .to_bytes();
-        let a = derive_intro_presence_capability(&alice_pub, 3);
-        let a_again = derive_intro_presence_capability(&alice_pub, 3);
-        let a_next = derive_intro_presence_capability(&alice_pub, 4);
-        let b = derive_intro_presence_capability(&bob_pub, 3);
+        let a = derive_legacy_intro_presence_capability(&alice_pub, 3);
+        let a_again = derive_legacy_intro_presence_capability(&alice_pub, 3);
+        let a_next = derive_legacy_intro_presence_capability(&alice_pub, 4);
+        let b = derive_legacy_intro_presence_capability(&bob_pub, 3);
         assert_eq!(a, a_again);
         assert_ne!(a, a_next);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sealed_intro_is_deterministic_and_epoch_bound() {
+        let owner = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let secret = generate_intro_secret();
+        let (cap, key) = derive_sealed_intro_presence_capability(&owner, &secret, 7);
+        assert_eq!(
+            (cap, key),
+            derive_sealed_intro_presence_capability(&owner, &secret, 7)
+        );
+        let (next_cap, next_key) = derive_sealed_intro_presence_capability(&owner, &secret, 8);
+        assert_ne!(cap, next_cap);
+        assert_ne!(key, next_key);
+        assert_eq!(derive_sealed_intro_capability_from_key(&owner, &key, 7), cap);
+        assert_eq!(derive_intro_epoch_key(&owner, &secret, 7), key);
+    }
+
+    #[test]
+    fn sealed_intro_differs_per_secret_and_per_owner() {
+        let alice = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let bob = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let secret_a = [0x11u8; INTRO_SECRET_LEN];
+        let secret_b = [0x22u8; INTRO_SECRET_LEN];
+        let (a1, _) = derive_sealed_intro_presence_capability(&alice, &secret_a, 5);
+        let (a2, _) = derive_sealed_intro_presence_capability(&alice, &secret_b, 5);
+        let (b1, _) = derive_sealed_intro_presence_capability(&bob, &secret_a, 5);
+        assert_ne!(a1, a2, "a reset secret must change the capability");
+        assert_ne!(a1, b1, "the same secret under another key is another namespace");
+        assert_ne!(generate_intro_secret(), generate_intro_secret());
+    }
+
+    #[test]
+    fn sealed_intro_is_not_computable_from_the_public_key_alone() {
+        let owner = signing_key_from_bytes(&gen_seed())
+            .verifying_key()
+            .to_bytes();
+        let epoch = 11;
+        let secret = generate_intro_secret();
+        let (sealed, epoch_key) = derive_sealed_intro_presence_capability(&owner, &secret, epoch);
+        // Everything derivable from the roster-visible key: the legacy intro,
+        // and the sealed derivation with an empty or all-zero secret.
+        assert_ne!(sealed, derive_legacy_intro_presence_capability(&owner, epoch));
+        assert_ne!(
+            sealed,
+            derive_sealed_intro_presence_capability(&owner, &[0u8; INTRO_SECRET_LEN], epoch).0
+        );
+        assert_ne!(
+            sealed,
+            derive_sealed_intro_capability_from_key(&owner, &[0u8; 32], epoch)
+        );
+        assert_ne!(sealed, blake3::derive_key("ember-intro-presence-v2:11", &owner));
+        // The epoch key the server sees does not open the next epoch.
+        assert_ne!(
+            derive_sealed_intro_capability_from_key(&owner, &epoch_key, epoch + 1),
+            derive_sealed_intro_presence_capability(&owner, &secret, epoch + 1).0
+        );
+    }
+
+    /// Pins the wire derivation the rendezvous server recomputes; a change
+    /// here without the server's copy makes every intro registration 403.
+    #[test]
+    fn sealed_intro_derivation_is_pinned() {
+        let owner = [0x42u8; 32];
+        let secret = [0x07u8; INTRO_SECRET_LEN];
+        let mut key_input = [0u8; 48];
+        key_input[..32].copy_from_slice(&owner);
+        key_input[32..].copy_from_slice(&secret);
+        let expected_key = blake3::derive_key("ember-intro-epoch-key-v2:9", &key_input);
+        let mut cap_input = [0u8; 64];
+        cap_input[..32].copy_from_slice(&owner);
+        cap_input[32..].copy_from_slice(&expected_key);
+        let expected_cap = blake3::derive_key("ember-intro-presence-v2:9", &cap_input);
+        assert_eq!(
+            derive_sealed_intro_presence_capability(&owner, &secret, 9),
+            (expected_cap, expected_key)
+        );
     }
 
     #[test]

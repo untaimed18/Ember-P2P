@@ -75,7 +75,7 @@ pub(in crate::network) async fn on_ember_refresh_tick(
             if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) {
                 continue;
             }
-            if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
+            if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                 continue;
             }
             let hash_bytes = match hex::decode(&transfer.file_hash) {
@@ -134,7 +134,7 @@ pub(in crate::network) async fn on_ember_refresh_tick(
             if transfer.status != TransferStatus::Completed {
                 continue;
             }
-            if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
+            if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                 continue;
             }
             if seen_hashes.contains(&transfer.file_hash) {

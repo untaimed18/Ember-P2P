@@ -390,8 +390,10 @@ fn a_failed_heartbeat_backs_off_instead_of_retrying_every_bootstrap_tick() {
 fn outcome(intro_ok: bool, attempted: usize, failed: usize) -> rendezvous::RegistrationOutcome {
     rendezvous::RegistrationOutcome {
         intro_ok,
+        sealed_intro_ok: intro_ok,
         pairwise_attempted: attempted,
         pairwise_failed: failed,
+        ..Default::default()
     }
 }
 

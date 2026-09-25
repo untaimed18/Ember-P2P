@@ -16,8 +16,11 @@ pub(in crate::network) async fn on_rendezvous_register_result(
         );
         return;
     }
+    let started_at = rendezvous_register_started_at.take();
     *rendezvous_register_in_flight = false;
-    *rendezvous_register_started_at = None;
+    let forced_since_start = state
+        .rendezvous_force_register_at
+        .is_some_and(|forced| started_at.is_none_or(|started| forced >= started));
     match result.result {
         Ok(outcome) => {
             // Classic `/register` succeeded. Latch registered *and*
@@ -27,7 +30,14 @@ pub(in crate::network) async fn on_rendezvous_register_result(
             // the full 1+1+N mutation sequence every 10s.
             state.rendezvous_registered = true;
             state.last_presence_blocked = outcome.existing_friends_blocked();
-            state.rendezvous_last_register = Some(std::time::Instant::now());
+            if forced_since_start {
+                // Leave the clock expired so the next tick re-registers with
+                // whatever the forced refresh was waiting for.
+                state.rendezvous_last_register = None;
+            } else {
+                state.rendezvous_force_register_at = None;
+                state.rendezvous_last_register = Some(std::time::Instant::now());
+            }
             state.rendezvous_register_fail_streak = 0;
             // Nothing else moves the room beat, so the one this
             // registration selected with is still current.

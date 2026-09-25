@@ -241,6 +241,7 @@ pub(super) async fn handle_udp_packet_inner(
                     mgr.active.values().chain(mgr.queue.iter()).find_map(|t| {
                         if t.direction != TransferDirection::Download
                             || t.file_hash != hash_hex
+                            || t.friends_only
                             || matches!(
                                 t.status,
                                 TransferStatus::Completed | TransferStatus::Failed
@@ -1084,9 +1085,8 @@ pub(super) async fn handle_udp_packet_inner(
                 }
             }
 
-            // If valid receiver key, also explicitly verify in routing table
-            if valid_receiver_key {
-                state.routing_table.mark_verified(&sender_id);
+            if valid_receiver_key && !peer_udp_firewalled {
+                state.routing_table.mark_verified_from(&sender_id, ip);
             }
 
             // eMule: only request ACK when crypt is on and the peer is Kad ≥8.
@@ -1219,9 +1219,8 @@ pub(super) async fn handle_udp_packet_inner(
                 );
             }
 
-            // If valid receiver key, also verify the contact in the routing table
-            if valid_receiver_key {
-                state.routing_table.mark_verified(&sender_id);
+            if valid_receiver_key && !peer_udp_firewalled {
+                state.routing_table.mark_verified_from(&sender_id, ip);
             }
             state.stats.connected_peers = state.routing_table.len() as u32;
 

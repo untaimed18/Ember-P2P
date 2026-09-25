@@ -70,8 +70,11 @@ pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
     }
 
     let (stem, ext) = split_name_ext(name);
+    let ext = crate::security::sanitize_remote_text(&ext, usize::MAX);
 
-    let mut result = url_decode(&stem);
+    // Percent-decoding can materialise bidi/invisible controls (e.g. `%E2%80%AE`)
+    // that the upstream wire-name sanitizer never saw, so sanitize after it.
+    let mut result = crate::security::sanitize_remote_text(&url_decode(&stem), usize::MAX);
 
     for pattern in cleanup_strings {
         let pat_lower = pattern.to_lowercase();
@@ -439,6 +442,34 @@ mod tests {
     fn test_preserves_decimal() {
         let result = cleanup_filename("version.1.5.patch.zip", &default_cleanup());
         assert!(result.contains("1.5"));
+    }
+
+    #[test]
+    fn cleanup_filename_strips_percent_encoded_bidi_controls() {
+        let cleanup = default_cleanup();
+        for raw in [
+            "Holiday%E2%80%AEgpj.exe",
+            "Holiday%e2%80%aegpj.exe",
+            "Holiday%E2%81%A7gpj%E2%81%A9.exe",
+            "Holiday%E2%80%8Bgpj%EF%BB%BF.exe",
+        ] {
+            let result = cleanup_filename(raw, &cleanup);
+            assert!(
+                !result.chars().any(crate::security::is_invisible_or_bidi_control_pub),
+                "{raw:?} -> {result:?} still contains an invisible/bidi control"
+            );
+            assert!(result.ends_with(".exe"), "{raw:?} -> {result:?}");
+        }
+        assert_eq!(
+            cleanup_filename("Holiday%E2%80%AEgpj.exe", &cleanup),
+            "Holidaygpj.exe"
+        );
+    }
+
+    #[test]
+    fn cleanup_filename_strips_bidi_controls_in_extension() {
+        let result = cleanup_filename("Holiday.ex\u{202E}e", &default_cleanup());
+        assert_eq!(result, "Holiday.exe");
     }
 
     #[test]

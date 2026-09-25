@@ -184,8 +184,9 @@ pub const CHANNEL_RENDEZVOUS_ROTATION_DEPTH: usize = 2;
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.
 pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
-/// In-session cap on distinct gossip ids remembered for flood dedup.
-pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
+/// In-session cap on flood-dedup keys. Each admitted frame spends two — its id
+/// and its body key ([`admit_gossip`]) — so this is twice the frame window.
+pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 8192;
 /// `CHANNEL_MSG` frames we will relay for the mesh per second.
 pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// `CHANNEL_MSG` frames this user may originate per second.
@@ -1476,6 +1477,83 @@ pub fn decode_channel_chat_plain(
         return None;
     }
     Some((pk, text, sig))
+}
+
+const CHAT_MSG_ID_DOMAIN: &[u8] = b"ember-channel-chat-msg-id-v1\0";
+const CHAT_MSG_ID_NONCE_LEN: usize = 6;
+
+fn chat_msg_id_from_nonce(
+    channel_id: &[u8; 16],
+    author: &[u8; 32],
+    timestamp: i64,
+    nonce: &[u8; CHAT_MSG_ID_NONCE_LEN],
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CHAT_MSG_ID_DOMAIN);
+    hasher.update(channel_id);
+    hasher.update(author);
+    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(nonce);
+    let tag = hasher.finalize();
+    let mut id = [0u8; 16];
+    id[..CHAT_MSG_ID_NONCE_LEN].copy_from_slice(nonce);
+    id[CHAT_MSG_ID_NONCE_LEN..].copy_from_slice(&tag.as_bytes()[..16 - CHAT_MSG_ID_NONCE_LEN]);
+    id
+}
+
+/// A fresh chat `msg_id` that proves who wrote the line and when.
+///
+/// `nonce(6) || BLAKE3(domain, room, author, timestamp, nonce)[..10]`. Still
+/// opaque to every older peer, which only ever compares ids, but it lets a
+/// member who never held the line check an *edit* of it: the edit frame names
+/// its signer, target and original timestamp, and nothing else ties the target
+/// to anyone. Without the binding an edit arriving ahead of (or instead of) its
+/// line had to be taken on trust, which is how one member could claim another's
+/// id and have the genuine line dropped as a duplicate.
+///
+/// `timestamp` must be the one the line is signed and sealed with.
+pub fn new_chat_msg_id(channel_id: &[u8; 16], author: &[u8; 32], timestamp: i64) -> [u8; 16] {
+    let mut nonce = [0u8; CHAT_MSG_ID_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    chat_msg_id_from_nonce(channel_id, author, timestamp, &nonce)
+}
+
+/// Whether `msg_id` was minted by [`new_chat_msg_id`] for this author and time.
+///
+/// False for every id a build before the binding minted: those are uniformly
+/// random, and match with probability 2^-80.
+pub fn chat_msg_id_binds(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    author: &[u8; 32],
+    timestamp: i64,
+) -> bool {
+    let mut nonce = [0u8; CHAT_MSG_ID_NONCE_LEN];
+    nonce.copy_from_slice(&msg_id[..CHAT_MSG_ID_NONCE_LEN]);
+    chat_msg_id_from_nonce(channel_id, author, timestamp, &nonce) == *msg_id
+}
+
+/// [`chat_msg_id_binds`] over the hex the database stores. Anything that does
+/// not decode — a handoff copy's synthetic id, say — binds to nobody.
+pub fn chat_msg_id_binds_hex(
+    channel_id_hex: &str,
+    msg_id_hex: &str,
+    author_hex: &str,
+    timestamp: i64,
+) -> bool {
+    fn decode<const N: usize>(s: &str) -> Option<[u8; N]> {
+        hex::decode(s).ok()?.try_into().ok()
+    }
+    match (
+        decode::<16>(channel_id_hex),
+        decode::<16>(msg_id_hex),
+        decode::<32>(author_hex),
+    ) {
+        (Some(channel_id), Some(msg_id), Some(author)) => {
+            chat_msg_id_binds(&channel_id, &msg_id, &author, timestamp)
+        }
+        _ => false,
+    }
 }
 
 /// A member's own signed assertion that they were in a room at an instant.
@@ -3273,6 +3351,63 @@ pub fn remember_gossip_id(
     true
 }
 
+const GOSSIP_BODY_KEY_DOMAIN: &[u8] = b"ember-channel-gossip-body-v1\0";
+
+/// Dedup key for one exact sealed frame, as opposed to its id.
+///
+/// Kept in the same seen-set as ids; the domain keeps the two from colliding.
+pub fn gossip_body_key(gossip: &ChannelGossip) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(GOSSIP_BODY_KEY_DOMAIN);
+    hasher.update(&gossip.channel_id);
+    hasher.update(&gossip.msg_id);
+    hasher.update(&gossip.timestamp.to_le_bytes());
+    hasher.update(&gossip.sender_counter.to_le_bytes());
+    hasher.update(&gossip.ciphertext);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipAdmission {
+    /// First frame under this id.
+    Fresh,
+    /// The id was seen, but with a different body. A chat line's id is chosen
+    /// by whoever sends first, so a member can sign their own line under
+    /// somebody else's id and race it out; were the id alone the dedup key, the
+    /// genuine line would be dropped here before storage could tell the two
+    /// apart. Callers must treat these as chat-only and must not relay one
+    /// they already hold, or the originator's own echo floods again.
+    Variant,
+    /// This exact frame was seen.
+    Duplicate,
+}
+
+/// Flood dedup on id first, exact body second.
+///
+/// A fresh id also records its body key, so a byte-identical replay is a
+/// [`GossipAdmission::Duplicate`] rather than a variant. [`forget_gossip_id`]
+/// on the id alone still re-admits a retransmit: a fresh id never consults
+/// the body key.
+pub fn admit_gossip(
+    seen: &mut HashMap<[u8; 16], Instant>,
+    order: &mut VecDeque<[u8; 16]>,
+    cap: usize,
+    msg_id: [u8; 16],
+    body_key: [u8; 16],
+    now: Instant,
+) -> GossipAdmission {
+    if remember_gossip_id(seen, order, cap, msg_id, now) {
+        let _ = remember_gossip_id(seen, order, cap, body_key, now);
+        GossipAdmission::Fresh
+    } else if remember_gossip_id(seen, order, cap, body_key, now) {
+        GossipAdmission::Variant
+    } else {
+        GossipAdmission::Duplicate
+    }
+}
+
 /// Undo a [`remember_gossip_id`] for a message refused on grounds that may not
 /// hold next time — a rate limit rather than a validity failure.
 ///
@@ -3516,6 +3651,75 @@ mod tests {
             reacted_at: at,
             signature,
         }
+    }
+
+    #[test]
+    fn a_different_body_under_a_seen_channel_id_is_admitted_once_as_a_variant() {
+        let key = [7u8; 32];
+        let id = new_chat_msg_id(&CHAT_CHANNEL, &[0xA1u8; 32], CHAT_TS);
+        let squat = ChannelGossip::sealed(CHAT_CHANNEL, id, &key, 1, b"mallory", 4, CHAT_TS);
+        let genuine = ChannelGossip::sealed(CHAT_CHANNEL, id, &key, 1, b"alice", 4, CHAT_TS);
+        let mut seen: HashMap<[u8; 16], Instant> = HashMap::new();
+        let mut order: VecDeque<[u8; 16]> = VecDeque::new();
+        let now = Instant::now();
+        let admit = |g: &ChannelGossip,
+                     seen: &mut HashMap<[u8; 16], Instant>,
+                     order: &mut VecDeque<[u8; 16]>| {
+            admit_gossip(seen, order, 64, g.msg_id, gossip_body_key(g), now)
+        };
+
+        assert_eq!(admit(&squat, &mut seen, &mut order), GossipAdmission::Fresh);
+        // A relayed copy differs only in its hop count, which is outside the key.
+        let relayed = squat.decremented_ttl().unwrap();
+        assert_eq!(admit(&relayed, &mut seen, &mut order), GossipAdmission::Duplicate);
+        assert_eq!(
+            admit(&genuine, &mut seen, &mut order),
+            GossipAdmission::Variant,
+            "the genuine line must reach storage even when a squatter's frame came first"
+        );
+        assert_eq!(admit(&genuine, &mut seen, &mut order), GossipAdmission::Duplicate);
+
+        // Forgetting the id alone still re-admits a retransmit of the original.
+        forget_gossip_id(&mut seen, &mut order, &id);
+        assert_eq!(admit(&squat, &mut seen, &mut order), GossipAdmission::Fresh);
+    }
+
+    #[test]
+    fn a_chat_msg_id_binds_only_its_author_room_and_timestamp() {
+        let alice = [0xA1u8; 32];
+        let mallory = [0x3Cu8; 32];
+        let id = new_chat_msg_id(&CHAT_CHANNEL, &alice, CHAT_TS);
+        assert!(chat_msg_id_binds(&CHAT_CHANNEL, &id, &alice, CHAT_TS));
+        assert!(
+            !chat_msg_id_binds(&CHAT_CHANNEL, &id, &mallory, CHAT_TS),
+            "an edit signed by someone else must not be able to claim the line"
+        );
+        assert!(!chat_msg_id_binds(&[9u8; 16], &id, &alice, CHAT_TS));
+        assert!(
+            !chat_msg_id_binds(&CHAT_CHANNEL, &id, &alice, CHAT_TS + 60),
+            "a re-dated original would reopen the edit window"
+        );
+        // Ids minted before the binding are random and bind to nobody.
+        assert!(!chat_msg_id_binds(&CHAT_CHANNEL, &CHAT_MSG_ID, &alice, CHAT_TS));
+
+        assert!(chat_msg_id_binds_hex(
+            &hex::encode(CHAT_CHANNEL),
+            &hex::encode(id),
+            &hex::encode(alice).to_ascii_uppercase(),
+            CHAT_TS,
+        ));
+        assert!(!chat_msg_id_binds_hex(
+            &hex::encode(CHAT_CHANNEL),
+            "handoff-x-1",
+            &hex::encode(alice),
+            CHAT_TS,
+        ));
+
+        // Same author, same second: still distinct lines.
+        let ids: HashSet<[u8; 16]> = (0..256)
+            .map(|_| new_chat_msg_id(&CHAT_CHANNEL, &alice, CHAT_TS))
+            .collect();
+        assert_eq!(ids.len(), 256);
     }
 
     #[test]

@@ -384,11 +384,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             // Register partial download for KAD source publishing
             if let Ok(hash_bytes) = hex::decode(&transfer.file_hash) {
                 if hash_bytes.len() >= 16
-                    && kad_may_advertise_partial(
-                        known_files,
-                        &resume_restricted,
-                        &transfer.file_hash,
-                    )
+                    && transfer_may_advertise_partial(known_files, &resume_restricted, &transfer)
                 {
                     let ext = std::path::Path::new(&transfer.file_name)
                         .extension()

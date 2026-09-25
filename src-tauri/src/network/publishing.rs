@@ -107,6 +107,17 @@ pub(super) fn kad_may_advertise_partial(
     known_files.is_authoritative() && !hash_hex_is_friends_only(restricted, file_hash)
 }
 
+/// [`kad_may_advertise_partial`] for one of our downloads. A download taken
+/// from a friend who restricts the file carries that on the transfer, since
+/// neither the index nor known.met knows the hash until it completes.
+pub(super) fn transfer_may_advertise_partial(
+    known_files: &KnownFileList,
+    restricted: &HashSet<String>,
+    transfer: &Transfer,
+) -> bool {
+    !transfer.friends_only && kad_may_advertise_partial(known_files, restricted, &transfer.file_hash)
+}
+
 /// Complete shares: must be publicly listable on the index *and* not
 /// friends-only in known.met. Until the catalog is absorbed, skip them
 /// the same way as partials — a rematch row looks public.
@@ -129,6 +140,25 @@ pub(super) fn hash16_is_friends_only(
         .or_else(|| local_index.get_by_hash(&hex.to_ascii_uppercase()))
         .is_some_and(|f| f.friends_only)
         || known_files.find_by_hash(hash).is_some_and(|r| r.friends_only)
+}
+
+/// True when we already hold `hash` under our own public scope. A friend's
+/// restriction must not override that: the user chose to share this content
+/// openly before the friend's copy entered the picture. known.met decides when
+/// it has a record, as it does on completion; otherwise a library row does.
+pub(super) fn hash16_has_public_copy(
+    hash: &[u8; 16],
+    local_index: &crate::search::index::LocalIndex,
+    known_files: &KnownFileList,
+) -> bool {
+    if let Some(record) = known_files.find_by_hash(hash) {
+        return !record.friends_only;
+    }
+    let hex = hex::encode(hash);
+    local_index
+        .get_by_hash(&hex)
+        .or_else(|| local_index.get_by_hash(&hex.to_ascii_uppercase()))
+        .is_some_and(|f| !f.friends_only)
 }
 
 /// Register active/queued public downloads for KAD source publish. No-ops
@@ -159,7 +189,7 @@ pub(super) async fn publish_kad_partials_from_transfers(
         ) {
             continue;
         }
-        if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
+        if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
             continue;
         }
         let hash_bytes = match hex::decode(&transfer.file_hash) {
@@ -639,6 +669,78 @@ mod known_friends_only_snapshot_tests {
             kad_may_advertise_partial(&known, &restricted, &hex::encode(public_hash)),
             "a public partial must advertise once the catalog is absorbed"
         );
+    }
+
+    fn download_of(hash: [u8; 16], friends_only: bool) -> Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": "t1",
+            "file_name": "from-friend.bin",
+            "file_hash": hex::encode(hash),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "active",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 10,
+            "transferred": 0,
+            "started_at": 0,
+            "friends_only": friends_only,
+        }))
+        .unwrap()
+    }
+
+    /// Neither the index nor known.met knows a partial taken from a friend's
+    /// friends-only listing, so only the transfer's own flag can hold it back.
+    #[test]
+    fn friend_restricted_partial_is_never_advertised() {
+        let hash = [0xEE; 16];
+        let mut known = KnownFileList::new();
+        known.mark_authoritative_for_tests();
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        assert!(transfer_may_advertise_partial(&known, &restricted, &download_of(hash, false)));
+        assert!(!transfer_may_advertise_partial(&known, &restricted, &download_of(hash, true)));
+
+        known.add_or_update(rec(hash, true, "/r.bin"));
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        assert!(
+            !transfer_may_advertise_partial(&known, &restricted, &download_of(hash, false)),
+            "known.met restrictions still apply to unflagged transfers"
+        );
+    }
+
+    #[test]
+    fn our_own_public_copy_is_detected_from_known_met_then_the_index() {
+        let hash = [0xE1; 16];
+        let hex = hex::encode(hash);
+        let mut index = LocalIndex::new();
+        let mut known = KnownFileList::new();
+        assert!(!hash16_has_public_copy(&hash, &index, &known), "content we do not hold");
+
+        index.add_file(public_share(&hex));
+        assert!(hash16_has_public_copy(&hash, &index, &known), "a public library row");
+
+        known.add_or_update(rec(hash, true, "/r.bin"));
+        assert!(
+            !hash16_has_public_copy(&hash, &index, &known),
+            "a restricted known.met record outranks a public-looking row"
+        );
+        known.add_or_update(rec(hash, false, "/r.bin"));
+        assert!(hash16_has_public_copy(&hash, &index, &known));
+
+        let mut restricted_row = public_share(&hex);
+        restricted_row.friends_only = true;
+        let mut restricted_index = LocalIndex::new();
+        restricted_index.add_file(restricted_row);
+        assert!(!hash16_has_public_copy(&hash, &restricted_index, &KnownFileList::new()));
+    }
+
+    #[test]
+    fn transfer_friends_only_defaults_to_unrestricted_when_absent() {
+        let mut value = serde_json::to_value(download_of([0x01; 16], true)).unwrap();
+        value.as_object_mut().unwrap().remove("friends_only");
+        let parsed: Transfer = serde_json::from_value(value).unwrap();
+        assert!(!parsed.friends_only);
     }
 
     #[test]

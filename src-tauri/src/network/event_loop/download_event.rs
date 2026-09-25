@@ -82,6 +82,18 @@ fn forget_requeue_history(transfer_id: &str) {
     }
 }
 
+/// Scope of a finished download's known.met record. An existing record is the
+/// user's own decision about this content and wins either way: re-downloading
+/// something they restricted must not republish it, and a friend's restriction
+/// must not take back something they already share openly. Only new content
+/// inherits the friend's restriction (still shared, but only with friends).
+fn completed_download_friends_only(
+    from_restricting_friend: bool,
+    existing_record: Option<bool>,
+) -> bool {
+    existing_record.unwrap_or(from_restricting_friend)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -128,7 +140,11 @@ pub(in crate::network) async fn on_download_event(
     if let DownloadEvent::PartFileReady { ref transfer_id, ref file_hash, file_size, ref file_name } = event {
         info!("Part file ready for {} ({}) — offering to server and publishing to KAD",
             transfer_id, hex::encode(file_hash));
-        let restricted = {
+        let from_restricting_friend = {
+            let mgr = transfer_manager.read().await;
+            mgr.get_transfer(transfer_id).is_some_and(|t| t.friends_only)
+        };
+        let restricted = from_restricting_friend || {
             let index = local_index.read().await;
             !known_files.is_authoritative()
                 || hash16_is_friends_only(file_hash, &index, known_files)
@@ -247,9 +263,12 @@ pub(in crate::network) async fn on_download_event(
                 t.file_name.clone(),
                 t.total_size,
                 t.transferred,
+                t.friends_only,
             ))
         };
-        if let Some((peer_id, file_hash, file_name, file_size, _transferred)) = completed_snapshot {
+        if let Some((peer_id, file_hash, file_name, file_size, _transferred, from_restricting_friend)) =
+            completed_snapshot
+        {
             if let Some((ip_str, port_str)) = peer_id.split_once(':') {
                 if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                     state.dead_sources.remove(0, u32::from(ip), port);
@@ -446,13 +465,10 @@ pub(in crate::network) async fn on_download_event(
                                 .map(|record| record.is_shared)
                                 .unwrap_or(true),
                         ),
-                        // Re-downloading content the user had
-                        // restricted to friends must not quietly
-                        // republish it to the open network.
-                        friends_only: existing
-                            .as_ref()
-                            .map(|record| record.friends_only)
-                            .unwrap_or(false),
+                        friends_only: completed_download_friends_only(
+                            from_restricting_friend,
+                            existing.as_ref().map(|record| record.friends_only),
+                        ),
                         complete_sources: existing
                             .as_ref()
                             .map(|record| record.complete_sources)
@@ -472,6 +488,9 @@ pub(in crate::network) async fn on_download_event(
                     };
                     let completed_friends_only = record.friends_only;
                     known_files.add_or_update(record.clone());
+                    if completed_friends_only {
+                        sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
+                    }
 
                     // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
                     let ext = completed_path.extension()
@@ -557,6 +576,21 @@ pub(in crate::network) async fn on_download_event(
                         // runtime/shared flags from an existing
                         // same-path (including pending) row.
                         index.add_file(shared_file.clone());
+                        // `add_file` keeps a pre-existing row's flag, and a
+                        // row the watcher found first reads public. Only this
+                        // path is ours to restrict; other copies of the hash
+                        // keep their own scope.
+                        if completed_friends_only {
+                            if let Some(mut row) = index
+                                .get_by_path(&shared_file.path)
+                                .filter(|row| !row.friends_only)
+                                .cloned()
+                            {
+                                row.friends_only = true;
+                                index.remove_file_by_path(&shared_file.path);
+                                index.add_file(row);
+                            }
+                        }
                         index
                             .get_by_path(&shared_file.path)
                             .cloned()
@@ -1748,6 +1782,29 @@ pub(in crate::network) async fn on_download_event(
     // Do not auto-resume user-paused downloads when a transfer
     // completes — Pausing is an explicit user action. Concurrent
     // slot refill for queued (not paused) work is handled elsewhere.
+}
+
+#[cfg(test)]
+mod friends_only_completion_tests {
+    use super::*;
+
+    #[test]
+    fn new_copy_of_a_friends_restricted_file_completes_friends_only() {
+        assert!(completed_download_friends_only(true, None));
+    }
+
+    #[test]
+    fn a_friends_restriction_does_not_override_our_public_record() {
+        assert!(!completed_download_friends_only(true, Some(false)));
+    }
+
+    #[test]
+    fn prior_restriction_is_kept_and_public_stays_public() {
+        assert!(completed_download_friends_only(false, Some(true)));
+        assert!(completed_download_friends_only(true, Some(true)));
+        assert!(!completed_download_friends_only(false, Some(false)));
+        assert!(!completed_download_friends_only(false, None));
+    }
 }
 
 #[cfg(test)]

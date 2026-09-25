@@ -2668,13 +2668,19 @@ impl Ed2kDownload {
                 // Ember-to-Ember single-source downloads.
                 pkt
             } else {
-                match tokio::time::timeout(
+                match read_packet_within(
+                    &mut reader,
                     std::time::Duration::from_secs(3),
-                    read_packet_async(&mut reader),
+                    std::time::Duration::from_secs(
+                        super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS,
+                    ),
                 )
                 .await
                 {
-                    Ok(Ok(pkt)) => pkt,
+                    Ok(Some(pkt)) => pkt,
+                    Err(e) if e.get_ref().is_some_and(|i| i.is::<PacketStreamDesynced>()) => {
+                        return Err(anyhow::Error::from(e).context("stage:emule_info_wait"));
+                    }
                     _ => break,
                 }
             };
@@ -4081,6 +4087,7 @@ impl Ed2kDownload {
                         debug!("Waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping");
                     }
                 }
+                Err(e) if is_packet_stream_desynced(&e) => return Err(e),
                 Err(e) => {
                     debug!("No hashset answer (peer may not support it): {e}");
                     break;
@@ -4884,10 +4891,14 @@ impl Ed2kDownload {
                             .max(std::time::Duration::from_secs(1))
                     };
 
+                    let packet_started = std::sync::atomic::AtomicBool::new(false);
                     let read_outcome = if let Some(packet) = auth_deferred.pop_front() {
                         Ok(Ok(packet))
                     } else {
-                        let mut read_fut = std::pin::pin!(read_packet_async(&mut reader));
+                        let mut read_fut = std::pin::pin!(read_packet_marking_start(
+                            &mut reader,
+                            &packet_started
+                        ));
                         let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
                         let mut expire_tick =
                             tokio::time::interval(std::time::Duration::from_secs(2));
@@ -4958,7 +4969,10 @@ impl Ed2kDownload {
                                         push_outstanding_batch(&mut outstanding_ranges, batch);
                                         sent_idx += 1;
                                     }
-                                    if total_received >= total_sent_bytes {
+                                    if total_received >= total_sent_bytes
+                                        && !packet_started
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
                                         break Err(());
                                     }
                                     hard_deadline = tokio::time::Instant::now() + read_timeout;
@@ -4971,7 +4985,9 @@ impl Ed2kDownload {
                         Ok(Ok(pkt)) => pkt,
                         Ok(Err(e)) => return Err(e.into()),
                         Err(()) => {
-                            if total_received >= total_sent_bytes {
+                            let mid_packet =
+                                packet_started.load(std::sync::atomic::Ordering::Relaxed);
+                            if total_received >= total_sent_bytes && !mid_packet {
                                 continue;
                             }
                             let _ = write_packet_async(
@@ -4981,6 +4997,13 @@ impl Ed2kDownload {
                                 &[],
                             )
                             .await;
+                            if mid_packet {
+                                return Err(anyhow::Error::from(packet_stream_desynced_error())
+                                    .context(format!(
+                                        "stage:data_wait download timeout: stalled mid-packet for {}s",
+                                        read_timeout.as_secs()
+                                    )));
+                            }
                             if !got_any_data {
                                 debug!("Source {} accepted transfer but sent no data in {}s — disconnecting",
                                     self.source_addr, INITIAL_DATA_TIMEOUT_SECS);
@@ -7237,30 +7260,116 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
 /// could hold a callback download at 0% for close to half an hour without ever
 /// timing out. `multi_source` has always used the short handshake bound here,
 /// for the reason its constant documents.
+///
+/// A timeout while no packet has begun is a plain `TimedOut` and leaves the
+/// stream on a packet boundary; a stall part-way through a packet is reported
+/// as [`PacketStreamDesynced`] (see [`read_packet_within`]).
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS),
-        read_packet_async(reader),
+    let bound =
+        std::time::Duration::from_secs(super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS);
+    read_packet_within(reader, bound, bound)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))
+}
+
+/// Carried inside the `io::Error` of a packet read that was abandoned after
+/// consuming part of a packet. The next read would start mid-frame (and, on an
+/// obfuscated link, mid-keystream), so the connection must be dropped.
+#[derive(Debug)]
+pub(super) struct PacketStreamDesynced(String);
+
+impl std::fmt::Display for PacketStreamDesynced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; stream can no longer be framed", self.0)
+    }
+}
+
+impl std::error::Error for PacketStreamDesynced {}
+
+pub(super) fn packet_stream_desynced_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        PacketStreamDesynced("peer stalled mid-packet".to_string()),
     )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// Re-tag an error raised after a packet's first byte was consumed. The kind
+/// is kept so reset/EOF classification still sees it.
+pub(super) fn desynced_io_error(cause: std::io::Error) -> std::io::Error {
+    if cause
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PacketStreamDesynced>())
+    {
+        return cause;
+    }
+    std::io::Error::new(cause.kind(), PacketStreamDesynced(cause.to_string()))
+}
+
+pub(super) fn is_packet_stream_desynced(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .is_some_and(|inner| inner.is::<PacketStreamDesynced>())
+    })
+}
+
+/// Wait up to `start_within` for a packet to begin, then up to `finish_within`
+/// for the rest of it.
+///
+/// Only the protocol byte races the idle deadline: a one-byte read consumes
+/// that byte or nothing, so `Ok(None)` leaves the stream on a packet boundary.
+/// Once a packet has begun, abandoning it would strand the reader mid-frame,
+/// so that expiry is an error carrying [`PacketStreamDesynced`].
+async fn read_packet_within<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    start_within: std::time::Duration,
+    finish_within: std::time::Duration,
+) -> std::io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let protocol = match tokio::time::timeout(start_within, reader.read_u8()).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    };
+    match tokio::time::timeout(finish_within, read_packet_body(reader, protocol)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(packet_stream_desynced_error()),
+    }
 }
 
 async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
-    let length = reader.read_u32_le().await? as usize;
+    read_packet_body(reader, protocol).await
+}
+
+/// [`read_packet_async`] that sets `started` once the first byte is consumed,
+/// so a caller dropping the future can tell whether the stream is still framed.
+async fn read_packet_marking_start<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    started: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    started.store(true, std::sync::atomic::Ordering::Relaxed);
+    read_packet_body(reader, protocol).await
+}
+
+/// The rest of a packet once its protocol byte has been read.
+async fn read_packet_body<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    protocol: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    const OP_PACKEDPROT: u8 = 0xD4;
+    let length = reader.read_u32_le().await.map_err(desynced_io_error)? as usize;
     if length == 0 || length > MAX_WIRE_PACKET_LEN {
-        return Err(std::io::Error::new(
+        return Err(desynced_io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
-        ));
+        )));
     }
-    let opcode = reader.read_u8().await?;
+    let opcode = reader.read_u8().await.map_err(desynced_io_error)?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
     // trusting the declared length up front. A peer that announces a large
@@ -7278,7 +7387,10 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
         let want = remaining.min(READ_STEP);
         let start = payload.len();
         payload.resize(start + want, 0);
-        reader.read_exact(&mut payload[start..start + want]).await?;
+        reader
+            .read_exact(&mut payload[start..start + want])
+            .await
+            .map_err(desynced_io_error)?;
         remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
@@ -7323,4 +7435,158 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod packet_framing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn send(peer: &mut tokio::io::DuplexStream, protocol: u8, opcode: u8, payload: &[u8]) {
+        write_packet_async(peer, protocol, opcode, payload)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_packet_split_across_the_idle_tick_is_read_whole() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            let mut frame = Vec::new();
+            write_packet_async(&mut frame, OP_EDONKEYHEADER, OP_HASHSETANSWER, &[0x5A; 700])
+                .await
+                .unwrap();
+            peer.write_all(&frame[..4]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            peer.write_all(&frame[4..]).await.unwrap();
+            send(&mut peer, OP_EMULEPROT, OP_SECIDENTSTATE, &[1, 2, 3, 4, 5]).await;
+            peer
+        });
+
+        let got = read_packet_within(&mut reader, Duration::from_millis(40), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(got, Some((OP_EDONKEYHEADER, OP_HASHSETANSWER, vec![0x5A; 700])));
+        let next = read_packet_within(&mut reader, Duration::from_millis(40), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(next, Some((OP_EMULEPROT, OP_SECIDENTSTATE, vec![1, 2, 3, 4, 5])));
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_idle_tick_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        assert_eq!(
+            read_packet_within(&mut reader, Duration::from_millis(20), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            None
+        );
+        send(&mut peer, OP_EMULEPROT, OP_PUBLICKEY, &[3, 9, 9, 9]).await;
+        assert_eq!(
+            read_packet_within(&mut reader, Duration::from_millis(500), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            Some((OP_EMULEPROT, OP_PUBLICKEY, vec![3, 9, 9, 9]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stall_mid_packet_is_reported_as_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let mut frame = Vec::new();
+        write_packet_async(&mut frame, OP_EDONKEYHEADER, OP_HASHSETANSWER, &[0; 64])
+            .await
+            .unwrap();
+        peer.write_all(&frame[..7]).await.unwrap();
+        let err = read_packet_within(&mut reader, Duration::from_millis(500), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:hashset_wait")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_length_after_the_header_is_a_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[OP_EDONKEYHEADER, 0, 0, 0, 0, OP_HASHSETANSWER])
+            .await
+            .unwrap();
+        let err = read_packet_with_timeout(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:hashset_wait")
+        ));
+    }
+
+    #[tokio::test]
+    async fn eof_mid_packet_is_a_desync_but_eof_on_a_boundary_is_not() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        let mut frame = Vec::new();
+        write_packet_async(&mut frame, OP_EMULEPROT, OP_PUBLICKEY, &[0; 20])
+            .await
+            .unwrap();
+        peer.write_all(&frame[..12]).await.unwrap();
+        drop(peer);
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(err)));
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn a_bad_packed_payload_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        send(&mut peer, 0xD4, 0x40, &[0xDE, 0xAD, 0xBE, 0xEF]).await;
+        send(&mut peer, OP_EMULEPROT, OP_PUBLICKEY, &[1]).await;
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+        assert_eq!(
+            read_packet_async(&mut reader).await.unwrap(),
+            (OP_EMULEPROT, OP_PUBLICKEY, vec![1])
+        );
+    }
+
+    #[test]
+    fn retagging_keeps_the_kind_and_message() {
+        let tagged = desynced_io_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "forcibly closed",
+        ));
+        assert_eq!(tagged.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(tagged.to_string().contains("forcibly closed"));
+        let twice = desynced_io_error(tagged);
+        assert_eq!(
+            twice.to_string(),
+            "forcibly closed; stream can no longer be framed"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_read_flags_a_packet_only_once_it_has_begun() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let started = std::sync::atomic::AtomicBool::new(false);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            read_packet_marking_start(&mut reader, &started)
+        )
+        .await
+        .is_err());
+        assert!(!started.load(std::sync::atomic::Ordering::Relaxed));
+
+        peer.write_all(&[OP_EDONKEYHEADER, 9]).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            read_packet_marking_start(&mut reader, &started)
+        )
+        .await
+        .is_err());
+        assert!(started.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }

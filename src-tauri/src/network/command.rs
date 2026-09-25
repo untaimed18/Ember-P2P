@@ -992,6 +992,54 @@ async fn handle_command_inner(
             discovery_only,
             friend_ember_hash,
         } => {
+            // Before anything below can advertise the partial: a copy of a
+            // file its owner restricts to friends stays friends-only here.
+            // Restricting needs no membership check — it only narrows what
+            // we ourselves publish. A copy we already share publicly keeps
+            // the user's own scope.
+            let from_restricting_friend = match parse_ed2k_hash16(file_hash.trim()) {
+                Some(hash)
+                    if friend_ember_hash.is_some_and(|eh| {
+                        super::browse::friend_marked_friends_only(eh, &hash)
+                    }) =>
+                {
+                    let idx = local_index.read().await;
+                    !hash16_has_public_copy(&hash, &idx, known_files)
+                }
+                _ => false,
+            };
+            if from_restricting_friend {
+                let newly_marked = {
+                    let mut guard = transfer_manager.write().await;
+                    let mgr = &mut *guard;
+                    mgr.active
+                        .get_mut(&transfer_id)
+                        .or_else(|| mgr.queue.iter_mut().find(|t| t.id == transfer_id))
+                        .map(|t| !std::mem::replace(&mut t.friends_only, true))
+                };
+                if newly_marked == Some(true) {
+                    info!("Download {transfer_id} comes from a friend who restricts it; keeping it friends-only");
+                    let db_ref = db.clone();
+                    let tid = transfer_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db_ref.mark_transfer_friends_only(&tid) {
+                            warn!("Failed to persist friends-only flag for {tid}: {e}");
+                        }
+                    });
+                    // Drop anything a tick queued in the gap between the
+                    // row being enqueued and this command arriving.
+                    if let Some(hash) = parse_ed2k_hash16(file_hash.trim()) {
+                        state.publish_manager.remove_file(&md4_bytes_to_kad_id(&hash));
+                    }
+                    state.ember_payload_dirty = true;
+                }
+            }
+            let transfer_friends_only = from_restricting_friend
+                || transfer_manager
+                    .read()
+                    .await
+                    .get_transfer(&transfer_id)
+                    .is_some_and(|t| t.friends_only);
             // Seed expected BLAKE3 from search/UI so verify does not depend
             // solely on having processed an Ember keyword hit this session.
             // Non-search starts (deep link, friend browse, collections) often
@@ -1272,7 +1320,7 @@ async fn handle_command_inner(
                         if hb.len() >= 16 {
                             let mut raw = [0u8; 16];
                             raw.copy_from_slice(&hb[..16]);
-                            let restricted = {
+                            let restricted = transfer_friends_only || {
                                 let idx = local_index.read().await;
                                 !known_files.is_authoritative()
                                     || idx
@@ -1702,6 +1750,7 @@ async fn handle_command_inner(
                                 up_part_count: None,
                                 up_peer_part_status: None,
                                 ember_verified: false,
+                                friends_only: transfer_friends_only,
                             };
                             // Not best-effort: this row is what lets the download
                             // resume after a restart, so a swallowed failure here
@@ -1770,7 +1819,7 @@ async fn handle_command_inner(
                 if hb.len() >= 16 {
                     let mut raw = [0u8; 16];
                     raw.copy_from_slice(&hb[..16]);
-                    let restricted = {
+                    let restricted = transfer_friends_only || {
                         let idx = local_index.read().await;
                         idx.get_by_hash(&file_hash.to_ascii_lowercase())
                             .is_some_and(|f| f.friends_only)
@@ -5230,7 +5279,7 @@ async fn handle_command_inner(
             // the same reason it is only servable to one.
             let restricted = {
                 let idx = local_index.read().await;
-                idx.get_by_hash(&hash_hex).is_some_and(|f| f.friends_only)
+                hash16_is_friends_only(&file_hash, &idx, known_files)
             };
             if restricted && !mutual_friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("File is restricted to mutual friends".into()));
@@ -5241,6 +5290,9 @@ async fn handle_command_inner(
                 file_size,
                 file_name,
                 ember_file_hash,
+                // Until known.met is absorbed a restricted row can read
+                // public, and the recipient would republish it.
+                friends_only: restricted || !known_files.is_authoritative(),
             });
             let sessions = state.ember_sessions.read().await;
             let Some(session) = sessions
@@ -5704,8 +5756,7 @@ async fn handle_command_inner(
                         ) {
                             continue;
                         }
-                        if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash)
-                        {
+                        if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                             continue;
                         }
                         if transfer.file_hash.is_empty()
@@ -5808,11 +5859,7 @@ async fn handle_command_inner(
                             ) {
                                 continue;
                             }
-                            if !kad_may_advertise_partial(
-                                known_files,
-                                &restricted,
-                                &transfer.file_hash,
-                            ) {
+                            if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                                 continue;
                             }
                             if transfer.file_hash.is_empty()
@@ -6850,6 +6897,7 @@ async fn handle_command_inner(
             state.outbound_session_tasks.remove(&removed_hash);
             state.friend_reconnect_last.remove(&removed_hash);
             state.recent_ember_chat.remove(&removed_hash);
+            super::browse::forget_friend_scope(removed_hash);
 
             if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
                 for request in pending {
@@ -7056,6 +7104,7 @@ async fn handle_command_inner(
             // Expire the heartbeat clock so the network loop's next tick
             // re-publishes intro + pairwise presence without waiting ~120s.
             state.rendezvous_last_register = None;
+            state.rendezvous_force_register_at = Some(tokio::time::Instant::now());
         }
 
         NetworkCommand::RetryFriendSearch {

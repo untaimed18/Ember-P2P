@@ -130,13 +130,13 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             host: Some(host),
         });
     }
-    if lower.starts_with("ember2:") {
-        let (hash_hex, _, _) = crate::commands::peers::parse_friend_code(&payload)?;
+    if lower.starts_with("ember3:") || lower.starts_with("ember2:") {
+        let code = crate::commands::peers::parse_friend_code(&payload)?;
         return Ok(DeepLinkPreview {
             kind: "friend".into(),
             name: None,
             size: None,
-            hash: Some(hash_hex),
+            hash: Some(code.canonical),
             ember: None,
             endpoint: None,
             host: None,
@@ -273,6 +273,7 @@ pub fn is_deep_link_payload(arg: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
         || lower.ends_with(".emulecollection")
+        || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
 }
@@ -551,6 +552,21 @@ mod tests {
             "a code detected in any case must also parse in any case"
         );
         assert!(preview_deep_link_payload("ember2:not-a-code").is_err());
+    }
+
+    #[test]
+    fn previews_ember3_friend_codes_and_rejects_broken_ones() {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey).unwrap();
+        let code = crate::commands::peers::format_friend_code(&hash, &pubkey, &[0x3Cu8; 16]);
+        assert!(is_deep_link_payload(&code));
+        assert!(is_deep_link_payload(&code.to_ascii_uppercase()));
+        let preview = preview_deep_link_payload(&code).unwrap();
+        assert_eq!(preview.kind, "friend");
+        assert_eq!(preview.hash.as_deref(), Some(hex::encode(hash).as_str()));
+        assert!(preview_deep_link_payload("ember3:not-a-code").is_err());
+        assert!(preview_deep_link_payload(&code[..code.len() - 2]).is_err());
     }
 
     #[test]

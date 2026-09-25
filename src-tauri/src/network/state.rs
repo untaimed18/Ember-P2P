@@ -998,6 +998,11 @@ pub(super) struct NetworkState {
     /// Consecutive failed presence heartbeats. Drives
     /// [`presence_failure_retry_secs`]; reset on success.
     pub(super) rendezvous_register_fail_streak: u32,
+    /// When the last forced refresh was requested. A registration started
+    /// before it may predate what the refresh is for (a reset intro secret, a
+    /// new friend), so that attempt's success must not restart the heartbeat
+    /// clock and cancel the refresh.
+    pub(super) rendezvous_force_register_at: Option<tokio::time::Instant>,
     /// Tracks active outbound friend session tasks to prevent duplicates.
     /// ember_hash -> Instant when the session was started.
     pub(super) outbound_session_tasks: HashMap<[u8; 16], std::time::Instant>,

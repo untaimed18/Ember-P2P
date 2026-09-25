@@ -250,6 +250,218 @@ pub(super) fn should_refresh_presence(
 /// ignored by the current frontend; `discoverable` stays true whenever
 /// existing friends can still resolve us so the no-grace-period banner
 /// is not tripped by a degraded-but-working intro failure.
+/// Identity lookups spent per heartbeat on friends we hold no public key for.
+/// Each is a rate-limited request on the same budget as the registration.
+const HASH_ONLY_BACKFILL_PER_HEARTBEAT: usize = 3;
+const HASH_ONLY_BACKFILL_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const HASH_ONLY_BACKFILL_BACKOFF_MAX: std::time::Duration =
+    std::time::Duration::from_secs(6 * 3600);
+
+/// Misses at the backoff cap (about a day's worth) before a friend stops
+/// keeping the pubkey-derivable legacy intro published and is only looked up
+/// weekly. In memory only, so a restart grants another day; the persisted
+/// staleness test below is what bounds it across restarts.
+const HASH_ONLY_GIVE_UP_MISSES_AT_CAP: u32 = 4;
+const HASH_ONLY_GIVEN_UP_RETRY: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 3600);
+/// A mutual friend not seen for this long no longer keeps the legacy intro
+/// published, whatever the lookups say.
+const HASH_ONLY_STALE_AFTER_SECS: i64 = 14 * 24 * 3600;
+
+#[derive(Debug, Clone, Copy)]
+struct BackfillState {
+    next: std::time::Instant,
+    delay: std::time::Duration,
+    misses_at_cap: u32,
+}
+
+impl BackfillState {
+    fn given_up(&self) -> bool {
+        self.misses_at_cap >= HASH_ONLY_GIVE_UP_MISSES_AT_CAP
+    }
+}
+
+type BackfillBackoff = HashMap<[u8; 16], BackfillState>;
+
+fn hash_only_backfill_backoff() -> &'static parking_lot::Mutex<BackfillBackoff> {
+    static BACKOFF: std::sync::OnceLock<parking_lot::Mutex<BackfillBackoff>> =
+        std::sync::OnceLock::new();
+    BACKOFF.get_or_init(Default::default)
+}
+
+#[derive(Debug, Default)]
+struct HashOnlyPlan {
+    selection: rendezvous::HashOnlyFriends,
+    /// Mutual keyless friends we no longer publish the legacy intro for.
+    stranded: Vec<[u8; 16]>,
+}
+
+/// Decide, for friends we hold no key for, who to look up this round and who
+/// still justifies publishing the legacy intro.
+///
+/// Only mutual friends count toward the latter. An outgoing request does
+/// not need us findable: it is delivered by *our* lookups of them, and once
+/// they accept they hold our key and we find them through the pairwise entry
+/// they then register for us — at which point a session gives us theirs.
+/// A mutual friend stops counting once stale or after repeated misses at the
+/// backoff cap, so a deleted or long-gone account cannot keep our address
+/// readable to everyone who knows our public key.
+fn plan_hash_only_friends(
+    friends: &[crate::storage::database::HashOnlyFriend],
+    backoff: &mut BackfillBackoff,
+    now: std::time::Instant,
+    now_unix: i64,
+) -> HashOnlyPlan {
+    backoff.retain(|hash, _| friends.iter().any(|friend| friend.hash == *hash));
+    let due = |hash: &[u8; 16]| backoff.get(hash).is_none_or(|state| now >= state.next);
+    let backfill = friends
+        .iter()
+        .filter(|friend| friend.mutual)
+        .chain(friends.iter().filter(|friend| !friend.mutual))
+        .map(|friend| friend.hash)
+        .filter(|hash| due(hash))
+        .take(HASH_ONLY_BACKFILL_PER_HEARTBEAT)
+        .collect();
+    let mut plan = HashOnlyPlan::default();
+    plan.selection.backfill = backfill;
+    for friend in friends.iter().filter(|friend| friend.mutual) {
+        let stale = now_unix.saturating_sub(friend.last_contact) > HASH_ONLY_STALE_AFTER_SECS;
+        let given_up = backoff.get(&friend.hash).is_some_and(BackfillState::given_up);
+        if stale || given_up {
+            plan.stranded.push(friend.hash);
+        } else {
+            plan.selection.legacy_dependents.push(friend.hash);
+        }
+    }
+    plan
+}
+
+fn note_hash_only_backfill_miss(
+    backoff: &mut BackfillBackoff,
+    hash: [u8; 16],
+    now: std::time::Instant,
+) {
+    let state = backoff.entry(hash).or_insert(BackfillState {
+        next: now,
+        delay: std::time::Duration::ZERO,
+        misses_at_cap: 0,
+    });
+    let was_given_up = state.given_up();
+    if state.delay >= HASH_ONLY_BACKFILL_BACKOFF_MAX {
+        state.misses_at_cap = state.misses_at_cap.saturating_add(1);
+    }
+    state.delay = if state.given_up() {
+        HASH_ONLY_GIVEN_UP_RETRY
+    } else if state.delay.is_zero() {
+        HASH_ONLY_BACKFILL_BACKOFF_MIN
+    } else {
+        (state.delay * 2).min(HASH_ONLY_BACKFILL_BACKOFF_MAX)
+    };
+    state.next = now + state.delay;
+    if state.given_up() && !was_given_up {
+        info!(
+            "Friend {}… has no public key on the rendezvous server after repeated lookups; no longer publishing the legacy intro for them",
+            &hex::encode(hash)[..8]
+        );
+    }
+}
+
+/// One presence registration plus the friend bookkeeping around it: learn
+/// keys for hash-only friends so pairwise presence covers them, and drop
+/// intro secrets that pairwise presence has made redundant.
+///
+/// A friend's intro secret is only needed to find them before they add us
+/// back. Once mutual *and* keyed on our side, the pairwise entry they
+/// register for us is what we look up, so the secret is cleared. A mutual
+/// friend with no key on our row keeps it until the backfill supplies one.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn register_presence(
+    db: Arc<Database>,
+    base_url: &str,
+    ember_hash: &[u8; 16],
+    port: u16,
+    udp_port: u16,
+    external_ip: std::net::Ipv4Addr,
+    pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    friend_identities: &[([u8; 16], [u8; 32])],
+    channel_neighbors: &[([u8; 16], [u8; 32])],
+) -> Result<rendezvous::RegistrationOutcome, String> {
+    let db_read = db.clone();
+    let (hash_only, cleared) = tokio::task::spawn_blocking(move || {
+        let hash_only = db_read.get_hash_only_friends().unwrap_or_else(|e| {
+            warn!("Failed to list friends without a public key: {e}");
+            Vec::new()
+        });
+        let cleared = db_read
+            .clear_keyed_mutual_friend_intro_secrets()
+            .unwrap_or_else(|e| {
+                debug!("Failed to clear redundant friend intro secrets: {e}");
+                Vec::new()
+            });
+        (hash_only, cleared)
+    })
+    .await
+    .unwrap_or_default();
+    for hash in &cleared {
+        crate::network::friend_intro::forget_friend_intro_secret(hash);
+    }
+    let plan = plan_hash_only_friends(
+        &hash_only,
+        &mut hash_only_backfill_backoff().lock(),
+        std::time::Instant::now(),
+        chrono::Utc::now().timestamp(),
+    );
+
+    let mut outcome = rendezvous::register(
+        base_url,
+        ember_hash,
+        port,
+        udp_port,
+        external_ip,
+        pubkey,
+        secret_key,
+        friend_identities,
+        channel_neighbors,
+        &plan.selection,
+    )
+    .await?;
+    if !outcome.legacy_intro_ok {
+        outcome.legacy_stranded_friends = plan
+            .stranded
+            .into_iter()
+            .filter(|hash| !outcome.backfilled_pubkeys.iter().any(|(learned, _)| learned == hash))
+            .collect();
+    }
+
+    {
+        let mut backoff = hash_only_backfill_backoff().lock();
+        let now = std::time::Instant::now();
+        for (hash, _) in &outcome.backfilled_pubkeys {
+            backoff.remove(hash);
+        }
+        for hash in &outcome.backfill_missed {
+            note_hash_only_backfill_miss(&mut backoff, *hash, now);
+        }
+    }
+    if !outcome.backfilled_pubkeys.is_empty() {
+        let learned = outcome.backfilled_pubkeys.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (hash, key) in learned {
+                if let Err(e) = db.set_friend_public_key(&hex::encode(hash), &key) {
+                    warn!("Failed to store a backfilled friend public key: {e}");
+                }
+            }
+        })
+        .await;
+        info!(
+            "Rendezvous: learned {} friend public key(s); pairwise presence now covers them",
+            outcome.backfilled_pubkeys.len()
+        );
+    }
+    Ok(outcome)
+}
+
 pub(super) fn friend_discoverable_event(
     outcome: &rendezvous::RegistrationOutcome,
     initial: bool,
@@ -258,11 +470,21 @@ pub(super) fn friend_discoverable_event(
     let mut payload = serde_json::json!({
         "discoverable": discoverable,
         "intro_ok": outcome.intro_ok,
+        "sealed_intro": outcome.sealed_intro_ok,
+        "legacy_intro": outcome.legacy_intro_ok,
         "pairwise_attempted": outcome.pairwise_attempted,
         "pairwise_failed": outcome.pairwise_failed,
     });
     if let Some(reason) = outcome.degraded_reason() {
         payload["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    if !outcome.legacy_stranded_friends.is_empty() {
+        payload["legacy_stranded_friends"] = outcome
+            .legacy_stranded_friends
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .into();
     }
     // The friends store treats `discoverable: false` + `initial: true` as
     // confirmed failure and skips its 90s grace period. Only attach
@@ -850,11 +1072,18 @@ pub(super) fn spawn_rendezvous_friend_lookup(
                     "Rendezvous lookup: friend {} not found",
                     hex::encode(target_hash)
                 );
+                // Without their intro secret the only intro we could try was
+                // the legacy one, which current builds no longer register. For
+                // someone who has not added us back that miss is expected, and
+                // the fix is their new friend code rather than waiting.
+                let legacy_code =
+                    crate::network::friend_intro::friend_intro_secret(&target_hash).is_none();
                 let _ = app_fc.emit(
                     "ember:friend-search-failed",
                     serde_json::json!({
                         "user_hash": hex::encode(target_hash),
                         "reason": "not_found",
+                        "legacy_code": legacy_code,
                     }),
                 );
             }
@@ -912,4 +1141,125 @@ pub(super) fn spawn_rendezvous_friend_lookup(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod hash_only_backfill_tests {
+    use super::*;
+    use crate::storage::database::HashOnlyFriend;
+
+    const NOW_UNIX: i64 = 1_800_000_000;
+
+    fn friend(seed: u8, mutual: bool, age_secs: i64) -> HashOnlyFriend {
+        HashOnlyFriend {
+            hash: [seed; 16],
+            mutual,
+            last_contact: NOW_UNIX - age_secs,
+        }
+    }
+
+    #[test]
+    fn backfill_is_capped_prefers_mutual_and_skips_friends_in_backoff() {
+        let now = std::time::Instant::now();
+        let friends: Vec<HashOnlyFriend> = vec![
+            friend(0, false, 60),
+            friend(1, true, 60),
+            friend(2, false, 60),
+            friend(3, true, 60),
+            friend(4, true, 60),
+        ];
+        let mut backoff = BackfillBackoff::new();
+        note_hash_only_backfill_miss(&mut backoff, [1; 16], now);
+
+        let plan = plan_hash_only_friends(&friends, &mut backoff, now, NOW_UNIX);
+        assert_eq!(plan.selection.backfill, vec![[3; 16], [4; 16], [0; 16]]);
+
+        let later = now + HASH_ONLY_BACKFILL_BACKOFF_MIN;
+        let plan = plan_hash_only_friends(&friends, &mut backoff, later, NOW_UNIX);
+        assert_eq!(plan.selection.backfill[0], [1; 16], "an expired backoff is retried");
+    }
+
+    #[test]
+    fn only_mutual_friends_keep_the_legacy_intro() {
+        let now = std::time::Instant::now();
+        let friends = vec![friend(1, false, 60), friend(2, true, 60)];
+        let plan = plan_hash_only_friends(&friends, &mut BackfillBackoff::new(), now, NOW_UNIX);
+        assert_eq!(plan.selection.legacy_dependents, vec![[2; 16]]);
+        assert!(plan.stranded.is_empty());
+    }
+
+    #[test]
+    fn a_stale_mutual_friend_stops_keeping_the_legacy_intro() {
+        let now = std::time::Instant::now();
+        let friends = vec![
+            friend(1, true, HASH_ONLY_STALE_AFTER_SECS + 1),
+            friend(2, true, HASH_ONLY_STALE_AFTER_SECS - 1),
+        ];
+        let plan = plan_hash_only_friends(&friends, &mut BackfillBackoff::new(), now, NOW_UNIX);
+        assert_eq!(plan.selection.legacy_dependents, vec![[2; 16]]);
+        assert_eq!(plan.stranded, vec![[1; 16]]);
+    }
+
+    #[test]
+    fn repeated_misses_at_the_cap_give_up_and_fall_back_to_weekly_lookups() {
+        let now = std::time::Instant::now();
+        let mut backoff = BackfillBackoff::new();
+        let mut misses = 0;
+        while !backoff.get(&[9; 16]).is_some_and(BackfillState::given_up) {
+            note_hash_only_backfill_miss(&mut backoff, [9; 16], now);
+            misses += 1;
+            assert!(misses < 64, "gives up eventually");
+        }
+        let total_wait: std::time::Duration = {
+            let mut probe = BackfillBackoff::new();
+            let mut sum = std::time::Duration::ZERO;
+            for _ in 0..misses - 1 {
+                note_hash_only_backfill_miss(&mut probe, [9; 16], now);
+                sum += probe[&[9; 16]].delay;
+            }
+            sum
+        };
+        assert!(
+            total_wait >= std::time::Duration::from_secs(20 * 3600)
+                && total_wait <= std::time::Duration::from_secs(48 * 3600),
+            "roughly a day of lookups before giving up, was {total_wait:?}"
+        );
+        assert_eq!(backoff[&[9; 16]].delay, HASH_ONLY_GIVEN_UP_RETRY);
+
+        let friends = vec![friend(9, true, 60)];
+        let plan = plan_hash_only_friends(&friends, &mut backoff, now, NOW_UNIX);
+        assert!(plan.selection.legacy_dependents.is_empty());
+        assert_eq!(plan.stranded, vec![[9; 16]]);
+        assert!(plan.selection.backfill.is_empty(), "not looked up again for a week");
+        let plan =
+            plan_hash_only_friends(&friends, &mut backoff, now + HASH_ONLY_GIVEN_UP_RETRY, NOW_UNIX);
+        assert_eq!(plan.selection.backfill, vec![[9; 16]]);
+    }
+
+    #[test]
+    fn backoff_forgets_friends_no_longer_hash_only() {
+        let now = std::time::Instant::now();
+        let mut backoff = BackfillBackoff::new();
+        note_hash_only_backfill_miss(&mut backoff, [9; 16], now);
+        let plan = plan_hash_only_friends(&[], &mut backoff, now, NOW_UNIX);
+        assert!(plan.selection.backfill.is_empty());
+        assert!(backoff.is_empty());
+    }
+
+    #[test]
+    fn stranded_friends_reach_the_discoverability_event() {
+        let outcome = rendezvous::RegistrationOutcome {
+            intro_ok: true,
+            sealed_intro_ok: true,
+            legacy_stranded_friends: vec![[0xAB; 16]],
+            ..Default::default()
+        };
+        let payload = friend_discoverable_event(&outcome, false);
+        assert_eq!(
+            payload["legacy_stranded_friends"],
+            serde_json::json!([hex::encode([0xAB; 16])])
+        );
+        let quiet = friend_discoverable_event(&rendezvous::RegistrationOutcome::default(), false);
+        assert!(quiet.get("legacy_stranded_friends").is_none());
+    }
 }

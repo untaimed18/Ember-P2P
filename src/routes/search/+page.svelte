@@ -522,8 +522,14 @@
     return net.length === 0;
   }
 
+  // Mirrors the backend `is_invisible_or_bidi_control` set plus C0/C1 controls:
+  // `<bdi dir="auto">` isolates direction but does not neutralize an embedded RLO.
+  const DISPLAY_NAME_STRIP_RE =
+    /[\u0000-\u001F\u007F-\u009F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{E0100}-\u{E01EF}]/gu;
+
   function displayName(result: SearchResult): string {
-    return result.clean_name || result.file.name;
+    const clean = (result.clean_name ?? '').replace(DISPLAY_NAME_STRIP_RE, '').trim();
+    return clean || (result.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, '');
   }
 
   /**

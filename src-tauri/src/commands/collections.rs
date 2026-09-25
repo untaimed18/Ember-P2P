@@ -598,6 +598,7 @@ pub async fn download_collection_files(
             up_part_count: None,
             up_peer_part_status: None,
             ember_verified: false,
+            friends_only: false,
         };
 
         let (active_now, persisted_transfer) = {

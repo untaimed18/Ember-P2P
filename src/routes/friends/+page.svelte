@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
@@ -53,6 +54,12 @@
   let myHash = $state('');
   let myHashCopied = $state(false);
   let myHashCopyTimer: ReturnType<typeof setTimeout> | undefined;
+  let confirmResetCodeOpen = $state(false);
+  let resettingCode = $state(false);
+  /** Mutual friends we hold no key for and no longer publish the legacy intro
+   *  for, from the latest presence registration. Only a current Friend Code
+   *  lets them find us. */
+  let legacyStrandedFriends = $state(new Set<string>());
 
   let showAddForm = $state(false);
   let newHash = $state('');
@@ -443,7 +450,17 @@
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
       .catch((e) => console.error('friends: failed to register firewall-status listener', e));
 
-    listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
+    listen<{ intro_ok?: boolean; legacy_stranded_friends?: unknown }>('ember:friend-discoverable', (event) => {
+      if (destroyed) return;
+      // A failed registration carries no presence detail; keep the last answer.
+      if (typeof event.payload?.intro_ok !== 'boolean') return;
+      const raw = event.payload.legacy_stranded_friends;
+      const hashes = Array.isArray(raw) ? raw.map(validFriendHash).filter((h): h is string => h !== null) : [];
+      legacyStrandedFriends = new Set(hashes);
+    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
+      .catch((e) => console.error('friends: failed to register ember:friend-discoverable listener', e));
+
+    listen<{ user_hash: string; reason?: string; legacy_code?: boolean }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
       const hash = validFriendHash(event.payload?.user_hash);
       if (!hash) return;
@@ -460,6 +477,14 @@
           break;
         case 'secure_v2_required':
           msg = m.error_secure_friend_v2_required();
+          break;
+        case 'not_found':
+          // Someone added from an older code or a bare ID, who has not added
+          // us back, can only be found if they still run an old build. An
+          // established friend going unfound is just offline.
+          msg = event.payload?.legacy_code === true && f && !f.mutual
+            ? m.friends_search_needs_new_code({ name })
+            : null;
           break;
         default:
           msg = null;
@@ -625,46 +650,63 @@
     }
   }
 
-  function friendHashFromCode(value: string): string | null {
-    const trimmed = value.trim();
-    if (/^[0-9a-fA-F]{32}$/.test(trimmed)) return trimmed.toLowerCase();
-    const match = /^ember2:([0-9a-fA-F]{32}):([0-9a-fA-F]{64})$/i.exec(trimmed);
-    return match?.[1]?.toLowerCase() ?? null;
-  }
-
-  function isValidHash(h: string): boolean {
-    return friendHashFromCode(h) !== null;
-  }
-
+  // A bare public key's Friend ID is a BLAKE3 digest only the backend derives,
+  // so the self/duplicate/blocked checks for that form are left to
+  // `add_friend`, which reports each as a coded error.
   async function handleAdd() {
     if (adding) return;
     addError = null;
     const hash = newHash.trim();
     const nick = newNickname.trim();
     if (!hash) { addError = m.friends_validation_hash_required(); return; }
-    if (!isValidHash(hash)) { addError = m.friends_validation_hash_format(); return; }
+    if (!isAcceptedFriendInput(hash)) { addError = m.friends_validation_hash_format(); return; }
     const canonicalHash = friendHashFromCode(hash);
-    if (myHash && canonicalHash === friendHashFromCode(myHash)) {
-      addError = m.friends_validation_self_add();
-      return;
-    }
-    if (friends.some((f) => f.user_hash.toLowerCase() === canonicalHash)) {
-      addError = m.friends_validation_already_friend();
-      return;
-    }
-    if (blocked.some((b) => b.user_hash.toLowerCase() === canonicalHash)) {
-      addError = m.friends_validation_blocked();
-      return;
+    // A current code for someone already listed is how a one-sided add made
+    // from an older code becomes findable, so it goes through as an update.
+    let updatedFriend: FriendInfo | undefined;
+    if (canonicalHash !== null) {
+      if (myHash && canonicalHash === friendHashFromCode(myHash)) {
+        addError = m.friends_validation_self_add();
+        return;
+      }
+      const existing = friends.find((f) => f.user_hash.toLowerCase() === canonicalHash);
+      if (existing && !carriesIntroSecret(hash)) {
+        addError = m.friends_validation_already_friend();
+        return;
+      }
+      updatedFriend = existing;
+      if (blocked.some((b) => b.user_hash.toLowerCase() === canonicalHash)) {
+        addError = m.friends_validation_blocked();
+        return;
+      }
     }
     adding = true;
     try {
+      const before = new Set(friends.map((f) => f.user_hash.toLowerCase()));
+      // For a public key, re-adding an existing friend is an upsert rather than
+      // an error, so the only way to tell it apart is whether a row appeared.
       await addFriend(hash, nick || undefined);
-      flash(m.friends_added({ name: nick || (canonicalHash ?? hash).slice(0, 8) + '\u2026' }));
+      if (updatedFriend) {
+        failedSearchToastsShown.delete(updatedFriend.user_hash.toLowerCase());
+        flash(m.friends_code_updated({
+          name: nick || updatedFriend.nickname || updatedFriend.user_hash.slice(0, 8) + '\u2026',
+        }));
+      } else if (canonicalHash) {
+        flash(m.friends_added({ name: nick || canonicalHash.slice(0, 8) + '\u2026' }));
+      }
       newHash = '';
       newNickname = '';
       showAddForm = false;
       await reloadFriendRequests();
       await loadFriends();
+      // `flash` clears `error`, so skip it when the reload failed rather than
+      // hide that failure behind a name the stale list cannot supply anyway.
+      if (!canonicalHash && !error) {
+        const added = friends.find((f) => !before.has(f.user_hash.toLowerCase()));
+        flash(added
+          ? m.friends_added({ name: nick || added.user_hash.slice(0, 8) + '\u2026' })
+          : m.friends_validation_already_friend());
+      }
     } catch (e: unknown) {
       addError = toErr(e);
     } finally {
@@ -814,6 +856,24 @@
     copyTimer = setTimeout(() => (copiedHash = null), 1500);
   }
 
+  async function handleResetCode() {
+    confirmResetCodeOpen = false;
+    if (resettingCode) return;
+    resettingCode = true;
+    try {
+      const code = await resetFriendCode();
+      if (destroyed) return;
+      myHash = code;
+      myHashError = false;
+      myHashCopied = false;
+      flash(m.friends_reset_code_done());
+    } catch (e: unknown) {
+      if (!destroyed) error = toErr(e);
+    } finally {
+      resettingCode = false;
+    }
+  }
+
   async function copyMyHash() {
     if (!(await copyToClipboard(myHash))) {
       toastError(m.kad_clipboard_unavailable());
@@ -838,6 +898,15 @@
   confirmLabel={removeDialog.mutual ? m.common_remove() : m.friends_withdraw_title()}
   danger={true}
   onconfirm={handleRemove}
+/>
+
+<ConfirmDialog
+  bind:open={confirmResetCodeOpen}
+  title={m.friends_reset_code_confirm_title()}
+  message={m.friends_reset_code_confirm_message()}
+  confirmLabel={m.friends_reset_code()}
+  danger={true}
+  onconfirm={handleResetCode}
 />
 
 <ConfirmDialog
@@ -961,20 +1030,28 @@
           {/if}
         </div>
       </div>
-      <button type="button" class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
-        {#if myHashCopied}
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 8 7 12 13 4"/>
-          </svg>
-          {m.common_copied()}
-        {:else}
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="5" y="5" width="9" height="9" rx="1.5"/>
-            <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
-          </svg>
-          {m.common_copy()}
-        {/if}
-      </button>
+      <div class="my-id-actions">
+        <button type="button" class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
+          {#if myHashCopied}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 8 7 12 13 4"/>
+            </svg>
+            {m.common_copied()}
+          {:else}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="5" width="9" height="9" rx="1.5"/>
+              <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
+            </svg>
+            {m.common_copy()}
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="ghost my-id-reset"
+          onclick={() => { confirmResetCodeOpen = true; }}
+          disabled={resettingCode}
+        >{m.friends_reset_code()}</button>
+      </div>
     </div>
   {:else if myHashError}
     <!-- Hiding the card outright made a transient failure look like the app
@@ -1164,7 +1241,7 @@
           type="text"
           bind:value={newHash}
           placeholder={m.friends_hash_placeholder()}
-          maxlength="128"
+          maxlength="192"
           spellcheck="false"
           autocomplete="off"
           class="hash-input"
@@ -1325,6 +1402,9 @@
               {m.friends_status_added({ when: formatDate(f.added_at) })}
             {/if}
           </span>
+          {#if f.mutual && !isOnline && legacyStrandedFriends.has(f.user_hash.toLowerCase())}
+            <span class="card-legacy-hint">{m.friends_legacy_stranded_hint()}</span>
+          {/if}
         </div>
 
         <div class="card-controls">
@@ -1656,6 +1736,20 @@
     height: 13px;
   }
 
+  .my-id-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .my-id-reset {
+    font-size: 11px;
+    padding: 4px 10px;
+    white-space: nowrap;
+  }
+
   /* --- How Friends work --- */
   .how-panel {
     padding: 12px 16px;
@@ -1934,6 +2028,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .card-legacy-hint {
+    font-size: 11px;
+    color: var(--warning);
+    line-height: 1.35;
   }
 
   .status-online {

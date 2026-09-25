@@ -147,6 +147,9 @@ export interface Transfer {
   expected_aich?: string;
   /** Optional Ember content BLAKE3 (64 hex) from `eh=` / browse / offer. */
   ember_file_hash?: string;
+  /** Downloads only: taken from a friend who restricts the file, so it is
+   *  never advertised on the open network and completes friends-only. */
+  friends_only?: boolean;
   /** Downloads only: absolute path of the finished file on disk. Completion
    *  moves the `.part` to `Downloads/<name>`, but the backend deduplicates
    *  against an existing file by appending ` (n)` to the stem — so rebuilding

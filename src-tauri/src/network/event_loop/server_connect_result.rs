@@ -312,11 +312,7 @@ pub(in crate::network) async fn on_server_connect_result(
                         ) {
                             continue;
                         }
-                        if !kad_may_advertise_partial(
-                            known_files,
-                            &restricted,
-                            &transfer.file_hash,
-                        ) {
+                        if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                             continue;
                         }
                         if transfer.file_hash.is_empty()

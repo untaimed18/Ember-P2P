@@ -2828,7 +2828,16 @@
         // does: a `getTransfers()` snapshot already in flight when the backend
         // drops the row still carries it, and without the tombstone the next
         // merge pushed the row straight back for a poll cycle.
-        case 'remove': markDownloadRemoved(t.id); await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'remove':
+          markDownloadRemoved(t.id);
+          try {
+            await removeTransfer(t.id);
+          } catch (e: unknown) {
+            clearDownloadRemoved(t.id);
+            throw e;
+          }
+          speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id));
+          break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
@@ -5897,7 +5906,23 @@
     ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => {
+    let markedIds: string[] = [];
+    try {
+      if (transferFilter.trim()) {
+        await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
+      } else {
+        markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
+        for (const id of markedIds) markDownloadRemoved(id);
+        await clearCompleted();
+        markedIds = [];
+        transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; });
+      }
+    } catch (e: unknown) {
+      for (const id of markedIds) clearDownloadRemoved(id);
+      transferError = toErrorMsg(e);
+    }
+  }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->

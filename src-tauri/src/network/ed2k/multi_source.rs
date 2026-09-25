@@ -26,8 +26,9 @@ use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
 use super::transfer::CompressedPartAccumulator;
 use super::transfer::{
-    expire_outstanding_ranges, is_filtered_source_ip, push_outstanding_batch,
-    refresh_outstanding_range, take_completed_outstanding_range, DownloadEvent, OutstandingRange,
+    desynced_io_error, expire_outstanding_ranges, is_filtered_source_ip, is_packet_stream_desynced,
+    packet_stream_desynced_error, push_outstanding_batch, refresh_outstanding_range,
+    take_completed_outstanding_range, DownloadEvent, OutstandingRange, PacketStreamDesynced,
 };
 
 /// Shared registry of active download trackers so the shutdown path can
@@ -1253,6 +1254,29 @@ fn no_source_can_ever_arrive(
     has_established_rx: bool,
 ) -> bool {
     sources_empty && !has_source_rx && !has_established_rx
+}
+
+/// Smallest OP_SENDINGPART accepted for a range we never asked for (D18). A
+/// peer shipping 1-byte chunks unprompted is broken or abusive (work
+/// amplification against the syscall/allocator path).
+const MIN_UNSOLICITED_BLOCK_BYTES: u64 = 16;
+
+/// True for an undersized block that neither ends the file nor lies inside a
+/// range we requested. The floor cannot apply to requested ranges: the gap
+/// planner asks for whatever gaps remain, and an interrupted compressed block
+/// can leave a tail of any length, which the uploader answers with an
+/// uncompressed packet of exactly that size.
+fn is_unsolicited_undersized_block(
+    start: u64,
+    end: u64,
+    file_size: u64,
+    requested: impl IntoIterator<Item = (u64, u64)>,
+) -> bool {
+    end.saturating_sub(start) < MIN_UNSOLICITED_BLOCK_BYTES
+        && end != file_size
+        && !requested
+            .into_iter()
+            .any(|(req_start, req_end)| start >= req_start && end <= req_end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5784,6 +5808,7 @@ async fn download_parts_from_source(
                     deferred_packet = Some((proto, opcode, payload));
                 }
             }
+            Err(e) if is_packet_stream_desynced(&e) => return Err(e),
             Err(e) => {
                 debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
             }
@@ -5924,15 +5949,19 @@ async fn download_parts_from_source(
             // for Ember-to-Ember downloads.
             pkt
         } else {
-            match tokio::time::timeout(
+            match read_packet_within_ms(
+                &mut *reader,
                 std::time::Duration::from_millis(read_timeout_ms),
-                read_packet_async_ms(&mut *reader),
+                std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
             )
             .await
             {
-                Ok(Ok(pkt)) => {
+                Ok(Some(pkt)) => {
                     read_timeout_ms = 3000;
                     pkt
+                }
+                Err(e) if e.get_ref().is_some_and(|i| i.is::<PacketStreamDesynced>()) => {
+                    return Err(anyhow::Error::from(e).context("stage:emule_info_wait"));
                 }
                 _ => break,
             }
@@ -7689,6 +7718,7 @@ async fn download_parts_from_source(
                     Ok((proto, opcode, _)) => {
                         debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
                     }
+                    Err(e) if is_packet_stream_desynced(&e) => return Err(e),
                     Err(_) => {
                         debug!(
                             "No hashset answer from source {} (peer may not support it)",
@@ -7857,18 +7887,17 @@ async fn download_parts_from_source(
             // tick expiry with no packet is NORMAL while queued (it is NOT the
             // timeout — that is the `elapsed > queue_wait_secs` check above).
             let poll_secs = queue_wait_secs.saturating_sub(elapsed).clamp(1, 5);
-            let result = tokio::time::timeout(
+            let result = read_packet_within_ms(
+                &mut *reader,
                 std::time::Duration::from_secs(poll_secs),
-                read_packet_async_ms(&mut *reader),
+                std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
             )
             .await;
             let (proto, opcode, payload) = match result {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
+                Ok(Some(p)) => p,
+                Ok(None) => continue,
+                Err(e) => {
                     anyhow::bail!("stage:queue_detached connection lost while queued: {e}");
-                }
-                Err(_) => {
-                    continue;
                 }
             };
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -8029,6 +8058,12 @@ async fn download_parts_from_source(
     // Taken once, outside the receive loop: the wire-byte counter is incremented
     // on every packet and must not cost a tracker lock each time.
     let wire_bytes_counter = tracker.read().await.transferred_counter();
+    // Set when we abandon a read that may have consumed part of a packet,
+    // which leaves the stream unparseable for the rest of the connection.
+    // The part in hand is still verified (that only touches disk), but the
+    // AICH repair has to be skipped because it writes a request and reads
+    // the answer, and no further part may be requested on this connection.
+    let mut stream_maybe_desynced = false;
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -8040,6 +8075,21 @@ async fn download_parts_from_source(
     'session_loop: loop {
         while queue_idx < part_queue.len() {
             check_control(&control).await?;
+            if stream_maybe_desynced {
+                if tracker.read().await.all_complete() {
+                    break;
+                }
+                let _ = write_packet_async_ms(
+                    &mut *writer,
+                    OP_EDONKEYHEADER,
+                    OP_CANCELTRANSFER,
+                    &[],
+                )
+                .await;
+                return Err(anyhow::Error::from(packet_stream_desynced_error()).context(
+                    "stage:data_wait connection unusable after an abandoned read; reconnecting for the reopened parts",
+                ));
+            }
             let part_idx = part_queue[queue_idx];
             queue_idx += 1;
             if peer_out_of_parts {
@@ -8394,11 +8444,6 @@ async fn download_parts_from_source(
             let mut bytes_received_this_part: u64 = 0;
             let mut chunks_received_this_part: u32 = 0;
             let mut bytes_received_for_other_parts: u64 = 0;
-            // Set when we abandon a read that may have consumed part of a
-            // packet, which leaves the stream unparseable. Nothing below reads
-            // from it again, but the AICH repair still *writes* to it and then
-            // waits for an answer, so that request has to be skipped.
-            let mut stream_maybe_desynced = false;
             let receive_loop_started = std::time::Instant::now();
             // DIAG: snapshot the gap state for this part at entry so we can
             // tell whether is_part_complete tripping mid-loop is "the only
@@ -8548,6 +8593,7 @@ async fn download_parts_from_source(
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
                 let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
+                let packet_started = AtomicBool::new(false);
                 let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = if let Some(
                     packet,
                 ) =
@@ -8555,7 +8601,10 @@ async fn download_parts_from_source(
                 {
                     Ok(Ok(packet))
                 } else {
-                    let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
+                    let mut read_fut = std::pin::pin!(read_packet_marking_start_ms(
+                        &mut *reader,
+                        &packet_started
+                    ));
                     let mut stall_check = tokio::time::interval(std::time::Duration::from_secs(2));
                     stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     // Consume the immediate first tick so the first real
@@ -8683,6 +8732,7 @@ async fn download_parts_from_source(
                                             .await;
                                     } else if outstanding_ranges.is_empty()
                                         && sent_idx >= batches.len()
+                                        && !packet_started.load(Ordering::Relaxed)
                                     {
                                         break Err(());
                                     }
@@ -8764,6 +8814,21 @@ async fn download_parts_from_source(
                     }
                     Err(()) => {
                         let file_complete = tracker.read().await.all_complete();
+                        let mid_packet = packet_started.load(Ordering::Relaxed);
+                        if mid_packet && !file_complete {
+                            let _ = write_packet_async_ms(
+                                &mut *writer,
+                                OP_EDONKEYHEADER,
+                                OP_CANCELTRANSFER,
+                                &[],
+                            )
+                            .await;
+                            return Err(anyhow::Error::from(packet_stream_desynced_error())
+                                .context(format!(
+                                    "stage:data_wait download timeout: stalled mid-packet for {}s",
+                                    read_timeout.as_secs()
+                                )));
+                        }
                         match read_timeout_action(
                             file_complete,
                             outstanding_ranges.is_empty(),
@@ -8775,10 +8840,9 @@ async fn download_parts_from_source(
                             !all_blocks.is_empty(),
                         ) {
                             ReadTimeoutAction::FileComplete => {
-                                // The read we just abandoned may have taken a
-                                // partial packet with it, so the stream can no
-                                // longer be framed.
-                                stream_maybe_desynced = true;
+                                // If the read we just abandoned had begun a
+                                // packet, the stream can no longer be framed.
+                                stream_maybe_desynced |= mid_packet;
                                 exit_reason = "all_complete";
                                 break;
                             }
@@ -8911,15 +8975,27 @@ async fn download_parts_from_source(
                             }
                             continue;
                         }
-                        // D18: refuse absurdly small chunks. eMule-family peers
-                        // never ship OP_SENDINGPART below a few KiB; a peer
-                        // sending 1-byte chunks is either broken or abusive
-                        // (work amplification vs our syscall/allocator path).
-                        // 16 bytes keeps the floor trivially low for any legit
-                        // truncated-tail block.
-                        const MIN_BLOCK_BYTES: u64 = 16;
                         let piece_len = end - start;
-                        if piece_len < MIN_BLOCK_BYTES && end != file_size {
+                        let requested_ranges = outstanding_ranges
+                            .iter()
+                            .map(|r| (r.start, r.end))
+                            .chain(batches.iter().take(sent_idx).flatten().copied())
+                            .chain(pipelined_next.iter().flat_map(|pending| {
+                                pending
+                                    .outstanding_ranges
+                                    .iter()
+                                    .map(|r| (r.start, r.end))
+                                    .chain(
+                                        pending
+                                            .batches
+                                            .iter()
+                                            .take(pending.sent_idx)
+                                            .flatten()
+                                            .copied(),
+                                    )
+                            }));
+                        if is_unsolicited_undersized_block(start, end, file_size, requested_ranges)
+                        {
                             consecutive_bad_blocks += 1;
                             tracing::debug!(
                             "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
@@ -10713,7 +10789,7 @@ async fn download_parts_from_source(
         // OP_OUTOFPARTREQS). For any other exit reason the queue is
         // genuinely exhausted (no more parts this peer can serve) and
         // re-queueing would just stall.
-        if !peer_out_of_parts {
+        if !peer_out_of_parts || stream_maybe_desynced {
             break 'session_loop;
         }
         // Verify there's still work for this peer to do before we burn
@@ -11500,30 +11576,74 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
 /// [`HANDSHAKE_READ_TIMEOUT_SECS`] of silence. All call sites are pre-transfer
 /// (hello / emule-info / file-status / hashset); the in-transfer no-data check
 /// uses the longer `DOWNLOADTIMEOUT_SECS` separately.
+///
+/// A timeout while no packet has begun is a plain `TimedOut` and leaves the
+/// stream on a packet boundary; a stall part-way through a packet is reported
+/// as [`PacketStreamDesynced`] (see [`read_packet_within_ms`]).
 async fn read_packet_timeout_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
-        read_packet_async_ms(reader),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+    let bound = std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS);
+    read_packet_within_ms(reader, bound, bound)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))
+}
+
+/// Wait up to `start_within` for a packet to begin, then up to `finish_within`
+/// for the rest of it.
+///
+/// Only the protocol byte races the idle deadline: a one-byte read consumes
+/// that byte or nothing, so `Ok(None)` leaves the stream on a packet boundary.
+/// Once a packet has begun, abandoning it would strand the reader mid-frame,
+/// so that expiry is an error carrying [`PacketStreamDesynced`].
+async fn read_packet_within_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    start_within: std::time::Duration,
+    finish_within: std::time::Duration,
+) -> std::io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let protocol = match tokio::time::timeout(start_within, reader.read_u8()).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    };
+    match tokio::time::timeout(finish_within, read_packet_body_ms(reader, protocol)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(packet_stream_desynced_error()),
+    }
 }
 
 async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
-    let length = reader.read_u32_le().await? as usize;
+    read_packet_body_ms(reader, protocol).await
+}
+
+/// [`read_packet_async_ms`] that sets `started` once the first byte is
+/// consumed, so a caller dropping the future can tell whether the stream is
+/// still framed.
+async fn read_packet_marking_start_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    started: &AtomicBool,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    started.store(true, Ordering::Relaxed);
+    read_packet_body_ms(reader, protocol).await
+}
+
+/// The rest of a packet once its protocol byte has been read.
+async fn read_packet_body_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    protocol: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    const OP_PACKEDPROT: u8 = 0xD4;
+    let length = reader.read_u32_le().await.map_err(desynced_io_error)? as usize;
     if length == 0 || length > MAX_WIRE_PACKET_LEN {
-        return Err(std::io::Error::new(
+        return Err(desynced_io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
-        ));
+        )));
     }
-    let opcode = reader.read_u8().await?;
+    let opcode = reader.read_u8().await.map_err(desynced_io_error)?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
     // trusting the declared length up front. A peer that announces a large
@@ -11541,7 +11661,10 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
         let want = remaining.min(READ_STEP);
         let start = payload.len();
         payload.resize(start + want, 0);
-        reader.read_exact(&mut payload[start..start + want]).await?;
+        reader
+            .read_exact(&mut payload[start..start + want])
+            .await
+            .map_err(desynced_io_error)?;
         remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
@@ -12955,5 +13078,244 @@ mod final_verify_recovery_tests {
         let got = diagnose_final_hash_mismatch(f.path.clone(), f.file_hash, f.size, Vec::new())
             .await;
         assert_eq!(got, FinalVerifyRecovery::Reopen(vec![0, 1]));
+    }
+}
+
+#[cfg(test)]
+mod undersized_block_tests {
+    use super::super::hash::PARTSIZE;
+    use super::*;
+
+    const FILE_SIZE: u64 = 3 * PARTSIZE;
+
+    #[test]
+    fn a_tiny_block_inside_a_requested_range_is_accepted() {
+        // The gap planner re-requests the 5-byte tail an interrupted packed
+        // block left behind; the uploader answers with exactly those bytes.
+        let requested = [(1_000, 1_005)];
+        assert!(!is_unsolicited_undersized_block(
+            1_000, 1_005, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn a_tiny_slice_of_a_larger_request_is_accepted() {
+        let requested = [(0, 180 * 1024)];
+        assert!(!is_unsolicited_undersized_block(
+            10_240, 10_241, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn a_tiny_block_nobody_asked_for_is_rejected() {
+        let requested = [(0, 180 * 1024)];
+        assert!(is_unsolicited_undersized_block(
+            PARTSIZE,
+            PARTSIZE + 1,
+            FILE_SIZE,
+            requested
+        ));
+        assert!(is_unsolicited_undersized_block(
+            500,
+            501,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+    }
+
+    #[test]
+    fn a_tiny_block_straddling_a_request_edge_is_rejected() {
+        let requested = [(1_000, 1_005)];
+        assert!(is_unsolicited_undersized_block(
+            1_003, 1_008, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn the_file_tail_and_full_size_blocks_are_never_rejected() {
+        assert!(!is_unsolicited_undersized_block(
+            FILE_SIZE - 3,
+            FILE_SIZE,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+        assert!(!is_unsolicited_undersized_block(
+            0,
+            MIN_UNSOLICITED_BLOCK_BYTES,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod packet_framing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn frame(protocol: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![protocol];
+        out.extend_from_slice(&(1 + payload.len() as u32).to_le_bytes());
+        out.push(opcode);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn a_packet_split_across_the_idle_tick_is_read_whole() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let payload = vec![0xAB; 600];
+        let first = frame(0xE3, 0x46, &payload);
+        let second = frame(0xC5, 0x60, &[1, 2]);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&first[..8]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            peer.write_all(&first[8..]).await.unwrap();
+            peer.write_all(&second).await.unwrap();
+            peer
+        });
+
+        let got = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, Some((0xE3, 0x46, payload)));
+        let next = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next, Some((0xC5, 0x60, vec![1, 2])));
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_idle_tick_consumes_nothing() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let idle = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(idle, None);
+
+        peer.write_all(&frame(0xE3, 0x54, &[7; 12])).await.unwrap();
+        let got = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, Some((0xE3, 0x54, vec![7; 12])));
+    }
+
+    #[tokio::test]
+    async fn a_stall_mid_packet_is_reported_as_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        peer.write_all(&frame(0xE3, 0x46, &[0; 64])[..10]).await.unwrap();
+        let err = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        let err = anyhow::Error::from(err).context("stage:hashset_wait");
+        assert!(is_packet_stream_desynced(&err));
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_length_after_the_header_is_a_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[0xE3, 0, 0, 0, 0, 0x46]).await.unwrap();
+        let err = read_packet_within_ms(&mut reader, Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:emule_info_wait")
+        ));
+
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[0xE3, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn eof_mid_packet_is_a_desync_that_keeps_its_kind() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&frame(0xE3, 0x46, &[0; 32])[..9]).await.unwrap();
+        drop(peer);
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let err = anyhow::Error::from(err);
+        assert!(is_packet_stream_desynced(&err));
+        assert!(is_connection_reset(&err));
+    }
+
+    #[tokio::test]
+    async fn eof_on_a_packet_boundary_is_not_a_desync() {
+        let (peer, mut reader) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn a_bad_packed_payload_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        peer.write_all(&frame(0xD4, 0x40, &[0xDE, 0xAD, 0xBE, 0xEF]))
+            .await
+            .unwrap();
+        peer.write_all(&frame(0xE3, 0x54, &[9])).await.unwrap();
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+        assert_eq!(
+            read_packet_async_ms(&mut reader).await.unwrap(),
+            (0xE3, 0x54, vec![9])
+        );
+    }
+
+    #[test]
+    fn only_the_desync_marker_classifies_as_desync() {
+        let idle = std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out");
+        assert!(!is_packet_stream_desynced(
+            &anyhow::Error::from(idle).context("stage:emule_info_wait")
+        ));
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(
+            packet_stream_desynced_error()
+        )));
+    }
+
+    #[tokio::test]
+    async fn marking_read_flags_a_packet_only_once_it_has_begun() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let started = AtomicBool::new(false);
+        {
+            let read = read_packet_marking_start_ms(&mut reader, &started);
+            assert!(tokio::time::timeout(Duration::from_millis(20), read)
+                .await
+                .is_err());
+        }
+        assert!(!started.load(Ordering::Relaxed));
+
+        peer.write_all(&frame(0xE3, 0x46, &[0; 32])[..3]).await.unwrap();
+        {
+            let read = read_packet_marking_start_ms(&mut reader, &started);
+            assert!(tokio::time::timeout(Duration::from_millis(50), read)
+                .await
+                .is_err());
+        }
+        assert!(started.load(Ordering::Relaxed));
     }
 }

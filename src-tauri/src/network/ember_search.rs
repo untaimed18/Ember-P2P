@@ -612,15 +612,21 @@ pub(super) fn build_ember_keyword_built(
                 continue;
             }
         }
+        // The record's signed bytes keep the publisher's raw name; only the
+        // display/derived copy is sanitized, as on the KAD result path.
+        let file_name = crate::security::sanitize_remote_text(&rec.file_name, 8192);
+        if file_name.is_empty() {
+            continue;
+        }
         // Local re-filter, mirroring the KAD keyword path: the DHT key only
         // matched the primary keyword, so the rest of the query is applied
         // against the file name here.
         if let Some(expr) = expr {
-            if !expr.matches(&rec.file_name.to_lowercase()) {
+            if !expr.matches(&file_name.to_lowercase()) {
                 continue;
             }
         } else if kw_lower.len() > 1 {
-            let name_lower = rec.file_name.to_lowercase();
+            let name_lower = file_name.to_lowercase();
             if !kw_lower.iter().all(|k| name_lower.contains(k)) {
                 continue;
             }
@@ -646,8 +652,7 @@ pub(super) fn build_ember_keyword_built(
                 }
             }
             None => {
-                let extension = rec
-                    .file_name
+                let extension = file_name
                     .rsplit_once('.')
                     .map(|(_, e)| e.to_string())
                     .unwrap_or_default();
@@ -663,7 +668,7 @@ pub(super) fn build_ember_keyword_built(
                 let sr = SearchResult {
                     file: FileInfo {
                         id: hash_hex.clone(),
-                        name: rec.file_name.clone(),
+                        name: file_name,
                         path: String::new(),
                         size: rec.file_size,
                         hash: hash_hex,
@@ -938,5 +943,42 @@ mod ember_digest_corroboration_tests {
             corroborated_ember_digest(&digests(&[(1, 0xAA), (2, 0x00), (3, 0x00)])),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod ember_keyword_sanitize_tests {
+    use super::*;
+
+    fn kw_blob(name: &str) -> Vec<u8> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let rec = ember::dht::publish::SignedRecord::keyword(
+            "holiday",
+            [0x11; 16],
+            [0u8; 32],
+            1234,
+            name,
+            &sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    #[test]
+    fn ember_keyword_build_strips_bidi_override_from_name() {
+        let blobs = vec![kw_blob("holiday\u{202E}gpj.exe\u{200B}")];
+        let results = build_ember_keyword_built(&blobs, &["holiday".to_string()], None).results;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.file.name, "holidaygpj.exe");
+        assert_eq!(r.file.extension, "exe");
+    }
+
+    #[test]
+    fn ember_keyword_build_drops_names_that_are_only_controls() {
+        let blobs = vec![kw_blob("\u{202E}\u{200B}")];
+        let results = build_ember_keyword_built(&blobs, &["holiday".to_string()], None).results;
+        assert!(results.is_empty());
     }
 }

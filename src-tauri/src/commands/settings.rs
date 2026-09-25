@@ -479,6 +479,18 @@ pub async fn pick_preview_player(
     let Some(path) = selected else {
         return Ok(None);
     };
+    // Preview refuses to start a player from a network location, so accepting
+    // one here would only produce a setting that is silently ignored. The
+    // lexical check runs first so a UNC path is refused without being opened.
+    let not_local = || {
+        coded(
+            "settings_preview_player_not_local",
+            "Choose a media player installed on this computer, not on a network location",
+        )
+    };
+    if !crate::network::ed2k::preview::player_path_is_local(&path) {
+        return Err(not_local());
+    }
     // A directory would spawn nothing; catching it here means the Settings
     // form never shows a path that Preview would then quietly ignore.
     if !path.is_file() {
@@ -486,6 +498,11 @@ pub async fn pick_preview_player(
             "settings_preview_player_not_a_file",
             "That is not a program",
         ));
+    }
+    // The launch's own validator: a local-looking path that links onto a
+    // share, or cannot be resolved, is ignored by Preview.
+    if !crate::network::ed2k::preview::player_is_usable(&path) {
+        return Err(not_local());
     }
     remember_picked_preview_player(&path);
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -1259,6 +1276,24 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Best-effort undo of a registry claim whose settings save then failed, so
+/// the registry and config.json go on naming the same handle. A claim is a
+/// rename, so re-claiming the previous name is the undo; with no previous name
+/// there is nothing to go back to and the stray claim is only logged.
+async fn restore_previous_username_claim(state: &AppState, previous: &str) {
+    if previous.is_empty() {
+        warn!("Settings save failed after claiming a Channel username; the registry keeps the new claim");
+        return;
+    }
+    match crate::commands::channels::claim_username_on_registry(state, previous).await {
+        Ok(_) => info!("Settings save failed; restored the previous Channel username claim"),
+        Err(error) => warn!(
+            "Settings save failed after claiming a new Channel username, and restoring the \
+             previous claim failed too: {error}"
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn update_settings(
     app: tauri::AppHandle,
@@ -1376,11 +1411,10 @@ pub async fn update_settings(
                 ));
             }
         } else {
-            settings.channel_username = crate::commands::channels::claim_username_on_registry(
-                &state,
-                &settings.channel_username,
-            )
-            .await?;
+            // Shape only. The registry claim is a remote side effect, so it
+            // waits until every local check below has passed.
+            settings.channel_username =
+                crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
         }
     }
     let username_changed = settings.channel_username != old_settings.channel_username
@@ -1542,9 +1576,20 @@ pub async fn update_settings(
                 &settings.download_folder,
             )
             .await;
+        // Last, immediately before the commit and still under
+        // `settings_save_lock`: any refusal after the claim would leave the
+        // registry and config.json naming different handles. The claim stores
+        // the sanitized form already in `settings`, so `save_data` is accurate.
+        if username_changed {
+            crate::commands::channels::claim_username_on_registry(
+                &state,
+                &settings.channel_username,
+            )
+            .await?;
+        }
         let download_folder = settings.download_folder.clone();
         let (data, tmp, final_path) = save_data;
-        tokio::task::spawn_blocking(move || {
+        let persisted = tokio::task::spawn_blocking(move || {
             let mut reapprovals = Vec::new();
             if reapprove_download_root
                 && !download_folder.is_empty()
@@ -1565,8 +1610,14 @@ pub async fn update_settings(
             )
         })
         .await
-        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
-        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))
+        .and_then(|result| result.map_err(|e| coded_ctx("settings_save_failed", "Save failed", e)));
+        if let Err(error) = persisted {
+            if username_changed {
+                restore_previous_username_claim(&state, &old_settings.channel_username).await;
+            }
+            return Err(error);
+        }
     }
     {
         let mut config = state.config.write().await;

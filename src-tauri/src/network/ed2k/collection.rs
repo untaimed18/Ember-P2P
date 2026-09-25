@@ -87,12 +87,12 @@ impl Collection {
             match tag_id {
                 FT_FILENAME => {
                     if let TagValue::String(s) = tag_value {
-                        name = s;
+                        name = sanitize_collection_text(&s);
                     }
                 }
                 FT_COLLECTIONAUTHOR => {
                     if let TagValue::String(s) = tag_value {
-                        author = s;
+                        author = sanitize_collection_text(&s);
                     }
                 }
                 FT_COLLECTIONAUTHORKEY => {
@@ -136,7 +136,7 @@ impl Collection {
                 match tag_id {
                     FT_FILENAME => {
                         if let TagValue::String(s) = tag_value {
-                            fname = s;
+                            fname = sanitize_collection_text(&s);
                         }
                     }
                     FT_FILESIZE => match tag_value {
@@ -201,7 +201,7 @@ impl Collection {
         let mut files = Vec::new();
         let name = path
             .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
+            .map(|s| sanitize_collection_text(&s.to_string_lossy()))
             .unwrap_or_default();
 
         let mut line_count = 0usize;
@@ -317,6 +317,12 @@ impl Collection {
         }
         content
     }
+}
+
+/// Collection files come from other users; strip controls and bidi overrides
+/// before any name/author reaches the UI.
+fn sanitize_collection_text(value: &str) -> String {
+    crate::security::sanitize_remote_text(value, 4096)
 }
 
 fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
@@ -662,6 +668,56 @@ mod tests {
         );
         let parsed = parse_ed2k_link(text.trim()).expect("parse emitted link");
         assert_eq!(parsed.ember_file_hash, digest);
+    }
+
+    fn temp_collection_path(tag: &str, ext: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ember_collection_{tag}_{}_{}.{ext}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default(),
+        ))
+    }
+
+    #[test]
+    fn binary_collection_load_strips_bidi_controls() {
+        let collection = Collection {
+            name: "Pics\u{202E}exe.gpj".to_string(),
+            author: "Mal\u{200B}lory\u{2066}".to_string(),
+            files: vec![CollectionFile {
+                name: "Holiday\u{202E}gpj.exe\n".to_string(),
+                size: 9,
+                hash: "00112233445566778899aabbccddeeff".to_string(),
+                aich_hash: String::new(),
+                ember_file_hash: String::new(),
+            }],
+        };
+        let path = temp_collection_path("bidi", "emulecollection");
+        std::fs::write(&path, collection.to_binary_bytes().unwrap()).unwrap();
+        let loaded = Collection::load(&path).expect("load collection");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.name, "Picsexe.gpj");
+        assert_eq!(loaded.author, "Mallory");
+        assert_eq!(loaded.files[0].name, "Holidaygpj.exe");
+        assert_eq!(loaded.files[0].hash, "00112233445566778899aabbccddeeff");
+    }
+
+    #[test]
+    fn text_collection_load_strips_percent_encoded_bidi_controls() {
+        let path = temp_collection_path("bidi_text", "txt");
+        std::fs::write(
+            &path,
+            "ed2k://|file|Holiday%E2%80%AEgpj.exe|9|00112233445566778899aabbccddeeff|/\n",
+        )
+        .unwrap();
+        let loaded = Collection::load(&path).expect("load text collection");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].name, "Holidaygpj.exe");
     }
 
     #[test]

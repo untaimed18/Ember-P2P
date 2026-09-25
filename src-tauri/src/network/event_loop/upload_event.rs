@@ -398,6 +398,11 @@ pub(in crate::network) async fn on_upload_event(
                 // bidi/control primitives chat text goes through
                 // before it reaches the UI.
                 let safe_name = crate::security::sanitize_chat_text(&offer.file_name);
+                crate::network::browse::record_friend_offer(
+                    offer_eh,
+                    offer.file_hash,
+                    offer.friends_only,
+                );
                 let _ = app_handle.emit(
                     "ember:file-offer",
                     serde_json::json!({
@@ -406,6 +411,7 @@ pub(in crate::network) async fn on_upload_event(
                         "file_name": safe_name,
                         "file_size": offer.file_size,
                         "ember_file_hash": offer.ember_file_hash.map(hex::encode),
+                        "friends_only": offer.friends_only,
                     }),
                 );
             }
@@ -805,6 +811,7 @@ pub(in crate::network) async fn on_upload_event(
                 // hold authenticated, so the grant has to be
                 // revoked the same way removal revokes it.
                 friend_hashes.write().await.remove(&decline_hash);
+                crate::network::friend_intro::forget_friend_intro_secret(&decline_hash);
                 ed2k::upload::revoke_all_secure_sessions(decline_hash);
                 let _ = app_handle.emit(
                     "ember:friend-request-declined",
@@ -985,6 +992,11 @@ pub(in crate::network) async fn on_upload_event(
                 Option<[u8; 20]>,
                 Option<[u8; 32]>,
             )> = Vec::new();
+            let mut restricted_entries: Vec<[u8; 16]> = Vec::new();
+            // Fail closed until known.met is absorbed: a friends-only row
+            // can still read public in the index during that window, and
+            // the friend would then republish it.
+            let catalog_authoritative = known_files.is_authoritative();
             // Mutual friends see friends-only files alongside
             // public ones — that is the whole point of the scope.
             for f in files
@@ -1021,6 +1033,16 @@ pub(in crate::network) async fn on_upload_event(
                 } else {
                     None
                 };
+                if !catalog_authoritative
+                    || f.friends_only
+                    || known_files.find_by_hash(&hash).is_some_and(|r| r.friends_only)
+                    || upload_server::friends_only_snapshot_contains(
+                        shared_friends_only_hashes,
+                        &hash,
+                    )
+                {
+                    restricted_entries.push(hash);
+                }
                 encoded_entries.push((hash, f.size, name_bytes, aich, ember));
                 // Rough pre-cap so encode stays under the frame budget.
                 let approx = encoded_entries.iter().fold(8usize, |acc, e| {
@@ -1034,6 +1056,24 @@ pub(in crate::network) async fn on_upload_event(
                 });
                 if approx >= MAX_BROWSE_ANSWER_BYTES {
                     break;
+                }
+            }
+            // Pre-EBR1 requesters predate the scope frame too. It goes
+            // first on the same stream so it is already attached to the
+            // pending request when the answer lands.
+            if supports_ebr1 && !restricted_entries.is_empty() {
+                let scope = crate::network::browse::encode_browse_scope(restricted_entries.iter());
+                let frame = ed2k::messages::build_ember_ext_frame(
+                    ed2k::messages::EMBER_EXT_BROWSE_SCOPE,
+                    &scope,
+                );
+                if let Err(e) = send_browse_response_to_origin(reply_tx, frame) {
+                    tracing::warn!(
+                        "Browse scope to {} on session {} dropped, listing public files only: {e}",
+                        hex::encode(browse_eh),
+                        session_id,
+                    );
+                    encoded_entries.retain(|(h, ..)| !restricted_entries.contains(h));
                 }
             }
             let res_payload = if supports_ebr1 {
@@ -1146,6 +1186,39 @@ pub(in crate::network) async fn on_upload_event(
         return;
     }
 
+    if let UploadEventKind::EmberBrowseScope {
+        ember_hash: scope_eh,
+        session_id,
+        ref body,
+    } = event.kind
+    {
+        if !friend_hashes.read().await.contains(&scope_eh) {
+            return;
+        }
+        match crate::network::browse::parse_browse_scope(body) {
+            Some(restricted) => {
+                if !crate::network::browse::attach_browse_scope(
+                    &mut state.pending_browse_requests,
+                    scope_eh,
+                    session_id,
+                    restricted,
+                ) {
+                    debug!(
+                        "Ignoring browse scope from {} with no request pending on session {}",
+                        hex::encode(scope_eh),
+                        session_id
+                    );
+                }
+            }
+            None => debug!(
+                "Friend {} sent an unparseable browse scope ({} bytes)",
+                hex::encode(scope_eh),
+                body.len()
+            ),
+        }
+        return;
+    }
+
     if let UploadEventKind::EmberBrowseResponse {
         ember_hash: browse_eh,
         session_id,
@@ -1157,6 +1230,16 @@ pub(in crate::network) async fn on_upload_event(
             return;
         }
         let hash_hex = hex::encode(browse_eh);
+        let restricted = crate::network::browse::take_browse_scope(
+            &mut state.pending_browse_requests,
+            browse_eh,
+            session_id,
+        )
+        .unwrap_or_default();
+        let listed: Vec<[u8; 16]> = entries
+            .iter()
+            .filter_map(|(hash, ..)| parse_ed2k_hash16(hash))
+            .collect();
         let files: Vec<serde_json::Value> = entries
             .iter()
             .map(|(hash, size, name, aich, ember)| {
@@ -1166,6 +1249,11 @@ pub(in crate::network) async fn on_upload_event(
                     "size": size,
                     "name": clean_name,
                 });
+                if parse_ed2k_hash16(hash).is_some_and(|h| restricted.contains(&h)) {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("friends_only".into(), serde_json::Value::Bool(true));
+                }
                 if let Some(aich_hash) = aich.as_ref().filter(|h| h.len() == 40) {
                     obj.as_object_mut().unwrap().insert(
                         "aich_hash".into(),
@@ -1187,6 +1275,7 @@ pub(in crate::network) async fn on_upload_event(
             browse_eh,
             session_id,
         ) {
+            crate::network::browse::record_friend_listing(browse_eh, listed.iter(), &restricted);
             let _ = app_handle.emit("ember:browse-result", serde_json::json!({
                 "user_hash": hash_hex,
                 "request_id": request_id,

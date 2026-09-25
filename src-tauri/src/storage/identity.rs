@@ -75,6 +75,13 @@ pub struct NodeIdentity {
     /// X25519 static public key (32 bytes) for Noise protocol transport encryption.
     #[serde(default)]
     pub noise_public_key: [u8; 32],
+    /// Random secret carried in the `ember3:` friend code. The rendezvous
+    /// intro capability is derived from it, so a public key seen in a room
+    /// roster is not enough to locate this node. Resettable, so the live
+    /// value is `network::friend_intro::own_intro_secret`; this is the
+    /// persisted copy read at startup.
+    #[serde(default)]
+    pub intro_secret: [u8; crypto::INTRO_SECRET_LEN],
 }
 
 impl std::fmt::Debug for NodeIdentity {
@@ -88,6 +95,7 @@ impl std::fmt::Debug for NodeIdentity {
             .field("ed25519_public_key", &"[redacted]")
             .field("noise_private_key", &"[redacted]")
             .field("noise_public_key", &"[redacted]")
+            .field("intro_secret", &"[redacted]")
             .finish()
     }
 }
@@ -128,7 +136,36 @@ impl NodeIdentity {
             ed25519_public_key: public_key.to_bytes(),
             noise_private_key,
             noise_public_key,
+            intro_secret: crypto::generate_intro_secret(),
         })
+    }
+
+    fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
+        let data = Zeroizing::new(serde_json::to_vec_pretty(self)?);
+        let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
+        crate::security::atomic_write(&data_dir.join("identity.json"), &protected, true)?;
+        crate::security::atomic_write(
+            &data_dir.join("identity.protected"),
+            PROTECTION_MARKER,
+            true,
+        )?;
+        Ok(())
+    }
+
+    /// Replace the intro secret, invalidating every `ember3:` code shared so
+    /// far. Friends already confirmed both ways are unaffected: they find us
+    /// through pairwise capabilities, which do not involve this secret.
+    pub fn rotate_intro_secret(
+        data_dir: &Path,
+    ) -> anyhow::Result<[u8; crypto::INTRO_SECRET_LEN]> {
+        let mut id = Self::load_or_create(data_dir)?;
+        let mut fresh = crypto::generate_intro_secret();
+        while fresh == id.intro_secret || fresh == [0u8; crypto::INTRO_SECRET_LEN] {
+            fresh = crypto::generate_intro_secret();
+        }
+        id.intro_secret = fresh;
+        id.save(data_dir)?;
+        Ok(fresh)
     }
 
     pub fn kad_id(&self) -> KadId {
@@ -142,15 +179,7 @@ impl NodeIdentity {
     pub fn replace_user_hash(data_dir: &Path, user_hash: [u8; 16]) -> anyhow::Result<()> {
         let mut id = Self::load_or_create(data_dir)?;
         id.user_hash = user_hash;
-        let data = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
-        let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
-        crate::security::atomic_write(&data_dir.join("identity.json"), &protected, true)?;
-        crate::security::atomic_write(
-            &data_dir.join("identity.protected"),
-            PROTECTION_MARKER,
-            true,
-        )?;
-        Ok(())
+        id.save(data_dir)
     }
 
     /// Load identity from disk, or generate and save a new one.
@@ -306,6 +335,12 @@ impl NodeIdentity {
                             id.noise_public_key.copy_from_slice(&noise_keypair.public);
                             migrated = true;
                             info!("Migrated identity: generated Noise static keypair");
+                        }
+
+                        if id.intro_secret == [0u8; crypto::INTRO_SECRET_LEN] {
+                            id.intro_secret = crypto::generate_intro_secret();
+                            migrated = true;
+                            info!("Migrated identity: generated friend-code intro secret");
                         }
 
                         if migrated {
@@ -493,6 +528,52 @@ mod tests {
 
         std::fs::write(dir.join("identity.json.ember-replace-bak"), b"parked").unwrap();
         assert!(crate::security::interrupted_replace_backup_exists(&path));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn temp_identity_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-identity-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn intro_secret_is_generated_persisted_and_rotatable() {
+        let dir = temp_identity_dir("intro");
+        let first = NodeIdentity::load_or_create(&dir).expect("mint");
+        assert_ne!(first.intro_secret, [0u8; crypto::INTRO_SECRET_LEN]);
+        let reloaded = NodeIdentity::load_or_create(&dir).expect("reload");
+        assert_eq!(reloaded.intro_secret, first.intro_secret);
+
+        let rotated = NodeIdentity::rotate_intro_secret(&dir).expect("rotate");
+        assert_ne!(rotated, first.intro_secret);
+        let after = NodeIdentity::load_or_create(&dir).expect("reload after rotate");
+        assert_eq!(after.intro_secret, rotated);
+        assert_eq!(after.ed25519_public_key, first.ed25519_public_key);
+        assert_eq!(after.kad_id, first.kad_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Identities written before the intro secret existed deserialize with an
+    /// all-zero one, which would make every such install share a single
+    /// "secret". Loading must mint a real one and persist it.
+    #[test]
+    fn legacy_identity_without_intro_secret_is_migrated() {
+        let dir = temp_identity_dir("intro-legacy");
+        let mut legacy = serde_json::to_value(NodeIdentity::generate().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("intro_secret");
+        let protected =
+            crate::storage::secret_store::protect(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        std::fs::write(dir.join("identity.json"), protected).unwrap();
+
+        let loaded = NodeIdentity::load_or_create(&dir).expect("load legacy");
+        assert_ne!(loaded.intro_secret, [0u8; crypto::INTRO_SECRET_LEN]);
+        let again = NodeIdentity::load_or_create(&dir).expect("reload");
+        assert_eq!(again.intro_secret, loaded.intro_secret);
         let _ = std::fs::remove_dir_all(dir);
     }
 

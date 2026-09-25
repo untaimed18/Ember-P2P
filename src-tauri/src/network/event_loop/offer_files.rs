@@ -63,11 +63,7 @@ pub(in crate::network) async fn drain_offer_files(
                     ) {
                         continue;
                     }
-                    if !kad_may_advertise_partial(
-                        known_files,
-                        &restricted,
-                        &transfer.file_hash,
-                    ) {
+                    if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                         continue;
                     }
                     if transfer.file_hash.is_empty()

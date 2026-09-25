@@ -26,8 +26,8 @@ use super::messages::PARTSIZE;
 ///
 /// Global rather than per-file because an upload session holds no handle to
 /// the download worker's tracker. The cost of the over-broad signal is one
-/// extra `.part.met` parse on unrelated partial seeds, which is far cheaper
-/// than shipping bytes we can no longer vouch for.
+/// [`UNVERIFIED_SINCE_CLEAR`] lookup on unrelated partial seeds, which is far
+/// cheaper than shipping bytes we can no longer vouch for.
 static VERIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Current value of [`VERIFICATION_EPOCH`]. A cached tracker built at a
@@ -38,6 +38,90 @@ pub fn verification_epoch() -> u64 {
 
 fn bump_verification_epoch() {
     VERIFICATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Parts some tracker un-verified in memory and no tracker has verified since,
+/// keyed by sidecar path and by file hash.
+///
+/// The epoch alone only tells an upload session to re-read `.part.met`, and
+/// the download worker persists the cleared bit later (or never, if the save
+/// fails), so the re-read could pick up the pre-invalidation sidecar and cache
+/// it as current. Every `.part.met` load therefore applies this set on top of
+/// whatever the file says. Entries are recorded before the epoch bump and
+/// dropped only when a part is verified again (or the sidecar is deleted), so
+/// there is no window in which neither the file nor this set carries the
+/// clear.
+///
+/// Keyed twice because the upload side reaches the file through a resolved,
+/// possibly canonicalised path that need not match the worker's `met_path`
+/// byte for byte, while the hash it reads back out of the sidecar always does.
+static UNVERIFIED_SINCE_CLEAR: OnceLock<parking_lot::Mutex<UnverifiedSinceClear>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct UnverifiedSinceClear {
+    by_path: HashMap<PathBuf, HashSet<usize>>,
+    by_hash: HashMap<[u8; 16], HashSet<usize>>,
+}
+
+impl UnverifiedSinceClear {
+    fn record(&mut self, path: &Path, hash: &[u8; 16], parts: &[usize]) {
+        if parts.is_empty() {
+            return;
+        }
+        self.by_path
+            .entry(path.to_path_buf())
+            .or_default()
+            .extend(parts.iter().copied());
+        if *hash != [0u8; 16] {
+            self.by_hash.entry(*hash).or_default().extend(parts.iter().copied());
+        }
+    }
+
+    fn clear_part(&mut self, path: &Path, hash: &[u8; 16], part: usize) {
+        if let Some(set) = self.by_path.get_mut(path) {
+            set.remove(&part);
+            if set.is_empty() {
+                self.by_path.remove(path);
+            }
+        }
+        if let Some(set) = self.by_hash.get_mut(hash) {
+            set.remove(&part);
+            if set.is_empty() {
+                self.by_hash.remove(hash);
+            }
+        }
+    }
+
+    fn clear_all(&mut self, path: &Path, hash: &[u8; 16]) {
+        self.by_path.remove(path);
+        self.by_hash.remove(hash);
+    }
+
+    fn parts_for(&self, path: &Path, hash: &[u8; 16]) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        if let Some(set) = self.by_path.get(path) {
+            out.extend(set.iter().copied());
+        }
+        if *hash != [0u8; 16] {
+            if let Some(set) = self.by_hash.get(hash) {
+                out.extend(set.iter().copied());
+            }
+        }
+        out
+    }
+}
+
+fn unverified_since_clear() -> &'static parking_lot::Mutex<UnverifiedSinceClear> {
+    UNVERIFIED_SINCE_CLEAR.get_or_init(|| parking_lot::Mutex::new(UnverifiedSinceClear::default()))
+}
+
+/// Cheap change detector for the `.part.met` beside `part_file`: modification
+/// time and length. `None` when the sidecar cannot be stat'ed, which callers
+/// must treat as "changed".
+pub fn part_met_fingerprint(part_file: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(part_file.with_extension("part.met")).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 const OLD_PART_MET_MAGIC: u32 = 0x504D4554; // "PMET" - legacy format
@@ -462,14 +546,48 @@ impl PartTracker {
     pub fn clear_part_hashes_and_verified(&mut self) {
         self.part_hashes.clear();
         self.file_hash_verified = false;
-        let had_verified = self.part_verified.iter().any(|&v| v);
+        let cleared: Vec<usize> = self
+            .part_verified
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| v.then_some(i))
+            .collect();
         for flag in self.part_verified.iter_mut() {
             *flag = false;
         }
-        if had_verified {
+        if !cleared.is_empty() {
             // An upload session may be serving these parts out of a cached
             // tracker right now; see `VERIFICATION_EPOCH`.
+            self.record_unverified(&cleared);
             bump_verification_epoch();
+        }
+    }
+
+    /// Publish parts this tracker just un-verified to
+    /// [`UNVERIFIED_SINCE_CLEAR`]. Must run before the epoch bump.
+    fn record_unverified(&self, parts: &[usize]) {
+        unverified_since_clear()
+            .lock()
+            .record(&self.met_path, &self.file_hash, parts);
+    }
+
+    /// Clear every verified bit that some tracker withdrew in memory and has
+    /// not re-established, regardless of what `.part.met` said. Applied by
+    /// every load; callers holding a long-lived disk snapshot call it again
+    /// when [`verification_epoch`] moves, which is far cheaper than a re-parse.
+    pub fn apply_pending_invalidations(&mut self) {
+        let parts = unverified_since_clear()
+            .lock()
+            .parts_for(&self.met_path, &self.file_hash);
+        let mut cleared = false;
+        for p in parts {
+            if let Some(flag) = self.part_verified.get_mut(p) {
+                cleared |= *flag;
+                *flag = false;
+            }
+        }
+        if cleared {
+            self.file_hash_verified = false;
         }
     }
 
@@ -528,6 +646,7 @@ impl PartTracker {
             if self.part_verified[part_idx] {
                 // See `VERIFICATION_EPOCH`: a partial-file upload session may
                 // still be serving this part from a cached tracker.
+                self.record_unverified(&[part_idx]);
                 bump_verification_epoch();
             }
             self.part_verified[part_idx] = false;
@@ -549,6 +668,9 @@ impl PartTracker {
     pub fn set_part_verified(&mut self, part_idx: usize) {
         if part_idx < self.part_verified.len() {
             self.part_verified[part_idx] = true;
+            unverified_since_clear()
+                .lock()
+                .clear_part(&self.met_path, &self.file_hash, part_idx);
         }
     }
 
@@ -597,6 +719,9 @@ impl PartTracker {
         for flag in self.part_verified.iter_mut() {
             *flag = true;
         }
+        unverified_since_clear()
+            .lock()
+            .clear_all(&self.met_path, &self.file_hash);
     }
 
     /// Mark a byte range as not received (e.g. AICH-identified bad 180 KiB blocks inside a part).
@@ -605,15 +730,18 @@ impl PartTracker {
         if start < end && end <= self.file_size && !self.part_verified.is_empty() {
             let first = (start / PARTSIZE) as usize;
             let last = ((end - 1) / PARTSIZE) as usize;
-            let mut cleared = false;
+            let mut cleared = Vec::new();
             for p in first..=last.min(self.part_count.saturating_sub(1)) {
-                cleared |= self.part_verified[p];
+                if self.part_verified[p] {
+                    cleared.push(p);
+                }
                 self.part_verified[p] = false;
             }
-            if cleared {
+            if !cleared.is_empty() {
                 // See `VERIFICATION_EPOCH`. AICH-identified bad blocks land
                 // here, so this is the path that most needs an upload session
                 // to stop serving the range immediately.
+                self.record_unverified(&cleared);
                 bump_verification_epoch();
             }
         }
@@ -1103,6 +1231,7 @@ impl PartTracker {
         self.write_reservations.clear();
         self.in_flight_requests.clear();
         self.sync_to_on_disk_part_length();
+        self.apply_pending_invalidations();
     }
 
     /// If the `.part` file exists but is shorter than `file_size`, drop
@@ -1667,6 +1796,9 @@ impl PartTracker {
     pub fn delete_met(&self, allowed_roots: &[String]) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
         suppressed_met_saves().lock().insert(&self.met_path);
+        unverified_since_clear()
+            .lock()
+            .clear_all(&self.met_path, &self.file_hash);
         let path_guard = save_path_guard(&self.met_path);
         {
             let _guard = path_guard.lock();
@@ -2598,6 +2730,99 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    fn unique_test_hash() -> [u8; 16] {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut hash = [0u8; 16];
+        hash[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        hash[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        hash[12..].copy_from_slice(&[0xE5, 0x7A, 0x1E, 0xD0]);
+        hash
+    }
+
+    /// Two verified, complete parts (plus a missing third, since a sidecar
+    /// with no gaps reloads as an unverified completion candidate) saved to
+    /// disk, returned with the live tracker still holding that state.
+    fn saved_two_verified_parts(name: &str) -> (PathBuf, PartTracker) {
+        let part_path = temp_part_path(name);
+        let file_size = PARTSIZE * 3;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash(unique_test_hash());
+        tracker.fill_range(0, 2 * PARTSIZE);
+        tracker.set_part_verified(0);
+        tracker.set_part_verified(1);
+        tracker.save();
+        (part_path, tracker)
+    }
+
+    /// The download worker clears a verified bit under its lock and persists
+    /// it later (or not at all). A reader that re-parses the sidecar in
+    /// between must not get the withdrawn part back as serveable.
+    #[test]
+    fn stale_part_met_does_not_resurrect_an_invalidated_part() {
+        let (part_path, mut live) = saved_two_verified_parts("stale-invalidate");
+        live.invalidate_range(100, 200);
+
+        let reread = PartTracker::new(live.file_size, &part_path);
+        assert!(!reread.is_part_verified(0), "withdrawn part must stay unverified");
+        assert!(!reread.is_range_safe_to_serve(0, PARTSIZE));
+        assert!(reread.is_part_verified(1), "untouched part keeps its bit");
+
+        // Re-verifying the part in memory lifts the override even though the
+        // sidecar has not been rewritten since.
+        live.fill_range(100, 200);
+        live.set_part_verified(0);
+        let reread = PartTracker::new(live.file_size, &part_path);
+        assert!(reread.is_part_verified(0));
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// Upload sessions reach the sidecar through a resolved path that need not
+    /// match the worker's spelling; the hash stored inside still identifies it.
+    #[test]
+    fn invalidation_is_found_by_file_hash_under_another_path() {
+        let (part_path, mut live) = saved_two_verified_parts("stale-by-hash");
+        let other_part = temp_part_path("stale-by-hash-alias");
+        std::fs::copy(
+            part_path.with_extension("part.met"),
+            other_part.with_extension("part.met"),
+        )
+        .unwrap();
+        live.mark_incomplete(1);
+
+        let reread = PartTracker::new(live.file_size, &other_part);
+        assert!(reread.is_part_verified(0));
+        assert!(!reread.is_part_verified(1));
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+        let _ = std::fs::remove_file(other_part.with_extension("part.met"));
+    }
+
+    /// A long-lived snapshot parsed before the clear catches up without a
+    /// re-read once it applies the pending set.
+    #[test]
+    fn cached_snapshot_picks_up_pending_invalidations_without_reparse() {
+        let (part_path, mut live) = saved_two_verified_parts("stale-cached");
+        let mut cached = PartTracker::new(live.file_size, &part_path);
+        assert!(cached.is_part_verified(0) && cached.is_part_verified(1));
+
+        let epoch = verification_epoch();
+        live.clear_part_hashes_and_verified();
+        assert_ne!(verification_epoch(), epoch);
+        assert!(cached.is_part_verified(0), "snapshot is stale until applied");
+        cached.apply_pending_invalidations();
+        assert!(!cached.is_part_verified(0));
+        assert!(!cached.is_part_verified(1));
+
+        // Completion clears the record so a later download of the same file
+        // does not inherit it.
+        live.mark_file_hash_verified();
+        let reread = PartTracker::new(live.file_size, &part_path);
+        assert!(reread.is_part_verified(0) && reread.is_part_verified(1));
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }

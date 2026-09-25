@@ -3023,7 +3023,7 @@
             <tbody>
               {#each displayedLoadedCollectionFiles as cf, i (`${cf.hash}:${i}`)}
                 <tr>
-                  <td title={cf.name}>{cf.name}</td>
+                  <td title={cf.name}><bdi dir="auto">{cf.name}</bdi></td>
                   <td class="coll-col-size">{formatSize(cf.size)}</td>
                   <td class="coll-col-hash" title={cf.hash}>{cf.hash.substring(0, 16)}&hellip;</td>
                 </tr>

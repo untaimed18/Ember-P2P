@@ -2223,6 +2223,7 @@ mod tests {
             up_part_count: None,
             up_peer_part_status: None,
             ember_verified: false,
+            friends_only: false,
         }
     }
 

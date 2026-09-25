@@ -874,6 +874,7 @@ pub(super) async fn handle_upload_event(
                 up_part_count: None,
                 up_peer_part_status: None,
                 ember_verified: false,
+                friends_only: false,
             };
             {
                 let mut mgr = transfer_manager.write().await;
@@ -1094,6 +1095,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberChatRead { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
+        | UploadEventKind::EmberBrowseScope { .. }
         | UploadEventKind::EmberBrowseSessionReady { .. }
         | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }

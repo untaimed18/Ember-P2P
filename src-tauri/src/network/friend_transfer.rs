@@ -516,8 +516,7 @@ pub(super) async fn friend_transfer_request_status(
     // a deadlock — nothing in the codebase ever takes `mutual_friend_hashes`
     // and then wants `local_index`, so the order is one-directional — but it
     // was the only place that nested the two, and the equivalent checks in
-    // `resolve_upload_file` and `friends_only_and_barred` already read the
-    // file out first. Keeping one order everywhere is what makes that property
+    // `resolve_upload_file` already reads the file out first. Keeping one order everywhere is what makes that property
     // easy to keep true.
     let restriction = {
         let index = local_index.read().await;

@@ -109,8 +109,15 @@ export async function updateFriendNickname(userHashHex: string, nickname: string
   return invoke('update_friend_nickname', { userHashHex, nickname });
 }
 
+/** Our current `ember3:` Friend Code. */
 export async function getMyEmberHash(): Promise<string> {
   return invoke('get_my_ember_hash');
+}
+
+/** Mint a new intro secret, invalidating every Friend Code shared so far.
+ *  Resolves with the new code. */
+export async function resetFriendCode(): Promise<string> {
+  return invoke('reset_friend_code');
 }
 
 /**
@@ -161,6 +168,8 @@ export interface IncomingFileOffer {
   file_name: string;
   file_size: number;
   ember_file_hash?: string;
+  /** The sender restricts this file to friends; our copy will be friends-only. */
+  friends_only?: boolean;
 }
 
 /** Where a chat attachment is. See `network/chat_attach.rs` for who moves it. */
@@ -334,4 +343,6 @@ export interface BrowseFileEntry {
   aich_hash?: string;
   /** Optional 64-char hex BLAKE3 digest when the peer includes it. */
   ember_file_hash?: string;
+  /** Set when the friend restricts this file; a download of it stays friends-only. */
+  friends_only?: boolean;
 }

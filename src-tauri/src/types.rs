@@ -306,6 +306,12 @@ pub struct Transfer {
     /// claims a check that actually ran.
     #[serde(default)]
     pub ember_verified: bool,
+    /// Downloads only: the friend this file came from restricts it to
+    /// friends, so our copy is never advertised or served on the open network
+    /// (server offers, KAD, Ember, EPX, source exchange) and is shared
+    /// friends-only once complete. Only ever set, never cleared.
+    #[serde(default)]
+    pub friends_only: bool,
 }
 
 fn default_priority() -> String {

@@ -27,7 +27,16 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 52;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 54;
+
+/// A friend row with no public key bound to its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashOnlyFriend {
+    pub hash: [u8; 16],
+    pub mutual: bool,
+    /// Unix seconds of the last contact, or of the add if never seen.
+    pub last_contact: i64,
+}
 
 /// One friend-chat row as the UI needs it.
 #[derive(Debug, Clone)]
@@ -129,7 +138,8 @@ pub enum ChannelEditOutcome {
     /// the catch-up path: a member who was away is handed the revision instead of
     /// the original followed by it.
     Created(i64),
-    /// Signed by somebody other than the line's author.
+    /// Signed by somebody other than the line's author — or, for a line we do
+    /// not hold, by somebody the line's id does not prove to be its author.
     NotAuthor,
     /// The 15-minute window had closed on at least one of the two clocks.
     OutsideWindow,
@@ -2495,6 +2505,31 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 53 {
+            // A download from a friend who restricts the file to friends. The
+            // flag has to outlive a restart: a resumed partial that forgot it
+            // would be offered to servers and KAD the moment it came back.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "transfers",
+                "friends_only",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 53)?;
+            tx.commit()?;
+        }
+
+        if version < 54 {
+            // The intro secret from a friend's `ember3:` code. Until they add
+            // us back it is the only way to find them on the rendezvous
+            // server, so a one-sided add must keep working across restarts.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "friends", "intro_secret", "BLOB")?;
+            set_version(&tx, 54)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -3195,8 +3230,8 @@ impl Database {
             TransferStatus::NoneNeeded => "noneneeded",
         };
         conn.execute(
-            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                file_name = excluded.file_name,
                file_hash = excluded.file_hash,
@@ -3212,7 +3247,8 @@ impl Database {
                priority = excluded.priority,
                category = excluded.category,
                expected_aich = excluded.expected_aich,
-               ember_file_hash = excluded.ember_file_hash",
+               ember_file_hash = excluded.ember_file_hash,
+               friends_only = MAX(friends_only, excluded.friends_only)",
             params![
                 transfer.id,
                 transfer.file_name,
@@ -3237,7 +3273,20 @@ impl Database {
                 transfer.category,
                 transfer.expected_aich,
                 transfer.ember_file_hash,
+                transfer.friends_only,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a download as coming from a friend who restricts the file. Never
+    /// cleared: `save_transfer` keeps the stored flag when a stale snapshot
+    /// without it is written back.
+    pub fn mark_transfer_friends_only(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE transfers SET friends_only = 1 WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }
@@ -3257,7 +3306,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -3398,6 +3447,7 @@ impl Database {
                         // loader, and an incomplete one hasn't been checked
                         // yet either way.
                         ember_verified: false,
+                        friends_only: row.get::<_, i64>(16).unwrap_or(0) != 0,
                     })
                 },
             )?
@@ -4550,6 +4600,142 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(Some(mutual))
+    }
+
+    /// Record the intro secret from a friend's `ember3:` code. `false` when no
+    /// friend row matches (removed in between), so nothing was written.
+    pub fn set_friend_intro_secret(
+        &self,
+        user_hash: &str,
+        intro_secret: &[u8; crate::network::ember::crypto::INTRO_SECRET_LEN],
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE friends SET intro_secret = ?2 WHERE user_hash = ?1",
+            params![user_hash, intro_secret.as_slice()],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Friends whose row has no usable public key — absent, malformed, or not
+    /// bound to their hash — so no pairwise presence can be registered for
+    /// them.
+    pub fn get_hash_only_friends(&self) -> anyhow::Result<Vec<HashOnlyFriend>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, ed25519_pubkey, mutual, \
+             MAX(COALESCE(last_seen, 0), COALESCE(added_at, 0)) FROM friends",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(hash_hex, pubkey, mutual, last_contact)| {
+                let hash = <[u8; 16]>::try_from(hex::decode(&hash_hex).ok()?).ok()?;
+                let keyed = pubkey
+                    .and_then(|key| <[u8; 32]>::try_from(key).ok())
+                    .is_some_and(|key| {
+                        crate::network::ember::crypto::verify_ember_hash_binding(&key, &hash)
+                    });
+                (!keyed).then_some(HashOnlyFriend {
+                    hash,
+                    mutual,
+                    last_contact,
+                })
+            })
+            .collect())
+    }
+
+    /// Store a public key learned for an existing friend. The caller has
+    /// checked it binds to the hash, which also makes it the only key the row
+    /// could legitimately hold.
+    pub fn set_friend_public_key(
+        &self,
+        user_hash: &str,
+        ed25519_pubkey: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE friends SET ed25519_pubkey = ?2 WHERE user_hash = ?1",
+            params![user_hash, ed25519_pubkey.as_slice()],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Clear intro secrets that pairwise presence has made redundant: the
+    /// friend is mutual and we hold a key bound to their hash. Returns the
+    /// hashes cleared so the in-memory copies can go too.
+    pub fn clear_keyed_mutual_friend_intro_secrets(&self) -> anyhow::Result<Vec<[u8; 16]>> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT user_hash, ed25519_pubkey FROM friends \
+                 WHERE mutual = 1 AND intro_secret IS NOT NULL AND ed25519_pubkey IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut cleared = Vec::new();
+        for (hash_hex, pubkey) in rows {
+            let Some(hash) = hex::decode(&hash_hex)
+                .ok()
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            else {
+                continue;
+            };
+            let keyed = <[u8; 32]>::try_from(pubkey).is_ok_and(|key| {
+                crate::network::ember::crypto::verify_ember_hash_binding(&key, &hash)
+            });
+            if keyed {
+                tx.execute(
+                    "UPDATE friends SET intro_secret = NULL WHERE user_hash = ?1",
+                    params![hash_hex],
+                )?;
+                cleared.push(hash);
+            }
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
+    /// Every stored friend intro secret, skipping rows that do not decode.
+    pub fn get_friend_intro_secrets(
+        &self,
+    ) -> anyhow::Result<Vec<([u8; 16], [u8; crate::network::ember::crypto::INTRO_SECRET_LEN])>>
+    {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, intro_secret FROM friends WHERE intro_secret IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(hash_hex, secret)| {
+                let hash = <[u8; 16]>::try_from(hex::decode(&hash_hex).ok()?).ok()?;
+                let secret = <[u8; crate::network::ember::crypto::INTRO_SECRET_LEN]>::try_from(
+                    secret,
+                )
+                .ok()?;
+                Some((hash, secret))
+            })
+            .collect())
     }
 
     pub fn get_friend_public_keys(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
@@ -7983,7 +8169,7 @@ impl Database {
         read: bool,
     ) -> anyhow::Result<i64> {
         const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
-        const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
+        const MAX_MESSAGES_PER_CHANNEL: i64 = Database::CHANNEL_MESSAGES_PER_CHANNEL;
         let message: &str = if message.len() > MAX_CHANNEL_MESSAGE_LEN {
             let mut end = MAX_CHANNEL_MESSAGE_LEN;
             while end > 0 && !message.is_char_boundary(end) {
@@ -8000,6 +8186,14 @@ impl Database {
         } else {
             chrono::Utc::now().timestamp()
         };
+        if let Some((held_id, true)) =
+            Self::channel_line_supersedes_locked(&tx, channel_id, msg_id, sender_pubkey, now)?
+        {
+            tx.execute(
+                "DELETE FROM channel_messages WHERE id = ?1",
+                params![held_id],
+            )?;
+        }
         tx.execute(
             "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -8157,6 +8351,9 @@ impl Database {
         Ok(hits)
     }
 
+    /// Lines kept per room; older ones are pruned on insert.
+    const CHANNEL_MESSAGES_PER_CHANNEL: i64 = 5_000;
+
     /// Tombstoned `msg_id`s kept per room.
     ///
     /// Bounded for the same reason history is: an unbounded local table is a
@@ -8164,7 +8361,8 @@ impl Database {
     /// old is no longer being replayed by anyone.
     const CHANNEL_TOMBSTONES_PER_CHANNEL: i64 = 5_000;
 
-    /// Whether this device has been told to forget `msg_id`.
+    /// Whether this device has been told to forget `msg_id` as sent by
+    /// `sender_pubkey`.
     ///
     /// The ingest dedup gate asks "do we hold this line", which a deletion
     /// answers no to, so without this the next replay puts it straight back.
@@ -8172,20 +8370,48 @@ impl Database {
         &self,
         channel_id: &str,
         msg_id: &str,
+        sender_pubkey: &str,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::channel_message_forgotten_locked(&conn, channel_id, msg_id)
+        Self::channel_message_forgotten_locked(&conn, channel_id, msg_id, sender_pubkey)
+    }
+
+    /// Tombstone key for a deleted row.
+    ///
+    /// The bare id when the id binds the row's sender. Otherwise the row cannot
+    /// show the id is its own — it may be a squatter on somebody else's line —
+    /// so the tombstone names the sender too, or deleting the squatter would
+    /// bury the genuine line that has yet to arrive. Kept in the existing
+    /// `msg_id` column; `/` never occurs in an id.
+    fn channel_tombstone_key(
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        timestamp: i64,
+    ) -> String {
+        if crate::network::ember::channel::chat_msg_id_binds_hex(
+            channel_id,
+            msg_id,
+            sender_pubkey,
+            timestamp,
+        ) {
+            msg_id.to_string()
+        } else {
+            format!("{msg_id}/{}", sender_pubkey.to_ascii_lowercase())
+        }
     }
 
     fn channel_message_forgotten_locked(
         conn: &Connection,
         channel_id: &str,
         msg_id: &str,
+        sender_pubkey: &str,
     ) -> anyhow::Result<bool> {
+        let scoped = format!("{msg_id}/{}", sender_pubkey.to_ascii_lowercase());
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM channel_message_tombstones \
-             WHERE channel_id = ?1 AND msg_id = ?2",
-            params![channel_id, msg_id],
+             WHERE channel_id = ?1 AND (msg_id = ?2 OR msg_id = ?3)",
+            params![channel_id, msg_id, scoped],
             |row| row.get(0),
         )?;
         Ok(n > 0)
@@ -8199,19 +8425,26 @@ impl Database {
         // Before the row goes, while its `msg_id` is still readable. Without the
         // tombstone the delete is undone by the next gossip replay or catch-up
         // that carries the line.
-        let msg_id: Option<String> = tx
+        let held: Option<(String, String, i64)> = tx
             .query_row(
-                "SELECT msg_id FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
+                "SELECT msg_id, sender_pubkey, timestamp FROM channel_messages
+                 WHERE channel_id = ?1 AND id = ?2",
                 params![channel_id, id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some(msg_id) = msg_id.filter(|msg_id| !msg_id.is_empty()) {
+        if let Some((msg_id, sender, timestamp)) =
+            held.filter(|(msg_id, _, _)| !msg_id.is_empty())
+        {
             tx.execute(
                 "INSERT OR IGNORE INTO channel_message_tombstones
                     (channel_id, msg_id, deleted_at)
                  VALUES (?1, ?2, ?3)",
-                params![channel_id, msg_id, chrono::Utc::now().timestamp()],
+                params![
+                    channel_id,
+                    Self::channel_tombstone_key(channel_id, &msg_id, &sender, timestamp),
+                    chrono::Utc::now().timestamp()
+                ],
             )?;
             tx.execute(
                 "DELETE FROM channel_message_tombstones
@@ -8335,6 +8568,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn channel_message_exists(&self, channel_id: &str, msg_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let n: i64 = conn.query_row(
@@ -8343,6 +8577,87 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// The ingest dedup gate for a verified chat line: whether we hold a row
+    /// under its `msg_id` that it would *not* displace.
+    ///
+    /// Not [`Self::channel_message_exists`], because holding the id is not the
+    /// same as holding the line. A row somebody else put there without proving
+    /// the id is theirs must not be what turns the genuine line away as a repeat
+    /// — see [`Self::channel_line_supersedes_locked`].
+    pub fn channel_message_held(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        timestamp: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(matches!(
+            Self::channel_line_supersedes_locked(&conn, channel_id, msg_id, sender_pubkey, timestamp)?,
+            Some((_, false))
+        ))
+    }
+
+    /// The row held under `msg_id`, and whether a line signed by `sender_pubkey`
+    /// at `timestamp` should replace it.
+    ///
+    /// `msg_id`s are chosen by whoever sends first, so the first row to land
+    /// under one is not evidence it belongs there. A held row from somebody else
+    /// gives way only when it cannot show the id is its author's and the
+    /// incoming line can ([`crate::network::ember::channel::chat_msg_id_binds`]).
+    /// Nothing weaker will do: an unbound row may be a genuine line or edit an
+    /// older build stored, and letting any signed line displace it would hand
+    /// it to whoever sent one first. From the same author, an edit-only row on
+    /// an unbound id is re-judged against the original's real timestamp: the
+    /// one the revision claimed was the author's word alone.
+    ///
+    /// Our own sent lines never give way.
+    fn channel_line_supersedes_locked(
+        conn: &Connection,
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        timestamp: i64,
+    ) -> anyhow::Result<Option<(i64, bool)>> {
+        use crate::network::ember::channel::{chat_msg_id_binds_hex, edit_within_window};
+        let held: Option<(i64, String, String, String, String, i64, i64)> = conn
+            .query_row(
+                "SELECT id, sender_pubkey, direction, author_sig, edit_sig, timestamp, edited_at
+                 FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+                params![channel_id, msg_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, held_sender, direction, author_sig, edit_sig, held_ts, edited_at)) = held
+        else {
+            return Ok(None);
+        };
+        if direction == "sent" {
+            return Ok(Some((id, false)));
+        }
+        let held_bound = chat_msg_id_binds_hex(channel_id, msg_id, &held_sender, held_ts);
+        let edit_only = author_sig.is_empty() && !edit_sig.is_empty();
+        let supersedes = if held_sender.eq_ignore_ascii_case(sender_pubkey) {
+            edit_only
+                && !held_bound
+                && (held_ts != timestamp
+                    || !edit_within_window(timestamp, edited_at, 0, timestamp))
+        } else {
+            !held_bound && chat_msg_id_binds_hex(channel_id, msg_id, sender_pubkey, timestamp)
+        };
+        Ok(Some((id, supersedes)))
     }
 
     /// Decrypted messages for neighbor history catch-up.
@@ -8367,9 +8682,11 @@ impl Database {
         let limit = limit.clamp(1, 64);
         let oldest_first =
             crate::network::ember::channel::channel_sync_serves_oldest_first(since_ts);
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(i64, String, String, String, String, i64, String, i64, String)> = {
-            let conn = self.conn.lock();
+        let Some(chat_key) = self.chat_key.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn.lock();
+        {
             // A watermark is a timestamp, so a whole page sitting on the
             // watermark's own second is a page the requester cannot advance
             // past: it already holds that second, and the next round would ask
@@ -8410,45 +8727,74 @@ impl Database {
                  WHERE channel_id = ?1 AND timestamp >= ?2
                    AND (author_sig <> '' OR edit_sig <> '')
                  {order}
-                 LIMIT ?3"
+                 LIMIT ?3 OFFSET ?4"
             ))?;
-            let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ))
-            })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
-        let Some(chat_key) = self.chat_key.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, msg_id, sender, direction, stored, timestamp, author_sig, edited_at, edit_sig) in
-            rows
-        {
-            if let Ok(message) = Self::decrypt_channel_message_body(
-                chat_key, id, channel_id, &direction, timestamp, &stored,
-            ) {
-                out.push(ChannelSyncRow {
-                    msg_id,
-                    sender_pubkey: sender,
-                    message,
-                    timestamp,
-                    author_sig,
-                    edited_at,
-                    edit_sig,
-                });
+            // Rows are filtered below, after the LIMIT, so one page can come back
+            // empty; an empty reply leaves the requester's watermark where it
+            // was and it asks the same question forever. Keep reading until the
+            // page fills or the room runs out — bounded by retention, so the
+            // worst case is one pass over the room.
+            let max_pages = Self::CHANNEL_MESSAGES_PER_CHANNEL / limit + 2;
+            let mut out = Vec::with_capacity(limit as usize);
+            for page in 0..max_pages {
+                #[allow(clippy::type_complexity)]
+                let rows: Vec<(i64, String, String, String, String, i64, String, i64, String)> =
+                    stmt.query_map(
+                        params![channel_id, since_ts, limit, page * limit],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let exhausted = (rows.len() as i64) < limit;
+                for (id, msg_id, sender, direction, stored, timestamp, author_sig, edited_at, edit_sig) in
+                    rows
+                {
+                    if out.len() as i64 >= limit {
+                        break;
+                    }
+                    // Without the author's signature over the line itself, only an
+                    // id bound to them shows this row belongs under it. Anything
+                    // else is a revision taken on trust — an older build stored
+                    // those — and re-serving it would plant the same claim on
+                    // every requester.
+                    if author_sig.is_empty()
+                        && !crate::network::ember::channel::chat_msg_id_binds_hex(
+                            channel_id, &msg_id, &sender, timestamp,
+                        )
+                    {
+                        continue;
+                    }
+                    if let Ok(message) = Self::decrypt_channel_message_body(
+                        chat_key, id, channel_id, &direction, timestamp, &stored,
+                    ) {
+                        out.push(ChannelSyncRow {
+                            msg_id,
+                            sender_pubkey: sender,
+                            message,
+                            timestamp,
+                            author_sig,
+                            edited_at,
+                            edit_sig,
+                        });
+                    }
+                }
+                if exhausted || out.len() as i64 >= limit {
+                    break;
+                }
             }
+            Ok(out)
         }
-        Ok(out)
     }
 
     /// The few fields deciding whether a local edit or reaction is allowed.
@@ -8487,7 +8833,10 @@ impl Database {
     /// diverge on it:
     ///
     /// * the editor must be the key that authored the line — a signature proves
-    ///   who asked, not that they were entitled to;
+    ///   who asked, not that they were entitled to. For a line we do not hold
+    ///   that means the id itself must bind the editor
+    ///   ([`crate::network::ember::channel::chat_msg_id_binds`]); a revision of
+    ///   an unbound id is refused rather than stored under the editor's name;
     /// * the window must still be open on both clocks
     ///   ([`crate::network::ember::channel::edit_within_window`]);
     /// * and a revision must be newer than the one we already applied, so a
@@ -8508,6 +8857,12 @@ impl Database {
         edit_sig: &str,
         now: i64,
     ) -> anyhow::Result<ChannelEditOutcome> {
+        // A future-dated revision would win every later newer-wins comparison.
+        if edited_at
+            > now.saturating_add(crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+        {
+            return Ok(ChannelEditOutcome::OutsideWindow);
+        }
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         let existing: Option<(i64, String, String, i64, i64, i64)> = tx
@@ -8527,6 +8882,24 @@ impl Database {
                 },
             )
             .optional()?;
+        use crate::network::ember::channel::chat_msg_id_binds_hex;
+        let editor_owns_id =
+            chat_msg_id_binds_hex(channel_id, msg_id, editor_pubkey, original_timestamp);
+        // The held row cannot show the id is its sender's and the revision can,
+        // so it was squatting on somebody else's line. Rolled back with the rest
+        // of the transaction if the revision is refused below.
+        let existing = match existing {
+            Some((id, sender, direction, timestamp, ..))
+                if editor_owns_id
+                    && direction != "sent"
+                    && !sender.eq_ignore_ascii_case(editor_pubkey)
+                    && !chat_msg_id_binds_hex(channel_id, msg_id, &sender, timestamp) =>
+            {
+                tx.execute("DELETE FROM channel_messages WHERE id = ?1", params![id])?;
+                None
+            }
+            other => other,
+        };
 
         let (id, direction, row_timestamp, created) = match existing {
             Some((id, sender, direction, timestamp, prior_edit, first_seen_at)) => {
@@ -8550,18 +8923,33 @@ impl Database {
                 // Absent because this device deleted it, not because it was
                 // never here. Storing the revision would put the line back under
                 // the very id the user asked to forget.
-                if Self::channel_message_forgotten_locked(&tx, channel_id, msg_id)? {
+                if Self::channel_message_forgotten_locked(&tx, channel_id, msg_id, editor_pubkey)? {
                     return Ok(ChannelEditOutcome::Forgotten);
                 }
+                // Stored under the editor's name, so the editor has to be shown to
+                // own the id: a signature proves who sent the revision, not whose
+                // line it names. Refused rather than parked, because a revision
+                // from the real author cannot be told apart from anyone else's
+                // here, and the genuine line arriving later still lands.
+                if !editor_owns_id {
+                    return Ok(ChannelEditOutcome::NotAuthor);
+                }
                 // Catch-up: judged on the author's clock alone, because a line we
-                // never held has no first-seen time to check against. Stored as
+                // never held has no first-seen time to check against. The id binds
+                // `original_timestamp`, so that clock cannot be re-dated. Stored as
                 // `received`, since a revision only reaches us from elsewhere.
-                if !crate::network::ember::channel::edit_within_window(
-                    original_timestamp,
-                    edited_at,
-                    0,
-                    now,
-                ) {
+                //
+                // The row takes `original_timestamp` as its own, so it is held to
+                // the envelope rule too: a far-future row would sit above every
+                // history-sync watermark.
+                if !crate::network::ember::channel::gossip_timestamp_ok(original_timestamp, now)
+                    || !crate::network::ember::channel::edit_within_window(
+                        original_timestamp,
+                        edited_at,
+                        0,
+                        now,
+                    )
+                {
                     return Ok(ChannelEditOutcome::OutsideWindow);
                 }
                 tx.execute(
@@ -8767,11 +9155,18 @@ impl Database {
         Ok(mapped.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The history-sync watermark. Rows dated past the gossip skew are left out:
+    /// one of those as the maximum would put the watermark above everything
+    /// still missing, and an older build could store one from a revision.
     pub fn latest_channel_message_timestamp(&self, channel_id: &str) -> anyhow::Result<i64> {
+        let ceiling = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS);
         let conn = self.conn.lock();
         let ts: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(timestamp), 0) FROM channel_messages WHERE channel_id = ?1",
-            params![channel_id],
+            "SELECT COALESCE(MAX(timestamp), 0) FROM channel_messages
+             WHERE channel_id = ?1 AND timestamp <= ?2",
+            params![channel_id, ceiling],
             |row| row.get(0),
         )?;
         Ok(ts)
@@ -10340,6 +10735,43 @@ mod tests {
     }
 
     #[test]
+    fn transfer_friends_only_survives_restart_and_stale_saves() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-friends-only-transfer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (
+                    id, file_name, file_hash, peer_id, peer_name, direction, status,
+                    progress, speed, total_size, transferred, started_at, priority,
+                    category, expected_aich, ember_file_hash
+                 ) VALUES (?1, 'file.bin', ?2, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', NULL, NULL)",
+                params!["transfer-restricted", "22".repeat(16)],
+            )
+            .unwrap();
+        let loaded = db.get_incomplete_downloads().unwrap();
+        assert!(!loaded[0].friends_only, "rows from before the column read as unrestricted");
+
+        db.mark_transfer_friends_only("transfer-restricted").unwrap();
+        let mut restricted = db.get_incomplete_downloads().unwrap().remove(0);
+        assert!(restricted.friends_only);
+
+        // A snapshot taken before the flag was set must not clear it.
+        restricted.friends_only = false;
+        db.save_transfer(&restricted).unwrap();
+        assert!(db.get_incomplete_downloads().unwrap()[0].friends_only);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
     fn pending_restore_is_paginated_and_overflow_is_quarantined_without_deletion() {
         let path = std::env::temp_dir().join(format!(
             "ember-pending-budget-{}-{}.db",
@@ -10437,6 +10869,106 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn friend_intro_secret_is_stored_and_listed_per_friend() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-friend-intro-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let hash = "0123456789abcdef0123456789abcdef";
+        let secret = [0x5Cu8; crate::network::ember::crypto::INTRO_SECRET_LEN];
+
+        assert!(!db.set_friend_intro_secret(hash, &secret).expect("no row"));
+        db.add_friend(hash, "Code", None).expect("add");
+        db.add_friend("fedcba9876543210fedcba9876543210", "Legacy", None)
+            .expect("add legacy");
+        assert!(db.set_friend_intro_secret(hash, &secret).expect("set"));
+
+        let listed = db.get_friend_intro_secrets().expect("list");
+        let mut expected_hash = [0u8; 16];
+        hex::decode_to_slice(hash, &mut expected_hash).unwrap();
+        assert_eq!(listed, vec![(expected_hash, secret)]);
+
+        db.remove_friend(hash).expect("remove");
+        assert!(db.get_friend_intro_secrets().expect("list").is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A friend with no usable key is hash-only until one is stored; the
+    /// intro secret goes only once the friend is both mutual and keyed.
+    #[test]
+    fn hash_only_friends_are_backfilled_and_redundant_secrets_cleared() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-friend-backfill-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[5u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&key).unwrap();
+        let hash_hex = hex::encode(hash);
+        let other = crate::network::ember::crypto::signing_key_from_bytes(&[6u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let secret = [0x5Cu8; crate::network::ember::crypto::INTRO_SECRET_LEN];
+
+        db.add_friend(&hash_hex, "HashOnly", None).expect("add");
+        // A key that does not bind to the hash leaves the row hash-only.
+        db.set_friend_public_key(&hash_hex, &other).expect("store unbound key");
+        let listed = db.get_hash_only_friends().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hash, hash);
+        assert!(!listed[0].mutual, "an outgoing request is not mutual");
+        assert!(listed[0].last_contact > 0, "never seen falls back to the add time");
+
+        db.set_friend_intro_secret(&hash_hex, &secret).expect("set secret");
+        db.set_friend_mutual(&hash_hex, "", 0, None).expect("promote");
+        assert!(db.get_hash_only_friends().expect("list")[0].mutual);
+        assert!(
+            db.clear_keyed_mutual_friend_intro_secrets().expect("sweep").is_empty(),
+            "mutual but unkeyed keeps its secret"
+        );
+
+        assert!(db.set_friend_public_key(&hash_hex, &key).expect("store key"));
+        assert!(db.get_hash_only_friends().expect("list").is_empty());
+        assert_eq!(
+            db.clear_keyed_mutual_friend_intro_secrets().expect("sweep"),
+            vec![hash]
+        );
+        assert!(db.get_friend_intro_secrets().expect("list").is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn one_sided_keyed_friends_keep_their_intro_secret() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-friend-oneside-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let hash_hex =
+            hex::encode(crate::network::ember::crypto::node_id_from_ed25519_bytes(&key).unwrap());
+        db.add_friend(&hash_hex, "Pending", Some(&key)).expect("add");
+        db.set_friend_intro_secret(&hash_hex, &[1u8; 16]).expect("set");
+        assert!(db.clear_keyed_mutual_friend_intro_secrets().expect("sweep").is_empty());
+        assert_eq!(db.get_friend_intro_secrets().expect("list").len(), 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// v6 and v8 snapshot the rows they are about to rewrite or replace, and
@@ -11607,8 +12139,12 @@ mod tests {
         );
 
         // A revision for a line this device never held stands on its own, which is
-        // how a member who was away receives it.
-        let unseen = "bb".repeat(16);
+        // how a member who was away receives it — provided the id is its signer's.
+        let unseen = hex::encode(crate::network::ember::channel::new_chat_msg_id(
+            &hex::decode(&channel_id).unwrap().try_into().unwrap(),
+            &hex::decode(&other).unwrap().try_into().unwrap(),
+            sent,
+        ));
         let created = db
             .apply_channel_message_edit(
                 &channel_id, &unseen, &other, sent, sent + 20, "caught up", "66", sent + 20,
@@ -11625,6 +12161,469 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn bound_chat_msg_id(channel_id: &str, author: &str, timestamp: i64) -> String {
+        hex::encode(crate::network::ember::channel::new_chat_msg_id(
+            &hex::decode(channel_id).unwrap().try_into().unwrap(),
+            &hex::decode(author).unwrap().try_into().unwrap(),
+            timestamp,
+        ))
+    }
+
+    fn open_channel_test_db(tag: &str) -> (Database, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let db = Database::open_at(&path).unwrap();
+        (db, path, dir)
+    }
+
+    /// Stands in for a row an older build stored from a revision it took on
+    /// trust: sender and id rewritten after the fact, which the body's
+    /// encryption does not bind.
+    fn plant_edit_only_row(
+        db: &Database,
+        channel_id: &str,
+        sender: &str,
+        msg_id: &str,
+        original_ts: i64,
+        edited_at: i64,
+        text: &str,
+    ) -> i64 {
+        let scratch = bound_chat_msg_id(channel_id, sender, original_ts);
+        let ChannelEditOutcome::Created(id) = db
+            .apply_channel_message_edit(
+                channel_id, &scratch, sender, original_ts, edited_at, text, &"77".repeat(64),
+                edited_at,
+            )
+            .unwrap()
+        else {
+            panic!("scratch revision should create its row");
+        };
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channel_messages SET sender_pubkey = ?1, msg_id = ?2 WHERE id = ?3",
+                params![sender, msg_id, id],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_forged_channel_edit_cannot_claim_another_members_line_before_it_arrives() {
+        let (db, path, dir) = open_channel_test_db("channel-forged-edit");
+        let channel_id = "ab".repeat(16);
+        let victim = "cd".repeat(32);
+        let mallory = "ef".repeat(32);
+        db.insert_channel(&channel_id, &victim, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 60;
+
+        // A new id bound to the victim, and one minted before ids were bound.
+        for msg_id in [bound_chat_msg_id(&channel_id, &victim, sent), "aa".repeat(16)] {
+            assert_eq!(
+                db.apply_channel_message_edit(
+                    &channel_id, &msg_id, &mallory, sent, sent + 5, "hijacked", "22", now,
+                )
+                .unwrap(),
+                ChannelEditOutcome::NotAuthor,
+            );
+            assert!(!db.channel_message_exists(&channel_id, &msg_id).unwrap());
+            assert!(!db
+                .channel_message_held(&channel_id, &msg_id, &victim, sent)
+                .unwrap());
+
+            let id = db
+                .insert_channel_message(
+                    &channel_id, &victim, "received", "genuine words", &msg_id, sent,
+                    &"11".repeat(64), false,
+                )
+                .unwrap();
+            let rows = db.get_channel_messages(&channel_id, 50, None).unwrap();
+            let row = rows.iter().find(|r| r.msg_id == msg_id).unwrap();
+            assert_eq!(row.id, id);
+            assert_eq!(row.sender_pubkey, victim);
+            assert_eq!(row.message, "genuine words");
+            assert_eq!(row.edited_at, 0);
+        }
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert_eq!(sync.len(), 2);
+        assert!(sync.iter().all(|r| r.sender_pubkey == victim));
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_channel_authors_edit_before_the_line_stands_in_for_it_and_cannot_be_re_dated() {
+        let (db, path, dir) = open_channel_test_db("channel-early-edit");
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        db.insert_channel(&channel_id, &author, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 60;
+        let msg_id = bound_chat_msg_id(&channel_id, &author, sent);
+
+        // Claiming a later original to stretch the window breaks the binding.
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &author, sent + 50, sent + 55, "late", "33", now,
+            )
+            .unwrap(),
+            ChannelEditOutcome::NotAuthor,
+        );
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &author, sent, sent + 3_000, "late", "33", now,
+            )
+            .unwrap(),
+            ChannelEditOutcome::OutsideWindow,
+        );
+
+        let ChannelEditOutcome::Created(id) = db
+            .apply_channel_message_edit(
+                &channel_id, &msg_id, &author, sent, sent + 30, "fixed", "44", now,
+            )
+            .unwrap()
+        else {
+            panic!("the author's own revision must stand in for the line");
+        };
+        // The original arriving afterwards is a repeat, not a replacement.
+        assert!(db
+            .channel_message_held(&channel_id, &msg_id, &author, sent)
+            .unwrap());
+        assert_eq!(
+            db.insert_channel_message(
+                &channel_id, &author, "received", "fxied", &msg_id, sent, &"11".repeat(64), false,
+            )
+            .unwrap(),
+            id
+        );
+        let rows = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender_pubkey, author);
+        assert_eq!(rows[0].message, "fixed");
+        assert_eq!(rows[0].edited_at, sent + 30);
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert_eq!(sync.len(), 1);
+        assert_eq!(sync[0].sender_pubkey, author);
+        assert!(!sync[0].edit_sig.is_empty());
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_channel_row_planted_under_someone_elses_id_is_never_served_or_taken_over() {
+        let (db, path, dir) = open_channel_test_db("channel-planted-row");
+        let channel_id = "ab".repeat(16);
+        let victim = "cd".repeat(32);
+        let mallory = "ef".repeat(32);
+        db.insert_channel(&channel_id, &victim, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 60;
+        let bound = bound_chat_msg_id(&channel_id, &victim, sent);
+        let legacy = "aa".repeat(16);
+        for msg_id in [&bound, &legacy] {
+            plant_edit_only_row(&db, &channel_id, &mallory, msg_id, sent, sent + 5, "hijacked");
+        }
+
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert!(
+            sync.iter().all(|r| r.sender_pubkey != mallory),
+            "a revision taken on trust must not be re-served under the id it claimed"
+        );
+        assert!(sync.is_empty());
+
+        // Under an id bound to the victim, their genuine line displaces it.
+        assert!(!db
+            .channel_message_held(&channel_id, &bound, &victim, sent)
+            .unwrap());
+        db.insert_channel_message(
+            &channel_id, &victim, "received", "genuine words", &bound, sent, &"11".repeat(64),
+            false,
+        )
+        .unwrap();
+
+        // Under an unbound id nobody can prove ownership, and the row may be a
+        // genuine revision an older build stored: no signed line — the
+        // victim's or a third member's — may take it over.
+        let third = "0f".repeat(32);
+        for sender in [&victim, &third] {
+            assert!(db
+                .channel_message_held(&channel_id, &legacy, sender, sent)
+                .unwrap());
+            db.insert_channel_message(
+                &channel_id, sender, "received", "takeover", &legacy, sent, &"11".repeat(64),
+                false,
+            )
+            .unwrap();
+        }
+
+        let rows = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = |id: &str| rows.iter().find(|r| r.msg_id == id).unwrap().clone();
+        assert_eq!(row(&bound).sender_pubkey, victim);
+        assert_eq!(row(&bound).message, "genuine words");
+        assert_eq!(row(&legacy).sender_pubkey, mallory);
+        assert_eq!(row(&legacy).message, "hijacked");
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert_eq!(sync.len(), 1);
+        assert_eq!(sync[0].msg_id, bound);
+        assert_eq!(sync[0].sender_pubkey, victim);
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_channel_line_squatting_on_a_bound_id_gives_way_to_its_author() {
+        let (db, path, dir) = open_channel_test_db("channel-squat");
+        let channel_id = "ab".repeat(16);
+        let victim = "cd".repeat(32);
+        let mallory = "ef".repeat(32);
+        db.insert_channel(&channel_id, &victim, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 60;
+
+        // Mallory's own signed line, first to arrive under the victim's id.
+        let first = bound_chat_msg_id(&channel_id, &victim, sent);
+        db.insert_channel_message(
+            &channel_id, &mallory, "received", "squat", &first, sent, &"22".repeat(64), false,
+        )
+        .unwrap();
+        assert!(!db
+            .channel_message_held(&channel_id, &first, &victim, sent)
+            .unwrap());
+        db.insert_channel_message(
+            &channel_id, &victim, "received", "genuine", &first, sent, &"11".repeat(64), false,
+        )
+        .unwrap();
+        // And once the author holds it, a later squat is just a repeat.
+        assert!(db
+            .channel_message_held(&channel_id, &first, &mallory, sent)
+            .unwrap());
+        db.insert_channel_message(
+            &channel_id, &mallory, "received", "squat", &first, sent, &"22".repeat(64), false,
+        )
+        .unwrap();
+
+        // The author's revision displaces a squatter the same way.
+        let second = bound_chat_msg_id(&channel_id, &victim, sent);
+        db.insert_channel_message(
+            &channel_id, &mallory, "received", "squat", &second, sent, &"22".repeat(64), false,
+        )
+        .unwrap();
+        assert!(matches!(
+            db.apply_channel_message_edit(
+                &channel_id, &second, &victim, sent, sent + 10, "genuine, edited", "33", now,
+            )
+            .unwrap(),
+            ChannelEditOutcome::Created(_)
+        ));
+
+        let rows = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.sender_pubkey == victim));
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert_eq!(sync.len(), 2);
+        assert!(sync.iter().all(|r| r.sender_pubkey == victim));
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unbound_early_channel_edit_is_re_judged_on_the_originals_real_timestamp() {
+        let (db, path, dir) = open_channel_test_db("channel-rejudge");
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        db.insert_channel(&channel_id, &author, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 7_200;
+        let legacy = "aa".repeat(16);
+        let honest = "bb".repeat(16);
+        // An older build took both revisions on trust. One claimed an original
+        // an hour later than the line really was, to stay inside the window.
+        plant_edit_only_row(&db, &channel_id, &author, &legacy, sent + 3_600, sent + 3_630, "rewritten");
+        plant_edit_only_row(&db, &channel_id, &author, &honest, sent, sent + 30, "fixed");
+
+        for msg_id in [&legacy, &honest] {
+            db.insert_channel_message(
+                &channel_id, &author, "received", "as sent", msg_id, sent, &"11".repeat(64), false,
+            )
+            .unwrap();
+        }
+        let rows = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        let by_id = |id: &str| rows.iter().find(|r| r.msg_id == id).unwrap().clone();
+        assert_eq!(by_id(&legacy).message, "as sent");
+        assert_eq!(by_id(&legacy).edited_at, 0);
+        assert_eq!(by_id(&honest).message, "fixed");
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_future_dated_channel_edit_neither_lands_nor_lifts_the_sync_watermark() {
+        let (db, path, dir) = open_channel_test_db("channel-future-edit");
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        db.insert_channel(&channel_id, &author, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let skew = crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS;
+
+        let far = now + 10 * 365 * 86_400;
+        let far_id = bound_chat_msg_id(&channel_id, &author, far);
+        assert_eq!(
+            db.apply_channel_message_edit(&channel_id, &far_id, &author, far, far + 5, "x", "22", now)
+                .unwrap(),
+            ChannelEditOutcome::OutsideWindow,
+        );
+        let zero_id = bound_chat_msg_id(&channel_id, &author, 0);
+        assert_eq!(
+            db.apply_channel_message_edit(&channel_id, &zero_id, &author, 0, 5, "x", "22", now)
+                .unwrap(),
+            ChannelEditOutcome::OutsideWindow,
+        );
+        assert!(!db.channel_message_exists(&channel_id, &far_id).unwrap());
+
+        // A held line cannot be pinned by a revision dated past the skew either.
+        let sent = now - 60;
+        let held = bound_chat_msg_id(&channel_id, &author, sent);
+        db.insert_channel_message(
+            &channel_id, &author, "received", "hi", &held, sent, &"11".repeat(64), false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &held, &author, sent, now + skew + 60, "pinned", "33", now,
+            )
+            .unwrap(),
+            ChannelEditOutcome::OutsideWindow,
+        );
+
+        // A far-future row an older build stored must not become the watermark.
+        db.insert_channel_message(
+            &channel_id, &author, "received", "from the future", &"aa".repeat(16), far,
+            &"11".repeat(64), false,
+        )
+        .unwrap();
+        assert_eq!(db.latest_channel_message_timestamp(&channel_id).unwrap(), sent);
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_channel_sync_page_reads_past_rows_it_cannot_serve() {
+        let (db, path, dir) = open_channel_test_db("channel-sync-paging");
+        let channel_id = "ab".repeat(16);
+        let victim = "cd".repeat(32);
+        let mallory = "ef".repeat(32);
+        db.insert_channel(&channel_id, &victim, "Lobby", "public", false, None, None)
+            .unwrap();
+        // More unservable rows than one page, all ahead of the servable ones.
+        for n in 0..40 {
+            let ts = 1_000 + n;
+            let id = bound_chat_msg_id(&channel_id, &victim, ts);
+            plant_edit_only_row(&db, &channel_id, &mallory, &id, ts, ts + 5, "hijacked");
+        }
+        for n in 0..3 {
+            let ts = 2_000 + n;
+            db.insert_channel_message(
+                &channel_id, &victim, "received", "servable",
+                &bound_chat_msg_id(&channel_id, &victim, ts), ts, &"11".repeat(64), false,
+            )
+            .unwrap();
+        }
+        let sync = db.list_channel_messages_for_sync(&channel_id, 1, 32).unwrap();
+        assert_eq!(sync.len(), 3, "a page of filtered rows must not stall the walk");
+        assert!(sync.iter().all(|r| r.sender_pubkey == victim));
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_a_channel_squatter_does_not_bury_the_genuine_line() {
+        let (db, path, dir) = open_channel_test_db("channel-squat-tombstone");
+        let channel_id = "ab".repeat(16);
+        let victim = "cd".repeat(32);
+        let mallory = "ef".repeat(32);
+        db.insert_channel(&channel_id, &victim, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let sent = now - 60;
+
+        let first = bound_chat_msg_id(&channel_id, &victim, sent);
+        let squat = db
+            .insert_channel_message(
+                &channel_id, &mallory, "received", "squat", &first, sent, &"22".repeat(64), false,
+            )
+            .unwrap();
+        assert!(db.delete_channel_message(&channel_id, squat).unwrap());
+        assert!(db
+            .channel_message_forgotten(&channel_id, &first, &mallory)
+            .unwrap());
+        assert!(!db
+            .channel_message_forgotten(&channel_id, &first, &victim.to_ascii_uppercase())
+            .unwrap());
+        db.insert_channel_message(
+            &channel_id, &victim, "received", "genuine", &first, sent, &"11".repeat(64), false,
+        )
+        .unwrap();
+
+        // The author's revision is not refused as forgotten either.
+        let second = bound_chat_msg_id(&channel_id, &victim, sent);
+        let squat = db
+            .insert_channel_message(
+                &channel_id, &mallory, "received", "squat", &second, sent, &"22".repeat(64), false,
+            )
+            .unwrap();
+        assert!(db.delete_channel_message(&channel_id, squat).unwrap());
+        assert!(matches!(
+            db.apply_channel_message_edit(
+                &channel_id, &second, &victim, sent, sent + 10, "genuine, edited", "33", now,
+            )
+            .unwrap(),
+            ChannelEditOutcome::Created(_)
+        ));
+
+        // Deleting the author's own line under their id forgets it for everyone.
+        let genuine = db
+            .get_channel_messages(&channel_id, 50, None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.msg_id == first)
+            .unwrap();
+        assert_eq!(genuine.sender_pubkey, victim);
+        assert!(db.delete_channel_message(&channel_id, genuine.id).unwrap());
+        assert!(db.channel_message_forgotten(&channel_id, &first, &victim).unwrap());
+        assert!(db.channel_message_forgotten(&channel_id, &first, &mallory).unwrap());
+
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -14132,11 +15131,13 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(!db.channel_message_forgotten(&channel_id, &msg_id).unwrap());
+        assert!(!db
+            .channel_message_forgotten(&channel_id, &msg_id, &pubkey)
+            .unwrap());
 
         assert!(db.delete_channel_message(&channel_id, row_id).unwrap());
         assert!(
-            db.channel_message_forgotten(&channel_id, &msg_id).unwrap(),
+            db.channel_message_forgotten(&channel_id, &msg_id, &pubkey).unwrap(),
             "the id has to be remembered or the line comes back"
         );
         assert!(!db.channel_message_exists(&channel_id, &msg_id).unwrap());

@@ -101,6 +101,12 @@ const MAX_PATH_LEN: usize = 4 * 1024;
 const MANIFEST_NAME: &str = "manifest.json";
 const STAGING_DIR: &str = "restore-pending";
 const STAGING_MARKER: &str = "RESTORE.json";
+/// Progress of an apply that has started swapping files; see [`ApplyJournal`].
+const APPLY_JOURNAL: &str = "APPLY.json";
+/// Left in staging when a finished restore's marker could not be removed, so
+/// the next launch discards the staged copies instead of applying them again.
+const APPLIED_SENTINEL: &str = "APPLIED";
+const BACKUP_DIR_PREFIX: &str = "pre-restore-";
 const BACKUP_EXTENSION: &str = "emberbackup";
 
 /// Per-entry and whole-archive ceilings on what a restore will unpack. The
@@ -1153,13 +1159,17 @@ fn staging_dir(data_dir: &Path) -> PathBuf {
 /// after a failed / schema-too-new apply). Incomplete directories without
 /// a marker are discarded by [`apply_pending_restore`] and do not count.
 pub(crate) fn pending_restore_still_staged(data_dir: &Path) -> bool {
-    staging_dir(data_dir).join(STAGING_MARKER).is_file()
+    let staging = staging_dir(data_dir);
+    staging.join(STAGING_MARKER).is_file() && !staging.join(APPLIED_SENTINEL).exists()
 }
 
 /// The marker a completed staging run leaves behind, or `None` when there is
 /// nothing trustworthy to apply. Written last by [`stage_restore`], so its
 /// absence means the staging directory is incomplete.
 fn read_pending_marker(staging: &Path) -> Option<PendingRestore> {
+    if staging.join(APPLIED_SENTINEL).exists() {
+        return None;
+    }
     std::fs::read(staging.join(STAGING_MARKER))
         .ok()
         .and_then(|raw| serde_json::from_slice(&raw).ok())
@@ -1438,6 +1448,19 @@ fn copy_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let staging = staging_dir(data_dir);
     let marker = staging.join(STAGING_MARKER);
+    if staging.join(APPLIED_SENTINEL).exists() {
+        tracing::warn!(
+            "Removing the staged copies of a restore that was already applied: {}",
+            staging.display()
+        );
+        if let Err(e) = remove_applied_staging(&staging) {
+            tracing::error!(
+                "Could not remove {} ({e}); delete it by hand",
+                staging.display()
+            );
+        }
+        return Ok(None);
+    }
     if !marker.is_file() {
         // No marker means either no restore or an interrupted staging run;
         // either way there is nothing trustworthy to apply.
@@ -1460,10 +1483,13 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
     };
 
     // A marker without a timestamp (an older staging run) is not judged on age.
+    // Nor is an apply that already started swapping: discarding staging would
+    // take its journal with it and leave the profile half-restored.
+    let resuming = staging.join(APPLY_JOURNAL).exists();
     let age_secs = chrono::Utc::now()
         .timestamp()
         .saturating_sub(pending.staged_at);
-    if pending.staged_at > 0 && age_secs > STAGED_RESTORE_MAX_AGE_SECS {
+    if !resuming && pending.staged_at > 0 && age_secs > STAGED_RESTORE_MAX_AGE_SECS {
         tracing::error!(
             "Discarding a staged restore from a backup made by Ember {}: it was prepared {} days \
              ago and is too old to apply safely over the profile in use since. Import the backup \
@@ -1474,6 +1500,16 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         let _ = std::fs::remove_dir_all(&staging);
         return Ok(None);
     }
+
+    // Every refusal from here on leaves the restore staged for a later launch.
+    // One that interrupts an apply already under way must roll it back first,
+    // or the app starts on a mix of restored and original files.
+    let refuse = || -> std::io::Result<Option<PathBuf>> {
+        if resuming {
+            abandon_interrupted_apply(data_dir, &staging);
+        }
+        Ok(None)
+    };
 
     // The build that staged this restore accepted its schema; the build now
     // applying it may be an older one the user reinstalled in between.
@@ -1488,7 +1524,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             pending.schema_version,
             crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION
         );
-        return Ok(None);
+        return refuse();
     }
 
     // Every file the marker lists has to be present before anything moves.
@@ -1515,7 +1551,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             staging.display(),
             absent.join(", ")
         );
-        return Ok(None);
+        return refuse();
     }
 
     // Room for the copies before any of them is attempted.
@@ -1528,17 +1564,13 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
     // that used to squeeze through into one that fails part-way. The rollback
     // handles that correctly now, but an upfront refusal that keeps staging
     // intact is a better answer than a mid-apply abort.
-    let staged_bytes: u64 = pending
-        .files
-        .iter()
-        .filter_map(|name| std::fs::metadata(staging.join(name)).ok())
-        .map(|meta| meta.len())
-        .sum();
     if let Ok(free) = fs2::available_space(data_dir) {
-        // The originals are moved aside rather than copied, so one further
-        // copy of the staged set is what this actually needs; the margin
-        // covers the database's WAL and SHM sidecars.
-        let needed = staged_bytes.saturating_add(staged_bytes / 4);
+        let journal = if resuming {
+            read_apply_journal(&staging)
+        } else {
+            None
+        };
+        let needed = restore_space_needed(data_dir, &staging, &pending.files, journal.as_ref());
         if free < needed {
             tracing::error!(
                 "Not applying the staged restore: it needs about {} MiB free in {} and only {} MiB \
@@ -1548,23 +1580,393 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
                 data_dir.display(),
                 free / (1024 * 1024)
             );
-            return Ok(None);
+            return refuse();
         }
     }
 
-    let backup_dir = data_dir.join(format!("pre-restore-{}", chrono::Utc::now().timestamp()));
-    std::fs::create_dir_all(&backup_dir)?;
-    crate::security::restrict_file_permissions(&backup_dir);
+    // Staging and its marker are deliberately left in place on failure: the
+    // restore can then be retried on the next launch, or discarded from
+    // Settings > Backup if the cause is permanent. Removing staging here is
+    // what previously turned a mid-restore failure into an unrecoverable one.
+    let (backup_dir, outcome) =
+        swap_in_staged_files(data_dir, &staging, &pending.files, copy_into_place)?;
+    let applied = match outcome {
+        Ok(applied) => applied,
+        Err(reason) => {
+            tracing::error!(
+                "Staged restore aborted: {reason}. Rolled back the files already swapped; the \
+                 staged copy is kept for the next launch and the previous files remain in {}",
+                backup_dir.display()
+            );
+            return Ok(None);
+        }
+    };
 
+    // Before staging goes: while it exists a crash here re-runs the whole
+    // apply, which ends up here again, and the repair is idempotent.
+    if pending.files.iter().any(|name| name == "config.json") {
+        sanitize_restored_config(data_dir);
+    }
+    retire_applied_staging(&staging);
+    tracing::warn!(
+        "Applied a staged restore of {applied} file(s) from a backup made by Ember {}; the \
+         previous files are preserved in {}",
+        pending.source_app_version,
+        backup_dir.display()
+    );
+    Ok(Some(backup_dir))
+}
+
+/// A live file the apply loop has touched, and what it takes to undo that.
+#[derive(Clone, Serialize, Deserialize)]
+struct Swapped {
+    name: String,
+    /// Whether a live original was moved into the pre-restore directory. When
+    /// there was none, undoing the swap means removing the restored copy.
+    displaced: bool,
+    /// Sidecars (`ember.db-wal`, `ember.db-shm`) stashed beside the original.
+    /// They belong to it and go back only if it does.
+    sidecars: Vec<String>,
+    /// Set once the live database's sidecars have all been moved aside. After
+    /// that, a sidecar found live on a retry was written against a restored
+    /// copy, not the original.
+    #[serde(default)]
+    sidecars_done: bool,
+    /// Sidecars a rollback could not return or move aside. The database has
+    /// been used without them since, so they must never go back beside it.
+    #[serde(default)]
+    stranded: Vec<String>,
+    /// [`ApplyJournal::attempt`] that last touched this entry.
+    #[serde(default)]
+    attempt: u32,
+    /// What the copy left live, so a later attempt can tell its own copy from
+    /// a file the app created or changed after an attempt returned.
+    #[serde(default)]
+    copied: Option<FileFingerprint>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    len: u64,
+    modified_ns: u64,
+}
+
+impl FileFingerprint {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified_ns: u64::try_from(modified.as_nanos()).ok()?,
+        })
+    }
+}
+
+/// On-disk progress of an apply, kept in staging beside the marker.
+///
+/// A crash mid-apply must not let the retry mistake a restored or half-copied
+/// file for the user's original: moving it aside as the "original" strands the
+/// real one, and rolling a failed retry back would then restore the wrong
+/// bytes. So every attempt reuses the one pre-restore folder named here, and a
+/// file present in that folder is an original an earlier attempt moved aside,
+/// whatever sits live now. The entries add what the folder cannot show: which
+/// files had no original at all (so a live copy is ours to overwrite or
+/// delete), and whether the database's sidecars were already dealt with.
+///
+/// The apply runs at startup before anything else opens these files, so an
+/// attempt that is still `in_progress` when the journal is next read crashed,
+/// and nothing has touched the profile since. Once an attempt has returned,
+/// the app may have run, and live files may be the user's again.
+#[derive(Serialize, Deserialize)]
+struct ApplyJournal {
+    /// Name of the pre-restore folder under the data directory.
+    backup_dir: String,
+    #[serde(default)]
+    attempt: u32,
+    #[serde(default)]
+    in_progress: bool,
+    entries: Vec<Swapped>,
+}
+
+impl ApplyJournal {
+    /// Whether the live copy of an entry with no original is this apply's own
+    /// work, safe to overwrite or delete without preserving it.
+    fn live_is_ours(&self, entry: &Swapped, live: &Path, crashed_attempt: Option<u32>) -> bool {
+        crashed_attempt == Some(entry.attempt)
+            || entry
+                .copied
+                .is_some_and(|fp| FileFingerprint::of(live) == Some(fp))
+    }
+}
+
+/// Like `Path::exists`, but an error other than "not found" is an error
+/// rather than a no. Taking a permission or sharing failure for absence would
+/// skip preserving the original and then copy over it.
+fn path_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_apply_journal(staging: &Path) -> Option<ApplyJournal> {
+    std::fs::read(staging.join(APPLY_JOURNAL))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+}
+
+/// Free space the rest of the apply needs: one further copy of every staged
+/// file that has not already landed, plus a margin for the database's WAL and
+/// SHM sidecars. The originals are moved aside rather than copied.
+///
+/// Files an interrupted attempt already copied are not counted: their space is
+/// already spent, and counting it again would refuse every later launch the
+/// resume that has to finish or roll back.
+fn restore_space_needed(
+    data_dir: &Path,
+    staging: &Path,
+    files: &[String],
+    journal: Option<&ApplyJournal>,
+) -> u64 {
+    let landed = |name: &str| {
+        journal.is_some_and(|journal| {
+            journal.entries.iter().any(|entry| {
+                entry.name == name
+                    && entry
+                        .copied
+                        .is_some_and(|fp| FileFingerprint::of(&data_dir.join(name)) == Some(fp))
+            })
+        })
+    };
+    let staged_bytes: u64 = files
+        .iter()
+        .filter(|name| !landed(name))
+        .filter_map(|name| std::fs::metadata(staging.join(name)).ok())
+        .map(|meta| meta.len())
+        .sum();
+    staged_bytes.saturating_add(staged_bytes / 4)
+}
+
+fn write_apply_journal(staging: &Path, journal: &ApplyJournal) -> std::io::Result<()> {
+    let data = serde_json::to_vec_pretty(journal).map_err(std::io::Error::other)?;
+    crate::security::atomic_write(&staging.join(APPLY_JOURNAL), &data, true)
+}
+
+/// The journal of an apply already under way, or a new one naming a fresh
+/// pre-restore folder, on disk before anything is moved.
+fn open_apply_journal(data_dir: &Path, staging: &Path) -> std::io::Result<(PathBuf, ApplyJournal)> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    match std::fs::read(staging.join(APPLY_JOURNAL)) {
+        Ok(raw) => {
+            let journal: ApplyJournal = serde_json::from_slice(&raw).map_err(|e| {
+                invalid(format!("the restore progress journal is unreadable ({e})"))
+            })?;
+            let mut components = Path::new(&journal.backup_dir).components();
+            let plain = matches!(
+                (components.next(), components.next()),
+                (Some(std::path::Component::Normal(_)), None)
+            );
+            if !plain || !journal.backup_dir.starts_with(BACKUP_DIR_PREFIX) {
+                return Err(invalid(format!(
+                    "the restore progress journal names an invalid folder {:?}",
+                    journal.backup_dir
+                )));
+            }
+            let dir = data_dir.join(&journal.backup_dir);
+            std::fs::create_dir_all(&dir)?;
+            Ok((dir, journal))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let stamp = chrono::Utc::now().timestamp();
+            let mut attempt = 0u32;
+            let (name, dir) = loop {
+                let name = match attempt {
+                    0 => format!("{BACKUP_DIR_PREFIX}{stamp}"),
+                    n => format!("{BACKUP_DIR_PREFIX}{stamp}-{n}"),
+                };
+                let dir = data_dir.join(&name);
+                // Must be new: anything already in it would read as an
+                // original this apply had moved aside.
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => break (name, dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1000 => {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            crate::security::restrict_file_permissions(&dir);
+            let journal = ApplyJournal {
+                backup_dir: name,
+                attempt: 0,
+                in_progress: false,
+                entries: Vec::new(),
+            };
+            write_apply_journal(staging, &journal)?;
+            Ok((dir, journal))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Move a stashed sidecar that must never go back beside its database to a
+/// name nothing else uses, keeping it for manual recovery. Never replaces an
+/// earlier orphan.
+fn orphan_sidecar(backup_dir: &Path, sidecar: &str) -> std::io::Result<PathBuf> {
+    for n in 1..=1000u32 {
+        let target = backup_dir.join(format!("{sidecar}.orphaned-{n}"));
+        if !path_exists(&target)? {
+            std::fs::rename(backup_dir.join(sidecar), &target)?;
+            return Ok(target);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free orphan name for {sidecar}"),
+    ))
+}
+
+/// Drop entries whose original is already back in place — a rollback that
+/// was cut short, or whose journal update was lost.
+///
+/// Sidecars that rollback had not reached go back only when that rollback
+/// belonged to the attempt that crashed: then nothing has opened the database
+/// since. Otherwise the app has been using it without them, and replaying them
+/// now would corrupt it, so they are set aside instead.
+fn settle_rolled_back_entries(
+    data_dir: &Path,
+    backup_dir: &Path,
+    journal: &mut ApplyJournal,
+    crashed_attempt: Option<u32>,
+) {
+    journal.entries.retain(|entry| {
+        if !entry.displaced || path_exists(&backup_dir.join(&entry.name)).unwrap_or(true) {
+            return true;
+        }
+        let may_return = crashed_attempt == Some(entry.attempt);
+        for sidecar in entry.sidecars.iter().chain(&entry.stranded) {
+            let stashed = backup_dir.join(sidecar);
+            if !stashed.exists() {
+                continue;
+            }
+            let live = data_dir.join(sidecar);
+            if may_return && !entry.stranded.contains(sidecar) && !live.exists() {
+                if let Err(e) = std::fs::rename(&stashed, &live) {
+                    tracing::error!(
+                        "Could not return {sidecar} ({e}); recover it from {}",
+                        backup_dir.display()
+                    );
+                }
+            } else if let Err(e) = orphan_sidecar(backup_dir, sidecar) {
+                tracing::error!(
+                    "Could not set aside the stale {sidecar} in {} ({e})",
+                    backup_dir.display()
+                );
+            }
+        }
+        false
+    });
+}
+
+/// Move the live original aside unless an earlier attempt already did.
+/// Returns whether an original is in the backup folder, and whether this call
+/// is what put it there.
+fn displace_original(
+    live: &Path,
+    stashed: &Path,
+    live_is_restored: bool,
+) -> std::io::Result<(bool, bool)> {
+    if path_exists(stashed)? {
+        return Ok((true, false));
+    }
+    if live_is_restored || !path_exists(live)? {
+        return Ok((false, false));
+    }
+    std::fs::rename(live, stashed)?;
+    Ok((true, true))
+}
+
+/// Move the database's WAL/SHM sidecars out of the way of the restored copy.
+///
+/// The restored database is a `VACUUM INTO` snapshot with no write-ahead log.
+/// Leaving the previous sidecars in place would have SQLite replay an
+/// unrelated log over it. Nor may they be deleted: nothing checkpoints at
+/// shutdown, so the WAL can hold the most recent commits of the database it
+/// was moved aside with.
+///
+/// `fresh` means the live sidecars (if any) still belong to the original;
+/// `moved_now` means the original was moved aside by this attempt.
+fn stash_database_sidecars(
+    data_dir: &Path,
+    backup_dir: &Path,
+    entry: &mut Swapped,
+    fresh: bool,
+    moved_now: bool,
+) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar_name = format!("{}{suffix}", entry.name);
+        let live = data_dir.join(&sidecar_name);
+        let stashed = backup_dir.join(&sidecar_name);
+        if !fresh {
+            // Written against a restored copy that is about to be replaced.
+            if path_exists(&live)? {
+                std::fs::remove_file(&live)?;
+            }
+            continue;
+        }
+        if moved_now && path_exists(&stashed)? {
+            // Left by an earlier rollback that could not return it. The
+            // database has been used without it since, so it must never go
+            // back beside it — and must not be overwritten by the live one.
+            orphan_sidecar(backup_dir, &sidecar_name)?;
+            entry.sidecars.retain(|s| s != &sidecar_name);
+            entry.stranded.retain(|s| s != &sidecar_name);
+        }
+        if path_exists(&live)? {
+            std::fs::rename(&live, &stashed)?;
+            if !entry.sidecars.contains(&sidecar_name) {
+                entry.sidecars.push(sidecar_name);
+            }
+        } else if path_exists(&stashed)?
+            && !entry.sidecars.contains(&sidecar_name)
+            && !entry.stranded.contains(&sidecar_name)
+        {
+            entry.sidecars.push(sidecar_name);
+        }
+    }
+    Ok(())
+}
+
+/// Copy every staged file over its live counterpart, moving originals into
+/// the pre-restore folder. All or nothing: on any failure everything touched
+/// so far — by this attempt or an earlier one that crashed — is put back.
+/// Returns the pre-restore folder, and how many files were applied or why the
+/// apply was rolled back. An `Err` means the progress journal could not be
+/// read or started, and nothing was moved.
+///
+/// Applying per-file and pressing on left the profile holding a mix of
+/// restored and original files — a restored `identity.json` beside the
+/// original `ember.db` orphans exactly the credits this feature exists to
+/// carry over.
+fn swap_in_staged_files(
+    data_dir: &Path,
+    staging: &Path,
+    files: &[String],
+    mut copy: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<(PathBuf, Result<usize, String>)> {
+    let (backup_dir, mut journal) = open_apply_journal(data_dir, staging)?;
+    let crashed_attempt = journal.in_progress.then_some(journal.attempt);
+    settle_rolled_back_entries(data_dir, &backup_dir, &mut journal, crashed_attempt);
+    journal.attempt = journal.attempt.wrapping_add(1);
+    journal.in_progress = true;
     let mut applied = 0usize;
-    // Names swapped in so far, so a failure part-way can put them back. Applying
-    // per-file and pressing on left the profile holding a mix of restored and
-    // original files — a restored `identity.json` beside the original `ember.db`
-    // orphans exactly the credits this feature exists to carry over — and the
-    // staging directory was removed regardless, so nothing was left to retry.
-    let mut applied_names: Vec<String> = Vec::new();
     let mut failure: Option<String> = None;
-    for name in &pending.files {
+    for name in files {
         if backup_file(name).is_none() {
             tracing::warn!("Ignoring unexpected staged file {name}");
             continue;
@@ -1574,110 +1976,313 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             // Checked before the loop, so this is a file that vanished under
             // us mid-apply. A failure rather than a skip, for the reason the
             // pre-flight gives.
-            failure = Some(format!("the staged {name} disappeared before it was applied"));
+            failure = Some(format!(
+                "the staged {name} disappeared before it was applied"
+            ));
             break;
         }
         let live = data_dir.join(name);
-        let mut displaced = false;
-        if live.exists() {
-            if let Err(e) = std::fs::rename(&live, backup_dir.join(name)) {
-                failure = Some(format!("could not move the current {name} aside ({e})"));
+        let prior = journal.entries.iter().position(|e| e.name == *name);
+        // Anything else live is an original — possibly one the app created
+        // after an earlier attempt rolled back — and is preserved like one.
+        let live_is_restored = prior.is_some_and(|i| {
+            let entry = &journal.entries[i];
+            !entry.displaced && journal.live_is_ours(entry, &live, crashed_attempt)
+        });
+        let (displaced, moved_now) =
+            match displace_original(&live, &backup_dir.join(name), live_is_restored) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    failure = Some(format!("could not move the current {name} aside ({e})"));
+                    break;
+                }
+            };
+        let index = match prior {
+            Some(i) => {
+                let entry = &mut journal.entries[i];
+                entry.displaced = displaced;
+                entry.attempt = journal.attempt;
+                entry.copied = None;
+                i
+            }
+            None => {
+                journal.entries.push(Swapped {
+                    name: name.clone(),
+                    displaced,
+                    sidecars: Vec::new(),
+                    sidecars_done: false,
+                    stranded: Vec::new(),
+                    attempt: journal.attempt,
+                    copied: None,
+                });
+                journal.entries.len() - 1
+            }
+        };
+        if name == "ember.db" {
+            let entry = &mut journal.entries[index];
+            let fresh = moved_now || !entry.sidecars_done;
+            if let Err(e) = stash_database_sidecars(data_dir, &backup_dir, entry, fresh, moved_now)
+            {
+                failure = Some(format!(
+                    "could not move the current database sidecars aside ({e})"
+                ));
                 break;
             }
-            displaced = true;
+            entry.sidecars_done = true;
         }
-        // The restored database is a `VACUUM INTO` snapshot with no
-        // write-ahead log. Leaving the previous WAL/SHM sidecars in place
-        // would have SQLite replay an unrelated log over it.
-        if name == "ember.db" {
-            for suffix in ["-wal", "-shm"] {
-                let mut sidecar = live.as_os_str().to_os_string();
-                sidecar.push(suffix);
-                let sidecar = PathBuf::from(sidecar);
-                if sidecar.exists() {
-                    let stashed = backup_dir.join(format!("{name}{suffix}"));
-                    if let Err(e) = std::fs::rename(&sidecar, &stashed) {
-                        tracing::warn!("Could not move {} aside: {e}", sidecar.display());
-                        let _ = std::fs::remove_file(&sidecar);
-                    }
-                }
-            }
+        // Recorded before the copy, so a copy that fails part-way, or a crash
+        // during it, leaves a file that is undone rather than taken for the
+        // original on the next attempt.
+        if let Err(e) = write_apply_journal(staging, &journal) {
+            failure = Some(format!("could not record the restore's progress ({e})"));
+            break;
         }
-        match copy_into_place(&staged, &live) {
+        match copy(&staged, &live) {
             Ok(()) => {
                 crate::security::restrict_file_permissions(&live);
+                journal.entries[index].copied = FileFingerprint::of(&live);
                 applied += 1;
-                applied_names.push(name.clone());
             }
             Err(e) => {
                 tracing::error!("Failed to restore {name}: {e}");
-                // The file being replaced was moved aside a moment ago, and the
-                // staging directory is deleted below. Without putting it back,
-                // the data directory would be left with no copy of the file at
-                // all - for `identity.json` that means the next launch quietly
-                // generates a new identity, losing the user hash and credits
-                // this whole feature exists to preserve.
-                if displaced {
-                    match std::fs::rename(backup_dir.join(name), &live) {
-                        Ok(()) => tracing::warn!(
-                            "Kept the existing {name}: the copy from the backup could not be put in place"
-                        ),
-                        Err(back) => tracing::error!(
-                            "Could not put the previous {name} back ({back}); recover it from {}",
-                            backup_dir.display()
-                        ),
-                    }
-                }
                 failure = Some(format!("could not put the restored {name} in place ({e})"));
                 break;
             }
         }
     }
 
-    if let Some(reason) = failure {
-        // Undo the swaps that did land, newest first, so the profile goes back to
-        // being internally consistent rather than a mix of two backups. Staging
-        // and its marker are deliberately left in place: the restore can then be
-        // retried on the next launch, or discarded from Settings > Backup if the
-        // cause is permanent. Removing staging here is what previously turned a
-        // mid-restore failure into an unrecoverable one.
-        for name in applied_names.iter().rev() {
-            let live = data_dir.join(name);
-            let saved = backup_dir.join(name);
-            if !saved.exists() {
-                continue;
-            }
-            // No `remove_file` first: `fs::rename` already replaces the
-            // destination on every platform we ship, and deleting ahead of it
-            // opened a window where a rename that then failed left the profile
-            // with no copy of the file at all.
-            if let Err(e) = std::fs::rename(&saved, &live) {
+    let Some(reason) = failure else {
+        return Ok((backup_dir, Ok(applied)));
+    };
+    roll_back_journal(data_dir, staging, &backup_dir, &mut journal);
+    Ok((backup_dir, Err(reason)))
+}
+
+/// Put back everything the journal lists, newest first, so the profile goes
+/// back to being internally consistent rather than a mix of two backups.
+/// Entries that could not be put back stay in the journal for the next
+/// attempt, which is recorded as having returned.
+fn roll_back_journal(
+    data_dir: &Path,
+    staging: &Path,
+    backup_dir: &Path,
+    journal: &mut ApplyJournal,
+) {
+    let mut unresolved = Vec::new();
+    for mut entry in std::mem::take(&mut journal.entries).into_iter().rev() {
+        if !roll_back_swap(data_dir, backup_dir, &mut entry) {
+            unresolved.push(entry);
+        }
+    }
+    unresolved.reverse();
+    journal.entries = unresolved;
+    journal.in_progress = false;
+    if let Err(e) = write_apply_journal(staging, journal) {
+        tracing::error!("Could not record the rollback of the staged restore ({e})");
+        if journal.entries.is_empty() {
+            let _ = std::fs::remove_file(staging.join(APPLY_JOURNAL));
+        }
+    }
+}
+
+/// Roll back an apply that crashed part-way and that this launch is not going
+/// to resume, so the app never starts on a mix of restored and original files.
+fn abandon_interrupted_apply(data_dir: &Path, staging: &Path) {
+    let (backup_dir, mut journal) = match open_apply_journal(data_dir, staging) {
+        Ok(opened) => opened,
+        Err(e) => {
+            tracing::error!(
+                "Could not read the progress of the interrupted restore ({e}); the profile may \
+                 hold a mix of restored and original files"
+            );
+            return;
+        }
+    };
+    let crashed_attempt = journal.in_progress.then_some(journal.attempt);
+    settle_rolled_back_entries(data_dir, &backup_dir, &mut journal, crashed_attempt);
+    roll_back_journal(data_dir, staging, &backup_dir, &mut journal);
+    tracing::error!(
+        "Rolled back the interrupted restore; the previous files remain in {}",
+        backup_dir.display()
+    );
+}
+
+/// Undo one swap. Returns whether everything it touched is back in place.
+fn roll_back_swap(data_dir: &Path, backup_dir: &Path, entry: &mut Swapped) -> bool {
+    let name = &entry.name;
+    let live = data_dir.join(name);
+    let original_back = if entry.displaced {
+        // No `remove_file` first: `fs::rename` already replaces the
+        // destination on every platform we ship, and deleting ahead of it
+        // opened a window where a rename that then failed left the profile
+        // with no copy of the file at all — for `identity.json` that means the
+        // next launch quietly generates a new identity.
+        match std::fs::rename(backup_dir.join(name), &live) {
+            Ok(()) => true,
+            Err(e) => {
                 tracing::error!(
                     "Rollback failed for {name} ({e}); recover it from {}",
                     backup_dir.display()
                 );
+                false
             }
         }
-        tracing::error!(
-            "Staged restore aborted: {reason}. Rolled back {} already-swapped file(s); the staged \
-             copy is kept for the next launch and the previous files remain in {}",
-            applied_names.len(),
-            backup_dir.display()
-        );
-        return Ok(None);
+    } else {
+        // There was no original, so the backup's copy is the only thing to
+        // undo. Staging still holds it for a retry.
+        match std::fs::remove_file(&live) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::error!(
+                    "Rollback could not remove the restored {name} ({e}); delete it by hand \
+                     before relaunching"
+                );
+                false
+            }
+        }
+    };
+    if !entry.displaced {
+        // Sidecars stashed with no original database beside them were orphans;
+        // putting them back would have SQLite replay them into whatever
+        // database is created there next.
+        return original_back;
     }
+    if !original_back {
+        if !entry.sidecars.is_empty() {
+            // Replaying the old log over whatever still sits at `live` would
+            // corrupt it; the sidecars stay with the original they belong to.
+            tracing::error!(
+                "Left the {name} sidecars in {} beside the {name} they belong to",
+                backup_dir.display()
+            );
+        }
+        return false;
+    }
+    let mut complete = true;
+    for sidecar in entry.sidecars.clone() {
+        let stashed = backup_dir.join(&sidecar);
+        if !stashed.exists() {
+            continue;
+        }
+        let Err(e) = std::fs::rename(&stashed, data_dir.join(&sidecar)) else {
+            continue;
+        };
+        // The database is back and about to be opened without this sidecar,
+        // so the stashed one can never be returned later.
+        match orphan_sidecar(backup_dir, &sidecar) {
+            Ok(orphan) => tracing::error!(
+                "Could not return {sidecar} ({e}); the database is back without it, and it is \
+                 kept at {}",
+                orphan.display()
+            ),
+            Err(orphan_error) => {
+                tracing::error!(
+                    "Could not return {sidecar} ({e}) or set it aside ({orphan_error}); it stays \
+                     in {} and will not be returned",
+                    backup_dir.display()
+                );
+                if !entry.stranded.contains(&sidecar) {
+                    entry.stranded.push(sidecar);
+                }
+                complete = false;
+            }
+        }
+    }
+    complete
+}
 
-    let _ = std::fs::remove_dir_all(&staging);
-    if pending.files.iter().any(|name| name == "config.json") {
-        sanitize_restored_config(data_dir);
+/// Make sure a restore that has been applied is never applied again.
+///
+/// The staged files are copied into place, not consumed, so a staging folder
+/// that survives with its marker would re-apply the backup on the next launch
+/// over everything done since. The marker goes first and its removal is
+/// checked; only then is the rest of the folder cleaned up.
+fn retire_applied_staging(staging: &Path) {
+    if !mark_restore_applied(staging) {
+        let aside = staging.with_file_name(format!(
+            "{STAGING_DIR}-applied-{}",
+            chrono::Utc::now().timestamp()
+        ));
+        match std::fs::rename(staging, &aside) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_dir_all(&aside) {
+                    tracing::warn!(
+                        "Could not remove {} ({e}); delete it by hand",
+                        aside.display()
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                "Could not retire the applied restore at {} ({e}). It will be applied AGAIN on \
+                 the next launch unless that folder is deleted first.",
+                staging.display()
+            ),
+        }
+        return;
     }
-    tracing::warn!(
-        "Applied a staged restore of {applied} file(s) from a backup made by Ember {}; the \
-         previous files are preserved in {}",
-        pending.source_app_version,
-        backup_dir.display()
-    );
-    Ok(Some(backup_dir))
+    if let Err(e) = remove_applied_staging(staging) {
+        tracing::warn!(
+            "Could not remove the applied restore's staged copies at {} ({e}); they are \
+             discarded on the next launch",
+            staging.display()
+        );
+    }
+}
+
+/// Delete an applied restore's staging folder in the one order that is safe
+/// to interrupt: the marker first, then everything else, and the
+/// [`APPLIED_SENTINEL`] last. A sweep in arbitrary order can take the sentinel
+/// while the marker it stands in for survives, and the restore then reads as
+/// pending again. Stops at the first failure to remove the marker.
+fn remove_applied_staging(staging: &Path) -> std::io::Result<()> {
+    let ignore_missing = |result: std::io::Result<()>| match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    };
+    ignore_missing(std::fs::remove_file(staging.join(STAGING_MARKER)))?;
+    let mut first_error = None;
+    for entry in std::fs::read_dir(staging)? {
+        let path = entry?.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(APPLIED_SENTINEL) {
+            continue;
+        }
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = ignore_missing(removed) {
+            first_error.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    ignore_missing(std::fs::remove_file(staging.join(APPLIED_SENTINEL)))?;
+    ignore_missing(std::fs::remove_dir(staging))
+}
+
+/// Remove the marker, or failing that leave [`APPLIED_SENTINEL`]. Returns
+/// whether the next launch is now certain not to apply the staging again.
+fn mark_restore_applied(staging: &Path) -> bool {
+    match std::fs::remove_file(staging.join(STAGING_MARKER)) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::error!(
+                "Could not remove the marker of the applied restore ({e}); marking it applied instead"
+            );
+            match crate::security::atomic_write(&staging.join(APPLIED_SENTINEL), b"applied\n", true)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("Could not mark the applied restore as applied ({e})");
+                    false
+                }
+            }
+        }
+    }
 }
 
 /// Repair paths in a restored config that only made sense on the machine the
@@ -1688,7 +2293,8 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
 /// otherwise leave Ember unable to launch at all on a machine without that
 /// drive, on the very path this feature exists to serve.
 ///
-/// Only the download folder is touched. Shared folders that are missing right
+/// The media player is always cleared. Of the folders, only the download
+/// folder is touched. Shared folders that are missing right
 /// now are left alone on purpose: `initialize_approved_roots` already treats an
 /// absent root as offline and keeps its approval, so dropping them here would
 /// silently delete a user's shares whenever they restored with an external
@@ -1709,6 +2315,25 @@ fn sanitize_restored_config(data_dir: &Path) {
         return;
     };
     let mut changed = false;
+
+    // A program Ember will execute. Settings only accepts one the native
+    // picker produced this session; an archive is not that, and one carried
+    // over from another machine names a binary that may not exist here or may
+    // be anything at all once decrypted with a passphrase the attacker chose.
+    if obj
+        .get("preview_player")
+        .and_then(|v| v.as_str())
+        .is_some_and(|player| !player.is_empty())
+    {
+        tracing::warn!(
+            "Cleared the media player from the restored config; choose it again in Settings"
+        );
+        obj.insert(
+            "preview_player".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        changed = true;
+    }
 
     if let Some(folder) = obj
         .get("download_folder")
@@ -2023,6 +2648,592 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A copy step that fails for `fail_on` and copies everything else.
+    fn failing_copy(fail_on: &'static str) -> impl FnMut(&Path, &Path) -> std::io::Result<()> {
+        move |staged, live| {
+            if staged.file_name().and_then(|n| n.to_str()) == Some(fail_on) {
+                // Leave a truncated file behind, the way a copy that fails
+                // part-way does.
+                std::fs::write(live, b"partial")?;
+                return Err(std::io::Error::other("injected copy failure"));
+            }
+            copy_into_place(staged, live)
+        }
+    }
+
+    /// A copy step that dies for `crash_on` after writing part of the file,
+    /// with no chance to roll back: the state a power cut leaves.
+    fn crashing_copy(crash_on: &'static str) -> impl FnMut(&Path, &Path) -> std::io::Result<()> {
+        move |staged, live| {
+            if staged.file_name().and_then(|n| n.to_str()) == Some(crash_on) {
+                std::fs::write(live, b"partial").unwrap();
+                panic!("simulated crash while copying {crash_on}");
+            }
+            copy_into_place(staged, live)
+        }
+    }
+
+    fn stage(dir: &Path, files: &[(&str, &[u8])]) -> (PathBuf, Vec<String>) {
+        let staging = staging_dir(dir);
+        std::fs::create_dir_all(&staging).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(staging.join(name), bytes).unwrap();
+        }
+        let names = files.iter().map(|(name, _)| (*name).to_string()).collect();
+        (staging, names)
+    }
+
+    fn swap(
+        dir: &Path,
+        staging: &Path,
+        names: &[String],
+        copy: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    ) -> (PathBuf, Result<usize, String>) {
+        swap_in_staged_files(dir, staging, names, copy).unwrap()
+    }
+
+    fn crash(dir: &Path, staging: &Path, names: &[String], crash_on: &'static str) {
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            swap_in_staged_files(dir, staging, names, crashing_copy(crash_on))
+        }));
+        assert!(crashed.is_err(), "the injected crash must fire");
+    }
+
+    fn pre_restore_dirs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(BACKUP_DIR_PREFIX))
+            })
+            .collect()
+    }
+
+    fn write_all(dir: &Path, files: &[(&str, &[u8])]) {
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+    }
+
+    fn assert_contents(dir: &Path, files: &[(&str, &[u8])]) {
+        for (name, bytes) in files {
+            assert_eq!(
+                std::fs::read(dir.join(name)).unwrap(),
+                *bytes,
+                "{} in {}",
+                name,
+                dir.display()
+            );
+        }
+    }
+
+    /// The live database's WAL can hold its most recent commits (nothing
+    /// checkpoints at shutdown), so a rollback that restores `ember.db`
+    /// without its sidecars silently loses them.
+    #[test]
+    fn a_rolled_back_restore_puts_the_database_sidecars_back() {
+        let dir = scratch("rollback-sidecars");
+        for (name, bytes) in [
+            ("ember.db", &b"live-db"[..]),
+            ("ember.db-wal", b"live-wal"),
+            ("ember.db-shm", b"live-shm"),
+            ("config.json", b"live-config"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let (staging, names) = stage(
+            &dir,
+            &[
+                ("ember.db", b"restored-db"),
+                ("config.json", b"restored-config"),
+            ],
+        );
+
+        let err = swap(&dir, &staging, &names, failing_copy("config.json"))
+            .1
+            .unwrap_err();
+        assert!(err.contains("config.json"), "{err}");
+        for (name, bytes) in [
+            ("ember.db", &b"live-db"[..]),
+            ("ember.db-wal", b"live-wal"),
+            ("ember.db-shm", b"live-shm"),
+            ("config.json", b"live-config"),
+        ] {
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes, "{name}");
+        }
+        assert!(
+            staging.join("ember.db").is_file(),
+            "staging kept for a retry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_database_copy_puts_the_database_and_its_sidecars_back() {
+        let dir = scratch("rollback-db-copy");
+        std::fs::write(dir.join("ember.db"), b"live-db").unwrap();
+        std::fs::write(dir.join("ember.db-wal"), b"live-wal").unwrap();
+        let (staging, names) = stage(&dir, &[("ember.db", b"restored-db")]);
+
+        swap(&dir, &staging, &names, failing_copy("ember.db"))
+            .1
+            .unwrap_err();
+        assert_eq!(std::fs::read(dir.join("ember.db")).unwrap(), b"live-db");
+        assert_eq!(
+            std::fs::read(dir.join("ember.db-wal")).unwrap(),
+            b"live-wal"
+        );
+        assert!(!dir.join("ember.db-shm").exists(), "nothing invented");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the machine never had must not survive a rollback, or the
+    /// profile is left holding the backup's copy beside the machine's own
+    /// everything else.
+    #[test]
+    fn a_rolled_back_restore_removes_files_that_had_no_original() {
+        let dir = scratch("rollback-new-files");
+        std::fs::write(dir.join("config.json"), b"live-config").unwrap();
+        std::fs::write(dir.join("identity.json"), b"live-identity").unwrap();
+        let (staging, names) = stage(
+            &dir,
+            &[
+                ("config.json", b"restored-config"),
+                ("share_intent.json", b"restored-intent"),
+                ("known_paths.dat", b"restored-paths"),
+                ("identity.json", b"restored-identity"),
+            ],
+        );
+
+        swap(&dir, &staging, &names, failing_copy("identity.json"))
+            .1
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(dir.join("config.json")).unwrap(),
+            b"live-config"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("identity.json")).unwrap(),
+            b"live-identity"
+        );
+        assert!(!dir.join("share_intent.json").exists());
+        assert!(!dir.join("known_paths.dat").exists());
+        assert!(staging.join("share_intent.json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_swap_stashes_the_database_sidecars_with_the_original() {
+        let dir = scratch("swap-sidecars");
+        std::fs::write(dir.join("ember.db"), b"live-db").unwrap();
+        std::fs::write(dir.join("ember.db-wal"), b"live-wal").unwrap();
+        let (staging, names) = stage(&dir, &[("ember.db", b"restored-db")]);
+
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        assert_eq!(outcome.unwrap(), 1);
+        assert_eq!(std::fs::read(dir.join("ember.db")).unwrap(), b"restored-db");
+        assert!(!dir.join("ember.db-wal").exists());
+        assert_eq!(
+            std::fs::read(backup_dir.join("ember.db-wal")).unwrap(),
+            b"live-wal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const LIVE_PROFILE: &[(&str, &[u8])] = &[
+        ("identity.json", b"live-identity"),
+        ("ember.db", b"live-db"),
+        ("ember.db-wal", b"live-wal"),
+        ("ember.db-shm", b"live-shm"),
+        ("config.json", b"live-config"),
+    ];
+    const STAGED_PROFILE: &[(&str, &[u8])] = &[
+        ("identity.json", b"restored-identity"),
+        ("ember.db", b"restored-db"),
+        ("config.json", b"restored-config"),
+    ];
+
+    /// A crash mid-copy leaves a restored `identity.json` and a truncated
+    /// `ember.db` live. The retry must treat both as its own work, not move
+    /// them aside as the user's originals into a second pre-restore folder.
+    #[test]
+    fn a_crash_mid_copy_is_resumed_into_the_same_pre_restore_folder() {
+        let dir = scratch("crash-resume");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+
+        crash(&dir, &staging, &names, "ember.db");
+        assert_eq!(std::fs::read(dir.join("ember.db")).unwrap(), b"partial");
+
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        assert_eq!(outcome.unwrap(), 3);
+        assert_contents(&dir, STAGED_PROFILE);
+        assert!(!dir.join("ember.db-wal").exists());
+        assert!(!dir.join("ember.db-shm").exists());
+        assert_eq!(pre_restore_dirs(&dir), vec![backup_dir.clone()]);
+        assert_contents(&backup_dir, LIVE_PROFILE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retry that fails must roll back to the machine's originals, including
+    /// files an earlier, crashed attempt swapped and this one never reached.
+    #[test]
+    fn a_failed_retry_after_a_crash_rolls_back_to_the_originals() {
+        let dir = scratch("crash-rollback");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+
+        crash(&dir, &staging, &names, "config.json");
+        swap(&dir, &staging, &names, failing_copy("identity.json"))
+            .1
+            .unwrap_err();
+
+        assert_contents(&dir, LIVE_PROFILE);
+        let journal: ApplyJournal =
+            serde_json::from_slice(&std::fs::read(staging.join(APPLY_JOURNAL)).unwrap()).unwrap();
+        assert!(journal.entries.is_empty(), "everything was put back");
+
+        // And the next attempt starts over cleanly from the originals.
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        assert_eq!(outcome.unwrap(), 3);
+        assert_contents(&dir, STAGED_PROFILE);
+        assert_contents(&backup_dir, LIVE_PROFILE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash after `ember.db` was moved aside but before its sidecars were.
+    /// The retry sees no live database; the live WAL/SHM still belong to the
+    /// original and must travel with it, never be left for a fresh database.
+    #[test]
+    fn a_crash_between_moving_the_database_and_its_sidecars_is_recovered() {
+        let dir = scratch("crash-sidecars");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        let (backup_dir, _) = open_apply_journal(&dir, &staging).unwrap();
+        std::fs::rename(dir.join("ember.db"), backup_dir.join("ember.db")).unwrap();
+
+        swap(&dir, &staging, &names, failing_copy("config.json"))
+            .1
+            .unwrap_err();
+        assert_contents(&dir, LIVE_PROFILE);
+
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        assert_eq!(outcome.unwrap(), 3);
+        assert_contents(&backup_dir, LIVE_PROFILE);
+        assert!(!dir.join("ember.db-wal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the machine never had, copied in before the crash, is the
+    /// backup's copy. The retry must not preserve it as an "original", and a
+    /// failed retry must remove it.
+    #[test]
+    fn a_crash_after_copying_a_file_with_no_original_does_not_adopt_it() {
+        let dir = scratch("crash-new-file");
+        std::fs::write(dir.join("identity.json"), b"live-identity").unwrap();
+        let (staging, names) = stage(
+            &dir,
+            &[
+                ("share_intent.json", b"restored-intent"),
+                ("identity.json", b"restored-identity"),
+            ],
+        );
+
+        crash(&dir, &staging, &names, "identity.json");
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, failing_copy("identity.json"));
+        outcome.unwrap_err();
+
+        assert!(!dir.join("share_intent.json").exists());
+        assert!(!backup_dir.join("share_intent.json").exists());
+        assert_eq!(
+            std::fs::read(dir.join("identity.json")).unwrap(),
+            b"live-identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_marker(staging: &Path, files: &[&str]) {
+        let pending = PendingRestore {
+            version: FORMAT_VERSION,
+            staged_at: chrono::Utc::now().timestamp(),
+            source_app_version: "1.3.3".to_string(),
+            schema_version: 1,
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+        };
+        std::fs::write(
+            staging.join(STAGING_MARKER),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The staged files are copied, not consumed, so a marker that survives
+    /// cleanup would re-apply the backup over everything done since.
+    #[test]
+    fn a_marker_that_cannot_be_removed_is_overridden_by_the_applied_sentinel() {
+        let dir = scratch("applied-sentinel");
+        let (staging, _) = stage(&dir, &[("config.json", b"restored")]);
+        // A directory stands in for a marker an antivirus scanner holds open:
+        // `remove_file` refuses it on every platform.
+        std::fs::create_dir_all(staging.join(STAGING_MARKER).join("held")).unwrap();
+
+        assert!(mark_restore_applied(&staging));
+        assert!(staging.join(APPLIED_SENTINEL).is_file());
+        assert!(!pending_restore_still_staged(&dir));
+        assert!(read_pending_marker(&staging).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_applied_restore_is_never_applied_again() {
+        let dir = scratch("applied-once");
+        let (staging, _) = stage(&dir, &[("config.json", b"restored")]);
+        write_marker(&staging, &["config.json"]);
+        std::fs::write(staging.join(APPLIED_SENTINEL), b"applied\n").unwrap();
+        std::fs::write(dir.join("config.json"), b"changed since").unwrap();
+
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(dir.join("config.json")).unwrap(),
+            b"changed since"
+        );
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The config is repaired as part of the apply, not after staging is
+    /// gone, and the finished apply leaves nothing to re-apply.
+    #[test]
+    fn an_applied_restore_repairs_its_config_and_retires_staging() {
+        let dir = scratch("apply-sanitize");
+        let config = serde_json::to_vec(&serde_json::json!({
+            "preview_player": r"\\attacker\share\p.exe",
+            "nickname": "kept",
+        }))
+        .unwrap();
+        let (staging, _) = stage(&dir, &[("config.json", &config)]);
+        write_marker(&staging, &["config.json"]);
+
+        let backup_dir = apply_pending_restore(&dir).unwrap().unwrap();
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(repaired["preview_player"].as_str().unwrap(), "");
+        assert_eq!(repaired["nickname"].as_str().unwrap(), "kept");
+        assert!(!staging.exists());
+        assert!(backup_dir.is_dir());
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copies that already landed spent their space. Counting them again would
+    /// refuse, on every later launch, the resume that has to finish.
+    #[test]
+    fn a_resume_needs_space_only_for_the_files_not_yet_copied() {
+        let dir = scratch("resume-space");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        crash(&dir, &staging, &names, "config.json");
+
+        let journal = read_apply_journal(&staging).unwrap();
+        let config_len = b"restored-config".len() as u64;
+        assert_eq!(
+            restore_space_needed(&dir, &staging, &names, Some(&journal)),
+            config_len + config_len / 4
+        );
+        assert!(
+            restore_space_needed(&dir, &staging, &names, None)
+                > restore_space_needed(&dir, &staging, &names, Some(&journal))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_apply_is_resumed_at_the_next_launch() {
+        let dir = scratch("resume-apply");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
+        crash(&dir, &staging, &names, "ember.db");
+
+        let backup_dir = apply_pending_restore(&dir).unwrap().unwrap();
+        assert_contents(&dir, STAGED_PROFILE);
+        assert_contents(&backup_dir, LIVE_PROFILE);
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-check that refuses to resume must not leave the app to start on
+    /// the half-applied profile.
+    #[test]
+    fn a_resume_refused_by_a_pre_check_rolls_the_interrupted_apply_back() {
+        let dir = scratch("resume-refused");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
+        crash(&dir, &staging, &names, "ember.db");
+        std::fs::remove_file(staging.join("config.json")).unwrap();
+
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert_contents(&dir, LIVE_PROFILE);
+        assert!(pending_restore_still_staged(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pre_restore_with(dir: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+        let backup_dir = dir.join("pre-restore-test");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        write_all(&backup_dir, files);
+        backup_dir
+    }
+
+    fn db_entry(sidecars: &[&str], attempt: u32) -> Swapped {
+        Swapped {
+            name: "ember.db".to_string(),
+            displaced: true,
+            sidecars: sidecars.iter().map(|s| (*s).to_string()).collect(),
+            sidecars_done: true,
+            stranded: Vec::new(),
+            attempt,
+            copied: None,
+        }
+    }
+
+    /// The database goes back and is opened without the sidecar it could not
+    /// take along, so that sidecar must be set aside for good, not left where a
+    /// later launch would return it.
+    #[test]
+    fn a_sidecar_rollback_cannot_return_is_set_aside_under_a_unique_name() {
+        let dir = scratch("strand-sidecar");
+        let backup_dir = pre_restore_with(
+            &dir,
+            &[("ember.db", b"live-db"), ("ember.db-wal", b"live-wal")],
+        );
+        std::fs::write(dir.join("ember.db"), b"restored-db").unwrap();
+        // A non-empty directory where the WAL goes makes the rename fail.
+        std::fs::create_dir_all(dir.join("ember.db-wal").join("busy")).unwrap();
+
+        let mut entry = db_entry(&["ember.db-wal"], 1);
+        assert!(roll_back_swap(&dir, &backup_dir, &mut entry));
+        assert_eq!(std::fs::read(dir.join("ember.db")).unwrap(), b"live-db");
+        assert!(!backup_dir.join("ember.db-wal").exists());
+        assert_eq!(
+            std::fs::read(backup_dir.join("ember.db-wal.orphaned-1")).unwrap(),
+            b"live-wal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stashed_sidecar_returns_only_after_a_crash_not_after_the_app_ran() {
+        for (crashed_attempt, returned) in [(Some(1), true), (None, false)] {
+            let dir = scratch("settle-sidecar");
+            let backup_dir = pre_restore_with(&dir, &[("ember.db-wal", b"live-wal")]);
+            std::fs::write(dir.join("ember.db"), b"live-db").unwrap();
+            let mut journal = ApplyJournal {
+                backup_dir: "pre-restore-test".to_string(),
+                attempt: 1,
+                in_progress: crashed_attempt.is_some(),
+                entries: vec![db_entry(&["ember.db-wal"], 1)],
+            };
+
+            settle_rolled_back_entries(&dir, &backup_dir, &mut journal, crashed_attempt);
+            assert!(journal.entries.is_empty());
+            assert_eq!(dir.join("ember.db-wal").exists(), returned);
+            assert_eq!(
+                backup_dir.join("ember.db-wal.orphaned-1").exists(),
+                !returned
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A stale stash left by an earlier rollback must be set aside, not
+    /// replaced, when the live database's sidecar is stashed in its place.
+    #[test]
+    fn stashing_over_a_stale_sidecar_keeps_both_and_every_earlier_orphan() {
+        let dir = scratch("stash-stale");
+        let backup_dir = pre_restore_with(
+            &dir,
+            &[
+                ("ember.db-wal", b"stale"),
+                ("ember.db-wal.orphaned-1", b"older"),
+            ],
+        );
+        std::fs::write(dir.join("ember.db-wal"), b"current").unwrap();
+
+        let mut entry = db_entry(&[], 2);
+        stash_database_sidecars(&dir, &backup_dir, &mut entry, true, true).unwrap();
+        assert_contents(
+            &backup_dir,
+            &[
+                ("ember.db-wal", b"current"),
+                ("ember.db-wal.orphaned-1", b"older"),
+                ("ember.db-wal.orphaned-2", b"stale"),
+            ],
+        );
+        assert_eq!(entry.sidecars, vec!["ember.db-wal".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After an attempt returned, the app ran and may have created a file the
+    /// journal lists as having no original. That file is the user's now.
+    #[test]
+    fn a_file_created_after_an_attempt_returned_is_preserved_not_overwritten() {
+        for (copied_matches, preserved) in [(false, true), (true, false)] {
+            let dir = scratch("stale-no-original");
+            std::fs::write(dir.join("nodes.dat"), b"created by the app").unwrap();
+            let (staging, names) = stage(&dir, &[("nodes.dat", b"restored-nodes")]);
+            let (_, mut journal) = open_apply_journal(&dir, &staging).unwrap();
+            journal.attempt = 1;
+            journal.in_progress = false;
+            journal.entries.push(Swapped {
+                name: "nodes.dat".to_string(),
+                displaced: false,
+                sidecars: Vec::new(),
+                sidecars_done: false,
+                stranded: Vec::new(),
+                attempt: 1,
+                copied: copied_matches
+                    .then(|| FileFingerprint::of(&dir.join("nodes.dat")))
+                    .flatten(),
+            });
+            write_apply_journal(&staging, &journal).unwrap();
+
+            let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+            assert_eq!(outcome.unwrap(), 1);
+            assert_eq!(
+                std::fs::read(dir.join("nodes.dat")).unwrap(),
+                b"restored-nodes"
+            );
+            assert_eq!(backup_dir.join("nodes.dat").exists(), preserved);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Cleaning up an applied restore whose marker cannot be deleted must keep
+    /// the sentinel that stands in for it.
+    #[test]
+    fn staging_cleanup_never_removes_the_sentinel_before_the_marker() {
+        let dir = scratch("sentinel-last");
+        let (staging, _) = stage(&dir, &[("config.json", b"restored")]);
+        std::fs::create_dir_all(staging.join(STAGING_MARKER).join("held")).unwrap();
+        std::fs::write(staging.join(APPLIED_SENTINEL), b"applied\n").unwrap();
+
+        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(staging.join(APPLIED_SENTINEL).is_file());
+        assert!(!pending_restore_still_staged(&dir));
+        assert!(read_pending_marker(&staging).is_none());
+
+        std::fs::remove_dir_all(staging.join(STAGING_MARKER)).unwrap();
+        remove_applied_staging(&staging).unwrap();
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An abandoned export scratch directory holds DPAPI-*unwrapped* identity,
     /// SecIdent and chat keys, so it must not survive a restart.
     #[test]
@@ -2157,6 +3368,7 @@ mod tests {
                 dir.join("gone").to_string_lossy(),
             ],
             "nickname": "kept",
+            "preview_player": r"\\attacker\share\p.exe",
         });
         std::fs::write(
             dir.join("config.json"),
@@ -2178,6 +3390,33 @@ mod tests {
             "a folder that is merely offline must not be dropped from the config"
         );
         // Untouched fields must survive the raw-JSON edit.
+        assert_eq!(repaired["nickname"].as_str().unwrap(), "kept");
+        assert_eq!(
+            repaired["preview_player"].as_str().unwrap(),
+            "",
+            "a restored config must never name a program Ember will run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_config_with_only_a_media_player_is_rewritten_without_it() {
+        let dir = scratch("sanitize-player");
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "preview_player": r"C:\Windows\System32\mshta.exe",
+                "nickname": "kept",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        sanitize_restored_config(&dir);
+
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(repaired["preview_player"].as_str().unwrap(), "");
         assert_eq!(repaired["nickname"].as_str().unwrap(), "kept");
         let _ = std::fs::remove_dir_all(&dir);
     }

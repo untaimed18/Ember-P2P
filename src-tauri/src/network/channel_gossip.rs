@@ -710,28 +710,41 @@ pub(super) async fn handle_inbound_channel_gossip(
         debug!("Ember channel gossip: shed a frame from {from_id} over the per-hop budget");
         return;
     }
-    if !remember_channel_gossip(state, gossip.msg_id) {
-        return;
-    }
+    let body_key = ember::channel::gossip_body_key(&gossip);
+    let admission = ember::channel::admit_gossip(
+        &mut state.channel_gossip_seen,
+        &mut state.channel_gossip_seen_order,
+        ember::channel::CHANNEL_GOSSIP_SEEN_CAP,
+        gossip.msg_id,
+        body_key,
+        std::time::Instant::now(),
+    );
+    let variant = match admission {
+        ember::channel::GossipAdmission::Fresh => false,
+        ember::channel::GossipAdmission::Variant => true,
+        ember::channel::GossipAdmission::Duplicate => return,
+    };
+    // Releasing the id for a variant would re-admit the frame that claimed it.
+    let dedup_key = if variant { body_key } else { gossip.msg_id };
     if !ember::channel::gossip_timestamp_ok(
         gossip.timestamp,
         chrono::Utc::now().timestamp(),
     ) {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     if db.chat_locked() {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     let channel_id_hex = hex::encode(gossip.channel_id);
     let Some(view) = cached_channel_view(state, db, gossip.channel_id) else {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     };
     let ch = view.row;
     if !ch.in_room_now() {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     // Decrypt may succeed under an older epoch; that key is only used to
@@ -750,9 +763,20 @@ pub(super) async fn handle_inbound_channel_gossip(
         })
     else {
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     };
+    if variant
+        && ember::channel::decode_channel_chat_plain(
+            &plain,
+            &gossip.channel_id,
+            &gossip.msg_id,
+            gossip.timestamp,
+        )
+        .is_none()
+    {
+        return;
+    }
     // Ember Transfer frames are addressed to one member and never relayed on,
     // so they are matched before the gossip types and always return.
     //
@@ -1082,16 +1106,29 @@ pub(super) async fn handle_inbound_channel_gossip(
         );
         return;
     };
+    let sender_hex = hex::encode(sender_pk);
+    let msg_id_hex = hex::encode(gossip.msg_id);
+    // Ahead of the rate charge: our own lines echo back as variants, and a line
+    // we already hold says nothing new to us or to the mesh.
+    if variant
+        && (db
+            .channel_message_held(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
+            .unwrap_or(true)
+            || db
+                .channel_message_forgotten(&channel_id_hex, &msg_id_hex, &sender_hex)
+                .unwrap_or(true))
+    {
+        return;
+    }
     // Ahead of any DB work, and ahead of the relay below: a member flooding a
     // room must not be forwarded on by us, or the mesh amplifies it.
     if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
         // Release the dedup slot: this was refused for rate, not validity, so a
         // retransmit once the window rolls off has to still be admissible.
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         debug!("Ember channel gossip: rate-limited author in {channel_id_hex}");
         return;
     }
-    let sender_hex = hex::encode(sender_pk);
     if db
         .channel_member_is_banned(&channel_id_hex, &sender_hex)
         .unwrap_or(false)
@@ -1106,7 +1143,7 @@ pub(super) async fn handle_inbound_channel_gossip(
     {
         // The same line may still arrive under the current key — a catch-up
         // re-serve keeps its id — so it must not be burned as seen.
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         debug!(
             "Ember channel gossip: dropped a line in {channel_id_hex} from an unknown author \
              under a retired key"
@@ -1117,15 +1154,16 @@ pub(super) async fn handle_inbound_channel_gossip(
     if cleaned.is_empty() || cleaned.len() > 4096 {
         return;
     }
-    let msg_id_hex = hex::encode(gossip.msg_id);
     // Either we already hold the line, or we held it and were told to forget it.
     // Both mean do not store it again; both still pass it on, because forgetting
-    // a line here is a local decision and not a claim about the room.
+    // a line here is a local decision and not a claim about the room. Holding
+    // only the id is not holding the line: a row that cannot prove the id is its
+    // own gives way to this one inside `insert_channel_message`.
     if db
-        .channel_message_exists(&channel_id_hex, &msg_id_hex)
+        .channel_message_held(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
         .unwrap_or(false)
         || db
-            .channel_message_forgotten(&channel_id_hex, &msg_id_hex)
+            .channel_message_forgotten(&channel_id_hex, &msg_id_hex, &sender_hex)
             .unwrap_or(false)
     {
         if let Some(next) = gossip.decremented_ttl() {

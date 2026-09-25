@@ -675,6 +675,11 @@ pub fn run() {
             // across restarts — the subscriber is installed before this so a
             // failure in between still reaches the log file.
             security::logging::install_pseudonym_key(&identity.ed25519_secret_key);
+            network::friend_intro::set_own_intro_secret(identity.intro_secret);
+            match db.get_friend_intro_secrets() {
+                Ok(secrets) => network::friend_intro::load_friend_intro_secrets(secrets),
+                Err(e) => tracing::warn!("Failed to load friend intro secrets: {e}"),
+            }
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
@@ -2069,6 +2074,7 @@ pub fn run() {
             commands::peers::get_friends,
             commands::peers::update_friend_nickname,
             commands::peers::get_my_ember_hash,
+            commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,

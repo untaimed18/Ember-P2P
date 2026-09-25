@@ -2096,10 +2096,9 @@ pub async fn send_channel_message(
             "This device has no key for this channel",
         )
     })?;
-    let mut msg_id = [0u8; 16];
-    OsRng.fill_bytes(&mut msg_id);
     let sender_pk = state.identity.ed25519_public_key;
     let sent_at = chrono::Utc::now().timestamp();
+    let msg_id = channel::new_chat_msg_id(&channel_id_bytes, &sender_pk, sent_at);
     let author_sig = channel::chat_author_signature(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
         &sender_pk,

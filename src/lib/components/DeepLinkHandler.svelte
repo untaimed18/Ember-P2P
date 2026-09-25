@@ -36,7 +36,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
-  import { translateError } from '$lib/i18n';
+  import { codedErrorOf, translateError } from '$lib/i18n';
   import { formatBytes } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
@@ -179,13 +179,18 @@
           );
           return 'fail';
         }
-        // Add to the list, but don't let a duplicate-add error block the
-        // connect — a link pointing at an already-known server should still
-        // connect rather than surface a confusing failure.
+        // A link to a server that is already listed should still connect, so
+        // only the duplicate outcome falls through. That one arrives as the
+        // network task's plain sentence ("Server …:… is already in the list"),
+        // not a coded envelope. Any other failure leaves the server unlisted,
+        // and `connect_to_server` would then refuse with a misleading "add it
+        // first".
         try {
           await addServer(ip, port, '');
-        } catch (e) {
-          console.warn('Deep link: add server failed (continuing to connect):', e);
+        } catch (e: unknown) {
+          if (codedErrorOf(e)?.code === 'server_add_declined') return 'done';
+          const raw = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+          if (!/ is already in the list$/.test(raw)) throw e;
         }
         const msg = await connectToServer(ip, port);
         if (!destroyed) toastSuccess(msg);

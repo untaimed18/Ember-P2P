@@ -88,37 +88,57 @@ fn explicit_version_unsupported(status: reqwest::StatusCode) -> bool {
 /// answer had not changed since startup.
 const RENDEZVOUS_PROTOCOL_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-fn protocol_cache(
-) -> &'static tokio::sync::RwLock<std::collections::HashMap<String, (RendezvousProtocol, std::time::Instant)>>
-{
-    static CACHE: std::sync::OnceLock<
-        tokio::sync::RwLock<
-            std::collections::HashMap<String, (RendezvousProtocol, std::time::Instant)>,
-        >,
-    > = std::sync::OnceLock::new();
+/// What a rendezvous server advertised on `/v4/protocol`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ServerFeatures {
+    pub protocol: RendezvousProtocol,
+    /// Accepts `ember3:` intro registrations proved with an `intro_key`. An
+    /// older or third-party server only accepts the legacy pubkey-derived
+    /// intro and refuses anything else.
+    pub sealed_intro: bool,
+}
+
+type ProtocolCache =
+    tokio::sync::RwLock<std::collections::HashMap<String, (ServerFeatures, std::time::Instant)>>;
+
+fn protocol_cache() -> &'static ProtocolCache {
+    static CACHE: std::sync::OnceLock<ProtocolCache> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
 /// Record a successfully negotiated version. Only definite answers are cached
 /// — a transport failure leaves the cache alone so the next call re-probes
 /// rather than pinning a guess for the whole TTL.
-async fn remember_protocol(base_url: &str, protocol: RendezvousProtocol) {
+async fn remember_protocol(base_url: &str, features: ServerFeatures) {
     let mut cache = protocol_cache().write().await;
     let now = std::time::Instant::now();
     cache.retain(|_, (_, at)| now.duration_since(*at) < RENDEZVOUS_PROTOCOL_TTL);
     if cache.len() >= RENDEZVOUS_CLIENT_CACHE_MAX {
         cache.clear();
     }
-    cache.insert(base_url.to_string(), (protocol, now));
+    cache.insert(base_url.to_string(), (features, now));
+}
+
+/// The server advertised sealed intro but refused one anyway. Treat it as
+/// legacy-only until the cached answer expires, which is also when sealed
+/// registration is retried.
+async fn mark_sealed_intro_unsupported(base_url: &str) {
+    if let Some((features, _)) = protocol_cache().write().await.get_mut(base_url) {
+        features.sealed_intro = false;
+    }
 }
 
 pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProtocol, String> {
+    Ok(negotiate_server_features(base_url).await?.protocol)
+}
+
+pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFeatures, String> {
     require_https(base_url)?;
     {
         let cache = protocol_cache().read().await;
-        if let Some((protocol, at)) = cache.get(base_url) {
+        if let Some((features, at)) = cache.get(base_url) {
             if at.elapsed() < RENDEZVOUS_PROTOCOL_TTL {
-                return Ok(*protocol);
+                return Ok(*features);
             }
         }
     }
@@ -133,16 +153,24 @@ pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProto
             serde_json::from_slice(&read_bounded_bytes(response, MAX_RESPONSE_BYTES).await?)
                 .map_err(|error| format!("rendezvous protocol probe bad body: {error}"))?;
         return if body["version"].as_u64() == Some(4) {
-            remember_protocol(base_url, RendezvousProtocol::IpBoundV4).await;
-            Ok(RendezvousProtocol::IpBoundV4)
+            let features = ServerFeatures {
+                protocol: RendezvousProtocol::IpBoundV4,
+                sealed_intro: body["sealed_intro"].as_bool() == Some(true),
+            };
+            remember_protocol(base_url, features).await;
+            Ok(features)
         } else {
             Err("rendezvous protocol probe returned an unsupported version".to_string())
         };
     }
     if explicit_version_unsupported(response.status()) {
         debug!("Rendezvous: server explicitly lacks v4; using bounded legacy v3 compatibility");
-        remember_protocol(base_url, RendezvousProtocol::LegacyV3).await;
-        Ok(RendezvousProtocol::LegacyV3)
+        let features = ServerFeatures {
+            protocol: RendezvousProtocol::LegacyV3,
+            sealed_intro: false,
+        };
+        remember_protocol(base_url, features).await;
+        Ok(features)
     } else {
         Err(format!(
             "rendezvous protocol probe returned {}",
@@ -601,11 +629,26 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 /// Result of a successful classic `/register`. Presence-layer intro and
 /// pairwise posts are reported here so callers can treat "on the server"
 /// as distinct from "friends can look us up".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegistrationOutcome {
+    /// Some intro entry (sealed or legacy) is live.
     pub intro_ok: bool,
+    /// The `ember3:` intro is live, so a current friend code finds us.
+    pub sealed_intro_ok: bool,
+    /// The legacy pubkey-derived intro is live: the server lacks sealed
+    /// intro, or friends we hold no public key for still need it.
+    pub legacy_intro_ok: bool,
     pub pairwise_attempted: usize,
     pub pairwise_failed: usize,
+    /// Public keys learned this round for friends we only had a hash for.
+    /// The caller persists them so pairwise presence covers those friends.
+    pub backfilled_pubkeys: Vec<([u8; 16], [u8; 32])>,
+    /// Hash-only friends whose key lookup missed this round.
+    pub backfill_missed: Vec<[u8; 16]>,
+    /// Mutual friends we hold no key for and have stopped publishing the
+    /// legacy intro for, so they cannot find us until they get our current
+    /// friend code. Empty while the legacy intro is up for any reason.
+    pub legacy_stranded_friends: Vec<[u8; 16]>,
 }
 
 impl RegistrationOutcome {
@@ -641,6 +684,9 @@ impl RegistrationOutcome {
         let intro_bad = !self.intro_ok;
         let pairwise_any = self.pairwise_failed > 0;
         match (intro_bad, self.all_pairwise_failed(), pairwise_any) {
+            // Reachable, but only through the pubkey-derived intro: a
+            // current friend code does not find us on this server.
+            (false, false, false) if !self.sealed_intro_ok => Some("sealed_intro_unavailable"),
             (false, false, false) => None,
             (true, false, false) => Some("intro_presence_failed"),
             (false, false, true) => Some("pairwise_presence_partial"),
@@ -681,6 +727,12 @@ impl RegistrationOutcome {
 /// reported on [`RegistrationOutcome`] rather than collapsed into that
 /// boolean: lookup does not depend on the intro entry, and a pairwise
 /// miss is what actually hides us from the affected friends.
+///
+/// `hash_only` describes friends we hold no public key for: those in
+/// `backfill` get an identity lookup once we are on the server (the lookup
+/// requires that), with keys found coming back on the outcome; the legacy
+/// intro stays published while any of `legacy_dependents` is still keyless.
+#[allow(clippy::too_many_arguments)]
 pub async fn register(
     base_url: &str,
     ember_hash: &[u8; 16],
@@ -691,6 +743,7 @@ pub async fn register(
     secret_key: &[u8; 32],
     friend_identities: &[([u8; 16], [u8; 32])],
     channel_neighbors: &[([u8; 16], [u8; 32])],
+    hash_only: &HashOnlyFriends,
 ) -> Result<RegistrationOutcome, String> {
     require_https(base_url)?;
     // Probe *before* the mutating POST. A later `?` on GET /v4/protocol used
@@ -698,7 +751,8 @@ pub async fn register(
     // treated a registered node as unregistered and retried the POST every
     // 10s. Failure here now genuinely means we never registered. 404/405/410/
     // 501/426 still map to LegacyV3 inside `negotiate_protocol`.
-    let protocol = negotiate_protocol(base_url).await?;
+    let features = negotiate_server_features(base_url).await?;
+    let protocol = features.protocol;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
     let id_raw = sha256_id_raw(ember_hash);
@@ -726,41 +780,115 @@ pub async fn register(
         // success message at info and the identifying bits at debug.
         debug!("Rendezvous: registered {}… (ip={})", &id[..8], external_ip);
         let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
-        // Friend-code intro presence: public to holders of our ember2: code.
-        // Registered before pairwise entries so one-sided Add Friend can find us.
-        // Lookup tries intro *and* pairwise and skips 404, so a failed intro
-        // only degrades friend-code adds — existing friends still resolve
-        // via pairwise. Report it on the outcome; do not fail the register.
-        let intro_capability =
-            crate::network::ember::crypto::derive_intro_presence_capability(pubkey, epoch);
-        let intro_ok = match register_capability_presence(
-            base_url,
-            &intro_capability,
-            epoch,
-            port,
-            external_ip,
-            pubkey,
-            pubkey, // self-bound; server marks open_intro
-            secret_key,
-            protocol,
-            true,
-        )
-        .await
-        {
-            Ok(()) => true,
-            Err(error) => {
-                warn!("Intro presence registration failed: {error}");
-                false
+
+        // Learn keys for hash-only friends so pairwise presence can cover
+        // them. Needs our own registration above, which the identity lookup
+        // checks for.
+        let mut friend_identities = friend_identities.to_vec();
+        let mut backfilled_pubkeys = Vec::new();
+        let mut backfill_missed = Vec::new();
+        for target in &hash_only.backfill {
+            match fetch_identity_pubkey_authenticated(base_url, target, ember_hash, pubkey, secret_key)
+                .await
+            {
+                Ok(Some(key))
+                    if crate::network::ember::crypto::verify_ember_hash_binding(&key, target) =>
+                {
+                    backfilled_pubkeys.push((*target, key));
+                    friend_identities.push((*target, key));
+                }
+                Ok(_) => backfill_missed.push(*target),
+                Err(error) => {
+                    debug!("Rendezvous: key lookup for a hash-only friend failed: {error}");
+                    backfill_missed.push(*target);
+                }
             }
+        }
+        let hash_only_remaining = hash_only
+            .legacy_dependents
+            .iter()
+            .any(|hash| !backfilled_pubkeys.iter().any(|(learned, _)| learned == hash));
+
+        // Friend-code intro presence. Registered before pairwise entries so
+        // one-sided Add Friend can find us. Lookup tries intro *and* pairwise
+        // and skips 404, so a failed intro only degrades friend-code adds —
+        // existing keyed friends still resolve via pairwise. Report it on the
+        // outcome; do not fail the register.
+        let mut sealed_available = features.sealed_intro;
+        let mut sealed_intro_ok = false;
+        match crate::network::friend_intro::own_intro_secret() {
+            Some(intro_secret) if sealed_available => {
+                let (intro_capability, intro_key) =
+                    intro_presence_registration(pubkey, &intro_secret, epoch);
+                match register_capability_presence(
+                    base_url,
+                    &intro_capability,
+                    epoch,
+                    port,
+                    external_ip,
+                    pubkey,
+                    pubkey, // self-bound; server marks open_intro
+                    secret_key,
+                    protocol,
+                    IntroProof::Sealed(&intro_key),
+                )
+                .await
+                {
+                    Ok(()) => sealed_intro_ok = true,
+                    Err(error) if error.sealed_intro_rejected() => {
+                        warn!(
+                            "Rendezvous rejected the sealed intro ({error}); registering the legacy intro instead until the server is re-probed"
+                        );
+                        mark_sealed_intro_unsupported(base_url).await;
+                        sealed_available = false;
+                    }
+                    Err(error) => warn!(
+                        "Sealed intro registration failed ({error}); retrying on the next heartbeat"
+                    ),
+                }
+            }
+            Some(_) => {}
+            None => warn!("Sealed intro registration skipped: intro secret not loaded"),
+        }
+        let legacy_intro_ok = if legacy_intro_needed(sealed_available, hash_only_remaining) {
+            if !sealed_available {
+                note_legacy_only_server(base_url);
+            }
+            match register_capability_presence(
+                base_url,
+                &crate::network::ember::crypto::derive_legacy_intro_presence_capability(
+                    pubkey, epoch,
+                ),
+                epoch,
+                port,
+                external_ip,
+                pubkey,
+                pubkey,
+                secret_key,
+                protocol,
+                IntroProof::Legacy,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!("Legacy intro presence registration failed: {error}");
+                    false
+                }
+            }
+        } else {
+            false
         };
+        let intro_ok = sealed_intro_ok || legacy_intro_ok;
+
         // Public presence is never indexed by the stable Friend ID. Register
         // one opaque rotating capability for each friend whose public key is
-        // available; old/hash-only relationships simply fail closed until a
-        // v2 identity exchange supplies that key.
+        // available; hash-only relationships are covered by the legacy intro
+        // until the backfill above supplies their key.
         let mut pairwise_attempted = 0usize;
         let mut pairwise_failed = 0usize;
         let mut last_pairwise_error: Option<String> = None;
-        for (_, friend_pubkey) in friend_identities {
+        for (_, friend_pubkey) in &friend_identities {
             let Some(capability) =
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
                     secret_key,
@@ -782,12 +910,12 @@ pub async fn register(
                 friend_pubkey,
                 secret_key,
                 protocol,
-                false,
+                IntroProof::None,
             )
             .await
             {
                 pairwise_failed += 1;
-                last_pairwise_error = Some(error);
+                last_pairwise_error = Some(error.to_string());
             }
         }
         // Channel gossip neighbors resolve over Ember UDP, not the friend
@@ -816,7 +944,7 @@ pub async fn register(
                     neighbor_pubkey,
                     secret_key,
                     protocol,
-                    false,
+                    IntroProof::None,
                 )
                 .await
                 {
@@ -837,16 +965,21 @@ pub async fn register(
         }
         let outcome = RegistrationOutcome {
             intro_ok,
+            sealed_intro_ok,
+            legacy_intro_ok,
             pairwise_attempted,
             pairwise_failed,
+            backfilled_pubkeys,
+            backfill_missed,
+            legacy_stranded_friends: Vec::new(),
         };
         if outcome.existing_friends_blocked() {
             debug!(
                 "Rendezvous: registered on port {port}, but intro and all pairwise presence registrations failed — existing friends cannot resolve us"
             );
-        } else if !intro_ok || pairwise_failed > 0 {
+        } else if !sealed_intro_ok || pairwise_failed > 0 {
             debug!(
-                "Rendezvous: registered on port {port} with degraded presence (intro_ok={intro_ok}, pairwise {}/{pairwise_attempted})",
+                "Rendezvous: registered on port {port} with degraded presence (sealed_intro={sealed_intro_ok}, legacy_intro={legacy_intro_ok}, pairwise {}/{pairwise_attempted})",
                 outcome.pairwise_succeeded()
             );
         } else {
@@ -962,6 +1095,93 @@ pub(crate) async fn fetch_identity_pubkey(
     Ok(Some(pubkey))
 }
 
+/// Friends we hold no public key for, as far as one registration is
+/// concerned: which of them still keep the legacy intro published, and which
+/// to look up this round.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HashOnlyFriends {
+    pub legacy_dependents: Vec<[u8; 16]>,
+    pub backfill: Vec<[u8; 16]>,
+}
+
+/// Whether to register the legacy pubkey-derived intro alongside (or instead
+/// of) the sealed one. It is readable by anyone who has seen our public key,
+/// so it is only advertised while something depends on it: a server that
+/// cannot take the sealed form, or mutual friends we hold no public key for —
+/// they cannot get a pairwise entry and would otherwise lose us entirely.
+fn legacy_intro_needed(sealed_available: bool, legacy_dependents_remaining: bool) -> bool {
+    !sealed_available || legacy_dependents_remaining
+}
+
+/// Warn once per process that this server only takes the legacy intro;
+/// every heartbeat after that says so at debug.
+fn note_legacy_only_server(base_url: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "Rendezvous server {base_url} does not support sealed intro presence; registering the legacy intro, so anyone who knows our public key can find our address there. Current friend codes will not locate us until the server is upgraded."
+        );
+    } else {
+        debug!("Rendezvous: legacy-only intro on {base_url}");
+    }
+}
+
+/// Our sealed intro capability for `epoch`, with the epoch key the server
+/// verifies it against.
+fn intro_presence_registration(
+    pubkey: &[u8; 32],
+    intro_secret: &[u8; crate::network::ember::crypto::INTRO_SECRET_LEN],
+    epoch: i64,
+) -> ([u8; 32], [u8; 32]) {
+    crate::network::ember::crypto::derive_sealed_intro_presence_capability(
+        pubkey,
+        intro_secret,
+        epoch,
+    )
+}
+
+/// How a capability registration claims open-intro presence, if at all.
+#[derive(Clone, Copy, Debug)]
+enum IntroProof<'a> {
+    None,
+    /// Pubkey-derived; the server recomputes it with no extra field.
+    Legacy,
+    /// Secret-derived, proved by this epoch key.
+    Sealed(&'a [u8; 32]),
+}
+
+#[derive(Debug)]
+struct PresenceRegisterError {
+    status: Option<reqwest::StatusCode>,
+    message: String,
+}
+
+impl PresenceRegisterError {
+    /// The server refused the sealed intro proof itself (the rendezvous
+    /// server's `SEALED_INTRO_REJECTED`). Its generic 400s and 403s — a stale
+    /// timestamp, our registration lost to a server restart — say nothing
+    /// about sealed support and must not trigger a downgrade.
+    fn sealed_intro_rejected(&self) -> bool {
+        self.status == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+    }
+}
+
+impl From<String> for PresenceRegisterError {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for PresenceRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn register_capability_presence(
     base_url: &str,
     capability: &[u8; 32],
@@ -972,10 +1192,52 @@ async fn register_capability_presence(
     peer_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     protocol: RendezvousProtocol,
-    intro: bool,
-) -> Result<(), String> {
+    intro: IntroProof<'_>,
+) -> Result<(), PresenceRegisterError> {
+    let (route, body) = build_capability_presence_request(
+        capability,
+        epoch,
+        port,
+        external_ip,
+        pubkey,
+        peer_pubkey,
+        secret_key,
+        protocol,
+        intro,
+        current_timestamp(),
+    );
+    let resp = client(base_url)
+        .await?
+        .post(format!("{}{}", base_url.trim_end_matches('/'), route,))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("pairwise presence register failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(PresenceRegisterError {
+            status: Some(resp.status()),
+            message: format!("pairwise presence register returned {}", resp.status()),
+        });
+    }
+    Ok(())
+}
+
+/// Route and JSON body for a capability registration. A sealed intro also
+/// carries the epoch key the server checks the capability against.
+#[allow(clippy::too_many_arguments)]
+fn build_capability_presence_request(
+    capability: &[u8; 32],
+    epoch: i64,
+    port: u16,
+    external_ip: Ipv4Addr,
+    pubkey: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    protocol: RendezvousProtocol,
+    intro: IntroProof<'_>,
+    ts: i64,
+) -> (&'static str, serde_json::Value) {
     use ed25519_dalek::Signer;
-    let ts = current_timestamp();
     let (route, signed, legacy_sig) = match protocol {
         RendezvousProtocol::LegacyV3 => (
             "/v3/presence/register",
@@ -1029,30 +1291,22 @@ async fn register_capability_presence(
         "peer_pubkey": hex::encode(peer_pubkey),
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
-        "intro": intro,
+        "intro": !matches!(intro, IntroProof::None),
     });
+    let fields = body.as_object_mut().expect("presence body is an object");
     if let Some(legacy_sig) = legacy_sig {
-        body.as_object_mut()
-            .expect("presence body is an object")
-            .insert(
-                "legacy_sig".to_string(),
-                serde_json::Value::String(hex::encode(legacy_sig.to_bytes())),
-            );
+        fields.insert(
+            "legacy_sig".to_string(),
+            serde_json::Value::String(hex::encode(legacy_sig.to_bytes())),
+        );
     }
-    let resp = client(base_url)
-        .await?
-        .post(format!("{}{}", base_url.trim_end_matches('/'), route,))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("pairwise presence register failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "pairwise presence register returned {}",
-            resp.status()
-        ));
+    if let IntroProof::Sealed(intro_key) = intro {
+        fields.insert(
+            "intro_key".to_string(),
+            serde_json::Value::String(hex::encode(intro_key)),
+        );
     }
-    Ok(())
+    (route, body)
 }
 
 /// Look up a friend on the rendezvous server.
@@ -1125,24 +1379,14 @@ pub async fn lookup(
     let friend_id = hashed_id(friend_hash);
     let now = current_timestamp();
     let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
-
-    // Intro first (friend-code holders), then pairwise (mutual DH).
-    // For intro proofs the registrant signs peer_pubkey = owner; for
-    // pairwise they sign peer_pubkey = the authorized friend (us).
-    let mut candidates: Vec<([u8; 32], i64, [u8; 32])> = Vec::with_capacity(4);
-    for epoch in [current_epoch, current_epoch - 1] {
-        let intro =
-            crate::network::ember::crypto::derive_intro_presence_capability(&friend_pubkey, epoch);
-        candidates.push((intro, epoch, friend_pubkey));
-        if let Some(pairwise) = crate::network::ember::crypto::derive_pairwise_presence_capability(
-            our_secret_key,
-            &friend_pubkey,
-            &friend_pubkey,
-            epoch,
-        ) {
-            candidates.push((pairwise, epoch, *our_pubkey));
-        }
-    }
+    let intro_secret = crate::network::friend_intro::friend_intro_secret(friend_hash);
+    let candidates = friend_lookup_candidates(
+        our_pubkey,
+        our_secret_key,
+        &friend_pubkey,
+        intro_secret.as_ref(),
+        current_epoch,
+    );
     lookup_capability_entries(
         base_url,
         our_ember_hash,
@@ -1153,6 +1397,42 @@ pub async fn lookup(
         candidates,
     )
     .await
+}
+
+/// Capabilities to try for a friend, as `(capability, epoch, proof_peer)`.
+///
+/// Pairwise first: it is what an established friend answers on. Then the
+/// sealed intro when their `ember3:` code gave us the secret; otherwise the
+/// legacy pubkey-only intro, which only a peer on an older build still
+/// registers. For intro proofs the registrant signs `peer_pubkey = owner`;
+/// for pairwise they sign `peer_pubkey` = the authorized friend (us).
+fn friend_lookup_candidates(
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    friend_pubkey: &[u8; 32],
+    intro_secret: Option<&[u8; crate::network::ember::crypto::INTRO_SECRET_LEN]>,
+    current_epoch: i64,
+) -> Vec<([u8; 32], i64, [u8; 32])> {
+    use crate::network::ember::crypto;
+    let mut candidates = Vec::with_capacity(4);
+    for epoch in [current_epoch, current_epoch - 1] {
+        if let Some(pairwise) = crypto::derive_pairwise_presence_capability(
+            our_secret_key,
+            friend_pubkey,
+            friend_pubkey,
+            epoch,
+        ) {
+            candidates.push((pairwise, epoch, *our_pubkey));
+        }
+        let intro = match intro_secret {
+            Some(secret) => {
+                crypto::derive_sealed_intro_presence_capability(friend_pubkey, secret, epoch).0
+            }
+            None => crypto::derive_legacy_intro_presence_capability(friend_pubkey, epoch),
+        };
+        candidates.push((intro, epoch, *friend_pubkey));
+    }
+    candidates
 }
 
 /// Look up a channel gossip neighbor whose Ed25519 pubkey is already known
@@ -1443,9 +1723,28 @@ mod registration_outcome_tests {
     fn outcome(intro_ok: bool, attempted: usize, failed: usize) -> RegistrationOutcome {
         RegistrationOutcome {
             intro_ok,
+            sealed_intro_ok: intro_ok,
             pairwise_attempted: attempted,
             pairwise_failed: failed,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_legacy_only_intro_is_reported_as_degraded() {
+        let legacy_only = RegistrationOutcome {
+            intro_ok: true,
+            legacy_intro_ok: true,
+            pairwise_attempted: 2,
+            ..Default::default()
+        };
+        assert!(!legacy_only.existing_friends_blocked());
+        assert_eq!(legacy_only.degraded_reason(), Some("sealed_intro_unavailable"));
+        let both = RegistrationOutcome {
+            sealed_intro_ok: true,
+            ..legacy_only
+        };
+        assert_eq!(both.degraded_reason(), None);
     }
 
     #[test]
@@ -1478,6 +1777,179 @@ mod registration_outcome_tests {
         assert!(!o.existing_friends_blocked());
         assert_eq!(o.pairwise_succeeded(), 3);
         assert_eq!(o.degraded_reason(), Some("presence_partial"));
+    }
+}
+
+#[cfg(test)]
+mod intro_presence_tests {
+    use super::*;
+    use crate::network::ember::crypto;
+
+    fn identity(seed: u8) -> ([u8; 32], [u8; 32]) {
+        let key = crypto::signing_key_from_bytes(&[seed; 32]);
+        (key.to_bytes(), key.verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn rendezvous_registers_the_sealed_intro_with_a_verifiable_key() {
+        let (secret_key, pubkey) = identity(9);
+        let intro_secret = [0x5Au8; crypto::INTRO_SECRET_LEN];
+        let epoch = 1_234;
+        let (capability, intro_key) = intro_presence_registration(&pubkey, &intro_secret, epoch);
+        assert_ne!(
+            capability,
+            crypto::derive_legacy_intro_presence_capability(&pubkey, epoch),
+            "the sealed intro must not be the pubkey-derived one"
+        );
+        for protocol in [RendezvousProtocol::LegacyV3, RendezvousProtocol::IpBoundV4] {
+            let (route, body) = build_capability_presence_request(
+                &capability,
+                epoch,
+                4662,
+                Ipv4Addr::new(8, 8, 4, 4),
+                &pubkey,
+                &pubkey,
+                &secret_key,
+                protocol,
+                IntroProof::Sealed(&intro_key),
+                1_700_000_000,
+            );
+            assert!(route.ends_with("/presence/register"));
+            assert_eq!(body["intro"], serde_json::Value::Bool(true));
+            assert_eq!(body["capability"], hex::encode(capability));
+            assert_eq!(body["peer_pubkey"], hex::encode(pubkey));
+            let mut sent_key = [0u8; 32];
+            hex::decode_to_slice(body["intro_key"].as_str().unwrap(), &mut sent_key).unwrap();
+            assert_eq!(
+                crypto::derive_sealed_intro_capability_from_key(&pubkey, &sent_key, epoch),
+                capability,
+                "the server must be able to verify the capability from the sent key"
+            );
+            assert!(
+                !body.to_string().contains(&hex::encode(intro_secret)),
+                "the long-lived intro secret must never be sent to the server"
+            );
+        }
+    }
+
+    #[test]
+    fn pairwise_registration_carries_no_intro_fields() {
+        let (secret_key, pubkey) = identity(3);
+        let (_, friend) = identity(4);
+        let (_, body) = build_capability_presence_request(
+            &[0xA7; 32],
+            5,
+            4662,
+            Ipv4Addr::new(8, 8, 4, 4),
+            &pubkey,
+            &friend,
+            &secret_key,
+            RendezvousProtocol::IpBoundV4,
+            IntroProof::None,
+            1_700_000_000,
+        );
+        assert_eq!(body["intro"], serde_json::Value::Bool(false));
+        assert!(body.get("intro_key").is_none());
+        assert!(body.get("legacy_sig").is_some());
+    }
+
+    #[test]
+    fn a_legacy_intro_registration_claims_intro_without_a_key() {
+        let (secret_key, pubkey) = identity(3);
+        let epoch = 5;
+        let capability = crypto::derive_legacy_intro_presence_capability(&pubkey, epoch);
+        let (_, body) = build_capability_presence_request(
+            &capability,
+            epoch,
+            4662,
+            Ipv4Addr::new(8, 8, 4, 4),
+            &pubkey,
+            &pubkey,
+            &secret_key,
+            RendezvousProtocol::IpBoundV4,
+            IntroProof::Legacy,
+            1_700_000_000,
+        );
+        assert_eq!(body["intro"], serde_json::Value::Bool(true));
+        assert!(
+            body.get("intro_key").is_none(),
+            "an old server recomputes the legacy derivation with nothing else"
+        );
+    }
+
+    #[test]
+    fn the_legacy_intro_is_only_advertised_while_something_needs_it() {
+        assert!(!legacy_intro_needed(true, false), "sealed server, every friend keyed");
+        assert!(legacy_intro_needed(false, false), "server cannot take the sealed form");
+        assert!(legacy_intro_needed(true, true), "hash-only friends would lose us");
+        assert!(legacy_intro_needed(false, true));
+    }
+
+    #[test]
+    fn only_a_sealed_specific_rejection_downgrades() {
+        let failed = |status| PresenceRegisterError {
+            status: Some(status),
+            message: String::new(),
+        };
+        assert!(failed(reqwest::StatusCode::UNPROCESSABLE_ENTITY).sealed_intro_rejected());
+        for generic in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!failed(generic).sealed_intro_rejected(), "{generic}");
+        }
+        assert!(!PresenceRegisterError::from("timeout".to_string()).sealed_intro_rejected());
+    }
+
+    #[tokio::test]
+    async fn a_refused_sealed_intro_marks_the_server_legacy_until_reprobed() {
+        let url = "https://sealed-intro-refusal.test";
+        remember_protocol(
+            url,
+            ServerFeatures {
+                protocol: RendezvousProtocol::IpBoundV4,
+                sealed_intro: true,
+            },
+        )
+        .await;
+        assert!(negotiate_server_features(url).await.unwrap().sealed_intro);
+        mark_sealed_intro_unsupported(url).await;
+        let features = negotiate_server_features(url).await.unwrap();
+        assert!(!features.sealed_intro);
+        assert_eq!(features.protocol, RendezvousProtocol::IpBoundV4);
+    }
+
+    #[test]
+    fn lookup_uses_the_sealed_intro_only_with_the_friends_secret() {
+        let (our_secret, our_pubkey) = identity(1);
+        let (_, friend) = identity(2);
+        let intro_secret = [0x33u8; crypto::INTRO_SECRET_LEN];
+        let epoch = 77;
+
+        let with_secret =
+            friend_lookup_candidates(&our_pubkey, &our_secret, &friend, Some(&intro_secret), epoch);
+        let without_secret =
+            friend_lookup_candidates(&our_pubkey, &our_secret, &friend, None, epoch);
+        assert_eq!(with_secret.len(), 4);
+        assert_eq!(without_secret.len(), 4);
+
+        for e in [epoch, epoch - 1] {
+            let sealed = crypto::derive_sealed_intro_presence_capability(&friend, &intro_secret, e).0;
+            let legacy = crypto::derive_legacy_intro_presence_capability(&friend, e);
+            let pairwise =
+                crypto::derive_pairwise_presence_capability(&our_secret, &friend, &friend, e)
+                    .unwrap();
+            assert!(with_secret.contains(&(sealed, e, friend)));
+            assert!(!with_secret.iter().any(|(cap, ..)| *cap == legacy));
+            assert!(without_secret.contains(&(legacy, e, friend)));
+            assert!(!without_secret.iter().any(|(cap, ..)| *cap == sealed));
+            assert!(with_secret.contains(&(pairwise, e, our_pubkey)));
+            assert!(without_secret.contains(&(pairwise, e, our_pubkey)));
+        }
+        assert_eq!(with_secret[0].1, epoch, "the current epoch is tried first");
+        assert_eq!(with_secret[0].2, our_pubkey, "pairwise leads within an epoch");
     }
 }
 
