@@ -96,6 +96,17 @@ const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
 /// Version byte plus record count: the size of a `known.met` with no records.
 const KNOWN_MET_HEADER_LEN: u64 = 5;
 
+/// See [`KnownFileList::time_shift_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeShift {
+    /// Unmatched files with a record of the same name and size.
+    pub files: usize,
+    /// The most common difference, file time minus record time, in seconds.
+    pub common_delta_secs: i64,
+    /// How many of `files` are off by exactly that much.
+    pub common_count: usize,
+}
+
 /// A string tag from a `.met` file. eMule writes a name that is not plain
 /// ASCII twice: first as UTF-8 behind a byte-order mark, then in the local
 /// code page. Readers keep the first `FT_FILENAME`, as eMule does, and the
@@ -977,6 +988,48 @@ impl KnownFileList {
             return None;
         }
         found
+    }
+
+    /// Of files this catalog did not match, how many it holds a record for
+    /// under the same name and size but another modification time, and the
+    /// difference most of them share. A library off by one amount throughout
+    /// is a clock or time-zone shift on the drive, not new files. For the
+    /// startup log, which is all a user can send.
+    pub fn time_shift_summary<'a>(
+        &self,
+        unmatched: impl IntoIterator<Item = (&'a str, u64, i64)>,
+    ) -> Option<TimeShift> {
+        use std::collections::HashMap;
+        // Nearest difference found so far for each unmatched (size, name).
+        let mut wanted: HashMap<u64, HashMap<&'a str, (i64, Option<i64>)>> = HashMap::new();
+        for (name, size, mtime) in unmatched {
+            wanted.entry(size).or_default().insert(name, (mtime, None));
+        }
+        for record in self.files.values() {
+            let Some(slot) = wanted
+                .get_mut(&record.file_size)
+                .and_then(|by_name| by_name.get_mut(record.file_name.as_str()))
+            else {
+                continue;
+            };
+            let delta = slot.0 - record.modified_at;
+            if slot.1.is_none_or(|best| delta.abs() < best.abs()) {
+                slot.1 = Some(delta);
+            }
+        }
+        let mut tally: HashMap<i64, usize> = HashMap::new();
+        for (_, delta) in wanted.values().flat_map(HashMap::values) {
+            if let Some(delta) = delta {
+                *tally.entry(*delta).or_default() += 1;
+            }
+        }
+        let files = tally.values().sum();
+        let (common_delta_secs, common_count) = tally.into_iter().max_by_key(|(_, count)| *count)?;
+        Some(TimeShift {
+            files,
+            common_delta_secs,
+            common_count,
+        })
     }
 
     pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
@@ -2113,6 +2166,30 @@ mod tests {
         record.file_path = String::new();
         record.modified_at = modified_at;
         record
+    }
+
+    /// What the startup log says when a launch re-hashes: files the catalog
+    /// knows by name and size, and the time difference most of them share.
+    #[test]
+    fn a_library_shifted_in_time_is_reported_as_such() {
+        let mut kf = KnownFileList::new();
+        for (n, name) in ["a.mkv", "b.mkv", "c.mkv"].iter().enumerate() {
+            let mut record = pathless(n as u8 + 1, 1_700_000_000);
+            record.file_name = name.to_string();
+            kf.files.insert(record.file_hash, record);
+        }
+        let size = 1024 * 1024;
+        let unmatched = [
+            ("a.mkv", size, 1_700_007_200),
+            ("b.mkv", size, 1_700_007_200),
+            ("c.mkv", size, 1_700_000_005),
+            ("new.mkv", size, 1_700_000_000),
+            ("a.mkv", size + 1, 1_700_000_000),
+        ];
+        let shift = kf.time_shift_summary(unmatched.iter().map(|&(n, s, t)| (n, s, t))).unwrap();
+        assert_eq!(shift.files, 3, "a new name or another size is not the same file");
+        assert_eq!((shift.common_delta_secs, shift.common_count), (7200, 2));
+        assert_eq!(kf.time_shift_summary(std::iter::empty()), None);
     }
 
     /// A file carried over from eMule on a FAT drive, or across a DST change,

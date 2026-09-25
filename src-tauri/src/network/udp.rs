@@ -351,6 +351,7 @@ pub(super) async fn handle_udp_packet_inner(
                 } else {
                     let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILENOTFOUND_UDP];
                     let _ = socket.send_to(&resp, from).await;
+                    ed2k::upload::note_reask_file_not_found();
                     debug!("Answered UDP reask from {from} for {hash_hex}: file not found");
                 }
                 return;

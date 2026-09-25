@@ -1846,6 +1846,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // queued-source model in the field.
     let mut pathb_stats_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     pathb_stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Minutes since the upload queue line last went out when only its size had
+    // anything to say.
+    let mut queue_report_quiet_minutes: u32 = 0;
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -3456,6 +3459,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                              diversions, {rotations} slow-source rotations",
                         );
                     }
+                }
+                // Why an upload queue stays short, readable from an ordinary
+                // log: the per-peer lines behind these counts are debug-only.
+                let queue = ed2k::upload::take_queue_health();
+                let turned_away =
+                    queue.refused_at_limit + queue.dropped_unshared + queue.reask_not_found > 0;
+                queue_report_quiet_minutes = queue_report_quiet_minutes.saturating_add(1);
+                if turned_away || (queue.waiting > 0 && queue_report_quiet_minutes >= 10) {
+                    queue_report_quiet_minutes = 0;
+                    info!(
+                        "Upload queue: {} waiting; since the last report {} incoming connection(s) \
+                         refused at the connection limit, {} waiter(s) dropped because their file \
+                         is not shared, {} UDP re-ask(s) answered \"file not found\"",
+                        queue.waiting,
+                        queue.refused_at_limit,
+                        queue.dropped_unshared,
+                        queue.reask_not_found,
+                    );
                 }
                 // Friend transfer negotiation, on the same when-something-happened
                 // rule. Logged as well as exposed via `get_ember_diagnostics`

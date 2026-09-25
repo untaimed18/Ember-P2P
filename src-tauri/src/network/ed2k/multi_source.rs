@@ -770,22 +770,68 @@ fn admit_new_connection(
     None
 }
 
-/// Block until this task may open a new outbound connection: first until the
-/// "New Connections / 5s" window has room, then spacing dials by
-/// `OUTBOUND_DIAL_MIN_INTERVAL`. Neither lock is held across a sleep — each
-/// caller reserves its place, releases the lock, then waits.
-async fn throttle_outbound_dial() {
+/// How long until the "New Connections / 5s" window has room for a dial,
+/// without taking a place in it. `None` when there is room now.
+fn new_connection_window_wait(
+    window: &Option<(std::time::Instant, usize)>,
+    budget: usize,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    match *window {
+        Some((started, count))
+            if budget > 0
+                && count >= budget
+                && now.saturating_duration_since(started) < NEW_CONN_WINDOW =>
+        {
+            Some(NEW_CONN_WINDOW.saturating_sub(now.saturating_duration_since(started)))
+        }
+        _ => None,
+    }
+}
+
+fn outbound_dial_window_wait() -> Option<std::time::Duration> {
+    let window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    new_connection_window_wait(&window, budget, std::time::Instant::now())
+}
+
+/// Take this dial's place in the window, or say how long until it reopens.
+fn try_admit_outbound_dial() -> Option<std::time::Duration> {
+    let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    admit_new_connection(&mut window, budget, std::time::Instant::now(), true)
+}
+
+/// A slot in the shared connection budget for a download dial, taken only
+/// once the "New Connections / 5s" window has room for it.
+///
+/// The window is waited out without a slot. Accepts count toward it too, so a
+/// busy sharer can keep it full for a while, and a dial parked on a slot in
+/// the meantime is one requester the listener turns away — enough of them, and
+/// after [`MAX_LISTENER_FLOOR_WAIT`] they reach into the listener's reserve as
+/// well. eMule never holds a socket while its window is full: the download
+/// simply does not connect that tick (`TooManySockets`).
+async fn acquire_dial_slot(priority_ord: u8) -> Option<GlobalConnPermit> {
     loop {
-        let wait = {
-            let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
-            let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
-            admit_new_connection(&mut window, budget, std::time::Instant::now(), true)
-        };
-        match wait {
-            None => break,
-            Some(wait) => tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await,
+        if let Some(wait) = outbound_dial_window_wait() {
+            tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
+            continue;
+        }
+        let permit = acquire_global_dl_conn(priority_ord).await;
+        match try_admit_outbound_dial() {
+            None => return permit,
+            // Another dial took the last place while this one waited for a slot.
+            Some(wait) => {
+                drop(permit);
+                tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
+            }
         }
     }
+}
+
+/// Space our own dials by `OUTBOUND_DIAL_MIN_INTERVAL`. The lock is not held
+/// across the sleep: each caller reserves its place, releases it, then waits.
+async fn space_outbound_dial() {
     let gate = OUTBOUND_DIAL_GATE.get_or_init(|| {
         tokio::sync::Mutex::new(std::time::Instant::now() - OUTBOUND_DIAL_MIN_INTERVAL)
     });
@@ -5097,12 +5143,12 @@ async fn download_parts_from_source(
             return Ok(());
         }
         emit_source!("connecting", None, 0u64);
-        // Global connection cap + dial pacing apply to outbound dials only.
-        // Reserve the machine-wide slot first (waits here if we're already at
-        // eMule's `maxconnections`), then pace the actual TCP connect so a
-        // burst of source starts can't storm the network.
-        _global_conn_permit = acquire_global_dl_conn(control.download_priority_ordinal()).await;
-        throttle_outbound_dial().await;
+        // Global connection cap + dial pacing apply to outbound dials only:
+        // a machine-wide slot (eMule's `maxconnections`) once the "New
+        // Connections / 5s" window has room, then spacing so a burst of source
+        // starts can't storm the network.
+        _global_conn_permit = acquire_dial_slot(control.download_priority_ordinal()).await;
+        space_outbound_dial().await;
 
         // Build the Hello payload once; it's identical across attempts.
         // (Include buddy tags if we have a buddy.)
@@ -12398,5 +12444,22 @@ mod new_connection_window_tests {
         for _ in 0..100 {
             assert_eq!(admit_new_connection(&mut window, 0, t0, true), None);
         }
+    }
+
+    /// A dial checks for room before it takes a connection slot, and the
+    /// check must not use up the room it is asking about.
+    #[test]
+    fn looking_at_the_window_takes_no_place_in_it() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        assert_eq!(new_connection_window_wait(&window, 2, t0), None);
+        assert_eq!(admit_new_connection(&mut window, 2, t0, false), None);
+        assert_eq!(new_connection_window_wait(&window, 2, t0), None);
+        assert_eq!(window.map(|(_, count)| count), Some(1), "peeking counted nothing");
+        assert_eq!(admit_new_connection(&mut window, 2, t0, false), None);
+        let wait = new_connection_window_wait(&window, 2, t0 + std::time::Duration::from_secs(1));
+        assert_eq!(wait, Some(std::time::Duration::from_secs(4)));
+        assert_eq!(new_connection_window_wait(&window, 2, t0 + NEW_CONN_WINDOW), None);
+        assert_eq!(new_connection_window_wait(&window, 0, t0), None, "no limit, no wait");
     }
 }

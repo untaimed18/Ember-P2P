@@ -1165,6 +1165,43 @@ pub(crate) const MAX_UPLOAD_QUEUE_SIZE: usize = 5000;
 /// Below that it says nothing at all, because silence is what times the peer's
 /// UDP ask out and sends it back to TCP where it can re-enter the queue.
 pub(crate) const QUEUE_FULL_HEADROOM: usize = 50;
+
+/// What the once-a-minute "Upload queue" log line reports, so a queue that
+/// stays small can be explained from an ordinary log: the peer-level lines
+/// behind these counts are debug-only.
+static QUEUE_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static QUEUE_REFUSED_AT_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUEUE_DROPPED_UNSHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUEUE_REASK_NOT_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Upload queue figures since the last call. `waiting` is a gauge taken by
+/// the 30-second queue maintenance; the rest are counts, reset as they are read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueueHealth {
+    pub waiting: usize,
+    /// Inbound connections turned away because the shared connection budget
+    /// (`max_connections`) was full.
+    pub refused_at_limit: u64,
+    /// Waiters removed because the file they wanted is not in the shared index.
+    pub dropped_unshared: u64,
+    /// UDP re-asks answered "file not found", which makes the asker give up.
+    pub reask_not_found: u64,
+}
+
+pub fn take_queue_health() -> QueueHealth {
+    use std::sync::atomic::Ordering;
+    QueueHealth {
+        waiting: QUEUE_WAITING.load(Ordering::Relaxed),
+        refused_at_limit: QUEUE_REFUSED_AT_LIMIT.swap(0, Ordering::Relaxed),
+        dropped_unshared: QUEUE_DROPPED_UNSHARED.swap(0, Ordering::Relaxed),
+        reask_not_found: QUEUE_REASK_NOT_FOUND.swap(0, Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn note_reask_file_not_found() {
+    QUEUE_REASK_NOT_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
@@ -4030,6 +4067,7 @@ pub async fn start_upload_server(
                         let Some(conn_permit) =
                             super::multi_source::try_acquire_listener_conn(headroom)
                         else {
+                            QUEUE_REFUSED_AT_LIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             debug!("Rejecting connection from {peer_addr}: global connection limit reached");
                             drop(stream);
                             continue;
@@ -4889,6 +4927,7 @@ impl UploadHandler {
         // 1. Distinct, named file hashes currently in the queue.
         let hashes: Vec<[u8; 16]> = {
             let queue = self.upload_queue.lock().await;
+            QUEUE_WAITING.store(queue.len(), std::sync::atomic::Ordering::Relaxed);
             if queue.is_empty() {
                 return;
             }
@@ -4948,8 +4987,10 @@ impl UploadHandler {
             let mut queue = self.upload_queue.lock().await;
             let before = queue.len();
             queue.retain(|e| !unserveable.contains(&e.file_hash));
+            QUEUE_WAITING.store(queue.len(), std::sync::atomic::Ordering::Relaxed);
             before - queue.len()
         };
+        QUEUE_DROPPED_UNSHARED.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
         if removed > 0 {
             debug!(
                 "Upload queue: purged {removed} waiting peer(s) for {} file(s) no longer shared or downloading (eMule file-gone queue purge)",

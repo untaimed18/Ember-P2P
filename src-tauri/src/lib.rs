@@ -1229,6 +1229,36 @@ pub fn run() {
                         files_to_hash.push(file.clone());
                     }
                 }
+                // Before any hashing starts, so a log from a launch that
+                // re-hashes says why even if the user stops it partway.
+                {
+                    let found = all_discovered.len();
+                    let matched = found - files_to_hash.len();
+                    let records = known_list.file_count();
+                    let shift = if files_to_hash.is_empty() {
+                        None
+                    } else {
+                        known_list.time_shift_summary(
+                            files_to_hash.iter().map(|f| (f.name.as_str(), f.size, f.modified_at)),
+                        )
+                    };
+                    match shift {
+                        Some(shift) => info!(
+                            "Startup scan: {found} files found, {matched} matched in known.met \
+                             ({records} records), {} to hash; {} of those match a known file by \
+                             name and size but not by modification time ({} are off by {:+} s)",
+                            files_to_hash.len(),
+                            shift.files,
+                            shift.common_count,
+                            shift.common_delta_secs,
+                        ),
+                        None => info!(
+                            "Startup scan: {found} files found, {matched} matched in known.met \
+                             ({records} records), {} to hash",
+                            files_to_hash.len(),
+                        ),
+                    }
+                }
 
                 let current_shared_folders = {
                     let state = startup_app.state::<AppState>();
