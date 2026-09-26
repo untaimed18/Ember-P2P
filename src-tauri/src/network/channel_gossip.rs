@@ -864,7 +864,9 @@ pub(super) async fn handle_inbound_channel_gossip(
             ember::channel::decode_xfer_block_request(body)
         {
             apply_xfer_block_request(state, xfer_id, sender, offset, count);
-        } else if let Some(offer) = ember::channel::decode_xfer_offer(body) {
+        } else if let Some(offer) = ember::channel::decode_xfer_offer(body)
+            .or_else(|| ember::channel::decode_xfer_offer_sealed(&key, body))
+        {
             // The pairwise key already names the sender; under a retired key
             // they must also be somebody the roster holds, since that is what
             // an evicted member's fresh identity is not.

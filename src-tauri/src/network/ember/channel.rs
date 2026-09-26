@@ -1389,6 +1389,10 @@ const TYPING_PLAIN_VERSION: u8 = 23;
 /// one: v1.6.x drops it without scoring the hop, keeps using the block
 /// protocol, and never dials.
 const XFER_STREAM_SEALED_VERSION: u8 = 25;
+/// An offer encrypted to the recipient alone. See [`encode_xfer_offer_sealed`]
+/// for why 1.7.0 reads it and does not yet send it. v1.6.x drops the number
+/// like the two above, which is why senders keep the plain offer for now.
+const XFER_OFFER_SEALED_VERSION: u8 = 26;
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -3018,6 +3022,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
             | XFER_STREAM_SEALED_VERSION
+            | XFER_OFFER_SEALED_VERSION
     ) {
         return None;
     }
@@ -3103,7 +3108,64 @@ pub fn encode_xfer_offer(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
 
 pub fn decode_xfer_offer(bytes: &[u8]) -> Option<XferOffer> {
     let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_PLAIN_VERSION)?;
-    let rest = bytes.get(XFER_HEADER_LEN..)?;
+    parse_xfer_offer_body(sender, target, xfer_id, bytes.get(XFER_HEADER_LEN..)?)
+}
+
+/// `hdr || nonce(12) || sealed(size(8) || root(32) || name) || tag(16)`.
+///
+/// The plain offer's body, encrypted to the recipient alone, so a member the
+/// offer is forwarded through learns neither the file's name nor its size.
+/// 1.7.0 reads these and still sends the plain offer, because v1.6.x reads only
+/// that one and a sender cannot tell which build a relayed member runs; once
+/// the members who cannot read this have updated, senders can switch.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "not sent until senders switch; see docs/post-1.7.0.md")
+)]
+pub fn encode_xfer_offer_sealed(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
+    let name = truncate_utf8_owned(&offer.name, XFER_NAME_MAX);
+    let mut out = Vec::with_capacity(
+        XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 8 + 32 + name.len() + XFER_MAC_LEN,
+    );
+    put_xfer_header(
+        &mut out,
+        XFER_OFFER_SEALED_VERSION,
+        &offer.sender,
+        &offer.target,
+        &offer.xfer_id,
+    );
+    let mut nonce = [0u8; XFER_SEAL_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    out.extend_from_slice(&nonce);
+    let body = out.len();
+    out.extend_from_slice(&offer.size.to_le_bytes());
+    out.extend_from_slice(&offer.root);
+    out.extend_from_slice(name.as_bytes());
+    xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &offer.xfer_id, &nonce, &mut out[body..]);
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+/// Open a sealed offer. Call only on a frame [`xfer_verify`] has already
+/// accepted — decrypting first would be decrypting whatever a stranger sent.
+pub fn decode_xfer_offer_sealed(key: &[u8; 32], bytes: &[u8]) -> Option<XferOffer> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_SEALED_VERSION)?;
+    let sealed = bytes.get(XFER_HEADER_LEN..)?;
+    if sealed.len() < XFER_SEAL_NONCE_LEN {
+        return None;
+    }
+    let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
+    let mut rest = body.to_vec();
+    xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
+    parse_xfer_offer_body(sender, target, xfer_id, &rest)
+}
+
+fn parse_xfer_offer_body(
+    sender: [u8; 32],
+    target: [u8; 32],
+    xfer_id: [u8; 16],
+    rest: &[u8],
+) -> Option<XferOffer> {
     if rest.len() < 8 + 32 {
         return None;
     }
@@ -3360,19 +3422,21 @@ pub struct XferStreamPorts {
     pub public_ip: Option<std::net::Ipv4Addr>,
 }
 
-const XFER_STREAM_NONCE_LEN: usize = 12;
+const XFER_SEAL_NONCE_LEN: usize = 12;
 const XFER_STREAM_SEAL_DOMAIN: &[u8] = b"ember-channel-xfer-stream-v1\0";
+const XFER_OFFER_SEAL_DOMAIN: &[u8] = b"ember-channel-xfer-offer-v1\0";
 
-/// XOR a stream frame's body with a keystream only the two ends can produce.
+/// XOR a sealed control frame's body with a keystream only the two ends can
+/// produce, separated per frame kind by `domain`.
 ///
-/// Both ends hold the same pairwise key and each sends a frame per transfer,
-/// so unlike a block — whose offset already picks a stream only one plaintext
-/// ever uses — this one takes a random nonce from the wire. Without it the
-/// sender's frame and the recipient's would share a keystream, and anyone
-/// holding both would learn the XOR of their ports and addresses.
-fn xfer_stream_xor(key: &[u8; 32], xfer_id: &[u8; 16], nonce: &[u8], data: &mut [u8]) {
+/// Both ends hold the same pairwise key and each can send frames for one
+/// transfer, so unlike a block — whose offset already picks a stream only one
+/// plaintext ever uses — these take a random nonce from the wire. Without it
+/// the sender's stream frame and the recipient's would share a keystream, and
+/// anyone holding both would learn the XOR of their ports and addresses.
+fn xfer_seal_xor(key: &[u8; 32], domain: &[u8], xfer_id: &[u8; 16], nonce: &[u8], data: &mut [u8]) {
     let mut hasher = blake3::Hasher::new_keyed(key);
-    hasher.update(XFER_STREAM_SEAL_DOMAIN);
+    hasher.update(domain);
     hasher.update(xfer_id);
     hasher.update(nonce);
     let mut reader = hasher.finalize_xof();
@@ -3404,9 +3468,9 @@ pub fn encode_xfer_stream(
     ports: XferStreamPorts,
 ) -> Vec<u8> {
     let mut out =
-        Vec::with_capacity(XFER_HEADER_LEN + XFER_STREAM_NONCE_LEN + 9 + XFER_MAC_LEN);
+        Vec::with_capacity(XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 9 + XFER_MAC_LEN);
     put_xfer_header(&mut out, XFER_STREAM_SEALED_VERSION, sender, target, xfer_id);
-    let mut nonce = [0u8; XFER_STREAM_NONCE_LEN];
+    let mut nonce = [0u8; XFER_SEAL_NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
     out.extend_from_slice(&nonce);
     let body = out.len();
@@ -3420,7 +3484,7 @@ pub fn encode_xfer_stream(
     if let Some(ip) = public_ip {
         out.extend_from_slice(&ip.octets());
     }
-    xfer_stream_xor(key, xfer_id, &nonce, &mut out[body..]);
+    xfer_seal_xor(key, XFER_STREAM_SEAL_DOMAIN, xfer_id, &nonce, &mut out[body..]);
     append_xfer_tag(key, &mut out);
     out
 }
@@ -3436,12 +3500,12 @@ pub fn decode_xfer_stream(
 ) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, XferStreamPorts)> {
     let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_SEALED_VERSION)?;
     let sealed = bytes.get(XFER_HEADER_LEN..)?;
-    if sealed.len() < XFER_STREAM_NONCE_LEN + 3 {
+    if sealed.len() < XFER_SEAL_NONCE_LEN + 3 {
         return None;
     }
-    let (nonce, body) = sealed.split_at(XFER_STREAM_NONCE_LEN);
+    let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
     let mut rest = body.to_vec();
-    xfer_stream_xor(key, &xfer_id, nonce, &mut rest);
+    xfer_seal_xor(key, XFER_STREAM_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
     let role = XferStreamRole::from_code(rest[0])?;
     let quic = u16::from_le_bytes([rest[1], rest[2]]);
     if quic == 0 {
@@ -6136,7 +6200,7 @@ mod tests {
         // The role sits under the keystream; flipping Fetch (2) to 3 there.
         let mut role =
             opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
-        role[XFER_HEADER_LEN + XFER_STREAM_NONCE_LEN] ^= 2 ^ 3;
+        role[XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN] ^= 2 ^ 3;
         assert!(decode_xfer_stream(&K, &role).is_none());
         let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
         assert!(decode_xfer_stream(&K, &full[..full.len() - 1]).is_none());
@@ -6163,7 +6227,7 @@ mod tests {
         for frame in [&a, &b] {
             let body = &frame[XFER_HEADER_LEN..frame.len() - XFER_MAC_LEN];
             assert!(!body.windows(4).any(|w| w == [198, 51, 100, 77]));
-            assert_ne!(&body[XFER_STREAM_NONCE_LEN..], &clear[..]);
+            assert_ne!(&body[XFER_SEAL_NONCE_LEN..], &clear[..]);
         }
         // Someone without the pairwise key reads nothing sensible either.
         let other = [0x99u8; 32];
@@ -6185,6 +6249,32 @@ mod tests {
             from_a,
             derive_xfer_stream_capability(&a_seed, &b.pubkey, &room, &[0x43u8; 16]).unwrap()
         );
+    }
+
+    /// A sealed offer reads back as the same offer, passes the same bounds,
+    /// hides the name and size from anyone without the pairwise key, and is
+    /// never mistaken for a plain one or the reverse.
+    #[test]
+    fn a_sealed_offer_round_trips_and_hides_its_name_and_size() {
+        let offer = XferOffer { name: "holiday-photos.zip".into(), size: 123_456_789, ..sample_offer() };
+        let frame = encode_xfer_offer_sealed(&K, &offer);
+        assert_eq!(xfer_frame_peek(&frame), Some((offer.sender, offer.target, offer.xfer_id)));
+        assert_eq!(decode_xfer_offer_sealed(&K, &opened(&frame)), Some(offer.clone()));
+        assert_ne!(frame, encode_xfer_offer_sealed(&K, &offer), "a fresh nonce each time");
+
+        let body = &frame[XFER_HEADER_LEN..frame.len() - XFER_MAC_LEN];
+        assert!(!body.windows(offer.name.len()).any(|w| w == offer.name.as_bytes()));
+        assert!(!body.windows(8).any(|w| w == offer.size.to_le_bytes()));
+        assert!(!body.windows(32).any(|w| w == offer.root));
+
+        assert!(decode_xfer_offer_sealed(&[0x99u8; 32], &opened(&frame)).is_none_or(|o| o != offer));
+        assert!(decode_xfer_offer(&opened(&frame)).is_none());
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer(&K, &offer))).is_none());
+
+        let too_big = XferOffer { size: XFER_MAX_BYTES + 1, ..sample_offer() };
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &too_big))).is_none());
+        let empty = XferOffer { name: String::new(), ..sample_offer() };
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &empty))).is_none());
     }
 
     #[test]
@@ -7258,6 +7348,11 @@ mod tests {
         // never learns the port, so it never dials and keeps to the block
         // protocol.
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_SEALED_VERSION));
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_OFFER_SEALED_VERSION));
+        assert_eq!(
+            v1_6_7_branch(&encode_xfer_offer_sealed(&[0x5Au8; 32], &sample_offer())),
+            V167Branch::DroppedWithDebugLog
+        );
         let stream = encode_xfer_stream(
             &[0x5Au8; 32],
             &[1u8; 32],
