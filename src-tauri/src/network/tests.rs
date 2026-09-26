@@ -350,6 +350,31 @@ fn the_startup_sweep_sends_a_full_tick_of_lookups_even_when_most_are_online() {
 }
 
 #[test]
+fn the_startup_sweep_waits_until_a_friend_behind_a_nat_can_be_reached() {
+    let now = std::time::Duration::ZERO;
+    // The moment the external IP lands: neither registered nor able to punch.
+    assert!(!startup_sweep_ready(false, false, now));
+    assert!(
+        !startup_sweep_ready(true, false, now),
+        "registered, but the hole-punch still has no external address to offer"
+    );
+    assert!(
+        !startup_sweep_ready(false, true, now),
+        "punch-ready, but a relay or punch answer needs us registered"
+    );
+    assert!(startup_sweep_ready(true, true, now));
+}
+
+#[test]
+fn the_startup_sweep_runs_anyway_once_it_has_waited_long_enough() {
+    // A rendezvous server that is down or a STUN probe that never answers must
+    // not leave the friend list unsearched until the five-minute auto-retry.
+    let just_short = STARTUP_SWEEP_READY_WAIT - std::time::Duration::from_secs(1);
+    assert!(!startup_sweep_ready(false, false, just_short));
+    assert!(startup_sweep_ready(false, false, STARTUP_SWEEP_READY_WAIT));
+}
+
+#[test]
 fn a_friend_nothing_is_owed_for_leaves_the_startup_sweep_entirely() {
     // Dropped, not deferred: they are already reachable, already being
     // looked up, or no longer a friend. Deferring would re-offer them every

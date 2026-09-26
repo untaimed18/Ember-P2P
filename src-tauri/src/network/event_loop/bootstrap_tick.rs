@@ -853,19 +853,63 @@ pub(in crate::network) async fn on_bootstrap_tick(
     // until the five-minute auto-retry reached them — ten per
     // sweep, so a forty-friend list took twenty minutes to
     // resolve, and the log claimed all of them had been looked up.
+    //
+    // Not before a dial can actually reach a friend behind a NAT, though:
+    // see `startup_sweep_ready`.
     if !state.friend_search_initial_done
         && state.external_ip.is_some()
     {
-        state.friend_search_initial_done = true;
-        state.friend_search_started_at = Some(std::time::Instant::now());
-        state.friend_search_initial_queue =
-            friend_hashes.read().await.iter().copied().collect();
-        if !state.friend_search_initial_queue.is_empty() {
-            info!(
-                "Startup friend presence sweep: {} friend(s) queued, {} per tick",
-                state.friend_search_initial_queue.len(),
-                INITIAL_FRIEND_SEARCH_PER_TICK,
-            );
+        let waited = state
+            .friend_search_waiting_since
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed();
+        let punch_inputs_ready = state
+            .friend_nat_context
+            .read()
+            .map(|ctx| ctx.external_addr.is_some() && ctx.quic_endpoint.is_some())
+            .unwrap_or(false);
+        if startup_sweep_ready(state.rendezvous_registered, punch_inputs_ready, waited) {
+            state.friend_search_initial_done = true;
+            state.friend_search_started_at = Some(std::time::Instant::now());
+            state.friend_search_initial_queue =
+                friend_hashes.read().await.iter().copied().collect();
+            if !state.friend_search_initial_queue.is_empty() {
+                info!(
+                    "Startup friend presence sweep: {} friend(s) queued, {} per tick \
+                     ({:.0}s after the external IP; registered: {}, NAT traversal ready: {})",
+                    state.friend_search_initial_queue.len(),
+                    INITIAL_FRIEND_SEARCH_PER_TICK,
+                    waited.as_secs_f64(),
+                    state.rendezvous_registered,
+                    punch_inputs_ready,
+                );
+            }
+        }
+    }
+
+    // One follow-up pass over whoever the sweep left offline, a minute after
+    // its last lookup went out. A friend who launched at the same moment we
+    // did was not registered yet when we looked them up; without this they
+    // waited for the five-minute auto-retry. Anyone online or still being
+    // dialled is passed over by the drain below.
+    if state.friend_search_initial_done
+        && !state.friend_search_followup_done
+        && state.friend_search_initial_queue.is_empty()
+    {
+        let now = std::time::Instant::now();
+        match state.friend_search_followup_at {
+            None => state.friend_search_followup_at = Some(now + STARTUP_SWEEP_FOLLOWUP_AFTER),
+            Some(due) if now >= due => {
+                state.friend_search_followup_done = true;
+                state.friend_search_followup_at = None;
+                state.friend_search_initial_queue =
+                    friend_hashes.read().await.iter().copied().collect();
+                debug!(
+                    "Startup friend presence follow-up: re-checking {} friend(s)",
+                    state.friend_search_initial_queue.len()
+                );
+            }
+            Some(_) => {}
         }
     }
 

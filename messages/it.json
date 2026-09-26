@@ -3077,6 +3077,7 @@
   "channels_count_one": "1 stanza",
   "channels_count_other": "{count} stanze",
   "channels_no_matches": "Nessuna stanza corrispondente",
+  "channels_list_search_placeholder": "Cerca stanze…",
   "channels_no_selection": "Seleziona una stanza per chattare.",
   "channels_members": "Membri",
   "channels_members_n": "{count} membri",

@@ -190,6 +190,35 @@ pub(super) fn drain_initial_friend_search(
     targets
 }
 
+/// Longest the startup sweep waits, once our external IP is known, for the
+/// rest of what a friend dial leans on. Past it the sweep runs regardless: a
+/// rendezvous server that is down or a STUN probe that never answers must not
+/// leave every friend unsearched until the five-minute auto-retry.
+pub(super) const STARTUP_SWEEP_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Gap between the startup sweep's last lookup going out and its one
+/// follow-up pass over whoever is still offline.
+pub(super) const STARTUP_SWEEP_FOLLOWUP_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Whether the startup presence sweep can start.
+///
+/// It used to start the moment our external IP was known, which is the same
+/// tick our first rendezvous registration goes out and usually before the NAT
+/// probe has answered. A friend reachable by plain TCP came up; one behind a
+/// NAT needs the hole-punch, which is ineligible without our external address
+/// and QUIC endpoint, and a relay whose answer depends on our being
+/// registered. So the sweep marked those friends offline, and they stayed that
+/// way until the first auto-retry five minutes later — or until the user
+/// pressed Reconnect, which by then found everything ready and worked.
+pub(super) fn startup_sweep_ready(
+    rendezvous_registered: bool,
+    punch_inputs_ready: bool,
+    waited: std::time::Duration,
+) -> bool {
+    (rendezvous_registered && punch_inputs_ready) || waited >= STARTUP_SWEEP_READY_WAIT
+}
+
 /// Floor on retrying a *failed* presence heartbeat. Successes keep using
 /// [`PRESENCE_HEARTBEAT_SECS`] via [`should_refresh_presence`].
 ///

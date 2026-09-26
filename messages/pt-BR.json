@@ -3077,6 +3077,7 @@
   "channels_count_one": "1 sala",
   "channels_count_other": "{count} salas",
   "channels_no_matches": "Nenhuma sala correspondente",
+  "channels_list_search_placeholder": "Buscar salas…",
   "channels_no_selection": "Selecione uma sala para conversar.",
   "channels_members": "Membros",
   "channels_members_n": "{count} membros",

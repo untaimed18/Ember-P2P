@@ -1015,6 +1015,14 @@ pub(super) struct NetworkState {
     pub(super) friend_search_initial_queue: Vec<[u8; 16]>,
     /// When the initial friend search started (for 30-min auto-retry cutoff)
     pub(super) friend_search_started_at: Option<std::time::Instant>,
+    /// When the startup sweep began waiting for the network to be ready to
+    /// dial friends (see `friends::startup_sweep_ready`).
+    pub(super) friend_search_waiting_since: Option<std::time::Instant>,
+    /// When the startup sweep's follow-up pass is due. Set once the sweep's
+    /// queue has emptied.
+    pub(super) friend_search_followup_at: Option<std::time::Instant>,
+    /// The follow-up pass has run; there is only ever one per connection.
+    pub(super) friend_search_followup_done: bool,
     /// Backoff tracker for friend reconnection: ember_hash -> last attempt time.
     /// Prevents tight reconnect loops when sessions fail immediately.
     pub(super) friend_reconnect_last: HashMap<[u8; 16], std::time::Instant>,

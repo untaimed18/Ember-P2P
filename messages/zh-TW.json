@@ -3077,6 +3077,7 @@
   "channels_count_one": "1 個房間",
   "channels_count_other": "{count} 個房間",
   "channels_no_matches": "沒有符合的房間",
+  "channels_list_search_placeholder": "搜尋房間…",
   "channels_no_selection": "選取房間開始聊天。",
   "channels_members": "成員",
   "channels_members_n": "{count} 位成員",

@@ -390,9 +390,29 @@
   /** Rooms with a row on this device. A Discover-only listing has no row to
    *  delete, so removing one is a hide and nothing more. */
   let storedChannelIds = $derived(new Set(channelList.map((c) => c.channel_id)));
+  /**
+   * Largest rooms first, then by name. Ranked on the roster size the directory
+   * reports, not on the chip's present-now count for the open room: that one
+   * moves as people come and go, and would shuffle the list under the pointer
+   * the moment a room is opened.
+   */
+  let sortedChannels = $derived.by(() => {
+    const gathered = new Map(discovered.map((item) => [item.channel_id, item.member_count]));
+    const total = (ch: ChannelInfo) =>
+      ch.in_room ? ch.member_count : gathered.get(ch.channel_id) ?? ch.member_count;
+    return directoryList
+      .map((ch) => ({ ch, total: total(ch) }))
+      .sort(
+        (a, b) =>
+          b.total - a.total
+          || a.ch.name.localeCompare(b.ch.name)
+          || a.ch.channel_id.localeCompare(b.ch.channel_id),
+      )
+      .map(({ ch }) => ch);
+  });
   let visibleChannels = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
-    const list = directoryList;
+    const list = sortedChannels;
     if (!q) return list;
     return list.filter(
       (ch) =>
@@ -1889,7 +1909,7 @@
           class:hidden-when-chat={!!selected}
           inert={listCollapsed && !!selected}
         >
-          {#if directoryList.length > 5}
+          {#if directoryList.length > 0}
             <div class="search-wrap">
               <span class="search-icon">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
@@ -1900,8 +1920,8 @@
                 type="text"
                 class="search-input"
                 bind:value={listQuery}
-                placeholder={m.common_search_placeholder()}
-                aria-label={m.common_search()}
+                placeholder={m.channels_list_search_placeholder()}
+                aria-label={m.channels_list_search_placeholder()}
                 onkeydown={(e) => {
                   if (e.key !== 'Escape' || !listQuery) return;
                   e.preventDefault();

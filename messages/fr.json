@@ -3077,6 +3077,7 @@
   "channels_count_one": "1 salon",
   "channels_count_other": "{count} salons",
   "channels_no_matches": "Aucun salon correspondant",
+  "channels_list_search_placeholder": "Rechercher des salons…",
   "channels_no_selection": "Sélectionnez un salon pour discuter.",
   "channels_members": "Membres",
   "channels_members_n": "{count} membres",

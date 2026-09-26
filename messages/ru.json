@@ -3077,6 +3077,7 @@
   "channels_count_one": "1 комната",
   "channels_count_other": "Комнат: {count}",
   "channels_no_matches": "Нет подходящих комнат",
+  "channels_list_search_placeholder": "Поиск комнат…",
   "channels_no_selection": "Выберите комнату, чтобы начать общение.",
   "channels_members": "Участники",
   "channels_members_n": "{count} участников",

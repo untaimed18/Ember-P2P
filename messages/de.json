@@ -3080,6 +3080,7 @@
   "channels_count_one": "1 Raum",
   "channels_count_other": "{count} Räume",
   "channels_no_matches": "Keine passenden Räume",
+  "channels_list_search_placeholder": "Räume suchen…",
   "channels_no_selection": "Wählen Sie einen Raum, um zu chatten.",
   "channels_members": "Mitglieder",
   "channels_members_n": "{count} Mitglieder",

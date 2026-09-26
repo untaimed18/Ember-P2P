@@ -4480,6 +4480,9 @@ async fn handle_command_inner(
             state.friend_search_initial_done = false;
             state.friend_search_initial_queue.clear();
             state.friend_search_started_at = None;
+            state.friend_search_waiting_since = None;
+            state.friend_search_followup_at = None;
+            state.friend_search_followup_done = false;
             state.rendezvous_register_generation =
                 state.rendezvous_register_generation.saturating_add(1);
             state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
