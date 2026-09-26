@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { goto } from '$app/navigation';
   import ChatConversation from '$lib/components/ChatConversation.svelte';
   import {
@@ -38,6 +41,13 @@
     DOCK_WIDTH_MIN,
   } from '$lib/dockWidth';
   import { defaultSwitcherRow, filterSwitcherRows, searchNeedle } from '$lib/dockSearch';
+  import { dockBack, popOutChat, showInMainWindow } from '$lib/chatPopout';
+
+  /** Drawn as the whole of the popped-out chat window rather than as a panel
+   *  over the main window: always open, full size, and closing it docks the
+   *  chat back into the main window. */
+  let { windowed = false }: { windowed?: boolean } = $props();
+  let open = $derived(windowed || $chatDockOpen);
 
   /**
    * How wide the dock is, in pixels, remembered per device.
@@ -47,6 +57,14 @@
    * thing people actually do in it, with no way to change it.
    */
   const DOCK_WIDTH_KEY = 'ember.chatDock.width.v1';
+
+  /** Svelte runs transitions through the Web Animations API, which the global
+   *  reduced-motion rule in `app.css` does not reach — so it is checked here. */
+  const dockTransition = () => ({
+    x: prefersReducedMotion.current ? 0 : 24,
+    duration: prefersReducedMotion.current || windowed ? 0 : 180,
+    easing: cubicOut,
+  });
 
   /** The window as the clamp needs to see it. Zero before the DOM exists,
    *  which `maxDockWidth` treats as "no measurement" rather than "no room". */
@@ -358,7 +376,7 @@
   }
 
   $effect(() => {
-    if (!$chatDockOpen) {
+    if (!open) {
       closeSwitcher(false);
       finishResize();
     }
@@ -368,7 +386,7 @@
   // it as a landmark and focus lands somewhere useful. We bail early if
   // the dock is closed so the rest of the app keeps full focus.
   $effect(() => {
-    if ($chatDockOpen && panelEl) {
+    if (open && panelEl) {
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) {
         returnFocusEl = active;
@@ -379,7 +397,7 @@
       requestAnimationFrame(() => panelEl?.focus());
     }
     return () => {
-      if (!$chatDockOpen && returnFocusEl) {
+      if (!open && returnFocusEl) {
         const el = returnFocusEl;
         returnFocusEl = null;
         requestAnimationFrame(() => {
@@ -395,7 +413,7 @@
   // intercepted only when the dock is open so it doesn't fight with the
   // OS-level browser tab cycle in the rest of the app.
   function onKeydown(e: KeyboardEvent) {
-    if (!$chatDockOpen) return;
+    if (!open) return;
     // An open modal owns the keyboard. Its handlers sit on the dialog element
     // and let the event bubble to this window listener, so without this guard
     // one Escape both dismisses the dialog and collapses the dock behind it,
@@ -416,6 +434,8 @@
         closeSwitcher();
         return;
       }
+      // A stray Escape dismisses a panel; it should not close a window.
+      if (windowed) return;
       e.preventDefault();
       closeDock();
       return;
@@ -483,6 +503,10 @@
   function handleNewChat() {
     if (chatDisabled || $friendsList.length === 0) {
       closeSwitcher(false);
+      if (windowed) {
+        showInMainWindow('/friends');
+        return;
+      }
       void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
       return;
     }
@@ -514,7 +538,7 @@
   }
 </script>
 
-{#if $chatDockOpen}
+{#if open}
   <!--
     No backdrop overlay: the dock is intentionally non-modal so the
     user can keep clicking through to /friends, /transfers, /library
@@ -535,13 +559,16 @@
   <div
     class="chat-dock"
     class:resizing
-    style="width: {dockWidth}px"
+    class:windowed
+    style={windowed ? undefined : `width: ${dockWidth}px`}
     bind:this={panelEl}
-    role="complementary"
+    role={windowed ? 'main' : 'complementary'}
     aria-label={m.chat_dock_aria_label()}
-    aria-keyshortcuts={`Escape ${shortcutModAria()}+/`}
+    aria-keyshortcuts={windowed ? undefined : `Escape ${shortcutModAria()}+/`}
     tabindex="-1"
+    transition:fly={dockTransition()}
   >
+    {#if !windowed}
     <!--
       A real separator rather than a decorative grip: it is focusable and
       answers arrows, so the panel can be sized without a pointer at all.
@@ -570,6 +597,7 @@
       ondblclick={() => setDockWidth(DOCK_WIDTH_DEFAULT)}
       onkeydown={onResizeKeydown}
     ></div>
+    {/if}
 
     <!--
       One header naming the conversation on screen, in place of a strip of
@@ -648,12 +676,27 @@
           <line x1="3" y1="8" x2="13" y2="8"/>
         </svg>
       </button>
+      {#if !windowed}
+        <button
+          type="button"
+          class="dock-new"
+          title={m.chat_dock_pop_out()}
+          aria-label={m.chat_dock_pop_out()}
+          onclick={popOutChat}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 2.5h4.5V7"/>
+            <path d="M13.5 2.5L8 8"/>
+            <path d="M12 9.5v3a1 1 0 01-1 1H3.5a1 1 0 01-1-1V5a1 1 0 011-1h3"/>
+          </svg>
+        </button>
+      {/if}
       <button
         type="button"
         class="dock-close"
-        title={m.chat_dock_close_title()}
-        aria-label={m.chat_dock_close_aria()}
-        onclick={closeDock}
+        title={windowed ? m.chat_window_close() : m.chat_dock_close_title()}
+        aria-label={windowed ? m.chat_window_close() : m.chat_dock_close_aria()}
+        onclick={windowed ? () => void dockBack() : closeDock}
       >
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/>
@@ -862,6 +905,16 @@
     flex-direction: column;
     box-shadow: var(--shadow-panel-left);
     outline: none;
+  }
+
+  /* The whole window is the chat: no edge to sit against, nothing behind it
+     to cast a shadow on. */
+  .chat-dock.windowed {
+    inset: 0;
+    width: 100%;
+    min-width: 0;
+    border-left: none;
+    box-shadow: none;
   }
 
   /* Mid-drag the pointer is captured by the handle, but the press began over

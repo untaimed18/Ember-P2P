@@ -36,7 +36,7 @@
     type ChannelReactionInfo,
   } from '$lib/api/channels';
   import { appSettings } from '$lib/stores/settings';
-  import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
+  import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
   import {
@@ -622,6 +622,14 @@
         typingHoldTimer = null;
       }
     };
+  });
+
+  // Saved on request as well as on the way out: popping the chat into its own
+  // window, or docking it back, hands the drafts over while this is mounted.
+  $effect(() => {
+    const key = conversationKey;
+    if (!key) return;
+    return registerDraftFlusher(() => setDraft(key, inputText));
   });
 
   async function setupListener(gen: number, hash: string, channel: string): Promise<boolean> {

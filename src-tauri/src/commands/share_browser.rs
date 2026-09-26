@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -54,6 +54,10 @@ const MAX_CHILDREN: usize = 2_000;
 const MAX_SESSION_ENTRIES: usize = 100_000;
 const MAX_SHARE_SELECTION: usize = 500;
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// How long one measurement may walk before it answers with a lower bound.
+/// Long enough to finish an ordinary Documents folder on a local disk, short
+/// enough that the summary does not sit on "Counting…" for a whole drive.
+const MEASURE_BUDGET: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,6 +159,19 @@ struct ShareBrowserSession {
     /// shared but not offering everything reads as partly shared.
     offers: HashMap<String, FolderOffer>,
     data_dir: PathBuf,
+    /// Raised to stop the measurement in flight. Only the newest one is worth
+    /// finishing: each answers a selection the user has since changed.
+    measure_cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for ShareBrowserSession {
+    /// Closing, replacing or expiring the session stops its measurement, which
+    /// may otherwise be walking a whole drive for a dialog nobody has open.
+    fn drop(&mut self) {
+        if let Some(cancel) = self.measure_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What one shared folder currently contributes to the library.
@@ -179,6 +196,7 @@ impl ShareBrowserSession {
             unshared: HashSet::new(),
             offers: HashMap::new(),
             data_dir,
+            measure_cancel: None,
         }
     }
 
@@ -1776,6 +1794,86 @@ fn resolve_selected(path: &Path, kind: ShareBrowserKind) -> PathBuf {
         || path.to_path_buf(),
         |resolved| PathBuf::from(display_fs_path(&resolved)),
     )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareBrowserMeasure {
+    pub files: u64,
+    pub bytes: u64,
+    /// False when the count stopped early; `files` and `bytes` are then lower
+    /// bounds rather than totals.
+    pub complete: bool,
+}
+
+/// Count the files, and their bytes, that sharing these folders would offer,
+/// ahead of the scan that sharing starts. Files among `entry_ids` are left to
+/// the caller, which already has their sizes from the listing.
+///
+/// Starting a measurement stops the previous one: it answered a selection that
+/// has since changed.
+#[tauri::command]
+pub async fn measure_share_browser_entries(
+    window: tauri::WebviewWindow,
+    session_id: u64,
+    entry_ids: Vec<u64>,
+) -> Result<ShareBrowserMeasure, String> {
+    require_main_window(&window)?;
+    if entry_ids.len() > MAX_SHARE_SELECTION {
+        return Err(coded_ctx(
+            "sharing_browser_selection_too_large",
+            format!("Too many items selected (max {MAX_SHARE_SELECTION})"),
+            MAX_SHARE_SELECTION,
+        ));
+    }
+    let (roots, cancel) = {
+        let mut guard = lock_session()?;
+        let session = require_session(&mut guard, session_id)?;
+        let mut roots = Vec::with_capacity(entry_ids.len());
+        for id in &entry_ids {
+            let stored = session.entries.get(id).ok_or_else(|| {
+                coded(
+                    "sharing_browser_entry",
+                    "That folder is no longer in the browser session.",
+                )
+            })?;
+            let Location::Path(path) = &stored.location else {
+                continue;
+            };
+            if stored.kind == ShareBrowserKind::File
+                || path_has_sensitive_component(path)
+                || inside_data_dir(path, &session.data_dir)
+            {
+                continue;
+            }
+            roots.push(path.clone());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = session.measure_cancel.replace(cancel.clone()) {
+            previous.store(true, Ordering::Relaxed);
+        }
+        (roots, cancel)
+    };
+
+    let measure = tokio::task::spawn_blocking(move || {
+        crate::sharing::indexer::FileIndexer::measure_directories(
+            &roots,
+            Instant::now() + MEASURE_BUDGET,
+            &cancel,
+        )
+    })
+    .await
+    .map_err(|error| {
+        coded_ctx(
+            "sharing_browser_task_failed",
+            "Folder browser failed",
+            error,
+        )
+    })?;
+    Ok(ShareBrowserMeasure {
+        files: measure.files,
+        bytes: measure.bytes,
+        complete: measure.complete,
+    })
 }
 
 #[tauri::command]

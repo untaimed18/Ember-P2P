@@ -91,7 +91,7 @@ fn take_notify_token() -> bool {
 /// overrides go entirely — the same set `coded_ctx` strips, and for the same
 /// reason: a right-to-left override in a file name can make a notification read
 /// as text nobody sent.
-fn sanitize(raw: &str, max_chars: usize) -> String {
+pub(crate) fn sanitize(raw: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(raw.len().min(max_chars * 4));
     let mut chars = 0usize;
     let mut truncated = false;

@@ -95,6 +95,22 @@ export async function shareBrowserSelection(
   return invoke('share_browser_selection', { sessionId, entryIds });
 }
 
+export interface ShareBrowserMeasure {
+  files: number;
+  bytes: number;
+  /** False when counting stopped early; `files` and `bytes` are lower bounds. */
+  complete: boolean;
+}
+
+/** Count the files, and their bytes, under the given folder entries, by the
+ *  rules the scan will use. Starting a count stops the previous one. */
+export async function measureShareBrowserEntries(
+  sessionId: number,
+  entryIds: number[],
+): Promise<ShareBrowserMeasure> {
+  return invoke('measure_share_browser_entries', { sessionId, entryIds });
+}
+
 export async function closeShareBrowser(sessionId: number): Promise<void> {
   return invoke('close_share_browser', { sessionId });
 }

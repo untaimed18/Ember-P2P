@@ -34,6 +34,7 @@ import { get } from 'svelte/store';
 import { showNotification } from '$lib/api/system';
 import { appSettings } from '$lib/stores/settings';
 import type { AppSettings } from '$lib/types';
+import { chatWindowFocused, isChatWindow } from '$lib/windowRole';
 
 /** The categories a user can switch off independently, keyed to their setting. */
 export type NotifyCategory =
@@ -92,6 +93,7 @@ let deliveryUnavailable = false;
  */
 function emberIsFocused(): boolean {
   if (typeof document === 'undefined') return false;
+  if (chatWindowFocused()) return true;
   return document.visibilityState === 'visible' && document.hasFocus();
 }
 
@@ -133,6 +135,9 @@ function recordSignature(signature: string, now: number): void {
  */
 export function shouldNotify(category: NotifyCategory): boolean {
   if (deliveryUnavailable) return false;
+  // The chat window hears every event the main window does. The main window
+  // alone speaks, or each message would be announced twice.
+  if (isChatWindow()) return false;
   const settings = get(appSettings);
   // Unknown settings means the app has not finished booting. Staying silent is
   // the conservative reading: a missed notification during the first second is

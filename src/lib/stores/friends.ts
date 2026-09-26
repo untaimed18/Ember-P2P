@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { confusableSkeleton, isAppVisible, mixesLookalikeScripts } from '$lib/utils';
 import {
@@ -15,6 +15,7 @@ import {
 } from '$lib/api/friends';
 import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
+import { chatWindowShows } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
@@ -411,7 +412,8 @@ export async function initFriendsStore() {
         // separately marks the message read on the backend.
         // A mounted conversation in a hidden/minimized window is NOT being
         // read, so it must still raise a badge.
-        const beingRead = isAppVisible() && get(activeChatHash) === hash;
+        const beingRead =
+          (isAppVisible() && get(activeChatHash) === hash) || chatWindowShows(hash);
         if (!beingRead) {
           unreadCounts.update((m) => {
             const next = new Map(m);
@@ -437,6 +439,12 @@ export async function initFriendsStore() {
             safeEventText(p.message, 200),
           );
         }
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string }>(UNREAD_CLEARED_EVENT, (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (hash) dropUnread(hash);
       }),
     );
     registered.push(
@@ -486,6 +494,7 @@ export async function initFriendsStore() {
           if (oldest !== undefined) announcedAttachments.delete(oldest);
         }
         if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
+        if (chatWindowShows(a.user_hash)) return;
         if (!shouldNotify('friend_message')) return;
         const name = friendDisplayName(a.user_hash);
         void notify(
@@ -753,14 +762,24 @@ export async function initFriendsStore() {
   }
 }
 
-export function clearUnread(friendHash: string) {
+/** Frontend-only: a window cleared a friend's unread count. The other window
+ *  counts the same messages from the same events, and cannot see the read. */
+const UNREAD_CLEARED_EVENT = 'ember-ui:unread-cleared';
+
+function dropUnread(friendHash: string) {
   const hash = friendHash.toLowerCase();
   unreadCounts.update((m) => {
+    if (!m.has(hash) && !m.has(friendHash)) return m;
     const next = new Map(m);
     next.delete(hash);
     next.delete(friendHash);
     return next;
   });
+}
+
+export function clearUnread(friendHash: string) {
+  dropUnread(friendHash);
+  void emit(UNREAD_CLEARED_EVENT, { user_hash: friendHash.toLowerCase() }).catch(() => {});
 }
 
 /**

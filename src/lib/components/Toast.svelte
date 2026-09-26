@@ -5,6 +5,10 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { chatDockOpen } from '$lib/stores/chatTabs';
   import IconX from './IconX.svelte';
+  import { isChatWindow } from '$lib/windowRole';
+
+  /** The chat window is all dock, so there is no dock beside it to clear. */
+  const besideDock = !isChatWindow();
 
   const flyParams = () => ({ x: prefersReducedMotion.current ? 0 : 24, duration: prefersReducedMotion.current ? 0 : 200 });
 </script>
@@ -23,7 +27,7 @@
        the keyboard equivalent is `focusin`/`focusout` rather than a click. -->
   <div
     class="toast-container"
-    class:dock-open={$chatDockOpen}
+    class:dock-open={besideDock && $chatDockOpen}
     data-a11y-no-inert
     onmouseenter={pauseToastDismiss}
     onmouseleave={resumeToastDismiss}

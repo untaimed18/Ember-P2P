@@ -20,6 +20,21 @@ const MAX_DISCOVERED_FILES: usize = 100_000;
 /// ~100 MB of transient heap on top of the ~50 MB the page itself holds. Twice
 /// the page cap, so no tree whose page can be returned in full ever trims.
 const MAX_PENDING_FRONTIER: usize = 2 * MAX_DISCOVERED_FILES;
+/// Directory entries one [`FileIndexer::measure_directories`] call looks at
+/// before it settles for a lower bound. Far past what the time budget usually
+/// allows on a local disk; it bounds the walk on a filesystem that answers
+/// `read_dir` faster than it is worth counting.
+const MAX_MEASURED_ENTRIES: u64 = 2_000_000;
+
+/// Files and bytes a share would offer, as counted ahead of the scan.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryMeasure {
+    pub files: u64,
+    pub bytes: u64,
+    /// Every entry was counted. False when the walk was cancelled or ran out
+    /// of budget, which makes `files` and `bytes` lower bounds.
+    pub complete: bool,
+}
 
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
@@ -520,6 +535,99 @@ impl FileIndexer {
             partial,
             next_cursor,
         }
+    }
+
+    /// Count the files discovery would find under `roots`, and their bytes,
+    /// without building a page of them: the share picker's preview of what a
+    /// share is about to offer. Walks by the same rules as
+    /// [`Self::discover_directory_page`] so the preview agrees with the scan;
+    /// order does not matter for a count, so a plain stack replaces the sorted
+    /// queue. Roots nested inside another root are counted once.
+    ///
+    /// Stops early — reporting what it has, with `complete` false — when
+    /// `cancel` is set, `deadline` passes, or [`MAX_MEASURED_ENTRIES`] entries
+    /// have been looked at. Unreadable folders are skipped the way discovery
+    /// skips them, so they do not make a count incomplete.
+    pub fn measure_directories(
+        roots: &[std::path::PathBuf],
+        deadline: std::time::Instant,
+        cancel: &AtomicBool,
+    ) -> DirectoryMeasure {
+        use std::sync::atomic::Ordering;
+
+        let data_canon = canonical_data_dir();
+        let mut measure = DirectoryMeasure {
+            complete: true,
+            ..DirectoryMeasure::default()
+        };
+        let mut unique: Vec<&std::path::PathBuf> = Vec::new();
+        for root in roots {
+            if roots.iter().any(|other| other != root && root.starts_with(other)) {
+                continue;
+            }
+            if !unique.contains(&root) {
+                unique.push(root);
+            }
+        }
+
+        let mut stack: Vec<std::path::PathBuf> = Vec::new();
+        for root in unique {
+            if is_excluded_share_location(root) || !root.is_dir() {
+                continue;
+            }
+            stack.push(root.clone());
+        }
+
+        let mut visited: u64 = 0;
+        while let Some(directory) = stack.pop() {
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                visited += 1;
+                // Checked every few hundred entries rather than on each one:
+                // `Instant::now` is a syscall on some platforms.
+                if visited.is_multiple_of(256)
+                    && (cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline)
+                {
+                    measure.complete = false;
+                    return measure;
+                }
+                if visited > MAX_MEASURED_ENTRIES || stack.len() >= MAX_PENDING_FRONTIER {
+                    measure.complete = false;
+                    return measure;
+                }
+                let Ok(entry) = entry else { continue };
+                let Ok(file_type) = entry.file_type() else { continue };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let metadata = entry.metadata().ok();
+                if metadata.as_ref().is_some_and(walk_skips_metadata) {
+                    continue;
+                }
+                let entry_path = entry.path();
+                if file_type.is_dir() {
+                    if crate::sharing::is_sensitive_dir_name(&entry.file_name().to_string_lossy()) {
+                        continue;
+                    }
+                    if let Ok(canonical) = entry_path.canonicalize() {
+                        if canonical == data_canon || canonical.starts_with(data_canon) {
+                            continue;
+                        }
+                    }
+                    stack.push(entry_path);
+                } else if file_type.is_file() {
+                    if is_excluded_share_file_name(&entry_path) {
+                        continue;
+                    }
+                    measure.files += 1;
+                    measure.bytes += metadata.map_or(0, |metadata| metadata.len());
+                }
+            }
+        }
+        measure
     }
 
     /// Collect file metadata WITHOUT hashing (instant).
@@ -1085,5 +1193,58 @@ mod tests {
                 "{name} is ordinary content and must stay shareable"
             );
         }
+    }
+
+    fn measure_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = scratch_tree(&format!("measure-{tag}"));
+        std::fs::create_dir_all(dir.join("sub").join("deeper")).expect("temp dirs");
+        std::fs::write(dir.join("a.txt"), b"12345").expect("a");
+        std::fs::write(dir.join("sub").join("b.bin"), vec![0u8; 100]).expect("b");
+        std::fs::write(dir.join("sub").join("deeper").join("c.dat"), vec![0u8; 1000]).expect("c");
+        // Discovery refuses these, so the preview must not count them either.
+        std::fs::write(dir.join("sub").join("movie.part"), b"partial").expect("part");
+        std::fs::write(dir.join(".env"), b"SECRET=1").expect("env");
+        dir
+    }
+
+    #[test]
+    fn measuring_counts_what_discovery_would_share() {
+        let dir = measure_fixture("agree");
+        let flag = AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let measure = FileIndexer::measure_directories(&[dir.clone()], deadline, &flag);
+        let discovered = FileIndexer::discover_directory(&dir.to_string_lossy());
+        assert!(measure.complete);
+        assert_eq!(measure.files, discovered.files.len() as u64);
+        assert_eq!(measure.files, 3);
+        assert_eq!(measure.bytes, 1105);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn measuring_a_folder_and_its_subfolder_counts_it_once() {
+        let dir = measure_fixture("nested");
+        let flag = AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let measure =
+            FileIndexer::measure_directories(&[dir.join("sub"), dir.clone()], deadline, &flag);
+        assert_eq!(measure.files, 3);
+        assert_eq!(measure.bytes, 1105);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_passed_deadline_reports_an_incomplete_count() {
+        let dir = measure_fixture("deadline");
+        // Enough entries that the walk reaches its first budget check.
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").expect("file");
+        }
+        let flag = AtomicBool::new(false);
+        let measure =
+            FileIndexer::measure_directories(&[dir.clone()], std::time::Instant::now(), &flag);
+        assert!(!measure.complete);
+        assert!(measure.files < 303);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

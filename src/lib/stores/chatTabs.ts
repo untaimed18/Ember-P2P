@@ -113,6 +113,38 @@ export const chatDockOpen = writable<boolean>(false);
 chatTabs.subscribe((tabs) => persist({ tabs, activeHash: get(activeChatTab) }));
 activeChatTab.subscribe((activeHash) => persist({ tabs: get(chatTabs), activeHash }));
 
+/** A change to the tab list made in one window, to be replayed in the other. */
+export type ChatTabOp =
+  | { kind: 'open'; hash: string; name: string }
+  | { kind: 'close'; hash: string }
+  | { kind: 'rename'; hash: string; name: string };
+
+/**
+ * Installed in the main window while the chat is popped out into its own
+ * window (see `chatPopout.ts`). The tabs are then the chat window's, and it
+ * saves every change it makes, so the main window re-reads them before
+ * changing anything — its own copy is stale and saving it would undo what
+ * was done over there — and forwards the change instead of opening the dock.
+ */
+export interface ChatPopoutHook {
+  forward(op: ChatTabOp): void;
+  /** Show the chat: open the chat window, or bring it forward. */
+  reveal(): void;
+}
+
+let popout: ChatPopoutHook | null = null;
+
+export function setChatPopout(hook: ChatPopoutHook | null) {
+  popout = hook;
+}
+
+/** Re-read the tab list from storage, where the other window saved it. */
+export function reloadChatTabs() {
+  const state = loadPersisted();
+  chatTabs.set(state.tabs);
+  activeChatTab.set(state.activeHash);
+}
+
 /**
  * Sum of unread counts across all friends. Used by the Chats toggle
  * button in the sidebar to show a total-pending badge regardless of
@@ -185,6 +217,44 @@ export function clearDraft(hash: string) {
 }
 
 /**
+ * The open conversation keeps its draft in its own input and only writes it
+ * here when it is left. Handing the drafts to another window cannot wait for
+ * that — the dock's exit animation holds the conversation mounted — so the
+ * conversation registers a flush that {@link takeFriendDrafts} runs first.
+ */
+const draftFlushers = new Set<() => void>();
+
+export function registerDraftFlusher(flush: () => void): () => void {
+  draftFlushers.add(flush);
+  return () => {
+    draftFlushers.delete(flush);
+  };
+}
+
+/** Every friend draft, current to the keystroke, for another window to take
+ *  over. Passed over IPC rather than through storage: drafts stay off disk. */
+export function takeFriendDrafts(): Record<string, string> {
+  for (const flush of draftFlushers) flush();
+  const out: Record<string, string> = {};
+  for (const [key, text] of chatDrafts) {
+    if (!key.startsWith(CHANNEL_DRAFT_PREFIX) && text) out[key] = text;
+  }
+  return out;
+}
+
+/** Replace the friend drafts with ones handed over by the other window. Only
+ *  open tabs keep one, the same rule {@link setDraft} applies. */
+export function restoreFriendDrafts(drafts: Record<string, string>) {
+  for (const key of [...chatDrafts.keys()]) {
+    if (!key.startsWith(CHANNEL_DRAFT_PREFIX)) chatDrafts.delete(key);
+  }
+  const open = new Set(get(chatTabs).map((t) => t.hash));
+  for (const [key, text] of Object.entries(drafts)) {
+    if (typeof text === 'string' && text && open.has(key)) chatDrafts.set(key, text);
+  }
+}
+
+/**
  * Open (or focus) a conversation tab and ensure the dock is visible.
  *
  * If a tab already exists for `hash`, its display name is refreshed
@@ -194,6 +264,7 @@ export function clearDraft(hash: string) {
  */
 export function openChat(hash: string, name: string) {
   const key = hash.toLowerCase();
+  if (popout) reloadChatTabs();
   chatTabs.update((tabs) => {
     const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
     if (idx === -1) {
@@ -211,6 +282,11 @@ export function openChat(hash: string, name: string) {
     return tabs;
   });
   activeChatTab.set(key);
+  if (popout) {
+    popout.forward({ kind: 'open', hash: key, name });
+    popout.reveal();
+    return;
+  }
   chatDockOpen.set(true);
 }
 
@@ -221,6 +297,7 @@ export function openChat(hash: string, name: string) {
  */
 export function closeTab(hash: string) {
   const key = hash.toLowerCase();
+  if (popout) reloadChatTabs();
   const tabs = get(chatTabs);
   const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
   if (idx === -1) return;
@@ -239,14 +316,21 @@ export function closeTab(hash: string) {
     activeChatTab.set(neighbor);
     if (neighbor === null) chatDockOpen.set(false);
   }
+  popout?.forward({ kind: 'close', hash: key });
 }
 
 /** Activate an existing tab (no-op if it isn't open) and reveal the dock. */
 export function setActiveTab(hash: string) {
   const key = hash.toLowerCase();
+  if (popout) reloadChatTabs();
   const tab = get(chatTabs).find((t) => t.hash.toLowerCase() === key);
   if (tab) {
     activeChatTab.set(tab.hash);
+    if (popout) {
+      popout.forward({ kind: 'open', hash: tab.hash, name: tab.name });
+      popout.reveal();
+      return;
+    }
     chatDockOpen.set(true);
   }
 }
@@ -259,6 +343,10 @@ export function setActiveTab(hash: string) {
  * `/friends` to start a chat from there.
  */
 export function toggleDock() {
+  if (popout) {
+    popout.reveal();
+    return;
+  }
   chatDockOpen.update((v) => !v);
 }
 
@@ -329,6 +417,7 @@ export function removeChatForFriend(hash: string) {
  * after the change rather than leaving it to sit there opening nothing.
  */
 export function retainChatTabs(friendHashes: Iterable<string>) {
+  if (popout) reloadChatTabs();
   const allow = new Set([...friendHashes].map((h) => h.toLowerCase()));
   const tabs = get(chatTabs);
   const next = tabs.filter((t) => allow.has(t.hash.toLowerCase()));
@@ -352,6 +441,7 @@ export function retainChatTabs(friendHashes: Iterable<string>) {
  */
 export function renameTab(hash: string, newName: string) {
   const key = hash.toLowerCase();
+  if (popout) reloadChatTabs();
   chatTabs.update((tabs) => {
     const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
     if (idx === -1 || tabs[idx].name === newName) return tabs;
@@ -359,5 +449,6 @@ export function renameTab(hash: string, newName: string) {
     next[idx] = { hash: tabs[idx].hash, name: newName };
     return next;
   });
+  popout?.forward({ kind: 'rename', hash: key, name: newName });
 }
 

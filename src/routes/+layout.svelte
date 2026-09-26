@@ -45,6 +45,13 @@
   import { fly } from 'svelte/transition';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
+  import { initChatPopoutMain } from '$lib/chatPopout';
+  import { isChatWindow } from '$lib/windowRole';
+
+  /** This document is the popped-out chat window, which draws the chat and
+   *  nothing else of the shell. Fixed for the life of the document. */
+  const chatWindow = isChatWindow();
 
   // Sync `<html lang>` to the active Paraglide locale on every
   // mount. Paraglide's strategy chain (localStorage →
@@ -253,6 +260,8 @@
   // backend's (delayed) corrupt-config/db emit, so the
   // "active before the user can act" intent is preserved.
   onMount(() => {
+    // The chat window's shell starts what it needs itself.
+    if (chatWindow) return;
     initTheme();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
@@ -278,6 +287,12 @@
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
+    let stopChatPopout: (() => void) | null = null;
+
+    void initChatPopoutMain().then((stop) => {
+      if (mounted) stopChatPopout = stop;
+      else stop();
+    });
 
     // Last-resort floor for promise rejections nothing else caught. Every
     // `invoke()` rejects whenever its Rust command returns `Err`, so a call
@@ -636,10 +651,14 @@
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
       if (unlistenDownloadFolder) unlistenDownloadFolder();
+      stopChatPopout?.();
     };
   });
 </script>
 
+{#if chatWindow}
+<ChatWindowShell />
+{:else}
 <a href="#main-content" class="skip-to-content">{m.layout_skip_to_content()}</a>
 {#if splashVisible}
   <SplashScreen exiting={splashExiting} />
@@ -782,6 +801,7 @@
       </button>
     </div>
   </div>
+{/if}
 {/if}
 
 <style>

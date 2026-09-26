@@ -2027,6 +2027,7 @@ pub fn run() {
             commands::share_browser::list_share_browser_children,
             commands::share_browser::navigate_share_browser,
             commands::share_browser::share_browser_selection,
+            commands::share_browser::measure_share_browser_entries,
             commands::share_browser::close_share_browser,
             commands::chat_attachments::pick_and_send_chat_attachment,
             commands::chat_attachments::respond_chat_attachment,
@@ -2034,6 +2035,9 @@ pub fn run() {
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,
+            commands::chat_window::open_chat_window,
+            commands::chat_window::close_chat_window,
+            commands::chat_window::focus_main_window,
             commands::sharing::confirm_dropped_folders,
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
@@ -2256,8 +2260,30 @@ pub fn run() {
             // Title-bar X handler. Decides whether to fully exit, hide to
             // the system tray, or hand off to the frontend dialog based on
             // the user's saved `close_to_tray_behavior`. Only the main
-            // window participates — auxiliary windows (none today, but
-            // future about/preview popups) keep their normal close path.
+            // window participates. The popped-out chat window's X docks the
+            // chat back into the main window instead; see `chat_window`.
+            if window.label() == commands::chat_window::CHAT_WINDOW_LABEL {
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // Quitting closes every window; only a close the user
+                        // asked of this one docks the chat back first.
+                        let quitting = window.app_handle().try_state::<AppState>().is_some_and(|state| {
+                            state.quit_confirmed.load(std::sync::atomic::Ordering::Acquire)
+                        });
+                        if !quitting {
+                            api.prevent_close();
+                            commands::chat_window::request_redock(window);
+                        }
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        let _ = window
+                            .app_handle()
+                            .emit(commands::chat_window::CHAT_WINDOW_CLOSED_EVENT, ());
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if window.label() != "main" {
                 return;
             }
@@ -2309,8 +2335,16 @@ pub fn run() {
 
             match behavior {
                 "exit" => {
-                    // Default close path. Don't call `prevent_close`; let
-                    // Tauri tear the window down and fire `RunEvent::Exit`.
+                    // Exit the app rather than close this window: closing the
+                    // main window alone would leave a popped-out chat window
+                    // keeping Ember running with no way back to the rest of it.
+                    // The same path as `quit_app`, so `RunEvent::Exit` still
+                    // runs the shutdown.
+                    api.prevent_close();
+                    state
+                        .quit_confirmed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    app_handle.exit(0);
                 }
                 "tray" => {
                     api.prevent_close();

@@ -11,11 +11,13 @@
     addSharedFolder,
     closeShareBrowser,
     listShareBrowserChildren,
+    measureShareBrowserEntries,
     navigateShareBrowser,
     openShareBrowser,
     shareBrowserSelection,
     type ShareBrowserEntry,
     type ShareBrowserKind,
+    type ShareBrowserMeasure,
     type ShareBrowserView,
     type SharedFolderPick,
   } from '$lib/api/sharing';
@@ -88,6 +90,8 @@
     loading = true;
     error = null;
     selectedPaths = new Set();
+    measureCache = new Map();
+    measured = null;
     idByPath = new Map();
     entryByPath = new Map();
     history = [];
@@ -341,6 +345,150 @@
     }
     if (selectedFileCount === 0) return m.library_explorer_outcome_folder();
     return m.library_explorer_outcome_mixed();
+  });
+
+  /**
+   * What the Share button is about to offer. Files carry their size from the
+   * listing; folders are counted by the backend, by the rules the scan will
+   * use, so the total is known before anything is shared. A count that runs
+   * out of time is shown as a lower bound rather than held back.
+   */
+  type ShareSummary = {
+    files: number;
+    bytes: number;
+    /** `exact`: the total. `counting`: folders are still being walked.
+     *  `lower_bound`: the walk stopped early. `uncounted`: it failed, so
+     *  `folders` are named without their contents. */
+    state: 'exact' | 'counting' | 'lower_bound' | 'uncounted';
+    folders: number;
+    /** The folders are inside the open folder rather than picked one by one. */
+    subfolders: boolean;
+  };
+
+  const totalBytes = (files: ShareBrowserEntry[]) => files.reduce((sum, f) => sum + (f.size ?? 0), 0);
+
+  /** Folders whose contents the summary needs counted. Sharing the open folder
+   *  counts it whole, which covers its own files and any the listing cut off. */
+  let measureIds = $derived.by((): number[] => {
+    if (shareIds.length === 0) return [];
+    if (selectedCount > 0) {
+      return selectedEntries
+        .filter((entry) => entry.kind !== 'file')
+        .map((entry) => idByPath.get(entry.path))
+        .filter((id): id is number => id != null);
+    }
+    if (ownFilesOnly || !currentEntry) return [];
+    return [currentEntry.id];
+  });
+  let measureKey = $derived(`${sessionId}:${[...measureIds].sort((a, b) => a - b).join(',')}`);
+
+  type Measured = ShareBrowserMeasure & { failed: boolean };
+  /** Per session: going back to a folder, or re-ticking the same selection,
+   *  answers at once instead of walking the tree again. */
+  let measureCache = new Map<string, Measured>();
+  let measured = $state<{ key: string; result: Measured } | null>(null);
+
+  $effect(() => {
+    // Keyed on the string alone. `measureIds` is a fresh array whenever the
+    // listing grows, which browsing with folders ticked does on every step,
+    // and restarting the walk each time would keep a big one from finishing.
+    const key = measureKey;
+    const ids = untrack(() => measureIds);
+    const id = sessionId;
+    if (id == null || ids.length === 0) return;
+    const cached = measureCache.get(key);
+    if (cached) {
+      measured = { key, result: cached };
+      return;
+    }
+    let stale = false;
+    // Ticking several boxes in a row should start one walk, not one per box.
+    const timer = setTimeout(() => {
+      measureShareBrowserEntries(id, ids)
+        .then((result) => ({ ...result, failed: false }))
+        .catch(() => ({ files: 0, bytes: 0, complete: false, failed: true }))
+        .then((result) => {
+          if (stale) return;
+          // An early stop is worth another try next time; a finished count is not.
+          if (result.complete) measureCache.set(key, result);
+          measured = { key, result };
+        });
+    }, 200);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  });
+
+  let measurement = $derived(measured?.key === measureKey ? measured.result : null);
+
+  let shareSummary = $derived.by((): ShareSummary | null => {
+    if (shareIds.length === 0) return null;
+    const wholeFolder = selectedCount === 0 && !ownFilesOnly;
+    const listed = selectedCount > 0
+      ? selectedEntries.filter((entry) => entry.kind === 'file')
+      : ownFilesOnly ? currentOwnFiles : [];
+    const known = { files: listed.length, bytes: totalBytes(listed) };
+    if (measureIds.length === 0) {
+      return { ...known, state: 'exact', folders: 0, subfolders: false };
+    }
+    if (!measurement) {
+      return { ...known, state: 'counting', folders: measureIds.length, subfolders: false };
+    }
+    if (measurement.failed) {
+      // What the listing alone can say: the open folder's own files, and how
+      // many folders are left for the scan to count.
+      return wholeFolder
+        ? {
+            files: currentOwnFiles.length,
+            bytes: totalBytes(currentOwnFiles),
+            state: 'uncounted',
+            folders: currentSubfolders,
+            subfolders: true,
+          }
+        : { ...known, state: 'uncounted', folders: measureIds.length, subfolders: false };
+    }
+    return {
+      files: known.files + measurement.files,
+      bytes: known.bytes + measurement.bytes,
+      state: measurement.complete ? 'exact' : 'lower_bound',
+      folders: 0,
+      subfolders: false,
+    };
+  });
+
+  let summaryFiles = $derived.by(() => {
+    const count = shareSummary?.files ?? 0;
+    if (shareSummary?.state === 'lower_bound') {
+      return m.library_explorer_summary_files_at_least({ count: formatNumber(count) });
+    }
+    return count === 1
+      ? m.library_explorer_summary_files_one()
+      : m.library_explorer_summary_files_other({ count: formatNumber(count) });
+  });
+  let summarySize = $derived(
+    shareSummary
+      ? `${formatBytes(shareSummary.bytes)}${shareSummary.state === 'lower_bound' ? '+' : ''}`
+      : '',
+  );
+  let summaryFolders = $derived.by(() => {
+    if (!shareSummary) return '';
+    const { folders: count, subfolders } = shareSummary;
+    if (subfolders) {
+      return count === 1
+        ? m.library_explorer_summary_subfolders_one()
+        : m.library_explorer_summary_subfolders_other({ count: formatNumber(count) });
+    }
+    return count === 1
+      ? m.library_explorer_summary_folders_one()
+      : m.library_explorer_summary_folders_other({ count: formatNumber(count) });
+  });
+  let summaryHint = $derived.by(() => {
+    switch (shareSummary?.state) {
+      case 'lower_bound': return m.library_explorer_summary_incomplete();
+      case 'uncounted': return shareSummary.folders > 0 ? m.library_explorer_summary_pending() : null;
+      default: return null;
+    }
   });
 
   type TreeRow = { entry: ShareBrowserEntry; depth: number; isExpanded: boolean; canExpand: boolean };
@@ -637,6 +785,40 @@
             <span>{m.library_explorer_include_subfolders({ count: currentSubfolders })}</span>
           </label>
         {/if}
+        <!-- Always rendered, so the buttons below keep their place when the
+             selection empties and the summary has nothing to say. -->
+        <div class="share-summary" aria-live="polite">
+          {#if shareSummary}
+            {@const counting = shareSummary.state === 'counting'}
+            {#if !counting || shareSummary.files > 0}
+              <span class="summary-item">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M4 2.5h5l3 3V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M9 2.5V6h3"/></svg>
+                {summaryFiles}
+              </span>
+            {/if}
+            {#if shareSummary.files > 0}
+              <span class="summary-sep" aria-hidden="true">·</span>
+              <span class="summary-item summary-size">{summarySize}</span>
+            {/if}
+            {#if counting}
+              <span class="summary-counting">
+                <span class="summary-spinner" aria-hidden="true"></span>
+                {m.library_explorer_summary_counting()}
+              </span>
+            {:else if shareSummary.folders > 0}
+              {#if shareSummary.files > 0}
+                <span class="summary-sep" aria-hidden="true">·</span>
+              {/if}
+              <span class="summary-item">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></svg>
+                {summaryFolders}
+              </span>
+            {/if}
+            {#if summaryHint}
+              <span class="summary-hint">{summaryHint}</span>
+            {/if}
+          {/if}
+        </div>
         <p class="selection-meta">{shareOutcome}</p>
         <div class="footer-actions">
           <button type="button" class="ghost footer-fallback" onclick={useSystemDialog} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
@@ -950,6 +1132,55 @@
     font-size: 12px;
     line-height: 1.4;
     color: var(--text-secondary);
+  }
+  .share-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 8px;
+    row-gap: 2px;
+    min-height: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .summary-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .summary-item svg {
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+  .summary-size { color: var(--text-secondary); }
+  .summary-sep { color: var(--text-muted); }
+  .summary-counting {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+  .summary-spinner {
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: summary-spin 0.8s linear infinite;
+  }
+  @keyframes summary-spin {
+    to { transform: rotate(360deg); }
+  }
+  .summary-hint {
+    margin-left: 4px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-muted);
   }
   .subfolder-choice {
     display: flex;
