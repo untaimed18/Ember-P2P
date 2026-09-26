@@ -2,7 +2,7 @@
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
-  import { formatSize, formatDateWithYear as formatDate } from '$lib/utils';
+  import { formatSize, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -653,7 +653,7 @@
               {:else if col.key === 'folder'}
                 <td class="cell-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
               {:else if col.key === 'modified'}
-                <td class="cell-date" title={file.modified_at ? new Date(file.modified_at * 1000).toLocaleString() : ''}>{formatDate(file.modified_at)}</td>
+                <td class="cell-date" title={file.modified_at ? formatDateTime(file.modified_at) : ''}>{formatDate(file.modified_at)}</td>
               {:else if col.key === 'sources'}
                 <td class="cell-num">{file.complete_sources || '\u2014'}</td>
               {:else if col.key === 'shared'}

@@ -52,9 +52,12 @@ interface PersistedState {
   activeHash: string | null;
 }
 
+// The `typeof` checks sit inside the `try`: with storage disabled, merely
+// reading the `localStorage` global throws a SecurityError, and this runs at
+// module load, where a throw takes the whole layout down with it.
 function loadPersisted(): PersistedState {
-  if (typeof localStorage === 'undefined') return { tabs: [], activeHash: null };
   try {
+    if (typeof localStorage === 'undefined') return { tabs: [], activeHash: null };
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { tabs: [], activeHash: null };
     const parsed: unknown = JSON.parse(raw);
@@ -87,8 +90,8 @@ function loadPersisted(): PersistedState {
 }
 
 function persist(state: PersistedState) {
-  if (typeof localStorage === 'undefined') return;
   try {
+    if (typeof localStorage === 'undefined') return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch {
     // Quota exceeded / private mode / disabled — non-fatal. The dock

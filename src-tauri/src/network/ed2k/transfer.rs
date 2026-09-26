@@ -2998,7 +2998,7 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
                                         }
                                     }
                                 } else {
@@ -3744,7 +3744,7 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
                                         }
                                     }
                                     if peer_is_ember && !mesh_discovered_emitted {
@@ -5676,7 +5676,7 @@ impl Ed2kDownload {
                                                 if let Some(cm) = &self.credit_manager {
                                                     cm.write()
                                                         .await
-                                                        .set_ember_hash(peer_user_hash, *eh);
+                                                        .note_bound_ember_hash(peer_user_hash, *eh);
                                                 }
                                             }
                                             if peer_is_ember && !mesh_discovered_emitted {
@@ -5858,11 +5858,14 @@ impl Ed2kDownload {
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_part = super::aich::compute_aich_part(
-                            &part_data,
+                        let part_data = std::sync::Arc::new(part_data);
+                        let aich_part = super::aich::compute_aich_part_blocking(
+                            part_data.clone(),
                             part_idx,
                             tracker.part_count,
-                        );
+                        )
+                        .await
+                        .unwrap_or([0u8; 20]);
                         let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
                             / super::aich::AICH_BLOCK_SIZE;
                         warn!(
@@ -5947,16 +5950,17 @@ impl Ed2kDownload {
                             }
 
                             let mut narrowed = false;
-                            if let Some(ref rec) = recovery_bytes {
+                            if let Some(rec) = recovery_bytes.take() {
                                 if let Some(corrupt) =
-                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                    super::aich::corrupt_blocks_from_aich_recovery_blocking(
                                         master_hash,
                                         rec,
                                         part_idx,
-                                        &part_data,
+                                        part_data.clone(),
                                         part_len,
                                         self.file_size,
                                     )
+                                    .await
                                 {
                                     if !corrupt.is_empty() {
                                         let (ps, _) = tracker.part_range(part_idx);
@@ -7222,20 +7226,22 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
             // packed frame is capped at 2 MiB on the wire but may inflate to
             // 10 MiB — roughly 640 MiB resident per connection, on a path the
             // sender reaches by corrupting a part so its MD4 fails. Both limits
-            // leave the stream on a packet boundary, so refusing is safe either
-            // way.
+            // leave the stream on a packet boundary, so giving up on the answer
+            // is safe either way. The packet just read is kept (overshooting
+            // the byte cap by at most one packet): it is usually a requested
+            // data block, and dropping it loses that range for the session.
             const MAX_DEFERRED_PACKETS: usize = 64;
             const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            deferred_packets.push_back((proto, opcode, payload));
             let deferred_bytes: usize = deferred_packets
                 .iter()
                 .map(|(_, _, buffered)| buffered.len())
                 .sum();
             if deferred_packets.len() >= MAX_DEFERRED_PACKETS
-                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+                || deferred_bytes >= MAX_DEFERRED_BYTES
             {
                 return AichAnswerOutcome::NotAvailable;
             }
-            deferred_packets.push_back((proto, opcode, payload));
         }
     };
 

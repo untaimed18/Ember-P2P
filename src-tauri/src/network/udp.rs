@@ -5,6 +5,111 @@
 
 use super::*;
 
+/// Serveable-parts bitmaps for downloads answering UDP reasks without a live
+/// tracker (paused or queued), keyed by transfer id. Filled from the live
+/// tracker while the download runs and from `.part.met` on the blocking pool
+/// otherwise, so the reask path itself never reads the disk.
+///
+/// An entry is only as good as the [`ed2k::part_tracker::verification_epoch`]
+/// it was built at: any tracker un-verifying a part bumps the epoch, and a
+/// rebuild through `PartTracker::new` applies the process-wide
+/// cleared-since-verified set, so a mismatched entry is never served.
+#[derive(Default)]
+struct ReaskPartsCache {
+    entries: HashMap<String, ReaskPartsEntry>,
+    refreshing: HashSet<String>,
+}
+
+struct ReaskPartsEntry {
+    epoch: u64,
+    built: std::time::Instant,
+    total_size: u64,
+    /// `None`: the download has no `.part` on disk.
+    parts: Option<Vec<bool>>,
+}
+
+/// Refresh age for an entry. Parts a paused download already has stay valid
+/// (the epoch covers un-verification), so an older bitmap can only
+/// under-report, which is harmless; this bounds how far.
+const REASK_PARTS_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_REASK_PARTS_ENTRIES: usize = 1024;
+
+enum CachedReaskParts {
+    Fresh(Option<Vec<bool>>),
+    Aging(Option<Vec<bool>>),
+    Unknown,
+}
+
+fn reask_parts_cache() -> &'static parking_lot::Mutex<ReaskPartsCache> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<ReaskPartsCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn cached_reask_parts(transfer_id: &str, total_size: u64) -> CachedReaskParts {
+    let epoch = ed2k::part_tracker::verification_epoch();
+    let cache = reask_parts_cache().lock();
+    match cache.entries.get(transfer_id) {
+        Some(entry) if entry.epoch == epoch && entry.total_size == total_size => {
+            if entry.built.elapsed() < REASK_PARTS_REFRESH_AFTER {
+                CachedReaskParts::Fresh(entry.parts.clone())
+            } else {
+                CachedReaskParts::Aging(entry.parts.clone())
+            }
+        }
+        _ => CachedReaskParts::Unknown,
+    }
+}
+
+fn remember_reask_parts(transfer_id: &str, total_size: u64, epoch: u64, parts: Option<&[bool]>) {
+    let mut cache = reask_parts_cache().lock();
+    if !cache.entries.contains_key(transfer_id) && cache.entries.len() >= MAX_REASK_PARTS_ENTRIES {
+        if let Some(oldest) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.built)
+            .map(|(id, _)| id.clone())
+        {
+            cache.entries.remove(&oldest);
+        }
+    }
+    cache.entries.insert(
+        transfer_id.to_string(),
+        ReaskPartsEntry {
+            epoch,
+            built: std::time::Instant::now(),
+            total_size,
+            parts: parts.map(<[bool]>::to_vec),
+        },
+    );
+}
+
+/// Rebuild one entry from disk on the blocking pool; at most one rebuild per
+/// transfer is in flight, however many reasks arrive for it.
+fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: PathBuf) {
+    if !reask_parts_cache()
+        .lock()
+        .refreshing
+        .insert(transfer_id.clone())
+    {
+        return;
+    }
+    struct RefreshDone(String);
+    impl Drop for RefreshDone {
+        fn drop(&mut self) {
+            reask_parts_cache().lock().refreshing.remove(&self.0);
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        let _done = RefreshDone(transfer_id.clone());
+        let epoch = ed2k::part_tracker::verification_epoch();
+        let parts = part_path.exists().then(|| {
+            ed2k::part_tracker::PartTracker::new(total_size, &part_path).serveable_parts()
+        });
+        remember_reask_parts(&transfer_id, total_size, epoch, parts.as_deref());
+    });
+}
+
 /// Panic-isolating wrapper around [`handle_udp_packet_inner`]. Untrusted
 /// network packets are the prime adversarial surface, so a panic here must be
 /// contained rather than allowed to kill the network event loop.
@@ -249,36 +354,54 @@ pub(super) async fn handle_udp_packet_inner(
                         {
                             return None;
                         }
-                        let part_path = PathBuf::from(&settings.download_folder)
-                            .join("Temp")
-                            .join(format!("{}.part", t.id));
-                        if !part_path.exists() {
-                            return None;
-                        }
-                        Some((t.id.clone(), t.total_size, part_path))
+                        Some((t.id.clone(), t.total_size))
                     })
                 } else {
                     None
                 };
-                let partial_file = if let Some((transfer_id, total_size, part_path)) =
-                    partial_candidate
-                {
+                let partial_file = if let Some((transfer_id, total_size)) = partial_candidate {
+                    // Before the read, so a clear that lands during it leaves
+                    // the cached copy already stale.
+                    let epoch = ed2k::part_tracker::verification_epoch();
                     // An active download already holds its tracker in memory, so
-                    // ask that first. Rebuilding one from `.part.met` put a disk
-                    // round trip inside the event loop for every reask a peer
-                    // sent, and the recv arm drains up to 20 datagrams per turn
-                    // before it returns to `select!`.
+                    // ask that first. Nothing on this path touches the disk: the
+                    // recv arm drains up to 20 datagrams per turn before it
+                    // returns to `select!`, and anyone who knows a hash we
+                    // advertise as partial can send them.
                     match udp_reask_serveable_parts(state, &transfer_id).await {
-                        Some(parts) => Some((total_size, parts)),
-                        // Paused or queued: no live tracker, so fall back to the
-                        // sidecar on the blocking pool.
-                        None => tokio::task::spawn_blocking(move || {
-                            let tracker =
-                                ed2k::part_tracker::PartTracker::new(total_size, &part_path);
-                            (total_size, tracker.serveable_parts())
-                        })
-                        .await
-                        .ok(),
+                        Some(parts) => {
+                            remember_reask_parts(&transfer_id, total_size, epoch, Some(&parts));
+                            Some((total_size, parts))
+                        }
+                        // Paused or queued: no live tracker, so answer from the
+                        // cached bitmap and refresh it on the blocking pool.
+                        None => {
+                            let lookup = cached_reask_parts(&transfer_id, total_size);
+                            if !matches!(lookup, CachedReaskParts::Fresh(_)) {
+                                spawn_reask_parts_refresh(
+                                    transfer_id.clone(),
+                                    total_size,
+                                    PathBuf::from(&settings.download_folder)
+                                        .join("Temp")
+                                        .join(format!("{transfer_id}.part")),
+                                );
+                            }
+                            match lookup {
+                                CachedReaskParts::Fresh(parts)
+                                | CachedReaskParts::Aging(parts) => {
+                                    parts.map(|parts| (total_size, parts))
+                                }
+                                // Silence rather than a guess: a wrong "not
+                                // found" makes the peer drop us as a source,
+                                // while an unanswered reask is simply retried.
+                                CachedReaskParts::Unknown => {
+                                    debug!(
+                                        "UDP reask from {from} for {hash_hex}: no cached part map yet; not answering"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                     }
                 } else {
                     None
@@ -2416,28 +2539,48 @@ pub(super) async fn handle_udp_packet_inner(
             // comment that is nothing but formatting characters is not stored
             // as a blank one.
             note_comment = crate::security::sanitize_remote_text(&note_comment, 4096);
-            if note_rating > 0 || !note_comment.is_empty() {
-                let hash_hex = target.to_hex();
-                let publisher_id = sender_id.to_hex();
-                use ed2k::comments::rating_name;
-                debug!(
-                    "Received peer note for {}: rating={} ({})",
-                    hash_hex,
-                    note_rating,
-                    rating_name(note_rating)
-                );
-                state.comment_manager.write().await.add_peer_comment(
-                    &hash_hex,
-                    publisher_id,
-                    note_rating,
-                    note_comment,
-                    1,
-                );
-            }
             let tags_owned = tags.clone();
             let load = state
                 .dht_store
                 .store_notes_entry(&target, sender_id, tags_owned);
+            // Storing for the DHT is our duty as a node near `target`; showing
+            // the note in our own comment UI is not. Only files we share or are
+            // downloading have a comment view, and only a note the DHT store
+            // actually kept has passed its per-file and byte caps — anything
+            // else here let any peer fill the comment store for the session.
+            let stored = !state
+                .dht_store
+                .search_notes_page(&target, 0, 1, |id, _| *id == sender_id)
+                .is_empty();
+            if stored && (note_rating > 0 || !note_comment.is_empty()) {
+                if let Some(source_ip) = from_ip_v4(from) {
+                    let hash_hex = hex::encode(kad_id_to_md4_bytes(&target));
+                    let shared = local_index.read().await.get_by_hash(&hash_hex).is_some();
+                    let relevant = shared || {
+                        let mgr = transfer_manager.read().await;
+                        mgr.active.values().chain(mgr.queue.iter()).any(|t| {
+                            t.direction == TransferDirection::Download
+                                && t.file_hash.eq_ignore_ascii_case(&hash_hex)
+                        })
+                    };
+                    if relevant {
+                        use ed2k::comments::rating_name;
+                        debug!(
+                            "Received peer note for {}: rating={} ({})",
+                            hash_hex,
+                            note_rating,
+                            rating_name(note_rating)
+                        );
+                        state.comment_manager.write().await.add_kad_note(
+                            &hash_hex,
+                            source_ip,
+                            sender_id.to_hex(),
+                            note_rating,
+                            note_comment,
+                        );
+                    }
+                }
+            }
             let res = KadMessage::PublishRes {
                 target,
                 load,
@@ -3024,6 +3167,77 @@ pub(super) async fn handle_udp_packet_inner(
         KadMessage::IgnoredLegacy { opcode } => {
             // Match eMule behavior: silently ignore deprecated Kad1 opcodes.
             debug!("Ignoring deprecated Kad1 opcode 0x{opcode:02X} from {from}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod udp_reask_cache_tests {
+    use super::*;
+
+    fn unique_id(label: &str) -> String {
+        format!("udp-reask-{label}-{}", rand::random::<u64>())
+    }
+
+    #[test]
+    fn udp_reask_cache_serves_only_entries_built_at_the_current_epoch() {
+        let id = unique_id("epoch");
+        assert!(matches!(cached_reask_parts(&id, 100), CachedReaskParts::Unknown));
+
+        // Other tests bump the process-wide epoch concurrently; retry until one
+        // round runs without a bump in the middle.
+        let (epoch, lookup) = loop {
+            let epoch = ed2k::part_tracker::verification_epoch();
+            remember_reask_parts(&id, 100, epoch, Some(&[true, false]));
+            let lookup = cached_reask_parts(&id, 100);
+            if ed2k::part_tracker::verification_epoch() == epoch {
+                break (epoch, lookup);
+            }
+        };
+        match lookup {
+            CachedReaskParts::Fresh(Some(parts)) => assert_eq!(parts, vec![true, false]),
+            _ => panic!("an entry built at the current epoch must be served"),
+        }
+        assert!(
+            matches!(cached_reask_parts(&id, 101), CachedReaskParts::Unknown),
+            "a size mismatch is not the same download"
+        );
+
+        remember_reask_parts(&id, 100, epoch.wrapping_sub(1), Some(&[true, true]));
+        assert!(
+            matches!(cached_reask_parts(&id, 100), CachedReaskParts::Unknown),
+            "a bitmap from another epoch may still claim parts since un-verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_reask_refresh_runs_off_the_caller_and_records_a_missing_part() {
+        let id = unique_id("missing");
+        let part_path = std::env::temp_dir().join(format!("{id}.part"));
+        spawn_reask_parts_refresh(id.clone(), 100, part_path.clone());
+        // A second request while one is in flight must not queue another read.
+        spawn_reask_parts_refresh(id.clone(), 100, part_path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match cached_reask_parts(&id, 100) {
+                CachedReaskParts::Fresh(None) => break,
+                CachedReaskParts::Unknown => {
+                    assert!(std::time::Instant::now() < deadline, "refresh never landed");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    // A concurrent epoch bump invalidates a landed entry.
+                    spawn_reask_parts_refresh(
+                        id.clone(),
+                        100,
+                        std::env::temp_dir().join(format!("{id}.part")),
+                    );
+                }
+                _ => panic!("a download with no .part must cache as absent"),
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while reask_parts_cache().lock().refreshing.contains(&id) {
+            assert!(std::time::Instant::now() < deadline, "in-flight marker never cleared");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }

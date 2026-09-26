@@ -19,7 +19,7 @@
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { copyToClipboard, formatCompactCount } from '$lib/utils';
+  import { copyToClipboard, formatClockTime, formatCompactCount, formatNumber } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { toastError } from '$lib/stores/toast';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
@@ -268,7 +268,7 @@
   }
 
   function formatLogTime(at: number): string {
-    return new Date(at).toLocaleTimeString();
+    return formatClockTime(at / 1000);
   }
 
   async function handleConnect(server?: ServerInfo) {
@@ -887,7 +887,7 @@
   <div class="stats-row">
     <div class="stat-card">
       <div class="label">{m.servers_stat_in_list()}</div>
-      <div class="value">{servers.length.toLocaleString()}</div>
+      <div class="value">{formatNumber(servers.length)}</div>
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_connected()}</div>
@@ -898,11 +898,11 @@
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_selected()}</div>
-      <div class="value">{selectionCount.toLocaleString()}</div>
+      <div class="value">{formatNumber(selectionCount)}</div>
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_high_failure()}</div>
-      <div class="value">{failedServerCount.toLocaleString()}</div>
+      <div class="value">{formatNumber(failedServerCount)}</div>
       <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
     </div>
   </div>
@@ -1150,15 +1150,15 @@
             <div class="info-row">
               <span class="info-label">{m.servers_col_users()}</span>
               <span class="info-value">
-                {connectedServer.user_count.toLocaleString()}
+                {formatNumber(connectedServer.user_count)}
                 {#if connectedServer.max_users > 0}
-                  <span class="muted">/ {connectedServer.max_users.toLocaleString()}</span>
+                  <span class="muted">/ {formatNumber(connectedServer.max_users)}</span>
                 {/if}
               </span>
             </div>
             <div class="info-row">
               <span class="info-label">{m.servers_col_files()}</span>
-              <span class="info-value">{connectedServer.file_count.toLocaleString()}</span>
+              <span class="info-value">{formatNumber(connectedServer.file_count)}</span>
             </div>
             {@const perUserLimit = perUserFileLimit(connectedServer)}
             {#if perUserLimit > 0}
@@ -1168,9 +1168,9 @@
               <div class="info-row">
                 <span class="info-label">{m.servers_col_max_files()}</span>
                 <span class="info-value">
-                  {perUserLimit.toLocaleString()}
+                  {formatNumber(perUserLimit)}
                   {#if connectedServer.hard_files > perUserLimit}
-                    <span class="muted">({m.servers_hard_limit({ count: connectedServer.hard_files.toLocaleString() })})</span>
+                    <span class="muted">({m.servers_hard_limit({ count: formatNumber(connectedServer.hard_files) })})</span>
                   {/if}
                 </span>
               </div>

@@ -1,6 +1,9 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
@@ -252,20 +255,122 @@ struct KnownPathEntry {
     modified_at: i64,
 }
 
+/// Copy-on-write map behind [`KnownFileList`], so the periodic save can take
+/// its snapshot on the network event loop in O(1) and do the serialization
+/// and write on the blocking pool.
+///
+/// Values sit behind their own `Arc` as well as the table. A mutation while a
+/// snapshot is alive copies the table of pointers once (no record, path or
+/// hashset is duplicated), then copies only the one value it changes. With a
+/// single-`Arc` table the first counter bump during an in-flight save would
+/// deep-copy the whole catalogue on the loop, which is the cost this avoids.
+struct CowMap<K, V>(Arc<HashMap<K, Arc<V>>>);
+
+impl<K, V> Clone for CowMap<K, V> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+fn unshare<V: Clone>(value: Arc<V>) -> V {
+    Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> CowMap<K, V> {
+    fn new() -> Self {
+        Self(Arc::new(HashMap::new()))
+    }
+
+    fn table_mut(&mut self) -> &mut HashMap<K, Arc<V>> {
+        Arc::make_mut(&mut self.0)
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.0.get(key).map(|value| &**value)
+    }
+
+    fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.0.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.values().map(|value| &**value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|(key, value)| (key, &**value))
+    }
+
+    /// Unshares the table only when `key` is present.
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.0.contains_key(key) {
+            return None;
+        }
+        self.table_mut().get_mut(key).map(Arc::make_mut)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<Arc<V>> {
+        self.table_mut().insert(key, Arc::new(value))
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<Arc<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.0.contains_key(key) {
+            return None;
+        }
+        self.table_mut().remove(key)
+    }
+
+    fn into_owned(self) -> impl Iterator<Item = (K, V)> {
+        unshare(self.0)
+            .into_iter()
+            .map(|(key, value)| (key, unshare(value)))
+    }
+
+    #[cfg(test)]
+    fn shares_table_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct KnownFileList {
-    files: HashMap<[u8; 16], KnownFileRecord>,
-    path_index: HashMap<String, KnownPathEntry>,
+    files: CowMap<[u8; 16], KnownFileRecord>,
+    /// Keyed by `Arc<str>` so unsharing the table after a snapshot copies
+    /// pointers, not every path string.
+    path_index: CowMap<Arc<str>, KnownPathEntry>,
     /// How many `path_index` entries point at each hash.
     ///
     /// Only ever consulted to answer "does another path still reference this
     /// content?", which [`Self::add_or_update`] asks every time a path's hash
     /// changes. Answering it by scanning `path_index` made a library rescan
     /// O(changed x total) — with 100k shared files and 5k modified, half a
-    /// billion comparisons. A count rather than the paths themselves because
-    /// this struct is cloned in full on every periodic save, and duplicating
-    /// 100k path strings to answer a yes/no question is not worth the memory.
-    path_refs: HashMap<[u8; 16], u32>,
+    /// billion comparisons. A count rather than the paths themselves keeps
+    /// the table flat, so unsharing it after a snapshot is one allocation.
+    path_refs: Arc<HashMap<[u8; 16], u32>>,
     dirty: bool,
     dirty_generation: u64,
     authoritative: bool,
@@ -280,9 +385,9 @@ impl KnownFileList {
     /// distinction has to survive into the writer.
     pub fn new() -> Self {
         Self {
-            files: HashMap::new(),
-            path_index: HashMap::new(),
-            path_refs: HashMap::new(),
+            files: CowMap::new(),
+            path_index: CowMap::new(),
+            path_refs: Arc::new(HashMap::new()),
             dirty: false,
             dirty_generation: 0,
             authoritative: false,
@@ -291,9 +396,9 @@ impl KnownFileList {
 
     /// The only way a `path_index` entry is added or replaced, so `path_refs`
     /// cannot drift out of step with it.
-    fn index_path(&mut self, key: String, entry: KnownPathEntry) {
+    fn index_path(&mut self, key: impl Into<Arc<str>>, entry: KnownPathEntry) {
         let hash = entry.hash;
-        if let Some(previous) = self.path_index.insert(key, entry) {
+        if let Some(previous) = self.path_index.insert(key.into(), entry) {
             if previous.hash != hash {
                 self.release_path_ref(&previous.hash);
             } else {
@@ -301,18 +406,28 @@ impl KnownFileList {
                 return;
             }
         }
-        *self.path_refs.entry(hash).or_insert(0) += 1;
+        *Arc::make_mut(&mut self.path_refs).entry(hash).or_insert(0) += 1;
     }
 
     /// Drop one reference to `hash`, forgetting the counter once it reaches
     /// zero so the map stays the size of the content actually indexed.
     fn release_path_ref(&mut self, hash: &[u8; 16]) {
-        if let Some(count) = self.path_refs.get_mut(hash) {
+        if !self.path_refs.contains_key(hash) {
+            return;
+        }
+        let refs = Arc::make_mut(&mut self.path_refs);
+        if let Some(count) = refs.get_mut(hash) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.path_refs.remove(hash);
+                refs.remove(hash);
             }
         }
+    }
+
+    /// An O(1) copy for a background save: every later mutation of `self`
+    /// copies what it touches instead of writing through to the snapshot.
+    pub fn snapshot(&self) -> Self {
+        self.clone()
     }
 
     /// Merge records from a freshly loaded catalog.
@@ -337,9 +452,8 @@ impl KnownFileList {
     /// So: cumulative fields take the larger value, and fields that are either
     /// known or absent take whichever side actually has one.
     pub fn absorb_missing_from(&mut self, other: Self) {
-        for (hash, record) in other.files {
-            if let std::collections::hash_map::Entry::Occupied(mut e) = self.files.entry(hash) {
-                let live = e.get_mut();
+        for (hash, record) in other.files.into_owned() {
+            if let Some(live) = self.files.get_mut(&hash) {
                 // A share-scan that ran before disk load can insert a
                 // rediscovered row with `friends_only = false`. In-memory
                 // winning this would drop a persisted restriction.
@@ -404,8 +518,8 @@ impl KnownFileList {
         }
         // Path index entries for hashes we already had stay as-is; disk-only
         // path mappings for absorbed hashes are already inserted above.
-        for (path_key, entry) in other.path_index {
-            if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&path_key) {
+        for (path_key, entry) in other.path_index.into_owned() {
+            if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&*path_key) {
                 self.index_path(path_key, entry);
             }
         }
@@ -913,7 +1027,7 @@ impl KnownFileList {
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        if let Some(entry) = self.path_index.get(&normalize_path_key(path)) {
+        if let Some(entry) = self.path_index.get(normalize_path_key(path).as_str()) {
             if let Some(record) = self.files.get(&entry.hash) {
                 if entry.size == size && entry.modified_at == mtime {
                     return Some(record);
@@ -1142,7 +1256,10 @@ impl KnownFileList {
         discovered_aich: &str,
         discovered_ember: &str,
     ) -> bool {
-        if let Some(entry) = self.path_index.get(&normalize_path_key(discovered_path)) {
+        if let Some(entry) = self
+            .path_index
+            .get(normalize_path_key(discovered_path).as_str())
+        {
             return entry.hash != *hash
                 || entry.size != discovered_size
                 || entry.modified_at != discovered_mtime
@@ -1180,7 +1297,7 @@ impl KnownFileList {
             // different path casing updates the same entry instead of
             // accumulating a stale duplicate.
             let new_key = normalize_path_key(&new_path);
-            if let Some(old_entry) = self.path_index.get(&new_key) {
+            if let Some(old_entry) = self.path_index.get(new_key.as_str()) {
                 let old_hash = old_entry.hash;
                 if old_hash != hash {
                     // `new_key` is itself one of `old_hash`'s references, so
@@ -1704,13 +1821,19 @@ impl KnownFileList {
     ///
     /// Returns the number of records whose AICH root was cleared.
     pub fn clear_stale_multipart_aich(&mut self) -> usize {
-        let mut cleared = 0usize;
-        for record in self.files.values_mut() {
-            if record.file_size > crate::network::ed2k::hash::PARTSIZE
-                && !record.aich_hash.is_empty()
-            {
+        let stale: Vec<[u8; 16]> = self
+            .files
+            .iter()
+            .filter(|(_, record)| {
+                record.file_size > crate::network::ed2k::hash::PARTSIZE
+                    && !record.aich_hash.is_empty()
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let cleared = stale.len();
+        for hash in &stale {
+            if let Some(record) = self.files.get_mut(hash) {
                 record.aich_hash.clear();
-                cleared += 1;
             }
         }
         if cleared > 0 {
@@ -1904,11 +2027,11 @@ impl KnownFileList {
         buf.write_u8(3)?;
         buf.write_u64::<LittleEndian>(known_mtime_ns)?;
         buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
-        for (norm_key, entry) in &self.path_index {
+        for (norm_key, entry) in self.path_index.iter() {
             // Persist the original-case physical path and its own metadata,
             // not the content record's canonical path/mtime.
             let file_path = if entry.path.is_empty() {
-                norm_key.as_str()
+                &**norm_key
             } else {
                 entry.path.as_str()
             };
@@ -2250,7 +2373,7 @@ mod tests {
         let mut kf = KnownFileList::new();
         kf.parse_known_met(&buf).unwrap();
         for hash in [[0x31; 16], [0x32; 16]] {
-            assert_eq!(kf.files[&hash].file_size, (3u64 << 32) | 0x1000);
+            assert_eq!(kf.files.get(&hash).unwrap().file_size, (3u64 << 32) | 0x1000);
         }
     }
 
@@ -2314,7 +2437,7 @@ mod tests {
                 );
             }
             // No counter outlives the last path that justified it.
-            for (hash, count) in &kf.path_refs {
+            for (hash, count) in kf.path_refs.iter() {
                 assert_ne!(*count, 0, "a zeroed counter was left behind");
                 assert_eq!(*count, scan(kf, hash));
             }
@@ -2359,6 +2482,94 @@ mod tests {
         assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), None);
         assert!(!kf.files.contains_key(&[0x42; 16]));
         agrees(&kf);
+    }
+
+    /// The periodic known.met save snapshots the catalogue on the network
+    /// event loop and writes it on the blocking pool, so the snapshot has to
+    /// be O(1) and later mutations must never write through to it.
+    #[test]
+    fn known_files_snapshot_is_unaffected_by_later_mutation() {
+        fn record(byte: u8, path: &str) -> KnownFileRecord {
+            let mut record = sample_record();
+            record.file_hash = [byte; 16];
+            record.file_path = path.to_string();
+            record.all_time_transferred = 10;
+            record
+        }
+        let (bumped, renamed, untouched, added) = ([1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]);
+        let mut kf = KnownFileList::new();
+        kf.add_or_update(record(1, "C:/Library/bumped.bin"));
+        kf.add_or_update(record(2, "C:/Library/renamed.bin"));
+        kf.add_or_update(record(3, "C:/Library/untouched.bin"));
+        kf.mark_authoritative_for_tests();
+
+        let mut snapshot = kf.snapshot();
+        assert!(snapshot.files.shares_table_with(&kf.files));
+        assert!(snapshot.path_index.shares_table_with(&kf.path_index));
+        assert!(Arc::ptr_eq(&snapshot.path_refs, &kf.path_refs));
+        let generation = snapshot.dirty_generation();
+
+        assert!(kf.add_all_time_transferred(&bumped, 5));
+        kf.find_by_hash_mut(&renamed).unwrap().file_name = "changed.bin".into();
+        kf.add_or_update(record(4, "C:/Library/added.bin"));
+        // Moving a path to other content releases the old hash's reference
+        // and drops its record.
+        kf.add_or_update(record(5, "C:/Library/untouched.bin"));
+
+        assert_eq!(snapshot.find_by_hash(&bumped).unwrap().all_time_transferred, 10);
+        assert_eq!(snapshot.find_by_hash(&renamed).unwrap().file_name, "movie.mkv");
+        assert!(snapshot.find_by_hash(&untouched).is_some());
+        assert!(snapshot.find_by_hash(&added).is_none());
+        assert_eq!(snapshot.file_count(), 3);
+        assert_eq!(snapshot.path_refs.get(&untouched).copied(), Some(1));
+        assert_eq!(snapshot.dirty_generation(), generation);
+        let (size, mtime) = (1024 * 1024, 1_700_000_000);
+        assert!(snapshot
+            .find_by_path_and_meta("C:/Library/added.bin", size, mtime)
+            .is_none());
+        assert!(kf
+            .find_by_path_and_meta("C:/Library/added.bin", size, mtime)
+            .is_some());
+
+        assert_eq!(kf.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+        assert!(kf.find_by_hash(&untouched).is_none());
+        // Unsharing copied the table of pointers, not the records: one the
+        // live list never touched is still the snapshot's allocation.
+        let mut kept = KnownFileList::new();
+        kept.add_or_update(record(6, "C:/Library/kept.bin"));
+        kept.add_or_update(record(7, "C:/Library/other.bin"));
+        let before = kept.snapshot();
+        assert!(kept.add_all_time_transferred(&[7; 16], 1));
+        assert!(!before.files.shares_table_with(&kept.files));
+        assert!(Arc::ptr_eq(
+            before.files.0.get(&[6; 16]).unwrap(),
+            kept.files.0.get(&[6; 16]).unwrap()
+        ));
+
+        // Mutation flows neither way: the snapshot's own save-time edits
+        // (pruning, the dirty flag) stay off the live list.
+        snapshot.find_by_hash_mut(&bumped).unwrap().all_time_transferred = 99;
+        assert_eq!(kf.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-snapshot-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let snapshot = kf.snapshot();
+        kf.add_or_update(record(8, "C:/Library/late.bin"));
+        let mut writer = snapshot;
+        writer.save(&path).unwrap();
+        let reloaded = KnownFileList::load_checked(&path).unwrap();
+        assert!(reloaded.find_by_hash(&added).is_some());
+        assert!(
+            reloaded.find_by_hash(&[8; 16]).is_none(),
+            "a record added after the snapshot must not reach its save"
+        );
+        assert_eq!(reloaded.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

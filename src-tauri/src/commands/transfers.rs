@@ -127,6 +127,27 @@ pub(crate) fn emit_transfer_status(
     );
 }
 
+/// One `transfer-status-batch` event for a batch command instead of a
+/// `transfer-status` per row. Carries the same `{id, status}` items.
+pub(crate) fn emit_transfer_statuses(app: &tauri::AppHandle, statuses: &[(String, TransferStatus)]) {
+    if statuses.is_empty() {
+        return;
+    }
+    let items: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|(id, status)| {
+            serde_json::json!({
+                "id": id,
+                "status": transfer_status_key(status),
+            })
+        })
+        .collect();
+    let _ = app.emit(
+        "transfer-status-batch",
+        serde_json::json!({ "items": items }),
+    );
+}
+
 /// Persist a transfer before exposing it to the network worker or UI.
 ///
 /// A transfer without a durable row is unsafe to start: after a restart the
@@ -1074,6 +1095,7 @@ fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn pause_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
@@ -1094,6 +1116,11 @@ pub async fn pause_transfers_batch(
         }
         manager.pause_and_promote_many(&transfer_ids)
     };
+    let statuses: Vec<(String, TransferStatus)> = paused
+        .iter()
+        .map(|id| (id.clone(), TransferStatus::Paused))
+        .collect();
+    emit_transfer_statuses(&app, &statuses);
     persist_transfer_statuses(
         &state,
         paused
@@ -1135,6 +1162,7 @@ pub async fn pause_transfers_batch(
 
 #[tauri::command]
 pub async fn resume_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
@@ -1152,6 +1180,7 @@ pub async fn resume_transfers_batch(
         let mut manager = state.transfer_manager.write().await;
         manager.resume_many(&transfer_ids, true)
     };
+    emit_transfer_statuses(&app, &outcome.statuses);
     persist_transfer_statuses(
         &state,
         outcome
@@ -1820,6 +1849,19 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
     Ok(manager.get_all())
 }
 
+/// What changed since the caller's last answer, for the Transfers poll: only
+/// rows whose payload differs, the ids that left, and the revision to pass
+/// next time. `since: 0` (or a revision from another run) returns every row.
+#[tauri::command]
+pub async fn get_transfers_since(
+    state: tauri::State<'_, AppState>,
+    epoch: Option<u64>,
+    since: u64,
+) -> Result<crate::sharing::manager::TransferDelta, String> {
+    let manager = state.transfer_manager.read().await;
+    Ok(manager.get_transfers_since(epoch, since))
+}
+
 /// Chunk map and part counters for one download, for the "File Details"
 /// window. Read on demand rather than carried on every transfers poll, because
 /// a per-part bitmap on every tick would be paid for by every user who never
@@ -2169,9 +2211,11 @@ pub async fn pause_all_transfers(
         (paused, pause_ids)
     };
     // Immediate UI feedback for every paused row (see pause_transfer).
-    for id in &paused {
-        emit_transfer_status(&app, id, &TransferStatus::Paused);
-    }
+    let statuses: Vec<(String, TransferStatus)> = paused
+        .iter()
+        .map(|id| (id.clone(), TransferStatus::Paused))
+        .collect();
+    emit_transfer_statuses(&app, &statuses);
     persist_transfer_statuses(
         &state,
         paused
@@ -2231,9 +2275,7 @@ pub async fn resume_all_transfers(
         .collect();
     // Immediate UI feedback: flip every resumed row off Paused/Stopped now
     // (see resume_transfer) rather than waiting for the next poll.
-    for (id, status) in &resumed {
-        emit_transfer_status(&app, id, status);
-    }
+    emit_transfer_statuses(&app, &resumed);
     persist_transfer_statuses(
         &state,
         resumed

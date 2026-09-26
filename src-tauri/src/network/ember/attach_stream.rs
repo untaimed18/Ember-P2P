@@ -30,6 +30,241 @@ use super::transfer::HashTree;
 /// a task and a file handle for the life of the process.
 const ATTACH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long the receiver waits for the sender's status byte.
+///
+/// Longer than [`ATTACH_IO_TIMEOUT`] because the sender has to have the file's
+/// hash tree before it can answer, and the first stream for a file reads all of
+/// it — up to 2 GiB — to get one. The status byte has no "still hashing" value
+/// a receiver already in the field would accept (an unknown byte is `Corrupt`,
+/// which is not retried), so the wait moves here instead. The sender keeps the
+/// tree, so a retry after a timeout on either side answers at once.
+pub const ATTACH_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The least a stream waits for the status byte once a fetch has spent its
+/// [`ATTACH_STATUS_TIMEOUT`]. Short, so a sender that never answers holds a
+/// receive slot for one long wait rather than one per attempt.
+pub const ATTACH_RETRY_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Hash trees kept for files being served. A tree is `CHUNK_SIZE`-granular, so
+/// even a 2 GiB file's is 256 KiB.
+const HASH_CACHE_MAX: usize = 16;
+
+/// A cached tree nobody has asked for in this long is dropped. Past a grant's
+/// lifetime nothing will ask again, and a tree that outlives the bytes it
+/// describes is only ever a wrong answer.
+const HASH_CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// What identifies the bytes a tree was computed over, as far as the file
+/// system will say without reading them. Revalidated on every stream, from
+/// the handle that stream then serves from.
+///
+/// Not proof: a same-size rewrite in place that leaves every one of these
+/// alone (a coarse-timestamp volume, a memory-mapped write, a tool that
+/// restores the time) still matches. [`serve_attachment`] rehashes once on a
+/// root mismatch rather than trusting the cache over the grant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileStamp {
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    /// Volume and file id of the open handle, so a replacement renamed into
+    /// place under the same name, size and timestamp is still a different file.
+    object: (u64, u64),
+    /// A second clock where the platform has one: the inode change time on
+    /// Unix, which a timestamp-restoring tool cannot set back, and the
+    /// creation time on Windows.
+    changed: u64,
+}
+
+impl FileStamp {
+    fn of(path: &std::path::Path, file: &std::fs::File) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        let object = crate::security::filesystem::opened_file_identity(file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            object: (object.volume_serial, object.file_id),
+            changed: change_clock(&meta),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn change_clock(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime() as u64).wrapping_mul(1_000_000_000).wrapping_add(meta.ctime_nsec() as u64)
+}
+
+#[cfg(windows)]
+fn change_clock(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn change_clock(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+type HashOutcome = Option<Result<std::sync::Arc<HashTree>, String>>;
+
+enum HashSlot {
+    /// One job per file, however many streams are waiting on it — a receiver
+    /// retrying while the first hash is still running joins it rather than
+    /// starting another read of the whole file.
+    Hashing(tokio::sync::watch::Receiver<HashOutcome>),
+    Ready {
+        tree: std::sync::Arc<HashTree>,
+        used: std::time::Instant,
+    },
+}
+
+fn hash_cache() -> &'static std::sync::Mutex<std::collections::HashMap<FileStamp, HashSlot>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<FileStamp, HashSlot>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+enum HashLookup {
+    Ready(std::sync::Arc<HashTree>),
+    Wait(tokio::sync::watch::Receiver<HashOutcome>),
+    /// Nobody is hashing this file; the caller now owns the job.
+    Start(
+        tokio::sync::watch::Sender<HashOutcome>,
+        tokio::sync::watch::Receiver<HashOutcome>,
+    ),
+}
+
+fn lookup_hash(stamp: &FileStamp) -> HashLookup {
+    let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    match cache.get_mut(stamp) {
+        Some(HashSlot::Ready { tree, used })
+            if now.saturating_duration_since(*used) < HASH_CACHE_IDLE =>
+        {
+            *used = now;
+            return HashLookup::Ready(tree.clone());
+        }
+        Some(HashSlot::Hashing(rx)) => return HashLookup::Wait(rx.clone()),
+        _ => {}
+    }
+    // Every other entry for the same path is a version of the file that is no
+    // longer on disk.
+    cache.retain(|key, _| key.path != stamp.path);
+    let now = std::time::Instant::now();
+    cache.retain(|_, slot| match slot {
+        HashSlot::Ready { used, .. } => now.saturating_duration_since(*used) < HASH_CACHE_IDLE,
+        HashSlot::Hashing(_) => true,
+    });
+    if cache.len() >= HASH_CACHE_MAX {
+        let oldest = cache
+            .iter()
+            .filter_map(|(key, slot)| match slot {
+                HashSlot::Ready { used, .. } => Some((key.clone(), *used)),
+                HashSlot::Hashing(_) => None,
+            })
+            .min_by_key(|(_, used)| *used)
+            .map(|(key, _)| key);
+        if let Some(key) = oldest {
+            cache.remove(&key);
+        }
+    }
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    cache.insert(stamp.clone(), HashSlot::Hashing(rx.clone()));
+    HashLookup::Start(tx, rx)
+}
+
+/// Hash the file `stamp` names and publish the result. Blocking: a read of the
+/// whole file.
+fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>) {
+    let outcome = hash_stamped_file(&stamp);
+    #[cfg(test)]
+    tests::note_hashed(&stamp.path);
+    let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    match &outcome {
+        Ok(tree) => {
+            cache.insert(
+                stamp,
+                HashSlot::Ready {
+                    tree: tree.clone(),
+                    used: std::time::Instant::now(),
+                },
+            );
+        }
+        // Not cached: the next stream tries again, and the file may be back.
+        Err(_) => {
+            cache.remove(&stamp);
+        }
+    }
+    drop(cache);
+    let _ = tx.send(Some(outcome));
+}
+
+fn hash_stamped_file(stamp: &FileStamp) -> Result<std::sync::Arc<HashTree>, String> {
+    let file = std::fs::File::open(&stamp.path).map_err(|e| e.to_string())?;
+    if FileStamp::of(&stamp.path, &file).map_err(|e| e.to_string())? != *stamp {
+        return Err("attachment changed before it could be hashed".into());
+    }
+    let tree = HashTree::from_reader(std::io::BufReader::new(&file)).map_err(|e| e.to_string())?;
+    // A write that landed mid-read leaves a tree of neither version.
+    if FileStamp::of(&stamp.path, &file).map_err(|e| e.to_string())? != *stamp {
+        return Err("attachment changed while it was being hashed".into());
+    }
+    Ok(std::sync::Arc::new(tree))
+}
+
+/// Drop `tree` from the cache if it is still what `stamp` maps to, so the next
+/// lookup hashes the file again.
+fn forget_cached_tree(stamp: &FileStamp, tree: &std::sync::Arc<HashTree>) {
+    let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(
+        cache.get(stamp),
+        Some(HashSlot::Ready { tree: held, .. }) if std::sync::Arc::ptr_eq(held, tree)
+    ) {
+        cache.remove(stamp);
+    }
+}
+
+/// The hash tree for the file `stamp` describes: from the cache, from a job
+/// already running, or from a new job this call starts. The flag is true for a
+/// tree that came straight from the cache, which is the only kind worth
+/// doubting.
+///
+/// The job is detached from the caller. A stream whose receiver gave up while
+/// it waited does not take the work with it, which is what makes the
+/// receiver's retry cheap.
+async fn attachment_tree(stamp: FileStamp) -> Result<(std::sync::Arc<HashTree>, bool), String> {
+    let mut rx = match lookup_hash(&stamp) {
+        HashLookup::Ready(tree) => return Ok((tree, true)),
+        HashLookup::Wait(rx) => rx,
+        HashLookup::Start(tx, rx) => {
+            tokio::task::spawn_blocking(move || run_hash_job(stamp, tx));
+            rx
+        }
+    };
+    let outcome = rx
+        .wait_for(|outcome| outcome.is_some())
+        .await
+        .map_err(|_| "attachment hash job went away".to_string())?
+        .clone();
+    outcome
+        .unwrap_or_else(|| Err("attachment hash job went away".into()))
+        .map(|tree| (tree, false))
+}
+
+/// Start hashing a file we are about to serve, so the stream that asks for it
+/// does not have to wait. Blocking: call it from the blocking pool.
+pub fn prewarm_attachment_hash(path: &std::path::Path) {
+    let Ok(stamp) = std::fs::File::open(path).and_then(|file| FileStamp::of(path, &file)) else {
+        return;
+    };
+    if let HashLookup::Start(tx, _rx) = lookup_hash(&stamp) {
+        run_hash_job(stamp, tx);
+    }
+}
+
 /// Bytes the sender writes between checks of the upload cap.
 const ATTACH_SEND_SLICE: usize = 16 * 1024;
 
@@ -184,42 +419,67 @@ where
         anyhow::bail!("attachment resume cursor past the end of the file");
     }
 
-    // Re-hashed per stream rather than cached. The file lives outside the
-    // library and outside our control: the user may have replaced it between
-    // the offer and the dial, and serving new bytes under the old root would
-    // fail the recipient's per-chunk check anyway. Hashing first means we
-    // notice here and say so, instead of streaming a file that cannot verify.
+    // The file lives outside the library and outside our control: the user may
+    // have replaced it between the offer and the dial, and serving new bytes
+    // under the old root would fail the recipient's per-chunk check anyway.
+    // Checking first means we notice here and say so, instead of streaming a
+    // file that cannot verify.
     //
-    // On the blocking pool: this is a read of the whole file, up to 2 GiB, and
-    // it runs from the QUIC accept loop. Done inline it would pin a runtime
-    // worker for seconds, stalling every other task scheduled on it.
-    let hashed = {
+    // The check is the tree's root against the grant's, and the tree comes
+    // from `attachment_tree`, keyed on what this handle's metadata says the
+    // file is. Only a file that has changed since it was last hashed is read
+    // in full again; before, every stream — every retry included — re-read up
+    // to 2 GiB before answering at all.
+    let opened = {
         let path = path.clone();
-        tokio::task::spawn_blocking(move || -> std::io::Result<HashTree> {
+        tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, FileStamp)> {
             let file = std::fs::File::open(&path)?;
-            HashTree::from_reader(std::io::BufReader::new(file))
+            let stamp = FileStamp::of(&path, &file)?;
+            Ok((file, stamp))
         })
         .await
     };
-    let tree = match hashed {
-        Ok(Ok(tree)) if tree.file_size == size && tree.root_hash == root => tree,
-        Ok(Ok(_)) => {
-            refuse(send, AttachStreamStatus::SourceGone).await?;
-            anyhow::bail!("attachment on disk no longer matches the offer");
-        }
+    let (file, stamp) = match opened {
+        Ok(Ok(opened)) => opened,
         Ok(Err(e)) => {
             refuse(send, AttachStreamStatus::SourceGone).await?;
             return Err(e.into());
         }
         Err(e) => {
             refuse(send, AttachStreamStatus::SourceGone).await?;
-            anyhow::bail!("attachment hash task failed: {e}");
+            anyhow::bail!("attachment open task failed: {e}");
+        }
+    };
+    if stamp.size != size {
+        refuse(send, AttachStreamStatus::SourceGone).await?;
+        anyhow::bail!("attachment on disk no longer matches the offer");
+    }
+    let matches = |tree: &HashTree| tree.file_size == size && tree.root_hash == root;
+    let mut hashed = attachment_tree(stamp.clone()).await;
+    // A cached tree that disagrees with the grant may be describing bytes the
+    // stamp could not tell apart from the current ones. One fresh read settles
+    // it before the file is refused.
+    if let Ok((tree, true)) = &hashed {
+        if !matches(tree) {
+            forget_cached_tree(&stamp, tree);
+            hashed = attachment_tree(stamp).await;
+        }
+    }
+    let tree = match hashed {
+        Ok((tree, _)) if matches(&tree) => tree,
+        Ok(_) => {
+            refuse(send, AttachStreamStatus::SourceGone).await?;
+            anyhow::bail!("attachment on disk no longer matches the offer");
+        }
+        Err(e) => {
+            refuse(send, AttachStreamStatus::SourceGone).await?;
+            anyhow::bail!("attachment could not be hashed: {e}");
         }
     };
 
     let info = AttachFileInfo {
         size,
-        chunk_hashes: tree.chunk_hashes,
+        chunk_hashes: tree.chunk_hashes.clone(),
     };
     tokio::time::timeout(
         ATTACH_IO_TIMEOUT,
@@ -227,9 +487,10 @@ where
     )
     .await??;
 
-    // `tokio::fs`, which moves each read onto the blocking pool for the same
-    // reason as the hash above.
-    let mut handle = tokio::fs::File::open(&path).await?;
+    // The handle the stamp was read from, so the bytes served are the file the
+    // tree was checked against. `tokio::fs` moves each read onto the blocking
+    // pool.
+    let mut handle = tokio::fs::File::from_std(file);
     let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
     let mut sent = 0u64;
     let mut position = request.start_chunk as u64 * ATTACH_CHUNK_SIZE as u64;
@@ -289,8 +550,17 @@ where
 /// Resumes from whatever is already in `part`, rounded down to a whole verified
 /// chunk — a partial chunk is discarded rather than trusted, because nothing has
 /// checked it yet.
+///
+/// Waits at most `status_wait` for the sender's first byte, and adds the time
+/// it actually spent waiting to `status_waited` — whatever the outcome, and
+/// nothing if the stream failed before the request was sent. A caller spreads
+/// one [`ATTACH_STATUS_TIMEOUT`] across a fetch's streams with it: a stream
+/// that dropped early leaves the next one nearly the whole wait for the
+/// sender's first hash, and one that waited it out leaves the rest only
+/// [`ATTACH_RETRY_STATUS_TIMEOUT`], since by then the sender has the tree or
+/// is still building it and a retry joins that job.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_attachment<R, W, P>(
+pub async fn fetch_attachment_waiting<R, W, P>(
     recv: &mut R,
     send: &mut W,
     xfer_id: &[u8; 16],
@@ -299,6 +569,8 @@ pub async fn fetch_attachment<R, W, P>(
     root: &[u8; 32],
     part: std::fs::File,
     mut on_progress: P,
+    status_wait: std::time::Duration,
+    status_waited: &mut std::time::Duration,
 ) -> Result<FetchOutcome, FetchError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -331,7 +603,10 @@ where
     // One byte first, so a refusal is a refusal rather than a short read of a
     // header that was never coming.
     let mut status_byte = [0u8; 1];
-    tokio::time::timeout(ATTACH_IO_TIMEOUT, recv.read_exact(&mut status_byte)).await??;
+    let waiting = std::time::Instant::now();
+    let answered = tokio::time::timeout(status_wait, recv.read_exact(&mut status_byte)).await;
+    *status_waited += waiting.elapsed();
+    answered??;
     let status = AttachStreamStatus::from_byte(status_byte[0]).ok_or_else(|| {
         FetchError::Corrupt("attachment peer sent an unknown status".into())
     })?;
@@ -409,9 +684,230 @@ use tokio::io::AsyncSeekExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_attachment<R, W, P>(
+        recv: &mut R,
+        send: &mut W,
+        xfer_id: &[u8; 16],
+        capability: &[u8; 32],
+        size: u64,
+        root: &[u8; 32],
+        part: std::fs::File,
+        on_progress: P,
+    ) -> Result<FetchOutcome, FetchError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+        P: FnMut(u64, u64),
+    {
+        fetch_attachment_waiting(
+            recv,
+            send,
+            xfer_id,
+            capability,
+            size,
+            root,
+            part,
+            on_progress,
+            ATTACH_STATUS_TIMEOUT,
+            &mut std::time::Duration::default(),
+        )
+        .await
+    }
     use super::super::attach::derive_attach_capability;
     use ed25519_dalek::SigningKey;
     use std::path::Path;
+
+    static HASHED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn note_hashed(path: &Path) {
+        HASHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_path_buf());
+    }
+
+    fn times_hashed(path: &Path) -> usize {
+        HASHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.as_path() == path)
+            .count()
+    }
+
+    /// Serve `source` once to an honest receiver and return what it got.
+    async fn serve_once(
+        source: &Path,
+        size: u64,
+        root: [u8; 32],
+        xfer_id: [u8; 16],
+    ) -> Result<FetchOutcome, FetchError> {
+        let (a_seed, a_pub, b_seed, b_pub) = pair();
+        let cap_sender = derive_attach_capability(&a_seed, &b_pub, &xfer_id).expect("cap");
+        let cap_recv = derive_attach_capability(&b_seed, &a_pub, &xfer_id).expect("cap");
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
+        let served = source.to_path_buf();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), size, root, cap_sender)),
+                |_, _, _| true,
+                None,
+            )
+            .await
+        });
+        let part = temp_path("part-cache");
+        let fetched = fetch_attachment(
+            &mut client_r,
+            &mut client_w,
+            &xfer_id,
+            &cap_recv,
+            size,
+            &root,
+            open_part(&part),
+            |_, _| {},
+        )
+        .await;
+        let _ = server.await;
+        let _ = std::fs::remove_file(&part);
+        fetched
+    }
+
+    /// Only the first stream for a file reads all of it. A retry, or a second
+    /// stream of the same grant, is answered from the tree the first one built.
+    #[tokio::test]
+    async fn a_second_stream_for_the_same_file_does_not_rehash_it() {
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE + 99).map(|i| (i % 211) as u8).collect();
+        let source = temp_path("src-cached");
+        std::fs::write(&source, &data).expect("write");
+        let root = HashTree::from_data(&data).root_hash;
+        let size = data.len() as u64;
+
+        for _ in 0..2 {
+            let outcome = serve_once(&source, size, root, [12u8; 16]).await.expect("fetch");
+            assert!(outcome.complete);
+        }
+        assert_eq!(times_hashed(&source), 1);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// The cache is keyed on what the file system says the file is, so a file
+    /// rewritten after it was hashed is noticed, not served under the old tree.
+    #[tokio::test]
+    async fn a_file_rewritten_after_it_was_hashed_is_not_served_from_the_cache() {
+        let source = temp_path("src-rewritten");
+        std::fs::write(&source, b"first version!").expect("write");
+        let root = HashTree::from_data(b"first version!").root_hash;
+        serve_once(&source, 14, root, [13u8; 16]).await.expect("first serve");
+
+        std::fs::write(&source, b"second version").expect("rewrite");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .and_then(|f| f.set_modified(later))
+            .expect("move mtime");
+
+        let err = serve_once(&source, 14, root, [13u8; 16])
+            .await
+            .expect_err("the rewritten file must not verify against the old root");
+        assert!(err.to_string().contains("SourceGone"), "unexpected error: {err}");
+        assert_eq!(times_hashed(&source), 2, "the new version was hashed afresh");
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// Streams that arrive while a file is still being hashed wait on that job
+    /// rather than each starting another read of the whole file.
+    #[tokio::test]
+    async fn concurrent_streams_share_one_hash_job() {
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 3).map(|i| (i % 7) as u8).collect();
+        let source = temp_path("src-shared");
+        std::fs::write(&source, &data).expect("write");
+        let stamp = FileStamp::of(&source, &std::fs::File::open(&source).expect("open"))
+            .expect("stamp");
+        let (a, b) = tokio::join!(attachment_tree(stamp.clone()), attachment_tree(stamp));
+        let expected = HashTree::from_data(&data).root_hash;
+        assert_eq!(a.expect("first").0.root_hash, expected);
+        assert_eq!(b.expect("second").0.root_hash, expected);
+        assert_eq!(times_hashed(&source), 1);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// A same-size rewrite that leaves the stamp alone — here, by putting the
+    /// modification time back — is exactly what the cache cannot see. A grant
+    /// for the new bytes must still be served: the cached tree is doubted once
+    /// before the file is refused.
+    #[tokio::test]
+    async fn a_stale_cached_tree_is_rehashed_before_a_grant_is_refused() {
+        let source = temp_path("src-stale");
+        std::fs::write(&source, b"version one!").expect("write");
+        let original_mtime = std::fs::metadata(&source).expect("meta").modified().expect("mtime");
+        let first_root = HashTree::from_data(b"version one!").root_hash;
+        serve_once(&source, 12, first_root, [15u8; 16]).await.expect("first serve");
+
+        std::fs::write(&source, b"version two!").expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .and_then(|f| f.set_modified(original_mtime))
+            .expect("restore mtime");
+        let second_root = HashTree::from_data(b"version two!").root_hash;
+        let outcome = serve_once(&source, 12, second_root, [16u8; 16])
+            .await
+            .expect("the re-offer of the new bytes is served");
+        assert!(outcome.complete);
+        assert_eq!(times_hashed(&source), 2);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// Idle trees go whether or not the cache is full.
+    #[test]
+    fn an_idle_cached_tree_is_not_served() {
+        let stamp = FileStamp {
+            path: temp_path("idle-entry"),
+            size: 1,
+            modified: None,
+            object: (1, 2),
+            changed: 3,
+        };
+        let stale_use = std::time::Instant::now()
+            .checked_sub(HASH_CACHE_IDLE + std::time::Duration::from_secs(1))
+            .expect("clock far enough along");
+        hash_cache().lock().unwrap().insert(
+            stamp.clone(),
+            HashSlot::Ready {
+                tree: std::sync::Arc::new(HashTree::from_data(b"x")),
+                used: stale_use,
+            },
+        );
+        assert!(matches!(lookup_hash(&stamp), HashLookup::Start(..)));
+        hash_cache().lock().unwrap().remove(&stamp);
+    }
+
+    #[tokio::test]
+    async fn a_prewarmed_file_is_served_without_hashing_again() {
+        let data = b"prewarmed attachment".to_vec();
+        let source = temp_path("src-prewarm");
+        std::fs::write(&source, &data).expect("write");
+        let prewarm = source.clone();
+        tokio::task::spawn_blocking(move || prewarm_attachment_hash(&prewarm))
+            .await
+            .expect("prewarm");
+        let root = HashTree::from_data(&data).root_hash;
+        let outcome = serve_once(&source, data.len() as u64, root, [14u8; 16])
+            .await
+            .expect("fetch");
+        assert!(outcome.complete);
+        assert_eq!(times_hashed(&source), 1);
+        let _ = std::fs::remove_file(&source);
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -711,6 +1207,38 @@ mod tests {
             err.to_string().contains("did not match its hash"),
             "unexpected error: {err}"
         );
+        let _ = std::fs::remove_file(&part);
+    }
+
+    /// A stream that drops before the sender answers has not used up the
+    /// long status wait: only the time actually spent waiting is counted.
+    #[tokio::test]
+    async fn a_stream_dropped_before_the_status_counts_only_the_time_waited() {
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 16);
+        let (server_w, mut client_r) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 7];
+            let _ = server_r.read_exact(&mut request).await;
+            drop(server_w);
+        });
+        let part = temp_path("part-dropped");
+        let mut waited = std::time::Duration::ZERO;
+        let fetched = fetch_attachment_waiting(
+            &mut client_r,
+            &mut client_w,
+            &[17u8; 16],
+            &[0u8; 32],
+            1,
+            &[0u8; 32],
+            open_part(&part),
+            |_, _| {},
+            ATTACH_STATUS_TIMEOUT,
+            &mut waited,
+        )
+        .await;
+        server.await.expect("join");
+        assert!(matches!(fetched, Err(FetchError::Transient(_))));
+        assert!(waited < std::time::Duration::from_secs(5), "waited {waited:?}");
         let _ = std::fs::remove_file(&part);
     }
 

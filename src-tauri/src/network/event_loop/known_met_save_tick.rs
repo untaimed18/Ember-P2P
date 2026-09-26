@@ -51,27 +51,32 @@ pub(in crate::network) async fn on_known_met_save_tick(
             || !state.data_dir.join("known.met").exists())
         && !*known_met_save_in_flight
     {
-        let ownership = state
-            .known_met_save_lock
-            .clone()
-            .lock_owned()
-            .await;
-        let known_path = state.data_dir.join("known.met");
-        let generation = known_files.dirty_generation();
-        let mut snapshot = known_files.clone();
-        let tx = known_met_save_result_tx.clone();
-        *known_met_save_in_flight = true;
-        *known_met_save_started_at = Some(tokio::time::Instant::now());
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let _ownership = ownership;
-                snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
-            .and_then(|r| r);
-            let _ = tx.send(KnownMetSaveResult { generation, result });
-        });
+        // Other writers hold this across their fsync. The catalog stays
+        // dirty, so a skipped tick is just a save two minutes later, where
+        // waiting here stalled the whole event loop behind someone else's disk.
+        match state.known_met_save_lock.clone().try_lock_owned() {
+            Ok(ownership) => {
+                let known_path = state.data_dir.join("known.met");
+                let generation = known_files.dirty_generation();
+                let mut snapshot = known_files.snapshot();
+                let tx = known_met_save_result_tx.clone();
+                *known_met_save_in_flight = true;
+                *known_met_save_started_at = Some(tokio::time::Instant::now());
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
+                        snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
+                    .and_then(|r| r);
+                    let _ = tx.send(KnownMetSaveResult { generation, result });
+                });
+            }
+            Err(_) => {
+                debug!("known.met save lock busy; deferring the periodic save to the next tick");
+            }
+        }
     }
     while let Ok(hs) = aich_set_rx.try_recv() {
         // Only the not-yet-appended queue is bounded; the file is not. A

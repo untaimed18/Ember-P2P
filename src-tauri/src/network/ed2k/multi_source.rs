@@ -6294,7 +6294,7 @@ async fn download_parts_from_source(
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                                 if peer_user_hash != [0u8; 16] {
                                     if let Some(cm) = &credit_mgr {
-                                        cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                     }
                                 }
                             } else {
@@ -7015,7 +7015,7 @@ async fn download_parts_from_source(
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
-                                    cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                    cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                 }
                             }
                             if hello_caps.is_ember && !mesh_discovered_emitted {
@@ -8027,6 +8027,9 @@ async fn download_parts_from_source(
         Mismatch,
         AichNarrowed,
         Unverified,
+        /// The part changed or was verified by another source while this one
+        /// hashed it, so this source's verdict describes bytes that are gone.
+        Superseded,
     }
 
     // Cross-part request pipelining.
@@ -10171,9 +10174,11 @@ async fn download_parts_from_source(
                     // for the duration of the fsync.
                     let snap = {
                         let t = tracker.read().await;
-                        t.snapshot_for_save()
+                        t.periodic_snapshot_for_save(PERIODIC_SAVE_INTERVAL)
                     };
-                    super::part_tracker::save_snapshot_async(snap).await;
+                    if let Some(snap) = snap {
+                        super::part_tracker::save_snapshot_async(snap).await;
+                    }
                     last_periodic_save = std::time::Instant::now();
                 }
             }
@@ -10263,6 +10268,7 @@ async fn download_parts_from_source(
             }
 
             // Verify part hash before marking complete
+            let mut hashed_generation: u64 = 0;
             let part_hash_outcome = {
                 // Copied out under a short read, so the guard drops here.
                 //
@@ -10283,6 +10289,7 @@ async fn download_parts_from_source(
                     let t = tracker.read().await;
                     let (ps, pe) = t.part_range(part_idx);
                     let part_len = (pe - ps) as usize;
+                    hashed_generation = t.part_content_generation(part_idx);
                     drop(t);
 
                     // Read + MD4 in one writer-thread round-trip: the hash
@@ -10295,15 +10302,19 @@ async fn download_parts_from_source(
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                        let part_data = std::sync::Arc::new(part_data);
+                        let (aich_root, aich_leaves) =
+                            super::aich::part_aich_summary_blocking(part_data.clone())
+                                .await
+                                .unwrap_or(([0u8; 20], 0));
                         warn!(
                         "Multi-source part {} hash mismatch from source {}! expected={} got={}, part_aich_root={}, {} AICH leaves",
                         part_idx,
                         _src_idx,
                         hex::encode(expected_hash),
                         hex::encode(actual_hash),
-                        hex::encode(aich_hs.root_hash),
-                        aich_hs.leaf_count(),
+                        hex::encode(aich_root),
+                        aich_leaves,
                     );
 
                         let mut recovery_bytes: Option<Vec<u8>> =
@@ -10381,48 +10392,60 @@ async fn download_parts_from_source(
                             }
 
                             let mut narrowed = false;
-                            if let Some(ref rec) = recovery_bytes {
+                            let mut superseded = false;
+                            if let Some(rec) = recovery_bytes.take() {
                                 if let Some(corrupt) =
-                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                    super::aich::corrupt_blocks_from_aich_recovery_blocking(
                                         master_hash,
                                         rec,
                                         part_idx,
-                                        &part_data,
+                                        part_data.clone(),
                                         part_len,
                                         file_size,
                                     )
+                                    .await
                                 {
                                     if !corrupt.is_empty() {
                                         let mut invalidated = 0u64;
                                         let snap = {
                                             let mut t = tracker.write().await;
-                                            for &bi in &corrupt {
-                                                let rel =
-                                                    bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
-                                                let gs = ps + rel;
-                                                let ge = (gs + super::aich::AICH_BLOCK_SIZE as u64)
-                                                    .min(ps + part_len as u64);
-                                                t.invalidate_range(gs, ge);
-                                                invalidated += ge - gs;
+                                            if t.part_verdict_superseded(part_idx, hashed_generation) {
+                                                superseded = true;
+                                                None
+                                            } else {
+                                                for &bi in &corrupt {
+                                                    let rel = bi as u64
+                                                        * super::aich::AICH_BLOCK_SIZE as u64;
+                                                    let gs = ps + rel;
+                                                    let ge = (gs
+                                                        + super::aich::AICH_BLOCK_SIZE as u64)
+                                                        .min(ps + part_len as u64);
+                                                    t.invalidate_range(gs, ge);
+                                                    invalidated += ge - gs;
+                                                }
+                                                Some(t.snapshot_for_save())
                                             }
-                                            t.snapshot_for_save()
                                         };
-                                        save_snapshot_now(snap, "AICH narrowed").await;
-                                        let _ = progress_tx
-                                            .send((_src_idx, -(invalidated as i64)))
-                                            .await;
-                                        info!(
-                                        "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
-                                        part_idx,
-                                        corrupt.len(),
-                                        invalidated
-                                    );
-                                        narrowed = true;
+                                        if let Some(snap) = snap {
+                                            save_snapshot_now(snap, "AICH narrowed").await;
+                                            let _ = progress_tx
+                                                .send((_src_idx, -(invalidated as i64)))
+                                                .await;
+                                            info!(
+                                            "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
+                                            part_idx,
+                                            corrupt.len(),
+                                            invalidated
+                                        );
+                                            narrowed = true;
+                                        }
                                     }
                                 }
                             }
 
-                            if narrowed {
+                            if superseded {
+                                PartHashOutcome::Superseded
+                            } else if narrowed {
                                 PartHashOutcome::AichNarrowed
                             } else {
                                 if let std::net::IpAddr::V4(v4) = addr.ip() {
@@ -10517,7 +10540,8 @@ async fn download_parts_from_source(
                     let committed = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);
-                        let reopened = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                        let reopened = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps)
+                            || t.part_content_generation(part_idx) != hashed_generation;
                         if reopened {
                             ip_guard.release_locked(part_idx, &mut t);
                             None
@@ -10611,16 +10635,31 @@ async fn download_parts_from_source(
                             .await;
                     }
                 }
+                PartHashOutcome::Superseded => {
+                    {
+                        let mut t = tracker.write().await;
+                        ip_guard.release_locked(part_idx, &mut t);
+                    }
+                    per_part_credit.remove(&part_idx);
+                    info!(
+                        "Multi-source part {part_idx}: another source changed or verified it \
+                         while source {_src_idx} was hashing; discarding this source's verdict"
+                    );
+                    continue;
+                }
                 PartHashOutcome::Mismatch => {
-                    let (ps, pe, snap) = {
+                    let (ps, pe, snap, superseded) = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);
                         // D15: the inner verification block has already sent a
                         // progress correction for this part (using part_len);
                         // don't double-subtract here.
-                        t.mark_incomplete(part_idx);
+                        let superseded = t.part_verdict_superseded(part_idx, hashed_generation);
+                        if !superseded {
+                            t.mark_incomplete(part_idx);
+                        }
                         ip_guard.release_locked(part_idx, &mut t);
-                        (ps, pe, t.snapshot_for_save())
+                        (ps, pe, t.snapshot_for_save(), superseded)
                     };
                     spawn_save_snapshot(snap).await;
                     // D12: drop the per-part credit bucket for THIS part —
@@ -10630,7 +10669,12 @@ async fn download_parts_from_source(
                     // independently).
                     per_part_credit.remove(&part_idx);
                     let _ = progress_tx.try_send((_src_idx, 0i64));
-                    if let Some(ref etx) = event_tx {
+                    if superseded {
+                        info!(
+                            "Multi-source part {part_idx}: another source changed or verified it \
+                             while source {_src_idx} was hashing; not blaming this source"
+                        );
+                    } else if let Some(ref etx) = event_tx {
                         let _ = etx
                             .send(DownloadEvent::PartCorrupted {
                                 file_hash: *file_hash,
@@ -11545,19 +11589,24 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
             // on the wire but may inflate to 10 MiB — roughly 640 MiB resident per
             // connection, multiplied across source slots, on a path the sender
             // reaches by failing a part's MD4. Both limits leave the stream on a
-            // packet boundary, so refusing to buffer more is safe either way.
+            // packet boundary, so giving up on the answer is safe either way.
+            //
+            // The packet just read is buffered before giving up, never
+            // dropped: it is usually a requested data block, and losing it
+            // leaves that range outstanding for the rest of the session. That
+            // overshoots the byte cap by at most one packet.
             const MAX_DEFERRED_PACKETS: usize = 64;
             const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            deferred_packets.push_back((proto, opcode, payload));
             let deferred_bytes: usize = deferred_packets
                 .iter()
                 .map(|(_, _, buffered)| buffered.len())
                 .sum();
             if deferred_packets.len() >= MAX_DEFERRED_PACKETS
-                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+                || deferred_bytes >= MAX_DEFERRED_BYTES
             {
                 return AichAnswerOutcome::NotAvailable;
             }
-            deferred_packets.push_back((proto, opcode, payload));
         }
     };
 
@@ -13159,6 +13208,42 @@ mod packet_framing_tests {
         out.push(opcode);
         out.extend_from_slice(payload);
         out
+    }
+
+    #[tokio::test]
+    async fn aich_wait_keeps_the_packet_that_fills_the_deferred_buffer() {
+        let mut stream = Vec::new();
+        for i in 0..70u8 {
+            stream.extend(frame(0xE3, 0x46, &[i; 8]));
+        }
+        let mut reader = std::io::Cursor::new(stream);
+        let mut deferred = std::collections::VecDeque::new();
+        let outcome =
+            wait_for_aich_recovery_answer_ms(&mut reader, &[0; 16], 0, [0; 20], &mut deferred)
+                .await;
+        assert!(matches!(outcome, AichAnswerOutcome::NotAvailable));
+        assert_eq!(deferred.len(), 64);
+        assert_eq!(deferred.back().map(|p| p.2.clone()), Some(vec![63u8; 8]));
+        let next = read_packet_async_ms(&mut reader).await.unwrap();
+        assert_eq!(next.2, vec![64u8; 8], "nothing was read and discarded");
+    }
+
+    #[tokio::test]
+    async fn aich_wait_keeps_the_packet_that_crosses_the_byte_cap() {
+        let big = vec![0x5A; 1_500_000];
+        let mut stream = Vec::new();
+        for _ in 0..4 {
+            stream.extend(frame(0xE3, 0x46, &big));
+        }
+        let mut reader = std::io::Cursor::new(stream);
+        let mut deferred = std::collections::VecDeque::new();
+        let outcome =
+            wait_for_aich_recovery_answer_ms(&mut reader, &[0; 16], 0, [0; 20], &mut deferred)
+                .await;
+        assert!(matches!(outcome, AichAnswerOutcome::NotAvailable));
+        assert_eq!(deferred.len(), 3, "the third block is buffered, not dropped");
+        let next = read_packet_async_ms(&mut reader).await.unwrap();
+        assert_eq!(next.2.len(), big.len());
     }
 
     #[tokio::test]

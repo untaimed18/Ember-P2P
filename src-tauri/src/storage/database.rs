@@ -308,6 +308,53 @@ pub enum ChannelMemberWrite {
     Refused,
 }
 
+/// Moved by every write to `channel_members` that a cached roster could
+/// observe — a row added, removed, banned, unbanned or made moderator, or a
+/// `last_seen` carried to fresh from stale or from nearly stale (see
+/// [`channel_presence_revived`]) — so a caller holding a copy of a room's
+/// roster can tell whether it is still what the table says. A `last_seen` that
+/// moves well inside the fresh window does not count: nothing a snapshot
+/// answers changes before it expires, and those writes are the commonest
+/// there are.
+///
+/// Per room, hashed into a fixed set of slots: rooms sharing a slot only cost
+/// each other an extra re-read. Process-wide rather than per `Database`, since
+/// there is one store in production and a second (tests) is harmless here.
+static CHANNEL_ROSTER_GENERATIONS: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+fn channel_roster_slot(channel_id: &str) -> &'static std::sync::atomic::AtomicU64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in channel_id.bytes() {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    &CHANNEL_ROSTER_GENERATIONS[(hash % CHANNEL_ROSTER_GENERATIONS.len() as u64) as usize]
+}
+
+/// Must run *after* the write has committed. A reader samples the generation
+/// before it reads the rows, so a bump that lands first lets it cache
+/// pre-write rows under the post-write generation, where nothing would ever
+/// notice they are stale.
+fn bump_channel_roster_generation(channel_id: &str) {
+    channel_roster_slot(channel_id).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// The longest a cached roster may be served before it is read again, whatever
+/// the generation says.
+pub(crate) const CHANNEL_ROSTER_SNAPSHOT_TTL_SECS: i64 = 30;
+
+/// Whether moving a roster row's `last_seen` from `before` to `after` changes
+/// whether it counts as present at any time a snapshot taken now could still
+/// be answering: now, or up to [`CHANNEL_ROSTER_SNAPSHOT_TTL_SECS`] later. A
+/// row about to go stale that is touched without a bump would otherwise read
+/// as absent from a still-valid snapshot until it expired, since the touch
+/// buffer that covered it has been drained by the flush that wrote it.
+fn channel_presence_revived(before: i64, after: i64, now: i64) -> bool {
+    let cutoff = now.saturating_sub(PRESENCE_FRESH_SECS);
+    before < cutoff.saturating_add(CHANNEL_ROSTER_SNAPSHOT_TTL_SECS) && after >= cutoff
+}
+
 /// What the transactional half of a handoff did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelHandoffTransition {
@@ -361,6 +408,9 @@ pub const CHAT_FAILED: i64 = 2;
 /// to someone who never returns is retried on every reconnect forever and
 /// counted as unsent for the life of the database.
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+/// How long a settled `chat_attachments` row (finished, refused, expired,
+/// failed) stays in the transcript before it is deleted.
+const CHAT_ATTACHMENT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// How long an undelivered friend-request withdrawal keeps being retried. Same
 /// ceiling as the chat outbox, for the same reason: the row holds the address of
 /// someone the user has removed, so it must not be kept indefinitely on the
@@ -406,8 +456,25 @@ impl Database {
         let app_dir = paths::ensure_data_dir_with_app(app_handle)
             .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
 
-        let db_path = app_dir.join("ember.db");
-        match Self::open_at(&db_path) {
+        Self::open_for_session(&app_dir.join("ember.db"))
+    }
+
+    /// [`Self::new`] at an explicit path: open for a whole app session,
+    /// replacing a corrupt database and recording the session marker.
+    fn open_for_session(db_path: &std::path::Path) -> anyhow::Result<Self> {
+        let db_path = db_path.to_path_buf();
+        // `PRAGMA quick_check` reads every page of the database, on the main
+        // thread, before the first window exists. What it guards against —
+        // pages torn by a power cut or an OS crash — can only have happened if
+        // the last session never reached its shutdown, so only then is it run.
+        let marker = Self::session_marker_path(&db_path);
+        let unclean = marker.exists();
+        if unclean {
+            tracing::warn!(
+                "The previous session did not shut down cleanly; checking ember.db integrity"
+            );
+        }
+        let opened = match Self::open_with(&db_path, unclean) {
             Ok(db) => Ok(db),
             Err(e) if db_path.exists() && Self::is_corruption_error(&e) => {
                 let backup = Self::backup_corrupt_database(&db_path)?;
@@ -425,14 +492,48 @@ impl Database {
                 Ok(db)
             }
             Err(e) => Err(e),
+        }?;
+        if let Err(error) = std::fs::write(&marker, b"") {
+            tracing::debug!(
+                "Could not record the session marker at {}: {error}",
+                marker.display()
+            );
+        }
+        Ok(opened)
+    }
+
+    /// Present from a successful open until [`Self::mark_clean_shutdown`].
+    /// Named as an `ember.db` variant so the share denylist already covers it.
+    fn session_marker_path(db_path: &std::path::Path) -> std::path::PathBuf {
+        let mut marker = db_path.as_os_str().to_os_string();
+        marker.push(".session");
+        std::path::PathBuf::from(marker)
+    }
+
+    /// Record that this session reached its shutdown, so the next launch can
+    /// skip the full integrity check.
+    pub fn mark_clean_shutdown(&self) {
+        let marker = Self::session_marker_path(&self.path);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                "Could not clear the session marker at {}: {error}",
+                marker.display()
+            ),
         }
     }
 
-    /// Open (or create) a database at an explicit path, running migrations.
+    /// Open (or create) a database at an explicit path, running migrations and
+    /// a full integrity check.
     ///
     /// `pub(crate)` so callers that already know the path can use it without a
     /// Tauri handle, notably the backup round-trip test.
     pub(crate) fn open_at(db_path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::open_with(db_path, true)
+    }
+
+    fn open_with(db_path: &std::path::Path, integrity_check: bool) -> anyhow::Result<Self> {
         // Repair ACLs before SQLite touches the main file or its WAL/SHM
         // sidecars. A prior ACL-hardening bug could leave those sidecars with
         // an empty DACL, in which case `Connection::open` fails before the
@@ -463,9 +564,12 @@ impl Database {
         crate::security::restrict_file_permissions_checked(db_path)?;
         let chat_key = Self::load_or_create_chat_key(db_path, &conn)?;
 
-        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        if !quick_check.eq_ignore_ascii_case("ok") {
-            return Err(CorruptDatabase(quick_check).into());
+        if integrity_check {
+            let quick_check: String =
+                conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if !quick_check.eq_ignore_ascii_case("ok") {
+                return Err(CorruptDatabase(quick_check).into());
+            }
         }
 
         conn.execute_batch(
@@ -2827,6 +2931,9 @@ impl Database {
     ///
     /// A receive that is running is not swept: its expiry is only the offer's,
     /// and the task moving the bytes is what settles it.
+    ///
+    /// Settled rows older than [`CHAT_ATTACHMENT_RETENTION_SECS`] are deleted
+    /// on the same pass; nothing else ever removes a row.
     pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let moved = conn.execute(
@@ -2836,7 +2943,21 @@ impl Database {
                  OR (direction = 'received' AND status = 'awaiting'))",
             rusqlite::params![now],
         )?;
+        Self::prune_settled_chat_attachments_locked(&conn, now)?;
         Ok(moved)
+    }
+
+    /// Delete settled attachment rows whose last date is past the retention
+    /// window. A row that is still live — an open grant, a receive in flight —
+    /// is never a candidate, whatever its age.
+    fn prune_settled_chat_attachments_locked(conn: &Connection, now: i64) -> anyhow::Result<usize> {
+        let cutoff = now.saturating_sub(CHAT_ATTACHMENT_RETENTION_SECS);
+        Ok(conn.execute(
+            "DELETE FROM chat_attachments
+             WHERE status NOT IN ('offered', 'awaiting', 'accepted', 'active')
+               AND expires_at < ?1 AND created_at < ?1",
+            rusqlite::params![cutoff],
+        )?)
     }
 
     /// Write a consistent, self-contained copy of the live database to `dest`.
@@ -4821,6 +4942,12 @@ impl Database {
             "DELETE FROM chat_messages WHERE friend_hash = ?1",
             params![user_hash],
         )?;
+        // Takes the friend's grants with it: a `sent` row is what makes its
+        // `source_path` readable to them.
+        tx.execute(
+            "DELETE FROM chat_attachments WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
         tx.execute(
             "DELETE FROM friends WHERE user_hash = ?1",
             params![user_hash],
@@ -5120,6 +5247,10 @@ impl Database {
             params![user_hash],
         )?;
         tx.execute(
+            "DELETE FROM chat_attachments WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
             "DELETE FROM friends WHERE user_hash = ?1",
             params![user_hash],
         )?;
@@ -5375,12 +5506,21 @@ impl Database {
         // unverified requests from another channel — a legitimate
         // re-request from the real user always raises the flag or
         // leaves it unchanged, never lowers it.
+        //
+        // The same goes for the fields an accept acts on: an unverified
+        // request must not repoint a verified one's nickname or address,
+        // since accepting it would dial whatever the spoofer supplied.
         tx.execute(
             "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified, sender_pubkey)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(sender_hash) DO UPDATE SET sender_nickname = excluded.sender_nickname,
-             sender_ip = excluded.sender_ip, sender_port = excluded.sender_port,
-             verified = MAX(friend_requests.verified, excluded.verified),
+             ON CONFLICT(sender_hash) DO UPDATE SET
+             sender_nickname = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
+                THEN friend_requests.sender_nickname ELSE excluded.sender_nickname END,
+             sender_ip = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
+                THEN friend_requests.sender_ip ELSE excluded.sender_ip END,
+             sender_port = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
+                THEN friend_requests.sender_port ELSE excluded.sender_port END,
+             verified = MAX(COALESCE(friend_requests.verified, 0), excluded.verified),
              sender_pubkey = CASE WHEN excluded.verified != 0
                 THEN COALESCE(excluded.sender_pubkey, friend_requests.sender_pubkey)
                 ELSE friend_requests.sender_pubkey END",
@@ -5771,6 +5911,25 @@ impl Database {
             "UPDATE chat_messages SET delivery = ?1 WHERE id = ?2",
             params![delivery, id],
         )?)
+    }
+
+    /// [`Self::set_chat_delivery`] for many rows in one transaction. Returns,
+    /// per id in order, whether a row matched.
+    pub fn set_chat_delivery_many(&self, ids: &[i64], delivery: i64) -> anyhow::Result<Vec<bool>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut matched = Vec::with_capacity(ids.len());
+        {
+            let mut stmt = tx.prepare("UPDATE chat_messages SET delivery = ?1 WHERE id = ?2")?;
+            for id in ids {
+                matched.push(stmt.execute(params![delivery, id])? > 0);
+            }
+        }
+        tx.commit()?;
+        Ok(matched)
     }
 
     /// Count of outbound messages still queued, per friend. Drives the
@@ -6376,6 +6535,9 @@ impl Database {
             )?;
         }
         tx.commit()?;
+        if n > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(n > 0)
     }
 
@@ -6467,6 +6629,7 @@ impl Database {
             params![channel_id],
         )?;
         tx.commit()?;
+        bump_channel_roster_generation(channel_id);
         Ok(n > 0)
     }
 
@@ -6889,6 +7052,8 @@ impl Database {
                 return Ok(false);
             }
             tx.commit()?;
+            bump_channel_roster_generation(old_channel_id);
+            bump_channel_roster_generation(successor_channel_id);
         }
         self.finish_channel_handoff(old_channel_id, successor_channel_id)?;
         Ok(true)
@@ -7344,6 +7509,8 @@ impl Database {
                 return Ok(false);
             }
             tx.commit()?;
+            bump_channel_roster_generation(channel_id);
+            bump_channel_roster_generation(&successor_id);
             successor_id
         };
         self.finish_channel_handoff(channel_id, &successor_id)?;
@@ -7402,10 +7569,11 @@ impl Database {
             params![channel_id],
             |row| row.get(0),
         )?;
+        let mut evicted = 0usize;
         if live > CHANNEL_MEMBERS_MAX as i64 {
             let extra = live - CHANNEL_MEMBERS_MAX as i64;
             let cutoff = now.saturating_sub(PRESENCE_FRESH_SECS);
-            tx.execute(
+            evicted = tx.execute(
                 "DELETE FROM channel_members WHERE rowid IN (
                     SELECT rowid FROM channel_members
                      WHERE channel_id = ?1 AND banned = 0 AND moderator = 0
@@ -7433,10 +7601,20 @@ impl Database {
                     params![channel_id, member_pubkey],
                 )?;
                 tx.commit()?;
+                if evicted > 0 {
+                    bump_channel_roster_generation(channel_id);
+                }
                 return Ok(ChannelMemberWrite::Refused);
             }
         }
         tx.commit()?;
+        let visible = evicted > 0
+            || prior
+                .as_ref()
+                .is_none_or(|(_, old_seen)| channel_presence_revived(*old_seen, last_seen, now));
+        if visible {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(match prior {
             None => ChannelMemberWrite::Inserted,
             Some((old_nick, old_seen)) => {
@@ -7483,19 +7661,32 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let mut updated = Vec::with_capacity(rows.len());
+        let mut revived: Vec<&str> = Vec::new();
         {
             let mut stmt = tx.prepare(
                 "UPDATE channel_members
                  SET last_seen = ?3
                  WHERE channel_id = ?1 AND member_pubkey = ?2 AND last_seen < ?3",
             )?;
+            let mut prior = tx.prepare(
+                "SELECT last_seen FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+            )?;
             for (channel_id, member_pubkey, last_seen) in rows {
                 let last_seen = (*last_seen).min(now);
-                let n = stmt.execute(params![channel_id, member_pubkey, last_seen])?;
-                updated.push(n > 0);
+                let before: Option<i64> = prior
+                    .query_row(params![channel_id, member_pubkey], |row| row.get(0))
+                    .optional()?;
+                let moved = stmt.execute(params![channel_id, member_pubkey, last_seen])? > 0;
+                if moved && before.is_some_and(|before| channel_presence_revived(before, last_seen, now)) {
+                    revived.push(channel_id.as_str());
+                }
+                updated.push(moved);
             }
         }
         tx.commit()?;
+        for channel_id in revived {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(updated)
     }
 
@@ -7505,14 +7696,26 @@ impl Database {
         member_pubkey: &str,
         last_seen: i64,
     ) -> anyhow::Result<bool> {
-        let last_seen = last_seen.min(chrono::Utc::now().timestamp());
+        let now = chrono::Utc::now().timestamp();
+        let last_seen = last_seen.min(now);
         let conn = self.conn.lock();
+        let before: Option<i64> = conn
+            .query_row(
+                "SELECT last_seen FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
         let n = conn.execute(
             "UPDATE channel_members
              SET last_seen = ?3
              WHERE channel_id = ?1 AND member_pubkey = ?2 AND last_seen < ?3",
             params![channel_id, member_pubkey, last_seen],
         )?;
+        drop(conn);
+        if n > 0 && before.is_some_and(|before| channel_presence_revived(before, last_seen, now)) {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(n > 0)
     }
 
@@ -7529,7 +7732,18 @@ impl Database {
                AND last_seen <= ?3",
             params![channel_id, member_pubkey, last_seen],
         )?;
+        drop(conn);
+        if n > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(n > 0)
+    }
+
+    /// See [`bump_channel_roster_generation`] for the ordering a caller relies
+    /// on: read this, then the rows, and the copy is current for as long as
+    /// this value has not moved.
+    pub fn channel_roster_generation(&self, channel_id: &str) -> u64 {
+        channel_roster_slot(channel_id).load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn list_channel_members(
@@ -7771,6 +7985,9 @@ impl Database {
                 timestamp
             ],
         )?;
+        if n > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
         Ok(n > 0)
     }
 
@@ -7922,6 +8139,7 @@ impl Database {
             params![channel_id, i64::from(slow_mode_secs.unwrap_or(0))],
         )?;
         tx.commit()?;
+        bump_channel_roster_generation(channel_id);
         Ok(true)
     }
 
@@ -8366,6 +8584,7 @@ impl Database {
     ///
     /// The ingest dedup gate asks "do we hold this line", which a deletion
     /// answers no to, so without this the next replay puts it straight back.
+    #[cfg(test)]
     pub fn channel_message_forgotten(
         &self,
         channel_id: &str,
@@ -8586,6 +8805,7 @@ impl Database {
     /// same as holding the line. A row somebody else put there without proving
     /// the id is theirs must not be what turns the genuine line away as a repeat
     /// — see [`Self::channel_line_supersedes_locked`].
+    #[cfg(test)]
     pub fn channel_message_held(
         &self,
         channel_id: &str,
@@ -8598,6 +8818,26 @@ impl Database {
             Self::channel_line_supersedes_locked(&conn, channel_id, msg_id, sender_pubkey, timestamp)?,
             Some((_, false))
         ))
+    }
+
+    /// Whether ingest should decline to store this line: a row we hold that
+    /// it would not displace, or a tombstone telling us to forget it. Both
+    /// questions under one lock, since ingest asks both of every line.
+    pub fn channel_message_known(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        timestamp: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        if matches!(
+            Self::channel_line_supersedes_locked(&conn, channel_id, msg_id, sender_pubkey, timestamp)?,
+            Some((_, false))
+        ) {
+            return Ok(true);
+        }
+        Self::channel_message_forgotten_locked(&conn, channel_id, msg_id, sender_pubkey)
     }
 
     /// The row held under `msg_id`, and whether a line signed by `sender_pubkey`
@@ -9441,6 +9681,20 @@ mod tests {
                 last_ip TEXT NOT NULL DEFAULT '',
                 last_port INTEGER NOT NULL DEFAULT 0,
                 queued_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE chat_attachments (
+                xfer_id TEXT PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                root_hash TEXT NOT NULL,
+                source_path TEXT,
+                dest_path TEXT,
+                status TEXT NOT NULL,
+                transferred INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
             );",
         )
         .expect("create schema");
@@ -9807,6 +10061,46 @@ mod tests {
         assert_eq!(db.add_friend("bb", "", None).expect("add"), Some(true));
         let friends = db.get_friends_full().expect("list");
         assert_eq!(friends[0].1, "Bob");
+    }
+
+    #[test]
+    fn friend_request_unverified_refresh_keeps_verified_contact_details() {
+        let db = friends_only_db();
+        db.add_friend_request("cc", None, "Carol", "1.2.3.4", 4662, true)
+            .expect("verified request");
+        db.add_friend_request("cc", None, "Mallory", "6.6.6.6", 6666, false)
+            .expect("spoofed refresh");
+
+        let requests = db.get_friend_requests().expect("list");
+        assert_eq!(requests.len(), 1);
+        let (_, nickname, _, ip, port, verified) = &requests[0];
+        assert_eq!(nickname, "Carol");
+        assert_eq!(ip, "1.2.3.4");
+        assert_eq!(*port, 4662);
+        assert!(*verified);
+
+        db.add_friend_request("cc", None, "Carol2", "5.5.5.5", 4663, true)
+            .expect("verified refresh");
+        let requests = db.get_friend_requests().expect("list");
+        let (_, nickname, _, ip, port, _) = &requests[0];
+        assert_eq!(nickname, "Carol2");
+        assert_eq!(ip, "5.5.5.5");
+        assert_eq!(*port, 4663);
+    }
+
+    #[test]
+    fn friend_request_unverified_refresh_updates_unverified_row() {
+        let db = friends_only_db();
+        db.add_friend_request("dd", None, "Dave", "1.2.3.4", 4662, false)
+            .expect("first request");
+        db.add_friend_request("dd", None, "Dave2", "5.6.7.8", 4663, false)
+            .expect("refresh");
+        let requests = db.get_friend_requests().expect("list");
+        let (_, nickname, _, ip, port, verified) = &requests[0];
+        assert_eq!(nickname, "Dave2");
+        assert_eq!(ip, "5.6.7.8");
+        assert_eq!(*port, 4663);
+        assert!(!*verified);
     }
 
     /// Auto-confirm promotes a one-sided friend to mutual without prompting,
@@ -11464,6 +11758,241 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The full-file check only runs when the last session never reached its
+    /// shutdown — and then it still finds and preserves a damaged database.
+    #[test]
+    fn open_checks_integrity_only_after_an_unclean_shutdown() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "ember-session-marker-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let marker = Database::session_marker_path(&path);
+
+        let db = Database::open_for_session(&path).expect("first open");
+        assert!(marker.exists(), "an open session is marked");
+        let (root, page_size) = {
+            let conn = db.conn.lock();
+            conn.execute_batch("CREATE TABLE filler(x BLOB);").unwrap();
+            for _ in 0..20 {
+                conn.execute("INSERT INTO filler VALUES (randomblob(2000))", [])
+                    .unwrap();
+            }
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let root: i64 = conn
+                .query_row("SELECT rootpage FROM sqlite_master WHERE name = 'filler'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+            (root, page_size)
+        };
+        db.mark_clean_shutdown();
+        assert!(!marker.exists());
+        drop(db);
+
+        // Damage a page nothing on the open path reads.
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(((root - 1) * page_size) as u64)).unwrap();
+            file.write_all(&[0xFF; 16]).unwrap();
+        }
+
+        let after_clean = Database::open_for_session(&path).expect("open after a clean exit");
+        assert!(
+            after_clean.corrupt_backup.is_none(),
+            "a clean shutdown skips the full check"
+        );
+        drop(after_clean);
+        assert!(marker.exists(), "that session never reached its shutdown");
+
+        let after_crash = Database::open_for_session(&path).expect("open after a crash");
+        assert!(
+            after_crash.corrupt_backup.is_some(),
+            "after an unclean shutdown the check runs and preserves the damaged file"
+        );
+        drop(after_crash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_db(tag: &str) -> (Database, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-{tag}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Database::open_at(&path).expect("open db"), path)
+    }
+
+    fn drop_scratch_db(db: Database, path: std::path::PathBuf) {
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Removing or blocking a friend has to take their attachment rows too: a
+    /// `sent` row is a grant that keeps a local path readable to them.
+    #[test]
+    fn removing_or_blocking_a_friend_deletes_their_attachments() {
+        let (db, path) = scratch_db("attach-friend-removal");
+        let now = chrono::Utc::now().timestamp();
+        let removed = "a1".repeat(8);
+        let blocked = "b2".repeat(8);
+        let kept = "c3".repeat(8);
+        for (i, friend) in [&removed, &blocked, &kept].iter().enumerate() {
+            db.upsert_chat_attachment(
+                &format!("{:02x}", 0x40 + i).repeat(8),
+                friend,
+                "sent",
+                "f.bin",
+                1,
+                &"11".repeat(32),
+                Some("C:\\f.bin"),
+                "accepted",
+                now,
+                now + 600,
+            )
+            .expect("insert");
+        }
+        db.remove_friend(&removed).expect("remove");
+        db.block_friend(&blocked).expect("block");
+        assert!(db.chat_attachments_for_friend(&removed, 10).unwrap().is_empty());
+        assert!(db.chat_attachments_for_friend(&blocked, 10).unwrap().is_empty());
+        assert_eq!(db.chat_attachments_for_friend(&kept, 10).unwrap().len(), 1);
+        drop_scratch_db(db, path);
+    }
+
+    /// Settled rows go once they are past retention; live ones stay whatever
+    /// their age, and so do settled ones still inside the window.
+    #[test]
+    fn settled_attachments_are_pruned_after_the_retention_window() {
+        let (db, path) = scratch_db("attach-prune");
+        let friend = "d4".repeat(8);
+        let now = 50_000_000i64;
+        let old = now - CHAT_ATTACHMENT_RETENTION_SECS - 3_600;
+        let recent = now - 60;
+        let rows = [
+            ("old-complete", "received", "complete", old),
+            ("old-declined", "sent", "declined", old),
+            ("old-active", "received", "active", old),
+            ("new-complete", "received", "complete", recent),
+        ];
+        for (i, (_, direction, status, at)) in rows.iter().enumerate() {
+            db.upsert_chat_attachment(
+                &format!("{:02x}", 0x50 + i).repeat(8),
+                &friend,
+                direction,
+                "f.bin",
+                1,
+                &"11".repeat(32),
+                None,
+                status,
+                *at,
+                *at + 600,
+            )
+            .expect("insert");
+        }
+        db.expire_chat_attachments(now).expect("sweep");
+        let mut left: Vec<String> = db
+            .chat_attachments_for_friend(&friend, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.status)
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["active".to_string(), "complete".to_string()]);
+        drop_scratch_db(db, path);
+    }
+
+    #[test]
+    fn chat_delivery_is_marked_for_a_batch_in_one_call() {
+        let (db, path) = scratch_db("chat-delivery-many");
+        let friend = "e5".repeat(8);
+        let a = db.insert_pending_chat_message(&friend, "one").expect("queue");
+        let b = db.insert_pending_chat_message(&friend, "two").expect("queue");
+        let matched = db
+            .set_chat_delivery_many(&[a, b, i64::MAX], CHAT_DELIVERED)
+            .expect("mark");
+        assert_eq!(matched, vec![true, true, false]);
+        assert!(db.pending_chat_messages(&friend, 10).unwrap().is_empty());
+        assert!(db.set_chat_delivery_many(&[], CHAT_DELIVERED).unwrap().is_empty());
+        drop_scratch_db(db, path);
+    }
+
+    /// A roster copy is only as good as the generation it was read under, so
+    /// every write that can change who is on it, or whether they are fresh or
+    /// banned, has to move it. Only increases are asserted: the counter is
+    /// shared by slot with whatever other tests are writing rosters.
+    #[test]
+    fn every_channel_roster_write_moves_the_roster_generation() {
+        let (db, path) = scratch_db("roster-generation");
+        let channel = "f6".repeat(16);
+        let member = "a7".repeat(32);
+        db.insert_channel(&channel, &"b8".repeat(32), "Room", "public", false, None, None)
+            .expect("channel");
+        let generation = || db.channel_roster_generation(&channel);
+
+        let before = generation();
+        db.upsert_channel_member(&channel, &member, "", 100, None).unwrap();
+        let after_insert = generation();
+        assert!(after_insert > before, "an insert");
+
+        let now = chrono::Utc::now().timestamp();
+        db.touch_channel_members_last_seen(&[(channel.clone(), member.clone(), now)])
+            .unwrap();
+        let after_touch = generation();
+        assert!(after_touch > after_insert, "a touch that brought the row back to fresh");
+
+        assert!(db.apply_channel_ban_action(&channel, &member, true, now).unwrap());
+        let after_ban = generation();
+        assert!(after_ban > after_touch, "a ban");
+
+        assert!(db.apply_channel_ban_action(&channel, &member, false, now).unwrap());
+        assert!(db.remove_channel_member(&channel, &member, i64::MAX).unwrap());
+        assert!(generation() > after_ban, "a removal");
+        drop_scratch_db(db, path);
+    }
+
+    /// The writes that do not move the generation are the ones no snapshot can
+    /// see before it expires: `last_seen` moving while it was comfortably
+    /// fresh, or while it stays stale. Those are nearly all of them.
+    #[test]
+    fn only_a_presence_move_a_snapshot_could_see_counts_as_a_channel_roster_change() {
+        let now = 10_000_000;
+        let fresh = now - 10;
+        let stale = now - PRESENCE_FRESH_SECS - 10;
+        assert!(channel_presence_revived(stale, fresh, now));
+        assert!(!channel_presence_revived(fresh, now, now), "fresh to fresher");
+        assert!(!channel_presence_revived(stale - 100, stale, now), "stale to less stale");
+        // Fresh now, but stale before a snapshot taken now would expire: a
+        // touch that is flushed without a bump would leave the member reading
+        // as absent for the rest of that snapshot's life.
+        let nearly_stale = now - PRESENCE_FRESH_SECS + CHANNEL_ROSTER_SNAPSHOT_TTL_SECS - 1;
+        assert!(channel_presence_revived(nearly_stale, now, now));
+        let safely_fresh = now - PRESENCE_FRESH_SECS + CHANNEL_ROSTER_SNAPSHOT_TTL_SECS;
+        assert!(!channel_presence_revived(safely_fresh, now, now));
+    }
+
+    #[test]
+    fn channel_roster_generations_are_per_room() {
+        let a = "0a".repeat(16);
+        let b = (0u8..=255)
+            .map(|i| format!("{i:02x}").repeat(16))
+            .find(|b| !std::ptr::eq(channel_roster_slot(&a), channel_roster_slot(b)))
+            .expect("another slot");
+        assert!(!std::ptr::eq(channel_roster_slot(&a), channel_roster_slot(&b)));
+        // Case-insensitive, since ids arrive in either case.
+        assert!(std::ptr::eq(
+            channel_roster_slot(&a),
+            channel_roster_slot(&a.to_ascii_uppercase())
+        ));
     }
 
     /// An offer nobody answered has to stop being readable on its own, or a

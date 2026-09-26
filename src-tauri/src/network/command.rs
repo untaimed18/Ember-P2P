@@ -24,6 +24,64 @@ use super::*;
 // stay translatable.
 use crate::commands::errors::{coded, coded_ctx};
 
+/// Remove every hash-pass handoff for a file in the index, returning the ones
+/// the reconcile will write into a record. Draining the rest too is what keeps
+/// a handoff for a file whose record already matched from staying resident
+/// forever.
+fn drain_fresh_part_hashes(
+    fresh: &mut HashMap<[u8; 16], Vec<[u8; 16]>>,
+    index_hashes: &HashSet<[u8; 16]>,
+    wanted: &HashSet<[u8; 16]>,
+) -> HashMap<[u8; 16], Vec<[u8; 16]>> {
+    let mut kept = HashMap::new();
+    fresh.retain(|hash, part_hashes| {
+        if !index_hashes.contains(hash) {
+            return true;
+        }
+        if wanted.contains(hash) {
+            kept.insert(*hash, std::mem::take(part_hashes));
+        }
+        false
+    });
+    kept
+}
+
+/// Transfer ids whose `.part` existed at the last probe, for the reconcile's
+/// OP_OFFERFILES change check. The probe runs on the blocking pool after the
+/// check reads this, so a check sees the previous pass's answer; a download
+/// that is unknown or stale here only makes the check request an offer drain
+/// that recomputes the list itself and finds nothing new to send.
+#[derive(Default)]
+struct PartPresence {
+    generation: u64,
+    present: HashSet<String>,
+}
+
+fn part_presence() -> &'static parking_lot::Mutex<PartPresence> {
+    static PRESENCE: std::sync::OnceLock<parking_lot::Mutex<PartPresence>> =
+        std::sync::OnceLock::new();
+    PRESENCE.get_or_init(Default::default)
+}
+
+fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
+    static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::task::spawn_blocking(move || {
+        let present: HashSet<String> = candidates
+            .into_iter()
+            .filter(|(_, path)| path.exists())
+            .map(|(id, _)| id)
+            .collect();
+        let mut slot = part_presence().lock();
+        // Probes can finish out of order; an older one must not overwrite a
+        // newer answer.
+        if generation > slot.generation {
+            slot.generation = generation;
+            slot.present = present;
+        }
+    });
+}
+
 /// Panic-isolating wrapper around [`handle_command_inner`]. Frontend/IPC
 /// commands drive nearly every operation; a panic in one handler must not
 /// permanently freeze networking, so it is caught and the loop carries on.
@@ -3836,6 +3894,12 @@ async fn handle_command_inner(
             // fresh filter on the side and only replace on success; on
             // I/O failure or task panic keep the previous ranges.
             let default_path = state.data_dir.join("ipfilter.dat");
+            if path == default_path {
+                // The download/import commands write ipfilter.dat themselves
+                // and then send this. An edit save still queued holds the
+                // list being replaced and would land over theirs.
+                supersede_queued_ipfilter_saves();
+            }
             let enabled = state.ip_filter.is_enabled();
             let block_private = state.ip_filter.blocks_private();
             let load_path = default_path.clone();
@@ -3940,7 +4004,7 @@ async fn handle_command_inner(
                         bytes
                     };
                     let persist_result =
-                        crate::security::atomic_write(&load_path, &persisted_bytes, false);
+                        write_ipfilter_dat_superseding(&load_path, &persisted_bytes);
                     let _ = std::fs::remove_file(&staged);
                     if let Err(error) = persist_result {
                         warn!("Failed to persist IP filter to {:?}: {}", load_path, error);
@@ -4421,6 +4485,10 @@ async fn handle_command_inner(
             state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
             state.rendezvous_registered = false;
             state.rendezvous_last_register = None;
+            // Backoff earned on the old connection must not hold up the first
+            // registration after reconnecting.
+            state.rendezvous_register_fail_streak = 0;
+            state.rendezvous_last_attempt = None;
             if rendezvous_was_registered {
                 let rv_url = settings.rendezvous_url.clone();
                 let rv_hash = ember_hash;
@@ -5465,231 +5533,212 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
-            let all_index_files = {
+            // One pass under the read guard, keeping only the hashes and the
+            // rows whose record drifted. Startup hashing fires this every 30 s,
+            // and cloning the whole index each time was most of its cost.
+            // Taken before the index is read: the deny below is decided from
+            // this observation but lands later on the blocking pool, so a
+            // share the user makes in between must win over it.
+            let intent_ticket = crate::storage::share_intent::write_ticket();
+            let mut index_hashes: HashSet<[u8; 16]> = HashSet::new();
+            let mut independent_denies: Vec<([u8; 16], bool)> = Vec::new();
+            let mut drifted = Vec::new();
+            {
                 let index = local_index.read().await;
-                index.all_files().to_vec()
-            };
-            let independent_denies: Vec<([u8; 16], bool)> = all_index_files
-                .iter()
-                .filter(|file| !file.shared)
-                .filter_map(|file| {
-                    let bytes = hex::decode(&file.hash).ok()?;
-                    if bytes.len() != 16 {
-                        return None;
+                for f in index.all_files() {
+                    let mut fh = [0u8; 16];
+                    if hex::decode_to_slice(&f.hash, &mut fh).is_err() {
+                        continue;
                     }
-                    let mut hash = [0u8; 16];
-                    hash.copy_from_slice(&bytes);
-                    known_files
-                        .find_by_hash(&hash)
-                        .is_none()
-                        .then_some((hash, false))
-                })
-                .collect();
-            if !independent_denies.is_empty() {
-                if let Err(error) =
-                    crate::storage::share_intent::set_explicit_batch(&independent_denies)
-                {
-                    let _ = reconcile_ack.send(Err(format!(
-                        "Failed to persist independent unshare intent: {error}"
-                    )));
-                    return;
+                    index_hashes.insert(fh);
+                    if !f.shared && known_files.find_by_hash(&fh).is_none() {
+                        independent_denies.push((fh, false));
+                    }
+                    // Refresh-on-drift fix: if a record already exists for
+                    // this hash but its `file_path` or `modified_at` no longer
+                    // match what we just discovered on disk, rewrite the
+                    // record with the current values. See
+                    // `KnownFileList::record_needs_refresh` for the full
+                    // rationale — short version, this breaks the "permanent
+                    // rehash loop" that surfaces whenever an external process
+                    // touches a shared file's metadata.
+                    if known_files.record_needs_refresh(
+                        &fh,
+                        &f.path,
+                        f.size,
+                        f.modified_at,
+                        &f.name,
+                        &f.aich_hash,
+                        &f.ember_file_hash,
+                    ) {
+                        drifted.push((fh, f.clone()));
+                    }
                 }
             }
-            for f in &all_index_files {
-                if let Ok(hash_bytes) = hex::decode(&f.hash) {
-                    if hash_bytes.len() == 16 {
-                        let mut fh = [0u8; 16];
-                        fh.copy_from_slice(&hash_bytes);
-                        // Always drain the hash-pass handoff, including when
-                        // known.met already matches this file. Otherwise a
-                        // correct existing record leaves the freshly-produced
-                        // vector resident forever.
-                        let fresh_part_hashes_for_file =
-                            take_fresh_part_hashes(fresh_part_hashes, &fh).await;
-                        // Refresh-on-drift fix: if a record already
-                        // exists for this hash but its `file_path`
-                        // or `modified_at` no longer match what we
-                        // just discovered on disk, rewrite the
-                        // record with the current values. See
-                        // `KnownFileList::record_needs_refresh` for
-                        // the full rationale — short version, this
-                        // breaks the "permanent rehash loop" that
-                        // surfaces whenever an external process
-                        // touches a shared file's metadata.
-                        if known_files.record_needs_refresh(
-                            &fh,
-                            &f.path,
-                            f.size,
-                            f.modified_at,
-                            &f.name,
-                            &f.aich_hash,
-                            &f.ember_file_hash,
-                        ) {
-                            use crate::storage::known_files::KnownFileRecord;
-                            // Preserve cumulative counters from the
-                            // existing record (uploaded bytes /
-                            // request totals shouldn't reset just
-                            // because mtime drifted).
-                            let existing = known_files.find_by_hash(&fh).cloned();
-                            let (att, atr, ata, prio, lps, is_shared, sources) = match &existing {
-                                Some(r) => (
-                                    r.all_time_transferred.max(f.bytes_transferred),
-                                    r.all_time_requested.max(f.requests),
-                                    r.all_time_accepted.max(f.accepted),
-                                    r.upload_priority,
-                                    r.last_publish_src,
-                                    // Preserve the persisted share flag across a
-                                    // metadata-drift refresh — a user's unshare/
-                                    // share toggle goes through `SetFileShared`,
-                                    // not this path, so this rewrite must never
-                                    // silently flip it back.
-                                    r.is_shared,
-                                    // Preserve the last-known Peers count too — a
-                                    // metadata-drift refresh has nothing to do
-                                    // with source availability, so it must not
-                                    // reset the count back to 0. The periodic
-                                    // source-count sync is the only place that
-                                    // should ever change this value.
-                                    r.complete_sources,
-                                ),
-                                // Brand-new record: seed both from the file's
-                                // current live state (its priority may already
-                                // reflect a shared-folder default; a file can
-                                // only be unshared here if it was toggled off
-                                // before its very first known.met record existed).
-                                None => (
-                                    f.bytes_transferred,
-                                    f.requests,
-                                    f.accepted,
-                                    crate::storage::known_files::priority_str_to_u8(&f.priority),
-                                    0,
-                                    f.shared,
-                                    f.complete_sources,
-                                ),
-                            };
-                            let is_shared =
-                                crate::storage::share_intent::effective_shared(&fh, is_shared);
-                            let mut part_hashes = existing
-                                .as_ref()
-                                .map(|r| r.part_hashes.clone())
-                                .unwrap_or_default();
-                            if part_hashes.len()
-                                != ed2k::hash::ed2k_known_met_part_hash_count(f.size)
-                            {
-                                // Prefer the part hashes already produced as a
-                                // byproduct of the initial ED2K+AICH combined
-                                // hash pass (`hash_file_combined_cancellable`,
-                                // stashed by the hashing task into
-                                // `fresh_part_hashes`) over re-reading the
-                                // whole file from disk a second time. Every
-                                // never-before-known file used to take the
-                                // fallback branch below on its first
-                                // SharedFilesChanged, so on a fresh share of a
-                                // large library this loop ran a full re-hash
-                                // for many files in a row — sequentially, on
-                                // this same network event loop task — which is
-                                // what starved KAD UDP/timers/IPC snapshots
-                                // (contacts, search activity) for the whole
-                                // hashing pass. spawn_blocking alone didn't
-                                // fix that: it only keeps the disk I/O off the
-                                // async worker threads, not off *this* task.
-                                if let Some(cached) = fresh_part_hashes_for_file {
-                                    part_hashes = cached;
-                                } else {
-                                    // Do not await a full-file re-hash on the
-                                    // network task — that starved KAD/IPC for
-                                    // large libraries. Empty part hashes here
-                                    // are filled on the next combined hash pass.
-                                    debug!(
-                                        "Deferring part-hash re-read for {}; using empty until next hash pass",
-                                        f.path
-                                    );
-                                    part_hashes = Vec::new();
-                                }
-                            }
-                            known_files.add_or_update(KnownFileRecord {
-                                file_hash: fh,
-                                part_hashes,
-                                file_name: f.name.clone(),
-                                file_size: f.size,
-                                file_path: f.path.clone(),
-                                aich_hash: if !f.aich_hash.is_empty() {
-                                    f.aich_hash.clone()
-                                } else {
-                                    existing
-                                        .as_ref()
-                                        .map(|r| r.aich_hash.clone())
-                                        .unwrap_or_default()
-                                },
-                                ember_file_hash: if !f.ember_file_hash.is_empty() {
-                                    f.ember_file_hash.clone()
-                                } else {
-                                    existing
-                                        .as_ref()
-                                        .map(|r| r.ember_file_hash.clone())
-                                        .unwrap_or_default()
-                                },
-                                modified_at: f.modified_at,
-                                all_time_transferred: att,
-                                all_time_requested: atr,
-                                all_time_accepted: ata,
-                                upload_priority: prio,
-                                last_publish_src: lps,
-                                last_shared: chrono::Utc::now().timestamp() as u32,
-                                is_shared,
-                                // Fail closed. A rediscovered or rehashed file
-                                // arrives with `friends_only = false` straight
-                                // from `discover_file`, and letting that win
-                                // would quietly republish content the user had
-                                // restricted. Lifting a restriction goes
-                                // through `SetFilesFriendsOnly`, which clears
-                                // the record before any reconcile runs, so an
-                                // intentional unrestrict is unaffected.
-                                friends_only: f.friends_only
-                                    || existing.as_ref().is_some_and(|r| r.friends_only),
-                                complete_sources: sources,
-                                last_ember_source_publish: existing
-                                    .as_ref()
-                                    .map(|r| r.last_ember_source_publish)
-                                    .unwrap_or(0),
-                                last_ember_keyword_publish: existing
-                                    .as_ref()
-                                    .map(|r| r.last_ember_keyword_publish)
-                                    .unwrap_or(0),
-                                // A rehash does not change the bytes' media, so
-                                // carry the probe result rather than making the
-                                // publisher read the file again.
-                                media: existing.as_ref().and_then(|r| r.media.clone()),
-                                media_scanned: existing.as_ref().is_some_and(|r| r.media_scanned),
-                            });
-                            // Real BLAKE3 just landed (or was refreshed) —
-                            // drop publish timers so the next tick advertises
-                            // the digest instead of waiting out a zeros publish.
-                            if !f.ember_file_hash.is_empty() {
-                                state.ember_source_publish_at.remove(&fh);
-                                state.ember_keyword_publish_at.remove(&fh);
-                                state.ember_source_publish_unix.remove(&fh);
-                                state.ember_keyword_publish_unix.remove(&fh);
-                            }
-                        }
+            // Applied to the records below directly rather than read back
+            // through `effective_shared`, so the rewrite of share_intent.json
+            // (fsync'd, and `global()` can wait on the startup migration) can
+            // run on the blocking pool instead of this task.
+            let denied_now: HashSet<[u8; 16]> =
+                independent_denies.iter().map(|(hash, _)| *hash).collect();
+            let deny_persist = (!independent_denies.is_empty()).then(|| {
+                tokio::task::spawn_blocking(move || {
+                    crate::storage::share_intent::set_explicit_batch_unless_newer(
+                        &independent_denies,
+                        intent_ticket,
+                    )
+                })
+            });
+            let mut fresh_for_drifted = {
+                let drifted_hashes: HashSet<[u8; 16]> =
+                    drifted.iter().map(|(hash, _)| *hash).collect();
+                let mut fresh = fresh_part_hashes.write().await;
+                drain_fresh_part_hashes(&mut fresh, &index_hashes, &drifted_hashes)
+            };
+            for (fh, f) in &drifted {
+                let fh = *fh;
+                use crate::storage::known_files::KnownFileRecord;
+                // Preserve cumulative counters from the existing record
+                // (uploaded bytes / request totals shouldn't reset just
+                // because mtime drifted).
+                let existing = known_files.find_by_hash(&fh).cloned();
+                let (att, atr, ata, prio, lps, is_shared, sources) = match &existing {
+                    Some(r) => (
+                        r.all_time_transferred.max(f.bytes_transferred),
+                        r.all_time_requested.max(f.requests),
+                        r.all_time_accepted.max(f.accepted),
+                        r.upload_priority,
+                        r.last_publish_src,
+                        // Preserve the persisted share flag across a
+                        // metadata-drift refresh — a user's unshare/share
+                        // toggle goes through `SetFileShared`, not this path,
+                        // so this rewrite must never silently flip it back.
+                        r.is_shared,
+                        // Preserve the last-known Peers count too — a
+                        // metadata-drift refresh has nothing to do with source
+                        // availability, so it must not reset the count back to
+                        // 0. The periodic source-count sync is the only place
+                        // that should ever change this value.
+                        r.complete_sources,
+                    ),
+                    // Brand-new record: seed both from the file's current live
+                    // state (its priority may already reflect a shared-folder
+                    // default; a file can only be unshared here if it was
+                    // toggled off before its very first known.met record
+                    // existed).
+                    None => (
+                        f.bytes_transferred,
+                        f.requests,
+                        f.accepted,
+                        crate::storage::known_files::priority_str_to_u8(&f.priority),
+                        0,
+                        f.shared,
+                        f.complete_sources,
+                    ),
+                };
+                let is_shared = !denied_now.contains(&fh)
+                    && crate::storage::share_intent::effective_shared(&fh, is_shared);
+                let mut part_hashes = existing
+                    .as_ref()
+                    .map(|r| r.part_hashes.clone())
+                    .unwrap_or_default();
+                if part_hashes.len() != ed2k::hash::ed2k_known_met_part_hash_count(f.size) {
+                    // Prefer the part hashes already produced as a byproduct
+                    // of the initial ED2K+AICH combined hash pass
+                    // (`hash_file_combined_cancellable`, stashed by the
+                    // hashing task into `fresh_part_hashes`) over re-reading
+                    // the whole file from disk a second time. Every
+                    // never-before-known file used to take the fallback branch
+                    // below on its first SharedFilesChanged, so on a fresh
+                    // share of a large library this loop ran a full re-hash
+                    // for many files in a row — sequentially, on this same
+                    // network event loop task — which is what starved KAD
+                    // UDP/timers/IPC snapshots (contacts, search activity) for
+                    // the whole hashing pass. spawn_blocking alone didn't fix
+                    // that: it only keeps the disk I/O off the async worker
+                    // threads, not off *this* task.
+                    if let Some(cached) = fresh_for_drifted.remove(&fh) {
+                        part_hashes = cached;
+                    } else {
+                        // Do not await a full-file re-hash on the network task
+                        // — that starved KAD/IPC for large libraries. Empty
+                        // part hashes here are filled on the next combined
+                        // hash pass.
+                        debug!(
+                            "Deferring part-hash re-read for {}; using empty until next hash pass",
+                            f.path
+                        );
+                        part_hashes = Vec::new();
                     }
+                }
+                known_files.add_or_update(KnownFileRecord {
+                    file_hash: fh,
+                    part_hashes,
+                    file_name: f.name.clone(),
+                    file_size: f.size,
+                    file_path: f.path.clone(),
+                    aich_hash: if !f.aich_hash.is_empty() {
+                        f.aich_hash.clone()
+                    } else {
+                        existing
+                            .as_ref()
+                            .map(|r| r.aich_hash.clone())
+                            .unwrap_or_default()
+                    },
+                    ember_file_hash: if !f.ember_file_hash.is_empty() {
+                        f.ember_file_hash.clone()
+                    } else {
+                        existing
+                            .as_ref()
+                            .map(|r| r.ember_file_hash.clone())
+                            .unwrap_or_default()
+                    },
+                    modified_at: f.modified_at,
+                    all_time_transferred: att,
+                    all_time_requested: atr,
+                    all_time_accepted: ata,
+                    upload_priority: prio,
+                    last_publish_src: lps,
+                    last_shared: chrono::Utc::now().timestamp() as u32,
+                    is_shared,
+                    // Fail closed. A rediscovered or rehashed file arrives
+                    // with `friends_only = false` straight from
+                    // `discover_file`, and letting that win would quietly
+                    // republish content the user had restricted. Lifting a
+                    // restriction goes through `SetFilesFriendsOnly`, which
+                    // clears the record before any reconcile runs, so an
+                    // intentional unrestrict is unaffected.
+                    friends_only: f.friends_only
+                        || existing.as_ref().is_some_and(|r| r.friends_only),
+                    complete_sources: sources,
+                    last_ember_source_publish: existing
+                        .as_ref()
+                        .map(|r| r.last_ember_source_publish)
+                        .unwrap_or(0),
+                    last_ember_keyword_publish: existing
+                        .as_ref()
+                        .map(|r| r.last_ember_keyword_publish)
+                        .unwrap_or(0),
+                    // A rehash does not change the bytes' media, so carry the
+                    // probe result rather than making the publisher read the
+                    // file again.
+                    media: existing.as_ref().and_then(|r| r.media.clone()),
+                    media_scanned: existing.as_ref().is_some_and(|r| r.media_scanned),
+                });
+                // Real BLAKE3 just landed (or was refreshed) — drop publish
+                // timers so the next tick advertises the digest instead of
+                // waiting out a zeros publish.
+                if !f.ember_file_hash.is_empty() {
+                    state.ember_source_publish_at.remove(&fh);
+                    state.ember_keyword_publish_at.remove(&fh);
+                    state.ember_source_publish_unix.remove(&fh);
+                    state.ember_keyword_publish_unix.remove(&fh);
                 }
             }
             // Index friends_only can OR onto a known.met record here; the
             // upload listener reads the snapshot, not this list.
             sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
             or_index_friends_only_from_known(local_index, known_files).await;
-            let restricted: HashSet<String> = all_index_files
-                .iter()
-                .filter(|f| f.friends_only && !f.hash.is_empty())
-                .map(|f| f.hash.to_ascii_lowercase())
-                .chain(
-                    known_files
-                        .iter_records()
-                        .filter(|r| r.friends_only)
-                        .map(|r| hex::encode(r.file_hash)),
-                )
-                .collect();
             // Until known.met is absorbed, kad_may_advertise_* is false for
             // every hash. Reconciling anyway would retain([]) — wiping a
             // first-publish that landed in the same session — and queue an
@@ -5697,36 +5746,49 @@ async fn handle_command_inner(
             if !known_files.is_authoritative() {
                 info!("Skipping KAD/eD2K advertise reconcile until known.met is absorbed");
             } else {
+                let collect_offers = state.server_connected;
                 let mut seen_hashes = std::collections::HashSet::new();
-                let files: Vec<PublishableFile> = all_index_files
-                    .iter()
-                    .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
-                    .filter_map(|f| {
-                        if f.hash.is_empty() || !seen_hashes.insert(f.hash.clone()) {
-                            return None;
+                let mut seen_offer_hashes = std::collections::HashSet::new();
+                let (restricted, files, ember_keep, mut offer_files) = {
+                    let index = local_index.read().await;
+                    let restricted = collect_friends_only_hashes(&index, known_files);
+                    let mut files: Vec<PublishableFile> = Vec::new();
+                    let mut ember_keep: HashSet<[u8; 16]> = HashSet::new();
+                    let mut offer_files: Vec<ed2k::server::OfferFile> = Vec::new();
+                    for f in index.all_files() {
+                        if !kad_may_advertise_complete(f, known_files, &restricted) {
+                            continue;
                         }
-                        let hash_bytes = hex::decode(&f.hash).ok()?;
-                        if hash_bytes.len() < 16 {
-                            return None;
-                        }
-                        Some(PublishableFile {
-                            file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
-                            file_name: f.name.clone(),
-                            file_size: f.size,
-                            file_type: crate::search::index::infer_file_type(&f.extension),
-                            complete_sources: f.complete_sources,
-                            keyword_publishable: true,
-                            last_source_publish: {
-                                let mut raw = [0u8; 16];
-                                raw.copy_from_slice(&hash_bytes[..16]);
-                                known_files
+                        let Some(raw) = parse_ed2k_hash16(&f.hash) else {
+                            continue;
+                        };
+                        ember_keep.insert(raw);
+                        if seen_hashes.insert(f.hash.clone()) {
+                            files.push(PublishableFile {
+                                file_hash: md4_bytes_to_kad_id(&raw),
+                                file_name: f.name.clone(),
+                                file_size: f.size,
+                                file_type: crate::search::index::infer_file_type(&f.extension),
+                                complete_sources: f.complete_sources,
+                                keyword_publishable: true,
+                                last_source_publish: known_files
                                     .find_by_hash(&raw)
                                     .map(|r| r.last_publish_src as i64)
-                                    .unwrap_or(0)
-                            },
-                        })
-                    })
-                    .collect();
+                                    .unwrap_or(0),
+                            });
+                        }
+                        if collect_offers && seen_offer_hashes.insert(f.hash.clone()) {
+                            offer_files.push(ed2k::server::OfferFile {
+                                hash: raw,
+                                name: f.name.clone(),
+                                size: f.size,
+                                is_complete: true,
+                                file_type: String::new(),
+                            });
+                        }
+                    }
+                    (restricted, files, ember_keep, offer_files)
+                };
                 let shared_count = files.len();
                 // Reconcile rather than wipe. The old `clear_all()` here threw
                 // away every in-memory keyword publish timestamp on each
@@ -5742,8 +5804,12 @@ async fn handle_command_inner(
                     files.iter().map(|f| f.file_hash).collect();
                 state.publish_manager.add_files_batch(files);
 
-                // Re-add active partial downloads to KAD publish.
+                // Re-add active partial downloads to KAD publish, and collect
+                // the partial OP_OFFERFILES candidates in the same pass.
                 let mut partial_count = 0u32;
+                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+                let mut partial_offers: Vec<(String, PathBuf, ed2k::server::OfferFile)> =
+                    Vec::new();
                 {
                     let mgr = transfer_manager.read().await;
                     for transfer in mgr.active.values().chain(mgr.queue.iter()) {
@@ -5759,38 +5825,46 @@ async fn handle_command_inner(
                         if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
                             continue;
                         }
-                        if transfer.file_hash.is_empty()
-                            || !seen_hashes.insert(transfer.file_hash.clone())
-                        {
+                        if transfer.file_hash.is_empty() {
                             continue;
                         }
-                        let hash_bytes = match hex::decode(&transfer.file_hash) {
-                            Ok(bytes) if bytes.len() >= 16 => bytes,
-                            _ => continue,
+                        let Some(raw) = parse_ed2k_hash16(&transfer.file_hash) else {
+                            continue;
                         };
-                        let ext = std::path::Path::new(&transfer.file_name)
-                            .extension()
-                            .map(|e| e.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let partial_hash = md4_bytes_to_kad_id(&hash_bytes[..16]);
-                        desired.insert(partial_hash);
-                        state.publish_manager.add_file(PublishableFile {
-                            file_hash: partial_hash,
-                            file_name: transfer.file_name.clone(),
-                            file_size: transfer.total_size,
-                            file_type: crate::search::index::infer_file_type(&ext),
-                            complete_sources: 0,
-                            keyword_publishable: false,
-                            last_source_publish: {
-                                let mut raw = [0u8; 16];
-                                raw.copy_from_slice(&hash_bytes[..16]);
-                                known_files
+                        if seen_hashes.insert(transfer.file_hash.clone()) {
+                            let ext = std::path::Path::new(&transfer.file_name)
+                                .extension()
+                                .map(|e| e.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let partial_hash = md4_bytes_to_kad_id(&raw);
+                            desired.insert(partial_hash);
+                            state.publish_manager.add_file(PublishableFile {
+                                file_hash: partial_hash,
+                                file_name: transfer.file_name.clone(),
+                                file_size: transfer.total_size,
+                                file_type: crate::search::index::infer_file_type(&ext),
+                                complete_sources: 0,
+                                keyword_publishable: false,
+                                last_source_publish: known_files
                                     .find_by_hash(&raw)
                                     .map(|r| r.last_publish_src as i64)
-                                    .unwrap_or(0)
-                            },
-                        });
-                        partial_count += 1;
+                                    .unwrap_or(0),
+                            });
+                            partial_count += 1;
+                        }
+                        if collect_offers && seen_offer_hashes.insert(transfer.file_hash.clone()) {
+                            partial_offers.push((
+                                transfer.id.clone(),
+                                temp_dir.join(format!("{}.part", transfer.id)),
+                                ed2k::server::OfferFile {
+                                    hash: raw,
+                                    name: transfer.file_name.clone(),
+                                    size: transfer.total_size,
+                                    is_complete: false,
+                                    file_type: String::new(),
+                                },
+                            ));
+                        }
                     }
                 }
                 // Evict publish records for files no longer shared/downloading
@@ -5811,81 +5885,27 @@ async fn handle_command_inner(
                 // Same eviction for the Ember badge set. Ember publishes only
                 // complete, publicly listable files (no partials), so unsharing
                 // one must darken its badge exactly as it does for KAD.
-                let ember_keep: HashSet<[u8; 16]> = all_index_files
-                    .iter()
-                    .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
-                    .filter_map(|f| parse_ed2k_hash16(&f.hash))
-                    .collect();
                 state
                     .ember_published_sources
                     .retain(|hash| ember_keep.contains(hash));
                 info!("Re-populated publish manager with {shared_count} shared + {partial_count} partial downloads after change");
 
                 // eMule: re-send OP_OFFERFILES to the server when shared files change
-                if state.server_connected {
-                    let mut seen_offer_hashes = std::collections::HashSet::new();
-                    let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
+                if collect_offers {
+                    let probe: Vec<(String, PathBuf)> = partial_offers
                         .iter()
-                        .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
-                        .filter_map(|f| {
-                            if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
-                                return None;
-                            }
-                            let hash_bytes = hex::decode(&f.hash).ok()?;
-                            if hash_bytes.len() < 16 {
-                                return None;
-                            }
-                            let mut h = [0u8; 16];
-                            h.copy_from_slice(&hash_bytes[..16]);
-                            Some(ed2k::server::OfferFile {
-                                hash: h,
-                                name: f.name.clone(),
-                                size: f.size,
-                                is_complete: true,
-                                file_type: String::new(),
-                            })
-                        })
+                        .map(|(id, path, _)| (id.clone(), path.clone()))
                         .collect();
-                    let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
                     {
-                        let mgr = transfer_manager.read().await;
-                        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                            if transfer.direction != TransferDirection::Download {
-                                continue;
-                            }
-                            if matches!(
-                                transfer.status,
-                                TransferStatus::Completed | TransferStatus::Failed
-                            ) {
-                                continue;
-                            }
-                            if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
-                                continue;
-                            }
-                            if transfer.file_hash.is_empty()
-                                || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                            {
-                                continue;
-                            }
-                            let hash_bytes = match hex::decode(&transfer.file_hash) {
-                                Ok(bytes) if bytes.len() >= 16 => bytes,
-                                _ => continue,
-                            };
-                            let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                            if !part_path.exists() {
-                                continue;
-                            }
-                            let mut h = [0u8; 16];
-                            h.copy_from_slice(&hash_bytes[..16]);
-                            offer_files.push(ed2k::server::OfferFile {
-                                hash: h,
-                                name: transfer.file_name.clone(),
-                                size: transfer.total_size,
-                                is_complete: false,
-                                file_type: String::new(),
-                            });
-                        }
+                        let presence = part_presence().lock();
+                        offer_files.extend(
+                            partial_offers
+                                .into_iter()
+                                .filter(|(id, _, _)| presence.present.contains(id))
+                                .map(|(_, _, offer)| offer),
+                        );
                     }
+                    spawn_part_presence_probe(probe);
                     let signature = offer_files_signature(&offer_files);
                     if state.last_offer_files_signature == Some(signature) {
                         debug!(
@@ -5902,7 +5922,25 @@ async fn handle_command_inner(
                     }
                 }
             }
-            let _ = reconcile_ack.send(Ok(()));
+            match deny_persist {
+                None => {
+                    let _ = reconcile_ack.send(Ok(()));
+                }
+                Some(persist) => {
+                    tokio::spawn(async move {
+                        let result = match persist.await {
+                            Ok(Ok(_)) => Ok(()),
+                            Ok(Err(error)) => Err(format!(
+                                "Failed to persist independent unshare intent: {error}"
+                            )),
+                            Err(error) => Err(format!(
+                                "Independent unshare intent task failed: {error}"
+                            )),
+                        };
+                        let _ = reconcile_ack.send(result);
+                    });
+                }
+            }
         }
 
         NetworkCommand::SetFileComment {
@@ -7264,5 +7302,54 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::Shutdown { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod reconcile_helper_tests {
+    use super::*;
+
+    #[test]
+    fn drain_removes_every_indexed_handoff_and_returns_only_wanted() {
+        let (kept, unused, foreign) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        let mut fresh = HashMap::from([
+            (kept, vec![[0xAA; 16]]),
+            (unused, vec![[0xBB; 16]]),
+            (foreign, vec![[0xCC; 16]]),
+        ]);
+        let index = HashSet::from([kept, unused]);
+        let wanted = HashSet::from([kept]);
+        let drained = drain_fresh_part_hashes(&mut fresh, &index, &wanted);
+        assert_eq!(drained, HashMap::from([(kept, vec![[0xAA; 16]])]));
+        assert_eq!(
+            fresh.keys().copied().collect::<Vec<_>>(),
+            vec![foreign],
+            "handoffs for indexed files are drained even when unused; others stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn part_presence_probe_records_only_existing_parts() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-part-presence-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present_id = format!("present-{}", rand::random::<u64>());
+        let absent_id = format!("absent-{}", rand::random::<u64>());
+        let present_path = dir.join(format!("{present_id}.part"));
+        std::fs::write(&present_path, b"x").unwrap();
+        spawn_part_presence_probe(vec![
+            (present_id.clone(), present_path),
+            (absent_id.clone(), dir.join(format!("{absent_id}.part"))),
+        ]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !part_presence().lock().present.contains(&present_id) {
+            assert!(std::time::Instant::now() < deadline, "probe never landed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!part_presence().lock().present.contains(&absent_id));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -59,7 +59,6 @@ pub(super) async fn send_xfer_frame(
     peer: [u8; 32],
     plain: &[u8],
 ) -> bool {
-    let channel_id_hex = hex::encode(channel_id);
     let Some(view) = cached_channel_view(state, db, channel_id) else {
         return false;
     };
@@ -94,7 +93,7 @@ pub(super) async fn send_xfer_frame(
             return true;
         }
     }
-    let roster = channel_member_pubkeys(db, &channel_id_hex);
+    let roster = channel_member_pubkeys_cached(state, db, channel_id);
     overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
 }
 
@@ -238,6 +237,122 @@ pub(super) async fn xfer_offer_allowed(state: &NetworkState, peer: &[u8; 32]) ->
     }
 }
 
+/// Offers one member may have waiting on the user at once, across every room.
+/// The sending side lets one member run this many transfers to one peer
+/// (`OfferChannelTransfer`), so anything lower refuses a second file sent back
+/// to back.
+pub(super) const XFER_PENDING_PER_SENDER: usize = ember::channel::XFER_MAX_ACTIVE;
+
+/// Offers waiting on the user at once, across every member and room.
+pub(super) const XFER_PENDING_MAX: usize = ember::channel::XFER_MAX_ACTIVE * 2;
+
+/// How long an offer is on screen before anything may displace it.
+pub(super) const XFER_PENDING_MIN_DISPLAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum XferOfferAdmission {
+    Admit,
+    /// Admit, after dropping this pending offer to stay under the total.
+    Evict([u8; 16]),
+    Busy,
+}
+
+/// One pending offer, as [`xfer_offer_admission`] weighs it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingOfferView {
+    pub(super) xfer_id: [u8; 16],
+    pub(super) peer: [u8; 32],
+    pub(super) received_at: std::time::Instant,
+    /// A sender whose identity cost something: a friend, a room's owner or
+    /// moderator, or any member of a private room, where joining takes the key.
+    pub(super) protected: bool,
+}
+
+/// Whether a new offer from `sender` fits beside the ones already pending.
+///
+/// A full table is settled in the newcomer's disfavour unless one of two
+/// things is true, and even then only against an offer that has been on screen
+/// for [`XFER_PENDING_MIN_DISPLAY`]:
+/// - some other member holds at least two more offers than the newcomer
+///   would, in which case their oldest goes — they keep the rest, so one
+///   member cannot hold the table, but nobody is reduced to nothing; or
+/// - the newcomer is protected and an unprotected offer is waiting, in which
+///   case the oldest of those goes.
+///
+/// Identities in a public room are free, and beacons admit several a beat, so
+/// anything looser let a stream of throwaway members evict every offer the
+/// user was actually waiting on.
+pub(super) fn xfer_offer_admission(
+    pending: &[PendingOfferView],
+    receiving: usize,
+    sender: &[u8; 32],
+    sender_protected: bool,
+    now: std::time::Instant,
+) -> XferOfferAdmission {
+    if receiving >= ember::channel::XFER_MAX_ACTIVE {
+        return XferOfferAdmission::Busy;
+    }
+    let mut held: HashMap<[u8; 32], usize> = HashMap::new();
+    for offer in pending {
+        *held.entry(offer.peer).or_default() += 1;
+    }
+    let ours = held.get(sender).copied().unwrap_or(0);
+    if ours >= XFER_PENDING_PER_SENDER {
+        return XferOfferAdmission::Busy;
+    }
+    if pending.len() < XFER_PENDING_MAX {
+        return XferOfferAdmission::Admit;
+    }
+    let displayed =
+        |offer: &PendingOfferView| now.saturating_duration_since(offer.received_at) >= XFER_PENDING_MIN_DISPLAY;
+    let oldest = |candidates: &mut dyn Iterator<Item = &PendingOfferView>| {
+        candidates
+            .filter(|offer| displayed(offer))
+            .min_by_key(|offer| (offer.received_at, offer.xfer_id))
+            .map(|offer| offer.xfer_id)
+    };
+    let busiest = held
+        .iter()
+        .filter(|(peer, count)| *peer != sender && **count >= ours + 2)
+        .map(|(_, count)| *count)
+        .max();
+    if let Some(most) = busiest {
+        let mut theirs = pending
+            .iter()
+            .filter(|offer| offer.peer != *sender && held.get(&offer.peer) == Some(&most));
+        if let Some(victim) = oldest(&mut theirs) {
+            return XferOfferAdmission::Evict(victim);
+        }
+    }
+    if sender_protected {
+        let mut exposed = pending.iter().filter(|offer| !offer.protected);
+        if let Some(victim) = oldest(&mut exposed) {
+            return XferOfferAdmission::Evict(victim);
+        }
+    }
+    XferOfferAdmission::Busy
+}
+
+/// Whether offers from `peer` in this room come from an identity that cost
+/// something. See [`PendingOfferView::protected`].
+fn xfer_sender_protected(
+    state: &mut NetworkState,
+    db: &Database,
+    friends: &HashSet<[u8; 16]>,
+    channel_id: [u8; 16],
+    peer: &[u8; 32],
+) -> bool {
+    if friends.contains(&ember::channel::channel_id_from_pubkey(peer)) {
+        return true;
+    }
+    let Some(view) = cached_channel_view(state, db, channel_id) else {
+        return false;
+    };
+    view.row.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+        || view.row.owner_pubkey.eq_ignore_ascii_case(&hex::encode(peer))
+        || channel_roster_snapshot(state, db, channel_id).is_moderator(peer)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_xfer_offer(
     socket: &UdpSocket,
@@ -250,15 +365,12 @@ pub(super) async fn apply_xfer_offer(
     key: [u8; 32],
 ) {
     let sender_hex = hex::encode(offer.sender);
-    if db
-        .channel_member_is_banned(&ch.channel_id, &sender_hex)
-        .unwrap_or(false)
-    {
+    if channel_member_banned(state, db, gossip.channel_id, &offer.sender) {
         return;
     }
     // Only someone we can see in the room may offer. Without this a member
     // who left, or was never here, could still put a dialog on screen.
-    if !channel_member_pubkeys(db, &ch.channel_id).contains(&offer.sender) {
+    if !channel_member_pubkeys_cached(state, db, gossip.channel_id).contains(&offer.sender) {
         return;
     }
     // An offer costs the recipient a prompt, so it is rate-limited exactly
@@ -287,13 +399,38 @@ pub(super) async fn apply_xfer_offer(
         return;
     }
 
+    let admission = {
+        let friends_lock = state.xfer_friend_hashes.clone();
+        let friends = friends_lock.read().await;
+        let entries: Vec<([u8; 16], [u8; 16], [u8; 32], std::time::Instant)> = state
+            .xfer_pending
+            .iter()
+            .map(|(id, p)| (*id, p.channel_id, p.peer, p.received_at))
+            .collect();
+        let pending: Vec<PendingOfferView> = entries
+            .into_iter()
+            .map(|(xfer_id, channel_id, peer, received_at)| PendingOfferView {
+                xfer_id,
+                peer,
+                received_at,
+                protected: xfer_sender_protected(state, db, &friends, channel_id, &peer),
+            })
+            .collect();
+        let sender_protected =
+            xfer_sender_protected(state, db, &friends, gossip.channel_id, &offer.sender);
+        xfer_offer_admission(
+            &pending,
+            state.xfer_recv.len(),
+            &offer.sender,
+            sender_protected,
+            std::time::Instant::now(),
+        )
+    };
     let refusal = if !xfer_offer_allowed(state, &offer.sender).await {
         Some(ember::channel::XferReply::NotAllowed)
     } else if offer.size > ember::channel::XFER_MAX_BYTES {
         Some(ember::channel::XferReply::TooLarge)
-    } else if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE
-        || state.xfer_pending.len() >= ember::channel::XFER_MAX_ACTIVE
-    {
+    } else if admission == XferOfferAdmission::Busy {
         Some(ember::channel::XferReply::Busy)
     } else {
         None
@@ -308,6 +445,31 @@ pub(super) async fn apply_xfer_offer(
         );
         send_xfer_frame(socket, state, db, gossip.channel_id, offer.sender, &plain).await;
         return;
+    }
+    if let XferOfferAdmission::Evict(victim_id) = admission {
+        if let Some(victim) = state.xfer_pending.remove(&victim_id) {
+            // Told, so their side ends now rather than waiting out the stall
+            // shed on an offer this device no longer holds.
+            let plain = ember::channel::encode_xfer_reply(
+                &victim.key,
+                &state.local_ed25519_pubkey,
+                &victim.peer,
+                &victim_id,
+                ember::channel::XferReply::Busy,
+            );
+            send_xfer_frame(socket, state, db, victim.channel_id, victim.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &victim_id,
+                &victim.channel_id,
+                &victim.peer,
+                "receive",
+                &victim.name,
+                victim.size,
+                0,
+                "expired",
+            );
+        }
     }
 
     state.xfer_pending.insert(
@@ -945,3 +1107,154 @@ pub(super) async fn drive_channel_transfers(
         }
     }
 }
+
+#[cfg(test)]
+mod xfer_offer_admission_tests {
+    use super::{
+        xfer_offer_admission, PendingOfferView, XferOfferAdmission, XFER_PENDING_MAX,
+        XFER_PENDING_MIN_DISPLAY, XFER_PENDING_PER_SENDER,
+    };
+    use crate::network::ember::channel::XFER_MAX_ACTIVE;
+    use std::time::{Duration, Instant};
+
+    fn member(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    fn id(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+
+    fn offer(n: u8, peer: u8, received_at: Instant, protected: bool) -> PendingOfferView {
+        PendingOfferView {
+            xfer_id: id(n),
+            peer: member(peer),
+            received_at,
+            protected,
+        }
+    }
+
+    /// Long enough ago that nothing is still inside its minimum display time.
+    fn shown(now: Instant, extra_secs: u64) -> Instant {
+        now - XFER_PENDING_MIN_DISPLAY - Duration::from_secs(extra_secs)
+    }
+
+    /// The sender allows `XFER_MAX_ACTIVE` transfers to one peer, so a second
+    /// file sent right after the first must not come back busy.
+    #[test]
+    fn back_to_back_offers_from_one_member_are_admitted_up_to_the_sender_cap() {
+        const _: () = assert!(XFER_PENDING_PER_SENDER >= 2);
+        let now = Instant::now();
+        let mut pending = Vec::new();
+        for i in 0..XFER_PENDING_PER_SENDER as u8 {
+            assert_eq!(
+                xfer_offer_admission(&pending, 0, &member(1), false, now),
+                XferOfferAdmission::Admit
+            );
+            pending.push(offer(i, 1, now, false));
+        }
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(1), false, now),
+            XferOfferAdmission::Busy
+        );
+    }
+
+    fn full_of_singletons(now: Instant, protected: bool) -> Vec<PendingOfferView> {
+        (0..XFER_PENDING_MAX as u8)
+            .map(|i| offer(i, 10 + i, shown(now, u64::from(XFER_PENDING_MAX as u8 - i)), protected))
+            .collect()
+    }
+
+    /// Cheap identities cannot clear the table: a newcomer who is not
+    /// protected is refused rather than displacing anybody's only offer.
+    #[test]
+    fn an_unprotected_newcomer_is_refused_rather_than_evicting() {
+        let now = Instant::now();
+        let pending = full_of_singletons(now, false);
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(99), false, now),
+            XferOfferAdmission::Busy
+        );
+    }
+
+    #[test]
+    fn a_protected_newcomer_displaces_the_oldest_unprotected_offer() {
+        let now = Instant::now();
+        let mut pending = full_of_singletons(now, false);
+        pending[0].protected = true;
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(99), true, now),
+            XferOfferAdmission::Evict(id(1)),
+            "the oldest offer is protected, so the next oldest goes"
+        );
+    }
+
+    #[test]
+    fn protected_offers_are_never_evicted_for_anybody() {
+        let now = Instant::now();
+        let pending = full_of_singletons(now, true);
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(99), true, now),
+            XferOfferAdmission::Busy
+        );
+    }
+
+    /// Nothing is displaced before it has been on screen for the minimum.
+    #[test]
+    fn a_fresh_offer_is_not_evicted() {
+        let now = Instant::now();
+        let pending: Vec<_> = (0..XFER_PENDING_MAX as u8)
+            .map(|i| offer(i, 10 + i, now, false))
+            .collect();
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(99), true, now),
+            XferOfferAdmission::Busy
+        );
+    }
+
+    /// One member holding the table gives way, protected or not, but only
+    /// down to where they still hold more than the newcomer.
+    #[test]
+    fn a_member_holding_the_most_gives_up_their_oldest() {
+        let now = Instant::now();
+        let mut pending = Vec::new();
+        let mut n = 0u8;
+        for peer in [1u8, 2] {
+            for i in 0..XFER_PENDING_PER_SENDER as u64 {
+                pending.push(offer(n, peer, shown(now, 100 - i - u64::from(peer) * 10), true));
+                n += 1;
+            }
+        }
+        assert_eq!(pending.len(), XFER_PENDING_MAX);
+        // Both hold the most, so the oldest of their offers goes — member 1's
+        // first, which carries the largest age offset.
+        assert_eq!(
+            xfer_offer_admission(&pending, 0, &member(3), false, now),
+            XferOfferAdmission::Evict(id(0))
+        );
+        // A member holding only one fewer than the busiest gains nothing by
+        // evicting: they would end up level with the member they displaced.
+        let mut close = pending.clone();
+        close.retain(|o| o.peer == member(1));
+        for i in 0..(XFER_PENDING_MAX - XFER_PENDING_PER_SENDER - (XFER_PENDING_PER_SENDER - 1)) as u8 {
+            close.push(offer(200 + i, 50 + i, shown(now, 0), false));
+        }
+        for i in 0..(XFER_PENDING_PER_SENDER - 1) as u8 {
+            close.push(offer(220 + i, 3, shown(now, 0), false));
+        }
+        assert_eq!(close.len(), XFER_PENDING_MAX);
+        assert_eq!(
+            xfer_offer_admission(&close, 0, &member(3), false, now),
+            XferOfferAdmission::Busy
+        );
+    }
+
+    #[test]
+    fn active_receives_still_bound_new_offers() {
+        assert_eq!(
+            xfer_offer_admission(&[], XFER_MAX_ACTIVE, &member(1), true, Instant::now()),
+            XferOfferAdmission::Busy
+        );
+    }
+}
+

@@ -44,7 +44,7 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
+  import { formatNumber, formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -3154,7 +3154,7 @@
     }
     pendingConfirm = { kind: 'copy-all-links', results: targets };
     confirmTitle = m.search_copy_all_confirm_title();
-    confirmMessage = m.search_copy_all_confirm({ count: targets.length.toLocaleString() });
+    confirmMessage = m.search_copy_all_confirm({ count: formatNumber(targets.length) });
     confirmOpen = true;
   }
 

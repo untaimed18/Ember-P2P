@@ -594,9 +594,23 @@
     listCollapsedLoaded = true;
     loadChannels();
     void refreshDirectory(false);
+    // A background browse is sixteen DHT walks plus sizing; skip it while the
+    // window is hidden or in the tray, like every other poll in the app, and
+    // catch up once on the way back if a tick was skipped.
+    let gatherMissedWhileHidden = false;
     const gatherTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        gatherMissedWhileHidden = true;
+        return;
+      }
       void refreshDirectory(false);
     }, 60_000);
+    const onGatherVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' || !gatherMissedWhileHidden) return;
+      gatherMissedWhileHidden = false;
+      void refreshDirectory(false);
+    };
+    document.addEventListener('visibilitychange', onGatherVisibilityChange);
     let cancelled = false;
     channelPresenceConfig()
       .then((config) => {
@@ -720,6 +734,7 @@
       cancelled = true;
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
+      document.removeEventListener('visibilitychange', onGatherVisibilityChange);
       unlistenMembers?.();
       unlistenPresence?.();
       unlistenChat?.();

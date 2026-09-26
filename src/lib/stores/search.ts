@@ -680,6 +680,34 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
 const MAX_SEARCH_TABS = 20;
 
 /**
+ * Rows a finished tab keeps once the user has moved off it.
+ *
+ * `MAX_TAB_RESULTS` bounds one tab; nothing bounded the set, so twenty finished
+ * broad searches could sit on 300k rows no one was looking at. The tab being
+ * viewed and the one still streaming keep their full cap.
+ */
+const IDLE_TAB_RESULTS = 3_000;
+
+function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
+  if (tab.id === activeId || tab.isSearching || tab.results.length <= IDLE_TAB_RESULTS) return tab;
+  const results = tab.results.slice();
+  shedWeakestRows(results, IDLE_TAB_RESULTS);
+  const resultIndex = new Map<string, number>();
+  for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
+  return { ...tab, results, resultIndex };
+}
+
+function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {
+  let changed = false;
+  const next = tabs.map((tab) => {
+    const trimmed = trimIdleTab(tab, activeId);
+    if (trimmed !== tab) changed = true;
+    return trimmed;
+  });
+  return changed ? next : tabs;
+}
+
+/**
  * Cancel a search, retrying briefly when the network task is busy.
  *
  * A tab's request id is rotated the moment it stops being the active search,
@@ -746,7 +774,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
       pendingByRequest.delete(rid);
       void cancelSearchWithRetry(rid);
     }
-    return next;
+    return trimIdleTabs(next, id);
   });
   activeSearchTabId.set(id);
   return { tabId: id, requestId, stoppedOthers };
@@ -754,6 +782,11 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
 
 export function setActiveSearchTab(tabId: string | null) {
   activeSearchTabId.set(tabId);
+  // Checked before writing: an object store notifies on every `set`, even of
+  // the same array, and the search page re-derives its whole list from it.
+  const tabs = get(searchTabs);
+  const trimmed = trimIdleTabs(tabs, tabId);
+  if (trimmed !== tabs) searchTabs.set(trimmed);
 }
 
 export async function closeSearchTab(tabId: string): Promise<void> {
@@ -1086,12 +1119,11 @@ export async function initSearchStore() {
       if (pendingByRequest.has(requestId)) {
         flushSearchResults();
       }
+      const activeId = get(activeSearchTabId);
       searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) => ({
-          ...t,
-          isSearching: false,
-          progress: null,
-        })),
+        updateTabByRequestId(tabs, requestId, (t) =>
+          trimIdleTab({ ...t, isSearching: false, progress: null }, activeId),
+        ),
       );
     }));
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(

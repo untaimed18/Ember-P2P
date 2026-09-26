@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { formatSize } from '$lib/utils';
+  import { formatDateTime, formatSize } from '$lib/utils';
   import ToggleSwitch from './ToggleSwitch.svelte';
   import {
     detectEmuleInstalls,
@@ -680,7 +680,7 @@
   {#if mode === 'settings' && report}
     <div class="group">
       <h4 class="subsection-title">
-        {m.emule_import_report_heading({ when: new Date(report.applied_at * 1000).toLocaleString() })}
+        {m.emule_import_report_heading({ when: formatDateTime(report.applied_at) })}
       </h4>
       <ul class="item-list">
         {#each report.items as item (item.kind)}

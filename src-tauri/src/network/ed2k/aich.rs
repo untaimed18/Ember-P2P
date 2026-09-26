@@ -795,6 +795,57 @@ pub fn corrupt_blocks_from_aich_recovery(
     Some(hs.find_corrupt_blocks(part_index, part_data, part_size))
 }
 
+/// [`corrupt_blocks_from_aich_recovery`] on the blocking pool. Hashing a whole
+/// 9.28 MB part is tens of milliseconds of SHA-1, too long for a Tokio worker.
+pub async fn corrupt_blocks_from_aich_recovery_blocking(
+    trusted_master: [u8; 20],
+    recovery_data: Vec<u8>,
+    part_index: usize,
+    part_data: std::sync::Arc<Vec<u8>>,
+    part_size: usize,
+    file_size: u64,
+) -> Option<Vec<usize>> {
+    tokio::task::spawn_blocking(move || {
+        corrupt_blocks_from_aich_recovery(
+            trusted_master,
+            &recovery_data,
+            part_index,
+            &part_data,
+            part_size,
+            file_size,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("AICH recovery task for part {part_index} failed: {e}");
+        None
+    })
+}
+
+/// Root and leaf count of a part's own AICH tree, for mismatch diagnostics,
+/// computed on the blocking pool.
+pub async fn part_aich_summary_blocking(
+    part_data: std::sync::Arc<Vec<u8>>,
+) -> Option<([u8; 20], usize)> {
+    tokio::task::spawn_blocking(move || {
+        let hs = AICHRecoveryHashSet::build_from_data(&part_data);
+        (hs.root_hash, hs.leaf_count())
+    })
+    .await
+    .ok()
+}
+
+/// [`compute_aich_part`] on the blocking pool.
+pub async fn compute_aich_part_blocking(
+    part_data: std::sync::Arc<Vec<u8>>,
+    part_index: usize,
+    num_parts: usize,
+) -> Option<[u8; 20]> {
+    tokio::task::spawn_blocking(move || compute_aich_part(&part_data, part_index, num_parts))
+        .await
+        .ok()
+}
+
 /// eMule known2_64.met file format version
 const KNOWN2_MET_VERSION: u8 = 0x02;
 

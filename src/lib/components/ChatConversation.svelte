@@ -23,7 +23,7 @@
     sendChannelMessage,
     type ChannelMessageInfo,
   } from '$lib/api/channels';
-  import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
+  import { activeChatHash, clearUnread, friendLabel, friendNames, onlineFriends } from '$lib/stores/friends';
   import { clearChannelUnread, noteChannelOnScreen } from '$lib/stores/channels';
   import {
     editChannelMessage,
@@ -40,6 +40,8 @@
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
   import {
+    formatCalendarDate,
+    formatClockTime,
     insertMention,
     isAppVisible,
     linkifyMessage,
@@ -142,6 +144,15 @@
   // opened.
   let isOnline = $derived(
     !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
+  );
+
+  /** Header name. For a friend it carries the short hash whenever the name
+   *  could pass for another friend's, since the header is what says who the
+   *  conversation is with. */
+  let headerName = $derived(
+    !isChannel && friendHash
+      ? friendLabel(friendHash, friendName, $friendNames)
+      : friendName || friendHash.slice(0, 8) + '\u2026',
   );
 
   // The user can disable chat entirely in Settings; when off, the backend
@@ -1709,7 +1720,7 @@
     if (day === yesterday.getTime()) return m.chat_day_yesterday();
     const d = new Date(ts * 1000);
     const sameYear = d.getFullYear() === new Date().getFullYear();
-    return d.toLocaleDateString(undefined, {
+    return formatCalendarDate(ts, {
       weekday: 'short',
       month: 'short',
       day: 'numeric',
@@ -1913,11 +1924,9 @@
     const d = new Date(ts * 1000);
     const now = new Date();
     const sameDay = d.toDateString() === now.toDateString();
-    if (sameDay) {
-      return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-    }
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
-      d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    const clock = formatClockTime(ts, { hour: '2-digit', minute: '2-digit' });
+    if (sameDay) return clock;
+    return `${formatCalendarDate(ts, { month: 'short', day: 'numeric' })} ${clock}`;
   }
 
   /** Where each file sits among the messages. See `chatAttachmentPlacement`. */
@@ -1979,7 +1988,7 @@
         </svg>
       </div>
       <span class="conv-name" title={friendName || friendHash}>
-        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
+        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi dir="auto">{headerName}</bdi>
       </span>
       {#if isOnline}
         <span class="conv-status online" title={m.chat_online_title()} aria-label={m.chat_online_aria()}>

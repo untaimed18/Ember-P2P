@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::network::ed2k::messages::ED2K_MAX_FILE_SIZE_BYTES;
 use crate::network::ed2k::part_tracker::{summarize_part_met, PartMetSummary, PartTracker};
 
 pub const PENDING_DIR: &str = "emule-import-pending";
@@ -679,11 +680,14 @@ fn scan_downloads(temp_dirs: &[PathBuf], ctx: &ScanContext) -> Vec<ScannedDownlo
             let part = dir.join(format!("{stem}.part"));
             // eMule keeps a `.bak` of the previous save; use it when the
             // current one does not parse, and stage whichever one did.
+            // A size past the ed2k ceiling is a corrupt record, not a download:
+            // nothing could ever fetch it, and summed into the move total it
+            // overflows.
             let Some((met, summary)) = [entry.path(), dir.join(format!("{stem}.part.met.bak"))]
                 .into_iter()
                 .find_map(|met| {
                     let summary = summarize_part_met(&std::fs::read(&met).ok()?).ok()?;
-                    Some((met, summary))
+                    (summary.file_size <= ED2K_MAX_FILE_SIZE_BYTES).then_some((met, summary))
                 })
             else {
                 continue;
@@ -1007,7 +1011,9 @@ fn stage_scan(
         }
         let temp_dir = Path::new(&download_folder).join("Temp");
         std::fs::create_dir_all(&temp_dir)?;
-        let total: u64 = chosen.iter().map(|d| d.summary.file_size).sum();
+        let total: u64 = chosen
+            .iter()
+            .fold(0u64, |total, d| total.saturating_add(d.summary.file_size));
         let mut done = 0u64;
         for download in chosen {
             let record = StagedDownload {
@@ -1117,5 +1123,49 @@ pub fn discard(data_dir: &Path) -> anyhow::Result<()> {
     match std::fs::remove_dir_all(pending_dir(data_dir)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part_met(hash: [u8; 16], name: &str, size: u64) -> Vec<u8> {
+        let mut buf = vec![0xE0];
+        buf.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+        buf.extend_from_slice(&hash);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0x02, 1, 0, 0x01]);
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&[0x0B, 1, 0, 0x02]);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf
+    }
+
+    /// Summed into the staging total, two such sizes overflowed — a panic,
+    /// since release builds keep overflow checks on.
+    #[test]
+    fn a_part_met_claiming_an_impossible_size_is_not_offered() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-emule-sizes-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (stem, hash, size) in [
+            ("001", [0x11; 16], u64::MAX),
+            ("002", [0x22; 16], 1u64 << 63),
+            ("003", [0x33; 16], 1000),
+        ] {
+            std::fs::write(dir.join(format!("{stem}.part.met")), part_met(hash, "f.bin", size))
+                .unwrap();
+            std::fs::write(dir.join(format!("{stem}.part")), vec![0u8; 16]).unwrap();
+        }
+        let found = scan_downloads(std::slice::from_ref(&dir), &ScanContext::default());
+        assert_eq!(found.len(), 1, "only the plausible download is listed");
+        assert_eq!(found[0].summary.file_hash, [0x33; 16]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

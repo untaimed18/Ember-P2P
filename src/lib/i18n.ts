@@ -22,6 +22,7 @@
  */
 import {
   baseLocale,
+  extractLocaleFromNavigator,
   locales,
   getLocale,
   setLocale,
@@ -73,43 +74,19 @@ export function useSystemLocale(): void {
 
 /**
  * The locale that `preferredLanguage` would resolve to right
- * now — i.e. the first compiled locale whose language tag is a
- * prefix match for `navigator.language`, otherwise the base.
- * Used by the Settings picker to show e.g. "System (Spanish)"
+ * now. Used by the Settings picker to show e.g. "System (Spanish)"
  * so the user knows what they'd be following.
+ *
+ * Delegates to the same Paraglide function the strategy chain runs,
+ * so the label always names the locale that would actually load.
  */
 export function systemLocale(): Locale {
   if (typeof navigator === 'undefined') return baseLocale;
-  const nav = (navigator.languages?.[0] ?? navigator.language ?? '').toLowerCase();
-  if (!nav) return baseLocale;
-  const lang = nav.split('-')[0];
-  const compiled = locales as readonly Locale[];
-  // exact match first (e.g. zh-CN), then language-only (e.g. es),
-  // then script/region-aware Chinese, then primary-subtag match.
-  const exact = compiled.find((l) => l.toLowerCase() === nav);
-  if (exact) return exact;
-  const prefix = compiled.find((l) => l.toLowerCase() === lang);
-  if (prefix) return prefix;
-  if (lang === 'zh') {
-    // Match whole subtags, not substrings. An explicit script wins over the
-    // region, so `zh-Hans-HK` is Simplified even though its region normally
-    // implies Traditional — a substring test read the `hk` and got it
-    // backwards.
-    const parts = nav.split(/[-_]/);
-    const hant = parts.includes('hant')
-      ? true
-      : parts.includes('hans')
-        ? false
-        : parts.some((part) => part === 'tw' || part === 'hk' || part === 'mo');
-    const want = hant ? 'zh-tw' : 'zh-cn';
-    const preferred = compiled.find((l) => l.toLowerCase() === want);
-    if (preferred) return preferred;
+  try {
+    return extractLocaleFromNavigator() ?? baseLocale;
+  } catch {
+    return baseLocale;
   }
-  const regional = compiled.find((l) => {
-    const lower = l.toLowerCase();
-    return lower.startsWith(`${lang}-`) || lower.startsWith(`${lang}_`);
-  });
-  return regional ?? baseLocale;
 }
 
 /**

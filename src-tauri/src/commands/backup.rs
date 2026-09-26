@@ -1246,6 +1246,15 @@ pub async fn preview_backup(
 
     tokio::task::spawn_blocking(move || {
         let scratch = temp_dir_in(&data_dir, "restore-tmp")?;
+        // The scratch dir holds the decrypted archive, so it has to go even if
+        // the preview unwinds.
+        struct RemoveOnDrop<'a>(&'a Path);
+        impl Drop for RemoveOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(&scratch);
         let result = (|| {
             let zip_path = scratch.join("payload.zip");
             decrypt_stream(&source, &zip_path, &passphrase)?;
@@ -1259,7 +1268,9 @@ pub async fn preview_backup(
                     .iter()
                     .filter(|f| !is_legacy_ignored(&f.name))
             };
-            let total_bytes = restorable().map(|f| f.size).sum();
+            // Sizes are the manifest's word, not the archive's; a crafted one
+            // must not be able to overflow the total.
+            let total_bytes = restorable().fold(0u64, |total, f| total.saturating_add(f.size));
             Ok(BackupPreview {
                 app_version: manifest.app_version.clone(),
                 created_at: manifest.created_at,
@@ -1271,7 +1282,6 @@ pub async fn preview_backup(
                     > crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION,
             })
         })();
-        let _ = std::fs::remove_dir_all(&scratch);
         result
     })
     .await

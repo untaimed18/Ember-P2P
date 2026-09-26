@@ -158,6 +158,94 @@ mod rendezvous_room_selection_tests {
 }
 
 #[cfg(test)]
+mod channel_roster_snapshot_tests {
+    use super::{ChannelRosterSnapshot, CHANNEL_ROSTER_SNAPSHOT_TTL};
+    use crate::storage::database::StoredChannelMember;
+    use std::time::Instant;
+
+    fn row(pk: u8, last_seen: i64, banned: bool) -> StoredChannelMember {
+        StoredChannelMember {
+            member_pubkey: hex::encode([pk; 32]),
+            nickname: String::new(),
+            last_seen,
+            banned,
+            moderator: false,
+        }
+    }
+
+    fn snapshot(generation: u64, at: Instant) -> ChannelRosterSnapshot {
+        ChannelRosterSnapshot::from_rows(
+            vec![row(1, 1_000, false), row(2, 10, false), row(3, 1_000, true)],
+            generation,
+            at,
+        )
+    }
+
+    #[test]
+    fn status_matches_what_the_table_would_say() {
+        let snap = snapshot(0, Instant::now());
+        assert_eq!(snap.status(&[1; 32]), Some(false));
+        assert_eq!(snap.status(&[3; 32]), Some(true));
+        assert_eq!(snap.status(&[9; 32]), None);
+    }
+
+    /// Freshness is judged when asked, and a touch still waiting on its flush
+    /// counts: otherwise a member heard from a moment ago would read as stale
+    /// until the next flush, and a queued line would keep waiting on them.
+    #[test]
+    fn fresh_members_exclude_bans_and_count_pending_touches() {
+        let snap = snapshot(0, Instant::now());
+        assert_eq!(snap.fresh_members(500, |_| None), vec![[1; 32]]);
+        let fresh = snap.fresh_members(500, |pk| (*pk == [2; 32]).then_some(900));
+        assert_eq!(fresh, vec![[1; 32], [2; 32]]);
+        let banned_touched = snap.fresh_members(500, |pk| (*pk == [3; 32]).then_some(900));
+        assert!(!banned_touched.contains(&[3; 32]), "a ban is not undone by presence");
+    }
+
+    #[test]
+    fn a_snapshot_is_valid_only_under_its_own_generation() {
+        let now = Instant::now();
+        let snap = snapshot(7, now);
+        assert!(snap.valid_at(7, now));
+        assert!(!snap.valid_at(8, now), "any roster write since");
+        assert!(!snap.valid_at(7, now + CHANNEL_ROSTER_SNAPSHOT_TTL), "the backstop");
+    }
+
+    /// A roster that could not be read admits nobody: every author reads as
+    /// banned, nobody is on it for a retired-key check, and it is never taken
+    /// as current, so the next caller reads again.
+    #[test]
+    fn an_unreadable_roster_fails_closed_and_is_never_current() {
+        let now = Instant::now();
+        let snap = ChannelRosterSnapshot::unreadable(now);
+        assert_eq!(snap.status(&[1; 32]), Some(true));
+        assert!(snap.fresh_members(0, |_| Some(i64::MAX)).is_empty());
+        assert!(!snap.is_moderator(&[1; 32]));
+        assert!(!snap.valid_at(0, now));
+    }
+
+    #[test]
+    fn a_banned_moderator_is_not_a_moderator() {
+        let mut moderator = row(6, 1_000, false);
+        moderator.moderator = true;
+        let mut banned = row(7, 1_000, true);
+        banned.moderator = true;
+        let snap = ChannelRosterSnapshot::from_rows(vec![moderator, banned], 0, Instant::now());
+        assert!(snap.is_moderator(&[6; 32]));
+        assert!(!snap.is_moderator(&[7; 32]));
+        assert!(!snap.is_moderator(&[8; 32]));
+    }
+
+    #[test]
+    fn rows_that_do_not_decode_are_dropped() {
+        let mut bad = row(4, 1_000, false);
+        bad.member_pubkey = "zz".into();
+        let snap = ChannelRosterSnapshot::from_rows(vec![bad, row(5, 1_000, false)], 0, Instant::now());
+        assert_eq!(snap.fresh_members(0, |_| None), vec![[5; 32]]);
+    }
+}
+
+#[cfg(test)]
 mod channel_view_cache_tests {
     use super::{
         make_room_in_channel_view_cache, CachedChannelView, CHANNEL_VIEW_CACHE_MAX,
@@ -196,6 +284,7 @@ mod channel_view_cache_tests {
                 slow_mode_secs: 0,
             },
             content_keys: Vec::new(),
+            roster: None,
         }
     }
 
@@ -508,6 +597,190 @@ pub(super) struct CachedChannelView {
     pub(super) fetched_at: std::time::Instant,
     pub(super) row: crate::storage::database::StoredChannel,
     pub(super) content_keys: Vec<[u8; 32]>,
+    /// Carried across refreshes of `row`: it has its own validity rule (see
+    /// [`ChannelRosterSnapshot`]), and the view's one-second TTL would
+    /// otherwise throw it away with the row.
+    pub(super) roster: Option<Arc<ChannelRosterSnapshot>>,
+}
+
+/// One room's `channel_members`, as of a [`Database::channel_roster_generation`].
+///
+/// Every roster write moves the generation, so a snapshot whose generation
+/// still matches is exactly what the table holds — including bans written from
+/// an IPC command, which never pass through the network loop. That is what
+/// lets the per-frame paths (fanout, relay, presence, chat ingest) answer
+/// "who is here" and "is this author banned" without a query each, where each
+/// used to be a full `list_channel_members` scan or a point read on the
+/// process-wide connection, run inline on the `select!` loop.
+///
+/// Freshness is judged at read time, against `now` and the buffered
+/// [`NetworkState::channel_member_touches`], so a snapshot does not go stale
+/// just because time passed or a touch is still waiting on its flush.
+pub(super) struct ChannelRosterSnapshot {
+    fetched_at: std::time::Instant,
+    generation: u64,
+    /// In `list_channel_members` order, which is the order
+    /// [`channel_member_pubkeys`] has always returned.
+    rows: Vec<RosterRow>,
+    index: HashMap<[u8; 32], usize>,
+    /// The roster could not be read. Every question is answered in the
+    /// direction that admits nobody: all banned, none fresh, no moderators.
+    unreadable: bool,
+}
+
+struct RosterRow {
+    member: [u8; 32],
+    last_seen: i64,
+    banned: bool,
+    moderator: bool,
+}
+
+/// Backstop only: invalidation is by generation. Bounds how long a write
+/// outside `Database`'s methods — there are none today — could go unseen.
+pub(super) const CHANNEL_ROSTER_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(
+    crate::storage::database::CHANNEL_ROSTER_SNAPSHOT_TTL_SECS as u64,
+);
+
+impl ChannelRosterSnapshot {
+    pub(super) fn from_rows(
+        rows: Vec<crate::storage::database::StoredChannelMember>,
+        generation: u64,
+        fetched_at: std::time::Instant,
+    ) -> Self {
+        let rows: Vec<RosterRow> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let bytes = hex::decode(&row.member_pubkey).ok()?;
+                Some(RosterRow {
+                    member: <[u8; 32]>::try_from(bytes).ok()?,
+                    last_seen: row.last_seen,
+                    banned: row.banned,
+                    moderator: row.moderator,
+                })
+            })
+            .collect();
+        let index = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.member, i))
+            .collect();
+        Self {
+            fetched_at,
+            generation,
+            rows,
+            index,
+            unreadable: false,
+        }
+    }
+
+    pub(super) fn unreadable(fetched_at: std::time::Instant) -> Self {
+        Self {
+            fetched_at,
+            generation: 0,
+            rows: Vec::new(),
+            index: HashMap::new(),
+            unreadable: true,
+        }
+    }
+
+    pub(super) fn valid_at(&self, generation: u64, now: std::time::Instant) -> bool {
+        !self.unreadable
+            && self.generation == generation
+            && now.saturating_duration_since(self.fetched_at) < CHANNEL_ROSTER_SNAPSHOT_TTL
+    }
+
+    /// Same answer as [`Database::channel_member_status`]: `None` for no row,
+    /// `Some(banned)` otherwise.
+    pub(super) fn status(&self, member: &[u8; 32]) -> Option<bool> {
+        if self.unreadable {
+            return Some(true);
+        }
+        self.index.get(member).map(|&i| self.rows[i].banned)
+    }
+
+    pub(super) fn is_moderator(&self, member: &[u8; 32]) -> bool {
+        self.index
+            .get(member)
+            .is_some_and(|&i| self.rows[i].moderator && !self.rows[i].banned)
+    }
+
+    /// Same answer as [`channel_member_pubkeys`], with each row's `last_seen`
+    /// raised by whatever `pending` still holds for it.
+    pub(super) fn fresh_members(
+        &self,
+        cutoff: i64,
+        pending: impl Fn(&[u8; 32]) -> Option<i64>,
+    ) -> Vec<[u8; 32]> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                !row.banned && row.last_seen.max(pending(&row.member).unwrap_or(i64::MIN)) >= cutoff
+            })
+            .map(|row| row.member)
+            .collect()
+    }
+}
+
+/// The room's roster snapshot, re-read only when the table has moved since.
+///
+/// Held on the room's [`CachedChannelView`], so a room this device has not
+/// joined caches nothing here either. For such a room this still answers,
+/// from a fresh read.
+pub(super) fn channel_roster_snapshot(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+) -> Arc<ChannelRosterSnapshot> {
+    let now = std::time::Instant::now();
+    let channel_id_hex = hex::encode(channel_id);
+    let generation = db.channel_roster_generation(&channel_id_hex);
+    if let Some(snapshot) = state
+        .channel_view_cache
+        .get(&channel_id)
+        .and_then(|view| view.roster.as_ref())
+    {
+        if snapshot.valid_at(generation, now) {
+            return snapshot.clone();
+        }
+    }
+    // Not cached, so the next caller reads again. Cached as an empty roster, a
+    // transient error was a room where nobody was banned for the next 30 s.
+    let rows = match db.list_channel_members(&channel_id_hex) {
+        Ok(rows) => rows,
+        Err(e) => {
+            debug!("Channel roster read failed for {channel_id_hex}: {e}");
+            return Arc::new(ChannelRosterSnapshot::unreadable(now));
+        }
+    };
+    let snapshot = Arc::new(ChannelRosterSnapshot::from_rows(rows, generation, now));
+    if let Some(view) = state.channel_view_cache.get_mut(&channel_id) {
+        view.roster = Some(snapshot.clone());
+    }
+    snapshot
+}
+
+/// [`channel_member_pubkeys`] from the room's roster snapshot.
+pub(super) fn channel_member_pubkeys_cached(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+) -> Vec<[u8; 32]> {
+    let snapshot = channel_roster_snapshot(state, db, channel_id);
+    let cutoff = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(ember::channel::PRESENCE_FRESH_SECS);
+    let touches = &state.channel_member_touches;
+    snapshot.fresh_members(cutoff, |pk| touches.get(&(channel_id, *pk)).copied())
+}
+
+/// [`Database::channel_member_status`] from the room's roster snapshot.
+pub(super) fn channel_member_status_cached(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+) -> Option<bool> {
+    channel_roster_snapshot(state, db, channel_id).status(member)
 }
 
 /// How long a memoised room view is served before it is read again.
@@ -565,10 +838,15 @@ pub(super) fn cached_channel_view(
     // absence would let them size this map.
     let row = db.get_channel_lite(&channel_id_hex).ok().flatten()?;
     let content_keys = channel_content_keys(db, &row);
+    let roster = state
+        .channel_view_cache
+        .get(&channel_id)
+        .and_then(|old| old.roster.clone());
     let view = CachedChannelView {
         fetched_at: now,
         row,
         content_keys,
+        roster,
     };
     make_room_in_channel_view_cache(&mut state.channel_view_cache, now);
     state.channel_view_cache.insert(channel_id, view.clone());
@@ -1199,6 +1477,12 @@ pub(super) async fn apply_channel_presence_beacons(
     let announcement = beacons.len() == 1;
     let mut roster_changed = false;
     let mut relay = false;
+    // One snapshot for the whole digest. The inserts and removals below each
+    // move the roster generation, and re-reading the roster after every one
+    // of them would put back the per-beacon queries this replaces; the rows
+    // this frame changed are tracked beside it instead.
+    let snapshot = channel_roster_snapshot(state, db, channel_id);
+    let mut written: HashMap<[u8; 32], Option<bool>> = HashMap::new();
     for beacon in beacons {
         if beacon.member == state.local_ed25519_pubkey {
             continue;
@@ -1207,9 +1491,10 @@ pub(super) async fn apply_channel_presence_beacons(
             continue;
         };
         let member_hex = hex::encode(beacon.member);
-        let status = db
-            .channel_member_status(&ch.channel_id, &member_hex)
-            .unwrap_or(None);
+        let status = written
+            .get(&beacon.member)
+            .copied()
+            .unwrap_or_else(|| snapshot.status(&beacon.member));
         if status == Some(true) {
             continue;
         }
@@ -1243,6 +1528,7 @@ pub(super) async fn apply_channel_presence_beacons(
             {
                 roster_changed = true;
                 state.rendezvous_last_register = None;
+                written.insert(beacon.member, None);
             }
             // Kept rather than dropped, and passed on in digests like any other
             // beacon. It is signed, so relaying it needs no trust, and holding
@@ -1256,12 +1542,12 @@ pub(super) async fn apply_channel_presence_beacons(
             continue;
         }
         if status.is_some() {
-            if db
-                .touch_channel_member_last_seen(&ch.channel_id, &member_hex, at)
-                .unwrap_or(false)
-            {
-                mark_channel_presence_dirty(state, channel_id, &beacon.member, at);
-            }
+            // Buffered like every other liveness touch, and flushed in one
+            // transaction by `flush_channel_member_touches`, which is also
+            // what reports the rows that moved to the UI. A digest carries up
+            // to a roster's worth of beacons, so writing each here was a
+            // synchronous fsync per beacon on the network task.
+            note_channel_member_alive(state, channel_id, &beacon.member, at);
         } else {
             if !channel_beacon_insert_ok(state, channel_id, now) {
                 continue;
@@ -1282,6 +1568,7 @@ pub(super) async fn apply_channel_presence_beacons(
                     // pairwise capability they will look us up under has to be
                     // re-registered rather than waiting out the heartbeat.
                     state.rendezvous_last_register = None;
+                    written.insert(beacon.member, Some(false));
                 }
                 // The room is full of members who are neither stale nor exempt.
                 // Not cached and not relayed: the beacon map is meant to be

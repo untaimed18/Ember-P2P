@@ -714,25 +714,35 @@ pub(in crate::network) async fn on_bootstrap_tick(
         // The outer gate already requires external_ip.is_some();
         // guard defensively so a future change there degrades to
         // "not discoverable yet" instead of panicking this task.
-        if let Some(rv_ip) = state.external_ip {
+        //
+        // Never registered, so there is no success clock: the failure
+        // backoff alone decides, or a server that is down or 503ing gets
+        // every unregistered client retrying on every tick.
+        let initial_retry_due = register_retry_due(
+            None,
+            state.rendezvous_last_attempt.map(|t| t.elapsed()),
+            state.rendezvous_register_fail_streak,
+            &ember_hash,
+        );
+        match state.external_ip {
+        _ if !initial_retry_due => {}
+        Some(rv_ip) => {
             let rv_pubkey = ed25519_pubkey;
             let rv_secret = ed25519_secret_key;
-            let (rv_friends, rv_channel_neighbors) =
-                load_rendezvous_register_targets(
-                    db,
-                    rv_pubkey,
-                    state.channel_focused,
-                    state.rendezvous_room_beat,
-                )
-                .await;
+            let rv_focused = state.channel_focused;
+            let rv_beat = state.rendezvous_room_beat;
             let tx = rendezvous_register_result_tx.clone();
             *rendezvous_register_in_flight = true;
             *rendezvous_register_started_at = Some(tokio::time::Instant::now());
+            state.rendezvous_last_attempt = Some(std::time::Instant::now());
             state.rendezvous_register_generation =
                 state.rendezvous_register_generation.saturating_add(1);
             let generation = state.rendezvous_register_generation;
             let rv_db = db.clone();
             tokio::spawn(async move {
+                let (rv_friends, rv_channel_neighbors) =
+                    load_rendezvous_register_targets(&rv_db, rv_pubkey, rv_focused, rv_beat)
+                        .await;
                 let result =
                     crate::network::friends::register_presence(
                         rv_db,
@@ -753,8 +763,10 @@ pub(in crate::network) async fn on_bootstrap_tick(
                     result,
                 });
             });
-        } else {
+        }
+        None => {
             debug!("Initial rendezvous register skipped: external_ip unexpectedly None");
+        }
         }
     }
 
@@ -780,10 +792,11 @@ pub(in crate::network) async fn on_bootstrap_tick(
         state.friend_presence_initial_done,
         *rendezvous_register_in_flight,
         state.rendezvous_last_register.map(|t| t.elapsed()),
-    ) && presence_failure_retry_due(
+    ) && register_retry_due(
         state.rendezvous_last_register.map(|t| t.elapsed()),
         state.rendezvous_last_attempt.map(|t| t.elapsed()),
         state.rendezvous_register_fail_streak,
+        &ember_hash,
     ) {
         if let Some(rv_ip) = state.external_ip {
             let rv_url = settings.rendezvous_url.clone();
@@ -792,14 +805,8 @@ pub(in crate::network) async fn on_bootstrap_tick(
             let rv_hash = ember_hash;
             let rv_pubkey = ed25519_pubkey;
             let rv_secret = ed25519_secret_key;
-            let (rv_friends, rv_channel_neighbors) =
-                load_rendezvous_register_targets(
-                    db,
-                    rv_pubkey,
-                    state.channel_focused,
-                    state.rendezvous_room_beat,
-                )
-                .await;
+            let rv_focused = state.channel_focused;
+            let rv_beat = state.rendezvous_room_beat;
             let tx = rendezvous_register_result_tx.clone();
             *rendezvous_register_in_flight = true;
             *rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -809,6 +816,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
             let generation = state.rendezvous_register_generation;
             let rv_db = db.clone();
             tokio::spawn(async move {
+                let (rv_friends, rv_channel_neighbors) =
+                    load_rendezvous_register_targets(&rv_db, rv_pubkey, rv_focused, rv_beat)
+                        .await;
                 let result = crate::network::friends::register_presence(
                     rv_db,
                     &rv_url,
@@ -890,4 +900,98 @@ pub(in crate::network) async fn on_bootstrap_tick(
         }
     }
 
+}
+
+/// Most the failure backoff is stretched, in thousandths: up to half again.
+const REGISTER_RETRY_JITTER_MAX_PERMILLE: u32 = 500;
+
+/// How far this node stretches the failure backoff at `fail_streak`.
+///
+/// Every client loses the server at the same moment, so unjittered they all
+/// come back on the same schedule. Derived from our hash and the streak rather
+/// than rolled per tick: a fresh roll on every 10 s tick would make each tick a
+/// coin flip and collapse the spread back towards the base interval.
+fn register_retry_jitter_permille(ember_hash: &[u8; 16], fail_streak: u32) -> u32 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ember/rendezvous-register-retry-jitter");
+    hasher.update(ember_hash);
+    hasher.update(&fail_streak.to_le_bytes());
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) % (REGISTER_RETRY_JITTER_MAX_PERMILLE + 1)
+}
+
+/// [`presence_failure_retry_due`] with this node's jitter applied to the
+/// failure backoff. The success-path interval is left exact.
+fn register_retry_due(
+    since_last_register: Option<std::time::Duration>,
+    since_last_attempt: Option<std::time::Duration>,
+    fail_streak: u32,
+    ember_hash: &[u8; 16],
+) -> bool {
+    let jitter = register_retry_jitter_permille(ember_hash, fail_streak);
+    // Shrinking the elapsed time by the stretch factor is the same test as
+    // stretching the backoff it is compared against.
+    presence_failure_retry_due(
+        since_last_register,
+        since_last_attempt.map(|elapsed| elapsed * 1000 / (1000 + jitter)),
+        fail_streak,
+    )
+}
+
+#[cfg(test)]
+mod register_retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const HASH: [u8; 16] = [7; 16];
+
+    #[test]
+    fn the_first_attempt_is_immediate() {
+        assert!(register_retry_due(None, None, 0, &HASH));
+    }
+
+    #[test]
+    fn a_failed_first_registration_backs_off_like_a_failed_heartbeat() {
+        for streak in 1..8u32 {
+            let base = Duration::from_secs(presence_failure_retry_secs(streak));
+            assert!(
+                !register_retry_due(None, Some(base - Duration::from_millis(1)), streak, &HASH),
+                "streak {streak} retried before its backoff"
+            );
+            let stretched = base * (1000 + REGISTER_RETRY_JITTER_MAX_PERMILLE) / 1000;
+            assert!(
+                register_retry_due(None, Some(stretched + Duration::from_millis(1)), streak, &HASH),
+                "streak {streak} still waiting past the jitter ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_backoff_lets_the_first_registration_go_straight_out() {
+        // What a disconnect after a run of failed heartbeats used to leave behind.
+        let carried_streak = 6;
+        let carried_attempt = Some(Duration::from_secs(30));
+        assert!(!register_retry_due(None, carried_attempt, carried_streak, &HASH));
+        // The disconnect handler clears the streak and the attempt clock.
+        assert!(register_retry_due(None, None, 0, &HASH));
+    }
+
+    #[test]
+    fn a_live_success_clock_is_not_jittered() {
+        assert!(register_retry_due(Some(Duration::ZERO), Some(Duration::ZERO), 9, &HASH));
+    }
+
+    #[test]
+    fn jitter_is_bounded_stable_and_differs_between_nodes() {
+        let mut distinct = std::collections::HashSet::new();
+        for n in 0..64u8 {
+            let hash = [n; 16];
+            let j = register_retry_jitter_permille(&hash, 3);
+            assert!(j <= REGISTER_RETRY_JITTER_MAX_PERMILLE);
+            assert_eq!(j, register_retry_jitter_permille(&hash, 3));
+            distinct.insert(j);
+        }
+        assert!(distinct.len() > 16, "jitter barely varies across nodes: {distinct:?}");
+    }
 }

@@ -1,7 +1,7 @@
 import { writable, get } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import { isAppVisible } from '$lib/utils';
+import { confusableSkeleton, isAppVisible, mixesLookalikeScripts } from '$lib/utils';
 import {
   getFriendRequests,
   getFriends,
@@ -90,9 +90,63 @@ function safeEventText(raw: unknown, max = 4096): string {
  * chose one, and "someone you added is online" is worse than eight hex digits.
  */
 export function friendDisplayName(friendHash: string): string {
+  return friendLabel(friendHash, undefined, get(friendNames));
+}
+
+let skeletonCountsFor: Map<string, string> | null = null;
+let skeletonCounts = new Map<string, number>();
+
+/** How many friends' names fold to each skeleton. Cached per map: the store
+ *  only ever replaces the map, so identity is the change signal. */
+function friendSkeletonCounts(names: Map<string, string>): Map<string, number> {
+  if (names !== skeletonCountsFor) {
+    skeletonCountsFor = names;
+    skeletonCounts = new Map();
+    for (const name of names.values()) {
+      const key = confusableSkeleton(name);
+      skeletonCounts.set(key, (skeletonCounts.get(key) ?? 0) + 1);
+    }
+  }
+  return skeletonCounts;
+}
+
+/**
+ * Whether a friend's name alone does not say which friend it is: another
+ * friend's name looks the same once lookalike characters are folded, or the
+ * name mixes Latin, Cyrillic and Greek letters the way a spoof does.
+ */
+export function friendNameIsAmbiguous(
+  friendHash: string,
+  name: string,
+  names: Map<string, string>,
+): boolean {
+  if (mixesLookalikeScripts(name)) return true;
+  const key = confusableSkeleton(name);
+  let others = friendSkeletonCounts(names).get(key) ?? 0;
+  const own = names.get(friendHash.toLowerCase());
+  if (own !== undefined && confusableSkeleton(own) === key) others -= 1;
+  return others > 0;
+}
+
+/**
+ * Display label for a friend: the name, with a short hash beside it when the
+ * name is ambiguous (see {@link friendNameIsAmbiguous}), or the short hash
+ * alone when there is no name.
+ *
+ * `nickname` overrides the cached name for callers that hold a fresher one;
+ * `names` is passed in so a component can supply `$friendNames` and re-render
+ * when the cache changes.
+ */
+export function friendLabel(
+  friendHash: string,
+  nickname: string | null | undefined,
+  names: Map<string, string>,
+): string {
   const hash = friendHash.toLowerCase();
-  const known = get(friendNames).get(hash);
-  return known && known.trim() ? known : `${hash.slice(0, 8)}\u2026`;
+  const short = `${hash.slice(0, 8)}\u2026`;
+  const name = (nickname ?? '').trim() || (names.get(hash) ?? '').trim();
+  if (!name) return short;
+  return friendNameIsAmbiguous(hash, name, names) ? `${name} (${short})` : name;
 }
 
 /** Record (or refresh) one friend's nickname. */
@@ -502,7 +556,9 @@ export async function initFriendsStore() {
           scheduleFriendRequestRefetch();
 
           if (!alreadyPending && shouldNotify('friend_request')) {
-            const name = nickname.trim() || `${sender_hash.slice(0, 8)}\u2026`;
+            // A stranger named like an existing friend is exactly the case the
+            // short hash is for.
+            const name = friendLabel(sender_hash, nickname, get(friendNames));
             void notify(
               'friend_request',
               m.notify_friend_request_title(),
@@ -564,7 +620,7 @@ export async function initFriendsStore() {
         scheduleFriendRequestRefetch();
         const nickname = safeEventText(event.payload?.nickname, 128);
         rememberFriendName(hash, nickname);
-        const name = nickname || `${hash.slice(0, 8)}\u2026`;
+        const name = friendLabel(hash, nickname, get(friendNames));
         toastSuccess(m.friends_auto_confirmed({ name }));
         scheduleFriendsListRefresh();
       }),

@@ -6,7 +6,7 @@
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
-  import { formatBytes } from '$lib/utils';
+  import { formatBytes, formatNumber } from '$lib/utils';
   import {
     addSharedFolder,
     closeShareBrowser,
@@ -624,7 +624,7 @@
               </div>
             {/each}
             {#if truncated}
-              <div class="empty">{m.library_explorer_truncated({ count: children.length.toLocaleString() })}</div>
+              <div class="empty">{m.library_explorer_truncated({ count: formatNumber(children.length) })}</div>
             {/if}
           {/if}
         </div>

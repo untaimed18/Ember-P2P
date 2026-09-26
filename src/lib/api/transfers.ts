@@ -110,6 +110,24 @@ export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }
 
+/** `TransferDelta` in `sharing/manager.rs`. */
+export interface TransferDelta {
+  epoch: number;
+  revision: number;
+  /** `transfers` is every row; replace rather than merge. */
+  full: boolean;
+  transfers: Transfer[];
+  removed: string[];
+}
+
+/** Rows changed since `since` of `epoch`. Pass `null`/`0` for a full snapshot. */
+export async function getTransfersSince(
+  epoch: number | null,
+  since: number,
+): Promise<TransferDelta> {
+  return invoke('get_transfers_since', { epoch, since });
+}
+
 /** Snapshot of peers waiting in our upload queue (transfers/uploads pane,
  *  "Queued" tab). Polled on demand while the tab is visible. */
 export async function getUploadQueue(): Promise<UploadQueueClient[]> {

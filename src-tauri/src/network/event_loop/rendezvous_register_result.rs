@@ -75,10 +75,10 @@ pub(in crate::network) async fn on_rendezvous_register_result(
             state.rendezvous_registered = false;
             state.last_presence_blocked = false;
             state.rendezvous_last_register = None;
-            if !result.initial {
-                state.rendezvous_register_fail_streak =
-                    state.rendezvous_register_fail_streak.saturating_add(1);
-            }
+            // Initial failures count too: the first-registration path backs
+            // off on this streak exactly as the heartbeat does.
+            state.rendezvous_register_fail_streak =
+                state.rendezvous_register_fail_streak.saturating_add(1);
             let _ = app_handle.emit(
                 "ember:friend-discoverable",
                 serde_json::json!({

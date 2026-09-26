@@ -1181,6 +1181,47 @@ impl std::fmt::Display for PresenceRegisterError {
     }
 }
 
+/// Furthest ahead of the wall clock a capability registration is signed. The
+/// server accepts ±300 s, and friends verifying the proof on lookup accept
+/// [`MAX_LOOKUP_SIG_AGE_SECS`]; a few seconds is all the ordering below needs.
+const CAPABILITY_TS_MAX_LEAD_SECS: i64 = 5;
+/// Capabilities whose last signed second is remembered. Only ones signed at
+/// or after the current second are kept, so this is a burst bound, not a
+/// history.
+const CAPABILITY_TS_MAX_TRACKED: usize = 4_096;
+
+/// Last second each capability was signed at, for [`next_capability_ts`].
+static CAPABILITY_LAST_SIGNED_TS: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], i64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Timestamp for the next registration of `capability`: strictly after the
+/// last one signed for it, where the lead allows.
+///
+/// The server refuses a registration whose timestamp does not exceed the
+/// stored one unless every field matches, since timestamps cannot order two
+/// proofs signed in the same second. A heartbeat followed within that second
+/// by an address change would otherwise 409, leaving the old address
+/// published until the next heartbeat.
+fn next_capability_ts(
+    last_signed: &mut std::collections::BTreeMap<[u8; 32], i64>,
+    capability: &[u8; 32],
+    now: i64,
+) -> i64 {
+    // Anything signed before `now` cannot push `now` forward.
+    last_signed.retain(|_, last| *last >= now);
+    let ts = match last_signed.get(capability) {
+        Some(&last) => last
+            .saturating_add(1)
+            .clamp(now, now.saturating_add(CAPABILITY_TS_MAX_LEAD_SECS)),
+        None => now,
+    };
+    if last_signed.len() < CAPABILITY_TS_MAX_TRACKED || last_signed.contains_key(capability) {
+        let entry = last_signed.entry(*capability).or_insert(ts);
+        *entry = (*entry).max(ts);
+    }
+    ts
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn register_capability_presence(
     base_url: &str,
@@ -1194,6 +1235,13 @@ async fn register_capability_presence(
     protocol: RendezvousProtocol,
     intro: IntroProof<'_>,
 ) -> Result<(), PresenceRegisterError> {
+    let ts = next_capability_ts(
+        &mut CAPABILITY_LAST_SIGNED_TS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        capability,
+        current_timestamp(),
+    );
     let (route, body) = build_capability_presence_request(
         capability,
         epoch,
@@ -1204,7 +1252,7 @@ async fn register_capability_presence(
         secret_key,
         protocol,
         intro,
-        current_timestamp(),
+        ts,
     );
     let resp = client(base_url)
         .await?
@@ -3159,30 +3207,131 @@ pub(crate) struct DirectoryChannel {
     pub name: String,
 }
 
+/// Pages of `/v4/channels/directory` followed per browse. The cursor comes
+/// from the server, so both this and [`MAX_DIRECTORY_ROOMS`] bound what a
+/// hostile one can make a single Discover download and hold.
+const MAX_DIRECTORY_PAGES: usize = 10;
+const MAX_DIRECTORY_ROOMS: usize = 5_000;
+/// Longest cursor echoed back to the server; anything longer is not one of
+/// ours and ends the walk.
+const MAX_DIRECTORY_CURSOR_LEN: usize = 256;
+
+#[derive(Debug, Default)]
+struct DirectoryPage {
+    channels: Vec<DirectoryChannel>,
+    next_cursor: Option<String>,
+}
+
+fn parse_directory_page(bytes: &[u8]) -> Result<DirectoryPage, ChannelRegistryError> {
+    let body: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let channels = match body.get("channels") {
+        Some(list) => serde_json::from_value(list.clone())
+            .map_err(|_| ChannelRegistryError::Unavailable)?,
+        None => Vec::new(),
+    };
+    // `next` is the `/v4/channels/deleted` spelling; accept either so the
+    // client does not care which one the server settled on.
+    let next_cursor = body
+        .get("next_cursor")
+        .or_else(|| body.get("next"))
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.is_empty() && c.len() <= MAX_DIRECTORY_CURSOR_LEN)
+        .map(str::to_owned);
+    Ok(DirectoryPage {
+        channels,
+        next_cursor,
+    })
+}
+
+/// Follow directory cursors until the server stops offering one, a bound is
+/// hit, or the server misbehaves.
+///
+/// Only the first page is load-bearing: once rooms are in hand, a later page
+/// failing or timing out returns what was gathered rather than throwing it
+/// away, since Discover merges DHT results on top either way.
+async fn walk_directory_pages<F, Fut>(mut fetch_page: F) -> Result<Vec<DirectoryChannel>, ChannelRegistryError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<DirectoryPage, ChannelRegistryError>>,
+{
+    let mut out: Vec<DirectoryChannel> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    for page_index in 0..MAX_DIRECTORY_PAGES {
+        let page = match fetch_page(cursor.clone()).await {
+            Ok(page) => page,
+            Err(error) if page_index == 0 => return Err(error),
+            Err(_) => break,
+        };
+        let page_was_empty = page.channels.is_empty();
+        for listing in page.channels {
+            if out.len() >= MAX_DIRECTORY_ROOMS {
+                return Ok(out);
+            }
+            if seen_ids.insert(listing.channel_id.to_ascii_lowercase()) {
+                out.push(listing);
+            }
+        }
+        match page.next_cursor {
+            // A repeated cursor or an empty page with a cursor would otherwise
+            // spin us to the page bound re-downloading the same rows.
+            Some(next) if !page_was_empty && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch the public directory, following pages until `budget` runs out.
+///
+/// The budget covers the whole walk, not each page, so a paged directory costs
+/// Discover no more wall-clock than the single-page one did.
 pub(crate) async fn fetch_channel_directory(
     base_url: &str,
+    budget: std::time::Duration,
 ) -> Result<Vec<DirectoryChannel>, ChannelRegistryError> {
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
-    let resp = client(base_url)
+    let deadline = tokio::time::Instant::now() + budget;
+    let url = reqwest::Url::parse(&format!(
+        "{}/v4/channels/directory",
+        base_url.trim_end_matches('/')
+    ))
+    .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let http = tokio::time::timeout_at(deadline, client(base_url))
         .await
         .map_err(|_| ChannelRegistryError::Unavailable)?
-        .get(format!(
-            "{}/v4/channels/directory",
-            base_url.trim_end_matches('/')
-        ))
-        .send()
-        .await
         .map_err(|_| ChannelRegistryError::Unavailable)?;
-    if !resp.status().is_success() {
-        return Err(map_registry_status(resp.status()));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
-            .map_err(|_| ChannelRegistryError::Unavailable)?;
-    let Some(list) = body.get("channels") else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+    walk_directory_pages(|cursor| {
+        let mut page_url = url.clone();
+        if let Some(cursor) = cursor.as_deref() {
+            // Percent-encoded, so a hostile cursor cannot smuggle in extra
+            // query parameters.
+            page_url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        let request = http.get(page_url);
+        async move {
+            tokio::time::timeout_at(deadline, async move {
+                let resp = request
+                    .send()
+                    .await
+                    .map_err(|_| ChannelRegistryError::Unavailable)?;
+                if !resp.status().is_success() {
+                    return Err(map_registry_status(resp.status()));
+                }
+                let bytes = read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES)
+                    .await
+                    .map_err(|_| ChannelRegistryError::Unavailable)?;
+                parse_directory_page(&bytes)
+            })
+            .await
+            .map_err(|_| ChannelRegistryError::Unavailable)?
+        }
+    })
+    .await
 }
 
 /// Pages of `/v4/channels/deleted` this will follow before giving up.
@@ -3419,5 +3568,201 @@ mod relay_ticket_tests {
         assert!(!is_transient_relay_ticket_read_error(
             "relay ticket status: status 403 Forbidden"
         ));
+    }
+}
+
+#[cfg(test)]
+mod directory_paging_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    fn room(n: usize) -> DirectoryChannel {
+        DirectoryChannel {
+            channel_id: format!("{n:032x}"),
+            pubkey: String::new(),
+            name: format!("room {n}"),
+        }
+    }
+
+    fn page(range: std::ops::Range<usize>, next: Option<&str>) -> Result<DirectoryPage, ChannelRegistryError> {
+        Ok(DirectoryPage {
+            channels: range.map(room).collect(),
+            next_cursor: next.map(str::to_owned),
+        })
+    }
+
+    /// Serve `pages` in order and record the cursor each request carried.
+    async fn walk(
+        pages: Vec<Result<DirectoryPage, ChannelRegistryError>>,
+    ) -> (Result<Vec<DirectoryChannel>, ChannelRegistryError>, Vec<Option<String>>) {
+        let pages = Arc::new(Mutex::new(VecDeque::from(pages)));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let result = walk_directory_pages(|cursor| {
+            asked.lock().unwrap().push(cursor);
+            let next = pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| panic!("walked past the last served page"));
+            async move { next }
+        })
+        .await;
+        let asked = asked.lock().unwrap().clone();
+        (result, asked)
+    }
+
+    #[tokio::test]
+    async fn a_server_without_cursors_is_one_page() {
+        let (rooms, asked) = walk(vec![page(0..3, None)]).await;
+        assert_eq!(rooms.unwrap().len(), 3);
+        assert_eq!(asked, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn follows_next_cursor_until_the_last_page() {
+        let (rooms, asked) = walk(vec![
+            page(0..2, Some("c1")),
+            page(2..4, Some("c2")),
+            page(4..5, None),
+        ])
+        .await;
+        assert_eq!(rooms.unwrap().len(), 5);
+        assert_eq!(asked, vec![None, Some("c1".into()), Some("c2".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_cursor_ends_the_walk() {
+        let (rooms, asked) = walk(vec![page(0..2, Some("same")), page(2..4, Some("same"))]).await;
+        assert_eq!(rooms.unwrap().len(), 4);
+        assert_eq!(asked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_endless_server_is_cut_off_at_the_page_bound() {
+        let pages = (0..MAX_DIRECTORY_PAGES)
+            .map(|i| {
+                let next = format!("c{i}");
+                page(i * 10..i * 10 + 10, Some(&next))
+            })
+            .collect();
+        let (rooms, asked) = walk(pages).await;
+        assert_eq!(rooms.unwrap().len(), MAX_DIRECTORY_PAGES * 10);
+        assert_eq!(asked.len(), MAX_DIRECTORY_PAGES);
+    }
+
+    #[tokio::test]
+    async fn the_room_bound_caps_the_total() {
+        let per_page = MAX_DIRECTORY_ROOMS / 2 + 1;
+        let (rooms, asked) = walk(vec![
+            page(0..per_page, Some("c1")),
+            page(per_page..2 * per_page, Some("c2")),
+        ])
+        .await;
+        assert_eq!(rooms.unwrap().len(), MAX_DIRECTORY_ROOMS);
+        assert_eq!(asked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rows_repeated_across_pages_are_listed_once() {
+        let (rooms, _) = walk(vec![page(0..3, Some("c1")), page(2..5, None)]).await;
+        assert_eq!(rooms.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_page_is_an_error_but_a_later_one_keeps_what_arrived() {
+        let (first, _) = walk(vec![Err(ChannelRegistryError::Unavailable)]).await;
+        assert_eq!(first.unwrap_err(), ChannelRegistryError::Unavailable);
+
+        let (later, _) = walk(vec![page(0..2, Some("c1")), Err(ChannelRegistryError::Unavailable)]).await;
+        assert_eq!(later.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parses_either_cursor_spelling_and_drops_junk() {
+        let row = r#"{"channel_id":"ab","pubkey":"cd","name":"x"}"#;
+        let a = parse_directory_page(format!(r#"{{"channels":[{row}],"next_cursor":"k"}}"#).as_bytes()).unwrap();
+        assert_eq!((a.channels.len(), a.next_cursor.as_deref()), (1, Some("k")));
+        let b = parse_directory_page(format!(r#"{{"channels":[{row}],"next":"k"}}"#).as_bytes()).unwrap();
+        assert_eq!(b.next_cursor.as_deref(), Some("k"));
+        let c = parse_directory_page(br#"{"channels":[],"next_cursor":null}"#).unwrap();
+        assert!(c.next_cursor.is_none());
+        let long = "a".repeat(MAX_DIRECTORY_CURSOR_LEN + 1);
+        let d = parse_directory_page(format!(r#"{{"channels":[],"next_cursor":"{long}"}}"#).as_bytes()).unwrap();
+        assert!(d.next_cursor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod capability_ts_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const NOW: i64 = 1_800_000_000;
+    const A: [u8; 32] = [1; 32];
+    const B: [u8; 32] = [2; 32];
+
+    #[test]
+    fn a_second_registration_in_the_same_second_is_signed_later() {
+        let mut last = BTreeMap::new();
+        assert_eq!(next_capability_ts(&mut last, &A, NOW), NOW);
+        assert_eq!(
+            next_capability_ts(&mut last, &A, NOW),
+            NOW + 1,
+            "an equal timestamp with a new address is a 409 on the server"
+        );
+        assert_eq!(next_capability_ts(&mut last, &A, NOW), NOW + 2);
+    }
+
+    #[test]
+    fn capabilities_are_ordered_independently() {
+        let mut last = BTreeMap::new();
+        assert_eq!(next_capability_ts(&mut last, &A, NOW), NOW);
+        assert_eq!(
+            next_capability_ts(&mut last, &B, NOW),
+            NOW,
+            "one heartbeat's burst of friends must not push each other ahead"
+        );
+    }
+
+    #[test]
+    fn the_wall_clock_wins_once_it_catches_up() {
+        let mut last = BTreeMap::new();
+        next_capability_ts(&mut last, &A, NOW);
+        next_capability_ts(&mut last, &A, NOW);
+        assert_eq!(next_capability_ts(&mut last, &A, NOW + 10), NOW + 10);
+        assert_eq!(last.len(), 1);
+        next_capability_ts(&mut last, &B, NOW + 20);
+        assert!(!last.contains_key(&A), "entries behind the clock are dropped");
+    }
+
+    #[test]
+    fn the_lead_over_the_wall_clock_is_capped() {
+        let mut last = BTreeMap::new();
+        let mut signed = Vec::new();
+        for _ in 0..20 {
+            signed.push(next_capability_ts(&mut last, &A, NOW));
+        }
+        assert!(signed.iter().all(|&ts| ts <= NOW + CAPABILITY_TS_MAX_LEAD_SECS));
+        assert_eq!(*signed.last().unwrap(), NOW + CAPABILITY_TS_MAX_LEAD_SECS);
+        assert!(signed.windows(2).all(|w| w[1] >= w[0]), "never goes backwards");
+    }
+
+    #[test]
+    fn a_clock_stepping_back_never_signs_behind_what_was_sent() {
+        let mut last = BTreeMap::new();
+        assert_eq!(next_capability_ts(&mut last, &A, NOW), NOW);
+        assert_eq!(next_capability_ts(&mut last, &A, NOW - 1), NOW + 1);
+    }
+
+    #[test]
+    fn the_table_is_bounded() {
+        let mut last = BTreeMap::new();
+        for i in 0..CAPABILITY_TS_MAX_TRACKED + 10 {
+            let mut cap = [0u8; 32];
+            cap[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(next_capability_ts(&mut last, &cap, NOW), NOW);
+        }
+        assert_eq!(last.len(), CAPABILITY_TS_MAX_TRACKED);
     }
 }

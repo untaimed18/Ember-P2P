@@ -12,7 +12,7 @@
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { toastError, toastWarning } from '$lib/stores/toast';
-  import { copyToClipboard, formatBytes } from '$lib/utils';
+  import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import {
@@ -251,7 +251,7 @@
     if (diff < 60) return m.friends_just_now();
     if (diff < 3600) return m.friends_minutes_ago({ minutes: Math.floor(diff / 60) });
     if (diff < 86400) return m.friends_hours_ago({ hours: Math.floor(diff / 3600) });
-    return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return formatCalendarDate(ts, { month: 'short', day: 'numeric' });
   }
 
   function friendPresence(f: FriendInfo): 'online' | 'offline' {
@@ -434,13 +434,9 @@
     // — we rely on the `onlineFriendsStore` subscription above to drive
     // `onlineFriends`, and the effect below takes care of the toast-clear
     // side effect. This avoids double event handling when the page is open.
-    listen<{ user_hash: string }>('ember:friend-confirmed', () => {
-      if (destroyed) return;
-      // Background rediscovery sweeps fire this every few minutes; that is not
-      // a reason to clear an error the user is currently reading.
-      loadFriends(false);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
-      .catch((e) => console.error('friends: failed to register ember:friend-confirmed listener', e));
+    // 'ember:friend-confirmed' is likewise left to the store, whose debounced
+    // refresh writes the same `friendsList` this page renders from; a reload
+    // here per event doubled the `get_friends` calls of every rediscovery sweep.
 
     listen<{ firewalled: boolean }>('firewall-status', (event) => {
       if (destroyed) return;
@@ -545,8 +541,8 @@
    *  wipe a failure message the user is still reading. */
   async function loadFriends(clearError = true) {
     if (destroyed) return;
-    // Guard against overlapping loads (mount + 'ember:friend-confirmed' event,
-    // or rapid events) resolving out of order and clobbering newer data with a
+    // Guard against overlapping loads (mount plus a mutation's reload, or
+    // rapid mutations) resolving out of order and clobbering newer data with a
     // stale snapshot. Only the most recent invocation commits its result.
     const seq = ++loadFriendsSeq;
     // The list itself now lives in the shared store, which the Transfers table
@@ -809,7 +805,7 @@
 
   function formatDate(ts: number): string {
     if (!ts) return '';
-    return new Date(ts * 1000).toLocaleDateString(undefined, {
+    return formatCalendarDate(ts, {
       year: 'numeric', month: 'short', day: 'numeric',
     });
   }

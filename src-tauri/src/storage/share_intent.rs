@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +44,20 @@ impl Default for PersistedShareIntent {
 pub struct ShareIntentStore {
     path: std::path::PathBuf,
     state: parking_lot::RwLock<PersistedShareIntent>,
+    /// [`WRITE_SEQUENCE`] value of the last explicit write per hash, this
+    /// session. Taken only while `state` is write-locked.
+    write_seq: parking_lot::Mutex<HashMap<[u8; 16], u64>>,
+}
+
+/// Orders explicit share-intent writes; see
+/// [`ShareIntentStore::set_explicit_batch_unless_newer`].
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A point in the share-intent write order. A batch applied later with
+/// [`set_explicit_batch_unless_newer`] cannot override any write that lands
+/// after this call returns.
+pub fn write_ticket() -> u64 {
+    WRITE_SEQUENCE.load(Ordering::Acquire)
 }
 
 enum Slot {
@@ -175,9 +189,53 @@ impl ShareIntentStore {
         }
     }
 
-    pub fn set_explicit_batch(&self, updates: &[([u8; 16], bool)]) -> io::Result<()> {
-        self.mutate(|state| {
-            for (hash, shared) in updates {
+    /// Returns whether anything changed. A batch that is already in effect
+    /// is not persisted: the reconcile re-asserts every independent deny on
+    /// each pass, and each persist is a pretty-printed, fsync'd rewrite of
+    /// the whole store.
+    pub fn set_explicit_batch(&self, updates: &[([u8; 16], bool)]) -> io::Result<bool> {
+        self.apply_explicit_batch(updates, None)
+    }
+
+    /// [`Self::set_explicit_batch`] for a decision made at [`write_ticket`]
+    /// `ticket` and applied later: any hash written since then is left alone.
+    /// Last-applied-wins is wrong for a write that was queued before a newer
+    /// one — a deferred unshare landing after the user re-shared would deny
+    /// the file for good while the Library and known.met say shared.
+    pub fn set_explicit_batch_unless_newer(
+        &self,
+        updates: &[([u8; 16], bool)],
+        ticket: u64,
+    ) -> io::Result<bool> {
+        self.apply_explicit_batch(updates, Some(ticket))
+    }
+
+    fn apply_explicit_batch(
+        &self,
+        updates: &[([u8; 16], bool)],
+        ticket: Option<u64>,
+    ) -> io::Result<bool> {
+        let mut state = self.state.write();
+        let mut write_seq = self.write_seq.lock();
+        let updates: Vec<([u8; 16], bool)> = updates
+            .iter()
+            .copied()
+            .filter(|(hash, _)| {
+                ticket.is_none_or(|ticket| write_seq.get(hash).is_none_or(|seq| *seq <= ticket))
+            })
+            .collect();
+        let seq = WRITE_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+        let in_effect = updates.iter().all(|(hash, shared)| {
+            let key = normalize_hash(hash);
+            if *shared {
+                state.explicit_allow.contains(&key) && !state.denied.contains(&key)
+            } else {
+                state.denied.contains(&key) && !state.explicit_allow.contains(&key)
+            }
+        });
+        if !in_effect {
+            let before = state.clone();
+            for (hash, shared) in &updates {
                 let key = normalize_hash(hash);
                 if *shared {
                     state.denied.remove(&key);
@@ -193,13 +251,23 @@ impl ShareIntentStore {
                 .saturating_add(state.explicit_allow.len())
                 > MAX_INTENTS
             {
+                *state = before;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "share-intent store exceeds its safety limit",
                 ));
             }
-            Ok(())
-        })
+            if let Err(error) = self.persist_state(&state) {
+                *state = before;
+                return Err(error);
+            }
+        }
+        // Stamped even when nothing changed: a re-share of an already-allowed
+        // file is still newer than a deny queued before it.
+        for (hash, _) in &updates {
+            write_seq.insert(*hash, seq);
+        }
+        Ok(!in_effect)
     }
 
     pub fn enter_fail_closed(&self) -> io::Result<()> {
@@ -391,6 +459,7 @@ fn persisted_store(
     let store = Arc::new(ShareIntentStore {
         path,
         state: parking_lot::RwLock::new(state),
+        write_seq: parking_lot::Mutex::new(HashMap::new()),
     });
     store.persist_state(&store.state.read())?;
     Ok(store)
@@ -446,8 +515,17 @@ pub fn effective_shared(hash: &[u8; 16], catalog_value: bool) -> bool {
         .unwrap_or(false)
 }
 
-pub fn set_explicit_batch(updates: &[([u8; 16], bool)]) -> io::Result<()> {
+/// Returns whether the store changed (and was persisted).
+pub fn set_explicit_batch(updates: &[([u8; 16], bool)]) -> io::Result<bool> {
     global()?.set_explicit_batch(updates)
+}
+
+/// See [`ShareIntentStore::set_explicit_batch_unless_newer`].
+pub fn set_explicit_batch_unless_newer(
+    updates: &[([u8; 16], bool)],
+    ticket: u64,
+) -> io::Result<bool> {
+    global()?.set_explicit_batch_unless_newer(updates, ticket)
 }
 
 /// Enter durable fail-closed mode. If persistence fails, latch a process-local
@@ -496,7 +574,37 @@ mod tests {
                 fail_closed,
                 ..Default::default()
             }),
+            write_seq: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn queued_deny_cannot_override_a_newer_share() {
+        let store = test_store(false);
+        let (reshared, untouched) = ([0x51; 16], [0x52; 16]);
+        // The reconcile decides to deny both, but its write is deferred.
+        let ticket = write_ticket();
+        // Meanwhile the user re-shares one of them; an allow already in
+        // effect still counts as the newer write.
+        store.set_explicit_batch(&[(reshared, true)]).unwrap();
+        store.set_explicit_batch(&[(reshared, true)]).unwrap();
+
+        store
+            .set_explicit_batch_unless_newer(&[(reshared, false), (untouched, false)], ticket)
+            .unwrap();
+        assert!(
+            store.effective_shared(&reshared, false),
+            "a deny queued before the re-share must not re-deny it"
+        );
+        assert!(
+            !store.effective_shared(&untouched, true),
+            "hashes nobody wrote since the ticket still get the deny"
+        );
+
+        // A write made after the stale one still applies normally.
+        store.set_explicit_batch(&[(reshared, false)]).unwrap();
+        assert!(!store.effective_shared(&reshared, true));
+        let _ = std::fs::remove_file(&store.path);
     }
 
     #[test]
@@ -517,6 +625,27 @@ mod tests {
         let hash = [0x24; 16];
         store.set_explicit_batch(&[(hash, false)]).unwrap();
         assert!(!store.effective_shared(&hash, true));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn batch_already_in_effect_is_not_persisted() {
+        let store = test_store(false);
+        let (a, b) = ([0x31; 16], [0x32; 16]);
+        assert!(store.set_explicit_batch(&[(a, false), (b, true)]).unwrap());
+        assert!(store.path.exists());
+        std::fs::remove_file(&store.path).unwrap();
+
+        assert!(!store.set_explicit_batch(&[(a, false), (b, true)]).unwrap());
+        assert!(!store.set_explicit_batch(&[]).unwrap());
+        assert!(
+            !store.path.exists(),
+            "a batch that changes nothing must not rewrite the store"
+        );
+
+        assert!(store.set_explicit_batch(&[(a, false), (b, false)]).unwrap());
+        assert!(store.path.exists(), "a real change is still persisted");
+        assert!(!store.effective_shared(&b, true));
         let _ = std::fs::remove_file(&store.path);
     }
 

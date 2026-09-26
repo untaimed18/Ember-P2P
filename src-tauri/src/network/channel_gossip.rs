@@ -57,11 +57,22 @@ pub(super) fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16])
 ///
 /// What a frame opened under a retired key needs before anything in it is
 /// kept: such a frame can refresh a member, never introduce one.
-pub(super) fn channel_member_on_roster(db: &Database, channel_id_hex: &str, member_hex: &str) -> bool {
-    matches!(
-        db.channel_member_status(channel_id_hex, member_hex),
-        Ok(Some(false))
-    )
+pub(super) fn channel_member_on_roster(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+) -> bool {
+    channel_member_status_cached(state, db, channel_id, member) == Some(false)
+}
+
+pub(super) fn channel_member_banned(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+) -> bool {
+    channel_member_status_cached(state, db, channel_id, member) == Some(true)
 }
 
 /// Most delivery verdicts held between ticks.
@@ -183,11 +194,17 @@ pub(super) async fn drain_channel_origin_retry(
     let pending = std::mem::take(&mut state.channel_origin_retry);
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(ember::channel::CHANNEL_ORIGIN_RETRY_SECS);
+    // Decided once per room per pass. What a queue is almost always waiting
+    // on is a room with nobody else in it, and every body queued there would
+    // otherwise walk the whole fanout to learn that again, once a second for
+    // up to ten minutes.
+    let mut alone: HashMap<[u8; 16], bool> = HashMap::new();
     for (queued_at, body) in pending {
+        let gossip = ember::channel::ChannelGossip::decode(&body);
         if now.saturating_duration_since(queued_at) >= ttl {
             // Ten minutes of finding nobody. This is the state that used to
             // vanish silently, leaving the sender a line their room never had.
-            if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+            if let Some(gossip) = gossip {
                 note_channel_delivery(
                     state,
                     gossip.channel_id,
@@ -197,8 +214,36 @@ pub(super) async fn drain_channel_origin_retry(
             }
             continue;
         }
+        if let Some(gossip) = gossip {
+            let room_alone = match alone.get(&gossip.channel_id) {
+                Some(known) => *known,
+                None => {
+                    let known = channel_room_is_empty_but_us(state, db, gossip.channel_id);
+                    alone.insert(gossip.channel_id, known);
+                    known
+                }
+            };
+            if room_alone {
+                queue_channel_origin_retry(state, body, queued_at);
+                continue;
+            }
+        }
         fanout_channel_gossip_retry(socket, state, db, body, None, Some(queued_at)).await;
     }
+}
+
+/// A room we are in whose fresh roster names nobody but us — the case in which
+/// the fanout would only queue the frame again. Anything else, including a
+/// room we have left, is for the fanout to settle.
+fn channel_room_is_empty_but_us(state: &mut NetworkState, db: &Database, channel_id: [u8; 16]) -> bool {
+    let in_room = cached_channel_view(state, db, channel_id).is_some_and(|view| view.row.in_room_now());
+    if !in_room {
+        return false;
+    }
+    let local = state.local_ed25519_pubkey;
+    channel_member_pubkeys_cached(state, db, channel_id)
+        .iter()
+        .all(|pk| *pk == local)
 }
 
 /// Admit one outbound fanout, against the bucket that fits where it came from.
@@ -394,7 +439,6 @@ pub(super) async fn fanout_channel_gossip_retry(
     let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
         return;
     };
-    let channel_id_hex = hex::encode(gossip.channel_id);
     let in_room = cached_channel_view(state, db, gossip.channel_id)
         .is_some_and(|view| view.row.in_room_now());
     if !in_room {
@@ -412,7 +456,7 @@ pub(super) async fn fanout_channel_gossip_retry(
         }
         return;
     }
-    let members = channel_member_pubkeys(db, &channel_id_hex);
+    let members = channel_member_pubkeys_cached(state, db, gossip.channel_id);
     let others: Vec<[u8; 32]> = members
         .iter()
         .copied()
@@ -655,11 +699,10 @@ pub(super) async fn handle_inbound_channel_relay(
         .await;
         return;
     }
-    let channel_id_hex = hex::encode(channel_id);
     let in_room = cached_channel_view(state, db, channel_id)
         .is_some_and(|view| view.row.in_room_now());
     let roster = if in_room {
-        channel_member_pubkeys(db, &channel_id_hex)
+        channel_member_pubkeys_cached(state, db, channel_id)
     } else {
         Vec::new()
     };
@@ -826,7 +869,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             // they must also be somebody the roster holds, since that is what
             // an evicted member's fresh identity is not.
             if opened == ember::channel::OpenedUnder::Current
-                || channel_member_on_roster(db, &channel_id_hex, &hex::encode(sender))
+                || channel_member_on_roster(state, db, gossip.channel_id, &sender)
             {
                 apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
             } else {
@@ -918,11 +961,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         &gossip.msg_id,
         gossip.timestamp,
     ) {
-        let sender_hex = hex::encode(sender_pk);
-        if db
-            .channel_member_is_banned(&channel_id_hex, &sender_hex)
-            .unwrap_or(false)
-        {
+        if channel_member_banned(state, db, gossip.channel_id, &sender_pk) {
             return;
         }
         // Signature-verified above, so asking for catch-up is itself evidence
@@ -978,10 +1017,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         // one on the current — and an evicted member's fresh identity is on
         // neither list.
         let sender_hex = hex::encode(sender_pk);
-        if db
-            .channel_member_is_banned(&channel_id_hex, &sender_hex)
-            .unwrap_or(false)
-        {
+        if channel_member_banned(state, db, gossip.channel_id, &sender_pk) {
             return;
         }
         if !db
@@ -1111,12 +1147,9 @@ pub(super) async fn handle_inbound_channel_gossip(
     // Ahead of the rate charge: our own lines echo back as variants, and a line
     // we already hold says nothing new to us or to the mesh.
     if variant
-        && (db
-            .channel_message_held(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
+        && db
+            .channel_message_known(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
             .unwrap_or(true)
-            || db
-                .channel_message_forgotten(&channel_id_hex, &msg_id_hex, &sender_hex)
-                .unwrap_or(true))
     {
         return;
     }
@@ -1129,17 +1162,14 @@ pub(super) async fn handle_inbound_channel_gossip(
         debug!("Ember channel gossip: rate-limited author in {channel_id_hex}");
         return;
     }
-    if db
-        .channel_member_is_banned(&channel_id_hex, &sender_hex)
-        .unwrap_or(false)
-    {
+    if channel_member_banned(state, db, gossip.channel_id, &sender_pk) {
         return;
     }
     // A member already on the roster who is still on the previous epoch keeps
     // talking while the rotation propagates. Anyone else under a retired key is
     // indistinguishable from the member it evicted under a new name.
     if opened == ember::channel::OpenedUnder::Retired
-        && !channel_member_on_roster(db, &channel_id_hex, &sender_hex)
+        && !channel_member_on_roster(state, db, gossip.channel_id, &sender_pk)
     {
         // The same line may still arrive under the current key — a catch-up
         // re-serve keeps its id — so it must not be burned as seen.
@@ -1154,23 +1184,6 @@ pub(super) async fn handle_inbound_channel_gossip(
     if cleaned.is_empty() || cleaned.len() > 4096 {
         return;
     }
-    // Either we already hold the line, or we held it and were told to forget it.
-    // Both mean do not store it again; both still pass it on, because forgetting
-    // a line here is a local decision and not a claim about the room. Holding
-    // only the id is not holding the line: a row that cannot prove the id is its
-    // own gives way to this one inside `insert_channel_message`.
-    if db
-        .channel_message_held(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
-        .unwrap_or(false)
-        || db
-            .channel_message_forgotten(&channel_id_hex, &msg_id_hex, &sender_hex)
-            .unwrap_or(false)
-    {
-        if let Some(next) = gossip.decremented_ttl() {
-            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
-        }
-        return;
-    }
     let now = gossip.timestamp;
     // Keep the author's signature only when sanitising left the text alone.
     // The signature covers what they wrote; if we had to change it, the two no
@@ -1182,34 +1195,81 @@ pub(super) async fn handle_inbound_channel_gossip(
     } else {
         String::new()
     };
-    match db.insert_channel_message(
-        &channel_id_hex,
-        &sender_hex,
-        "received",
-        &cleaned,
-        &msg_id_hex,
-        now,
-        &stored_sig,
-        false,
-    ) {
-        Ok(row_id) => {
-            note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
-            if ember::channel::chat_author_joins_gossip_roster(
-                ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
-                opened,
-                gossip.ttl,
+    let joins_roster = ember::channel::chat_author_joins_gossip_roster(
+        ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+        opened,
+        gossip.ttl,
+    );
+    // Awaited, not detached: the dedup verdict, the stored row and the roster
+    // write decide what this frame does next, and the next frame for the same
+    // line has to see this one's row. What moves is the blocking itself — the
+    // three statements now run on the blocking pool rather than pinning the
+    // runtime worker that carries the network `select!`.
+    let ingest = {
+        let db = db.clone();
+        let channel_id_hex = channel_id_hex.clone();
+        let sender_hex = sender_hex.clone();
+        let msg_id_hex = msg_id_hex.clone();
+        let cleaned = cleaned.clone();
+        let local_hex = hex::encode(state.local_ed25519_pubkey);
+        tokio::task::spawn_blocking(move || {
+            // Either we already hold the line, or we held it and were told to
+            // forget it. Both mean do not store it again; both still pass it
+            // on, because forgetting a line here is a local decision and not a
+            // claim about the room. Holding only the id is not holding the
+            // line: a row that cannot prove the id is its own gives way to this
+            // one inside `insert_channel_message`.
+            if db
+                .channel_message_known(&channel_id_hex, &msg_id_hex, &sender_hex, now)
+                .unwrap_or(false)
+            {
+                return ChatLineIngest::Known;
+            }
+            match db.insert_channel_message(
+                &channel_id_hex,
+                &sender_hex,
+                "received",
+                &cleaned,
+                &msg_id_hex,
+                now,
+                &stored_sig,
+                false,
             ) {
-                // First line from someone this device did not already hold: the
-                // roster has to grow, and XOR-neighbors may have changed, so do
-                // not wait for the next presence walk or the friend heartbeat.
-                match db.upsert_channel_member(
-                    &channel_id_hex,
-                    &sender_hex,
-                    "",
-                    now,
-                    Some(&hex::encode(state.local_ed25519_pubkey)),
-                ) {
-                    Ok(ChannelMemberWrite::Inserted) => {
+                Ok(row_id) => ChatLineIngest::Stored {
+                    row_id,
+                    // First line from someone this device did not already
+                    // hold: the roster has to grow, and XOR-neighbors may have
+                    // changed, so do not wait for the next presence walk or the
+                    // friend heartbeat.
+                    member: joins_roster.then(|| {
+                        db.upsert_channel_member(
+                            &channel_id_hex,
+                            &sender_hex,
+                            "",
+                            now,
+                            Some(&local_hex),
+                        )
+                        .ok()
+                    }),
+                },
+                Err(e) => ChatLineIngest::Failed(e.to_string()),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| ChatLineIngest::Failed(e.to_string()))
+    };
+    match ingest {
+        ChatLineIngest::Known => {
+            if let Some(next) = gossip.decremented_ttl() {
+                fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+            }
+            return;
+        }
+        ChatLineIngest::Stored { row_id, member } => {
+            note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
+            if let Some(member) = member {
+                match member {
+                    Some(ChannelMemberWrite::Inserted) => {
                         state.rendezvous_last_register = None;
                         let _ = app_handle.emit(
                             "ember:channel-members",
@@ -1219,10 +1279,10 @@ pub(super) async fn handle_inbound_channel_gossip(
                     // Chat carries no nickname, so `Updated` is unreachable
                     // here; both are folded in anyway so a future caller that
                     // does pass one cannot silently stop refreshing the row.
-                    Ok(ChannelMemberWrite::Touched) => {
+                    Some(ChannelMemberWrite::Touched) => {
                         mark_channel_presence_dirty(state, gossip.channel_id, &sender_pk, now);
                     }
-                    Ok(ChannelMemberWrite::Updated) => {
+                    Some(ChannelMemberWrite::Updated) => {
                         let _ = app_handle.emit(
                             "ember:channel-members",
                             serde_json::json!({ "channel_id": channel_id_hex }),
@@ -1255,13 +1315,26 @@ pub(super) async fn handle_inbound_channel_gossip(
                 }),
             );
         }
-        Err(e) => {
+        ChatLineIngest::Failed(e) => {
             debug!("Ember channel gossip: persist failed for {channel_id_hex}: {e}");
         }
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
     }
+}
+
+/// What the blocking half of a chat line's ingest found.
+enum ChatLineIngest {
+    /// Already held, or held and forgotten: relay, do not store.
+    Known,
+    /// `member` is the roster write, when the line was one that may grow it;
+    /// its inner `None` is a write that failed.
+    Stored {
+        row_id: i64,
+        member: Option<Option<ChannelMemberWrite>>,
+    },
+    Failed(String),
 }
 
 pub(super) async fn apply_channel_handoff_offer(
@@ -1834,7 +1907,7 @@ pub(super) async fn send_channel_gossip_unicast(
     // Member hops only. The non-member fallback the fanout keeps is a frame to
     // a node that current builds make drop it, so here it would be charged to
     // the relay allowance and counted as a path for nothing.
-    let roster = channel_member_pubkeys(db, &hex::encode(channel_id));
+    let roster = channel_member_pubkeys_cached(state, db, channel_id);
     let (hops, via_members) = overlay_channel_hops(state, &[peer], &roster);
     if hops.is_empty() || !via_members {
         return ChannelUnicast::NoPath;
@@ -1890,16 +1963,13 @@ pub(super) async fn handle_inbound_channel_edit(
         return;
     }
     let sender_hex = hex::encode(edit.sender);
-    if db
-        .channel_member_is_banned(channel_id_hex, &sender_hex)
-        .unwrap_or(false)
-    {
+    if channel_member_banned(state, db, gossip.channel_id, &edit.sender) {
         return;
     }
     // A catch-up revision can create the line it revises, so it is held to the
     // same rule as a chat line under a retired key.
     if opened == ember::channel::OpenedUnder::Retired
-        && !channel_member_on_roster(db, channel_id_hex, &sender_hex)
+        && !channel_member_on_roster(state, db, gossip.channel_id, &edit.sender)
     {
         forget_channel_gossip(state, &gossip.msg_id);
         return;
@@ -2024,14 +2094,11 @@ pub(super) async fn handle_inbound_channel_reactions(
             }
         }
         let member_hex = hex::encode(entry.member);
-        if db
-            .channel_member_is_banned(channel_id_hex, &member_hex)
-            .unwrap_or(false)
-        {
+        if channel_member_banned(state, db, gossip.channel_id, &entry.member) {
             continue;
         }
         if opened == ember::channel::OpenedUnder::Retired
-            && !channel_member_on_roster(db, channel_id_hex, &member_hex)
+            && !channel_member_on_roster(state, db, gossip.channel_id, &entry.member)
         {
             continue;
         }
@@ -2395,7 +2462,7 @@ pub(super) async fn maybe_sync_channel_history(
         if recent_stamps >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
             continue;
         }
-        let members = channel_member_pubkeys(db, &ch.channel_id);
+        let members = channel_member_pubkeys_cached(state, db, channel_id);
         // Same set the fanout uses, so catch-up reaches across the id space
         // instead of asking the same local cluster the flood already covered.
         let neighbors = ember::channel::gossip_neighbors(

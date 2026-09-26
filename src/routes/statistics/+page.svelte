@@ -1,7 +1,14 @@
 <script lang="ts">
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { getReputationStats, type ReputationStatsInfo } from '$lib/api/reputation';
-  import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
+  import {
+    formatBytes,
+    formatCalendarDate,
+    formatDateTime,
+    formatNumber,
+    formatSpeed as formatRate,
+    formatDurationSecs as formatDuration,
+  } from '$lib/utils';
   import { onMount } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -10,7 +17,14 @@
   let loading = $state(true);
   let error: string | null = $state(null);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
-  let refreshBusy = false;
+  /** Sequence number of the call holding the in-flight gate, 0 when idle. A
+   *  forced refresh takes the gate over, so the poll it overlapped must not
+   *  release it when it lands first. */
+  let busySeq = 0;
+  let requestSeq = 0;
+  /** Newest call whose results were applied. An older call landing later is
+   *  discarded rather than rolling the dashboard back. */
+  let appliedSeq = 0;
   let tickCounter = $state(0);
   let unmounted = false;
   // Monotonic session elapsed from the backend at last successful poll,
@@ -34,8 +48,9 @@
     // in-flight gate so it never silently no-ops while a 2s poll happens to be
     // mid-flight. Watchdog timers are local to each call so a forced retry
     // running concurrently with a poll can't clobber the other's timer id.
-    if (refreshBusy && !opts.force) return;
-    refreshBusy = true;
+    if (busySeq !== 0 && !opts.force) return;
+    const seq = ++requestSeq;
+    busySeq = seq;
     let statsTimer: ReturnType<typeof setTimeout> | undefined;
     let repTimer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -56,7 +71,7 @@
         // Reputation rides the same watchdog as stats. Unlike
         // getStatistics() (a direct cached-snapshot read), this round-trips
         // through the network task's command channel, whose reply timeout
-        // is 10s. Because both fetches share the `refreshBusy` gate, a
+        // is 10s. Because both fetches share the in-flight gate, a
         // briefly-busy network loop would otherwise stall the entire
         // dashboard refresh for up to 10s even though the transfer stats
         // themselves resolved instantly. Bound it independently.
@@ -67,7 +82,8 @@
           }),
         ]),
       ]);
-      if (unmounted) return;
+      if (unmounted || seq < appliedSeq) return;
+      appliedSeq = seq;
       if (repResult.status === 'fulfilled') {
         repStats = repResult.value;
         repUnavailable = false;
@@ -89,7 +105,7 @@
         error = translateError(statsResult.reason, m.error_operation_failed());
       }
     } catch (e) {
-      if (unmounted) return;
+      if (unmounted || seq < appliedSeq) return;
       if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
       // Clear the race watchdogs so the loser timers don't linger until they
@@ -97,7 +113,7 @@
       if (statsTimer) clearTimeout(statsTimer);
       if (repTimer) clearTimeout(repTimer);
       if (!unmounted) loading = false;
-      refreshBusy = false;
+      if (busySeq === seq) busySeq = 0;
     }
   }
 
@@ -200,8 +216,7 @@
   // Returns an em-dash if we don't have a reset timestamp yet (fresh
   // install before the first session ends).
   function formatSinceDate(ts: number): string {
-    if (!ts) return '\u2014';
-    return new Date(ts * 1000).toLocaleDateString(undefined, {
+    return formatCalendarDate(ts, {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
@@ -317,7 +332,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_down.toLocaleString()}</span>
+            <span class="big-value">{formatNumber(stats.session_completed_down)}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -340,7 +355,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_up.toLocaleString()}</span>
+            <span class="big-value">{formatNumber(stats.session_completed_up)}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -359,7 +374,7 @@
         {#if stats.stat_last_reset}
           <span
             class="head-aside"
-            title={m.stats_cumulative_started_on({ when: new Date(stats.stat_last_reset * 1000).toLocaleString() })}
+            title={m.stats_cumulative_started_on({ when: formatDateTime(stats.stat_last_reset) })}
           >{m.stats_since({ date: formatSinceDate(stats.stat_last_reset) })}</span>
         {/if}
       </div>
@@ -379,11 +394,11 @@
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_downloads()}</span>
           <!-- cum_ excludes current session (DB snapshot at startup), so addition is intentional -->
-          <span class="cum-value">{(stats.cum_completed_down + stats.session_completed_down).toLocaleString()}</span>
+          <span class="cum-value">{formatNumber(stats.cum_completed_down + stats.session_completed_down)}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_uploads()}</span>
-          <span class="cum-value">{(stats.cum_completed_up + stats.session_completed_up).toLocaleString()}</span>
+          <span class="cum-value">{formatNumber(stats.cum_completed_up + stats.session_completed_up)}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_upload_download_ratio()}</span>
@@ -460,18 +475,18 @@
         <div class="reputation-row">
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_tracked_peers_hint()}>{m.stats_tracked_peers()}</span>
-            <span class="rep-value">{repStats.tracked_peers.toLocaleString()}</span>
+            <span class="rep-value">{formatNumber(repStats.tracked_peers)}</span>
           </div>
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_banned_peers_hint()}>{m.stats_banned_peers()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
-              {repStats.banned_peers.toLocaleString()}
+              {formatNumber(repStats.banned_peers)}
             </span>
           </div>
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_banned_ips_hint()}>{m.stats_banned_ips()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_ips > 0}>
-              {repStats.banned_ips.toLocaleString()}
+              {formatNumber(repStats.banned_ips)}
             </span>
           </div>
         </div>

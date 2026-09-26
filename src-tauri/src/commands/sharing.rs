@@ -759,6 +759,38 @@ const CHAINED_SCAN_PAGE_DELAY: std::time::Duration = std::time::Duration::from_s
 /// grace, so a single long sleep would make every exit pay that grace in full.
 const CHAINED_SCAN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Which kind of pass holds [`RELOAD_IN_FLIGHT`], so work turned away by it
+/// can tell a full reload (which runs its own page chain) from a scoped
+/// rescan (which does not, and will be done shortly).
+static RELOAD_FLIGHT_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const FLIGHT_NONE: u8 = 0;
+const FLIGHT_FULL: u8 = 1;
+const FLIGHT_SCOPED: u8 = 2;
+
+/// Clears [`RELOAD_FLIGHT_KIND`] when the pass that set it ends.
+struct ReloadFlightKind;
+
+impl ReloadFlightKind {
+    fn set(scoped: bool) -> Self {
+        RELOAD_FLIGHT_KIND.store(
+            if scoped { FLIGHT_SCOPED } else { FLIGHT_FULL },
+            Ordering::Release,
+        );
+        Self
+    }
+}
+
+impl Drop for ReloadFlightKind {
+    fn drop(&mut self) {
+        RELOAD_FLIGHT_KIND.store(FLIGHT_NONE, Ordering::Release);
+    }
+}
+
+/// How long work turned away by a running pass waits before trying again.
+const RELOAD_BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Ceiling on the backoff between those retries.
+const RELOAD_BUSY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn remove_cancel_flag_if_current(
     flags: &Arc<RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
     key: &str,
@@ -913,7 +945,7 @@ fn fresh_part_hashes_exclusively_under_roots(
         .filter(|file| {
             roots
                 .iter()
-                .any(|root| crate::security::path_matches_dir(&file.path, root))
+                .any(|root| crate::security::path_within_dir(&file.path, root))
         })
         .filter_map(|file| fresh_part_hash_key(&file.hash))
         .collect::<HashSet<_>>();
@@ -922,7 +954,7 @@ fn fresh_part_hashes_exclusively_under_roots(
         .filter(|file| {
             !roots
                 .iter()
-                .any(|root| crate::security::path_matches_dir(&file.path, root))
+                .any(|root| crate::security::path_within_dir(&file.path, root))
         })
         .filter_map(|file| fresh_part_hash_key(&file.hash))
         .collect::<HashSet<_>>();
@@ -1245,8 +1277,33 @@ fn scan_can_write_under(scan_key: &str, removed_folder: &str) -> bool {
     if scan_key.starts_with("__") {
         return false;
     }
-    crate::security::path_matches_dir(scan_key, removed_folder)
-        || crate::security::path_matches_dir(removed_folder, scan_key)
+    crate::security::path_within_dir(scan_key, removed_folder)
+        || crate::security::path_within_dir(removed_folder, scan_key)
+}
+
+/// The stored shared folder a removal request names, spelled as stored.
+/// Matched on the canonical form and on the spelling the request carried,
+/// since an offline root cannot canonicalize.
+fn stored_shared_folder(
+    shared_folders: &[String],
+    canonical: Option<&str>,
+    requested: &str,
+) -> Option<String> {
+    shared_folders
+        .iter()
+        .find(|stored| {
+            canonical.is_some_and(|canonical| paths_equal_ignore_case(stored, canonical))
+                || paths_equal_ignore_case(stored, requested)
+        })
+        .cloned()
+}
+
+/// Whether an unshare request names a stored shared folder or something inside
+/// one. Only then may the drive-aware prefix operations act on it.
+fn unshare_target_is_shared(shared_folders: &[String], requested: &str) -> bool {
+    shared_folders
+        .iter()
+        .any(|stored| crate::security::path_within_dir(requested, stored))
 }
 
 pub(crate) async fn refresh_file_cache(
@@ -1573,10 +1630,13 @@ pub(crate) async fn serve_media_request(
     response.body(body).unwrap_or_default()
 }
 
+/// `shared_folders` must be the stored shared list (or a subset of it, or
+/// paths under it): a whole shared drive contains its files, which
+/// `path_matches_dir` would deny.
 pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String]) -> bool {
     shared_folders
         .iter()
-        .any(|folder| crate::security::path_matches_dir(file_path, folder))
+        .any(|folder| crate::security::path_within_dir(file_path, folder))
 }
 
 async fn delete_file_with_retry(
@@ -2172,7 +2232,7 @@ fn apply_folder_defaults_to_new_files(
         folder_priorities
             .iter()
             .filter(|(folder, priority)| {
-                !priority.is_empty() && crate::security::path_matches_dir(path, folder)
+                !priority.is_empty() && crate::security::path_within_dir(path, folder)
             })
             .max_by_key(|(folder, _)| folder.len())
             .map(|(_, priority)| priority.clone())
@@ -2213,7 +2273,7 @@ pub(crate) fn apply_folder_allowlists(
     let apply = |file: &mut FileInfo| {
         let Some((_, allowed)) = lists
             .iter()
-            .filter(|(folder, _)| crate::security::path_matches_dir(&file.path, folder))
+            .filter(|(folder, _)| crate::security::path_within_dir(&file.path, folder))
             .max_by_key(|(folder, _)| folder.len())
         else {
             return;
@@ -2271,7 +2331,7 @@ fn withhold_known_files_outside_allowlist(
         .filter(|file| file.shared && !file.hash.is_empty())
     {
         let key = crate::search::index::normalize_path_key(&file.path);
-        if crate::security::path_matches_dir(&file.path, folder)
+        if crate::security::path_within_dir(&file.path, folder)
             && !allowlist_permits(&allowed, &key)
         {
             file.shared = false;
@@ -2298,7 +2358,7 @@ fn known_hashes_outside_allowlist(
         .all_records()
         .filter(|record| {
             record.is_shared
-                && crate::security::path_matches_dir(&record.file_path, folder)
+                && crate::security::path_within_dir(&record.file_path, folder)
                 && !allowlist_permits(
                     &allowed,
                     &crate::search::index::normalize_path_key(&record.file_path),
@@ -2347,6 +2407,27 @@ async fn persist_pending_intents(
     share_removals: &[String],
     priority_removals: &[String],
 ) -> Result<(), String> {
+    write_pending_intents(
+        state,
+        share_updates,
+        priority_updates,
+        share_removals,
+        priority_removals,
+        true,
+    )
+    .await
+}
+
+/// [`persist_pending_intents`], with `user_driven` deciding whether updates
+/// bump the visible settings revision.
+async fn write_pending_intents(
+    state: &AppState,
+    share_updates: &[(String, bool)],
+    priority_updates: &[(String, String)],
+    share_removals: &[String],
+    priority_removals: &[String],
+    user_driven: bool,
+) -> Result<(), String> {
     if share_updates.is_empty()
         && priority_updates.is_empty()
         && share_removals.is_empty()
@@ -2394,7 +2475,7 @@ async fn persist_pending_intents(
     // Only user-driven updates bump the visible settings revision; internal
     // intent cleanup must not make an open Settings form spuriously stale
     // (same rationale as `persist_scan_cursors`).
-    if !share_updates.is_empty() || !priority_updates.is_empty() {
+    if user_driven && (!share_updates.is_empty() || !priority_updates.is_empty()) {
         settings.settings_revision = settings.settings_revision.saturating_add(1);
     }
     let save_data = {
@@ -2681,7 +2762,7 @@ fn set_added_folder_allowlist(
     folder: &str,
     limit: Option<&(Vec<String>, Vec<String>)>,
 ) {
-    lists.retain(|listed, _| !crate::security::path_matches_dir(listed, folder));
+    lists.retain(|listed, _| !crate::security::path_within_dir(listed, folder));
     if let Some((files, dirs)) = limit {
         lists.insert(
             crate::search::index::normalize_path_key(folder),
@@ -2950,7 +3031,7 @@ pub(crate) async fn add_shared_folder_approved(
             let mut dirs = Vec::new();
             let mut whole = false;
             for (entry, is_dir) in entries {
-                if !crate::security::path_matches_dir(&entry, &canonical_str) {
+                if !crate::security::path_within_dir(&entry, &canonical_str) {
                     continue;
                 }
                 if is_dir {
@@ -2984,7 +3065,7 @@ pub(crate) async fn add_shared_folder_approved(
         // share, and adding their folder would be refused as an overlap.
         let existing = config.settings.shared_folders.iter().find(|f| {
             paths_equal_ignore_case(f, &canonical_str)
-                || (limit.is_some() && crate::security::path_matches_dir(&canonical_str, f))
+                || (limit.is_some() && crate::security::path_within_dir(&canonical_str, f))
         });
         if let Some(existing) = existing {
             Err(existing.clone())
@@ -3550,7 +3631,8 @@ pub(crate) async fn add_shared_folder_approved(
                     .all_files()
                     .iter()
                     .filter(|f| {
-                        crate::security::path_matches_dir(&f.path, &path) && !f.hash.is_empty()
+                        crate::security::path_within_dir(&f.path, &canonical_str)
+                            && !f.hash.is_empty()
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -4005,7 +4087,7 @@ pub async fn confirm_dropped_folders(
             let only = if only_files {
                 let in_folder: Vec<String> = files
                     .iter()
-                    .filter(|file| crate::security::path_matches_dir(file, &folder))
+                    .filter(|file| crate::security::path_within_dir(file, &folder))
                     .cloned()
                     .collect();
                 if in_folder.is_empty() {
@@ -4177,7 +4259,7 @@ fn outermost_folders(folders: Vec<String>) -> Vec<String> {
     for folder in &folders {
         let nested = folders.iter().any(|other| {
             !paths_equal_ignore_case(other, folder)
-                && crate::security::path_matches_dir(folder, other)
+                && crate::security::path_within_dir(folder, other)
         });
         if !nested && !out.iter().any(|kept| paths_equal_ignore_case(kept, folder)) {
             out.push(folder.clone());
@@ -4234,17 +4316,28 @@ pub async fn remove_shared_folder(
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
-    let canonical_path = match resolved_path {
-        Ok(path) => path,
-        Err(canonical_error) => {
-            let config = state.config.read().await;
-            config
-                .settings
-                .shared_folders
-                .iter()
-                .find(|configured| paths_equal_ignore_case(configured, &path))
-                .cloned()
-                .ok_or(canonical_error)?
+    // Everything below removes rows and state at or under this folder, and a
+    // shared drive root covers its whole drive, so it has to be a folder the
+    // user actually shared: a request naming an unshared drive must not wipe
+    // that drive's rows.
+    let canonical_path = {
+        let config = state.config.read().await;
+        match stored_shared_folder(
+            &config.settings.shared_folders,
+            resolved_path.as_deref().ok(),
+            &path,
+        ) {
+            Some(stored) => stored,
+            None => {
+                return Err(match resolved_path {
+                    Err(canonical_error) => canonical_error,
+                    Ok(_) => coded_ctx(
+                        "sharing_folder_not_shared",
+                        "Folder is not a shared folder",
+                        &path,
+                    ),
+                })
+            }
         }
     };
     // `add_shared_folder` stores the *canonical* form in
@@ -4285,13 +4378,13 @@ pub async fn remove_shared_folder(
             .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
         new_settings
             .pending_share_states
-            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+            .retain(|path, _| !crate::security::path_within_dir(path, &canonical_path));
         new_settings
             .pending_file_priorities
-            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+            .retain(|path, _| !crate::security::path_within_dir(path, &canonical_path));
         new_settings
             .pending_folder_allowlists
-            .retain(|folder, _| !crate::security::path_matches_dir(folder, &canonical_path));
+            .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
         new_settings
             .shared_folder_scan_cursors
             .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
@@ -4337,15 +4430,15 @@ pub async fn remove_shared_folder(
         config
             .settings
             .pending_share_states
-            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+            .retain(|path, _| !crate::security::path_within_dir(path, &canonical_path));
         config
             .settings
             .pending_file_priorities
-            .retain(|path, _| !crate::security::path_matches_dir(path, &canonical_path));
+            .retain(|path, _| !crate::security::path_within_dir(path, &canonical_path));
         config
             .settings
             .pending_folder_allowlists
-            .retain(|folder, _| !crate::security::path_matches_dir(folder, &canonical_path));
+            .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
         config
             .settings
             .shared_folder_scan_cursors
@@ -4372,7 +4465,7 @@ pub async fn remove_shared_folder(
         let dropped: Vec<String> = index
             .all_files()
             .iter()
-            .filter(|file| crate::security::path_matches_dir(&file.path, &canonical_path))
+            .filter(|file| crate::security::path_within_dir(&file.path, &canonical_path))
             .map(|file| file.hash.clone())
             .collect();
         index.remove_files_by_path_prefix(&canonical_path);
@@ -4407,6 +4500,34 @@ pub async fn remove_shared_folder(
 pub async fn get_shared_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileInfo>, String> {
     let cached = state.cached_shared_files.read().await;
     Ok(cached.clone())
+}
+
+/// [`get_shared_files`] for a caller that already holds a copy.
+#[derive(serde::Serialize)]
+pub struct SharedFilesSnapshot {
+    /// Changes whenever any row's serialized form does.
+    pub etag: String,
+    /// `None` when the library still matches the caller's `etag`.
+    pub files: Option<Vec<FileInfo>>,
+}
+
+/// Hashing the cached rows costs a fraction of cloning, serializing and
+/// shipping them, so a Library refresh with nothing new skips all three.
+#[tauri::command]
+pub async fn get_shared_files_if_changed(
+    state: tauri::State<'_, AppState>,
+    etag: Option<String>,
+) -> Result<SharedFilesSnapshot, String> {
+    let cached = state.cached_shared_files.read().await;
+    let current = format!(
+        "{:016x}",
+        crate::sharing::manager::serde_fingerprint_rows(cached.iter())
+    );
+    let files = (etag.as_deref() != Some(current.as_str())).then(|| cached.clone());
+    Ok(SharedFilesSnapshot {
+        etag: current,
+        files,
+    })
 }
 
 /// Count and total byte size of files the user is *actively sharing*
@@ -4958,7 +5079,236 @@ pub async fn reload_shared_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    reload_shared_files_page(app, &state, MAX_CHAINED_SCAN_PAGES).await
+    reload_shared_files_page(app, &state, MAX_CHAINED_SCAN_PAGES, None).await
+}
+
+/// Rescan only `paths` — the files and folders filesystem events named — and
+/// reconcile the index at and under each of them, leaving every other row of
+/// every shared folder alone.
+///
+/// What the FS watcher runs for an ordinary change. A full reload walks every
+/// root, re-reads `known.met` and re-announces the whole library, which is
+/// the wrong price for one file landing in one folder — and it was paid on
+/// every coalescing window for as long as anything kept writing.
+pub(crate) async fn rescan_shared_paths(
+    app: tauri::AppHandle,
+    state: &AppState,
+    paths: Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    reload_shared_files_page(app, state, 0, Some(paths)).await
+}
+
+/// `paths` without any that lie inside another of them, whose walk already
+/// covers them.
+fn outermost_paths(mut paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    paths.sort();
+    paths.dedup();
+    let all = paths.clone();
+    paths.retain(|path| !all.iter().any(|other| other != path && path.starts_with(other)));
+    paths
+}
+
+/// Unix seconds, in the unit `FileInfo::modified_at` uses.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Take out of `files_to_hash` the files modified too recently to be finished
+/// this pass. A file the index already holds hashed at this exact size and
+/// mtime is not being written — a download that just completed, say, whose
+/// `known.met` record has not reached disk yet — and is left to hash as before.
+///
+/// Their discovery rows stay in the pass's discovered set on purpose. The
+/// reconcile places each over the file's existing row, which carries its
+/// share state, friends-only restriction, priority and counters onto the
+/// unhashed placeholder, and the settle recheck's own placeholder and the
+/// hash completion carry them on from there. Dropping the row instead made
+/// the file come back as a brand-new public share once it settled: its new
+/// size, mtime and hash match nothing that remembers the old choices.
+fn take_settling_files(
+    files_to_hash: &mut Vec<FileInfo>,
+    index: &LocalIndex,
+    now: i64,
+) -> Vec<FileInfo> {
+    let mut settling = Vec::new();
+    files_to_hash.retain(|file| {
+        let indexed_as_is = index.get_by_path(&file.path).is_some_and(|row| {
+            !row.hash.is_empty() && row.size == file.size && row.modified_at == file.modified_at
+        });
+        if !indexed_as_is && crate::sharing::indexer::still_settling(file.modified_at, now) {
+            settling.push(file.clone());
+            false
+        } else {
+            true
+        }
+    });
+    settling
+}
+
+/// Normalized paths of the unhashed placeholder rows at or under `folders`.
+fn unhashed_placeholders_under(index: &LocalIndex, folders: &[String]) -> HashSet<String> {
+    index
+        .all_files()
+        .iter()
+        .filter(|file| {
+            file.id.starts_with(crate::search::index::PENDING_ID_PREFIX)
+                && file_in_shared_folders(&file.path, folders)
+        })
+        .map(|file| crate::search::index::normalize_path_key(&file.path))
+        .collect()
+}
+
+/// `remove_pending_files_under(folders)`, sparing the placeholders whose
+/// normalized path is in `keep`.
+fn remove_pending_rows_except(index: &mut LocalIndex, folders: &[String], keep: &HashSet<String>) {
+    let kept = index
+        .all_files()
+        .iter()
+        .filter(|file| {
+            file.id.starts_with(crate::search::index::PENDING_ID_PREFIX)
+                && keep.contains(&crate::search::index::normalize_path_key(&file.path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    index.remove_pending_files_under(folders);
+    index.add_files(kept);
+}
+
+/// Path-keyed intents that keep a settling file's restrictions across a
+/// restart: `(share updates, priority updates)` for [`write_pending_intents`].
+///
+/// Once a file's hashed row gives way to its settle placeholder, nothing on
+/// disk remembers its choices by anything that still matches it — `known.met`
+/// and the share-intent store are keyed by the old hash — so a restart before
+/// the recheck rediscovers it as a new public share. A pending intent is keyed
+/// by path, the startup scan applies it to that rediscovery, and it is pruned
+/// once the file is hashed again. A friends-only file is recorded as unshared:
+/// there is no path-keyed friends-only intent, and failing closed beats
+/// coming back public. In-session the placeholder carries the exact state and
+/// wins over the intent. Only a hashed row is recorded — a placeholder's
+/// choices were recorded when it replaced that row, and a later explicit
+/// change by the user must not be overwritten here.
+fn settle_carry_over_intents(
+    settling: &[FileInfo],
+    index: &LocalIndex,
+    existing_share_intents: &std::collections::HashMap<String, bool>,
+    existing_priority_intents: &std::collections::HashMap<String, String>,
+) -> (Vec<(String, bool)>, Vec<(String, String)>) {
+    let mut shares = Vec::new();
+    let mut priorities = Vec::new();
+    for file in settling {
+        let Some(row) = index.get_by_path(&file.path) else {
+            continue;
+        };
+        if row.hash.is_empty() {
+            continue;
+        }
+        let key = crate::search::index::normalize_path_key(&row.path);
+        if (!row.shared || row.friends_only) && !existing_share_intents.contains_key(&key) {
+            shares.push((row.path.clone(), false));
+        }
+        if row.priority != "normal" && !existing_priority_intents.contains_key(&key) {
+            priorities.push((row.path.clone(), row.priority.clone()));
+        }
+    }
+    (shares, priorities)
+}
+
+/// Split a scoped rescan's discoveries three ways before `known.met` is read:
+/// rows the index already holds for exactly this size and mtime (reused
+/// as-is), files still being written (deferred), and the rest. Only the rest
+/// needs `known.met`, so a pass that finds nothing else — an external writer's
+/// file growing, the common case — never loads it.
+fn split_scoped_discoveries(
+    discovered: Vec<FileInfo>,
+    index: &LocalIndex,
+    now: i64,
+) -> (Vec<FileInfo>, Vec<FileInfo>, Vec<FileInfo>) {
+    let mut unchanged = Vec::new();
+    let mut settling = Vec::new();
+    let mut rest = Vec::new();
+    for file in discovered {
+        match index.get_by_path(&file.path) {
+            Some(row)
+                if !row.hash.is_empty()
+                    && row.size == file.size
+                    && row.modified_at == file.modified_at =>
+            {
+                unchanged.push(row.clone());
+            }
+            _ if crate::sharing::indexer::still_settling(file.modified_at, now) => settling.push(file),
+            _ => rest.push(file),
+        }
+    }
+    (unchanged, settling, rest)
+}
+
+/// Rescan files left to settle once the newest of them has gone quiet.
+fn schedule_settle_recheck(app: &tauri::AppHandle, settling: &[FileInfo], now: i64) {
+    let newest = settling
+        .iter()
+        .map(|file| file.modified_at)
+        .max()
+        .unwrap_or(now);
+    let wait = newest
+        .saturating_add(crate::sharing::indexer::SETTLE_PERIOD_SECS)
+        .saturating_sub(now)
+        .clamp(1, 2 * crate::sharing::indexer::SETTLE_PERIOD_SECS) as u64
+        + 2;
+    let wait = std::time::Duration::from_secs(wait);
+    let paths = settling
+        .iter()
+        .map(|file| std::path::PathBuf::from(&file.path))
+        .collect::<Vec<_>>();
+    info!(
+        "{} file(s) are still being written; hashing them once they settle ({}s)",
+        paths.len(),
+        wait.as_secs()
+    );
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    match state.shared_folder_watcher.as_ref() {
+        Some(watcher) => watcher.queue_rescan_after(paths, wait),
+        None => {
+            tokio::spawn(settle_recheck_without_watcher(app.clone(), paths, wait));
+        }
+    }
+}
+
+/// [`schedule_settle_recheck`] when live folder tracking is off. Boxed for the
+/// same reason as [`chained_scan_page`]: it is mutually recursive with
+/// [`reload_shared_files_page`].
+fn settle_recheck_without_watcher(
+    app: tauri::AppHandle,
+    paths: Vec<std::path::PathBuf>,
+    wait: std::time::Duration,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        tokio::time::sleep(wait).await;
+        let mut backoff = RELOAD_BUSY_RETRY;
+        loop {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if state.bw_shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            // A pass can hold the flight for hours on a first-run library, so
+            // this outlasts it rather than giving up; a Stop is latched by the
+            // rescan itself.
+            match rescan_shared_paths(app.clone(), &state, paths.clone()).await {
+                Err(error) if error.contains("sharing_reload_in_flight") => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RELOAD_BUSY_RETRY_MAX);
+                }
+                _ => return,
+            }
+        }
+    })
 }
 
 /// Wait out the gap between chained pages, then run the next one.
@@ -4992,14 +5342,31 @@ fn chained_scan_page(
             }
             tokio::time::sleep(CHAINED_SCAN_POLL_INTERVAL).await;
         }
-        let Some(state) = app.try_state::<AppState>() else {
-            return;
-        };
-        if let Err(error) = reload_shared_files_page(app.clone(), &state, chained_pages_left).await
-        {
-            // Almost always the single-flight rejection: a reload the user or
-            // the FS watcher started in the gap now owns the remaining pages.
-            debug!("Chained shared-folder scan page did not start: {error}");
+        loop {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if state.bw_shutdown.load(Ordering::Acquire)
+                || state.hashing_paused.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            match reload_shared_files_page(app.clone(), &state, chained_pages_left, None).await {
+                // A full reload resumes from the same cursor and chains its own
+                // pages. A scoped rescan does neither, and giving up behind one
+                // left every later page of a large library unindexed.
+                Err(error)
+                    if error.contains("sharing_reload_in_flight")
+                        && RELOAD_FLIGHT_KIND.load(Ordering::Acquire) != FLIGHT_FULL =>
+                {
+                    tokio::time::sleep(RELOAD_BUSY_RETRY).await;
+                }
+                Err(error) => {
+                    debug!("Chained shared-folder scan page did not start: {error}");
+                    return;
+                }
+                Ok(()) => return,
+            }
         }
     })
 }
@@ -5015,11 +5382,13 @@ async fn schedule_chained_scan_page(app: tauri::AppHandle, chained_pages_left: u
 }
 
 /// `chained_pages_left` is how many *further* truncated pages this trigger may
-/// queue for itself; see [`MAX_CHAINED_SCAN_PAGES`].
+/// queue for itself; see [`MAX_CHAINED_SCAN_PAGES`]. `scope` limits the pass to
+/// those paths; see [`rescan_shared_paths`].
 async fn reload_shared_files_page(
     app: tauri::AppHandle,
     state: &AppState,
     chained_pages_left: u32,
+    scope: Option<Vec<std::path::PathBuf>>,
 ) -> Result<(), String> {
     // Shutdown raises `bw_shutdown` before joining the scans it tracks. A
     // reload that starts after that point takes `local_index.write()` and
@@ -5032,6 +5401,13 @@ async fn reload_shared_files_page(
         debug!("Shared-file reload declined: shutdown in progress");
         return Ok(());
     }
+    let scoped = scope.is_some();
+    // Nobody asked for a scoped pass, so it must not undo a Stop; the latch
+    // hands the change to the full reload that resuming runs.
+    if scoped && state.hashing_paused.load(Ordering::Relaxed) {
+        state.hashing_fs_dirty.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
     let reload_flight =
         crate::security::try_begin_single_flight(&RELOAD_IN_FLIGHT).ok_or_else(|| {
             coded(
@@ -5039,11 +5415,16 @@ async fn reload_shared_files_page(
                 "A shared-file reload is already running",
             )
         })?;
-    // Manual reload / resume always clear the pause latch. The FS watcher
-    // never reaches this path while paused (it checks hashing_paused first).
-    state.hashing_paused.store(false, Ordering::Relaxed);
-    state.hashing_fs_dirty.store(false, Ordering::Relaxed);
-    state.library_scan_truncated.store(false, Ordering::Relaxed);
+    let flight_kind = ReloadFlightKind::set(scoped);
+    if !scoped {
+        // Manual reload / resume always clear the pause latch. The FS watcher
+        // never reaches this path while paused (it checks hashing_paused
+        // first). A scoped pass re-walks no root, so it leaves the truncation
+        // banner to the pass that can re-evaluate it.
+        state.hashing_paused.store(false, Ordering::Relaxed);
+        state.hashing_fs_dirty.store(false, Ordering::Relaxed);
+        state.library_scan_truncated.store(false, Ordering::Relaxed);
+    }
 
     let (folders, scan_cursors) = {
         let config = state.config.read().await;
@@ -5091,6 +5472,9 @@ async fn reload_shared_files_page(
         // not handed to the hash-timeout drain: that drain can block indefinitely
         // on a stuck read, which would wedge every later reload.
         let _reload_flight_guard = reload_flight;
+        // Declared after the flight guard so it drops first: the kind is
+        // cleared while the flight is still ours, never over a newer pass's.
+        let _flight_kind = flight_kind;
         let _coordination_guard = scan_coordination.clone().lock_owned().await;
         scanning.fetch_add(1, Ordering::Relaxed);
         let scan_guard = ScanGuard(scanning.clone());
@@ -5098,16 +5482,45 @@ async fn reload_shared_files_page(
         // `truncated` gates the user-facing cap warning; `partial` gates
         // reconciliation. A resumed page is always partial but only rarely
         // truncated, so they cannot share one flag.
-        let (mut discovered, discovery_truncated, discovery_partial, discovery_cursor_updates): (
+        // `scanned_paths` is what a scoped pass examined and may reconcile
+        // under; empty for a full pass, which reconciles whole roots.
+        let (
+            mut discovered,
+            discovery_truncated,
+            discovery_partial,
+            discovery_cursor_updates,
+            scanned_paths,
+        ): (
             Vec<FileInfo>,
             bool,
             bool,
             std::collections::HashMap<String, Option<String>>,
+            Vec<String>,
         ) = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             let mut truncated = false;
             let mut partial = false;
             let mut cursor_updates = std::collections::HashMap::new();
+            let mut scanned = Vec::new();
+            if let Some(paths) = scope {
+                for path in outermost_paths(paths) {
+                    match FileIndexer::discover_scoped_path(&discovery_folders, &path) {
+                        crate::sharing::indexer::ScopedDiscovery::Skip => {}
+                        crate::sharing::indexer::ScopedDiscovery::Removed => {
+                            scanned.push(path.to_string_lossy().into_owned());
+                        }
+                        crate::sharing::indexer::ScopedDiscovery::Found {
+                            files: found,
+                            partial: found_partial,
+                        } => {
+                            partial |= found_partial;
+                            files.extend(found);
+                            scanned.push(path.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                return (files, truncated, partial, cursor_updates, scanned);
+            }
             for folder in &discovery_folders {
                 let key = crate::search::index::normalize_path_key(folder);
                 let result = FileIndexer::discover_directory_page(
@@ -5119,7 +5532,7 @@ async fn reload_shared_files_page(
                 cursor_updates.insert(folder.clone(), result.next_cursor);
                 files.extend(result.files);
             }
-            (files, truncated, partial, cursor_updates)
+            (files, truncated, partial, cursor_updates, scanned)
         })
         .await
         {
@@ -5147,16 +5560,33 @@ async fn reload_shared_files_page(
             let cfg = config.read().await;
             cfg.settings.shared_folders.clone()
         };
-        let reloaded_folders = folders
-            .iter()
-            .filter(|folder| {
-                current_folders
-                    .iter()
-                    .any(|current| paths_equal_ignore_case(current, folder))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        // For a scoped pass the "folders" reconciled are the examined paths
+        // themselves, each only while a current root still covers it.
+        let reloaded_folders = if scoped {
+            scanned_paths
+                .into_iter()
+                .filter(|path| {
+                    current_folders
+                        .iter()
+                        .any(|current| crate::security::path_within_dir(path, current))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            folders
+                .iter()
+                .filter(|folder| {
+                    current_folders
+                        .iter()
+                        .any(|current| paths_equal_ignore_case(current, folder))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         discovered.retain(|file| file_in_shared_folders(&file.path, &reloaded_folders));
+        if scoped && reloaded_folders.is_empty() {
+            remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
+            return;
+        }
 
         if cancel_flag.load(Ordering::Relaxed) {
             info!("Reload cancelled during discovery");
@@ -5168,18 +5598,38 @@ async fn reload_shared_files_page(
             return;
         }
 
-        let known_list = match load_known_files().await {
-            Ok(known_list) => known_list,
-            Err(e) => {
-                tracing::error!("Reload known.met load failed: {e}");
-                remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
-                return;
+        let settle_now = unix_now_secs();
+        let (unchanged_rows, early_settling) = if scoped {
+            let index = local_index.read().await;
+            let (unchanged, settling, rest) =
+                split_scoped_discoveries(std::mem::take(&mut discovered), &index, settle_now);
+            discovered = rest;
+            (unchanged, settling)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let known_list = if discovered.is_empty() {
+            KnownFileList::new()
+        } else {
+            match load_known_files().await {
+                Ok(known_list) => known_list,
+                Err(e) => {
+                    tracing::error!("Reload known.met load failed: {e}");
+                    remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
+                    return;
+                }
             }
         };
         let ResolvedWork {
             needs_hashing: mut files_to_hash,
             needs_top_up,
         } = resolve_from_known(&mut discovered, &known_list);
+        // Files still being written get the same new-file treatment
+        // (allowlist, intents, folder default) as a file about to be hashed —
+        // their placeholder row is what a brand-new file enters the index as —
+        // and are held back from hashing just below.
+        discovered.extend(early_settling.iter().cloned());
+        files_to_hash.extend(early_settling);
         let (
             folder_priorities,
             pending_share_states,
@@ -5206,12 +5656,46 @@ async fn reload_shared_files_page(
             &pending_share_states,
             &pending_file_priorities,
         );
+        let (settling, settle_share_intents, settle_priority_intents) = {
+            let index = local_index.read().await;
+            let settling = take_settling_files(&mut files_to_hash, &index, settle_now);
+            let (shares, priorities) = settle_carry_over_intents(
+                &settling,
+                &index,
+                &pending_share_states,
+                &pending_file_priorities,
+            );
+            (settling, shares, priorities)
+        };
+        // Recorded before the reconcile hands the old rows' state to their
+        // placeholders, so there is no moment when only memory holds it.
+        if let Err(error) = write_pending_intents(
+            &app.state::<AppState>(),
+            &settle_share_intents,
+            &settle_priority_intents,
+            &[],
+            &[],
+            false,
+        )
+        .await
+        {
+            warn!("Could not record the restrictions of files still being written: {error}");
+        }
+        discovered.extend(unchanged_rows);
 
-        let removed_fresh_hashes = {
+        let (removed_fresh_hashes, placeholders_before_pass) = {
             let mut index = local_index.write().await;
-            let before = (!discovery_partial).then(|| index.all_files().to_vec());
+            let placeholders_before_pass = unhashed_placeholders_under(&index, &reloaded_folders);
+            let before = (!discovery_partial || !settling.is_empty()).then(|| {
+                index
+                    .all_files()
+                    .iter()
+                    .filter(|file| file_in_shared_folders(&file.path, &reloaded_folders))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
             index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_partial);
-            before
+            let removed = before
                 .as_deref()
                 .map(|before| {
                     fresh_part_hashes_removed_by_reload(
@@ -5220,7 +5704,8 @@ async fn reload_shared_files_page(
                         &reloaded_folders,
                     )
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (removed, placeholders_before_pass)
         };
         discard_fresh_part_hashes(&fresh_part_hashes, &removed_fresh_hashes).await;
         refresh_file_cache(&local_index, &file_cache).await;
@@ -5428,8 +5913,23 @@ async fn reload_shared_files_page(
             let mut index = local_index.write().await;
             if was_cancelled {
                 // Scope the pending cleanup to the folders this reload owns so a
-                // concurrent folder-add scan keeps its in-progress entries.
-                index.remove_pending_files_under(&reloaded_folders);
+                // concurrent folder-add scan keeps its in-progress entries —
+                // and keep every placeholder that predates this pass or is one
+                // of its own settling files. Those are the only holders of a
+                // settling file's share state and restriction: a full pass
+                // would otherwise wipe an earlier scoped pass's placeholders,
+                // including ones on pages it never reached, and the recheck
+                // would find those files new and public.
+                let keep = placeholders_before_pass
+                    .iter()
+                    .cloned()
+                    .chain(
+                        settling
+                            .iter()
+                            .map(|file| crate::search::index::normalize_path_key(&file.path)),
+                    )
+                    .collect::<HashSet<_>>();
+                remove_pending_rows_except(&mut index, &reloaded_folders, &keep);
             }
             index.rebuild();
         }
@@ -5439,7 +5939,7 @@ async fn reload_shared_files_page(
         // cursor both moved and reached disk; otherwise it would rescan exactly
         // what just ran.
         let mut resume_point_advanced = false;
-        if !was_cancelled && page_complete {
+        if !was_cancelled && page_complete && !scoped {
             let cursor_updates = discovery_cursor_updates
                 .into_iter()
                 .filter(|(folder, _)| {
@@ -5463,12 +5963,17 @@ async fn reload_shared_files_page(
         refresh_file_cache(&local_index, &file_cache).await;
 
         if !was_cancelled {
+            // Announcing only adds to the publish set, so a scoped pass need
+            // only offer what it examined.
             let all_files = {
                 let index = local_index.read().await;
                 index
                     .all_files()
                     .iter()
-                    .filter(|f| !f.hash.is_empty())
+                    .filter(|f| {
+                        !f.hash.is_empty()
+                            && (!scoped || file_in_shared_folders(&f.path, &reloaded_folders))
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -5490,6 +5995,11 @@ async fn reload_shared_files_page(
             // hashed, hand the optional repairs to the background. Cancelling
             // the reload skips this too: Stop means leave the disks alone.
             queue_hash_top_up(app.clone(), &needs_top_up).await;
+        }
+        // Even after a cancel: the placeholders stay, and a recheck that
+        // arrives during Stop or shutdown declines on its own.
+        if !settling.is_empty() {
+            schedule_settle_recheck(&app, &settling, settle_now);
         }
         remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
 
@@ -5576,7 +6086,7 @@ async fn folders_losing_files_on_stop(state: &AppState) -> Vec<String> {
                 continue;
             }
             for folder in &shared_folders {
-                if crate::security::path_matches_dir(&file.path, folder) {
+                if crate::security::path_within_dir(&file.path, folder) {
                     at_risk.insert(folder.clone());
                 }
             }
@@ -5735,11 +6245,11 @@ pub(crate) async fn drop_from_allowlists(
 async fn clear_allowlists_under(state: &AppState, folder: &str) -> Result<(), String> {
     edit_folder_allowlists(state, |lists| {
         let before = lists.len();
-        lists.retain(|listed, _| !crate::security::path_matches_dir(listed, folder));
+        lists.retain(|listed, _| !crate::security::path_within_dir(listed, folder));
         let mut changed = lists.len() != before;
         for entries in lists.values_mut() {
             let before = entries.len();
-            entries.retain(|entry| !crate::security::path_matches_dir(entry, folder));
+            entries.retain(|entry| !crate::security::path_within_dir(entry, folder));
             changed |= entries.len() != before;
         }
         changed
@@ -5797,6 +6307,18 @@ pub async fn unshare_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    // The allowlist and row changes below are drive-aware, so a request naming
+    // a drive that is not shared would otherwise lift every allowlist on it.
+    {
+        let config = state.config.read().await;
+        if !unshare_target_is_shared(&config.settings.shared_folders, &path) {
+            return Err(coded_ctx(
+                "sharing_folder_not_shared",
+                "Folder is not in a shared folder",
+                &path,
+            ));
+        }
+    }
     // Before the index write, so a failure here cannot leave an allowlist
     // that re-offers the folder's files on the next scan.
     clear_allowlists_under(&state, &path).await?;
@@ -6507,6 +7029,350 @@ mod tests {
         assert_eq!(
             lists.get(&key("C:/music")),
             Some(&vec![key("C:/music/a.mp3"), key("C:/music/live")])
+        );
+    }
+
+    #[test]
+    fn scoped_paths_collapse_onto_the_outermost() {
+        use std::path::PathBuf;
+        let paths = vec![
+            PathBuf::from("/s/album/a.mp3"),
+            PathBuf::from("/s/album"),
+            PathBuf::from("/s/album2/b.mp3"),
+            PathBuf::from("/s/album"),
+        ];
+        assert_eq!(
+            outermost_paths(paths),
+            vec![PathBuf::from("/s/album"), PathBuf::from("/s/album2/b.mp3")]
+        );
+    }
+
+    /// The growing-file case: an external writer's file is neither hashed nor
+    /// sent to `known.met` while it is still changing, an unchanged indexed row
+    /// is reused as-is, and only genuinely new settled files go on to be
+    /// resolved.
+    #[test]
+    fn a_scoped_rescan_reuses_unchanged_rows_and_defers_files_still_being_written() {
+        let now = 1_000_000;
+        let mut unchanged = indexed_file("C:/s/done.mkv", "11111111111111111111111111111111");
+        unchanged.modified_at = now - 5;
+        let mut index = LocalIndex::new();
+        index.add_files(vec![unchanged.clone()]);
+
+        let mut seen_again = unchanged.clone();
+        seen_again.id = "pending:C:/s/done.mkv".into();
+        seen_again.hash.clear();
+        let mut growing = indexed_file("C:/s/growing.mkv", "");
+        growing.modified_at = now - 2;
+        let mut settled = indexed_file("C:/s/new.mkv", "");
+        settled.modified_at = now - 600;
+
+        let (reused, settling, rest) =
+            split_scoped_discoveries(vec![seen_again, growing, settled], &index, now);
+        assert_eq!(reused.len(), 1);
+        assert_eq!(reused[0].hash, unchanged.hash, "the indexed row is reused");
+        assert_eq!(settling.len(), 1);
+        assert_eq!(settling[0].path, "C:/s/growing.mkv");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].path, "C:/s/new.mkv");
+    }
+
+    #[test]
+    fn a_full_reload_leaves_young_files_to_settle_unless_already_indexed_as_is() {
+        let now = 1_000_000;
+        let mut completed = indexed_file("C:/s/completed.mkv", "22222222222222222222222222222222");
+        completed.modified_at = now - 3;
+        let mut index = LocalIndex::new();
+        index.add_files(vec![completed.clone()]);
+
+        let mut completed_pending = completed.clone();
+        completed_pending.hash.clear();
+        let mut growing = indexed_file("C:/s/growing.mkv", "");
+        growing.modified_at = now - 1;
+        let mut old = indexed_file("C:/s/old.mkv", "");
+        old.modified_at = now - 3600;
+
+        let mut files_to_hash = vec![completed_pending.clone(), growing.clone(), old.clone()];
+        let settling = take_settling_files(&mut files_to_hash, &index, now);
+        assert_eq!(settling.len(), 1);
+        assert_eq!(settling[0].path, growing.path);
+        assert_eq!(files_to_hash.len(), 2, "settled and already-indexed files still hash");
+    }
+
+    /// Cancelling a full pass must not wipe placeholders it did not create: an
+    /// earlier scoped pass's settle placeholder (whose file this pass then
+    /// queued as settled), and one on a page this pass never reached. Each is
+    /// the only holder of its file's restriction; only this pass's own new
+    /// pending rows go.
+    #[test]
+    fn cancelling_a_pass_keeps_the_placeholders_it_did_not_create() {
+        let root = "C:/s".to_string();
+        let placeholder = |path: &str| {
+            let mut file = indexed_file(path, "");
+            file.id = format!("{}{path}", crate::search::index::PENDING_ID_PREFIX);
+            file
+        };
+        let mut earlier = placeholder("C:/s/edited.mp3");
+        earlier.friends_only = true;
+        earlier.shared = false;
+        let mut unreached = placeholder("C:/s/zz/later.mp3");
+        unreached.friends_only = true;
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            earlier,
+            unreached,
+            indexed_file("C:/s/hashed.mp3", "55555555555555555555555555555555"),
+        ]);
+
+        let before = unhashed_placeholders_under(&index, std::slice::from_ref(&root));
+        assert_eq!(before.len(), 2);
+        // This (partial) page rediscovers the edited file, now settled and
+        // queued, plus one brand-new file.
+        index.reconcile_files_for_folders(
+            std::slice::from_ref(&root),
+            vec![placeholder("C:/s/edited.mp3"), placeholder("C:/s/new.mp3")],
+            false,
+        );
+
+        remove_pending_rows_except(&mut index, std::slice::from_ref(&root), &before);
+        index.rebuild();
+        let edited = index.get_by_path("C:/s/edited.mp3").expect("earlier placeholder kept");
+        assert!(edited.friends_only && !edited.shared, "its restriction survives the cancel");
+        assert!(index.get_by_path("C:/s/zz/later.mp3").expect("unreached kept").friends_only);
+        assert!(index.get_by_path("C:/s/new.mp3").is_none(), "this pass's own row goes");
+        assert!(index.get_by_path("C:/s/hashed.mp3").is_some());
+    }
+
+    /// A restart mid-settle rebuilds the index from discovery, and nothing
+    /// keyed by the old hash matches the edited file any more. The path-keyed
+    /// intent recorded when the placeholder took over is what the startup
+    /// scan applies, so the file comes back unshared rather than public.
+    #[test]
+    fn a_restart_mid_settle_does_not_bring_a_restricted_file_back_public() {
+        let path = "C:/s/song.mp3";
+        let mut hashed = indexed_file(path, "66666666666666666666666666666666");
+        hashed.friends_only = true;
+        hashed.priority = "high".to_string();
+        let mut index = LocalIndex::new();
+        index.add_files(vec![hashed]);
+        let settling = vec![indexed_file(path, "")];
+
+        let (shares, priorities) = settle_carry_over_intents(
+            &settling,
+            &index,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(shares, vec![(path.to_string(), false)]);
+        assert_eq!(priorities, vec![(path.to_string(), "high".to_string())]);
+
+        // An intent already recorded — the user's own, or an earlier pass's —
+        // is left as it is.
+        let key = crate::search::index::normalize_path_key(path);
+        let (again, _) = settle_carry_over_intents(
+            &settling,
+            &index,
+            &std::collections::HashMap::from([(key.clone(), true)]),
+            &std::collections::HashMap::new(),
+        );
+        assert!(again.is_empty());
+
+        // After the restart: a fresh row, as the startup scan would build it.
+        let share_intents = std::collections::HashMap::from([(key.clone(), false)]);
+        let priority_intents = std::collections::HashMap::from([(key, "high".to_string())]);
+        let mut discovered = vec![indexed_file(path, "")];
+        let mut files_to_hash = discovered.clone();
+        apply_pending_intents(
+            &mut discovered,
+            &mut files_to_hash,
+            &share_intents,
+            &priority_intents,
+        );
+        assert!(!discovered[0].shared, "fails closed instead of coming back public");
+        assert_eq!(discovered[0].priority, "high");
+
+        // An unrestricted file at the default priority records nothing.
+        let mut plain_index = LocalIndex::new();
+        plain_index.add_files(vec![indexed_file(path, "77777777777777777777777777777777")]);
+        let (none, no_priority) = settle_carry_over_intents(
+            &settling,
+            &plain_index,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(none.is_empty() && no_priority.is_empty());
+    }
+
+    /// The reported regression. A friends-only, unshared, high-priority file
+    /// edited in place by another program (a tag editor, say) was dropped from
+    /// the index while it settled, then came back as a brand-new row: shared,
+    /// public, normal priority — and ~47 s later was hashed and announced to
+    /// the open network. Its new size, mtime and hash match nothing that
+    /// remembers the old choices, so the placeholder row is what has to carry
+    /// them, through the settle pass, the recheck, and the hash completion.
+    #[test]
+    fn a_restricted_file_edited_externally_keeps_its_restrictions_through_settle_and_rehash() {
+        let now = 1_000_000;
+        let folder = "C:/s".to_string();
+        let path = "C:/s/song.mp3";
+        let mut original = indexed_file(path, "33333333333333333333333333333333");
+        original.modified_at = now - 86_400;
+        original.shared = false;
+        original.friends_only = true;
+        original.priority = "high".to_string();
+        original.alltime_requests = 7;
+        let mut index = LocalIndex::new();
+        index.add_files(vec![original]);
+
+        // What discovery produces for the edited file: a fresh pending row.
+        let rediscovered = |modified_at: i64, size: u64| {
+            let mut file = indexed_file(path, "");
+            file.id = format!("{}{path}", crate::search::index::PENDING_ID_PREFIX);
+            file.modified_at = modified_at;
+            file.size = size;
+            file
+        };
+
+        // Settle pass (scoped): the file is still being written.
+        let (unchanged, early_settling, rest) =
+            split_scoped_discoveries(vec![rediscovered(now - 2, 2)], &index, now);
+        assert!(unchanged.is_empty() && rest.is_empty());
+        let mut discovered = early_settling.clone();
+        let mut files_to_hash = early_settling;
+        let settling = take_settling_files(&mut files_to_hash, &index, now);
+        assert_eq!(settling.len(), 1);
+        assert!(files_to_hash.is_empty(), "nothing is hashed while it settles");
+        index.reconcile_files_for_folders(std::slice::from_ref(&folder), discovered, true);
+        let placeholder = index.get_by_path(path).expect("the row stays indexed").clone();
+        assert!(placeholder.hash.is_empty(), "a changing file is not served meanwhile");
+        assert!(!placeholder.shared && placeholder.friends_only);
+        assert_eq!(placeholder.priority, "high");
+        assert_eq!(placeholder.alltime_requests, 7);
+
+        // Recheck once it has settled: hashed now, over the placeholder.
+        let later = now + 60;
+        let (unchanged, early_settling, rest) =
+            split_scoped_discoveries(vec![rediscovered(now - 2, 2)], &index, later);
+        assert!(unchanged.is_empty() && early_settling.is_empty());
+        discovered = rest.clone();
+        files_to_hash = rest;
+        assert!(take_settling_files(&mut files_to_hash, &index, later).is_empty());
+        assert_eq!(files_to_hash.len(), 1);
+        index.reconcile_files_for_folders(std::slice::from_ref(&folder), discovered, true);
+        let mut completed = files_to_hash[0].clone();
+        completed.hash = "44444444444444444444444444444444".to_string();
+        completed.id = completed.hash.clone();
+        index
+            .finalize_pending_hash(&files_to_hash[0].id, completed)
+            .expect("the placeholder is finalized");
+
+        let row = index.get_by_path(path).expect("hashed row");
+        assert_eq!(row.hash, "44444444444444444444444444444444");
+        assert!(!row.shared, "an unshared file stays unshared");
+        assert!(row.friends_only, "a friends-only file must not come back public");
+        assert_eq!(row.priority, "high");
+        assert_eq!(row.alltime_requests, 7);
+    }
+
+    /// A whole data drive, shared after the native confirmation, has to index
+    /// the files on it, survive a root reconcile, and have its rows cleared
+    /// when it is unshared. `path_matches_dir` refuses a bare drive, so every
+    /// one of these steps used to treat the drive as containing nothing: the
+    /// scan dropped its files and a reconcile would have deleted any it had.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_drive_root_indexes_its_files_and_unsharing_clears_them() {
+        let drive = r"\\?\D:\".to_string();
+        let shared = vec![drive.clone(), r"\\?\E:\Music".to_string()];
+        let on_drive = [r"\\?\D:\Films\a.mkv", r"\\?\D:\b.iso"];
+        let elsewhere = r"\\?\E:\Music\c.mp3";
+
+        // Reload: discovery's rows survive the shared-folder filter and are
+        // reconciled under the drive.
+        let mut discovered: Vec<FileInfo> = on_drive
+            .iter()
+            .chain(std::iter::once(&elsewhere))
+            .enumerate()
+            .map(|(i, path)| indexed_file(path, &format!("{:032x}", i + 1)))
+            .collect();
+        discovered.retain(|file| file_in_shared_folders(&file.path, &shared));
+        assert_eq!(discovered.len(), 3, "files on a shared drive are in a shared folder");
+        let mut index = LocalIndex::new();
+        index.reconcile_files_for_folders(&shared, discovered, true);
+        assert_eq!(index.file_count(), 3);
+        assert!(
+            index.remove_files_outside_folders(&shared).is_empty(),
+            "a root reconcile keeps the drive's rows"
+        );
+
+        // Unshare the drive: the request resolves to the stored share, and
+        // then clears exactly the rows on it.
+        let target = stored_shared_folder(&shared, Some(r"\\?\D:\"), r"D:\")
+            .expect("the drive is a stored share");
+        assert_eq!(target, drive);
+        assert!(unshare_target_is_shared(&shared, r"D:\"));
+        let mutation = index.set_shared_by_path_prefix(&target, false);
+        assert_eq!(mutation.changed_paths, 2);
+        index.remove_files_by_path_prefix(&target);
+        assert_eq!(index.file_count(), 1);
+        assert_eq!(index.all_files()[0].path, elsewhere);
+    }
+
+    /// The drive-aware operations only ever run on a stored share. A request
+    /// naming a drive that is not itself shared — only a folder on it is —
+    /// is refused before anything touches that folder's rows or allowlists.
+    #[test]
+    fn a_request_for_an_unshared_drive_root_is_refused() {
+        let drive_request = if cfg!(windows) { r"D:\" } else { "/" };
+        let folder_on_it = if cfg!(windows) {
+            r"\\?\D:\Films".to_string()
+        } else {
+            "/mnt/films".to_string()
+        };
+        let shared = vec![folder_on_it.clone()];
+        assert_eq!(stored_shared_folder(&shared, Some(drive_request), drive_request), None);
+        assert!(!unshare_target_is_shared(&shared, drive_request));
+        let inside = if cfg!(windows) { r"D:\Films\Extras" } else { "/mnt/films/extras" };
+        assert!(
+            unshare_target_is_shared(&shared, inside),
+            "a folder inside a share can still be unshared"
+        );
+        let escaping = if cfg!(windows) { r"D:\Films\..\Other" } else { "/mnt/films/../other" };
+        assert!(!unshare_target_is_shared(&shared, escaping));
+    }
+
+    /// A drive shared for only a few of its files keeps that limit: the
+    /// allowlist is keyed by the drive root, which `path_matches_dir` refuses
+    /// to treat as containing anything.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_root_allowlist_limits_and_clears_like_any_folder() {
+        let key = crate::search::index::normalize_path_key;
+        let drive = r"\\?\D:\";
+        let keep = r"D:\Films\keep.mkv";
+        let skip = r"D:\Films\skip.mkv";
+        let mut lists = std::collections::HashMap::new();
+        set_added_folder_allowlist(
+            &mut lists,
+            drive,
+            Some(&(vec![keep.to_string()], Vec::new())),
+        );
+        assert_eq!(lists.get(&key(drive)), Some(&vec![key(keep)]));
+
+        let mut discovered = vec![indexed_file(keep, ""), indexed_file(skip, "")];
+        let mut files_to_hash = discovered.clone();
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &lists);
+        assert!(discovered[0].shared);
+        assert!(
+            !discovered[1].shared,
+            "a file on the drive but off its allowlist must not be offered"
+        );
+
+        lists.insert(key(r"D:\Films"), vec![key(keep)]);
+        set_added_folder_allowlist(&mut lists, drive, None);
+        assert!(
+            lists.is_empty(),
+            "sharing the whole drive lifts every limit at or under it"
         );
     }
 

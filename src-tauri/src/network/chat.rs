@@ -91,10 +91,11 @@ pub(super) async fn flush_pending_chat(
         pending.len()
     );
 
-    for (id, message, _stored_at) in pending {
-        let Some(packet) = ({
-            let sessions = ember_sessions.read().await;
-            sessions
+    let mut sent: Vec<i64> = Vec::with_capacity(pending.len());
+    {
+        let sessions = ember_sessions.read().await;
+        for (id, message, _stored_at) in pending {
+            let Some((session_tx, envelope)) = sessions
                 .get(&friend)
                 .filter(|h| h.is_fresh() && h.is_secure_v2())
                 .and_then(|sender| {
@@ -106,61 +107,72 @@ pub(super) async fn flush_pending_chat(
                     )
                     .map(|envelope| (sender.tx.clone(), envelope))
                 })
-        }) else {
-            // Session went away mid-flush. Everything from here stays queued.
-            break;
-        };
-        let (session_tx, envelope) = packet;
-        let mut framed = Vec::with_capacity(6 + envelope.len());
-        framed.push(OP_EMULEPROT);
-        framed.extend_from_slice(&((1 + envelope.len()) as u32).to_le_bytes());
-        framed.push(ed2k::messages::OP_EMBER_CHAT_MSG);
-        framed.extend_from_slice(&envelope);
-        if session_tx.try_send(framed).is_err() {
-            break;
+            else {
+                // No usable session. Everything from here stays queued.
+                break;
+            };
+            let mut framed = Vec::with_capacity(6 + envelope.len());
+            framed.push(OP_EMULEPROT);
+            framed.extend_from_slice(&((1 + envelope.len()) as u32).to_le_bytes());
+            framed.push(ed2k::messages::OP_EMBER_CHAT_MSG);
+            framed.extend_from_slice(&envelope);
+            if session_tx.try_send(framed).is_err() {
+                break;
+            }
+            sent.push(id);
         }
-        let db_mark = db.clone();
-        // A mark that silently failed left the row queued, so the next session
-        // with this friend sent the same message again and they saw it twice.
-        // We cannot un-send it, so log loudly rather than discarding the result.
-        let marked_delivered = match tokio::task::spawn_blocking(move || {
-            db_mark.set_chat_delivery(id, crate::storage::database::CHAT_DELIVERED)
-        })
-        .await
-        {
-            Ok(Ok(_n @ 1..)) => true,
-            Ok(Ok(0)) => {
-                tracing::warn!(
-                    "Chat message {id} to {hash_hex} was sent but matched no row to mark \
-                     delivered; it may be re-sent on the next session"
-                );
-                false
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "Chat message {id} to {hash_hex} was sent but could not be marked \
-                     delivered ({e}); it may be re-sent on the next session"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Chat message {id} to {hash_hex} was sent but the marking task failed \
-                     ({e}); it may be re-sent on the next session"
-                );
-                false
-            }
-        };
-        if marked_delivered {
-            let _ = app_handle.emit(
-                "ember:chat-delivery",
-                serde_json::json!({
-                    "user_hash": hash_hex,
-                    "id": id,
-                    "delivery": "delivered",
-                }),
+    }
+    if sent.is_empty() {
+        return;
+    }
+
+    // One transaction for the whole flush rather than a commit per row: under
+    // `synchronous=FULL` each was its own fsync, awaited in turn by the network
+    // task that called this, up to 200 times over.
+    let db_mark = db.clone();
+    let ids = sent.clone();
+    let marked = tokio::task::spawn_blocking(move || {
+        db_mark.set_chat_delivery_many(&ids, crate::storage::database::CHAT_DELIVERED)
+    })
+    .await;
+    // A mark that silently failed left the row queued, so the next session
+    // with this friend sent the same message again and they saw it twice.
+    // We cannot un-send it, so log loudly rather than discarding the result.
+    let matched = match marked {
+        Ok(Ok(matched)) => matched,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "{} chat message(s) to {hash_hex} were sent but could not be marked \
+                 delivered ({e}); they may be re-sent on the next session",
+                sent.len()
             );
+            return;
         }
+        Err(e) => {
+            tracing::warn!(
+                "{} chat message(s) to {hash_hex} were sent but the marking task failed \
+                 ({e}); they may be re-sent on the next session",
+                sent.len()
+            );
+            return;
+        }
+    };
+    for (id, matched) in sent.into_iter().zip(matched) {
+        if !matched {
+            tracing::warn!(
+                "Chat message {id} to {hash_hex} was sent but matched no row to mark \
+                 delivered; it may be re-sent on the next session"
+            );
+            continue;
+        }
+        let _ = app_handle.emit(
+            "ember:chat-delivery",
+            serde_json::json!({
+                "user_hash": hash_hex,
+                "id": id,
+                "delivery": "delivered",
+            }),
+        );
     }
 }
 

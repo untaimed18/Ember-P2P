@@ -295,6 +295,8 @@ pub(crate) async fn run_graceful_shutdown(
         Ok(mut filter) => filter.save(),
         Err(_) => tracing::warn!("Spam filter save skipped on shutdown: lock busy"),
     };
+
+    state.db.mark_clean_shutdown();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2002,6 +2004,7 @@ pub fn run() {
             commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
+            commands::transfers::get_transfers_since,
             commands::transfers::get_upload_queue,
             commands::transfers::get_download_file_details,
             commands::transfers::get_known_clients,
@@ -2035,6 +2038,7 @@ pub fn run() {
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
+            commands::sharing::get_shared_files_if_changed,
             commands::sharing::get_shared_file_count,
             commands::sharing::get_shared_folders,
             commands::sharing::get_file_media_metadata,

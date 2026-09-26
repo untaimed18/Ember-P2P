@@ -18,7 +18,8 @@
     onlineFriends,
     friendsList,
     fileOffers,
-    friendDisplayName,
+    friendLabel,
+    friendNames,
     acceptIncomingFileOffer,
     clearFileOffer,
   } from '$lib/stores/friends';
@@ -54,8 +55,8 @@
   }
 
   function loadPreferredWidth(): number {
-    if (typeof localStorage === 'undefined') return DOCK_WIDTH_DEFAULT;
     try {
+      if (typeof localStorage === 'undefined') return DOCK_WIDTH_DEFAULT;
       return preferredDockWidth(localStorage.getItem(DOCK_WIDTH_KEY));
     } catch {
       return DOCK_WIDTH_DEFAULT;
@@ -72,8 +73,8 @@
   let resizing = $state(false);
 
   function persistDockWidth() {
-    if (typeof localStorage === 'undefined') return;
     try {
+      if (typeof localStorage === 'undefined') return;
       localStorage.setItem(DOCK_WIDTH_KEY, String(preferredWidth));
     } catch {
       // Quota exceeded / private mode. The width holds for this session.
@@ -172,6 +173,9 @@
     kind: 'open' | 'friend';
     hash: string;
     name: string;
+    /** `name` as drawn: with a short hash when it could pass for another
+     *  friend's. `name` stays bare for search and for the tab it opens. */
+    label: string;
     online: boolean;
     unread: number;
   };
@@ -185,6 +189,7 @@
       kind: 'open' as const,
       hash: tab.hash,
       name: tab.name,
+      label: friendLabel(tab.hash, tab.name, $friendNames),
       online: isOnline(tab.hash),
       unread: $unreadCounts.get(tab.hash) ?? 0,
     })),
@@ -204,13 +209,17 @@
           .filter(
             (f) => !$chatTabs.some((t) => t.hash === f.user_hash.toLowerCase()),
           )
-          .map((f) => ({
-            kind: 'friend' as const,
-            hash: f.user_hash.toLowerCase(),
-            name: f.nickname || friendDisplayName(f.user_hash),
-            online: isOnline(f.user_hash),
-            unread: 0,
-          }))
+          .map((f) => {
+            const hash = f.user_hash.toLowerCase();
+            return {
+              kind: 'friend' as const,
+              hash,
+              name: f.nickname?.trim() || $friendNames.get(hash) || `${hash.slice(0, 8)}\u2026`,
+              label: friendLabel(hash, f.nickname, $friendNames),
+              online: isOnline(f.user_hash),
+              unread: 0,
+            };
+          })
           .sort((a, b) => {
             if (a.online !== b.online) return a.online ? -1 : 1;
             return a.name.localeCompare(b.name);
@@ -234,6 +243,9 @@
 
   let activeTab = $derived(
     $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
+  );
+  let activeTabLabel = $derived(
+    activeTab ? friendLabel(activeTab.hash, activeTab.name, $friendNames) : '',
   );
 
   /**
@@ -588,7 +600,7 @@
               ? m.chat_online_label()
               : m.chat_offline_label()}
           ></span>
-          <span class="dock-current-name"><bdi dir="auto">{activeTab.name}</bdi></span>
+          <span class="dock-current-name"><bdi dir="auto">{activeTabLabel}</bdi></span>
         {:else}
           <span class="dock-current-name dock-current-none">{m.chat_dock_none_selected()}</span>
         {/if}
@@ -718,7 +730,7 @@
                   role="img"
                   aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
                 ></span>
-                <span class="dock-row-name"><bdi dir="auto">{row.name}</bdi></span>
+                <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
                 {#if row.unread > 0}
                   <span
                     class="dock-row-unread"
@@ -738,7 +750,7 @@
                   class="dock-row-close"
                   tabindex="-1"
                   aria-hidden="true"
-                  title={m.chat_dock_close_tab({ name: row.name })}
+                  title={m.chat_dock_close_tab({ name: row.label })}
                   onclick={(e) => { e.stopPropagation(); closeRow(row); }}
                 >
                   <IconX size={12} />
@@ -768,7 +780,7 @@
                   role="img"
                   aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
                 ></span>
-                <span class="dock-row-name"><bdi dir="auto">{row.name}</bdi></span>
+                <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
               </div>
             {/each}
           </div>
@@ -783,7 +795,7 @@
               <div class="dock-offer-info">
                 <span class="dock-offer-name"><bdi dir="auto">{offer.file_name}</bdi></span>
                 <span class="dock-offer-meta">
-                  {m.friends_offer_from({ name: friendDisplayName(offer.user_hash) })}
+                  {m.friends_offer_from({ name: friendLabel(offer.user_hash, undefined, $friendNames) })}
                   {#if offer.file_size}&nbsp;·&nbsp;{formatBytes(offer.file_size)}{/if}
                 </span>
               </div>

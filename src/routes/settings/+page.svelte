@@ -59,7 +59,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatSize, formatSpeed, shortPubkey } from '$lib/utils';
+  import { formatDateTime, formatSize, formatSpeed, shortPubkey } from '$lib/utils';
   import { getRuntimeStatus } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
@@ -3955,7 +3955,7 @@
                 {m.settings_backup_pending_message({
                   files: pendingRestore.files,
                   version: pendingRestore.app_version,
-                  when: new Date(pendingRestore.staged_at * 1000).toLocaleString(),
+                  when: formatDateTime(pendingRestore.staged_at),
                 })}
               </span>
               <div class="action-row">
@@ -4054,7 +4054,7 @@
               <div class="backup-preview">
                 <div class="spam-stat">
                   <span>{m.settings_backup_preview_created()}</span>
-                  <strong>{new Date(restorePreview.created_at * 1000).toLocaleString()}</strong>
+                  <strong>{formatDateTime(restorePreview.created_at)}</strong>
                 </div>
                 <div class="spam-stat">
                   <span>{m.settings_backup_preview_version()}</span>

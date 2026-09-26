@@ -68,6 +68,66 @@ const COMPACT_COUNT_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
   notation: 'compact',
   maximumFractionDigits: 1,
 });
+const NUMBER_FORMATTER = new Intl.NumberFormat(APP_LOCALE);
+const DATE_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
+
+function dateFormatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = JSON.stringify(options);
+  let formatter = DATE_FORMATTERS.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(APP_LOCALE, options);
+    DATE_FORMATTERS.set(key, formatter);
+  }
+  return formatter;
+}
+
+function formatUnixWith(ts: number, options: Intl.DateTimeFormatOptions): string {
+  if (!Number.isFinite(ts) || ts <= 0) return '\u2014';
+  return dateFormatter(options).format(new Date(ts * 1000));
+}
+
+/**
+ * A count with the app language's digit grouping ("12,345", "12.345",
+ * "12 345"). `n.toLocaleString()` groups by the OS locale instead, which
+ * disagrees with the surrounding sentence whenever the two differ.
+ */
+export function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return '\u2014';
+  return NUMBER_FORMATTER.format(n);
+}
+
+/** A unix timestamp as date and time in the app language — the in-app
+ *  replacement for `new Date(ts * 1000).toLocaleString()`. */
+export function formatDateTime(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+  },
+): string {
+  return formatUnixWith(ts, options);
+}
+
+/** A unix timestamp's calendar date in the app language. Named apart from
+ *  {@link formatDate}, which is the short table-cell date *and* time. */
+export function formatCalendarDate(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'numeric', day: 'numeric' },
+): string {
+  return formatUnixWith(ts, options);
+}
+
+/** A unix timestamp's time of day in the app language. */
+export function formatClockTime(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = { hour: 'numeric', minute: '2-digit', second: '2-digit' },
+): string {
+  return formatUnixWith(ts, options);
+}
 
 /**
  * Abbreviate a large count for a narrow column ("12.3K").
@@ -269,7 +329,82 @@ export function shortPubkey(id: string): string {
   return id.slice(0, 8) + '\u2026';
 }
 
-/** Roster / chat label: append a short id when the nickname is shared in-room. */
+/**
+ * Single characters that render like a Latin letter, folded to that letter.
+ * Cyrillic and Greek homoglyphs plus a few Latin variants; case is kept on the
+ * left because an uppercase Greek eta is an "H" while its lowercase is not.
+ */
+const CONFUSABLE_CHARS: Record<string, string> = {
+  // Cyrillic
+  'а': 'a', 'А': 'a', 'В': 'b', 'в': 'b', 'с': 'c', 'С': 'c', 'ԁ': 'd', 'е': 'e', 'Е': 'e',
+  'һ': 'h', 'Н': 'h', 'н': 'h', 'і': 'i', 'І': 'i', 'ј': 'j', 'Ј': 'j', 'К': 'k', 'к': 'k',
+  'М': 'm', 'м': 'm', 'о': 'o', 'О': 'o', 'р': 'p', 'Р': 'p', 'ԛ': 'q', 'Ԛ': 'q', 'ѕ': 's',
+  'Ѕ': 's', 'Т': 't', 'т': 't', 'у': 'y', 'У': 'y', 'Ү': 'y', 'ү': 'y', 'ԝ': 'w', 'Ԝ': 'w',
+  'х': 'x', 'Х': 'x', 'ӏ': 'l', 'Ӏ': 'l',
+  // Greek
+  'α': 'a', 'Α': 'a', 'Β': 'b', 'Ε': 'e', 'Ζ': 'z', 'Η': 'h', 'ι': 'i', 'Ι': 'i', 'κ': 'k',
+  'Κ': 'k', 'Μ': 'm', 'Ν': 'n', 'ν': 'v', 'ο': 'o', 'Ο': 'o', 'ρ': 'p', 'Ρ': 'p', 'τ': 't',
+  'Τ': 't', 'υ': 'u', 'Υ': 'y', 'χ': 'x', 'Χ': 'x', 'γ': 'y',
+  // Latin variants
+  'ı': 'i', 'ɩ': 'i', 'ǀ': 'l', 'ʟ': 'l',
+};
+
+// eslint-disable-next-line no-misleading-character-class
+const COMBINING_DIACRITIC_RE = /[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF]/u;
+const LOOKALIKE_SCRIPT_RE = /[\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}]/u;
+
+const skeletonCache = new Map<string, string>();
+const SKELETON_CACHE_MAX = 4096;
+
+/**
+ * What a name looks like rather than what it spells, for spotting two names a
+ * reader cannot tell apart: `AIice` and `Alice`, `rnallory` and `mallory`, a
+ * Cyrillic `а` standing in for a Latin one.
+ *
+ * Deliberately over-eager: it is only ever used to decide that a label needs a
+ * key fragment next to it, and a false collision costs eight hex digits.
+ */
+export function confusableSkeleton(name: string): string {
+  const cached = skeletonCache.get(name);
+  if (cached !== undefined) return cached;
+  let folded = '';
+  let onLookalikeBase = false;
+  for (const ch of name.normalize('NFKD').replace(/\p{Cf}/gu, '')) {
+    // Only accents on Latin/Greek/Cyrillic letters are decoration. Elsewhere a
+    // mark is the letter — a Devanagari vowel sign, a Thai vowel, kana dakuten —
+    // and dropping it would call "राम" and "रमा" the same name.
+    if (COMBINING_DIACRITIC_RE.test(ch)) {
+      if (!onLookalikeBase) folded += ch;
+      continue;
+    }
+    onLookalikeBase = LOOKALIKE_SCRIPT_RE.test(ch);
+    folded += CONFUSABLE_CHARS[ch] ?? ch;
+  }
+  const skeleton = folded
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[il1|!]/g, 'l')
+    .replace(/0/g, 'o')
+    .replace(/rn/g, 'm')
+    .replace(/vv/g, 'w');
+  if (skeletonCache.size >= SKELETON_CACHE_MAX) skeletonCache.clear();
+  skeletonCache.set(name, skeleton);
+  return skeleton;
+}
+
+/** True when a name mixes Latin, Cyrillic and Greek letters — the usual shape
+ *  of a homoglyph spoof, and nearly never of a real name. */
+export function mixesLookalikeScripts(name: string): boolean {
+  let scripts = 0;
+  if (/\p{Script=Latin}/u.test(name)) scripts += 1;
+  if (/\p{Script=Cyrillic}/u.test(name)) scripts += 1;
+  if (/\p{Script=Greek}/u.test(name)) scripts += 1;
+  return scripts > 1;
+}
+
+/** Roster / chat label: append a short id when the nickname is shared in-room,
+ *  or only looks the same as another member's. */
 export function disambiguatedMemberName(
   nickname: string | undefined | null,
   pubkey: string,
@@ -277,10 +412,11 @@ export function disambiguatedMemberName(
 ): string {
   const nick = (nickname ?? '').trim();
   if (!nick) return shortPubkey(pubkey);
-  const lower = nick.toLowerCase();
+  const key = confusableSkeleton(nick);
   let hits = 0;
   for (const other of roomNicknames) {
-    if ((other ?? '').trim().toLowerCase() === lower) {
+    const name = (other ?? '').trim();
+    if (name && confusableSkeleton(name) === key) {
       hits += 1;
       if (hits > 1) {
         return `${nick} (${shortPubkey(pubkey)})`;
@@ -303,6 +439,7 @@ export interface MessageSegment {
  * certain to refuse.
  */
 const LINK_MAX_LEN = 2048;
+const LINK_SCAN_MAX = LINK_MAX_LEN + 64;
 
 /** Explicit scheme only. `www.` and bare hostnames are deliberately not
  *  matched: guessing a scheme for a string somebody typed in a room means
@@ -325,6 +462,10 @@ const BIDI_CONTROL_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 function trimTrailingPunctuation(url: string): string {
   let end = url.length;
   const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  // Closers minus openers per bracket pair, counted once on the first trailing
+  // bracket and then kept current as closers are trimmed. Recounting per
+  // character made a link ending in thousands of `)` quadratic.
+  let excess: Record<string, number> | null = null;
   while (end > 0) {
     const ch = url[end - 1];
     if ('.,;:!?"\u2019\u201d'.includes(ch)) {
@@ -333,14 +474,20 @@ function trimTrailingPunctuation(url: string): string {
     }
     const opener = closers[ch];
     if (opener) {
-      const slice = url.slice(0, end);
-      let opens = 0;
-      let closes = 0;
-      for (const c of slice) {
-        if (c === opener) opens += 1;
-        else if (c === ch) closes += 1;
+      if (excess === null) {
+        excess = { ')': 0, ']': 0, '}': 0 };
+        for (let i = 0; i < end; i++) {
+          const c = url[i];
+          if (c === '(') excess[')'] -= 1;
+          else if (c === ')') excess[')'] += 1;
+          else if (c === '[') excess[']'] -= 1;
+          else if (c === ']') excess[']'] += 1;
+          else if (c === '{') excess['}'] -= 1;
+          else if (c === '}') excess['}'] += 1;
+        }
       }
-      if (closes > opens) {
+      if (excess[ch] > 0) {
+        excess[ch] -= 1;
         end -= 1;
         continue;
       }
@@ -364,6 +511,11 @@ export function linkifyMessage(text: string): MessageSegment[] {
   let cursor = 0;
   LINK_RE.lastIndex = 0;
   for (let match = LINK_RE.exec(text); match !== null; match = LINK_RE.exec(text)) {
+    // Refused before trimming, so an oversized run costs one regex match and
+    // nothing more. The bound is looser than `LINK_MAX_LEN` because the raw
+    // match still carries the sentence punctuation trimming gives back; the
+    // `usable` test below is the one that decides.
+    if (match[0].length > LINK_SCAN_MAX) continue;
     const raw = trimTrailingPunctuation(match[0]);
     // Everything trimmed off goes back to the following text run, so no
     // character is ever dropped from what the sender wrote.

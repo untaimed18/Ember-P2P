@@ -6661,20 +6661,6 @@ impl UploadHandler {
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
 
-        // Remember who this is for the Known eD2K Peers ledger, which is
-        // built from credit records alone and so has no session to ask later.
-        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
-        // back to the peer's address for display, and an `IP:port` is not a
-        // nickname worth persisting.
-        if peer_user_hash != [0u8; 16] {
-            self.credit_manager.write().await.note_client_identity(
-                peer_user_hash,
-                Some(peer_addr.ip()),
-                &hello_caps.peer_name,
-                &ul_client_software,
-            );
-        }
-
         if peer_user_hash != [0u8; 16] {
             let banned = self
                 .banned_hashes
@@ -7189,16 +7175,6 @@ impl UploadHandler {
                 if !hello_caps.peer_name.is_empty() {
                     ul_peer_name = hello_caps.peer_name.clone();
                 }
-                // OP_EMULEINFO is where the version details arrive, so the
-                // software string is only now complete — re-record it.
-                if peer_user_hash != [0u8; 16] {
-                    self.credit_manager.write().await.note_client_identity(
-                        peer_user_hash,
-                        Some(peer_addr.ip()),
-                        &hello_caps.peer_name,
-                        &ul_client_software,
-                    );
-                }
                 let emule_payload = build_emule_info(
                     self.advertised_udp_port(),
                     self.obfuscation_enabled
@@ -7290,6 +7266,22 @@ impl UploadHandler {
                 ember_auth_state.is_verified(),
             );
             return Ok(());
+        }
+
+        // Remember who this is for the Known eD2K Peers ledger, which is
+        // built from credit records alone and so has no session to ask later.
+        // Only now, past the ban, rate-limit and anti-leech gates: every new
+        // user hash costs a credit record, and a Hello alone is unauthenticated.
+        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
+        // back to the peer's address for display, and an `IP:port` is not a
+        // nickname worth persisting.
+        if peer_user_hash != [0u8; 16] {
+            self.credit_manager.write().await.note_client_identity(
+                peer_user_hash,
+                Some(peer_addr.ip()),
+                &hello_caps.peer_name,
+                &ul_client_software,
+            );
         }
 
         // Proactively challenge the peer's identity — fire this AFTER the
@@ -8145,10 +8137,24 @@ impl UploadHandler {
                     }
                     r = tokio::time::timeout(timeout_dur, pkt_rx.recv()) => r,
                     Some(outbound_data) = outbound_rx.recv() => {
-                        if writer.write_all(&outbound_data).await.is_ok() {
-                            let _ = writer.flush().await;
+                        let wrote = tokio::time::timeout(WRITE_PACKET_TIMEOUT, async {
+                            writer.write_all(&outbound_data).await?;
+                            writer.flush().await
+                        })
+                        .await;
+                        match wrote {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => {
+                                info!("Ending session with {peer_addr}: outbound write failed: {e}");
+                            }
+                            Err(_) => {
+                                info!(
+                                    "Ending session with {peer_addr}: outbound write stalled > {}s",
+                                    WRITE_PACKET_TIMEOUT.as_secs()
+                                );
+                            }
                         }
-                        continue;
+                        break;
                     }
                 };
 
@@ -12309,7 +12315,7 @@ impl UploadHandler {
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
-                                        cm.set_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges

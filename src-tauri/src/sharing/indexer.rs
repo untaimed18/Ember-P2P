@@ -115,7 +115,16 @@ pub fn is_excluded_share_file_name(path: &Path) -> bool {
     name.ends_with(".part")
         || name.ends_with(".part.met")
         || name.ends_with(".met.tmp")
-        || (name.starts_with('.') && name.ends_with(".tmp"))
+        // Another program's in-progress write: a browser download, a torrent
+        // client's incomplete file, an Office lock, a save-in-progress temp.
+        // Each ends in a rename to the real name (or a delete). `.tmp` is the
+        // broad one — a user's own `.tmp` file stops being shareable too,
+        // which is rare and costs little next to hashing and announcing a file
+        // that is only ever a half-written copy of something else.
+        || name.ends_with(".tmp")
+        || name.ends_with(".crdownload")
+        || name.ends_with(".!qb")
+        || name.starts_with("~$")
         || name.ends_with(".migration-tmp")
         || name.ends_with(".bak")
         // A profile backup is a key container: it holds the DPAPI-unwrapped
@@ -173,7 +182,134 @@ pub fn is_excluded_share_location(path: &Path) -> bool {
     false
 }
 
+/// Entries discovery refuses on sight, whatever their name: reparse points,
+/// and what Windows marks hidden *and* system — how it flags what it owns on a
+/// volume (recycle bins, restore points, desktop.ini). A shared drive root
+/// walks straight into them.
+#[cfg(target_os = "windows")]
+fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const HIDDEN_SYSTEM: u32 = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    let attributes = metadata.file_attributes();
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & HIDDEN_SYSTEM == HIDDEN_SYSTEM
+}
+
+#[cfg(not(target_os = "windows"))]
+fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// True when every key under the directory keyed `dir_key` (which ends in a
+/// separator, so it prefixes all of them) sorts at or before `cursor`: the
+/// cursor is past the directory and not inside it.
+fn subtree_sorts_before_cursor(dir_key: &str, cursor: &str) -> bool {
+    cursor > dir_key && !cursor.starts_with(dir_key)
+}
+
+/// How long a file has to go unmodified before a rescan hashes it. Another
+/// program still writing it would otherwise have it read end to end on every
+/// rescan its own writes trigger, only for the size/mtime check around the
+/// hash to throw the result away.
+pub const SETTLE_PERIOD_SECS: i64 = 45;
+
+/// Leeway for a modification time ahead of our clock. Beyond it the time is
+/// wrong rather than recent, and waiting for it would defer the file for as
+/// long as the skew lasts.
+const SETTLE_FUTURE_TOLERANCE_SECS: i64 = 60;
+
+/// True when a file last modified at `modified_at` (Unix seconds) may still be
+/// being written.
+pub fn still_settling(modified_at: i64, now: i64) -> bool {
+    modified_at > now.saturating_sub(SETTLE_PERIOD_SECS)
+        && modified_at <= now.saturating_add(SETTLE_FUTURE_TOLERANCE_SECS)
+}
+
+/// One path a filesystem event named, resolved for a scoped rescan.
+#[derive(Debug)]
+pub enum ScopedDiscovery {
+    /// Gone, or nothing discovery would ever share: no row may remain at or
+    /// under it.
+    Removed,
+    /// What discovery finds at or under the path now. `partial` as in
+    /// [`DiscoveryResult`]: rows it did not list must not be reconciled away.
+    Found { files: Vec<FileInfo>, partial: bool },
+    /// Could not be examined, or lies outside every shared root as spelled:
+    /// leave its rows alone.
+    Skip,
+}
+
 impl FileIndexer {
+    /// Resolve one event path under `roots` the way a full walk of its root
+    /// would see it. Blocking.
+    ///
+    /// The walk's refusals are applied to every directory between the root and
+    /// the path, not only to the path: an event inside a recycle bin or a
+    /// junction names an ordinary-looking file whose parent the full walk never
+    /// enters.
+    pub fn discover_scoped_path(roots: &[String], path: &Path) -> ScopedDiscovery {
+        // Event paths are the watched root joined with the changed name, so
+        // they carry the root exactly as it is stored.
+        let Some(root) = roots
+            .iter()
+            .map(Path::new)
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+        else {
+            return ScopedDiscovery::Skip;
+        };
+        if is_excluded_share_location(path) {
+            return ScopedDiscovery::Removed;
+        }
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor == root || !ancestor.starts_with(root) {
+                break;
+            }
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.is_symlink() || walk_skips_metadata(&metadata) => {
+                    return ScopedDiscovery::Removed;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return ScopedDiscovery::Removed;
+                }
+                Err(_) => return ScopedDiscovery::Skip,
+            }
+        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ScopedDiscovery::Removed;
+            }
+            Err(_) => return ScopedDiscovery::Skip,
+        };
+        if metadata.is_symlink() || walk_skips_metadata(&metadata) {
+            return ScopedDiscovery::Removed;
+        }
+        if metadata.is_dir() {
+            let result = Self::discover_directory_page(&path.to_string_lossy(), None);
+            return ScopedDiscovery::Found {
+                files: result.files,
+                partial: result.partial,
+            };
+        }
+        if !metadata.is_file() || is_excluded_share_file_name(path) {
+            return ScopedDiscovery::Removed;
+        }
+        match Self::discover_file(path) {
+            Ok(info) => ScopedDiscovery::Found {
+                files: vec![info],
+                partial: false,
+            },
+            Err(error) => {
+                warn!("Failed to discover {}: {error}", path.display());
+                ScopedDiscovery::Skip
+            }
+        }
+    }
+
     /// Quickly discover files in a directory -- metadata only, no hashing.
     /// Files are returned with empty hash/aich_hash so they can be shown in the
     /// UI immediately.  A temporary id is generated from the path so the file
@@ -275,19 +411,8 @@ impl FileIndexer {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    use std::os::windows::fs::MetadataExt;
-                    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-                    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                    const HIDDEN_SYSTEM: u32 = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
                     if let Ok(metadata) = entry.metadata() {
-                        let attributes = metadata.file_attributes();
-                        // Hidden *and* system is how Windows marks what it owns
-                        // on a volume (recycle bins, restore points, desktop.ini).
-                        // A shared drive root walks straight into them.
-                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                            || attributes & HIDDEN_SYSTEM == HIDDEN_SYSTEM
-                        {
+                        if walk_skips_metadata(&metadata) {
                             continue;
                         }
                     }
@@ -313,7 +438,7 @@ impl FileIndexer {
         };
         let mut frontier_trimmed = enqueue_children(path, &mut pending);
 
-        while let Some(Reverse((_key, entry_path, is_directory))) = pending.pop() {
+        while let Some(Reverse((key, entry_path, is_directory))) = pending.pop() {
             if is_directory {
                 // A full page cannot take more files, so descending further only
                 // grows the frontier. Stop and report the cap: the next scan
@@ -322,33 +447,40 @@ impl FileIndexer {
                     truncated = true;
                     break;
                 }
+                // Everything under it sorts before the cursor, so the page
+                // could only discard it after reading the directory.
+                if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
+                    saw_before_cursor = true;
+                    continue;
+                }
                 frontier_trimmed |= enqueue_children(&entry_path, &mut pending);
                 continue;
             }
             if is_excluded_share_file_name(&entry_path) {
                 continue;
             }
+            // Decided on the key the entry was queued under, before any stat:
+            // testing after `discover_file` re-stated every file ahead of the
+            // cursor on every page.
+            if cursor.is_some_and(|value| key.as_str() <= value) {
+                // Never mix paths before the current cursor into this page:
+                // doing so makes the persisted cursor move backward and cycles
+                // pages. Keep the page partial so callers preserve prior index
+                // rows until the cursor explicitly resets after the end of the
+                // traversal.
+                saw_before_cursor = true;
+                continue;
+            }
+            if files.len() >= MAX_DISCOVERED_FILES {
+                // The priority queue guarantees this is the next global path
+                // after the returned page.
+                truncated = true;
+                break;
+            }
             match Self::discover_file(&entry_path) {
                 Ok(info) => {
-                    let key = normalize_path_key(&info.path);
-                    if cursor.is_none_or(|value| key.as_str() > value) {
-                        if files.len() < MAX_DISCOVERED_FILES {
-                            debug!("Discovered: {}", info.name);
-                            files.push(info);
-                        } else {
-                            // The priority queue guarantees this is the next
-                            // global path after the returned page.
-                            truncated = true;
-                            break;
-                        }
-                    } else {
-                        // Never mix paths before the current cursor into this
-                        // page: doing so makes the persisted cursor move
-                        // backward and cycles pages. Keep the page partial so
-                        // callers preserve prior index rows until the cursor
-                        // explicitly resets after the end of the traversal.
-                        saw_before_cursor = true;
-                    }
+                    debug!("Discovered: {}", info.name);
+                    files.push(info);
                 }
                 Err(error) => {
                     warn!("Failed to discover {}: {error}", entry_path.display());
@@ -766,6 +898,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Outside the system temp folder: on Windows that sits under `AppData`,
+    /// a component the share rules refuse.
+    fn scratch_tree(label: &str) -> std::path::PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("ember-indexer-{label}-{:016x}", rand::random::<u64>()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_directory_is_skipped_only_when_the_cursor_is_past_all_of_it() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir = format!("{sep}s{sep}a{sep}");
+        assert!(subtree_sorts_before_cursor(&dir, &format!("{sep}s{sep}b")));
+        assert!(
+            !subtree_sorts_before_cursor(&dir, &format!("{sep}s{sep}a{sep}m.bin")),
+            "a cursor inside the directory means part of it is still ahead"
+        );
+        assert!(!subtree_sorts_before_cursor(&dir, &format!("{sep}s{sep}0")));
+    }
+
+    /// A resumed page must still return exactly the files after its cursor,
+    /// now that the cursor is tested before anything is stat'ed and whole
+    /// directories behind it are never opened.
+    #[test]
+    fn a_resumed_page_lists_exactly_what_follows_its_cursor() {
+        let root = scratch_tree("cursor");
+        for rel in ["a/1.bin", "a/2.bin", "b/c/3.bin", "b/4.bin", "d.bin"] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let root_str = root.to_string_lossy().to_string();
+        let full = FileIndexer::discover_directory_page(&root_str, None);
+        let keys: Vec<String> = full.files.iter().map(|f| normalize_path_key(&f.path)).collect();
+        assert_eq!(keys.len(), 5);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "discovery is globally ordered");
+
+        let resumed = FileIndexer::discover_directory_page(&root_str, Some(&keys[2]));
+        let resumed_keys: Vec<String> =
+            resumed.files.iter().map(|f| normalize_path_key(&f.path)).collect();
+        assert_eq!(resumed_keys, keys[3..].to_vec());
+        assert!(resumed.partial, "a resumed page omits its prefix");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recently_written_files_are_left_to_settle() {
+        let now = 1_000_000;
+        assert!(still_settling(now, now));
+        assert!(still_settling(now - SETTLE_PERIOD_SECS + 1, now));
+        assert!(!still_settling(now - SETTLE_PERIOD_SECS, now));
+        assert!(!still_settling(0, now), "an unknown mtime does not wait");
+        assert!(
+            !still_settling(now + 10 * 60, now),
+            "a clock-skewed mtime must not defer a file for the length of the skew"
+        );
+    }
+
+    #[test]
+    fn scoped_discovery_resolves_files_folders_and_deletions() {
+        let root = scratch_tree("scoped");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let file = root.join("album").join("song.mp3");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(root.join("album").join("cover.jpg"), b"y").unwrap();
+
+        match FileIndexer::discover_scoped_path(&roots, &file) {
+            ScopedDiscovery::Found { files, partial } => {
+                assert_eq!(files.len(), 1);
+                assert!(!partial);
+            }
+            other => panic!("expected the file, got {other:?}"),
+        }
+        match FileIndexer::discover_scoped_path(&roots, &root.join("album")) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 2),
+            other => panic!("expected the folder's files, got {other:?}"),
+        }
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &root.join("gone.mkv")),
+            ScopedDiscovery::Removed
+        ));
+        let part = root.join("album").join("x.part");
+        std::fs::write(&part, b"z").unwrap();
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &part),
+            ScopedDiscovery::Removed
+        ));
+        assert!(
+            matches!(
+                FileIndexer::discover_scoped_path(&roots, Path::new("/elsewhere/a.mkv")),
+                ScopedDiscovery::Skip
+            ),
+            "a path under no shared root is not ours to reconcile"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn excludes_credential_files() {
         for name in [
@@ -805,6 +1040,22 @@ mod tests {
                 "{name} must never be shared"
             );
         }
+    }
+
+    /// Discovery and the watcher have to agree on these: a name the watcher
+    /// ignores but discovery indexes leaves a row nobody updates.
+    #[test]
+    fn excludes_other_programs_in_progress_writes() {
+        for name in [
+            "movie.mkv.crdownload",
+            "Linux.iso.!qB",
+            "~$report.docx",
+            "draft.docx.TMP",
+        ] {
+            assert!(is_excluded_share_file_name(Path::new(name)), "{name}");
+        }
+        assert!(!is_excluded_share_file_name(Path::new("template.docx")));
+        assert!(!is_excluded_share_file_name(Path::new("tmp-notes.txt")));
     }
 
     #[test]

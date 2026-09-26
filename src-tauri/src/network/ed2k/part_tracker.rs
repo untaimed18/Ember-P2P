@@ -368,6 +368,15 @@ pub struct PartTracker {
     file_hash_verified: bool,
     /// Invalidates queued snapshots when completion deletes `.part.met`.
     save_generation: Arc<AtomicU64>,
+    /// Bumped whenever a part's bytes may have changed: a gap opened in it or
+    /// new bytes filled into it. A source that hashed a part with no lock
+    /// held compares this before acting on the result, so a verdict about
+    /// bytes another source has since replaced is dropped rather than applied.
+    part_content_generation: Vec<u64>,
+    /// When a snapshot of this file was last taken for `.part.met`. Shared by
+    /// every source worker so the periodic save runs once per file per
+    /// interval, not once per source.
+    last_met_snapshot: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 /// Parts the tracker will model for `file_size`, or `None` when the size is
@@ -473,6 +482,8 @@ impl PartTracker {
             transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
+            part_content_generation: vec![0; part_count],
+            last_met_snapshot: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // A size the tracker refused to model must not adopt resume state
@@ -513,6 +524,8 @@ impl PartTracker {
             transferred: Arc::new(AtomicU64::new(0)),
             file_hash_verified: false,
             save_generation: Arc::new(AtomicU64::new(0)),
+            part_content_generation: vec![0; part_count],
+            last_met_snapshot: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -814,6 +827,9 @@ impl PartTracker {
             }
         }
         self.gaps = new_gaps;
+        if newly_filled > 0 {
+            self.bump_content_generation(start, end);
+        }
         // Bound gap-list fragmentation (defense-in-depth against hostile
         // peers that split the gap list with tiny fills). If we exceed
         // MAX_GAP_ENTRIES, find the smallest filled-between-two-gaps run
@@ -873,6 +889,35 @@ impl PartTracker {
         new_gaps.push((merged_start, merged_end));
         new_gaps.sort_by_key(|&(s, _)| s);
         self.gaps = new_gaps;
+        self.bump_content_generation(start, end);
+    }
+
+    fn bump_content_generation(&mut self, start: u64, end: u64) {
+        if start >= end || self.part_content_generation.is_empty() {
+            return;
+        }
+        let first = (start / PARTSIZE) as usize;
+        let last = ((end - 1) / PARTSIZE) as usize;
+        let last = last.min(self.part_content_generation.len() - 1);
+        for generation in self.part_content_generation.iter_mut().take(last + 1).skip(first) {
+            *generation = generation.wrapping_add(1);
+        }
+    }
+
+    /// Current content generation of `part_idx`; out-of-range parts report 0.
+    pub fn part_content_generation(&self, part_idx: usize) -> u64 {
+        self.part_content_generation
+            .get(part_idx)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether a hash verdict on `part_idx`, taken when its content generation
+    /// was `hashed_generation`, is stale: the part's bytes changed since, or
+    /// another source has already verified it.
+    pub fn part_verdict_superseded(&self, part_idx: usize, hashed_generation: u64) -> bool {
+        self.part_content_generation(part_idx) != hashed_generation
+            || self.is_part_verified(part_idx)
     }
 
     pub fn all_complete(&self) -> bool {
@@ -1071,6 +1116,27 @@ impl PartTracker {
     /// File-format byte-for-byte identical to `save_emule_format` so eMule
     /// resume metadata interop is preserved.
     pub fn snapshot_for_save(&self) -> SaveSnapshot {
+        *self.last_met_snapshot.lock() = Some(Instant::now());
+        self.build_save_snapshot()
+    }
+
+    /// Snapshot for the periodic `.part.met` save, or `None` when any source
+    /// has snapshotted this file within `interval`. Every source worker of a
+    /// file runs the periodic timer, so without the shared stamp a
+    /// fifty-source download rewrote and fsynced the same file fifty times a
+    /// minute.
+    pub fn periodic_snapshot_for_save(&self, interval: Duration) -> Option<SaveSnapshot> {
+        {
+            let mut last = self.last_met_snapshot.lock();
+            if last.is_some_and(|at| at.elapsed() < interval) {
+                return None;
+            }
+            *last = Some(Instant::now());
+        }
+        Some(self.build_save_snapshot())
+    }
+
+    fn build_save_snapshot(&self) -> SaveSnapshot {
         // Allocate a monotonically increasing sequence while the tracker is
         // locked. A delayed older writer checks this value before replacing
         // the file, so it cannot overwrite a newer snapshot that was taken
@@ -2308,6 +2374,63 @@ mod tests {
             let byte = u8::from_str_radix(&hex[(i / 8) * 2..(i / 8) * 2 + 2], 16).unwrap();
             assert_eq!(byte & (1 << (i % 8)) != 0, want, "part {i}");
         }
+    }
+
+    #[test]
+    fn content_generation_moves_only_when_a_parts_bytes_can_change() {
+        let file_size = PARTSIZE * 3;
+        let mut tracker = PartTracker::new_empty(file_size, &temp_part_path("generation"));
+        let g0 = tracker.part_content_generation(0);
+        let g1 = tracker.part_content_generation(1);
+
+        tracker.mark_complete(0);
+        let filled = tracker.part_content_generation(0);
+        assert_ne!(filled, g0, "filling bytes changes the part");
+        assert_eq!(tracker.part_content_generation(1), g1, "neighbours are untouched");
+
+        tracker.mark_complete(0);
+        tracker.set_part_verified(0);
+        assert_eq!(
+            tracker.part_content_generation(0),
+            filled,
+            "re-filling a complete part or flagging it verified changes no bytes"
+        );
+        assert!(tracker.part_verdict_superseded(0, filled), "verified by someone else");
+
+        tracker.mark_incomplete(0);
+        assert_ne!(tracker.part_content_generation(0), filled);
+
+        tracker.mark_complete(1);
+        let hashed = tracker.part_content_generation(1);
+        assert!(!tracker.part_verdict_superseded(1, hashed));
+        tracker.invalidate_range(PARTSIZE + 10, PARTSIZE + 20);
+        tracker.fill_range(PARTSIZE + 10, PARTSIZE + 20);
+        assert!(
+            tracker.part_verdict_superseded(1, hashed),
+            "a repair since hashing makes the old verdict stale even with no gap left"
+        );
+        assert_eq!(tracker.part_content_generation(99), 0);
+    }
+
+    #[test]
+    fn periodic_snapshot_runs_once_per_interval_across_sources() {
+        let tracker = PartTracker::new_empty(PARTSIZE, &temp_part_path("periodic"));
+        let interval = Duration::from_secs(60);
+        assert!(tracker.periodic_snapshot_for_save(interval).is_some());
+        assert!(
+            tracker.periodic_snapshot_for_save(interval).is_none(),
+            "a second source inside the interval must not rewrite the file"
+        );
+        let clone = tracker.clone();
+        assert!(clone.periodic_snapshot_for_save(interval).is_none());
+        assert!(tracker.periodic_snapshot_for_save(Duration::ZERO).is_some());
+
+        let fresh = PartTracker::new_empty(PARTSIZE, &temp_part_path("periodic-event"));
+        let _ = fresh.snapshot_for_save();
+        assert!(
+            fresh.periodic_snapshot_for_save(interval).is_none(),
+            "an event-driven save already covers this interval"
+        );
     }
 
     fn temp_part_path(name: &str) -> PathBuf {

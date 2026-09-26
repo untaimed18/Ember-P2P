@@ -47,6 +47,8 @@
   } from '$lib/i18n';
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
+  import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -1147,9 +1149,19 @@
    */
   let uploadQueueLoadFailed = $state(false);
   let knownClientsLoadFailed = $state(false);
+  // Requests still outstanding per poll. A tick is skipped while one is: the
+  // backend answers each from the network task with up to a 10 s reply
+  // timeout, so a 3 s tick would otherwise stack copies of the same request
+  // behind a busy task. The generation counters above still decide which
+  // answer lands when a user action refreshes on top of a poll.
+  let uploadQueueInFlight = 0;
+  let knownClientsInFlight = 0;
+  let knownCountsInFlight = 0;
+  let friendHashesInFlight = 0;
 
   async function refreshUploadQueue() {
     const gen = ++uploadQueueGen;
+    uploadQueueInFlight++;
     try {
       const data = await getUploadQueue();
       if (!mounted || gen !== uploadQueueGen) return;
@@ -1166,11 +1178,14 @@
         uploadQueueLoaded = true;
         uploadQueueLoadFailed = true;
       }
+    } finally {
+      uploadQueueInFlight--;
     }
   }
   /** Refresh just the tab-label counts. Cheap enough to run on any tab. */
   async function refreshKnownCounts() {
     const gen = ++knownCountsGen;
+    knownCountsInFlight++;
     try {
       const counts = await getKnownClientCounts();
       if (!mounted || gen !== knownCountsGen) return;
@@ -1179,12 +1194,15 @@
       // Leave the last good figures up rather than blanking the labels; the
       // next tick retries.
       console.warn('Failed to refresh known client counts:', e);
+    } finally {
+      knownCountsInFlight--;
     }
   }
 
   async function refreshKnownClients(refreshBadges = true) {
     const gen = ++knownClientsGen;
     const countGen = ++knownCountsGen;
+    knownClientsInFlight++;
     try {
       const data = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
@@ -1222,7 +1240,22 @@
         knownClientsLoaded = true;
         knownClientsLoadFailed = true;
       }
+    } finally {
+      knownClientsInFlight--;
     }
+  }
+
+  /** The poll ticks' entry points: each skips while its previous request is
+   *  still unanswered. */
+  function pollUploadQueue() {
+    if (uploadQueueInFlight === 0) void refreshUploadQueue();
+  }
+  function pollKnownClients() {
+    if (knownClientsInFlight === 0) void refreshKnownClients();
+    if (friendHashesInFlight === 0) void refreshFriendHashes();
+  }
+  function pollKnownCounts() {
+    if (knownCountsInFlight === 0) void refreshKnownCounts();
   }
 
   /** Per-hash reputation cache. Populated lazily when the Known
@@ -1318,6 +1351,7 @@
   }
 
   async function refreshFriendHashes() {
+    friendHashesInFlight++;
     try {
       const ticket = beginFriendsListFetch();
       const list = await getFriends();
@@ -1338,6 +1372,8 @@
       // Non-fatal: an unavailable friends list just means we won't
       // mark friend rows. The rest of the table still renders.
       console.warn('Failed to load friend hashes for known peers:', e);
+    } finally {
+      friendHashesInFlight--;
     }
   }
 
@@ -1414,7 +1450,7 @@
         if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
           return;
         }
-        refreshUploadQueue();
+        pollUploadQueue();
       },
       fast ? QUEUE_POLL_INTERVAL_MS : QUEUE_BADGE_POLL_INTERVAL_MS,
     );
@@ -1424,7 +1460,7 @@
     if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
       queueVisibilityHandler = () => {
         if (document.visibilityState !== 'visible') return;
-        refreshUploadQueue();
+        pollUploadQueue();
       };
       document.addEventListener('visibilitychange', queueVisibilityHandler);
     }
@@ -1480,7 +1516,8 @@
         if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
           return;
         }
-        pump();
+        if (onTab) pollKnownClients();
+        else pollKnownCounts();
       },
       onTab ? KNOWN_POLL_INTERVAL_MS : KNOWN_BADGE_POLL_INTERVAL_MS,
     );
@@ -1493,12 +1530,8 @@
     if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
       knownVisibilityHandler = () => {
         if (document.visibilityState !== 'visible') return;
-        if (isKnownLedgerView(bottomView)) {
-          refreshKnownClients();
-          void refreshFriendHashes();
-        } else {
-          void refreshKnownCounts();
-        }
+        if (isKnownLedgerView(bottomView)) pollKnownClients();
+        else pollKnownCounts();
       };
       document.addEventListener('visibilitychange', knownVisibilityHandler);
     }
@@ -1803,7 +1836,7 @@
 
   // Client-side EWMA speed tracker: computes speed from transferred-byte
   // deltas so the display works even when the backend reports speed=0.
-  const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number }> = new Map();
+  const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number; row: Transfer }> = new Map();
 
   // Prune `speedHistory` entries for transfers that no longer exist in the
   // store. Without this the map grows unbounded for the life of the page
@@ -1811,7 +1844,11 @@
   // local `speedHistory.delete(...)` callers don't cover (e.g. backend
   // finalise / retention policies, or peers dropping).
   $effect(() => {
-    const liveIds = new Set($transfers.map((t) => t.id));
+    const list = $transfers;
+    // Sweep only once a map outgrows the list; until then its stale entries
+    // are bounded by the list size, and this runs on every store update.
+    if (speedHistory.size <= list.length && uploadTooltipCache.size <= list.length) return;
+    const liveIds = new Set(list.map((t) => t.id));
     if (speedHistory.size > liveIds.size) {
       for (const id of Array.from(speedHistory.keys())) {
         if (!liveIds.has(id)) speedHistory.delete(id);
@@ -1836,9 +1873,13 @@
     for (const t of list) {
       const entry = speedHistory.get(t.id);
       if (!entry) {
-        speedHistory.set(t.id, { ewma: 0, lastTransferred: t.transferred, lastTime: now });
+        speedHistory.set(t.id, { ewma: 0, lastTransferred: t.transferred, lastTime: now, row: t });
         continue;
       }
+      // The store keeps a row's object when nothing in it changed, so the
+      // same object means no new bytes; only a live average can still decay.
+      if (entry.row === t && entry.ewma === 0) continue;
+      entry.row = t;
       const dt = (now - entry.lastTime) / 1000;
       if (dt < 0.5) continue;
       const bytesThisPeriod = t.transferred - entry.lastTransferred;
@@ -2031,6 +2072,147 @@
       : [...filteredActiveDownloads, ...filteredCompletedDownloads]
   );
   let visibleSelectableDownloadIds = $derived.by(() => new Set(filteredSelectableDownloads.map((t) => t.id)));
+
+  // --- Downloads table windowing ---
+  // Both sections render only the rows near the viewport, with spacer rows
+  // standing in for the rest. Selection, sorting and the context menu all work
+  // on the lists above, not on DOM rows, so none of them notice.
+  const DL_WINDOW_MIN_ROWS = 80;
+  const DL_WINDOW_OVERSCAN = 12;
+  let downloadsScrollEl: HTMLDivElement | undefined = $state(undefined);
+  let dlActiveTopPadEl: HTMLTableRowElement | undefined = $state(undefined);
+  let dlCompletedTopPadEl: HTMLTableRowElement | undefined = $state(undefined);
+  let dlRowHeight = $state(22);
+  let dlExpandedExtra = $state(0);
+  let dlActiveBodyTop = $state(0);
+  let dlCompletedBodyTop = $state(0);
+  let dlViewportHeight = $state(600);
+  let dlExpandedIndex = $derived(
+    expandedTransferId ? filteredActiveDownloads.findIndex((t) => t.id === expandedTransferId) : -1,
+  );
+  let dlActiveWindow = $derived(
+    computeSegmentWindow({
+      total: filteredActiveDownloads.length,
+      bodyTop: dlActiveBodyTop,
+      viewportHeight: dlViewportHeight,
+      rowHeight: dlRowHeight,
+      expandedIndex: dlExpandedIndex,
+      expandedExtra: dlExpandedExtra,
+      overscan: DL_WINDOW_OVERSCAN,
+      minRows: DL_WINDOW_MIN_ROWS,
+    }),
+  );
+  let dlCompletedWindow = $derived(
+    computeSegmentWindow({
+      total: completedCollapsed ? 0 : filteredCompletedDownloads.length,
+      bodyTop: dlCompletedBodyTop,
+      viewportHeight: dlViewportHeight,
+      rowHeight: dlRowHeight,
+      overscan: DL_WINDOW_OVERSCAN,
+      minRows: DL_WINDOW_MIN_ROWS,
+    }),
+  );
+  let dlActiveSlice = $derived(filteredActiveDownloads.slice(dlActiveWindow.start, dlActiveWindow.end));
+  let dlCompletedSlice = $derived(
+    completedCollapsed ? [] : filteredCompletedDownloads.slice(dlCompletedWindow.start, dlCompletedWindow.end),
+  );
+
+  /** Read the geometry the window depends on. Only the DOM knows where each
+   *  section starts (banners and the header sit above it) and how tall a row
+   *  and the open source block really are. */
+  function measureDownloadWindow() {
+    const scroller = downloadsScrollEl;
+    if (!scroller) return;
+    const top = scroller.getBoundingClientRect().top;
+    dlViewportHeight = scroller.clientHeight;
+    if (dlActiveTopPadEl) dlActiveBodyTop = dlActiveTopPadEl.getBoundingClientRect().top - top;
+    if (dlCompletedTopPadEl) dlCompletedBodyTop = dlCompletedTopPadEl.getBoundingClientRect().top - top;
+    const table = downloadTableEl;
+    if (!table) return;
+    const sample = table.querySelector<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
+    const h = sample?.getBoundingClientRect().height ?? 0;
+    if (h > 0) dlRowHeight = h;
+    if (!expandedTransferId) {
+      dlExpandedExtra = 0;
+      return;
+    }
+    // Measured only while the block is rendered; off screen it keeps the
+    // last height, which is what its spacer already accounts for.
+    const expanded = table.querySelector<HTMLTableRowElement>('tr.dl-row.expanded');
+    if (!expanded) return;
+    let extra = 0;
+    for (
+      let el = expanded.nextElementSibling;
+      el instanceof HTMLTableRowElement && el.classList.contains('source-child-row');
+      el = el.nextElementSibling
+    ) {
+      extra += el.getBoundingClientRect().height;
+    }
+    dlExpandedExtra = extra;
+  }
+
+  let dlScrollRaf = 0;
+  function onDownloadsScroll() {
+    if (dlScrollRaf) return;
+    dlScrollRaf = requestAnimationFrame(() => {
+      dlScrollRaf = 0;
+      measureDownloadWindow();
+    });
+  }
+
+  // Re-measure after anything that moves rows or changes what is rendered.
+  $effect(() => {
+    void filteredActiveDownloads.length;
+    void filteredCompletedDownloads.length;
+    void completedCollapsed;
+    void expandedTransferId;
+    void expandedSources;
+    void loadingSources;
+    void dlActiveWindow.start;
+    void dlActiveWindow.end;
+    void dlCompletedWindow.start;
+    void dlCompletedWindow.end;
+    untrack(measureDownloadWindow);
+  });
+
+  $effect(() => {
+    const el = downloadsScrollEl;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => measureDownloadWindow());
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (dlScrollRaf) cancelAnimationFrame(dlScrollRaf);
+      dlScrollRaf = 0;
+    };
+  });
+
+  /** Scroll a download row into view: arrow-key navigation can move the
+   *  selection onto a row the window has not rendered. */
+  function revealDownloadRow(id: string) {
+    const scroller = downloadsScrollEl;
+    if (!scroller) return;
+    measureDownloadWindow();
+    const headerHeight = downloadTableEl?.tHead?.getBoundingClientRect().height ?? 0;
+    let rowTop: number;
+    const activeIdx = filteredActiveDownloads.findIndex((t) => t.id === id);
+    if (activeIdx >= 0) {
+      rowTop = dlActiveBodyTop + segmentRowOffset(activeIdx, dlRowHeight, dlExpandedIndex, dlExpandedExtra);
+    } else {
+      const completedIdx = completedCollapsed ? -1 : filteredCompletedDownloads.findIndex((t) => t.id === id);
+      if (completedIdx < 0) return;
+      rowTop = dlCompletedBodyTop + segmentRowOffset(completedIdx, dlRowHeight);
+    }
+    const rowBottom = rowTop + dlRowHeight;
+    if (rowTop < headerHeight) {
+      scroller.scrollTop += rowTop - headerHeight;
+    } else if (rowBottom > scroller.clientHeight) {
+      scroller.scrollTop += rowBottom - scroller.clientHeight;
+    } else {
+      return;
+    }
+    measureDownloadWindow();
+  }
 
   let selectedTransfer = $derived.by(() => {
     if (selectedDownloadIds.length !== 1) return null;
@@ -2610,6 +2792,9 @@
   let fileDetailsCloseBtn: HTMLButtonElement | undefined = $state();
   let fileDetailsReturnFocusEl: HTMLElement | null = null;
   let fileDetailsGen = 0;
+  /** Transfer ids with a details request outstanding; the poll skips a tick
+   *  for an id still waiting on its previous answer. */
+  const fileDetailsInFlight = new Map<string, number>();
   /// Slower than the transfers poll: a chunk map that redraws every second is
   /// harder to read than one that settles, and parts complete in minutes.
   const FILE_DETAILS_POLL_MS = 4000;
@@ -2622,6 +2807,7 @@
 
   async function refreshFileDetails(transferId: string) {
     const gen = ++fileDetailsGen;
+    fileDetailsInFlight.set(transferId, (fileDetailsInFlight.get(transferId) ?? 0) + 1);
     try {
       const data = await getDownloadFileDetails(transferId);
       if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
@@ -2633,6 +2819,9 @@
       // a reason to show stale parts, not no parts.
       if (!fileDetails) fileDetailsError = translateError(e, m.transfers_file_details_failed());
     } finally {
+      const outstanding = (fileDetailsInFlight.get(transferId) ?? 1) - 1;
+      if (outstanding > 0) fileDetailsInFlight.set(transferId, outstanding);
+      else fileDetailsInFlight.delete(transferId);
       if (mounted && gen === fileDetailsGen && fileDetailsId === transferId) {
         fileDetailsLoading = false;
       }
@@ -2692,6 +2881,7 @@
       // Same gate as every other poll here: nothing to redraw for a window
       // nobody can see.
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (fileDetailsInFlight.has(id)) return;
       void refreshFileDetails(id);
     }, FILE_DETAILS_POLL_MS);
     return () => clearInterval(handle);
@@ -3259,7 +3449,11 @@
       for (const id of failedIds) clearDownloadRemoved(id);
       transfers.update((list) => {
         const existing = new Set(list.map((x) => x.id));
-        const toRestore = snapshots.filter((s) => failedIds.has(s.id) && !existing.has(s.id));
+        // Copies, not the snapshots themselves: the store skips merging a row
+        // object it already reconciled, and these missed every poll since.
+        const toRestore = snapshots
+          .filter((s) => failedIds.has(s.id) && !existing.has(s.id))
+          .map((s) => ({ ...s }));
         return toRestore.length ? [...list, ...toRestore] : list;
       });
     }
@@ -4252,10 +4446,10 @@
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
   if (e.key === 'ArrowDown') {
     const next = filteredSelectableDownloads[Math.min(filteredSelectableDownloads.length - 1, idx + 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
   } else if (e.key === 'ArrowUp') {
     const next = filteredSelectableDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
@@ -4346,7 +4540,7 @@
       </div>
     </div>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="pane-content scroll-shadows" oncontextmenu={onDownloadsPaneCtx}>
+    <div class="pane-content scroll-shadows" bind:this={downloadsScrollEl} use:passiveScroll={onDownloadsScroll} oncontextmenu={onDownloadsPaneCtx}>
       <table
         class="transfer-table dl-table"
         bind:this={downloadTableEl}
@@ -4406,9 +4600,11 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredActiveDownloads as t (t.id)}
+          <tr class="vpad-row" aria-hidden="true" bind:this={dlActiveTopPadEl} style="height: {dlActiveWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
+          {#each dlActiveSlice as t, i (t.id)}
             <tr
               class="dl-row {t.status}"
+              class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
               class:selected={selectedDlIdSet.has(t.id)}
               onclick={(e) => onDownloadRowClick(e, t)}
@@ -4594,6 +4790,9 @@
               {/if}
             {/if}
           {/each}
+          {#if dlActiveWindow.bottomPad > 0}
+            <tr class="vpad-row" aria-hidden="true" style="height: {dlActiveWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
+          {/if}
           {#if filteredCompletedDownloads.length > 0}
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
@@ -4604,9 +4803,11 @@
               </td>
             </tr>
             {#if !completedCollapsed}
-            {#each filteredCompletedDownloads as t (t.id)}
+            <tr class="vpad-row" aria-hidden="true" bind:this={dlCompletedTopPadEl} style="height: {dlCompletedWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
+            {#each dlCompletedSlice as t, i (t.id)}
               <tr
                 class="dl-row completed-row {t.status}"
+                class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
                 class:selected={selectedDlIdSet.has(t.id)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
@@ -4671,6 +4872,9 @@
                 {/each}
               </tr>
             {/each}
+            {#if dlCompletedWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {dlCompletedWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
+            {/if}
             {/if}
           {/if}
           {#if allDownloads.length === 0}
@@ -5868,7 +6072,8 @@
     } catch (e: unknown) {
       clearDownloadRemoved(id);
       if (snapshot) {
-        const restore = snapshot;
+        // A copy so the next poll merges it; see `removeTransfersBatch`.
+        const restore = { ...snapshot };
         transfers.update((list) =>
           list.some((x) => x.id === id) ? list : [...list, restore],
         );
@@ -5983,7 +6188,8 @@
       for (const id of idSet) clearDownloadRemoved(id);
       transfers.update((list) => {
         const existing = new Set(list.map((x) => x.id));
-        const toRestore = snapshots.filter((s) => !existing.has(s.id));
+        // Copies so the next poll merges them; see `removeTransfersBatch`.
+        const toRestore = snapshots.filter((s) => !existing.has(s.id)).map((s) => ({ ...s }));
         return toRestore.length ? [...list, ...toRestore] : list;
       });
       transferError = toErrorMsg(e);
@@ -6848,8 +7054,22 @@
     text-overflow: ellipsis;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
   }
-  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary)) {
+  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row)) {
     background: color-mix(in srgb, var(--bg-secondary) 40%, var(--bg-primary));
+  }
+  /* Download rows are windowed, so which of them is an even child changes
+     as the table scrolls; they carry their stripe from their list index. */
+  .transfer-table tbody tr.dl-row.row-alt {
+    background: color-mix(in srgb, var(--bg-secondary) 40%, var(--bg-primary));
+  }
+  .transfer-table tbody tr.vpad-row,
+  .transfer-table tbody tr.vpad-row:hover {
+    background: transparent;
+  }
+  .transfer-table tbody tr.vpad-row td {
+    padding: 0;
+    border: 0;
+    height: inherit;
   }
   .transfer-table tbody tr:hover {
     background: var(--bg-hover);

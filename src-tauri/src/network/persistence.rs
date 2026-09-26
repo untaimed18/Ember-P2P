@@ -334,11 +334,53 @@ pub(super) fn spawn_save_ipfilter_dat(ip_filter: &IpFilter, path: PathBuf) {
         return;
     }
     let bytes = ip_filter.canonical_dat_bytes();
+    spawn_ordered_ipfilter_write(path, bytes);
+}
+
+static IPFILTER_SAVE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static IPFILTER_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The same generation + lock gate as [`spawn_save_server_met`]: each edit
+/// spawns its own full rewrite, the blocking pool runs them in any order, and
+/// without the gate the last rename to land — not the last edit — decided
+/// what was on disk.
+fn spawn_ordered_ipfilter_write(path: PathBuf, bytes: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    let gen = IPFILTER_SAVE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     tokio::task::spawn_blocking(move || {
+        let _guard = IPFILTER_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if IPFILTER_SAVE_GENERATION.load(Ordering::Relaxed) != gen {
+            return;
+        }
         if let Err(e) = crate::security::atomic_write(&path, &bytes, false) {
             warn!("Failed to persist ipfilter.dat after a manual range change: {e}");
         }
-    });
+    })
+}
+
+/// Make every manual-edit save queued so far a no-op. For a caller about to
+/// replace the live list wholesale: those saves serialize the list it is
+/// replacing.
+pub(super) fn supersede_queued_ipfilter_saves() {
+    IPFILTER_SAVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Replace `ipfilter.dat` through the manual-edit gate: supersedes every
+/// queued edit save and writes after any already in progress, so neither can
+/// land an older list over this one. Every writer of `ipfilter.dat` outside
+/// startup must come through here. Blocks; call from the blocking pool.
+pub(crate) fn write_ipfilter_dat_superseding(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    supersede_queued_ipfilter_saves();
+    let _guard = IPFILTER_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::security::atomic_write(path, bytes, false)
 }
 
 /// Read `ipfilter.dat` into the live filter if it has not been read yet, so a
@@ -441,4 +483,70 @@ pub(super) struct DeferredDiskLoads {
     pub(super) known_files: KnownFileList,
     pub(super) known2: Option<ed2k::aich::Known2Store>,
     pub(super) aich_root_map: HashMap<[u8; 16], [u8; 20]>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These tests drive the process-wide save gate, so one's generation bump
+    /// would otherwise supersede the other's writes.
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        SERIAL.lock().await
+    }
+
+    #[tokio::test]
+    async fn ip_filter_saves_that_land_out_of_order_keep_the_latest_edit() {
+        let _serial = serial().await;
+        let dir = std::env::temp_dir().join(format!(
+            "ember-ipfilter-order-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ipfilter.dat");
+        // Both writers queue behind the lock, so neither can reach disk until
+        // both generations exist — the worst case for "last rename wins".
+        let (older, newer) = {
+            let _held = IPFILTER_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let older = spawn_ordered_ipfilter_write(path.clone(), b"older".to_vec());
+            let newer = spawn_ordered_ipfilter_write(path.clone(), b"newer".to_vec());
+            (older, newer)
+        };
+        newer.await.unwrap();
+        older.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ip_filter_import_is_not_overwritten_by_a_queued_edit_save() {
+        let _serial = serial().await;
+        let dir = std::env::temp_dir().join(format!(
+            "ember-ipfilter-import-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ipfilter.dat");
+        // An edit save is queued behind an in-progress write when the import
+        // arrives; whichever reaches the lock first, the import must be what
+        // is left on disk.
+        let held = IPFILTER_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let edit = spawn_ordered_ipfilter_write(path.clone(), b"stale edit".to_vec());
+        let import_path = path.clone();
+        let import = tokio::task::spawn_blocking(move || {
+            write_ipfilter_dat_superseding(&import_path, b"imported list")
+        });
+        // Give the import time to supersede the edit and queue on the lock,
+        // the ordering this test is about. Both writers run on the blocking
+        // pool, so a blocking sleep here does not stall them.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(held);
+        import.await.unwrap().unwrap();
+        edit.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"imported list");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

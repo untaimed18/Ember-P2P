@@ -156,6 +156,14 @@ pub(in crate::network) async fn on_cleanup_tick(
             Err(e) => debug!("Queued-chat expiry sweep panicked: {e}"),
         }
 
+        let db_attachments = db.clone();
+        let now = chrono::Utc::now().timestamp();
+        match tokio::task::spawn_blocking(move || db_attachments.expire_chat_attachments(now)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => debug!("Chat attachment expiry sweep failed: {e}"),
+            Err(e) => debug!("Chat attachment expiry sweep panicked: {e}"),
+        }
+
         // Same cadence, same reason: the ceiling is in days, and a
         // withdrawal nobody can deliver is holding the address of
         // someone the user removed.

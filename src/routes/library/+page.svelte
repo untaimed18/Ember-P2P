@@ -2,7 +2,7 @@
   import {
     deleteSharedFile,
     removeSharedFolder,
-    getSharedFiles,
+    getSharedFilesIfChanged,
     getSharedFolders,
     reloadSharedFiles,
     getScanStatus,
@@ -38,7 +38,13 @@
   } from '$lib/stores/collection';
   import { toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
-  import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
+  import {
+    formatSize,
+    formatNumber,
+    formatDateTime,
+    formatClockTime,
+    copyToClipboard as writeClipboard,
+  } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
   import { fly } from 'svelte/transition';
@@ -676,6 +682,9 @@
   let pendingRefresh = false;
   const refreshDebounce = createMaxWaitDebounce(() => { refresh(); });
   let loadGen = 0;
+  /** Etag of the backend rows `files` was last built from. A refresh passes it
+   *  back, and an unchanged library comes back without its rows. */
+  let filesEtag: string | null = null;
 
   /** Coalescing window for `shared-files-changed` while a scan is running.
    *
@@ -728,7 +737,7 @@
     if (!initialLoadDone) firstLoadSlow = false;
     const work = Promise.all([
       getSharedFolders(),
-      getSharedFiles(),
+      getSharedFilesIfChanged(force ? null : filesEtag),
       getScanStatus(),
       getFolderPriorities(),
       getLibraryScanTruncated(),
@@ -748,14 +757,15 @@
       }
     }, 5000);
     try {
-      const [newFolders, newFiles, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await work;
+      const [newFolders, snapshot, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await work;
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
       // The library is the offer list. A file that is not offered stays on
       // disk and stays out of this view; sharing it again is the folder window.
-      const offered = newFiles.filter((f) => f.shared);
-      files = offered.map(withMatchKeys);
+      const offered = snapshot.files ? snapshot.files.filter((f) => f.shared) : null;
+      if (offered) files = offered.map(withMatchKeys);
+      filesEtag = snapshot.etag;
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
@@ -772,7 +782,7 @@
       // the filtered view, so this only prunes files that left the list.
       // Without this the
       // bulk-bar count and later bulk ops could reference ghost paths.
-      if (checkedPaths.size > 0 || selectedPath) {
+      if (offered && (checkedPaths.size > 0 || selectedPath)) {
         const present = new Set(offered.map((f) => f.path));
         if (checkedPaths.size > 0) {
           let removed = false;
@@ -924,7 +934,7 @@
     }
     if (targets.length >= COPY_ALL_LINKS_CONFIRM_AT) {
       const confirmed = await askConfirm(
-        m.library_copy_all_confirm({ count: targets.length.toLocaleString() }),
+        m.library_copy_all_confirm({ count: formatNumber(targets.length) }),
         m.library_copy_all_confirm_title(),
       );
       if (!confirmed) return;
@@ -967,7 +977,7 @@
         }));
       } else if (selected.already_shared.length > 1) {
         toastInfo(m.library_folders_already_shared({
-          count: selected.already_shared.length.toLocaleString(),
+          count: formatNumber(selected.already_shared.length),
         }));
       }
       const sharedFiles = selected.files_shared ?? [];
@@ -977,11 +987,11 @@
           const name = [...folderNames][0];
           toastSuccess(sharedFiles.length === 1
             ? m.library_shared_from_one({ name })
-            : m.library_shared_from_other({ count: sharedFiles.length.toLocaleString(), name }));
+            : m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }));
         } else if (sharedFiles.length === 1) {
           toastSuccess(m.library_shared_one());
         } else {
-          toastSuccess(m.library_shared_other({ count: sharedFiles.length.toLocaleString() }));
+          toastSuccess(m.library_shared_other({ count: formatNumber(sharedFiles.length) }));
         }
       }
       if (selected.added.length === 0) {
@@ -1012,7 +1022,7 @@
       if (!mounted) return;
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
-        toastSuccess(m.library_folder_priority_set({ count: count.toLocaleString() }));
+        toastSuccess(m.library_folder_priority_set({ count: formatNumber(count) }));
       } else {
         const next = { ...folderPriorities };
         delete next[path];
@@ -1039,7 +1049,7 @@
       const body = stats > 0
         ? (stats === 1
             ? m.library_confirm_remove_folder_one({ name: displayName })
-            : m.library_confirm_remove_folder_other({ name: displayName, count: stats.toLocaleString() }))
+            : m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }))
         : m.library_confirm_remove_folder_empty({ name: displayName });
       const confirmed = await askConfirm(body, m.library_remove_folder_title());
       if (!confirmed || !mounted) return;
@@ -1115,7 +1125,7 @@
     const shown = names.slice(0, STOP_FOLDERS_NAMED);
     shown.push(
       m.library_stop_confirm_more_folders({
-        count: (names.length - STOP_FOLDERS_NAMED).toLocaleString(),
+        count: formatNumber(names.length - STOP_FOLDERS_NAMED),
       }),
     );
     return shown.join(', ');
@@ -1461,7 +1471,7 @@
       const confirmed = await askConfirm(
         targets.length === 1
           ? m.library_confirm_delete_one({ size: formatSize(totalBytes) })
-          : m.library_confirm_delete_other({ count: targets.length.toLocaleString(), size: formatSize(totalBytes) }),
+          : m.library_confirm_delete_other({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
         m.library_delete_files_title(),
       );
       if (!confirmed) return;
@@ -2379,7 +2389,7 @@
       const confirmed = await askConfirm(
         sharedCount === 1
           ? m.library_confirm_unshare_folder_one({ name: displayName })
-          : m.library_confirm_unshare_folder_other({ count: sharedCount.toLocaleString(), name: displayName }),
+          : m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
         m.library_unshare_folder_title(),
       );
       if (!confirmed) return;
@@ -2391,7 +2401,7 @@
 
   function formatSavedTime(ts: number | null): string {
     if (!ts) return '';
-    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return formatClockTime(ts / 1000, { hour: '2-digit', minute: '2-digit' });
   }
 
   // --- Persisted filters / sort ---
@@ -2946,7 +2956,7 @@
       {#if copyingAllLibraryLinks}
         {m.library_copying()}
       {:else}
-        {m.library_copy_all_links()}{filteredHashedFiles.length > 0 ? ` (${filteredHashedFiles.length.toLocaleString()})` : ''}
+        {m.library_copy_all_links()}{filteredHashedFiles.length > 0 ? ` (${formatNumber(filteredHashedFiles.length)})` : ''}
       {/if}
     </button>
     <button
@@ -2962,11 +2972,11 @@
       {m.library_columns_button()}
     </button>
     <span class="inline-stats">
-      <span class="inline-stat">{m.library_stat_files({ count: files.length.toLocaleString() })}</span>
+      <span class="inline-stat">{m.library_stat_files({ count: formatNumber(files.length) })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_hashed({ count: libraryHashedCount.toLocaleString() })}</span>
+      <span class="inline-stat">{m.library_stat_hashed({ count: formatNumber(libraryHashedCount) })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_folders({ count: folders.length.toLocaleString() })}</span>
+      <span class="inline-stat">{m.library_stat_folders({ count: formatNumber(folders.length) })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{m.stats_total_uploaded()}: {formatSize(aggregateUploaded)}</span>
     </span>
@@ -3007,8 +3017,8 @@
           {#if loadedCollection.files.length > displayedLoadedCollectionFiles.length}
             <div class="coll-pick-note">
               {m.library_status_showing({
-                shown: displayedLoadedCollectionFiles.length.toLocaleString(),
-                total: loadedCollection.files.length.toLocaleString()
+                shown: formatNumber(displayedLoadedCollectionFiles.length),
+                total: formatNumber(loadedCollection.files.length)
               })}
             </div>
           {/if}
@@ -3131,7 +3141,7 @@
           {/each}
           {#if collectionFilteredFiles.length > displayedCollectionFiles.length}
             <div class="coll-pick-empty">
-              {m.library_status_showing({ shown: displayedCollectionFiles.length.toLocaleString(), total: collectionFilteredFiles.length.toLocaleString() })}
+              {m.library_status_showing({ shown: formatNumber(displayedCollectionFiles.length), total: formatNumber(collectionFilteredFiles.length) })}
             </div>
           {/if}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
@@ -3210,7 +3220,7 @@
           <span class="tree-folder-name">{m.library_all_files()}</span>
         </span>
         <div class="tree-meta">
-          <span class="tree-count">{files.length.toLocaleString()}</span>
+          <span class="tree-count">{formatNumber(files.length)}</span>
         </div>
       </div>
       {#each folderRows as row (row.path)}
@@ -3270,7 +3280,7 @@
             </span>
           </span>
           <div class="tree-meta">
-            <span class="tree-count">{row.count.toLocaleString()} &middot; {formatSize(row.size)}</span>
+            <span class="tree-count">{formatNumber(row.count)} &middot; {formatSize(row.size)}</span>
             {#if row.isShare}
             <select
               class="tree-prio"
@@ -3415,7 +3425,7 @@
                   <span class="top-value">
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
-                      : (val === 1 ? m.library_uploads_one() : m.library_uploads_other({ count: val.toLocaleString() }))}
+                      : (val === 1 ? m.library_uploads_one() : m.library_uploads_other({ count: formatNumber(val) }))}
                   </span>
                 </span>
               </button>
@@ -3586,7 +3596,7 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
             </svg>
-            {checkedHiddenCount === 1 ? m.library_bulk_hidden_one() : m.library_bulk_hidden_other({ count: checkedHiddenCount.toLocaleString() })}
+            {checkedHiddenCount === 1 ? m.library_bulk_hidden_one() : m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) })}
           </button>
         {/if}
         <div class="bulk-prio-group">
@@ -3611,8 +3621,8 @@
           <span class="bulk-progress" role="status">
             <span class="spinner"></span>
             {m.library_bulk_progress({
-              done: bulkProgress.done.toLocaleString(),
-              total: bulkProgress.total.toLocaleString(),
+              done: formatNumber(bulkProgress.done),
+              total: formatNumber(bulkProgress.total),
             })}
           </span>
         {/if}
@@ -3623,7 +3633,7 @@
 
     <div class="status-bar">
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
-        <span>{m.library_status_showing({ shown: filteredFiles.length.toLocaleString(), total: files.length.toLocaleString() })}</span>
+        <span>{m.library_status_showing({ shown: formatNumber(filteredFiles.length), total: formatNumber(files.length) })}</span>
         <span class="status-sep">&middot;</span>
       {/if}
       <span>{activeFolderLabel}</span>
@@ -3700,7 +3710,7 @@
             <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
             {#if selectedFile.modified_at}
               <span class="meta-label">{m.library_col_modified()}</span>
-              <span class="meta-value">{new Date(selectedFile.modified_at * 1000).toLocaleString()}</span>
+              <span class="meta-value">{formatDateTime(selectedFile.modified_at)}</span>
             {/if}
             {#if selectedFile.hash}
               <span class="meta-label">{m.library_meta_hash()}</span>
@@ -3752,7 +3762,7 @@
             {#if selectedFile.complete_sources > 0}
               <span class="meta-label">{m.library_col_peers()}</span>
               <span class="meta-value" title={m.library_meta_peers_title()}>
-                {m.library_meta_peers_count({ count: selectedFile.complete_sources.toLocaleString() })}
+                {m.library_meta_peers_count({ count: formatNumber(selectedFile.complete_sources) })}
               </span>
             {/if}
           </div>
@@ -3763,16 +3773,16 @@
           <div class="activity-stats">
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_requests()}</span>
-              <span class="activity-stat-value">{selectedFile.requests.toLocaleString()}</span>
+              <span class="activity-stat-value">{formatNumber(selectedFile.requests)}</span>
               {#if selectedFile.alltime_requests}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_requests.toLocaleString()}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatNumber(selectedFile.alltime_requests)}</span>
               {/if}
             </div>
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_accepted()}</span>
-              <span class="activity-stat-value">{selectedFile.accepted.toLocaleString()}</span>
+              <span class="activity-stat-value">{formatNumber(selectedFile.accepted)}</span>
               {#if selectedFile.alltime_accepted}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_accepted.toLocaleString()}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatNumber(selectedFile.alltime_accepted)}</span>
               {/if}
             </div>
             <div class="activity-stat">

@@ -20,7 +20,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
   import { inertBackground } from '$lib/a11y';
-  import { copyToClipboard } from '$lib/utils';
+  import { copyToClipboard, formatDateTime, formatNumber } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
 
@@ -913,9 +913,9 @@
         <span class="toolbar-label">
           {m.kad_contacts_label()}
           {#if contactFilter.trim() || contactTypeFilter !== 'all'}
-            ({m.kad_contacts_count_filtered({ filtered: filteredContacts.length.toLocaleString(), total: contacts.length.toLocaleString() })})
+            ({m.kad_contacts_count_filtered({ filtered: formatNumber(filteredContacts.length), total: formatNumber(contacts.length) })})
           {:else}
-            ({contacts.length.toLocaleString()})
+            ({formatNumber(contacts.length)})
           {/if}
         </span>
         <input
@@ -1104,14 +1104,14 @@
         <div class="stat-group stat-group-grid">
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_contacts()}</span>
-            <span class="stat-value stat-numeric">{contacts.length.toLocaleString()}</span>
+            <span class="stat-value stat-numeric">{formatNumber(contacts.length)}</span>
           </div>
           <div class="stat-tile">
             <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
             <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || $networkStats.kad_users_estimate == null
                 ? '—'
-                : $networkStats.kad_users_estimate.toLocaleString()}
+                : formatNumber($networkStats.kad_users_estimate)}
             </span>
           </div>
         </div>
@@ -1411,7 +1411,7 @@
                   {:else if column.key === 'responses'}
                     <td class="num">{search.responses}</td>
                   {:else if column.key === 'started_at'}
-                    <td title={new Date(search.started_at * 1000).toLocaleString()}>{formatSearchAge(search.started_at)}</td>
+                    <td title={formatDateTime(search.started_at)}>{formatSearchAge(search.started_at)}</td>
                   {/if}
                 {/each}
                 <td>

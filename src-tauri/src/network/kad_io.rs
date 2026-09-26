@@ -585,6 +585,13 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
             state.ember_udp_reachable_at = None;
             state.ember_reach_witness = None;
         }
+        // Rendezvous failures earned on the old address say nothing about the
+        // new one, and presence has to be re-announced from it promptly. A
+        // transient `None` keeps the backoff; the disconnect path covers that.
+        if ip.is_some() {
+            state.rendezvous_register_fail_streak = 0;
+            state.rendezvous_last_attempt = None;
+        }
     }
     state.external_ip = ip;
     state.routing_table.set_external_ip(ip);

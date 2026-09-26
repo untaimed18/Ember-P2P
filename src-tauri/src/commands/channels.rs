@@ -4212,10 +4212,7 @@ pub async fn gather_channels(
 
     let url = rendezvous_url(&state).await;
     let (directory, deleted) = tokio::join!(
-        tokio::time::timeout(
-            DIRECTORY_FETCH_TIMEOUT,
-            crate::network::rendezvous::fetch_channel_directory(&url),
-        ),
+        crate::network::rendezvous::fetch_channel_directory(&url, DIRECTORY_FETCH_TIMEOUT),
         tokio::time::timeout(
             DIRECTORY_FETCH_TIMEOUT,
             crate::network::rendezvous::fetch_deleted_channel_ids(&url),
@@ -4226,13 +4223,9 @@ pub async fn gather_channels(
     // indistinguishable from "the network has no rooms". Log it so an empty
     // Discover can be told apart from an unreachable directory.
     let directory = match directory {
-        Ok(Ok(list)) => list,
-        Ok(Err(error)) => {
+        Ok(list) => list,
+        Err(error) => {
             tracing::warn!(?error, "channel directory fetch failed; showing DHT results only");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!("channel directory fetch timed out; showing DHT results only");
             Vec::new()
         }
     };

@@ -15,6 +15,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { formatNumber } from '$lib/utils';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -577,12 +578,12 @@
         </button>
       </div>
       <div class="controls-right">
-        <span class="inline-stat">{m.security_ranges_count({ count: stats.range_count.toLocaleString() })}</span>
+        <span class="inline-stat">{m.security_ranges_count({ count: formatNumber(stats.range_count) })}</span>
         <span class="inline-sep">&middot;</span>
         <!-- Red only when there is something to be red about. A permanent
              danger-coloured "0 hits" trains the eye to ignore the one place
              on the page that reports blocks actually happening. -->
-        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
+        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>{m.security_hits_count({ count: formatNumber(stats.total_hits) })}</span>
       </div>
     </div>
 
@@ -641,7 +642,7 @@
       <span class="result-count">
         {matchedCount === 1
           ? m.security_range_count_one()
-          : m.security_range_count_other({ count: matchedCount.toLocaleString() })}
+          : m.security_range_count_other({ count: formatNumber(matchedCount) })}
       </span>
     </div>
 
@@ -725,9 +726,9 @@
                     <!-- Reserve the "danger" red for ranges that are
                          actually doing meaningful blocking; otherwise
                          every populated table reads as alarming. -->
-                    <span class="hit-count hit-count-high">{entry.hits.toLocaleString()}</span>
+                    <span class="hit-count hit-count-high">{formatNumber(entry.hits)}</span>
                   {:else}
-                    <span class="hit-count">{entry.hits.toLocaleString()}</span>
+                    <span class="hit-count">{formatNumber(entry.hits)}</span>
                   {/if}
                 </td>
                 <td class="actions-cell">

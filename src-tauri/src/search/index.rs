@@ -14,6 +14,40 @@ pub struct LocalIndex {
     /// completed row is keyed by its content hash, so two copies of the same
     /// file share one id exactly as they share one `hash_map` key.
     id_map: HashMap<String, Vec<usize>>,
+    /// How many `path_map` keys sit under each directory key (no trailing
+    /// separator). Kept in step with `path_map`'s key set — changed only when a
+    /// key is newly inserted or actually removed — so "is anything indexed
+    /// under this folder" is a lookup instead of a walk of every row.
+    dir_counts: HashMap<String, usize>,
+}
+
+/// Every ancestor directory of a normalized path key, without trailing
+/// separators: `d:\films\a.mkv` gives `d:` and `d:\films`.
+fn ancestor_dir_keys(key: &str) -> impl Iterator<Item = &str> {
+    key.match_indices(std::path::MAIN_SEPARATOR)
+        .map(move |(at, _)| &key[..at])
+}
+
+fn count_key_dirs(dir_counts: &mut HashMap<String, usize>, key: &str) {
+    for dir in ancestor_dir_keys(key) {
+        match dir_counts.get_mut(dir) {
+            Some(count) => *count += 1,
+            None => {
+                dir_counts.insert(dir.to_string(), 1);
+            }
+        }
+    }
+}
+
+fn uncount_key_dirs(dir_counts: &mut HashMap<String, usize>, key: &str) {
+    for dir in ancestor_dir_keys(key) {
+        if let Some(count) = dir_counts.get_mut(dir) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                dir_counts.remove(dir);
+            }
+        }
+    }
 }
 
 /// Temporary id for a row that has never been hashed, so the index has nothing
@@ -81,7 +115,18 @@ impl LocalIndex {
             path_map: HashMap::new(),
             hash_map: HashMap::new(),
             id_map: HashMap::new(),
+            dir_counts: HashMap::new(),
         }
+    }
+
+    /// Whether a row sits at `path` or anywhere under it. Cheap enough for the
+    /// FS watcher to ask about every departed path it cannot rule out by name.
+    pub fn has_rows_at_or_under(&self, path: &str) -> bool {
+        let key = normalize_path_key(path);
+        self.path_map.contains_key(&key)
+            || self
+                .dir_counts
+                .contains_key(key.trim_end_matches(std::path::MAIN_SEPARATOR))
     }
 
     /// Insert or update a batch, patching the lookup maps as it goes.
@@ -146,6 +191,13 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Replace the rows at or under `folders` with `discovered`.
+    ///
+    /// This and every other folder- or prefix-scoped method here matches with
+    /// [`crate::security::path_within_dir`], so a shared drive root covers the
+    /// rows on it. Callers pass stored shared folders or paths under one —
+    /// never a folder taken straight from a request, which could name a drive
+    /// that is not shared.
     pub fn reconcile_files_for_folders(
         &mut self,
         folders: &[String],
@@ -164,7 +216,7 @@ impl LocalIndex {
             self.files.retain(|file| {
                 !folders
                     .iter()
-                    .any(|folder| crate::security::path_matches_dir(&file.path, folder))
+                    .any(|folder| crate::security::path_within_dir(&file.path, folder))
                     || discovered_keys.contains(&normalize_path_key(&file.path))
             });
             // `retain` closes the gaps it leaves, so every position after the
@@ -390,7 +442,7 @@ impl LocalIndex {
 
     pub fn remove_files_by_path_prefix(&mut self, prefix: &str) {
         self.files
-            .retain(|f| !crate::security::path_matches_dir(&f.path, prefix));
+            .retain(|f| !crate::security::path_within_dir(&f.path, prefix));
         self.rebuild_indices();
     }
 
@@ -403,7 +455,7 @@ impl LocalIndex {
         self.files.retain(|file| {
             let keep = folders
                 .iter()
-                .any(|folder| crate::security::path_matches_dir(&file.path, folder));
+                .any(|folder| crate::security::path_within_dir(&file.path, folder));
             if !keep {
                 removed.push(file.clone());
             }
@@ -474,7 +526,7 @@ impl LocalIndex {
             !(f.id.starts_with(PENDING_ID_PREFIX)
                 && prefixes
                     .iter()
-                    .any(|p| crate::security::path_matches_dir(&f.path, p)))
+                    .any(|p| crate::security::path_within_dir(&f.path, p)))
         });
         if self.files.len() != before {
             self.rebuild_indices();
@@ -548,7 +600,10 @@ impl LocalIndex {
 
         let removed = self.files.swap_remove(pos);
 
-        self.path_map.remove(&normalize_path_key(&removed.path));
+        let removed_key = normalize_path_key(&removed.path);
+        if self.path_map.remove(&removed_key).is_some() {
+            uncount_key_dirs(&mut self.dir_counts, &removed_key);
+        }
         if !removed.hash.is_empty() {
             if let Some(v) = self.hash_map.get_mut(&removed.hash) {
                 v.retain(|&i| i != pos && i != last_idx);
@@ -574,7 +629,10 @@ impl LocalIndex {
             // this, `hash_map` accumulates dangling indices (out-of-bounds, or
             // pointing at an unrelated file once the slot is reused) until the
             // next full `rebuild()`.
-            self.path_map.insert(normalize_path_key(&moved_path), pos);
+            let moved_path_key = normalize_path_key(&moved_path);
+            if self.path_map.insert(moved_path_key.clone(), pos).is_none() {
+                count_key_dirs(&mut self.dir_counts, &moved_path_key);
+            }
             if !moved_hash.is_empty() {
                 let v = self.hash_map.entry(moved_hash).or_default();
                 v.retain(|&i| i != last_idx && i != pos);
@@ -734,14 +792,14 @@ impl LocalIndex {
         let hashes: HashSet<String> = self
             .files
             .iter()
-            .filter(|file| crate::security::path_matches_dir(&file.path, folder))
+            .filter(|file| crate::security::path_within_dir(&file.path, folder))
             .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
             .iter()
             .filter(|file| {
-                file.hash.is_empty() && crate::security::path_matches_dir(&file.path, folder)
+                file.hash.is_empty() && crate::security::path_within_dir(&file.path, folder)
             })
             .map(|file| normalize_path_key(&file.path))
             .collect();
@@ -776,7 +834,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| only_paths.contains(&normalize_path_key(&file.path)))
-            .filter(|file| crate::security::path_matches_dir(&file.path, folder))
+            .filter(|file| crate::security::path_within_dir(&file.path, folder))
             .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
@@ -785,7 +843,7 @@ impl LocalIndex {
             .filter(|file| {
                 file.hash.is_empty()
                     && only_paths.contains(&normalize_path_key(&file.path))
-                    && crate::security::path_matches_dir(&file.path, folder)
+                    && crate::security::path_within_dir(&file.path, folder)
             })
             .map(|file| normalize_path_key(&file.path))
             .collect();
@@ -900,14 +958,14 @@ impl LocalIndex {
         let hashes: HashSet<String> = self
             .files
             .iter()
-            .filter(|file| crate::security::path_matches_dir(&file.path, prefix))
+            .filter(|file| crate::security::path_within_dir(&file.path, prefix))
             .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
             .iter()
             .filter(|file| {
-                file.hash.is_empty() && crate::security::path_matches_dir(&file.path, prefix)
+                file.hash.is_empty() && crate::security::path_within_dir(&file.path, prefix)
             })
             .map(|file| normalize_path_key(&file.path))
             .collect();
@@ -1108,7 +1166,10 @@ impl LocalIndex {
     /// `pos`. `file` must describe the path/hash/name whose entries are being
     /// removed (it may differ from `self.files[pos]` when replacing in place).
     fn remove_index_entries(&mut self, pos: usize, file: &FileInfo) {
-        self.path_map.remove(&normalize_path_key(&file.path));
+        let path_key = normalize_path_key(&file.path);
+        if self.path_map.remove(&path_key).is_some() {
+            uncount_key_dirs(&mut self.dir_counts, &path_key);
+        }
         if !file.hash.is_empty() {
             if let Some(v) = self.hash_map.get_mut(&file.hash) {
                 v.retain(|&i| i != pos);
@@ -1138,7 +1199,9 @@ impl LocalIndex {
                 file.id.clone(),
             )
         };
-        self.path_map.insert(path_key, pos);
+        if self.path_map.insert(path_key.clone(), pos).is_none() {
+            count_key_dirs(&mut self.dir_counts, &path_key);
+        }
         if !hash.is_empty() {
             self.hash_map.entry(hash).or_default().push(pos);
         }
@@ -1151,8 +1214,13 @@ impl LocalIndex {
         self.path_map.clear();
         self.hash_map.clear();
         self.id_map.clear();
+        self.dir_counts.clear();
         for (idx, file) in self.files.iter().enumerate() {
-            self.path_map.insert(normalize_path_key(&file.path), idx);
+            let path_key = normalize_path_key(&file.path);
+            if !self.path_map.contains_key(&path_key) {
+                count_key_dirs(&mut self.dir_counts, &path_key);
+            }
+            self.path_map.insert(path_key, idx);
             if !file.hash.is_empty() {
                 self.hash_map
                     .entry(file.hash.clone())
@@ -1407,6 +1475,61 @@ mod local_index_tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    /// The directory counts behind `has_rows_at_or_under` are patched at every
+    /// place `path_map` changes, so each kind of mutation has to leave them
+    /// exactly as a recount from scratch would.
+    #[test]
+    fn directory_counts_answer_what_is_under_a_folder_through_every_mutation() {
+        fn recount(index: &LocalIndex) -> std::collections::HashMap<String, usize> {
+            let mut counts = std::collections::HashMap::new();
+            for key in index.path_map.keys() {
+                super::count_key_dirs(&mut counts, key);
+            }
+            counts
+        }
+        let h = |byte: u8| format!("{byte:02x}").repeat(16);
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("S/Album/a.bin", &h(1), true, "normal"),
+            file("S/Album/Live/b.bin", &h(2), true, "normal"),
+            file("S/Other/c.bin", &h(3), true, "normal"),
+        ]);
+        assert!(index.has_rows_at_or_under("S/Album"));
+        assert!(index.has_rows_at_or_under("S/Album/"));
+        assert!(index.has_rows_at_or_under("S/Album/Live"));
+        assert!(index.has_rows_at_or_under("S/Album/a.bin"), "a row at the path itself");
+        assert!(!index.has_rows_at_or_under("S/Alb"), "a name prefix is not a folder");
+        assert!(!index.has_rows_at_or_under("S/Album2"));
+        assert!(!index.has_rows_at_or_under("S/Album/a.bin.part"));
+        #[cfg(windows)]
+        assert!(
+            index.has_rows_at_or_under(r"s\ALBUM"),
+            "folder keys fold case and separators on Windows"
+        );
+        assert_eq!(index.dir_counts, recount(&index));
+
+        // Swap-remove, including the row moved into the freed slot.
+        index.remove_file_by_path("S/Album/Live/b.bin");
+        assert!(!index.has_rows_at_or_under("S/Album/Live"));
+        assert!(index.has_rows_at_or_under("S/Album"));
+        assert_eq!(index.dir_counts, recount(&index));
+
+        // Replacing a row in place must not count its folders twice.
+        index.add_files(vec![file("S/Album/a.bin", &h(4), true, "normal")]);
+        assert_eq!(index.dir_counts, recount(&index));
+        index.remove_file_by_path("S/Album/a.bin");
+        assert!(!index.has_rows_at_or_under("S/Album"));
+
+        // Retain-then-rebuild.
+        index.remove_files_by_path_prefix("S/Other");
+        assert!(!index.has_rows_at_or_under("S"));
+        assert!(index.dir_counts.is_empty());
+        index.add_files(vec![file("S/New/d.bin", &h(5), true, "normal")]);
+        index.rebuild();
+        assert!(index.has_rows_at_or_under("S/New"));
+        assert_eq!(index.dir_counts, recount(&index));
     }
 
     /// `add_files` patches the four lookup maps as it goes instead of clearing

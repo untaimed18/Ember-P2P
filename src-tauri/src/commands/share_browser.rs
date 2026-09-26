@@ -1271,27 +1271,10 @@ fn remember_once(list: &mut Vec<String>, path: String) {
     }
 }
 
-/// `path` is `dir` or lies inside it, compared component by component so a
-/// drive root contains what is on it. [`crate::security::path_matches_dir`]
-/// deliberately never treats a bare drive as a directory, which let a selected
-/// drive and something on it be planned as two separate shares.
+/// See [`crate::security::path_within_dir`]: planning a selected drive and
+/// something on it as two separate shares is what the drive-aware form stops.
 fn path_within(path: &str, dir: &str) -> bool {
-    let parts = |value: &str| -> Vec<String> {
-        Path::new(&display_fs_path(Path::new(value)))
-            .components()
-            .filter(|component| !matches!(component, Component::CurDir))
-            .map(|component| {
-                let part = component.as_os_str().to_string_lossy();
-                if cfg!(windows) {
-                    part.to_lowercase()
-                } else {
-                    part.into_owned()
-                }
-            })
-            .collect()
-    };
-    let dir = parts(dir);
-    !dir.is_empty() && parts(path).starts_with(&dir)
+    crate::security::path_within_dir(path, dir)
 }
 
 /// `root` is already shared, or overlaps a share, so adding it either changes

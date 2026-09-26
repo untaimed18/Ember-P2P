@@ -125,6 +125,16 @@ export async function getSharedFiles(): Promise<FileInfo[]> {
   return invoke('get_shared_files');
 }
 
+/** `files` is `null` when the library still matches `etag`. */
+export interface SharedFilesSnapshot {
+  etag: string;
+  files: FileInfo[] | null;
+}
+
+export async function getSharedFilesIfChanged(etag: string | null): Promise<SharedFilesSnapshot> {
+  return invoke('get_shared_files_if_changed', { etag });
+}
+
 /**
  * Count and total size of files the user is actively sharing (the `shared`
  * flag is set), not the total number of files in the library. Lightweight

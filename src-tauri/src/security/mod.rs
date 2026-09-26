@@ -778,6 +778,61 @@ pub fn path_matches_dir(path: &str, dir: &str) -> bool {
         || normalized_path.starts_with(&(normalized_dir.clone() + "/"))
 }
 
+/// `path` is `dir` or lies inside it, compared component by component so a
+/// drive root contains what is on it.
+///
+/// For callers whose `dir` is a folder the user deliberately shared — a whole
+/// drive included — taken from the stored shared list or approved roots, and
+/// need to know what falls under it. [`path_matches_dir`] refuses a bare drive
+/// on purpose, as a guard against a request naming a root; using it there made
+/// every containment test against a shared drive answer "no". A `dir` that
+/// arrives in a request must be matched against the stored list first, or
+/// stay on `path_matches_dir`.
+///
+/// `..` is resolved lexically and `\` is a separator on every platform, as in
+/// [`path_matches_dir`], so `path` may itself be request input:
+/// `D:\Share\..\Other` is not inside `D:\Share`.
+pub fn path_within_dir(path: &str, dir: &str) -> bool {
+    let parts = |value: &str| -> Vec<String> {
+        let value = match value.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => value.strip_prefix(r"\\?\").unwrap_or(value).to_string(),
+        };
+        let value = if cfg!(windows) {
+            value
+        } else {
+            value.replace('\\', "/")
+        };
+        let mut out: Vec<String> = Vec::new();
+        // Prefix and root components, which `..` never climbs past.
+        let mut anchor = 0;
+        for component in Path::new(&value).components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if out.len() > anchor {
+                        out.pop();
+                    }
+                }
+                other => {
+                    let part = other.as_os_str().to_string_lossy();
+                    out.push(if cfg!(windows) {
+                        part.to_lowercase()
+                    } else {
+                        part.into_owned()
+                    });
+                    if !matches!(other, Component::Normal(_)) {
+                        anchor = out.len();
+                    }
+                }
+            }
+        }
+        out
+    };
+    let dir = parts(dir);
+    !dir.is_empty() && parts(path).starts_with(&dir)
+}
+
 /// `true` when the normalized path is a single segment ending in `:`
 /// (e.g. `"c:"`), i.e. a Windows drive root with no path components.
 fn is_bare_drive_letter(normalized: &str) -> bool {
@@ -1677,6 +1732,40 @@ pub fn sanitize_chat_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_within_dir_treats_a_drive_root_as_a_directory() {
+        #[cfg(windows)]
+        {
+            assert!(path_within_dir(r"D:\Music\a.mp3", r"\\?\D:\"));
+            assert!(path_within_dir(r"\\?\D:\Music", r"d:\"));
+            assert!(path_within_dir(r"D:\", r"D:\"));
+            assert!(!path_within_dir(r"E:\Music\a.mp3", r"D:\"));
+            assert!(!path_within_dir(r"D:\", r"D:\Music"));
+            assert!(path_within_dir(r"\\?\UNC\nas\share\x.mkv", r"\\NAS\share"));
+            // The drive root is exactly what `path_matches_dir` refuses.
+            assert!(!path_matches_dir(r"D:\Music\a.mp3", r"\\?\D:\"));
+        }
+        assert!(path_within_dir("/mnt/data/music/a.mp3", "/mnt/data"));
+        assert!(!path_within_dir("/mnt/database/a.mp3", "/mnt/data"));
+        assert!(!path_within_dir("/mnt/data/a.mp3", ""));
+    }
+
+    /// `path` can be request input, so climbing out of the shared folder with
+    /// `..` must not count as being inside it — the same answer
+    /// `path_matches_dir` gives.
+    #[test]
+    fn path_within_dir_resolves_parent_components() {
+        assert!(!path_within_dir("/mnt/data/share/../other/a.mp3", "/mnt/data/share"));
+        assert!(path_within_dir("/mnt/data/share/x/../a.mp3", "/mnt/data/share"));
+        assert!(!path_within_dir("/../../etc/passwd", "/mnt/data"));
+        assert!(path_within_dir(r"C:\share\a.mp3", "C:/share"));
+        #[cfg(windows)]
+        {
+            assert!(!path_within_dir(r"D:\Share\..\Other\x.mkv", r"\\?\D:\Share"));
+            assert!(path_within_dir(r"D:\..\..\x.mkv", r"D:\"), "`..` stops at the drive root");
+        }
+    }
 
     #[test]
     fn test_sanitize_filename() {

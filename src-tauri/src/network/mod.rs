@@ -142,6 +142,7 @@ use self::kad_io::*;
 use self::kad_search::*;
 use self::nat_mapping::*;
 use self::persistence::*;
+pub(crate) use self::persistence::write_ipfilter_dat_superseding;
 use self::publishing::*;
 use self::search::*;
 use self::server::*;
@@ -1430,14 +1431,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 seen_ip,
             ) in records
             {
-                // `get_or_create` bumps `last_seen` to "now" — the right
-                // behaviour for live mutations but wrong on a startup
-                // load. The explicit `record.last_seen = last_seen`
-                // overwrite below restores the persisted timestamp
-                // before the cleanup below so the 90-day prune sees the
-                // real ages. Don't reorder these lines without also
-                // splitting the helper.
-                let record = cm.get_or_create(hash);
+                // Built here and adopted by `insert_loaded_credit` rather
+                // than via `get_or_create`, which would bump `last_seen` to
+                // "now" and index it there, so cap eviction and the 90-day
+                // prune would both misjudge the record's real age.
+                let mut record = ed2k::credits::CreditRecord::new(hash);
                 record.uploaded = uploaded;
                 record.downloaded = downloaded;
                 record.last_seen = last_seen;
@@ -1458,17 +1456,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 record.peer_name = peer_name;
                 record.client_software = client_software;
                 record.seen_ip = seen_ip;
+                cm.insert_loaded_credit(record);
             }
             info!(
                 "Loaded {} credit records from database",
                 cm.all_records().len()
             );
         }
-        // Ember credit records live in a separate v15 table. Same
-        // "bump-last-seen in helper, overwrite after load" dance as
-        // the eMule table above: the `get_or_create_ember` accessor
-        // sets `last_seen = now`, which we then overwrite with the
-        // persisted value so the 90-day prune honours real ages.
+        // Ember credit records live in a separate v15 table, loaded the
+        // same way as the eMule table above.
         if let Ok(records) = db.load_ember_credits() {
             let loaded_count = records.len();
             for (
@@ -1484,7 +1480,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 verified,
             ) in records
             {
-                let record = cm.get_or_create_ember(pk);
+                let mut record = ed2k::credits::EmberCreditRecord::new(pk);
                 record.uploaded = up;
                 record.downloaded = down;
                 record.last_upload_time = last_up;
@@ -1494,6 +1490,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 record.avg_upload_speed = avg_speed;
                 record.last_seen = last_seen;
                 record.ident_verified = verified;
+                cm.insert_loaded_ember_credit(record);
             }
             if loaded_count > 0 {
                 info!("Loaded {loaded_count} Ember credit records from database");

@@ -51,6 +51,11 @@ pub(crate) const ATTACH_EVENT: &str = "ember:attach-update";
 /// for the user rather than refusing it, and an explicit accept is told to wait.
 const MAX_ACTIVE_FETCHES: usize = 4;
 
+/// Of those, how many may be from one friend. A sender that accepts streams
+/// and never answers holds each slot for a full status wait, so without this
+/// one friend could hold every receive the user has.
+const MAX_ACTIVE_FETCHES_PER_FRIEND: usize = 2;
+
 /// Offers from one friend waiting on an answer at once. A friend who keeps
 /// offering without the user answering gets "busy" rather than a growing list.
 const MAX_PENDING_PER_FRIEND: usize = 8;
@@ -353,6 +358,35 @@ fn running_fetches(state: &mut NetworkState) -> usize {
     state.attach_fetches.len()
 }
 
+/// Whether another receive may start from `friend`. The running set is keyed
+/// by transfer, so the friend behind each comes from its row — at most
+/// [`MAX_ACTIVE_FETCHES`] point reads, on an accept.
+fn fetch_slot_free(state: &mut NetworkState, db: &Database, friend: &[u8; 16]) -> bool {
+    let total = running_fetches(state);
+    let friend_hex = hex::encode(friend);
+    let theirs = state
+        .attach_fetches
+        .keys()
+        .filter(|id| {
+            db.chat_attachment(&hex::encode(id))
+                .is_some_and(|row| row.friend_hash.eq_ignore_ascii_case(&friend_hex))
+        })
+        .count();
+    fetch_slots_allow(total, theirs)
+}
+
+/// How long the next stream of a fetch waits for the sender's status byte,
+/// given how long the fetch's earlier streams actually waited for theirs.
+fn next_status_wait(waited: Duration) -> Duration {
+    attach_stream::ATTACH_STATUS_TIMEOUT
+        .saturating_sub(waited)
+        .max(attach_stream::ATTACH_RETRY_STATUS_TIMEOUT)
+}
+
+fn fetch_slots_allow(total: usize, from_friend: usize) -> bool {
+    total < MAX_ACTIVE_FETCHES && from_friend < MAX_ACTIVE_FETCHES_PER_FRIEND
+}
+
 fn unavailable() -> String {
     coded(
         "peers_attach_unavailable",
@@ -478,6 +512,13 @@ pub(super) async fn on_reply(
         }
         if row.status == "offered" {
             let _ = db.set_chat_attachment_status(&xfer_hex, "accepted", None, None);
+            // Their dial follows the accept at once, and its first stream
+            // waits on this tree before it hears a byte.
+            if let Some((path, _, _)) = db.chat_attachment_grant(&xfer_hex, &row.friend_hash, now) {
+                tokio::task::spawn_blocking(move || {
+                    attach_stream::prewarm_attachment_hash(std::path::Path::new(&path));
+                });
+            }
         }
         emit_by_id(app, db, &xfer_hex);
         if let (Some(port), Some(endpoint), Some(addr)) = (quic_port, quic_endpoint(state), peer_addr) {
@@ -763,7 +804,7 @@ async fn try_auto_accept(
         .chat_attachment_auto_accept_mb
         .min(crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
         .saturating_mul(1024 * 1024);
-    if ceiling == 0 || size > ceiling || running_fetches(state) >= MAX_ACTIVE_FETCHES {
+    if ceiling == 0 || size > ceiling || !fetch_slot_free(state, db, &friend) {
         return false;
     }
     // Bound the map itself: an entry per friend who ever auto-sent, dropped
@@ -867,7 +908,10 @@ async fn accept_offer(
     settings: &AppSettings,
     xfer_id: [u8; 16],
 ) -> Result<(), String> {
-    if running_fetches(state) >= MAX_ACTIVE_FETCHES {
+    let Some(friend) = state.attach_inbound.get(&xfer_id).map(|inbound| inbound.friend) else {
+        return Err(not_found());
+    };
+    if !fetch_slot_free(state, db, &friend) {
         return Err(coded(
             "peers_attach_busy",
             "Too many files are already downloading. Try again when one finishes.",
@@ -1102,6 +1146,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
 
     let mut last = ReceiveFailure::Unreachable("no attempt was made".into());
     let mut connected = false;
+    let mut status_waited = Duration::ZERO;
     for attempt in 0..FETCH_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
@@ -1151,7 +1196,8 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             .try_clone()
             .map_err(|e| ReceiveFailure::Disk(e.to_string()))?;
         let mut last_emit: Option<Instant> = None;
-        let fetched = attach_stream::fetch_attachment(
+        let status_wait = next_status_wait(status_waited);
+        let fetched = attach_stream::fetch_attachment_waiting(
             &mut recv,
             &mut send,
             &ctx.xfer_id,
@@ -1165,6 +1211,8 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
                     emit_progress(&ctx.app, &ctx.db, &ctx.row, done);
                 }
             },
+            status_wait,
+            &mut status_waited,
         )
         .await;
         let _ = send.finish();
@@ -1389,6 +1437,34 @@ mod tests {
     /// A receive that never connected says so on both ends; one that connected
     /// and then lost the sender is an ordinary failure, because the direct path
     /// did exist.
+    /// One friend may not hold every receive slot, however many they offer.
+    #[test]
+    fn one_friend_cannot_take_every_attach_receive_slot() {
+        assert!(fetch_slots_allow(0, 0));
+        assert!(fetch_slots_allow(MAX_ACTIVE_FETCHES_PER_FRIEND, MAX_ACTIVE_FETCHES_PER_FRIEND - 1));
+        assert!(!fetch_slots_allow(MAX_ACTIVE_FETCHES_PER_FRIEND, MAX_ACTIVE_FETCHES_PER_FRIEND));
+        assert!(!fetch_slots_allow(MAX_ACTIVE_FETCHES, 0), "the total still binds");
+        const _: () = assert!(MAX_ACTIVE_FETCHES_PER_FRIEND < MAX_ACTIVE_FETCHES);
+    }
+
+    /// A stream that dropped before the sender answered leaves the next one
+    /// the rest of the long wait, not the retry floor: a large file on a slow
+    /// sender is still hashing. One that waited it out leaves only the floor.
+    #[test]
+    fn only_time_spent_waiting_for_the_sender_uses_up_the_status_wait() {
+        use attach_stream::{ATTACH_RETRY_STATUS_TIMEOUT, ATTACH_STATUS_TIMEOUT};
+        assert_eq!(next_status_wait(Duration::ZERO), ATTACH_STATUS_TIMEOUT);
+        assert_eq!(
+            next_status_wait(Duration::from_secs(5)),
+            ATTACH_STATUS_TIMEOUT - Duration::from_secs(5)
+        );
+        assert_eq!(next_status_wait(ATTACH_STATUS_TIMEOUT), ATTACH_RETRY_STATUS_TIMEOUT);
+        assert_eq!(
+            next_status_wait(ATTACH_STATUS_TIMEOUT * 2),
+            ATTACH_RETRY_STATUS_TIMEOUT
+        );
+    }
+
     #[test]
     fn a_receive_that_never_connected_is_unreachable_not_failed() {
         assert_eq!(

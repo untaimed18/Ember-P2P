@@ -646,10 +646,10 @@ fn prune_removed_shared_folder_state(
     }
     let is_under_removed_root = |path: &str| {
         removed_folders.iter().any(|root| {
-            crate::security::path_matches_dir(path, root)
+            crate::security::path_within_dir(path, root)
                 && !active_folders
                     .iter()
-                    .any(|active| crate::security::path_matches_dir(path, active))
+                    .any(|active| crate::security::path_within_dir(path, active))
         })
     };
 
@@ -2000,8 +2000,10 @@ pub async fn download_ipfilter(
     {
         let filter_path_w = filter_path.clone();
         let write_bytes = extracted.clone();
+        // Gated so a manual range edit still queued on the network task can't
+        // land the old list over this one.
         tokio::task::spawn_blocking(move || {
-            crate::security::atomic_write(&filter_path_w, &write_bytes, false)
+            crate::network::write_ipfilter_dat_superseding(&filter_path_w, &write_bytes)
         })
         .await
         .map_err(|e| coded_ctx("settings_save_task_failed", "Save task failed", e))?
@@ -2838,6 +2840,34 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removing one root must not prune state that belongs to a whole-drive
+    /// share still in the list, and removing the drive share prunes its own.
+    #[cfg(windows)]
+    #[test]
+    fn pruning_a_removed_root_respects_a_shared_drive_root() {
+        let drive = r"\\?\D:\".to_string();
+        let other = r"\\?\E:\Music".to_string();
+        let on_drive = crate::search::index::normalize_path_key(r"D:\Films\a.mkv");
+        let on_other = crate::search::index::normalize_path_key(r"E:\Music\b.mp3");
+        let mut settings = AppSettings::default();
+        settings.pending_share_states.insert(on_drive.clone(), false);
+        settings.pending_share_states.insert(on_other.clone(), false);
+
+        prune_removed_shared_folder_state(
+            &mut settings,
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&drive),
+        );
+        assert!(settings.pending_share_states.contains_key(&on_drive));
+        assert!(!settings.pending_share_states.contains_key(&on_other));
+
+        prune_removed_shared_folder_state(&mut settings, std::slice::from_ref(&drive), &[]);
+        assert!(
+            settings.pending_share_states.is_empty(),
+            "unsharing the drive clears what was kept under it"
+        );
+    }
 
     /// A link in a room is written by whoever is in the room. `opener::open`
     /// hands whatever it is given to the shell, so the scheme check is the

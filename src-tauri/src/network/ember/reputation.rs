@@ -40,6 +40,25 @@ const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
 const MAX_TRACKED_PEERS: usize = 10_000;
 const MAX_TRACKED_IPS: usize = 10_000;
 
+/// What an eviction pass trims a full table down to. Well under the cap so the
+/// pass — a walk of the whole table, on the network task — runs once per
+/// thousand new entries rather than on every one once the table has filled.
+const PEERS_EVICT_TARGET: usize = MAX_TRACKED_PEERS * 9 / 10;
+const IPS_EVICT_TARGET: usize = MAX_TRACKED_IPS * 9 / 10;
+
+/// Move the `count` smallest entries by `key` to the front, in no particular
+/// order, and return them. Linear rather than a full sort.
+fn smallest_by_key<T, K: Ord>(mut items: Vec<T>, count: usize, key: impl Fn(&T) -> K) -> Vec<T> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if count < items.len() {
+        items.select_nth_unstable_by_key(count - 1, key);
+        items.truncate(count);
+    }
+    items
+}
+
 /// Represents a tracked event type for reputation scoring.
 ///
 /// Every variant here is scored against a peer identified by its **eD2K user
@@ -643,8 +662,9 @@ impl ReputationManager {
         if self.ips.len() <= MAX_TRACKED_IPS {
             return;
         }
+        let to_remove = self.ips.len() - IPS_EVICT_TARGET;
         let now = now_secs();
-        let mut entries: Vec<([u8; 4], bool, i32, u64)> = self
+        let entries: Vec<([u8; 4], bool, i32, u64)> = self
             .ips
             .iter()
             .map(|(ip, record)| {
@@ -659,20 +679,20 @@ impl ReputationManager {
         // Preserve active bans; otherwise evict least-informative, stalest
         // rows first. See `evict_stale` for why "least informative" is
         // distance from `DEFAULT_REPUTATION` with negatives kept longest.
-        entries.sort_by_key(|(_, banned, score, last)| {
-            (*banned, *score < 0, score.unsigned_abs(), *last)
+        let victims = smallest_by_key(entries, to_remove, |(ip, banned, score, last)| {
+            (*banned, *score < 0, score.unsigned_abs(), *last, *ip)
         });
-        for (ip, _, _, _) in entries.into_iter().take(self.ips.len() - MAX_TRACKED_IPS) {
+        for (ip, _, _, _) in victims {
             self.ips.remove(&ip);
         }
     }
 
-    /// Remove the oldest, lowest-scoring peers to stay under the limit.
+    /// Remove the oldest, lowest-scoring peers, down to [`PEERS_EVICT_TARGET`].
     fn evict_stale(&mut self) {
         if self.peers.len() <= MAX_TRACKED_PEERS {
             return;
         }
-        let to_remove = self.peers.len() - MAX_TRACKED_PEERS;
+        let to_remove = self.peers.len() - PEERS_EVICT_TARGET;
         let now = now_secs();
 
         // A banned peer's score sits at or below `BAN_THRESHOLD` by
@@ -703,24 +723,17 @@ impl ReputationManager {
         // earned +900), and negative scores last (least negative first), so
         // the rows closest to a ban are the very last to be forgotten. Oldest
         // interaction breaks ties.
-        non_banned.sort_by_key(|(_, score, last)| (*score < 0, score.unsigned_abs(), *last));
-
-        let mut removed = 0usize;
-        for (id, _, _) in non_banned.iter() {
-            if removed >= to_remove {
-                break;
-            }
-            self.peers.remove(id);
-            removed += 1;
+        let non_banned = smallest_by_key(non_banned, to_remove, |(id, score, last)| {
+            (*score < 0, score.unsigned_abs(), *last, *id)
+        });
+        let removed = non_banned.len();
+        for (id, _, _) in non_banned {
+            self.peers.remove(&id);
         }
         if removed < to_remove {
-            banned.sort_by_key(|a| a.1);
-            for (id, _) in banned.iter() {
-                if removed >= to_remove {
-                    break;
-                }
-                self.peers.remove(id);
-                removed += 1;
+            let banned = smallest_by_key(banned, to_remove - removed, |(id, until)| (*until, *id));
+            for (id, _) in banned {
+                self.peers.remove(&id);
             }
         }
     }
@@ -876,7 +889,7 @@ mod tests {
 
         mgr.evict_stale();
 
-        assert_eq!(mgr.peers.len(), MAX_TRACKED_PEERS);
+        assert_eq!(mgr.peers.len(), PEERS_EVICT_TARGET);
         assert!(
             mgr.peers.contains_key(&nearly_banned),
             "a record one point from a ban must outlive neutral filler"
@@ -957,6 +970,47 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
         ))
+    }
+
+    /// Eviction trims well below the cap, so a full table pays for one pass
+    /// per batch of newcomers rather than one per newcomer.
+    #[test]
+    fn a_full_table_is_trimmed_in_batches() {
+        let mut mgr = ReputationManager::new();
+        let id = |i: usize| {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            id
+        };
+        for i in 0..=MAX_TRACKED_PEERS {
+            mgr.record_event(&id(i), ReputationEvent::SuccessfulChunk);
+        }
+        assert_eq!(mgr.tracked_count(), PEERS_EVICT_TARGET);
+        let headroom = MAX_TRACKED_PEERS - PEERS_EVICT_TARGET;
+        for i in 0..headroom {
+            mgr.record_event(&id(MAX_TRACKED_PEERS + 1 + i), ReputationEvent::SuccessfulChunk);
+        }
+        assert_eq!(
+            mgr.tracked_count(),
+            MAX_TRACKED_PEERS,
+            "nothing is evicted again until the cap is passed"
+        );
+
+        let ip = |i: usize| std::net::Ipv4Addr::from((i as u32).wrapping_add(0x0A00_0000));
+        for i in 0..=MAX_TRACKED_IPS {
+            mgr.record_event_with_ip(&id(0), ip(i), ReputationEvent::SuccessfulChunk);
+        }
+        assert_eq!(mgr.ips.len(), IPS_EVICT_TARGET);
+    }
+
+    #[test]
+    fn smallest_by_key_returns_exactly_the_smallest() {
+        let picked = smallest_by_key(vec![5, 1, 9, 3, 7], 2, |v| *v);
+        let mut picked = picked;
+        picked.sort();
+        assert_eq!(picked, vec![1, 3]);
+        assert!(smallest_by_key(vec![1, 2], 0, |v| *v).is_empty());
+        assert_eq!(smallest_by_key(vec![2, 1], 5, |v| *v).len(), 2);
     }
 
     #[test]

@@ -24,7 +24,7 @@
     EmberDhtSearchEntry,
     EmberDhtStoreEntry,
   } from '$lib/types';
-  import { copyToClipboard, formatDurationSecs } from '$lib/utils';
+  import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { checkForUpdates, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
@@ -317,7 +317,7 @@
   // as unknown until the backend has enough answered contacts to make one.
   let estimatedNodes = $derived(
     (diag?.ember_dht_estimated_nodes ?? 0) > 0
-      ? `~${(diag?.ember_dht_estimated_nodes ?? 0).toLocaleString()}`
+      ? `~${formatNumber(diag?.ember_dht_estimated_nodes ?? 0)}`
       : '\u2014',
   );
   // Zero means nothing has ever arrived, which reads as unknown rather than as

@@ -6,7 +6,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
-  import { formatBytes, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatNumber, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
@@ -101,7 +101,7 @@
     const size = formatBytes(bytes);
     return count === 1
       ? m.statusbar_shared_title_one({ size })
-      : m.statusbar_shared_title_other({ count: count.toLocaleString(), size });
+      : m.statusbar_shared_title_other({ count: formatNumber(count), size });
   }
 
   onMount(() => {
@@ -288,7 +288,7 @@
       onclick={() => openPage('/library')}
     >
       <span class="shared-label">{m.statusbar_shared_label()}</span>
-      <span class="shared-count">{sharedCount.toLocaleString()}</span>
+      <span class="shared-count">{formatNumber(sharedCount)}</span>
       <span class="shared-size">({formatBytes(sharedBytes)})</span>
     </button>
   </div>

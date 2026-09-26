@@ -104,7 +104,9 @@
       value = 0;
     } else {
       displayValue = raw;
-      value = Math.round(num * multipliers[unit]);
+      // 0 means Unlimited, so a positive rate that rounds to 0 B/s must not
+      // silently remove the cap.
+      value = Math.max(1, Math.round(num * multipliers[unit]));
     }
     lastSyncedValue = value;
   }

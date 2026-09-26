@@ -293,6 +293,12 @@ pub struct TransferManager {
     controls: HashMap<String, Arc<TransferControl>>,
     /// Per-transfer source details (eMule-style per-source tracking)
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
+    /// Bumped by every structural change to `queue` made here. Nothing
+    /// outside this file reorders the queue; code that starts to must call
+    /// [`Self::queue_changed`] too.
+    queue_generation: u64,
+    queue_index: std::sync::Mutex<QueueIndex>,
+    revisions: std::sync::Mutex<TransferRevisions>,
 }
 
 /// Declares the closed set of health explanations a download row can show,
@@ -388,6 +394,227 @@ pub struct BatchResume {
     pub statuses: Vec<(String, TransferStatus)>,
 }
 
+/// Removals remembered for [`TransferManager::get_transfers_since`]. A caller
+/// further behind than this gets a full snapshot instead of a delta.
+const MAX_REVISION_TOMBSTONES: usize = 4096;
+
+const FINGERPRINT_SEED: u64 = 0x243F_6A88_85A3_08D3;
+
+#[inline]
+fn mix_word(h: u64, w: u64) -> u64 {
+    (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+}
+
+/// Each step is a bijection in the running state and in the input word, so
+/// two equal-length inputs that differ in a single 8-byte word always hash
+/// differently.
+fn mix_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    h = mix_word(h, bytes.len() as u64);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        h = mix_word(h, u64::from_le_bytes(word));
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = mix_word(h, u64::from_le_bytes(word));
+    }
+    h
+}
+
+/// Fingerprint of `value`'s JSON form — the bytes the UI would receive — so a
+/// row reads as changed exactly when its payload would. `buf` is scratch
+/// space reused across calls.
+pub fn serde_fingerprint<T: serde::Serialize + ?Sized>(buf: &mut Vec<u8>, value: &T) -> u64 {
+    buf.clear();
+    let _ = serde_json::to_writer(&mut *buf, value);
+    mix_bytes(FINGERPRINT_SEED, buf)
+}
+
+/// [`serde_fingerprint`] of a whole list, one row at a time so the scratch
+/// buffer only ever holds a single row.
+pub fn serde_fingerprint_rows<'a, T, I>(rows: I) -> u64
+where
+    T: serde::Serialize + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    let mut buf = Vec::new();
+    let mut h = FINGERPRINT_SEED;
+    let mut count = 0u64;
+    for row in rows {
+        h = mix_word(h, serde_fingerprint(&mut buf, row));
+        count += 1;
+    }
+    mix_word(h, count)
+}
+
+/// Rows changed since a caller's last [`TransferManager::get_transfers_since`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransferDelta {
+    /// Identifies this tracker; a caller holding another epoch's revision
+    /// (the backend restarted under it) is answered with a full snapshot.
+    pub epoch: u64,
+    pub revision: u64,
+    /// `transfers` is every row and `removed` is empty; the caller replaces
+    /// its copy instead of merging.
+    pub full: bool,
+    pub transfers: Vec<Transfer>,
+    pub removed: Vec<String>,
+}
+
+struct RowRevision {
+    fingerprint: u64,
+    revision: u64,
+    pass: u64,
+}
+
+/// Change detection by fingerprint rather than by instrumenting writers: the
+/// row collections are public and mutated in place from the network task, so
+/// no set of setters could see every change.
+struct TransferRevisions {
+    epoch: u64,
+    revision: u64,
+    pass: u64,
+    rows: HashMap<String, RowRevision>,
+    tombstones: VecDeque<(u64, String)>,
+    /// Revision of the newest tombstone dropped for space; a delta from any
+    /// earlier revision would miss that removal.
+    floor: u64,
+    buf: Vec<u8>,
+}
+
+impl TransferRevisions {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Kept under 2^53 so the UI can hold it in a JS number exactly.
+        let epoch = (nanos ^ (u64::from(std::process::id()) << 32)) & ((1u64 << 53) - 1);
+        Self {
+            epoch: epoch.max(1),
+            revision: 0,
+            pass: 0,
+            rows: HashMap::new(),
+            tombstones: VecDeque::new(),
+            floor: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Fingerprint every row, stamp the changed ones with a new revision, and
+    /// return the rows whose revision is newer than `since` (all of them when
+    /// `since` is `None`).
+    fn sync<'a>(
+        &mut self,
+        rows: impl Iterator<Item = (&'a Transfer, bool)>,
+        since: Option<u64>,
+    ) -> Vec<(&'a Transfer, bool)> {
+        self.pass = self.pass.wrapping_add(1);
+        let pass = self.pass;
+        let next = self.revision + 1;
+        let mut bumped = false;
+        let mut out = Vec::new();
+        for (transfer, preview_ready) in rows {
+            let fingerprint = mix_word(
+                serde_fingerprint(&mut self.buf, transfer),
+                u64::from(preview_ready),
+            );
+            let revision = match self.rows.get_mut(transfer.id.as_str()) {
+                Some(entry) if entry.pass == pass => {
+                    // A duplicate id: `get_all` reports both copies, so the
+                    // snapshot does too, but only the first is tracked.
+                    if since.is_none() {
+                        out.push((transfer, preview_ready));
+                    }
+                    continue;
+                }
+                Some(entry) => {
+                    entry.pass = pass;
+                    if entry.fingerprint != fingerprint {
+                        entry.fingerprint = fingerprint;
+                        entry.revision = next;
+                        bumped = true;
+                    }
+                    entry.revision
+                }
+                None => {
+                    self.rows.insert(
+                        transfer.id.clone(),
+                        RowRevision {
+                            fingerprint,
+                            revision: next,
+                            pass,
+                        },
+                    );
+                    bumped = true;
+                    next
+                }
+            };
+            if since.is_none_or(|since| revision > since) {
+                out.push((transfer, preview_ready));
+            }
+        }
+        let mut removed = Vec::new();
+        self.rows.retain(|id, entry| {
+            if entry.pass == pass {
+                true
+            } else {
+                removed.push(id.clone());
+                false
+            }
+        });
+        if !removed.is_empty() {
+            bumped = true;
+            for id in removed {
+                self.tombstones.push_back((next, id));
+            }
+            while self.tombstones.len() > MAX_REVISION_TOMBSTONES {
+                if let Some((revision, _)) = self.tombstones.pop_front() {
+                    self.floor = self.floor.max(revision);
+                }
+            }
+        }
+        if bumped {
+            self.revision = next;
+        }
+        out
+    }
+
+    fn removed_since(&self, since: u64) -> Vec<String> {
+        let start = self.tombstones.partition_point(|(revision, _)| *revision <= since);
+        self.tombstones
+            .iter()
+            .skip(start)
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+}
+
+/// `id -> position` for the queue, rebuilt whenever the queue's structure
+/// changed and double-checked on every hit.
+#[derive(Default)]
+struct QueueIndex {
+    generation: u64,
+    len: usize,
+    positions: HashMap<String, usize>,
+}
+
+impl QueueIndex {
+    fn rebuild(&mut self, queue: &VecDeque<Transfer>, generation: u64) {
+        self.positions.clear();
+        for (pos, transfer) in queue.iter().enumerate() {
+            // First occurrence wins, as `iter().find` would.
+            self.positions.entry(transfer.id.clone()).or_insert(pos);
+        }
+        self.generation = generation;
+        self.len = queue.len();
+    }
+}
+
 impl TransferManager {
     pub fn new(max_concurrent: u32) -> Self {
         Self {
@@ -398,7 +625,38 @@ impl TransferManager {
             speed_history: HashMap::new(),
             controls: HashMap::new(),
             source_details: HashMap::new(),
+            queue_generation: 0,
+            queue_index: std::sync::Mutex::new(QueueIndex::default()),
+            revisions: std::sync::Mutex::new(TransferRevisions::new()),
         }
+    }
+
+    pub fn queue_changed(&mut self) {
+        self.queue_generation = self.queue_generation.wrapping_add(1);
+    }
+
+    /// Position of `id` in the queue without scanning it, except to rebuild
+    /// the index after the queue changed shape.
+    fn queue_position(&self, id: &str) -> Option<usize> {
+        let mut index = self.queue_index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.generation != self.queue_generation || index.len != self.queue.len() {
+            index.rebuild(&self.queue, self.queue_generation);
+        }
+        let pos = *index.positions.get(id)?;
+        if self.queue.get(pos).is_some_and(|t| t.id == id) {
+            return Some(pos);
+        }
+        index.rebuild(&self.queue, self.queue_generation);
+        index.positions.get(id).copied()
+    }
+
+    fn queued(&self, id: &str) -> Option<&Transfer> {
+        self.queue_position(id).and_then(|pos| self.queue.get(pos))
+    }
+
+    fn queued_mut(&mut self, id: &str) -> Option<&mut Transfer> {
+        let pos = self.queue_position(id)?;
+        self.queue.get_mut(pos)
     }
 
     pub fn register_control(&mut self, id: &str, control: Arc<TransferControl>) {
@@ -408,7 +666,7 @@ impl TransferManager {
         let ord = self
             .active
             .get(id)
-            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .or_else(|| self.queued(id))
             .map(|t| Self::priority_ordinal(&t.priority));
         self.install_control(id, control, ord);
     }
@@ -425,13 +683,13 @@ impl TransferManager {
     }
 
     fn get_transfer_mut(&mut self, id: &str) -> Option<&mut Transfer> {
-        if let Some(transfer) = self.active.get_mut(id) {
-            Some(transfer)
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
-            Some(transfer)
-        } else {
-            self.completed.iter_mut().find(|t| t.id == id)
+        if self.active.contains_key(id) {
+            return self.active.get_mut(id);
         }
+        if let Some(pos) = self.queue_position(id) {
+            return self.queue.get_mut(pos);
+        }
+        self.completed.iter_mut().find(|t| t.id == id)
     }
 
     fn clear_runtime_health(transfer: &mut Transfer) {
@@ -625,7 +883,7 @@ impl TransferManager {
 
     pub fn enqueue(&mut self, mut transfer: Transfer) -> bool {
         let id = transfer.id.clone();
-        if self.active.contains_key(&id) || self.queue.iter().any(|t| t.id == id) {
+        if self.active.contains_key(&id) || self.queue_position(&id).is_some() {
             return false;
         }
         self.completed.retain(|t| t.id != id);
@@ -653,6 +911,7 @@ impl TransferManager {
                 transfer.status = Self::queued_wait_status(&transfer);
             }
             self.queue.push_back(transfer);
+            self.queue_changed();
             false
         }
     }
@@ -836,10 +1095,11 @@ impl TransferManager {
         let mut transfer = self.active.remove(id);
         if transfer.is_none() {
             transfer = self
-                .queue
-                .iter()
-                .position(|t| t.id == id)
+                .queue_position(id)
                 .and_then(|idx| self.queue.remove(idx));
+            if transfer.is_some() {
+                self.queue_changed();
+            }
         }
         if let Some(mut transfer) = transfer {
             transfer.status = TransferStatus::Completed;
@@ -895,8 +1155,10 @@ impl TransferManager {
                 // Stopped/queued rows live in `queue`; still move them into
                 // completed so Stop/cancel races don't leave a Failed queue
                 // entry without the normal Failed lifecycle.
-                let pos = self.queue.iter().position(|t| t.id == id)?;
-                self.queue.remove(pos).unwrap()
+                let pos = self.queue_position(id)?;
+                let transfer = self.queue.remove(pos).unwrap();
+                self.queue_changed();
+                transfer
             }
         };
         transfer.status = TransferStatus::Failed;
@@ -929,7 +1191,7 @@ impl TransferManager {
                 Self::clear_failure_context(transfer);
                 Self::clear_runtime_health(transfer);
             }
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.status = status;
             if matches!(
                 transfer.status,
@@ -1417,7 +1679,7 @@ impl TransferManager {
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             Self::mark_paused(transfer);
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             Self::mark_paused(transfer);
         }
         self.pause_control_and_sources(id);
@@ -1531,9 +1793,10 @@ impl TransferManager {
             self.speed_history.remove(id);
             self.source_details.remove(id);
             self.queue.push_front(transfer);
+            self.queue_changed();
             return self.promote_next();
         }
-        if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        if let Some(transfer) = self.queued_mut(id) {
             transfer.status = TransferStatus::Stopped;
             transfer.speed = 0;
             transfer.active_sources = 0;
@@ -1569,11 +1832,12 @@ impl TransferManager {
             }
             return Vec::new();
         }
-        if let Some(idx) = self.queue.iter().position(|t| t.id == id) {
+        if let Some(idx) = self.queue_position(id) {
             let Some(mut transfer) = self.queue.remove(idx) else {
                 tracing::error!("Queue index {idx} invalid after position() - skipping");
                 return Vec::new();
             };
+            self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             Self::clear_runtime_health(&mut transfer);
             if let Some(control) = self.controls.get(id) {
@@ -1597,6 +1861,7 @@ impl TransferManager {
             // ahead of. Only reachable with the concurrency cap full, and
             // invisible in the UI, so it read as the resume being ignored.
             self.queue.insert(idx, transfer);
+            self.queue_changed();
         }
         if let Some(control) = self.controls.get(id) {
             control.resume();
@@ -1688,6 +1953,7 @@ impl TransferManager {
                     self.queue.push_back(transfer);
                 }
             }
+            self.queue_changed();
         }
         outcome
     }
@@ -1698,6 +1964,7 @@ impl TransferManager {
         }
         self.active.remove(id);
         self.queue.retain(|t| t.id != id);
+        self.queue_changed();
         // Also drop any completed/failed copy so a Failed event that raced
         // ahead of cancel can't leave a sticky red "failed" row in memory
         // (and therefore in get_transfers) after the user cancelled.
@@ -1714,6 +1981,7 @@ impl TransferManager {
         }
         let was_active = self.active.remove(id).is_some();
         self.queue.retain(|t| t.id != id);
+        self.queue_changed();
         self.completed.retain(|t| t.id != id);
         self.controls.remove(id);
         self.speed_history.remove(id);
@@ -1728,7 +1996,7 @@ impl TransferManager {
     pub fn set_priority(&mut self, id: &str, priority: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.priority = priority.to_string();
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.priority = priority.to_string();
         }
         // Mirror onto the live control so an active download's connection-slot
@@ -1741,7 +2009,7 @@ impl TransferManager {
     pub fn set_category(&mut self, id: &str, category: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.category = category.to_string();
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.category = category.to_string();
         } else if let Some(transfer) = self.completed.iter_mut().find(|t| t.id == id) {
             transfer.category = category.to_string();
@@ -1768,7 +2036,7 @@ impl TransferManager {
     pub fn set_preview_priority(&mut self, id: &str, enabled: bool) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.preview_priority = enabled;
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.preview_priority = enabled;
         }
         if let Some(control) = self.controls.get(id) {
@@ -1935,11 +2203,67 @@ impl TransferManager {
         all
     }
 
+    /// Every row in `get_all` order, with the live preview flag `get_all`
+    /// overlays.
+    fn snapshot_rows(&self) -> impl Iterator<Item = (&Transfer, bool)> {
+        self.active
+            .values()
+            .chain(self.queue.iter())
+            .chain(self.completed.iter())
+            .map(|t| {
+                let preview_ready = self
+                    .controls
+                    .get(&t.id)
+                    .map_or(t.preview_ready, |c| c.is_preview_ready());
+                (t, preview_ready)
+            })
+    }
+
     pub fn get_transfer(&self, id: &str) -> Option<&Transfer> {
         self.active
             .get(id)
-            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .or_else(|| self.queued(id))
             .or_else(|| self.completed.iter().find(|t| t.id == id))
+    }
+
+    /// Rows changed since `since` of `epoch`, for a poller that keeps its own
+    /// copy. The first call, a stale epoch, or a caller further behind than
+    /// the removal history reaches all get the full snapshot.
+    pub fn get_transfers_since(&self, epoch: Option<u64>, since: u64) -> TransferDelta {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        let delta_possible = epoch == Some(revisions.epoch)
+            && since > 0
+            && since <= revisions.revision
+            && since >= revisions.floor;
+        let changed = revisions.sync(self.snapshot_rows(), delta_possible.then_some(since));
+        // Tombstones evicted during this very sync can raise the floor.
+        let full = !delta_possible || since < revisions.floor;
+        let changed = if full && delta_possible {
+            // Rare: walk again to collect every row. Nothing changed since the
+            // first walk, so the revision does not move.
+            revisions.sync(self.snapshot_rows(), None)
+        } else {
+            changed
+        };
+        let transfers = changed
+            .into_iter()
+            .map(|(t, preview_ready)| {
+                let mut row = t.clone();
+                row.preview_ready = preview_ready;
+                row
+            })
+            .collect();
+        TransferDelta {
+            epoch: revisions.epoch,
+            revision: revisions.revision,
+            full,
+            removed: if full {
+                Vec::new()
+            } else {
+                revisions.removed_since(since)
+            },
+            transfers,
+        }
     }
 
     /// Update the concurrent-download cap and promote any queued downloads
@@ -1973,6 +2297,7 @@ impl TransferManager {
                 tracing::error!("Queue index {idx} invalid during promotion - skipping");
                 break;
             };
+            self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             let t = transfer.clone();
             self.active.insert(transfer.id.clone(), transfer);
@@ -3093,5 +3418,140 @@ mod tests {
             "the row window ({SPEED_WINDOW_MS} ms) has drifted well ahead of \
              the total's ~{settle_ms:.0} ms settling time"
         );
+    }
+
+    fn delta_ids(delta: &TransferDelta) -> Vec<&str> {
+        let mut ids: Vec<&str> = delta.transfers.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn the_first_poll_is_a_full_snapshot_and_an_idle_one_is_empty() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.enqueue(sourced("b", 1));
+
+        let first = manager.get_transfers_since(None, 0);
+        assert!(first.full);
+        assert_eq!(delta_ids(&first), ["a", "b"]);
+        assert!(first.revision > 0);
+
+        let idle = manager.get_transfers_since(Some(first.epoch), first.revision);
+        assert!(!idle.full);
+        assert!(idle.transfers.is_empty() && idle.removed.is_empty());
+        assert_eq!(idle.revision, first.revision, "nothing changed, so no bump");
+    }
+
+    #[test]
+    fn a_delta_carries_only_changed_rows_and_removals() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.enqueue(sourced("b", 1));
+        manager.enqueue(sourced("c", 1));
+        let base = manager.get_transfers_since(None, 0);
+
+        // Written straight through the public field, the way the network task
+        // does — the tracker has to see it without a setter.
+        manager.queue.iter_mut().find(|t| t.id == "b").unwrap().sources = 9;
+        manager.cancel("c");
+
+        let delta = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert!(!delta.full);
+        assert_eq!(delta_ids(&delta), ["b"]);
+        assert_eq!(delta.removed, ["c"]);
+        assert_eq!(delta.revision, base.revision + 1);
+
+        // A caller that already has that revision is up to date; one still at
+        // the base gets the same answer again.
+        let caught_up = manager.get_transfers_since(Some(delta.epoch), delta.revision);
+        assert!(caught_up.transfers.is_empty() && caught_up.removed.is_empty());
+        let behind = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert_eq!(delta_ids(&behind), ["b"]);
+        assert_eq!(behind.removed, ["c"]);
+    }
+
+    #[test]
+    fn a_live_preview_flag_counts_as_a_change() {
+        let mut manager = TransferManager::new(1);
+        let mut row = sourced("a", 1);
+        row.status = TransferStatus::Active;
+        manager.enqueue(row);
+        let control = TransferControl::new();
+        manager.register_control("a", control.clone());
+        let base = manager.get_transfers_since(None, 0);
+        assert!(!base.transfers[0].preview_ready);
+
+        control.set_preview_ready(true);
+        let delta = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert_eq!(delta_ids(&delta), ["a"]);
+        assert!(delta.transfers[0].preview_ready);
+    }
+
+    #[test]
+    fn an_unknown_epoch_or_revision_gets_a_full_snapshot() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        let base = manager.get_transfers_since(None, 0);
+
+        let other_epoch = manager.get_transfers_since(Some(base.epoch ^ 1), base.revision);
+        assert!(other_epoch.full);
+        assert_eq!(delta_ids(&other_epoch), ["a"]);
+
+        let ahead = manager.get_transfers_since(Some(base.epoch), base.revision + 5);
+        assert!(ahead.full, "a revision this tracker never issued");
+    }
+
+    #[test]
+    fn a_caller_behind_the_removal_history_gets_a_full_snapshot() {
+        let mut manager = TransferManager::new(MAX_REVISION_TOMBSTONES as u32 + 8);
+        manager.enqueue(sourced("keep", 1));
+        let base = manager.get_transfers_since(None, 0);
+        for i in 0..=MAX_REVISION_TOMBSTONES {
+            let id = format!("gone-{i}");
+            manager.enqueue(sourced(&id, 1));
+            let _ = manager.get_transfers_since(Some(base.epoch), base.revision);
+            manager.cancel(&id);
+            let _ = manager.get_transfers_since(Some(base.epoch), base.revision);
+        }
+
+        let stale = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert!(stale.full, "removals it would need have been forgotten");
+        assert_eq!(delta_ids(&stale), ["keep"]);
+        assert!(stale.removed.is_empty());
+    }
+
+    #[test]
+    fn a_single_word_edit_always_changes_the_fingerprint() {
+        let mut buf = Vec::new();
+        let mut row = download("a");
+        let before = serde_fingerprint(&mut buf, &row);
+        row.speed = 1;
+        assert_ne!(serde_fingerprint(&mut buf, &row), before);
+        row.speed = 0;
+        assert_eq!(serde_fingerprint(&mut buf, &row), before);
+    }
+
+    #[test]
+    fn queue_lookups_follow_reordering() {
+        let mut manager = TransferManager::new(1);
+        let mut running = sourced("run", 1);
+        running.status = TransferStatus::Active;
+        manager.enqueue(running);
+        for id in ["q1", "q2", "q3"] {
+            manager.enqueue(sourced(id, 1));
+        }
+        assert_eq!(manager.get_transfer("q2").unwrap().id, "q2");
+
+        manager.cancel("q1");
+        assert_eq!(manager.get_transfer("q3").unwrap().id, "q3");
+        manager.stop("run");
+        assert_eq!(manager.get_transfer("run").unwrap().status, TransferStatus::Stopped);
+        manager.set_priority("q3", "high");
+        assert_eq!(manager.get_transfer("q3").unwrap().priority, "high");
+        assert!(manager.get_transfer("q1").is_none());
+        let queued = manager.queue.len();
+        manager.enqueue(sourced("q3", 1));
+        assert_eq!(manager.queue.len(), queued, "still queued, so not enqueued twice");
     }
 }

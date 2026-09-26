@@ -5,6 +5,7 @@
 
 use super::*;
 
+#[cfg(test)]
 pub(super) async fn take_fresh_part_hashes(
     fresh_part_hashes: &Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     file_hash: &[u8; 16],
