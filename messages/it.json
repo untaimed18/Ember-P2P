@@ -290,7 +290,7 @@
   "chat_attach_busy": "{name} è occupato. Riprova tra un attimo.",
   "chat_attach_not_allowed": "{name} non accetta file",
   "chat_attach_cancelled": "Annullato",
-  "chat_attach_unreachable": "Nessuna connessione diretta con {name}. I file non possono passare attraverso un relay.",
+  "chat_attach_unreachable": "Nessuna connessione diretta con {name} per il file, né via UDP né via TCP. La porta di chi invia deve essere raggiungibile; i file non passano attraverso i relay.",
   "chat_attach_source_gone_sent": "Il file è stato modificato o spostato prima di poter essere inviato",
   "chat_attach_source_gone_received": "Il file di {name} è stato modificato o spostato prima di arrivare",
   "chat_attach_failed": "Trasferimento non riuscito",

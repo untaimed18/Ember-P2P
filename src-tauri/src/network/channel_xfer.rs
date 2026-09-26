@@ -212,9 +212,24 @@ pub(super) async fn offer_xfer_stream(
         &peer,
         &xfer_id,
         ember::channel::XferStreamRole::Serve,
-        port,
+        ember::channel::XferStreamPorts {
+            quic: port,
+            tcp: tcp_port_for(state, peer_addr),
+        },
     );
     send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+}
+
+/// Our upload listener's port as a member at `peer` reaches it: the local one
+/// across a LAN, the advertised one otherwise. It is the fallback for a member
+/// whose QUIC dial cannot get through — often the only port a setup forwards.
+fn tcp_port_for(state: &NetworkState, peer: SocketAddr) -> Option<u16> {
+    let port = if chat_attach::reached_directly(peer.ip()) {
+        state.tcp_port
+    } else {
+        advertised_tcp_port(state)
+    };
+    (port != 0).then_some(port)
 }
 
 /// A stream frame from the other end of a transfer.
@@ -223,7 +238,7 @@ pub(super) fn apply_xfer_stream(
     xfer_id: [u8; 16],
     sender: [u8; 32],
     role: ember::channel::XferStreamRole,
-    port: u16,
+    ports: ember::channel::XferStreamPorts,
 ) {
     match role {
         ember::channel::XferStreamRole::Serve => {
@@ -241,7 +256,7 @@ pub(super) fn apply_xfer_stream(
             }
             state
                 .xfer_stream_ports
-                .insert(xfer_id, (sender, port, std::time::Instant::now()));
+                .insert(xfer_id, (sender, ports, std::time::Instant::now()));
         }
         ember::channel::XferStreamRole::Fetch => {
             // The recipient is dialling us. Dial them back for a moment so a
@@ -258,7 +273,7 @@ pub(super) fn apply_xfer_stream(
             ) else {
                 return;
             };
-            let Some(target) = chat_attach::dial_target(addr.ip(), port) else {
+            let Some(target) = chat_attach::dial_target(addr.ip(), ports.quic) else {
                 return;
             };
             chat_attach::spawn_punch(
@@ -280,7 +295,7 @@ pub(super) async fn start_xfer_stream_fetch(
     db: &Arc<Database>,
     xfer_id: [u8; 16],
 ) -> bool {
-    let Some((sender, port, _)) = state.xfer_stream_ports.remove(&xfer_id) else {
+    let Some((sender, ports, _)) = state.xfer_stream_ports.remove(&xfer_id) else {
         return false;
     };
     let Some((channel_id, peer, key, size, root)) = state
@@ -299,7 +314,7 @@ pub(super) async fn start_xfer_stream_fetch(
     let Some(peer_addr) = member_direct_addr(state, &peer) else {
         return false;
     };
-    let Some(target) = chat_attach::dial_target(peer_addr.ip(), port) else {
+    let Some(target) = chat_attach::dial_target(peer_addr.ip(), ports.quic) else {
         return false;
     };
     let Some(capability) = ember::channel::derive_xfer_stream_capability(
@@ -310,6 +325,21 @@ pub(super) async fn start_xfer_stream_fetch(
     ) else {
         return false;
     };
+    // The sender's upload listener, when it named one. Room members are not
+    // friends, but the secure stream admits any Ember identity that proves its
+    // key; the grant is what limits the stream to this transfer.
+    let tcp = ports
+        .tcp
+        .and_then(|port| chat_attach::dial_target(peer_addr.ip(), port))
+        .and_then(|addr| {
+            Some(RoomTcpFallback {
+                addr,
+                our_hash: ember::crypto::node_id_from_ed25519_bytes(&state.local_ed25519_pubkey)?,
+                our_pubkey: state.local_ed25519_pubkey,
+                seed: state.local_ed25519_seed,
+                peer_hash: ember::crypto::node_id_from_ed25519_bytes(&peer)?,
+            })
+        });
     let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
         return false;
     };
@@ -332,7 +362,10 @@ pub(super) async fn start_xfer_stream_fetch(
             &peer,
             &xfer_id,
             ember::channel::XferStreamRole::Fetch,
-            our_port,
+            ember::channel::XferStreamPorts {
+                quic: our_port,
+                tcp: None,
+            },
         );
         send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
     }
@@ -348,6 +381,7 @@ pub(super) async fn start_xfer_stream_fetch(
             seed,
             node_id,
             target,
+            tcp,
             xfer_id,
             capability,
             size,
@@ -375,6 +409,7 @@ async fn run_xfer_stream_fetch(
     seed: [u8; 32],
     node_id: [u8; 16],
     target: SocketAddr,
+    tcp: Option<RoomTcpFallback>,
     xfer_id: [u8; 16],
     capability: [u8; 32],
     size: u64,
@@ -390,6 +425,8 @@ async fn run_xfer_stream_fetch(
         return fall_back(&verified);
     };
     let mut status_waited = std::time::Duration::ZERO;
+    let mut quic_connected = false;
+    let mut tcp_tried = false;
     for attempt in 0..STREAM_FETCH_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -406,8 +443,31 @@ async fn run_xfer_stream_fetch(
                 "Ember Transfer: stream dial {}/{STREAM_FETCH_ATTEMPTS} did not connect",
                 attempt + 1
             );
+            // Straight after the first miss, before the block protocol: the
+            // sender's upload listener is often the one port its setup
+            // forwards.
+            if !quic_connected && !tcp_tried {
+                tcp_tried = true;
+                if let Some(tcp) = &tcp {
+                    if let Some(result) = fetch_room_over_tcp(
+                        tcp,
+                        &xfer_id,
+                        &capability,
+                        size,
+                        &root,
+                        &part,
+                        &verified,
+                        &mut status_waited,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                }
+            }
             continue;
         };
+        quic_connected = true;
         let Ok((mut send, mut recv)) = conn.open_bi().await else {
             continue;
         };
@@ -441,25 +501,112 @@ async fn run_xfer_stream_fetch(
                 ember::attach::ATTACH_CLOSE_ABANDONED
             },
         );
-        match fetched {
-            Ok(outcome) if outcome.complete => return StreamFetchResult::Complete,
-            Ok(_) => {}
-            Err(ember::attach_stream::FetchError::Corrupt(detail)) => {
-                warn!("Ember Transfer: stream content did not verify: {detail}");
-                return StreamFetchResult::Corrupt;
-            }
-            Err(ember::attach_stream::FetchError::Refused(
-                ember::attach::AttachStreamStatus::SourceGone,
-            )) => return StreamFetchResult::SourceGone,
-            // Anything else refused — a grant the sender has not recorded yet,
-            // say — is for the block protocol to settle, not worth a redial.
-            Err(ember::attach_stream::FetchError::Refused(_)) => return fall_back(&verified),
-            Err(ember::attach_stream::FetchError::Transient(e)) => {
-                debug!("Ember Transfer: stream dropped: {e}");
-            }
+        if let Some(result) = settle_stream_fetch(fetched, &verified) {
+            return result;
         }
     }
     fall_back(&verified)
+}
+
+/// Where a room transfer's sender can be reached over TCP when its QUIC port
+/// cannot, and who we must prove we are to its upload listener.
+struct RoomTcpFallback {
+    addr: SocketAddr,
+    our_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    seed: [u8; 32],
+    peer_hash: [u8; 16],
+}
+
+/// What one stream attempt means for the fetch: `Some` ends it, `None` is a
+/// drop worth another try.
+fn settle_stream_fetch(
+    fetched: Result<ember::attach_stream::FetchOutcome, ember::attach_stream::FetchError>,
+    verified: &std::sync::atomic::AtomicU64,
+) -> Option<StreamFetchResult> {
+    use ember::attach_stream::FetchError;
+    match fetched {
+        Ok(outcome) if outcome.complete => Some(StreamFetchResult::Complete),
+        Ok(_) => None,
+        Err(FetchError::Corrupt(detail)) => {
+            warn!("Ember Transfer: stream content did not verify: {detail}");
+            Some(StreamFetchResult::Corrupt)
+        }
+        Err(FetchError::Refused(ember::attach::AttachStreamStatus::SourceGone)) => {
+            Some(StreamFetchResult::SourceGone)
+        }
+        // Anything else refused — a grant the sender has not recorded yet,
+        // say — is for the block protocol to settle, not worth a redial.
+        Err(FetchError::Refused(_)) => Some(StreamFetchResult::FallBack {
+            verified: verified.load(std::sync::atomic::Ordering::Relaxed),
+        }),
+        Err(FetchError::Transient(e)) => {
+            debug!("Ember Transfer: stream dropped: {e}");
+            None
+        }
+    }
+}
+
+/// The TCP fallback for a room transfer. `None` when the sender's listener
+/// does not answer either; otherwise how the fetch ended, the block protocol
+/// taking over from a stream that kept dropping.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_room_over_tcp(
+    tcp: &RoomTcpFallback,
+    xfer_id: &[u8; 16],
+    capability: &[u8; 32],
+    size: u64,
+    root: &[u8; 32],
+    part: &std::fs::File,
+    verified: &Arc<std::sync::atomic::AtomicU64>,
+    status_waited: &mut std::time::Duration,
+) -> Option<StreamFetchResult> {
+    use std::sync::atomic::Ordering;
+    let dial = || {
+        ember::attach_tcp::dial_secure(tcp.addr, tcp.our_hash, tcp.our_pubkey, tcp.seed, tcp.peer_hash)
+    };
+    let mut parts = match dial().await {
+        Ok(parts) => parts,
+        Err(e) => {
+            debug!("Ember Transfer: TCP fallback did not connect: {e}");
+            return None;
+        }
+    };
+    info!("Ember Transfer: fetching over TCP; the sender's QUIC port did not answer");
+    for attempt in 0..STREAM_FETCH_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            match dial().await {
+                Ok(again) => parts = again,
+                Err(_) => break,
+            }
+        }
+        let Ok(handle) = part.try_clone() else {
+            break;
+        };
+        let status_wait = STREAM_STATUS_TIMEOUT
+            .saturating_sub(*status_waited)
+            .max(ember::attach_stream::ATTACH_RETRY_STATUS_TIMEOUT);
+        let fetched = ember::attach_tcp::fetch_over_tcp(
+            &mut parts,
+            ember::attach::ROOM_XFER_STREAM_MSG_TYPE,
+            xfer_id,
+            capability,
+            size,
+            root,
+            handle,
+            |done, _| verified.store(done, Ordering::Relaxed),
+            status_wait,
+            status_waited,
+        )
+        .await;
+        if let Some(result) = settle_stream_fetch(fetched, verified) {
+            return Some(result);
+        }
+    }
+    Some(StreamFetchResult::FallBack {
+        verified: verified.load(Ordering::Relaxed),
+    })
 }
 
 /// Keep the stream side of every transfer in step with the event loop's view

@@ -290,7 +290,7 @@
   "chat_attach_busy": "{name} 正忙，請稍後再試。",
   "chat_attach_not_allowed": "{name} 不接受檔案",
   "chat_attach_cancelled": "已取消",
-  "chat_attach_unreachable": "無法與 {name} 直接連線。檔案無法透過中繼傳送。",
+  "chat_attach_unreachable": "無法透過 UDP 或 TCP 與 {name} 直接連線以傳輸檔案。傳送方的連接埠必須可連入；檔案不會透過中繼傳送。",
   "chat_attach_source_gone_sent": "檔案在傳送前已被修改或移動",
   "chat_attach_source_gone_received": "{name} 的檔案在送達前已被修改或移動",
   "chat_attach_failed": "傳輸失敗",

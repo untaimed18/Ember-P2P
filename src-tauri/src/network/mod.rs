@@ -1656,6 +1656,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_inbound_stream_rx = inbound_stream_rx;
         let ul_adv_tcp = state.advertise_tcp_port.clone();
         let ul_adv_udp = state.advertise_udp_port.clone();
+        let ul_file_streams = Some(ember::relay::FileStreamServe {
+            chat: ember::relay::AttachServeContext {
+                db: db.clone(),
+                our_ed25519_seed: ed25519_secret_key,
+                app_handle: app_handle.clone(),
+            },
+            room: ember::relay::RoomXferServeContext {
+                grants: state.xfer_grants.clone(),
+            },
+        });
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -1712,6 +1722,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_epx_overhead,
                 connect_serve_rx,
                 ul_inbound_stream_rx,
+                ul_file_streams,
             )
             .await
             {

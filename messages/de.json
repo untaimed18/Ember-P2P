@@ -290,7 +290,7 @@
   "chat_attach_busy": "{name} ist beschäftigt. Versuchen Sie es gleich noch einmal.",
   "chat_attach_not_allowed": "{name} nimmt keine Dateien an",
   "chat_attach_cancelled": "Abgebrochen",
-  "chat_attach_unreachable": "Keine direkte Verbindung zu {name}. Dateien können nicht über ein Relay gesendet werden.",
+  "chat_attach_unreachable": "Keine direkte Verbindung mit {name} für die Datei, weder über UDP noch über TCP. Der Port des Absenders muss erreichbar sein; Dateien werden nicht über Relays gesendet.",
   "chat_attach_source_gone_sent": "Die Datei wurde geändert oder verschoben, bevor sie gesendet werden konnte",
   "chat_attach_source_gone_received": "Die Datei von {name} wurde geändert oder verschoben, bevor sie ankam",
   "chat_attach_failed": "Übertragung fehlgeschlagen",

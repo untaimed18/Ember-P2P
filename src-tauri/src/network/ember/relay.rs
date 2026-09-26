@@ -1943,6 +1943,124 @@ pub struct RoomXferServeContext {
     pub grants: super::xfer::StreamGrants,
 }
 
+/// Both serve contexts, for a carrier other than the QUIC accept loop: the
+/// upload listener's secure TCP sessions, which are the fallback when a
+/// recipient cannot reach our QUIC port.
+#[derive(Clone)]
+pub struct FileStreamServe {
+    pub chat: AttachServeContext,
+    pub room: RoomXferServeContext,
+}
+
+/// Serve a friend's chat-attachment request on a stream whose carrier has
+/// proved the friend's identity: the QUIC certificate, or the secure TCP
+/// stream's Noise handshake. `header` is the request's first seven bytes,
+/// already read to tell what the stream is.
+///
+/// `None` when the peer is not a friend. Otherwise the serve result, and the
+/// progress the carrier settles once it knows whether every byte arrived —
+/// which each carrier learns its own way.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_chat_attachment_stream<R, W>(
+    ctx: &AttachServeContext,
+    friends: &crate::app_state::SharedFriendHashes,
+    peer_id: [u8; 16],
+    peer_pubkey: [u8; 32],
+    recv: &mut R,
+    send: &mut W,
+    header: &[u8; 7],
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+) -> Option<(anyhow::Result<u64>, crate::network::chat_attach::ServeProgress)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Friendship is checked here as well as by the grant. A grant only exists
+    // for a friend, but a removed friend's grant would otherwise outlive the
+    // friendship until it expired.
+    if !friends.read().await.contains(&peer_id) {
+        debug!(
+            "Refusing attachment stream from non-friend {}",
+            hex::encode(peer_id)
+        );
+        return None;
+    }
+    let peer_hex = hex::encode(peer_id);
+    let mut progress = crate::network::chat_attach::ServeProgress::default();
+    let served = super::attach_stream::serve_attachment(
+        recv,
+        send,
+        header,
+        |xfer_id| {
+            let now = chrono::Utc::now().timestamp();
+            let (path, size, root_hex) =
+                ctx.db
+                    .chat_attachment_grant(&hex::encode(xfer_id), &peer_hex, now)?;
+            let mut root = [0u8; 32];
+            hex::decode_to_slice(&root_hex, &mut root).ok()?;
+            let capability =
+                super::attach::derive_attach_capability(&ctx.our_ed25519_seed, &peer_pubkey, xfer_id)?;
+            Some((std::path::PathBuf::from(path), size, root, capability))
+        },
+        |xfer_id, position, size| {
+            // Removing the friend has to end a stream already running, as it
+            // refuses the next one. A contended lock is not a removal; the
+            // next chunk looks again.
+            let still_friend = friends
+                .try_read()
+                .map_or(true, |set| set.contains(&peer_id));
+            still_friend
+                && progress.note(&ctx.db, &ctx.app_handle, xfer_id, &peer_hex, position, size)
+        },
+        Some(limiter),
+    )
+    .await;
+    match &served {
+        Ok(0) => debug!("No live attachment grant for {peer_hex}"),
+        Ok(bytes) => info!("Chat attachment: served {bytes} byte(s) to {peer_hex}"),
+        Err(e) => debug!("Attachment stream to {peer_hex} failed: {e}"),
+    }
+    Some((served, progress))
+}
+
+/// Serve a room member's transfer request on a stream whose carrier has proved
+/// the member's key. Not a friend check: the grant names the member the file
+/// was offered to, so only that member can read it — and only while the event
+/// loop still holds the transfer.
+pub async fn serve_room_transfer_stream<R, W>(
+    ctx: &RoomXferServeContext,
+    peer_pubkey: [u8; 32],
+    recv: &mut R,
+    send: &mut W,
+    header: &[u8; 7],
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let grants = ctx.grants.clone();
+    let served = super::attach_stream::serve_stream(
+        super::attach::ROOM_XFER_STREAM_MSG_TYPE,
+        recv,
+        send,
+        header,
+        |xfer_id| super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey),
+        // Called only once the request's tag has verified.
+        |xfer_id, position, _size| {
+            super::xfer::note_stream_served(&grants, xfer_id, &peer_pubkey, position)
+        },
+        Some(limiter),
+    )
+    .await;
+    match &served {
+        Ok(0) => debug!("No live room transfer grant for this member"),
+        Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s)"),
+        Err(e) => debug!("Room transfer stream failed: {e}"),
+    }
+    served
+}
+
 /// How long a sender holds an attachment connection open after the last chunk,
 /// waiting for the friend to confirm it has every byte.
 const ATTACH_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2198,65 +2316,20 @@ pub async fn run_quic_accept_loop(
                     debug!("QUIC accept: attachment stream from {remote} has no Ember identity");
                     return;
                 };
-                // Friendship is checked here as well as by the grant. A grant
-                // only exists for a friend, but a removed friend's grant would
-                // otherwise outlive the friendship until it expired.
-                if !friends.read().await.contains(&peer_id) {
-                    debug!(
-                        "QUIC accept: refusing attachment stream from non-friend {}",
-                        hex::encode(peer_id)
-                    );
-                    return;
-                }
-                let peer_hex = hex::encode(peer_id);
-                let mut progress = crate::network::chat_attach::ServeProgress::default();
-                let progress_db = ctx.db.clone();
-                let progress_app = ctx.app_handle.clone();
-                let served = super::attach_stream::serve_attachment(
+                let Some((served, progress)) = serve_chat_attachment_stream(
+                    &ctx,
+                    &friends,
+                    peer_id,
+                    peer_pubkey,
                     &mut init_recv,
                     &mut init_send,
                     &header,
-                    |xfer_id| {
-                        let now = chrono::Utc::now().timestamp();
-                        let (path, size, root_hex) =
-                            ctx.db
-                                .chat_attachment_grant(&hex::encode(xfer_id), &peer_hex, now)?;
-                        let mut root = [0u8; 32];
-                        hex::decode_to_slice(&root_hex, &mut root).ok()?;
-                        let capability = super::attach::derive_attach_capability(
-                            &ctx.our_ed25519_seed,
-                            &peer_pubkey,
-                            xfer_id,
-                        )?;
-                        Some((std::path::PathBuf::from(path), size, root, capability))
-                    },
-                    |xfer_id, position, size| {
-                        // Removing the friend has to end a stream already
-                        // running, as it refuses the next one. A contended lock
-                        // is not a removal; the next chunk looks again.
-                        let still_friend = friends
-                            .try_read()
-                            .map_or(true, |set| set.contains(&peer_id));
-                        still_friend
-                            && progress.note(
-                                &progress_db,
-                                &progress_app,
-                                xfer_id,
-                                &peer_hex,
-                                position,
-                                size,
-                            )
-                    },
-                    Some(limiter.as_ref()),
+                    limiter.as_ref(),
                 )
-                .await;
-                match &served {
-                    Ok(0) => debug!("QUIC accept: no live attachment grant for {peer_hex}"),
-                    Ok(bytes) => {
-                        info!("Chat attachment: served {bytes} byte(s) to {peer_hex}");
-                    }
-                    Err(e) => debug!("QUIC accept: attachment stream to {peer_hex} failed: {e}"),
-                }
+                .await
+                else {
+                    return;
+                };
                 // The stream is the whole conversation, but returning drops the
                 // last handle on the connection, and quinn closes it on the spot
                 // — discarding whatever is still queued, which after a fast
@@ -2282,25 +2355,15 @@ pub async fn run_quic_accept_loop(
                     debug!("QUIC accept: room transfer stream from {remote} has no Ember identity");
                     return;
                 };
-                let grants = ctx.grants.clone();
-                let served = super::attach_stream::serve_stream(
-                    super::attach::ROOM_XFER_STREAM_MSG_TYPE,
+                let _ = serve_room_transfer_stream(
+                    &ctx,
+                    peer_pubkey,
                     &mut init_recv,
                     &mut init_send,
                     &header,
-                    |xfer_id| super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey),
-                    // Called only once the request's tag has verified.
-                    |xfer_id, position, _size| {
-                        super::xfer::note_stream_served(&grants, xfer_id, &peer_pubkey, position)
-                    },
-                    Some(limiter.as_ref()),
+                    limiter.as_ref(),
                 )
                 .await;
-                match &served {
-                    Ok(0) => debug!("QUIC accept: no live room transfer grant for {remote}"),
-                    Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s) to {remote}"),
-                    Err(e) => debug!("QUIC accept: room transfer stream to {remote} failed: {e}"),
-                }
                 // As for an attachment: returning drops the connection, and
                 // quinn would discard whatever is still queued.
                 let _ = init_send.finish();

@@ -2698,6 +2698,9 @@ struct UploadHandler {
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE`) wire bytes.
     epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Grants for chat attachments and room transfers, for a secure stream
+    /// that asks for one instead of opening an eD2K session.
+    file_stream_serve: Option<crate::network::ember::relay::FileStreamServe>,
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
@@ -3966,6 +3969,9 @@ pub async fn start_upload_server(
     // they're served here rather than through `kad_callback_tx`. Drained in
     // the same accept `select!`.
     mut inbound_stream_rx: tokio::sync::mpsc::Receiver<InboundStreamRequest>,
+    // Chat attachments and room transfers, served here to a peer that could
+    // not reach our QUIC port. See `crate::network::ember::attach_tcp`.
+    file_stream_serve: Option<crate::network::ember::relay::FileStreamServe>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     // SO_REUSEADDR so the NATMAP-style TCP mapping hold can bind the same
@@ -4063,6 +4069,7 @@ pub async fn start_upload_server(
         halted_for_shutdown,
         sx_overhead,
         epx_overhead,
+        file_stream_serve,
     });
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -4586,6 +4593,74 @@ pub async fn start_upload_server(
 }
 
 impl UploadHandler {
+    /// A secure stream that asked for a chat attachment or a room transfer
+    /// instead of an eD2K session: the fallback for a recipient that could not
+    /// reach our QUIC port. `first` is the stream type it opened with.
+    ///
+    /// Never over a relay. A relay operator forwards sessions as a favour to
+    /// friends, and a file would turn that into carrying gigabytes for them.
+    async fn serve_file_stream(
+        &self,
+        first: u8,
+        mut reader: Box<dyn AsyncRead + Unpin + Send>,
+        mut writer: Box<dyn AsyncWrite + Unpin + Send>,
+        peer: super::secure_stream::SecurePeerIdentity,
+        relayed: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        use crate::network::ember::{attach, attach_tcp, relay};
+        if relayed {
+            debug!("Refusing a file stream over a relayed session");
+            return Ok(());
+        }
+        let Some(serve) = self.file_stream_serve.clone() else {
+            return Ok(());
+        };
+        let mut header = [0u8; 7];
+        header[0] = first;
+        if !matches!(
+            tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
+            Ok(Ok(_))
+        ) {
+            return Ok(());
+        }
+        if first == attach::ATTACH_STREAM_MSG_TYPE {
+            let Some((served, progress)) = relay::serve_chat_attachment_stream(
+                &serve.chat,
+                &self.friend_hashes,
+                peer.ember_hash,
+                peer.ed25519_public_key,
+                &mut reader,
+                &mut writer,
+                &header,
+                &self.bandwidth_limiter,
+            )
+            .await
+            else {
+                return Ok(());
+            };
+            let delivered =
+                served.is_ok() && attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
+            progress.finish(&serve.chat.db, &serve.chat.app_handle, delivered);
+        } else {
+            let served = relay::serve_room_transfer_stream(
+                &serve.room,
+                peer.ed25519_public_key,
+                &mut reader,
+                &mut writer,
+                &header,
+                &self.bandwidth_limiter,
+            )
+            .await;
+            // Completion reaches the event loop as the recipient's done frame;
+            // this only holds the connection until the last bytes are read.
+            if served.is_ok() {
+                let _ = attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
+            }
+        }
+        Ok(())
+    }
+
     fn advertised_tcp_port(&self) -> u16 {
         let p = self
             .advertise_tcp_port
@@ -6061,14 +6136,49 @@ impl UploadHandler {
                 reader: mut boxed_reader,
                 writer: boxed_writer,
                 secure_peer: preauthenticated_peer,
-                relayed: _,
+                relayed,
             } => {
                 let (mut rd, mut wr, first_inner_byte) = if let Some(peer) = preauthenticated_peer {
                     secure_v2_peer = Some(peer);
+                    let deadline = preauth_deadline.unwrap_or_else(|| {
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(INBOUND_PREAUTH_DEADLINE_SECS)
+                    });
+                    let first = match tokio::time::timeout_at(deadline, boxed_reader.read_u8()).await {
+                        Ok(Ok(byte)) => byte,
+                        Ok(Err(e)) if is_connection_closed(&e) => {
+                            info!("Secure connection from {peer_addr} closed immediately");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            info!("Secure connection read failed from {peer_addr}: {e}");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            info!("Timeout waiting for the first packet from secure peer {peer_addr}");
+                            return Ok(());
+                        }
+                    };
+                    // eD2K framing opens with a protocol marker, so a file
+                    // stream's type byte cannot be mistaken for a session.
+                    if first == crate::network::ember::attach::ATTACH_STREAM_MSG_TYPE
+                        || first == crate::network::ember::attach::ROOM_XFER_STREAM_MSG_TYPE
+                    {
+                        return self
+                            .serve_file_stream(
+                                first,
+                                boxed_reader,
+                                boxed_writer,
+                                peer,
+                                relayed,
+                                deadline,
+                            )
+                            .await;
+                    }
                     (
                         StreamReader::Boxed(boxed_reader),
                         StreamWriter::Boxed(boxed_writer),
-                        None,
+                        Some(first),
                     )
                 } else {
                     let first = match tokio::time::timeout_at(

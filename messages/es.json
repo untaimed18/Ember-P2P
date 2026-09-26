@@ -290,7 +290,7 @@
   "chat_attach_busy": "{name} está ocupado. Inténtalo de nuevo en un momento.",
   "chat_attach_not_allowed": "{name} no acepta archivos",
   "chat_attach_cancelled": "Cancelado",
-  "chat_attach_unreachable": "No hay conexión directa con {name}. Los archivos no se pueden enviar a través de un relé.",
+  "chat_attach_unreachable": "No hay conexión directa con {name} para el archivo, ni por UDP ni por TCP. El puerto de quien envía debe ser accesible; los archivos no se envían a través de relés.",
   "chat_attach_source_gone_sent": "El archivo cambió o se movió antes de poder enviarse",
   "chat_attach_source_gone_received": "El archivo de {name} cambió o se movió antes de llegar",
   "chat_attach_failed": "La transferencia falló",

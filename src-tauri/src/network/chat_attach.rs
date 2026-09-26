@@ -201,7 +201,7 @@ pub(super) fn dial_target(ip: IpAddr, port: u16) -> Option<SocketAddr> {
 /// network, on this machine, or across a VPN mesh (100.64/10, which Tailscale
 /// uses). Behind a CGNAT the address is not ours either, and neither port is
 /// right there, so treating it as direct costs nothing.
-fn reached_directly(ip: IpAddr) -> bool {
+pub(super) fn reached_directly(ip: IpAddr) -> bool {
     let ip = match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
         v4 => v4,
@@ -968,9 +968,11 @@ async fn accept_offer(
         app: app.clone(),
         endpoint,
         seed: state.local_ed25519_seed,
+        our_pubkey: state.local_ed25519_pubkey,
         friend: inbound.friend,
         peer_pubkey: inbound.peer_pubkey,
         dial,
+        tcp_dials: friend_tcp_candidates(db, &inbound.friend, inbound.peer_addr),
         xfer_id,
         size: inbound.offer.size,
         root: inbound.offer.root,
@@ -989,9 +991,13 @@ struct FetchCtx {
     app: tauri::AppHandle,
     endpoint: Arc<quinn::Endpoint>,
     seed: [u8; 32],
+    our_pubkey: [u8; 32],
     friend: [u8; 16],
     peer_pubkey: [u8; 32],
     dial: SocketAddr,
+    /// The friend's upload listener, for when `dial` does not connect. See
+    /// [`friend_tcp_candidates`].
+    tcp_dials: Vec<SocketAddr>,
     xfer_id: [u8; 16],
     size: u64,
     root: [u8; 32],
@@ -1146,6 +1152,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
 
     let mut last = ReceiveFailure::Unreachable("no attempt was made".into());
     let mut connected = false;
+    let mut tcp_tried = false;
     let mut status_waited = Duration::ZERO;
     for attempt in 0..FETCH_ATTEMPTS {
         if attempt > 0 {
@@ -1164,7 +1171,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         )
         .await;
         let conn = match dialled {
-            Ok(Ok(conn)) => conn,
+            Ok(Ok(conn)) => Some(conn),
             Ok(Err(e)) => {
                 info!(
                     "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} failed: {e}",
@@ -1172,7 +1179,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
                     ctx.dial
                 );
                 last = ReceiveFailure::Unreachable(e.to_string());
-                continue;
+                None
             }
             Err(_) => {
                 info!(
@@ -1181,8 +1188,22 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
                     ctx.dial
                 );
                 last = ReceiveFailure::Unreachable("the connection timed out".into());
-                continue;
+                None
             }
+        };
+        let Some(conn) = conn else {
+            // QUIC listens on a UDP port of its own, which a setup forwarding
+            // only the eD2K ports never opens. Try the friend's TCP listener
+            // once, straight after the first miss, before spending the
+            // remaining QUIC retries.
+            if !connected && !tcp_tried {
+                tcp_tried = true;
+                if let Some(done) = receive_over_tcp(ctx, part, &capability, &mut status_waited).await
+                {
+                    return done;
+                }
+            }
+            continue;
         };
         connected = true;
         let (mut send, mut recv) = match conn.open_bi().await {
@@ -1233,6 +1254,104 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         ReceiveFailure::Unreachable(detail) if !connected => ReceiveFailure::NoRoute(detail),
         other => other,
     })
+}
+
+/// Where the friend's upload listener may answer over TCP. The IP is the
+/// session's; the port is the listening one the friends table records, then
+/// the session's own, which is the listener's when we were the ones who
+/// dialled it.
+fn friend_tcp_candidates(
+    db: &Database,
+    friend: &[u8; 16],
+    session: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Ok(Some((_, port))) = db.get_friend_address(&hex::encode(friend)) {
+        out.extend(dial_target(session.ip(), port));
+    }
+    if let Some(addr) = dial_target(session.ip(), session.port()) {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// The fallback when QUIC cannot connect: the friend's upload listener, over
+/// the secure stream a friend session uses. `None` when no candidate connects
+/// either, so the caller can go on trying QUIC; otherwise how the receive
+/// ended.
+async fn receive_over_tcp(
+    ctx: &FetchCtx,
+    part: &std::fs::File,
+    capability: &[u8; 32],
+    status_waited: &mut Duration,
+) -> Option<Result<(), ReceiveFailure>> {
+    use super::ember::attach_tcp;
+    let our_hash = super::ember::crypto::node_id_from_ed25519_bytes(&ctx.our_pubkey)?;
+    let mut reached: Option<SocketAddr> = None;
+    let mut last = ReceiveFailure::Unreachable("no TCP attempt was made".into());
+    for attempt in 0..FETCH_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
+        }
+        // Every candidate until one answers; after that, only that one.
+        let targets = match reached {
+            Some(addr) => vec![addr],
+            None => ctx.tcp_dials.clone(),
+        };
+        let mut parts = None;
+        for addr in targets {
+            match attach_tcp::dial_secure(addr, our_hash, ctx.our_pubkey, ctx.seed, ctx.friend).await {
+                Ok(connected) => {
+                    info!("Chat attachment: reached the sender over TCP at {addr}");
+                    reached = Some(addr);
+                    parts = Some(connected);
+                    break;
+                }
+                Err(e) => info!("Chat attachment: TCP dial to {addr} failed: {e}"),
+            }
+        }
+        let Some(mut parts) = parts else {
+            reached?;
+            last = ReceiveFailure::Unreachable("the TCP redial failed".into());
+            continue;
+        };
+        let handle = match part.try_clone() {
+            Ok(handle) => handle,
+            Err(e) => return Some(Err(ReceiveFailure::Disk(e.to_string()))),
+        };
+        let mut last_emit: Option<Instant> = None;
+        let fetched = attach_tcp::fetch_over_tcp(
+            &mut parts,
+            attach::ATTACH_STREAM_MSG_TYPE,
+            &ctx.xfer_id,
+            capability,
+            ctx.size,
+            &ctx.root,
+            handle,
+            |done, _| {
+                if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
+                    last_emit = Some(Instant::now());
+                    emit_progress(&ctx.app, &ctx.db, &ctx.row, done);
+                }
+            },
+            next_status_wait(*status_waited),
+            status_waited,
+        )
+        .await;
+        match fetched {
+            Ok(outcome) if outcome.complete => return Some(Ok(())),
+            Ok(_) => last = ReceiveFailure::Unreachable("the stream ended early".into()),
+            Err(FetchError::Corrupt(detail)) => return Some(Err(ReceiveFailure::Corrupt(detail))),
+            Err(FetchError::Refused(status)) => return Some(Err(ReceiveFailure::Refused(status))),
+            Err(FetchError::Transient(e)) => last = ReceiveFailure::Unreachable(e.to_string()),
+        }
+    }
+    Some(Err(last))
 }
 
 // --- Either side ---------------------------------------------------------------

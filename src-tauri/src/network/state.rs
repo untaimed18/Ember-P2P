@@ -1430,9 +1430,10 @@ pub(super) struct NetworkState {
     /// Transfers the QUIC accept loop may serve as streams. Shared with that
     /// loop; `drive_channel_transfers` keeps it in step with `xfer_send`.
     pub(super) xfer_grants: ember::xfer::StreamGrants,
-    /// QUIC ports senders named for transfers offered to us, as
-    /// `(sender, port, when)`, consulted when the offer is accepted.
-    pub(super) xfer_stream_ports: HashMap<[u8; 16], ([u8; 32], u16, std::time::Instant)>,
+    /// Stream ports senders named for transfers offered to us, as
+    /// `(sender, ports, when)`, consulted when the offer is accepted.
+    pub(super) xfer_stream_ports:
+        HashMap<[u8; 16], ([u8; 32], ember::channel::XferStreamPorts, std::time::Instant)>,
     /// Receives running over a QUIC stream.
     pub(super) xfer_streams: HashMap<[u8; 16], StreamFetch>,
     /// Where a stream fetch reports how it ended; drained by

@@ -3338,36 +3338,55 @@ impl XferStreamRole {
     }
 }
 
-/// `hdr || role(1) || quic_port(2 LE) || tag(16)`.
+/// A decoded stream frame's ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XferStreamPorts {
+    pub quic: u16,
+    /// The sender's upload listener, for a recipient whose QUIC dial cannot
+    /// get through. `None` when the frame did not carry one.
+    pub tcp: Option<u16>,
+}
+
+/// `hdr || role(1) || quic_port(2 LE) || [tcp_port(2 LE)] || tag(16)`.
 pub fn encode_xfer_stream(
     key: &[u8; 32],
     sender: &[u8; 32],
     target: &[u8; 32],
     xfer_id: &[u8; 16],
     role: XferStreamRole,
-    quic_port: u16,
+    ports: XferStreamPorts,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 3 + XFER_MAC_LEN);
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 5 + XFER_MAC_LEN);
     put_xfer_header(&mut out, XFER_STREAM_PLAIN_VERSION, sender, target, xfer_id);
     out.push(role.code());
-    out.extend_from_slice(&quic_port.to_le_bytes());
+    out.extend_from_slice(&ports.quic.to_le_bytes());
+    if let Some(tcp) = ports.tcp.filter(|p| *p != 0) {
+        out.extend_from_slice(&tcp.to_le_bytes());
+    }
     append_xfer_tag(key, &mut out);
     out
 }
 
-/// Bytes past the port are ignored, so a later build can append candidate
+/// Bytes past the ports are ignored, so a later build can append candidate
 /// addresses without taking another frame number.
 pub fn decode_xfer_stream(
     bytes: &[u8],
-) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, u16)> {
+) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, XferStreamPorts)> {
     let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_PLAIN_VERSION)?;
-    let rest = bytes.get(XFER_HEADER_LEN..XFER_HEADER_LEN + 3)?;
-    let role = XferStreamRole::from_code(rest[0])?;
-    let quic_port = u16::from_le_bytes([rest[1], rest[2]]);
-    if quic_port == 0 {
+    let rest = bytes.get(XFER_HEADER_LEN..)?;
+    if rest.len() < 3 {
         return None;
     }
-    Some((sender, target, xfer_id, role, quic_port))
+    let role = XferStreamRole::from_code(rest[0])?;
+    let quic = u16::from_le_bytes([rest[1], rest[2]]);
+    if quic == 0 {
+        return None;
+    }
+    let tcp = rest
+        .get(3..5)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .filter(|p| *p != 0);
+    Some((sender, target, xfer_id, role, XferStreamPorts { quic, tcp }))
 }
 
 /// Capability behind a transfer's QUIC stream request.
@@ -6001,29 +6020,41 @@ mod tests {
         }
     }
 
+    fn quic_only(quic: u16) -> XferStreamPorts {
+        XferStreamPorts { quic, tcp: None }
+    }
+
     #[test]
     fn xfer_stream_frame_round_trips_and_is_routed_as_a_transfer() {
         let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let both = XferStreamPorts { quic: 4662, tcp: Some(4661) };
         for role in [XferStreamRole::Serve, XferStreamRole::Fetch] {
-            let frame = encode_xfer_stream(&K, &s, &t, &id, role, 4662);
-            assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
-            assert_eq!(decode_xfer_stream(&opened(&frame)), Some((s, t, id, role, 4662)));
+            for ports in [quic_only(4662), both] {
+                let frame = encode_xfer_stream(&K, &s, &t, &id, role, ports);
+                assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
+                assert_eq!(decode_xfer_stream(&opened(&frame)), Some((s, t, id, role, ports)));
+            }
         }
         // Appended fields are a later build's business, not a refusal.
-        let mut body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, 9));
+        let mut body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, both));
         body.extend_from_slice(&[0xEE; 12]);
-        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, 9)));
+        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, both)));
+        // A zero TCP port is no port, on either side of the wire.
+        let zero_tcp = XferStreamPorts { quic: 9, tcp: Some(0) };
+        let body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, zero_tcp));
+        assert_eq!(decode_xfer_stream(&body).map(|f| f.4), Some(quic_only(9)));
     }
 
     #[test]
     fn xfer_stream_frame_refuses_a_zero_port_an_unknown_role_or_a_short_body() {
         let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
-        let zero = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 0));
+        let zero = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(0)));
         assert!(decode_xfer_stream(&zero).is_none());
-        let mut role = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 80));
+        let mut role =
+            opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
         role[XFER_HEADER_LEN] = 3;
         assert!(decode_xfer_stream(&role).is_none());
-        let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 80));
+        let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
         assert!(decode_xfer_stream(&full[..full.len() - 1]).is_none());
         // Nor is any other transfer frame read as one.
         let reply = opened(&encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept));
@@ -7124,7 +7155,7 @@ mod tests {
             &[2u8; 32],
             &[3u8; 16],
             XferStreamRole::Serve,
-            4662,
+            XferStreamPorts { quic: 4662, tcp: Some(4661) },
         );
         assert_eq!(v1_6_7_branch(&stream), V167Branch::DroppedWithDebugLog);
         // It reaches that dispatch at all only through the envelope v1.6.7 also
