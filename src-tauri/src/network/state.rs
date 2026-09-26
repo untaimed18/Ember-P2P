@@ -1427,6 +1427,18 @@ pub(super) struct NetworkState {
     pub(super) channel_member_touches: HashMap<([u8; 16], [u8; 32]), i64>,
     /// Offers waiting on the user to accept or decline.
     pub(super) xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
+    /// Transfers the QUIC accept loop may serve as streams. Shared with that
+    /// loop; `drive_channel_transfers` keeps it in step with `xfer_send`.
+    pub(super) xfer_grants: ember::xfer::StreamGrants,
+    /// QUIC ports senders named for transfers offered to us, as
+    /// `(sender, port, when)`, consulted when the offer is accepted.
+    pub(super) xfer_stream_ports: HashMap<[u8; 16], ([u8; 32], u16, std::time::Instant)>,
+    /// Receives running over a QUIC stream.
+    pub(super) xfer_streams: HashMap<[u8; 16], StreamFetch>,
+    /// Where a stream fetch reports how it ended; drained by
+    /// `drive_channel_transfers`, which is why both halves live here.
+    pub(super) xfer_stream_tx: mpsc::UnboundedSender<StreamFetchOutcome>,
+    pub(super) xfer_stream_rx: mpsc::UnboundedReceiver<StreamFetchOutcome>,
     /// Data-block send budget. Separate from the chat one on purpose — see
     /// [`xfer_block_rate_ok`].
     pub(super) xfer_block_times: VecDeque<std::time::Instant>,

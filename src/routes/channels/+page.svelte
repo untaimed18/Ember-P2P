@@ -31,6 +31,7 @@
     leaveChannel,
     listChannelMembers,
     markChannelMessagesRead,
+    openChannelFilesFolder,
     channelPresenceConfig,
     setChannelFocus,
     pickAndOfferChannelTransfer,
@@ -2011,6 +2012,8 @@
       }),
   );
 
+  const LEGACY_XFER_MAX_BYTES = 100 * 1024 * 1024;
+
   function transferLabel(t: ChannelTransferInfo): string {
     const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
     switch (t.status) {
@@ -2036,7 +2039,11 @@
       case 'not_allowed':
         return m.channels_xfer_peer_refuses({ name: who });
       case 'expired':
-        return m.channels_xfer_expired();
+        // Builds before 1.7.0 drop an offer over 100 MB without answering, so
+        // for a file that size silence is as likely to be that as absence.
+        return t.direction === 'send' && t.size > LEGACY_XFER_MAX_BYTES
+          ? m.channels_xfer_expired_large()
+          : m.channels_xfer_expired();
       case 'stalled':
         return m.channels_xfer_stalled();
       case 'source_gone':
@@ -2958,6 +2965,15 @@
                           onclick={() => handleCancelTransfer(t.xfer_id)}
                         >
                           {m.common_cancel()}
+                        </button>
+                      {:else if t.status === 'complete' && t.direction === 'receive'}
+                        <button
+                          type="button"
+                          class="ghost"
+                          onclick={() =>
+                            void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+                        >
+                          {m.library_open_folder()}
                         </button>
                       {/if}
                     </div>

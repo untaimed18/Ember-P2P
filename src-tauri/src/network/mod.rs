@@ -699,6 +699,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // rather than with the other result channels below because the sender
     // lives in `NetworkState`, which is built next.
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
+    let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
 
     let mut state = NetworkState {
         local_id,
@@ -1067,6 +1068,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_finish_in_flight: 0,
         channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
+        xfer_grants: Default::default(),
+        xfer_stream_ports: HashMap::new(),
+        xfer_streams: HashMap::new(),
+        xfer_stream_tx,
+        xfer_stream_rx,
         xfer_block_times: VecDeque::new(),
         xfer_upload_credit: 0,
         xfer_offer_policy: settings.channel_file_offers.clone(),

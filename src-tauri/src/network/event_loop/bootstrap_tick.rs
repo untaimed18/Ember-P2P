@@ -600,6 +600,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                     our_ed25519_seed: ed25519_secret_key,
                                     app_handle: app_handle.clone(),
                                 }),
+                                Some(ember::relay::RoomXferServeContext {
+                                    grants: state.xfer_grants.clone(),
+                                }),
                             ));
                             tracing::info!("QUIC accept loop spawned");
 

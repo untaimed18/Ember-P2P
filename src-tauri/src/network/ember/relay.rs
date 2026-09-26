@@ -1936,6 +1936,13 @@ pub struct AttachServeContext {
     pub app_handle: tauri::AppHandle,
 }
 
+/// The grant table room transfers are served from. The event loop owns the
+/// transfers; this is the part of them the accept task can see.
+#[derive(Clone)]
+pub struct RoomXferServeContext {
+    pub grants: super::xfer::StreamGrants,
+}
+
 /// How long a sender holds an attachment connection open after the last chunk,
 /// waiting for the friend to confirm it has every byte.
 const ATTACH_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1956,11 +1963,14 @@ async fn attachment_delivered(send: &quinn::SendStream) -> bool {
     }
 }
 
-/// Run the QUIC accept loop. Handles four kinds of inbound QUIC connections:
+/// Run the QUIC accept loop. Handles five kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
 ///      authorized by the certificate identity plus the grant; see
 ///      [`super::attach_stream::serve_attachment`].
+///   5. **Room transfer** — a room member is fetching a file we offered them.
+///      Dispatched on [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`] and
+///      authorized the same way against [`RoomXferServeContext::grants`].
 ///
 /// The original three:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
@@ -1984,6 +1994,7 @@ pub async fn run_quic_accept_loop(
     address_policy: RelayAddressPolicy,
     bandwidth_limiter: std::sync::Arc<crate::bandwidth::limiter::BandwidthLimiter>,
     attach_serve: Option<AttachServeContext>,
+    room_serve: Option<RoomXferServeContext>,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
@@ -2072,6 +2083,7 @@ pub async fn run_quic_accept_loop(
         let policy = address_policy.clone();
         let limiter = bandwidth_limiter.clone();
         let attach_serve = attach_serve.clone();
+        let room_serve = room_serve.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
             let pending_ip_guard = pending_ip_guard;
@@ -2253,6 +2265,46 @@ pub async fn run_quic_accept_loop(
                 let _ = init_send.finish();
                 let delivered = attachment_delivered(&init_send).await;
                 progress.finish(&ctx.db, &ctx.app_handle, served.is_ok() && delivered);
+                return;
+            }
+
+            if msg_type == super::attach::ROOM_XFER_STREAM_MSG_TYPE {
+                // A room member fetching a file we offered them. Not a friend
+                // check: the grant names the member it was offered to, and the
+                // dialer's key comes off the certificate the handshake proved,
+                // so only that member can read it — and only while the event
+                // loop still holds the transfer.
+                let Some(ctx) = room_serve else {
+                    debug!("QUIC accept: room transfer stream from {remote} but it is off");
+                    return;
+                };
+                let Some(peer_pubkey) = super::quic::connection_ed25519_pubkey(&conn) else {
+                    debug!("QUIC accept: room transfer stream from {remote} has no Ember identity");
+                    return;
+                };
+                let grants = ctx.grants.clone();
+                let served = super::attach_stream::serve_stream(
+                    super::attach::ROOM_XFER_STREAM_MSG_TYPE,
+                    &mut init_recv,
+                    &mut init_send,
+                    &header,
+                    |xfer_id| super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey),
+                    // Called only once the request's tag has verified.
+                    |xfer_id, position, _size| {
+                        super::xfer::note_stream_served(&grants, xfer_id, &peer_pubkey, position)
+                    },
+                    Some(limiter.as_ref()),
+                )
+                .await;
+                match &served {
+                    Ok(0) => debug!("QUIC accept: no live room transfer grant for {remote}"),
+                    Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s) to {remote}"),
+                    Err(e) => debug!("QUIC accept: room transfer stream to {remote} failed: {e}"),
+                }
+                // As for an attachment: returning drops the connection, and
+                // quinn would discard whatever is still queued.
+                let _ = init_send.finish();
+                let _ = attachment_delivered(&init_send).await;
                 return;
             }
 

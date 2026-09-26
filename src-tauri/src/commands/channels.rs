@@ -5321,7 +5321,7 @@ pub async fn channel_member_friend_code(
 /// Offer a file to one member of a room.
 ///
 /// Nothing leaves this machine until they accept. The file is hashed here
-/// rather than in the network task so a 100 MB read never stalls the loop
+/// rather than in the network task so a 2 GiB read never stalls the loop
 /// that is also carrying everyone's chat.
 ///
 /// The file is chosen in a native dialog *here* rather than accepted as a path
@@ -5412,7 +5412,7 @@ pub async fn pick_and_offer_channel_transfer(
         if meta.len() == 0 || meta.len() > channel::XFER_MAX_BYTES {
             return Err(coded_ctx(
                 "channels_xfer_too_large",
-                "Files must be between 1 byte and 100 MB",
+                "Files must be between 1 byte and 2 GB",
                 channel::XFER_MAX_BYTES,
             ));
         }
@@ -5428,10 +5428,10 @@ pub async fn pick_and_offer_channel_transfer(
                 "That file name is not allowed",
             ));
         }
-        let tree = std::fs::File::open(&canonical).and_then(|f| {
-            crate::network::ember::transfer::HashTree::from_reader(std::io::BufReader::new(f))
-        })
-        .map_err(|e| coded_ctx("channels_xfer_failed", "Could not read that file", e))?;
+        // Cached for the QUIC stream that will serve it, so a 2 GiB file is
+        // read once here rather than again when the recipient connects.
+        let tree = crate::network::ember::attach_stream::hash_for_serving(&canonical)
+            .map_err(|e| coded_ctx("channels_xfer_failed", "Could not read that file", e))?;
         if tree.file_size != meta.len() {
             return Err(coded(
                 "channels_xfer_failed",
@@ -5510,6 +5510,30 @@ pub async fn cancel_channel_transfer(
         .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
     await_reply(rx, "channels_xfer_failed", "No response from network").await??;
     Ok(())
+}
+
+/// Open the Channel Files folder, creating it if nothing has landed there yet.
+#[tauri::command]
+pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let dl_folder = state.config.read().await.settings.download_folder.clone();
+    tokio::task::spawn_blocking(move || {
+        let allowed = vec![dl_folder.clone()];
+        let dir = crate::security::filesystem::prepare_approved_subdir(
+            std::path::Path::new(&dl_folder),
+            crate::network::ember::xfer::CHANNEL_FILES_DIR,
+            &allowed,
+        )
+        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+        crate::security::filesystem::open_with_default_app(&dir).map_err(|e| {
+            coded_ctx(
+                "transfers_open_explorer_failed",
+                "Failed to open the Channel Files folder",
+                e,
+            )
+        })
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
 }
 
 /// Everything currently offered, awaiting an answer, or moving.

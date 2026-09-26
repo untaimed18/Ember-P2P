@@ -183,7 +183,7 @@ fn part_file_name(xfer_id: &[u8; 16]) -> String {
 /// names only the port — so this is not an arbitrary target. It still refuses
 /// the addresses that are never a peer, and folds an IPv4-mapped IPv6 address
 /// back to IPv4, because the QUIC endpoint is bound on IPv4.
-fn dial_target(ip: IpAddr, port: u16) -> Option<SocketAddr> {
+pub(super) fn dial_target(ip: IpAddr, port: u16) -> Option<SocketAddr> {
     let ip = match ip {
         IpAddr::V6(v6) => IpAddr::V4(v6.to_ipv4_mapped()?),
         v4 => v4,
@@ -222,7 +222,7 @@ fn reached_directly(ip: IpAddr) -> bool {
 /// our local address, where the endpoint listens on its own port; naming the
 /// mapped one there sent every dial of a LAN transfer to a port nothing
 /// listened on, until the receiver gave up.
-fn quic_port_for(state: &NetworkState, peer: Option<SocketAddr>) -> Option<u16> {
+pub(super) fn quic_port_for(state: &NetworkState, peer: Option<SocketAddr>) -> Option<u16> {
     choose_quic_port(state.quic_port, super::advertised_quic_port(state), peer)
 }
 
@@ -345,7 +345,7 @@ async fn session_tx(
         .map(|h| h.tx.clone())
 }
 
-fn quic_endpoint(state: &NetworkState) -> Option<Arc<quinn::Endpoint>> {
+pub(super) fn quic_endpoint(state: &NetworkState) -> Option<Arc<quinn::Endpoint>> {
     state
         .connection_broker
         .as_ref()
@@ -566,7 +566,7 @@ fn accept_extends_grant(created_at: i64, expires_at: i64, now: i64) -> Option<bo
 ///
 /// Nothing is sent on the connection this makes. If it does complete, the
 /// recipient's accept loop sees a connection with no stream and drops it.
-fn spawn_punch(
+pub(super) fn spawn_punch(
     endpoint: Arc<quinn::Endpoint>,
     seed: [u8; 32],
     friend: [u8; 16],

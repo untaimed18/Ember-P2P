@@ -86,6 +86,13 @@ pub const ATTACH_AUTO_ACCEPT_DEFAULT_MB: u64 = 25;
 /// or above, so this claims a byte in the gap between them.
 pub const ATTACH_STREAM_MSG_TYPE: u8 = 0x07;
 
+/// First byte of a room transfer's data stream.
+///
+/// Same request, header and verified chunks as an attachment; its own byte
+/// because the accept loop authorizes the two differently — a friend against
+/// the grant table, a room member against the transfer offered to them.
+pub const ROOM_XFER_STREAM_MSG_TYPE: u8 = 0x08;
+
 /// Wire version of the stream request and of the signalling payloads.
 pub const ATTACH_VERSION: u8 = 1;
 
@@ -270,9 +277,23 @@ pub struct AttachRequest {
     pub start_chunk: u32,
 }
 
+#[cfg(test)]
 pub fn encode_attach_request(req: &AttachRequest) -> Vec<u8> {
+    encode_stream_request(ATTACH_STREAM_MSG_TYPE, req)
+}
+
+#[cfg(test)]
+pub fn decode_attach_request(bytes: &[u8]) -> Option<AttachRequest> {
+    decode_stream_request(ATTACH_STREAM_MSG_TYPE, bytes)
+}
+
+/// A stream request under `stream_type`: [`ATTACH_STREAM_MSG_TYPE`] for a chat
+/// attachment, [`ROOM_XFER_STREAM_MSG_TYPE`] for a room transfer. The layout
+/// is shared; only the first byte, and so who the accept loop asks to
+/// authorize it, differs.
+pub fn encode_stream_request(stream_type: u8, req: &AttachRequest) -> Vec<u8> {
     let mut out = Vec::with_capacity(ATTACH_REQUEST_LEN);
-    out.push(ATTACH_STREAM_MSG_TYPE);
+    out.push(stream_type);
     out.push(ATTACH_VERSION);
     out.extend_from_slice(&[0u8; 4]);
     out.extend_from_slice(&req.xfer_id);
@@ -282,11 +303,11 @@ pub fn encode_attach_request(req: &AttachRequest) -> Vec<u8> {
     out
 }
 
-pub fn decode_attach_request(bytes: &[u8]) -> Option<AttachRequest> {
+pub fn decode_stream_request(stream_type: u8, bytes: &[u8]) -> Option<AttachRequest> {
     if bytes.len() != ATTACH_REQUEST_LEN {
         return None;
     }
-    if bytes[0] != ATTACH_STREAM_MSG_TYPE || bytes[1] != ATTACH_VERSION {
+    if bytes[0] != stream_type || bytes[1] != ATTACH_VERSION {
         return None;
     }
     let mut xfer_id = [0u8; 16];

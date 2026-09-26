@@ -26,6 +26,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::channel::{
@@ -33,15 +35,87 @@ use super::channel::{
     XFER_WINDOW_BLOCKS,
 };
 
+/// Where finished room transfers land, beside `Downloads` and `Chat Files`
+/// under the download folder. Not `Downloads`: that folder is shared by
+/// default, and a file a member handed you in a room is not one you chose to
+/// publish to the network.
+pub const CHANNEL_FILES_DIR: &str = "Channel Files";
+
 /// Progress is reported to the UI in steps this many percent apart.
 ///
-/// A 100 MB file is a hundred thousand blocks; emitting an IPC message per
+/// A 2 GiB file is two million blocks; emitting an IPC message per
 /// block would cost more than the transfer.
 const PROGRESS_STEP_PCT: u8 = 1;
 
 /// How much longer than the recipient's prompt the sender holds an unanswered
 /// offer open. See [`SendState::is_stalled`].
 const OFFER_GRACE_SECS: u64 = 30;
+
+/// A transfer the QUIC accept loop may serve as a stream.
+///
+/// Kept apart from [`SendState`] because the accept loop runs on its own task
+/// and cannot reach `NetworkState`. The event loop keeps the map in step with
+/// `xfer_send`, so a transfer that ends stops being servable within a tick.
+pub struct StreamGrant {
+    /// The member the file was offered to. The accept loop compares this with
+    /// the key the dialer's certificate proved, never with anything it says.
+    pub peer: [u8; 32],
+    pub path: PathBuf,
+    pub size: u64,
+    pub root: [u8; 32],
+    /// See `channel::derive_xfer_stream_capability`.
+    pub capability: [u8; 32],
+    pub progress: Arc<StreamProgress>,
+}
+
+/// How far a served stream has got, written by the accept loop and read back
+/// by the event loop for the progress bar and the stall timer.
+#[derive(Default)]
+pub struct StreamProgress {
+    /// Absolute bytes handed to the stream.
+    pub position: AtomicU64,
+    /// A stream has opened for the transfer, which only its recipient can do
+    /// after accepting — so it stands in for an accept that was lost.
+    pub opened: AtomicBool,
+}
+
+pub type StreamGrants = Arc<parking_lot::Mutex<HashMap<[u8; 16], StreamGrant>>>;
+
+/// What to serve for `xfer_id` to the member whose key the QUIC handshake
+/// proved: `(path, size, root, capability)`, or nothing when the transfer was
+/// offered to someone else or has ended.
+pub fn stream_grant_for(
+    grants: &StreamGrants,
+    xfer_id: &[u8; 16],
+    peer: &[u8; 32],
+) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])> {
+    let map = grants.lock();
+    let grant = map.get(xfer_id).filter(|g| g.peer == *peer)?;
+    Some((grant.path.clone(), grant.size, grant.root, grant.capability))
+}
+
+/// Record how far a served stream has got. False once the grant is gone,
+/// which ends a stream already running; a contended lock is not an ending,
+/// and the next chunk looks again.
+pub fn note_stream_served(
+    grants: &StreamGrants,
+    xfer_id: &[u8; 16],
+    peer: &[u8; 32],
+    position: u64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(map) = grants.try_lock() else {
+        return true;
+    };
+    match map.get(xfer_id).filter(|g| g.peer == *peer) {
+        Some(grant) => {
+            grant.progress.opened.store(true, Ordering::Relaxed);
+            grant.progress.position.fetch_max(position, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
 
 /// A file we have offered, or are sending.
 pub struct SendState {
@@ -75,6 +149,8 @@ pub struct SendState {
     /// seeking a `BufReader` discards its buffer, so skipping the redundant
     /// seek is what makes the buffering worth having.
     read_pos: Option<u64>,
+    /// Bytes served over a QUIC stream, when the transfer went that way.
+    streamed: u64,
     reported_pct: u8,
 }
 
@@ -101,7 +177,23 @@ impl SendState {
             updated_at: Instant::now(),
             handle: None,
             read_pos: None,
+            streamed: 0,
             reported_pct: 0,
+        }
+    }
+
+    /// Record where a served stream has got to. A stream only opens after the
+    /// recipient accepted, so it also counts as the accept. Only movement
+    /// feeds the stall timer: this is called every tick while a stream is
+    /// open, and one whose recipient vanished must still time out.
+    pub fn note_streamed(&mut self, position: u64) {
+        if !self.accepted {
+            self.accepted = true;
+            self.updated_at = Instant::now();
+        }
+        if position > self.streamed {
+            self.streamed = position.min(self.size);
+            self.updated_at = Instant::now();
         }
     }
 
@@ -131,16 +223,16 @@ impl SendState {
     pub fn bytes_sent(&self) -> u64 {
         self.sent_blocks
             .saturating_mul(XFER_BLOCK_SIZE as u64)
+            .max(self.streamed)
             .min(self.size)
     }
 
     /// Percentage to report, if it has moved a whole step since last time.
     pub fn progress_step(&mut self) -> Option<u8> {
-        let total = self.total_blocks();
         let pct = self
-            .sent_blocks
+            .bytes_sent()
             .saturating_mul(100)
-            .checked_div(total)
+            .checked_div(self.size)
             .unwrap_or(100)
             .min(100) as u8;
         if pct / PROGRESS_STEP_PCT > self.reported_pct / PROGRESS_STEP_PCT {
@@ -257,6 +349,18 @@ pub struct RecvState {
     /// Blocks asked for, and when. Used to re-ask rather than to give up.
     inflight: HashMap<u64, Instant>,
     pub updated_at: Instant,
+    /// A QUIC stream is writing the part file. No blocks are asked for until
+    /// it ends: it writes through its own handle onto the same file cursor, so
+    /// the two must never write at once.
+    streaming: bool,
+    /// Verified bytes the stream has written.
+    streamed: u64,
+    /// Every chunk a stream wrote was checked against the offered root, so
+    /// completion need not read the whole file back to hash it.
+    pub stream_verified: bool,
+    /// No block below this is missing, so [`Self::next_requests`] starts
+    /// here rather than walking every block already received each tick.
+    first_missing: u64,
     reported_pct: u8,
 }
 
@@ -298,12 +402,70 @@ impl RecvState {
             total_blocks,
             inflight: HashMap::new(),
             updated_at: Instant::now(),
+            streaming: false,
+            streamed: 0,
+            stream_verified: false,
+            first_missing: 0,
             reported_pct: 0,
         }
     }
 
+    fn advance_first_missing(&mut self) {
+        while self.first_missing < self.total_blocks && self.has(self.first_missing) {
+            self.first_missing += 1;
+        }
+    }
+
     pub fn bytes_received(&self) -> u64 {
-        (self.have_blocks.saturating_mul(XFER_BLOCK_SIZE as u64)).min(self.size)
+        self.have_blocks
+            .saturating_mul(XFER_BLOCK_SIZE as u64)
+            .max(self.streamed)
+            .min(self.size)
+    }
+
+    /// A clone of the part file's handle for a stream to write through.
+    ///
+    /// Flushed first so nothing buffered here lands on top of it later. The
+    /// clone shares this handle's cursor, which is why block requests stop
+    /// while streaming.
+    pub fn stream_handle(&mut self) -> std::io::Result<std::fs::File> {
+        self.file.flush()?;
+        self.write_pos = None;
+        self.file.get_ref().try_clone()
+    }
+
+    pub fn set_streaming(&mut self, streaming: bool) {
+        self.streaming = streaming;
+        self.updated_at = Instant::now();
+    }
+
+    /// Verified bytes a running stream has written, for the progress bar and
+    /// the stall timer.
+    pub fn note_streamed(&mut self, verified: u64) {
+        if verified > self.streamed {
+            self.streamed = verified.min(self.size);
+            self.updated_at = Instant::now();
+        }
+    }
+
+    /// Take over what a stream verified before it stopped, so the block
+    /// protocol asks only for the rest. `verified` is a prefix of the file;
+    /// a block counts only if it lies wholly inside it.
+    pub fn adopt_verified_prefix(&mut self, verified: u64) {
+        let verified = verified.min(self.size);
+        let whole = verified / XFER_BLOCK_SIZE as u64;
+        let tail_done = verified == self.size && self.total_blocks > 0;
+        let upto = if tail_done { self.total_blocks } else { whole.min(self.total_blocks) };
+        for block in 0..upto {
+            if !self.has(block) {
+                self.set(block);
+                self.have_blocks = self.have_blocks.saturating_add(1);
+            }
+        }
+        self.advance_first_missing();
+        self.inflight.clear();
+        self.write_pos = None;
+        self.updated_at = Instant::now();
     }
 
     fn has(&self, block: u64) -> bool {
@@ -324,6 +486,12 @@ impl RecvState {
     /// re-requesting after a timeout races with the original arriving late,
     /// and both copies are identical.
     pub fn write_block(&mut self, offset: u64, data: &[u8]) -> std::io::Result<bool> {
+        // A late answer to a request made before the stream took over. The
+        // stream writes the same bytes, and writing these on the shared cursor
+        // while it runs could land either one at the wrong offset.
+        if self.streaming {
+            return Ok(false);
+        }
         if data.is_empty() || offset >= self.size {
             return Ok(false);
         }
@@ -361,6 +529,7 @@ impl RecvState {
         self.write_pos = Some(offset + data.len() as u64);
         self.set(block);
         self.have_blocks = self.have_blocks.saturating_add(1);
+        self.advance_first_missing();
         Ok(true)
     }
 
@@ -381,10 +550,11 @@ impl RecvState {
     /// Percentage to report, if it has moved a whole step since last time.
     pub fn progress_step(&mut self) -> Option<u8> {
         let pct = self
-            .have_blocks
+            .bytes_received()
             .saturating_mul(100)
-            .checked_div(self.total_blocks)
-            .unwrap_or(100) as u8;
+            .checked_div(self.size)
+            .unwrap_or(100)
+            .min(100) as u8;
         if pct / PROGRESS_STEP_PCT > self.reported_pct / PROGRESS_STEP_PCT || pct >= 100 {
             self.reported_pct = pct;
             return Some(pct);
@@ -398,6 +568,9 @@ impl RecvState {
     /// gone unanswered past [`XFER_BLOCK_TIMEOUT_MS`] is eligible again, which
     /// is the whole of the loss recovery: nothing is lost, it is just late.
     pub fn next_requests(&mut self, now: Instant) -> Vec<(u64, u16)> {
+        if self.streaming {
+            return Vec::new();
+        }
         let timeout = Duration::from_millis(XFER_BLOCK_TIMEOUT_MS);
         self.inflight
             .retain(|_, at| now.saturating_duration_since(*at) <= timeout);
@@ -407,7 +580,7 @@ impl RecvState {
         }
         let mut runs: Vec<(u64, u16)> = Vec::new();
         let mut run: Option<(u64, u16)> = None;
-        for block in 0..self.total_blocks {
+        for block in self.first_missing..self.total_blocks {
             if budget == 0 {
                 break;
             }
@@ -498,6 +671,128 @@ mod tests {
             file,
         );
         (state, TempDir(dir))
+    }
+
+    /// While a stream writes the part file, nothing is asked for and a late
+    /// block is dropped rather than written over it.
+    #[test]
+    fn a_streaming_receive_asks_for_nothing_and_writes_no_blocks() {
+        let size = XFER_BLOCK_SIZE as u64 * 3;
+        let (mut recv, _dir) = temp_recv(size);
+        recv.set_streaming(true);
+        assert!(recv.next_requests(Instant::now()).is_empty());
+        assert!(!recv
+            .write_block(0, &block_bytes(0, XFER_BLOCK_SIZE))
+            .unwrap());
+        assert_eq!(recv.bytes_received(), 0);
+        recv.note_streamed(XFER_BLOCK_SIZE as u64 + 10);
+        assert_eq!(recv.bytes_received(), XFER_BLOCK_SIZE as u64 + 10);
+        recv.set_streaming(false);
+        assert!(!recv.next_requests(Instant::now()).is_empty());
+    }
+
+    /// A stream that stopped partway hands its verified prefix over: whole
+    /// blocks inside it count as received, the one it cut through does not.
+    #[test]
+    fn a_verified_prefix_becomes_received_blocks() {
+        let size = XFER_BLOCK_SIZE as u64 * 4 + 7;
+        let (mut recv, _dir) = temp_recv(size);
+        recv.adopt_verified_prefix(XFER_BLOCK_SIZE as u64 * 2 + 100);
+        assert_eq!(recv.have_blocks, 2);
+        let runs = recv.next_requests(Instant::now());
+        assert_eq!(runs.first().map(|r| r.0), Some(2), "asks from the block it cut through");
+
+        let (mut whole, _dir2) = temp_recv(size);
+        whole.adopt_verified_prefix(size);
+        assert!(whole.is_complete(), "the short tail counts once the prefix is the file");
+    }
+
+    fn grant_table(peer: [u8; 32]) -> StreamGrants {
+        let grants = StreamGrants::default();
+        grants.lock().insert(
+            [9u8; 16],
+            StreamGrant {
+                peer,
+                path: PathBuf::from("offered.bin"),
+                size: 10,
+                root: [4u8; 32],
+                capability: [5u8; 32],
+                progress: Default::default(),
+            },
+        );
+        grants
+    }
+
+    /// Only the member the file was offered to is served, and only while the
+    /// transfer holds a grant.
+    #[test]
+    fn a_stream_grant_is_served_only_to_its_member() {
+        let grants = grant_table([1u8; 32]);
+        assert_eq!(
+            stream_grant_for(&grants, &[9u8; 16], &[1u8; 32]),
+            Some((PathBuf::from("offered.bin"), 10, [4u8; 32], [5u8; 32]))
+        );
+        assert!(stream_grant_for(&grants, &[9u8; 16], &[2u8; 32]).is_none());
+        assert!(stream_grant_for(&grants, &[8u8; 16], &[1u8; 32]).is_none());
+    }
+
+    #[test]
+    fn serving_records_progress_and_stops_once_the_grant_is_gone() {
+        use std::sync::atomic::Ordering;
+        let grants = grant_table([1u8; 32]);
+        assert!(!note_stream_served(&grants, &[9u8; 16], &[2u8; 32], 4));
+        assert!(note_stream_served(&grants, &[9u8; 16], &[1u8; 32], 6));
+        assert!(note_stream_served(&grants, &[9u8; 16], &[1u8; 32], 3), "never walks back");
+        {
+            let map = grants.lock();
+            let progress = &map[&[9u8; 16]].progress;
+            assert!(progress.opened.load(Ordering::Relaxed));
+            assert_eq!(progress.position.load(Ordering::Relaxed), 6);
+        }
+        grants.lock().clear();
+        assert!(!note_stream_served(&grants, &[9u8; 16], &[1u8; 32], 8));
+    }
+
+    /// Requests start at the first block still missing, and a block that
+    /// arrived out of order does not move that point past the gap before it.
+    #[test]
+    fn requests_start_at_the_first_missing_block() {
+        let size = XFER_BLOCK_SIZE as u64 * 6;
+        let (mut recv, _dir) = temp_recv(size);
+        for block in [0u64, 1, 3] {
+            let offset = block * XFER_BLOCK_SIZE as u64;
+            assert!(recv.write_block(offset, &block_bytes(block, XFER_BLOCK_SIZE)).unwrap());
+        }
+        assert_eq!(recv.first_missing, 2);
+        let runs = recv.next_requests(Instant::now());
+        assert_eq!(runs, vec![(2, 1), (4, 2)]);
+        let offset = 2 * XFER_BLOCK_SIZE as u64;
+        assert!(recv.write_block(offset, &block_bytes(2, XFER_BLOCK_SIZE)).unwrap());
+        assert_eq!(recv.first_missing, 4, "skips the block that was already there");
+    }
+
+    #[test]
+    fn a_served_stream_counts_as_accepted_progress() {
+        let (mut send, _dir, _) = temp_send(4);
+        assert!(!send.accepted);
+        send.note_streamed(XFER_BLOCK_SIZE as u64 * 2);
+        assert!(send.accepted);
+        assert_eq!(send.bytes_sent(), XFER_BLOCK_SIZE as u64 * 2);
+        assert_eq!(send.progress_step(), Some(50));
+    }
+
+    /// A stream that stopped moving is not kept alive by being looked at.
+    #[test]
+    fn a_stuck_stream_still_stalls() {
+        let (mut send, _dir, _) = temp_send(4);
+        send.note_streamed(100);
+        send.updated_at = Instant::now()
+            .checked_sub(Duration::from_secs(XFER_STALL_SECS + 1))
+            .expect("clock far enough along");
+        send.note_streamed(100);
+        assert!(send.is_stalled(Instant::now()));
+        send.note_streamed(200);
+        assert!(!send.is_stalled(Instant::now()));
     }
 
     /// Position-dependent bytes, so a block written or read at the wrong

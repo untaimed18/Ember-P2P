@@ -532,3 +532,9 @@ export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
   return invoke('list_channel_transfers');
 }
 
+/** Open the folder received room transfers are saved to. It is not shared,
+ *  unlike `Downloads`. */
+export async function openChannelFilesFolder(): Promise<void> {
+  return invoke('open_channel_files_folder');
+}
+

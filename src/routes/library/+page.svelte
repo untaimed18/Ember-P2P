@@ -70,6 +70,8 @@
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { openChatFilesFolder } from '$lib/api/friends';
+  import { openChannelFilesFolder } from '$lib/api/channels';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { appSettings } from '$lib/stores/settings';
@@ -2798,6 +2800,30 @@
 <div class="page-header">
   <h2>{m.library_title()}</h2>
   <div class="header-actions">
+    <!-- Files people handed you, kept apart from Downloads and not shared. -->
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_chat_files_title()}
+      onclick={() => void openChatFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_chat_files()}
+    </button>
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_channel_files_title()}
+      onclick={() => void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_channel_files()}
+    </button>
+    <span class="header-divider" aria-hidden="true"></span>
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
       {#if collectionLoading}
         <span class="spinner-inline" aria-hidden="true"></span> {m.library_opening()}
@@ -4091,7 +4117,26 @@
     flex-wrap: wrap;
   }
   .page-header h2 { margin: 0; }
-  .header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  .folder-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .folder-btn svg {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+  }
+
+  .header-divider {
+    width: 1px;
+    align-self: stretch;
+    margin: 4px 2px;
+    background: var(--border);
+  }
 
   .error-banner {
     display: flex;

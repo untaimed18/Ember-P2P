@@ -18,8 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::attach::{
     attach_chunk_count, attach_file_info_len, attach_stream_tag, attach_tags_match,
-    decode_attach_file_info, encode_attach_file_info, encode_attach_request, AttachFileInfo,
-    AttachRequest, AttachStreamStatus, ATTACH_CHUNK_SIZE, ATTACH_REQUEST_TAIL_LEN,
+    decode_attach_file_info, encode_attach_file_info, AttachFileInfo, AttachRequest,
+    AttachStreamStatus, ATTACH_CHUNK_SIZE, ATTACH_REQUEST_TAIL_LEN,
 };
 use super::transfer::HashTree;
 
@@ -265,6 +265,26 @@ pub fn prewarm_attachment_hash(path: &std::path::Path) {
     }
 }
 
+/// Hash a file about to be offered and keep the tree for the stream that will
+/// serve it, so the file is read once rather than once to offer and again to
+/// serve. Blocking: a read of the whole file.
+pub fn hash_for_serving(path: &std::path::Path) -> Result<std::sync::Arc<HashTree>, String> {
+    let stamp = std::fs::File::open(path)
+        .and_then(|file| FileStamp::of(path, &file))
+        .map_err(|e| e.to_string())?;
+    match lookup_hash(&stamp) {
+        HashLookup::Ready(tree) => Ok(tree),
+        HashLookup::Start(tx, rx) => {
+            run_hash_job(stamp, tx);
+            let outcome = rx.borrow().clone();
+            outcome.unwrap_or_else(|| Err("attachment hash job went away".into()))
+        }
+        // Another caller is already reading it, and a blocking caller cannot
+        // wait on that job; one more read is the rare case.
+        HashLookup::Wait(_) => hash_stamped_file(&stamp),
+    }
+}
+
 /// Bytes the sender writes between checks of the upload cap.
 const ATTACH_SEND_SLICE: usize = 16 * 1024;
 
@@ -373,6 +393,35 @@ pub async fn serve_attachment<R, W, F, P>(
     send: &mut W,
     prefix: &[u8; 7],
     capability_for: F,
+    on_progress: P,
+    limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
+    P: FnMut(&[u8; 16], u64, u64) -> bool,
+{
+    serve_stream(
+        super::attach::ATTACH_STREAM_MSG_TYPE,
+        recv,
+        send,
+        prefix,
+        capability_for,
+        on_progress,
+        limiter,
+    )
+    .await
+}
+
+/// [`serve_attachment`] for a request under `stream_type`. A room transfer
+/// serves through this with [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`].
+pub async fn serve_stream<R, W, F, P>(
+    stream_type: u8,
+    recv: &mut R,
+    send: &mut W,
+    prefix: &[u8; 7],
+    capability_for: F,
     mut on_progress: P,
     limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
 ) -> anyhow::Result<u64>
@@ -388,7 +437,7 @@ where
     let mut full = Vec::with_capacity(7 + tail.len());
     full.extend_from_slice(prefix);
     full.extend_from_slice(&tail);
-    let Some(request) = super::attach::decode_attach_request(&full) else {
+    let Some(request) = super::attach::decode_stream_request(stream_type, &full) else {
         refuse(send, AttachStreamStatus::Unknown).await?;
         anyhow::bail!("malformed attachment stream request");
     };
@@ -568,6 +617,42 @@ pub async fn fetch_attachment_waiting<R, W, P>(
     size: u64,
     root: &[u8; 32],
     part: std::fs::File,
+    on_progress: P,
+    status_wait: std::time::Duration,
+    status_waited: &mut std::time::Duration,
+) -> Result<FetchOutcome, FetchError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    P: FnMut(u64, u64),
+{
+    fetch_stream_waiting(
+        super::attach::ATTACH_STREAM_MSG_TYPE,
+        recv,
+        send,
+        xfer_id,
+        capability,
+        size,
+        root,
+        part,
+        on_progress,
+        status_wait,
+        status_waited,
+    )
+    .await
+}
+
+/// [`fetch_attachment_waiting`] with the request sent under `stream_type`.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_stream_waiting<R, W, P>(
+    stream_type: u8,
+    recv: &mut R,
+    send: &mut W,
+    xfer_id: &[u8; 16],
+    capability: &[u8; 32],
+    size: u64,
+    root: &[u8; 32],
+    part: std::fs::File,
     mut on_progress: P,
     status_wait: std::time::Duration,
     status_waited: &mut std::time::Duration,
@@ -595,7 +680,7 @@ where
     };
     tokio::time::timeout(
         ATTACH_IO_TIMEOUT,
-        send.write_all(&encode_attach_request(&request)),
+        send.write_all(&super::attach::encode_stream_request(stream_type, &request)),
     )
     .await??;
     tokio::time::timeout(ATTACH_IO_TIMEOUT, send.flush()).await??;
@@ -715,7 +800,7 @@ mod tests {
         )
         .await
     }
-    use super::super::attach::derive_attach_capability;
+    use super::super::attach::{derive_attach_capability, encode_attach_request};
     use ed25519_dalek::SigningKey;
     use std::path::Path;
 
@@ -889,6 +974,27 @@ mod tests {
         );
         assert!(matches!(lookup_hash(&stamp), HashLookup::Start(..)));
         hash_cache().lock().unwrap().remove(&stamp);
+    }
+
+    /// The tree built to put a room offer together is the one the stream
+    /// serves from; the file is not read a second time.
+    #[tokio::test]
+    async fn a_file_hashed_for_its_offer_is_served_without_hashing_again() {
+        let data = b"offered in a room".to_vec();
+        let source = temp_path("src-offer");
+        std::fs::write(&source, &data).expect("write");
+        let hashed = source.clone();
+        let tree = tokio::task::spawn_blocking(move || hash_for_serving(&hashed))
+            .await
+            .expect("join")
+            .expect("hash");
+        assert_eq!(tree.root_hash, HashTree::from_data(&data).root_hash);
+        let outcome = serve_once(&source, data.len() as u64, tree.root_hash, [23u8; 16])
+            .await
+            .expect("fetch");
+        assert!(outcome.complete);
+        assert_eq!(times_hashed(&source), 1);
+        let _ = std::fs::remove_file(&source);
     }
 
     #[tokio::test]
@@ -1162,6 +1268,93 @@ mod tests {
         assert!(outcome.complete);
         assert_eq!(std::fs::read(&part).expect("part"), data);
         assert_eq!(server_task.await.expect("server task"), size);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&part);
+    }
+
+    /// A room transfer rides the same stream under its own first byte, and a
+    /// server reads only its own type: a room request put to the chat server
+    /// is refused rather than served.
+    #[tokio::test]
+    async fn a_room_stream_round_trips_and_is_not_read_as_a_chat_one() {
+        use super::super::attach::{encode_stream_request, ROOM_XFER_STREAM_MSG_TYPE};
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE + 5).map(|i| (i % 13) as u8).collect();
+        let source = temp_path("room-src");
+        std::fs::write(&source, &data).expect("write");
+        let root = HashTree::from_data(&data).root_hash;
+        let size = data.len() as u64;
+        let (xfer_id, cap) = ([21u8; 16], [22u8; 32]);
+
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
+        let served = source.clone();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            serve_stream(
+                ROOM_XFER_STREAM_MSG_TYPE,
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), size, root, cap)),
+                |_, _, _| true,
+                None,
+            )
+            .await
+        });
+        let part = temp_path("room-part");
+        let outcome = fetch_stream_waiting(
+            ROOM_XFER_STREAM_MSG_TYPE,
+            &mut client_r,
+            &mut client_w,
+            &xfer_id,
+            &cap,
+            size,
+            &root,
+            open_part(&part),
+            |_, _| {},
+            ATTACH_STATUS_TIMEOUT,
+            &mut std::time::Duration::default(),
+        )
+        .await
+        .expect("room fetch");
+        assert!(outcome.complete);
+        assert_eq!(std::fs::read(&part).expect("part"), data);
+        let _ = server.await;
+
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 16);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 16);
+        let served = source.clone();
+        let chat_server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await.expect("prefix");
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), size, root, cap)),
+                |_, _, _| true,
+                None,
+            )
+            .await
+        });
+        let request = AttachRequest {
+            xfer_id,
+            tag: attach_stream_tag(&cap, &xfer_id),
+            start_chunk: 0,
+        };
+        client_w
+            .write_all(&encode_stream_request(ROOM_XFER_STREAM_MSG_TYPE, &request))
+            .await
+            .expect("write");
+        client_w.flush().await.expect("flush");
+        let mut status = [0u8; 1];
+        client_r.read_exact(&mut status).await.expect("status");
+        assert_eq!(
+            AttachStreamStatus::from_byte(status[0]),
+            Some(AttachStreamStatus::Unknown)
+        );
+        assert!(chat_server.await.expect("join").is_err());
         let _ = std::fs::remove_file(&source);
         let _ = std::fs::remove_file(&part);
     }

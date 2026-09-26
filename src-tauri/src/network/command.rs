@@ -3214,7 +3214,7 @@ async fn handle_command_inner(
             };
             state.xfer_send.insert(
                 xfer_id,
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path),
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone()),
             );
             let plain = ember::channel::encode_xfer_offer(
                 &key,
@@ -3248,6 +3248,10 @@ async fn handle_command_inner(
                 "offered",
             );
             let _ = tx.send(Ok(()));
+            // After the offer, so a recipient on an older build has the
+            // offer it understands before a frame it will drop.
+            offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root)
+                .await;
         }
 
         NetworkCommand::RespondChannelTransfer {
@@ -3366,7 +3370,7 @@ async fn handle_command_inner(
                         )?;
                         let done_dir = crate::security::filesystem::prepare_approved_subdir(
                             &root,
-                            "Downloads",
+                            ember::xfer::CHANNEL_FILES_DIR,
                             &allowed,
                         )?;
                         let (part_path, file) =
@@ -3449,6 +3453,16 @@ async fn handle_command_inner(
                 if accept { "active" } else { "declined" },
             );
             let _ = tx.send(Ok(()));
+            if accept {
+                if !start_xfer_stream_fetch(socket, state, db, xfer_id).await {
+                    debug!(
+                        "Ember Transfer: {} will use the block protocol (no direct stream)",
+                        hex::encode(xfer_id)
+                    );
+                }
+            } else {
+                state.xfer_stream_ports.remove(&xfer_id);
+            }
         }
 
         NetworkCommand::CancelChannelTransfer { xfer_id, tx } => {

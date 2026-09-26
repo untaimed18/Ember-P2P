@@ -2035,6 +2035,7 @@ pub fn run() {
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,
+            commands::channels::open_channel_files_folder,
             commands::chat_window::open_chat_window,
             commands::chat_window::close_chat_window,
             commands::chat_window::focus_main_window,

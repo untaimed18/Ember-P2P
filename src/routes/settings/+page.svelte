@@ -20,6 +20,7 @@
   import {
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
+    openChannelFilesFolder,
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
@@ -3767,15 +3768,23 @@
 
           <div class="field">
             <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
-            <select
-              id="channel-file-offers"
-              bind:value={settings.channel_file_offers}
-              onchange={() => void applyFriendTogglesLive()}
-            >
-              <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
-              <option value="friends">{m.settings_channel_file_offers_friends()}</option>
-              <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
-            </select>
+            <div class="chat-attach-row channel-offers-row">
+              <select
+                id="channel-file-offers"
+                bind:value={settings.channel_file_offers}
+                onchange={() => void applyFriendTogglesLive()}
+              >
+                <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
+                <option value="friends">{m.settings_channel_file_offers_friends()}</option>
+                <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
+              </select>
+              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                </svg>
+                {m.settings_channel_files_open_folder()}
+              </button>
+            </div>
             <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             <!--
               This select persists on change (`applyFriendTogglesLive`) while
@@ -6260,5 +6269,10 @@
     width: 14px;
     height: 14px;
     flex-shrink: 0;
+  }
+
+  .channel-offers-row select {
+    flex: 1;
+    min-width: 200px;
   }
 </style>

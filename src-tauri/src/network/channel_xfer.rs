@@ -97,6 +97,521 @@ pub(super) async fn send_xfer_frame(
     overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
 }
 
+// --- QUIC streams ------------------------------------------------------------
+//
+// A transfer both ends can reach directly moves over one QUIC stream: the
+// sender names its port after the offer, the recipient dials it on accept, and
+// the bytes arrive in 256 KiB chunks each checked against the offered root.
+// QUIC brings the congestion control and loss recovery the block protocol does
+// not have, so the block protocol stays only as the fallback — for a peer on an
+// older build, one reachable only through a relay, or a stream that failed.
+
+/// Dials a stream fetch makes before handing the transfer to the block
+/// protocol. The second one is the one the sender's punch is for.
+const STREAM_FETCH_ATTEMPTS: u32 = 2;
+
+/// How long one dial may take. Short, because a failure here only means the
+/// transfer goes the slow way, and the user is watching it not move.
+const STREAM_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long the first stream waits for the sender's status byte, which comes
+/// after the sender has the file's hash tree. Under the stall timeout, so a
+/// sender that never answers is fallen back from rather than timed out.
+const STREAM_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Stream ports kept for offers that have not been matched to their offer yet.
+const STREAM_PORTS_MAX: usize = 64;
+
+/// How long a stream port waits for an offer it arrived ahead of.
+const STREAM_PORT_ORPHAN_SECS: u64 = 30;
+
+/// A receive running over a QUIC stream.
+pub(super) struct StreamFetch {
+    handle: tokio::task::JoinHandle<()>,
+    /// Verified bytes the task has written, absolute.
+    verified: Arc<std::sync::atomic::AtomicU64>,
+    part_path: std::path::PathBuf,
+}
+
+/// How a stream fetch ended, posted back to the event loop.
+pub(super) struct StreamFetchOutcome {
+    xfer_id: [u8; 16],
+    result: StreamFetchResult,
+}
+
+enum StreamFetchResult {
+    /// Every chunk arrived and verified.
+    Complete,
+    /// The stream could not be used, or stopped short. The block protocol
+    /// takes over from `verified`.
+    FallBack { verified: u64 },
+    /// The sender's file no longer matches the offer. The block protocol would
+    /// fail the same check at the end, so the transfer stops here.
+    SourceGone,
+    /// A chunk failed its hash.
+    Corrupt,
+}
+
+/// A member's address, when we hold a live direct session with them. A member
+/// reached only through a relay or the overlay has none worth dialling.
+fn member_direct_addr(state: &NetworkState, member: &[u8; 32]) -> Option<SocketAddr> {
+    let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(member));
+    let contact = state.ember_dht.routing().get_contact(&node_id)?;
+    ember_has_live_session(state, contact).then_some(contact.addr)
+}
+
+/// After an offer: make the transfer servable as a stream and tell the
+/// recipient where to fetch it. Quietly does nothing when either end lacks a
+/// direct path; the block protocol carries it then, exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn offer_xfer_stream(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    xfer_id: [u8; 16],
+    key: [u8; 32],
+    path: std::path::PathBuf,
+    size: u64,
+    root: [u8; 32],
+) {
+    if chat_attach::quic_endpoint(state).is_none() {
+        return;
+    }
+    let Some(peer_addr) = member_direct_addr(state, &peer) else {
+        return;
+    };
+    let Some(port) = chat_attach::quic_port_for(state, Some(peer_addr)) else {
+        return;
+    };
+    let Some(capability) = ember::channel::derive_xfer_stream_capability(
+        &state.local_ed25519_seed,
+        &peer,
+        &channel_id,
+        &xfer_id,
+    ) else {
+        return;
+    };
+    // The stream's hash tree is already cached: the offer command built it
+    // through `hash_for_serving`.
+    state.xfer_grants.lock().insert(
+        xfer_id,
+        ember::xfer::StreamGrant {
+            peer,
+            path,
+            size,
+            root,
+            capability,
+            progress: Default::default(),
+        },
+    );
+    let plain = ember::channel::encode_xfer_stream(
+        &key,
+        &state.local_ed25519_pubkey,
+        &peer,
+        &xfer_id,
+        ember::channel::XferStreamRole::Serve,
+        port,
+    );
+    send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+}
+
+/// A stream frame from the other end of a transfer.
+pub(super) fn apply_xfer_stream(
+    state: &mut NetworkState,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    role: ember::channel::XferStreamRole,
+    port: u16,
+) {
+    match role {
+        ember::channel::XferStreamRole::Serve => {
+            // Kept for the accept. It may arrive ahead of its offer, so an
+            // unmatched one is held briefly rather than refused; one matched
+            // to a different sender is someone else's transfer id.
+            if let Some(offer) = state.xfer_pending.get(&xfer_id) {
+                if offer.peer != sender {
+                    return;
+                }
+            } else if state.xfer_recv.contains_key(&xfer_id)
+                || state.xfer_stream_ports.len() >= STREAM_PORTS_MAX
+            {
+                return;
+            }
+            state
+                .xfer_stream_ports
+                .insert(xfer_id, (sender, port, std::time::Instant::now()));
+        }
+        ember::channel::XferStreamRole::Fetch => {
+            // The recipient is dialling us. Dial them back for a moment so a
+            // NAT in front of us has a mapping their dial can come in on.
+            let Some(send) = state.xfer_send.get(&xfer_id) else {
+                return;
+            };
+            if send.peer != sender || !state.xfer_grants.lock().contains_key(&xfer_id) {
+                return;
+            }
+            let (Some(endpoint), Some(addr)) = (
+                chat_attach::quic_endpoint(state),
+                member_direct_addr(state, &sender),
+            ) else {
+                return;
+            };
+            let Some(target) = chat_attach::dial_target(addr.ip(), port) else {
+                return;
+            };
+            chat_attach::spawn_punch(
+                endpoint,
+                state.local_ed25519_seed,
+                ember::channel::channel_id_from_pubkey(&sender),
+                target,
+            );
+        }
+    }
+}
+
+/// After accepting: fetch the transfer over a stream if the sender offered
+/// one and we can reach it. Returns whether a fetch started; when it did not,
+/// the block protocol runs as it always has.
+pub(super) async fn start_xfer_stream_fetch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    xfer_id: [u8; 16],
+) -> bool {
+    let Some((sender, port, _)) = state.xfer_stream_ports.remove(&xfer_id) else {
+        return false;
+    };
+    let Some((channel_id, peer, key, size, root)) = state
+        .xfer_recv
+        .get(&xfer_id)
+        .map(|r| (r.channel_id, r.peer, r.key, r.size, r.root))
+    else {
+        return false;
+    };
+    if peer != sender {
+        return false;
+    }
+    let Some(endpoint) = chat_attach::quic_endpoint(state) else {
+        return false;
+    };
+    let Some(peer_addr) = member_direct_addr(state, &peer) else {
+        return false;
+    };
+    let Some(target) = chat_attach::dial_target(peer_addr.ip(), port) else {
+        return false;
+    };
+    let Some(capability) = ember::channel::derive_xfer_stream_capability(
+        &state.local_ed25519_seed,
+        &peer,
+        &channel_id,
+        &xfer_id,
+    ) else {
+        return false;
+    };
+    let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+        return false;
+    };
+    let part = match recv.stream_handle() {
+        Ok(part) => part,
+        Err(e) => {
+            debug!("Ember Transfer: no handle for a stream, using blocks: {e}");
+            return false;
+        }
+    };
+    recv.set_streaming(true);
+    let part_path = recv.part_path.clone();
+
+    // Our own port, so the sender can punch toward us while we dial. Sent
+    // before the dial starts; without a port we still dial, just unpunched.
+    if let Some(our_port) = chat_attach::quic_port_for(state, Some(peer_addr)) {
+        let plain = ember::channel::encode_xfer_stream(
+            &key,
+            &state.local_ed25519_pubkey,
+            &peer,
+            &xfer_id,
+            ember::channel::XferStreamRole::Fetch,
+            our_port,
+        );
+        send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+    }
+
+    let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let task_verified = verified.clone();
+    let tx = state.xfer_stream_tx.clone();
+    let seed = state.local_ed25519_seed;
+    let node_id = ember::channel::channel_id_from_pubkey(&peer);
+    let handle = tokio::spawn(async move {
+        let result = run_xfer_stream_fetch(
+            endpoint,
+            seed,
+            node_id,
+            target,
+            xfer_id,
+            capability,
+            size,
+            root,
+            part,
+            task_verified,
+        )
+        .await;
+        let _ = tx.send(StreamFetchOutcome { xfer_id, result });
+    });
+    state.xfer_streams.insert(
+        xfer_id,
+        StreamFetch {
+            handle,
+            verified,
+            part_path,
+        },
+    );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_xfer_stream_fetch(
+    endpoint: Arc<quinn::Endpoint>,
+    seed: [u8; 32],
+    node_id: [u8; 16],
+    target: SocketAddr,
+    xfer_id: [u8; 16],
+    capability: [u8; 32],
+    size: u64,
+    root: [u8; 32],
+    part: std::fs::File,
+    verified: Arc<std::sync::atomic::AtomicU64>,
+) -> StreamFetchResult {
+    use std::sync::atomic::Ordering;
+    let fall_back = |verified: &std::sync::atomic::AtomicU64| StreamFetchResult::FallBack {
+        verified: verified.load(Ordering::Relaxed),
+    };
+    let Ok((cert, key)) = ember::quic::generate_self_signed_cert(&seed) else {
+        return fall_back(&verified);
+    };
+    let mut status_waited = std::time::Duration::ZERO;
+    for attempt in 0..STREAM_FETCH_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let dialled = tokio::time::timeout(
+            STREAM_DIAL_TIMEOUT,
+            // Pinned: the certificate that answers must be the member we
+            // accepted from, so nobody else can serve this transfer.
+            ember::quic::connect_pinned(&endpoint, target, "ember", Some((&cert, &key, node_id))),
+        )
+        .await;
+        let Ok(Ok(conn)) = dialled else {
+            debug!(
+                "Ember Transfer: stream dial {}/{STREAM_FETCH_ATTEMPTS} did not connect",
+                attempt + 1
+            );
+            continue;
+        };
+        let Ok((mut send, mut recv)) = conn.open_bi().await else {
+            continue;
+        };
+        let Ok(handle) = part.try_clone() else {
+            return fall_back(&verified);
+        };
+        let status_wait = STREAM_STATUS_TIMEOUT
+            .saturating_sub(status_waited)
+            .max(ember::attach_stream::ATTACH_RETRY_STATUS_TIMEOUT);
+        let fetched = ember::attach_stream::fetch_stream_waiting(
+            ember::attach::ROOM_XFER_STREAM_MSG_TYPE,
+            &mut recv,
+            &mut send,
+            &xfer_id,
+            &capability,
+            size,
+            &root,
+            handle,
+            |done, _| verified.store(done, Ordering::Relaxed),
+            status_wait,
+            &mut status_waited,
+        )
+        .await;
+        let _ = send.finish();
+        let complete = matches!(&fetched, Ok(outcome) if outcome.complete);
+        conn.close(
+            0u32.into(),
+            if complete {
+                ember::attach::ATTACH_CLOSE_RECEIVED
+            } else {
+                ember::attach::ATTACH_CLOSE_ABANDONED
+            },
+        );
+        match fetched {
+            Ok(outcome) if outcome.complete => return StreamFetchResult::Complete,
+            Ok(_) => {}
+            Err(ember::attach_stream::FetchError::Corrupt(detail)) => {
+                warn!("Ember Transfer: stream content did not verify: {detail}");
+                return StreamFetchResult::Corrupt;
+            }
+            Err(ember::attach_stream::FetchError::Refused(
+                ember::attach::AttachStreamStatus::SourceGone,
+            )) => return StreamFetchResult::SourceGone,
+            // Anything else refused — a grant the sender has not recorded yet,
+            // say — is for the block protocol to settle, not worth a redial.
+            Err(ember::attach_stream::FetchError::Refused(_)) => return fall_back(&verified),
+            Err(ember::attach_stream::FetchError::Transient(e)) => {
+                debug!("Ember Transfer: stream dropped: {e}");
+            }
+        }
+    }
+    fall_back(&verified)
+}
+
+/// Keep the stream side of every transfer in step with the event loop's view
+/// of it: grants follow `xfer_send`, progress flows back into the send and
+/// receive states, finished fetches are settled, and a fetch whose transfer
+/// ended is stopped.
+async fn sync_xfer_streams(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Sender: a grant outlives its transfer by at most one tick.
+    let served: Vec<([u8; 16], u64)> = {
+        let mut grants = state.xfer_grants.lock();
+        grants.retain(|id, grant| {
+            state
+                .xfer_send
+                .get(id)
+                .is_some_and(|send| send.peer == grant.peer)
+        });
+        grants
+            .iter()
+            .filter(|(_, g)| g.progress.opened.load(Ordering::Relaxed))
+            .map(|(id, g)| (*id, g.progress.position.load(Ordering::Relaxed)))
+            .collect()
+    };
+    for (xfer_id, position) in served {
+        let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+            continue;
+        };
+        send.note_streamed(position);
+        if send.progress_step().is_some() {
+            let (channel_id, peer, name, size, sent) =
+                (send.channel_id, send.peer, send.name.clone(), send.size, send.bytes_sent());
+            emit_xfer_update(app_handle, &xfer_id, &channel_id, &peer, "send", &name, size, sent, "active");
+        }
+    }
+
+    // Receiver: stop fetches whose transfer ended some other way — a cancel, a
+    // ban, the stall shed — and clear what they left on disk once their handle
+    // on it is closed, which the abort alone does not wait for.
+    let orphaned: Vec<[u8; 16]> = state
+        .xfer_streams
+        .keys()
+        .filter(|id| !state.xfer_recv.contains_key(*id))
+        .copied()
+        .collect();
+    for xfer_id in orphaned {
+        if let Some(fetch) = state.xfer_streams.remove(&xfer_id) {
+            fetch.handle.abort();
+            let part_path = fetch.part_path;
+            let handle = fetch.handle;
+            tokio::spawn(async move {
+                let _ = handle.await;
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&part_path)).await;
+            });
+        }
+    }
+
+    // Receiver: progress.
+    let running: Vec<([u8; 16], u64)> = state
+        .xfer_streams
+        .iter()
+        .map(|(id, f)| (*id, f.verified.load(Ordering::Relaxed)))
+        .collect();
+    for (xfer_id, verified) in running {
+        let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+            continue;
+        };
+        recv.note_streamed(verified);
+        if recv.progress_step().is_some() && verified < recv.size {
+            let (channel_id, peer, name, size) =
+                (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
+            emit_xfer_update(app_handle, &xfer_id, &channel_id, &peer, "receive", &name, size, verified, "active");
+        }
+    }
+
+    // Receiver: fetches that ended.
+    while let Ok(outcome) = state.xfer_stream_rx.try_recv() {
+        let xfer_id = outcome.xfer_id;
+        // Removed before anything else looks at the transfer, so the orphan
+        // sweep above can never take a finished part file for an abandoned one.
+        state.xfer_streams.remove(&xfer_id);
+        let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+            continue;
+        };
+        recv.set_streaming(false);
+        let reason = match outcome.result {
+            StreamFetchResult::Complete => {
+                recv.note_streamed(recv.size);
+                recv.stream_verified = true;
+                finish_xfer_recv(state, xfer_id);
+                continue;
+            }
+            StreamFetchResult::FallBack { verified } => {
+                info!(
+                    "Ember Transfer: {} continues over the block protocol from {verified} bytes",
+                    recv.name
+                );
+                recv.adopt_verified_prefix(verified);
+                if recv.is_complete() {
+                    finish_xfer_recv(state, xfer_id);
+                }
+                continue;
+            }
+            StreamFetchResult::SourceGone => ember::channel::XferCancel::SourceGone,
+            StreamFetchResult::Corrupt => ember::channel::XferCancel::User,
+        };
+        let Some(recv) = state.xfer_recv.remove(&xfer_id) else {
+            continue;
+        };
+        let part_path = recv.part_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_file(&part_path);
+        });
+        let plain = ember::channel::encode_xfer_cancel(
+            &recv.key,
+            &state.local_ed25519_pubkey,
+            &recv.peer,
+            &xfer_id,
+            reason,
+        );
+        send_xfer_frame(socket, state, db, recv.channel_id, recv.peer, &plain).await;
+        let status = if reason == ember::channel::XferCancel::SourceGone {
+            "source_gone"
+        } else {
+            "failed"
+        };
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &recv.channel_id,
+            &recv.peer,
+            "receive",
+            &recv.name,
+            recv.size,
+            0,
+            status,
+        );
+    }
+
+    // Ports for offers that never came, or were answered without a stream.
+    let now = std::time::Instant::now();
+    state.xfer_stream_ports.retain(|id, (_, _, at)| {
+        state.xfer_pending.contains_key(id)
+            || now.saturating_duration_since(*at).as_secs() < STREAM_PORT_ORPHAN_SECS
+    });
+}
+
 /// Drop the transfers tied to one room, optionally only those with one member.
 ///
 /// A ban has to reach the transfer engine, not just the roster. Without this an
@@ -664,7 +1179,7 @@ pub(super) fn unique_download_path(path: &std::path::Path) -> std::path::PathBuf
 /// sender used, so "the file I have" and "the file you offered" are compared
 /// by the same function rather than by two that merely agree today.
 ///
-/// Verification reads and hashes the entire file — `XFER_MAX_BYTES` is 100 MB —
+/// Verification reads and hashes the entire file — `XFER_MAX_BYTES` is 2 GiB —
 /// so it runs on the blocking pool and reports back through
 /// `NetworkState::xfer_finish_tx`. Done inline it froze the network task for
 /// the length of a whole-file read: every peer connection, DHT tick and
@@ -684,10 +1199,21 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
     tokio::task::spawn_blocking(move || {
         let outcome = (|| -> std::io::Result<bool> {
             recv.finish()?;
-            let file = std::fs::File::open(&recv.part_path)?;
-            let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
-            if tree.root_hash != recv.root {
-                return Ok(false);
+            if recv.stream_verified {
+                // Each chunk was checked against the chunk list as it landed,
+                // and the list against the offered root before the first one,
+                // so reading up to 2 GiB back to hash it again proves nothing
+                // new. The length still has to be the offer's.
+                if std::fs::metadata(&recv.part_path)?.len() != recv.size {
+                    return Ok(false);
+                }
+            } else {
+                let file = std::fs::File::open(&recv.part_path)?;
+                let tree =
+                    ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
+                if tree.root_hash != recv.root {
+                    return Ok(false);
+                }
             }
             // Through the approved-root layer, like the eD2K completion path.
             // This used to be `create_dir_all` plus a `rename`, both by
@@ -882,6 +1408,9 @@ pub(super) async fn drive_channel_transfers(
     app_handle: &tauri::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
+    // Ahead of the early return: a fetch can end, and a grant can need
+    // retiring, after the last transfer has gone.
+    sync_xfer_streams(socket, state, db, app_handle).await;
     if state.xfer_send.is_empty() && state.xfer_recv.is_empty() && state.xfer_pending.is_empty() {
         return;
     }

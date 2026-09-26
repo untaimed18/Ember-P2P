@@ -485,8 +485,13 @@ pub fn handoff_republish_due(
 // the file identified by its BLAKE3 root, so a later QUIC or multi-source
 // implementation can carry the same offers without a new handshake.
 
-/// Largest file one member may offer another.
-pub const XFER_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Largest file one member may offer another. The same ceiling as a chat
+/// attachment, whose stream carries it when both ends can reach each other.
+///
+/// Builds before 1.7.0 capped this at 100 MB and decode a larger offer as
+/// malformed, dropping it without an answer, so such an offer to them simply
+/// expires. The UI says as much when one does.
+pub const XFER_MAX_BYTES: u64 = super::attach::ATTACH_MAX_BYTES;
 /// Payload bytes per block. Chosen so a data frame plus its plaintext header,
 /// authenticator, gossip envelope, and a relay wrapper still fit one
 /// unfragmented datagram. `xfer_block_frame_fits_one_unfragmented_datagram`
@@ -1374,6 +1379,11 @@ const PRESENCE_BEACON_PLAIN_VERSION: u8 = 22;
 /// fallthrough ends in a `debug!`. See
 /// `a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched`.
 const TYPING_PLAIN_VERSION: u8 = 23;
+/// A transfer's QUIC port. The sender sends one right after its offer, and a
+/// recipient that accepts answers with its own so the sender can punch toward
+/// it. A new number for the reason typing has one: v1.6.x drops it without
+/// scoring the hop, keeps using the block protocol, and never dials.
+const XFER_STREAM_PLAIN_VERSION: u8 = 24;
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -3002,6 +3012,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
             | XFER_BLOCK_DATA_SEALED_VERSION
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
+            | XFER_STREAM_PLAIN_VERSION
     ) {
         return None;
     }
@@ -3298,6 +3309,83 @@ pub fn decode_xfer_done(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> 
         return None;
     }
     Some(parsed)
+}
+
+/// Which end of a transfer a stream frame comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferStreamRole {
+    /// The sender: fetch this transfer from my QUIC endpoint at the port given.
+    Serve,
+    /// The recipient: I am dialling you, and the port given is mine, for your
+    /// punch toward it.
+    Fetch,
+}
+
+impl XferStreamRole {
+    fn code(self) -> u8 {
+        match self {
+            Self::Serve => 1,
+            Self::Fetch => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Serve),
+            2 => Some(Self::Fetch),
+            _ => None,
+        }
+    }
+}
+
+/// `hdr || role(1) || quic_port(2 LE) || tag(16)`.
+pub fn encode_xfer_stream(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    role: XferStreamRole,
+    quic_port: u16,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 3 + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_STREAM_PLAIN_VERSION, sender, target, xfer_id);
+    out.push(role.code());
+    out.extend_from_slice(&quic_port.to_le_bytes());
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+/// Bytes past the port are ignored, so a later build can append candidate
+/// addresses without taking another frame number.
+pub fn decode_xfer_stream(
+    bytes: &[u8],
+) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, u16)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_PLAIN_VERSION)?;
+    let rest = bytes.get(XFER_HEADER_LEN..XFER_HEADER_LEN + 3)?;
+    let role = XferStreamRole::from_code(rest[0])?;
+    let quic_port = u16::from_le_bytes([rest[1], rest[2]]);
+    if quic_port == 0 {
+        return None;
+    }
+    Some((sender, target, xfer_id, role, quic_port))
+}
+
+/// Capability behind a transfer's QUIC stream request.
+///
+/// Pairwise like [`derive_xfer_key`], under its own purpose so the stream tag
+/// and the frame authenticator never share a key.
+pub fn derive_xfer_stream_capability(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    xfer_id: &[u8; 16],
+) -> Option<[u8; 32]> {
+    // Pairwise purpose is capped at 64 bytes; this is 49.
+    let mut purpose = Vec::with_capacity(17 + 16 + 16);
+    purpose.extend_from_slice(b"ch-xfer-stream-v1");
+    purpose.extend_from_slice(channel_id);
+    purpose.extend_from_slice(xfer_id);
+    crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)
 }
 
 /// Total blocks a file of `size` bytes is cut into.
@@ -5914,6 +6002,52 @@ mod tests {
     }
 
     #[test]
+    fn xfer_stream_frame_round_trips_and_is_routed_as_a_transfer() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        for role in [XferStreamRole::Serve, XferStreamRole::Fetch] {
+            let frame = encode_xfer_stream(&K, &s, &t, &id, role, 4662);
+            assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
+            assert_eq!(decode_xfer_stream(&opened(&frame)), Some((s, t, id, role, 4662)));
+        }
+        // Appended fields are a later build's business, not a refusal.
+        let mut body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, 9));
+        body.extend_from_slice(&[0xEE; 12]);
+        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, 9)));
+    }
+
+    #[test]
+    fn xfer_stream_frame_refuses_a_zero_port_an_unknown_role_or_a_short_body() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let zero = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 0));
+        assert!(decode_xfer_stream(&zero).is_none());
+        let mut role = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 80));
+        role[XFER_HEADER_LEN] = 3;
+        assert!(decode_xfer_stream(&role).is_none());
+        let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, 80));
+        assert!(decode_xfer_stream(&full[..full.len() - 1]).is_none());
+        // Nor is any other transfer frame read as one.
+        let reply = opened(&encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept));
+        assert!(decode_xfer_stream(&reply).is_none());
+    }
+
+    #[test]
+    fn the_stream_capability_is_pairwise_and_not_the_frame_key() {
+        let a = ChannelIdentity::generate();
+        let b = ChannelIdentity::generate();
+        let (room, xfer) = ([0x41u8; 16], [0x42u8; 16]);
+        let a_seed = a.signing_key.to_bytes();
+        let b_seed = b.signing_key.to_bytes();
+        let from_a = derive_xfer_stream_capability(&a_seed, &b.pubkey, &room, &xfer).unwrap();
+        let from_b = derive_xfer_stream_capability(&b_seed, &a.pubkey, &room, &xfer).unwrap();
+        assert_eq!(from_a, from_b);
+        assert_ne!(from_a, derive_xfer_key(&a_seed, &b.pubkey, &room, &xfer).unwrap());
+        assert_ne!(
+            from_a,
+            derive_xfer_stream_capability(&a_seed, &b.pubkey, &room, &[0x43u8; 16]).unwrap()
+        );
+    }
+
+    #[test]
     fn xfer_offer_round_trip_and_bounds() {
         let offer = sample_offer();
         assert_eq!(
@@ -6980,6 +7114,19 @@ mod tests {
         const V167_ASSIGNED_OR_RETIRED: [u8; 22] =
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&TYPING_PLAIN_VERSION));
+        // The transfer's QUIC port frame rides the same fall-through: v1.6.7
+        // never learns the port, so it never dials and keeps to the block
+        // protocol.
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_PLAIN_VERSION));
+        let stream = encode_xfer_stream(
+            &[0x5Au8; 32],
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 16],
+            XferStreamRole::Serve,
+            4662,
+        );
+        assert_eq!(v1_6_7_branch(&stream), V167Branch::DroppedWithDebugLog);
         // It reaches that dispatch at all only through the envelope v1.6.7 also
         // speaks: outer version 1, the same header, and a hop budget it would
         // not forward on even if it knew the frame.
