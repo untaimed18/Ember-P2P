@@ -24,6 +24,10 @@ use super::*;
 // stay translatable.
 use crate::commands::errors::{coded, coded_ctx};
 
+/// Free space an accepted room transfer must leave beyond its own size, so
+/// taking it up does not run the volume to its last byte.
+const XFER_DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+
 /// Remove every hash-pass handoff for a file in the index, returning the ones
 /// the reconcile will write into a record. Draining the rest too is what keeps
 /// a handoff for a file whose record already matched from staying resident
@@ -3325,6 +3329,27 @@ async fn handle_command_inner(
                     let _ = tx.send(Err(coded(
                         "channels_xfer_no_member",
                         "That member is not in this room",
+                    )));
+                    return;
+                }
+                // Room for the whole file before a byte is asked for. The
+                // sender picks the size, and the content is only checked
+                // against its hash as it arrives, so without this a large offer
+                // filled the disk and then failed. The offer stays answerable:
+                // the user can free space and accept again, or deny it. A
+                // volume that cannot report its space is let through, as eD2K
+                // downloads do; a full disk still fails the write safely.
+                let free = tokio::task::spawn_blocking({
+                    let root = download_folder.clone();
+                    move || fs2::available_space(root).ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                if free.is_some_and(|free| free < offer.size.saturating_add(XFER_DISK_HEADROOM)) {
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_no_space",
+                        "Not enough free disk space for this file",
                     )));
                     return;
                 }

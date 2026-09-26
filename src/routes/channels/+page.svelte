@@ -2022,6 +2022,9 @@
   let roomTransfers = $derived(
     Object.values($channelTransfers)
       .filter((t) => t.channel_id === selectedChannelId)
+      // An offer from someone ignored here is left to expire unseen, as the
+      // toast and the nav badge already leave it; one already under way stays.
+      .filter((t) => t.status !== 'awaiting' || !roomIgnoredKeys.includes(t.peer_pubkey.toLowerCase()))
       .sort((a, b) => {
         const waiting = (t: ChannelTransferInfo) => (t.status === 'awaiting' ? 0 : 1);
         return waiting(a) - waiting(b) || a.xfer_id.localeCompare(b.xfer_id);

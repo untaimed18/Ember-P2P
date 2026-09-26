@@ -881,7 +881,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             apply_xfer_cancel(state, app_handle, xfer_id, sender, reason);
         } else if ember::channel::decode_xfer_done(body).is_some() {
             apply_xfer_done(state, app_handle, xfer_id, sender);
-        } else if let Some((_, _, _, role, ports)) = ember::channel::decode_xfer_stream(body) {
+        } else if let Some((_, _, _, role, ports)) = ember::channel::decode_xfer_stream(&key, body) {
             apply_xfer_stream(state, xfer_id, sender, role, ports);
         }
         return;

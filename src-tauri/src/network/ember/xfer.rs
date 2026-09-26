@@ -107,6 +107,10 @@ pub struct StreamProgress {
     /// A stream has opened for the transfer, which only its recipient can do
     /// after accepting — so it stands in for an accept that was lost.
     pub opened: AtomicBool,
+    /// We have punched toward the recipient. Once per transfer: the address
+    /// can be one the recipient only claims, and a repeated request must not
+    /// turn us into a source of traffic aimed wherever it likes.
+    pub punched: AtomicBool,
 }
 
 pub type StreamGrants = Arc<parking_lot::Mutex<HashMap<[u8; 16], StreamGrant>>>;

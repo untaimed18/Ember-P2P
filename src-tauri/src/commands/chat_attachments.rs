@@ -284,6 +284,18 @@ pub async fn open_chat_attachment(
             std::slice::from_ref(&dl_folder),
         )
         .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+        // And within that, to Chat Files, where every received attachment
+        // lands: a row is never a way to open anything else in Downloads.
+        let in_chat_files = std::path::Path::new(&dl_folder)
+            .join(CHAT_FILES_DIR)
+            .canonicalize()
+            .is_ok_and(|chat_files| canonical.starts_with(chat_files));
+        if !in_chat_files {
+            return Err(coded(
+                "transfers_invalid_path",
+                "Invalid or changed download path",
+            ));
+        }
         if reveal {
             return crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
                 coded_ctx("transfers_open_explorer_failed", "Failed to reveal file", e)

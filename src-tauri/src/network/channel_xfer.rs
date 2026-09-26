@@ -283,20 +283,36 @@ pub(super) fn apply_xfer_stream(
         }
         ember::channel::XferStreamRole::Fetch => {
             // The recipient is dialling us. Dial them back for a moment so a
-            // NAT in front of us has a mapping their dial can come in on.
+            // NAT in front of us has a mapping their dial can come in on: at
+            // the session's address when we hold one, else at the public one
+            // the recipient named — only a publicly routable one, and only once.
             let Some(send) = state.xfer_send.get(&xfer_id) else {
                 return;
             };
-            if send.peer != sender || !state.xfer_grants.lock().contains_key(&xfer_id) {
+            if send.peer != sender {
                 return;
             }
-            let (Some(endpoint), Some(addr)) = (
-                chat_attach::quic_endpoint(state),
-                member_direct_addr(state, &sender),
-            ) else {
+            let Some(endpoint) = chat_attach::quic_endpoint(state) else {
                 return;
             };
-            let Some(target) = chat_attach::dial_target(addr.ip(), ports.quic) else {
+            let Some(ip) = member_direct_addr(state, &sender).map(|a| a.ip()).or_else(|| {
+                ports
+                    .public_ip
+                    .filter(|ip| !crate::security::is_special_use_v4(*ip))
+                    .map(std::net::IpAddr::V4)
+            }) else {
+                return;
+            };
+            let first = state.xfer_grants.lock().get(&xfer_id).is_some_and(|grant| {
+                !grant
+                    .progress
+                    .punched
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            });
+            if !first {
+                return;
+            }
+            let Some(target) = chat_attach::dial_target(ip, ports.quic) else {
                 return;
             };
             chat_attach::spawn_punch(
@@ -395,8 +411,14 @@ pub(super) async fn start_xfer_stream_fetch(
     recv.set_streaming(true);
     let part_path = recv.part_path.clone();
 
-    // Our own port, so the sender can punch toward us while we dial. Sent
-    // before the dial starts; without a port we still dial, just unpunched.
+    // Our own port, so the sender can punch toward us while we dial — and,
+    // with no session between us, our public address to punch at. Sent before
+    // the dial starts; without a port we still dial, just unpunched.
+    let our_public_ip = peer_addr
+        .is_none()
+        .then_some(state.external_ip)
+        .flatten()
+        .filter(|ip| !crate::security::is_special_use_v4(*ip));
     if let Some(our_port) = chat_attach::quic_port_for(state, peer_addr) {
         let plain = ember::channel::encode_xfer_stream(
             &key,
@@ -407,7 +429,7 @@ pub(super) async fn start_xfer_stream_fetch(
             ember::channel::XferStreamPorts {
                 quic: our_port,
                 tcp: None,
-                public_ip: None,
+                public_ip: our_public_ip,
             },
         );
         send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;

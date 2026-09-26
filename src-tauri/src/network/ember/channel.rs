@@ -1379,11 +1379,16 @@ const PRESENCE_BEACON_PLAIN_VERSION: u8 = 22;
 /// fallthrough ends in a `debug!`. See
 /// `a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched`.
 const TYPING_PLAIN_VERSION: u8 = 23;
-/// A transfer's QUIC port. The sender sends one right after its offer, and a
-/// recipient that accepts answers with its own so the sender can punch toward
-/// it. A new number for the reason typing has one: v1.6.x drops it without
-/// scoring the hop, keeps using the block protocol, and never dials.
-const XFER_STREAM_PLAIN_VERSION: u8 = 24;
+// 24 was the stream frame with its ports and address in the clear, sealed only
+// by the gossip envelope — the room's content key, which every member a frame
+// is forwarded through holds. It never shipped in a release; retired rather
+// than reused so a pre-release build's frame is dropped, not misread.
+/// A transfer's QUIC port, encrypted to the other end alone. The sender sends
+/// one right after its offer, and a recipient that accepts answers with its own
+/// so the sender can punch toward it. A new number for the reason typing has
+/// one: v1.6.x drops it without scoring the hop, keeps using the block
+/// protocol, and never dials.
+const XFER_STREAM_SEALED_VERSION: u8 = 25;
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -3012,7 +3017,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
             | XFER_BLOCK_DATA_SEALED_VERSION
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
-            | XFER_STREAM_PLAIN_VERSION
+            | XFER_STREAM_SEALED_VERSION
     ) {
         return None;
     }
@@ -3345,17 +3350,51 @@ pub struct XferStreamPorts {
     /// The sender's upload listener, for a recipient whose QUIC dial cannot
     /// get through. `None` when the frame did not carry one.
     pub tcp: Option<u16>,
-    /// The sender's public IPv4 as STUN reports it. What lets a recipient
-    /// with no direct session to the sender — the ordinary case in a room,
-    /// where most members are reached through the relay — dial it at all. A
-    /// claim, but a claim the pairwise tag binds to the sender, and both dials
-    /// then demand the sender's key, so a wrong one fails rather than reaching
-    /// anyone else's service.
+    /// The frame sender's public IPv4 as STUN reports it, when the two ends
+    /// hold no direct session — the ordinary case in a room, where most
+    /// members are reached through the relay. On a Serve frame it is where the
+    /// recipient dials; on a Fetch frame, where the sender punches back. A
+    /// claim, but one the pairwise tag binds to the frame's sender, and every
+    /// connection made to it demands that sender's key, so a wrong one fails
+    /// rather than reaching anyone else's service.
     pub public_ip: Option<std::net::Ipv4Addr>,
 }
 
-/// `hdr || role(1) || quic_port(2 LE) || [tcp_port(2 LE) || [ipv4(4)]] || tag(16)`.
-/// A frame carrying an address but no TCP port writes the port as zero.
+const XFER_STREAM_NONCE_LEN: usize = 12;
+const XFER_STREAM_SEAL_DOMAIN: &[u8] = b"ember-channel-xfer-stream-v1\0";
+
+/// XOR a stream frame's body with a keystream only the two ends can produce.
+///
+/// Both ends hold the same pairwise key and each sends a frame per transfer,
+/// so unlike a block — whose offset already picks a stream only one plaintext
+/// ever uses — this one takes a random nonce from the wire. Without it the
+/// sender's frame and the recipient's would share a keystream, and anyone
+/// holding both would learn the XOR of their ports and addresses.
+fn xfer_stream_xor(key: &[u8; 32], xfer_id: &[u8; 16], nonce: &[u8], data: &mut [u8]) {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(XFER_STREAM_SEAL_DOMAIN);
+    hasher.update(xfer_id);
+    hasher.update(nonce);
+    let mut reader = hasher.finalize_xof();
+    let mut pad = [0u8; 64];
+    for chunk in data.chunks_mut(pad.len()) {
+        let pad = &mut pad[..chunk.len()];
+        reader.fill(pad);
+        for (byte, p) in chunk.iter_mut().zip(pad.iter()) {
+            *byte ^= *p;
+        }
+    }
+}
+
+/// `hdr || nonce(12) || sealed(role(1) || quic_port(2 LE) || [tcp_port(2 LE)
+/// || [ipv4(4)]]) || tag(16)`. A frame carrying an address but no TCP port
+/// writes the port as zero.
+///
+/// Sealed because the frame may be forwarded through other members, and every
+/// one of them can open the gossip envelope: what they would read is where each
+/// end can be reached — its public address, when the two share no session.
+/// Encrypt then MAC, as for blocks, so the tag covers the ciphertext and still
+/// binds sender, target and transfer.
 pub fn encode_xfer_stream(
     key: &[u8; 32],
     sender: &[u8; 32],
@@ -3364,8 +3403,13 @@ pub fn encode_xfer_stream(
     role: XferStreamRole,
     ports: XferStreamPorts,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 9 + XFER_MAC_LEN);
-    put_xfer_header(&mut out, XFER_STREAM_PLAIN_VERSION, sender, target, xfer_id);
+    let mut out =
+        Vec::with_capacity(XFER_HEADER_LEN + XFER_STREAM_NONCE_LEN + 9 + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_STREAM_SEALED_VERSION, sender, target, xfer_id);
+    let mut nonce = [0u8; XFER_STREAM_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    out.extend_from_slice(&nonce);
+    let body = out.len();
     out.push(role.code());
     out.extend_from_slice(&ports.quic.to_le_bytes());
     let tcp = ports.tcp.filter(|p| *p != 0);
@@ -3376,20 +3420,28 @@ pub fn encode_xfer_stream(
     if let Some(ip) = public_ip {
         out.extend_from_slice(&ip.octets());
     }
+    xfer_stream_xor(key, xfer_id, &nonce, &mut out[body..]);
     append_xfer_tag(key, &mut out);
     out
 }
 
+/// Open a stream frame. Call only on a frame [`xfer_verify`] has already
+/// accepted — decrypting first would be decrypting whatever a stranger sent.
+///
 /// Bytes past the ports are ignored, so a later build can append candidate
 /// addresses without taking another frame number.
 pub fn decode_xfer_stream(
+    key: &[u8; 32],
     bytes: &[u8],
 ) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, XferStreamPorts)> {
-    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_PLAIN_VERSION)?;
-    let rest = bytes.get(XFER_HEADER_LEN..)?;
-    if rest.len() < 3 {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_SEALED_VERSION)?;
+    let sealed = bytes.get(XFER_HEADER_LEN..)?;
+    if sealed.len() < XFER_STREAM_NONCE_LEN + 3 {
         return None;
     }
+    let (nonce, body) = sealed.split_at(XFER_STREAM_NONCE_LEN);
+    let mut rest = body.to_vec();
+    xfer_stream_xor(key, &xfer_id, nonce, &mut rest);
     let role = XferStreamRole::from_code(rest[0])?;
     let quic = u16::from_le_bytes([rest[1], rest[2]]);
     if quic == 0 {
@@ -6059,34 +6111,63 @@ mod tests {
             for ports in [quic_only(4662), both, addressed, address_only] {
                 let frame = encode_xfer_stream(&K, &s, &t, &id, role, ports);
                 assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
-                assert_eq!(decode_xfer_stream(&opened(&frame)), Some((s, t, id, role, ports)));
+                assert_eq!(decode_xfer_stream(&K, &opened(&frame)), Some((s, t, id, role, ports)));
             }
         }
         // Fields past the address are a later build's business, not a refusal.
         let mut body =
             opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, addressed));
         body.extend_from_slice(&[0xEE; 12]);
-        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, addressed)));
+        assert_eq!(
+            decode_xfer_stream(&K, &body),
+            Some((s, t, id, XferStreamRole::Serve, addressed))
+        );
         // A zero TCP port is no port, on either side of the wire.
         let zero_tcp = XferStreamPorts { quic: 9, tcp: Some(0), public_ip: None };
         let body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, zero_tcp));
-        assert_eq!(decode_xfer_stream(&body).map(|f| f.4), Some(quic_only(9)));
+        assert_eq!(decode_xfer_stream(&K, &body).map(|f| f.4), Some(quic_only(9)));
     }
 
     #[test]
     fn xfer_stream_frame_refuses_a_zero_port_an_unknown_role_or_a_short_body() {
         let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
         let zero = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(0)));
-        assert!(decode_xfer_stream(&zero).is_none());
+        assert!(decode_xfer_stream(&K, &zero).is_none());
+        // The role sits under the keystream; flipping Fetch (2) to 3 there.
         let mut role =
             opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
-        role[XFER_HEADER_LEN] = 3;
-        assert!(decode_xfer_stream(&role).is_none());
+        role[XFER_HEADER_LEN + XFER_STREAM_NONCE_LEN] ^= 2 ^ 3;
+        assert!(decode_xfer_stream(&K, &role).is_none());
         let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
-        assert!(decode_xfer_stream(&full[..full.len() - 1]).is_none());
+        assert!(decode_xfer_stream(&K, &full[..full.len() - 1]).is_none());
         // Nor is any other transfer frame read as one.
         let reply = opened(&encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept));
-        assert!(decode_xfer_stream(&reply).is_none());
+        assert!(decode_xfer_stream(&K, &reply).is_none());
+    }
+
+    /// A member the frame is forwarded through can open the gossip envelope,
+    /// and must find neither the ports nor the address under it — nor tell two
+    /// frames with the same content apart as the same.
+    #[test]
+    fn xfer_stream_frame_hides_its_ports_and_address() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let ports = XferStreamPorts {
+            quic: 0xBEEF,
+            tcp: Some(0xCAFE),
+            public_ip: Some(std::net::Ipv4Addr::new(198, 51, 100, 77)),
+        };
+        let a = encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, ports);
+        let b = encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, ports);
+        assert_ne!(a, b, "a fresh nonce each time");
+        let clear = [1, 0xEF, 0xBE, 0xFE, 0xCA, 198, 51, 100, 77];
+        for frame in [&a, &b] {
+            let body = &frame[XFER_HEADER_LEN..frame.len() - XFER_MAC_LEN];
+            assert!(!body.windows(4).any(|w| w == [198, 51, 100, 77]));
+            assert_ne!(&body[XFER_STREAM_NONCE_LEN..], &clear[..]);
+        }
+        // Someone without the pairwise key reads nothing sensible either.
+        let other = [0x99u8; 32];
+        assert_ne!(decode_xfer_stream(&other, &opened(&a)).map(|f| f.4), Some(ports));
     }
 
     #[test]
@@ -7176,7 +7257,7 @@ mod tests {
         // The transfer's QUIC port frame rides the same fall-through: v1.6.7
         // never learns the port, so it never dials and keeps to the block
         // protocol.
-        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_PLAIN_VERSION));
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_SEALED_VERSION));
         let stream = encode_xfer_stream(
             &[0x5Au8; 32],
             &[1u8; 32],

@@ -85,6 +85,10 @@ const AUTO_ACCEPT_MAX_FILES: usize = 20;
 /// silently cancelled by this.
 const AUTO_ACCEPT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Free space an accepted attachment must leave beyond its own size, so taking
+/// it up does not run the volume to its last byte.
+const ATTACH_DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+
 /// Where finished attachments land, beside `Downloads` and `Temp` under the
 /// download folder. A folder of its own because these are files people were
 /// handed in a conversation, not files they went looking for — and so they can
@@ -908,13 +912,33 @@ async fn accept_offer(
     settings: &AppSettings,
     xfer_id: [u8; 16],
 ) -> Result<(), String> {
-    let Some(friend) = state.attach_inbound.get(&xfer_id).map(|inbound| inbound.friend) else {
+    let Some((friend, size)) = state
+        .attach_inbound
+        .get(&xfer_id)
+        .map(|inbound| (inbound.friend, inbound.offer.size))
+    else {
         return Err(not_found());
     };
     if !fetch_slot_free(state, db, &friend) {
         return Err(coded(
             "peers_attach_busy",
             "Too many files are already downloading. Try again when one finishes.",
+        ));
+    }
+    // Room for the whole file first; the offer stays answerable when there is
+    // not. A volume that cannot report its space is let through, as eD2K
+    // downloads do; a full disk still fails the write safely.
+    let free = tokio::task::spawn_blocking({
+        let root = std::path::PathBuf::from(&settings.download_folder);
+        move || fs2::available_space(root).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if free.is_some_and(|free| free < size.saturating_add(ATTACH_DISK_HEADROOM)) {
+        return Err(coded(
+            "peers_attach_no_space",
+            "Not enough free disk space for this file",
         ));
     }
     let Some(endpoint) = quic_endpoint(state) else {
