@@ -3338,16 +3338,24 @@ impl XferStreamRole {
     }
 }
 
-/// A decoded stream frame's ports.
+/// A decoded stream frame's ports, and the address they are on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XferStreamPorts {
     pub quic: u16,
     /// The sender's upload listener, for a recipient whose QUIC dial cannot
     /// get through. `None` when the frame did not carry one.
     pub tcp: Option<u16>,
+    /// The sender's public IPv4 as STUN reports it. What lets a recipient
+    /// with no direct session to the sender — the ordinary case in a room,
+    /// where most members are reached through the relay — dial it at all. A
+    /// claim, but a claim the pairwise tag binds to the sender, and both dials
+    /// then demand the sender's key, so a wrong one fails rather than reaching
+    /// anyone else's service.
+    pub public_ip: Option<std::net::Ipv4Addr>,
 }
 
-/// `hdr || role(1) || quic_port(2 LE) || [tcp_port(2 LE)] || tag(16)`.
+/// `hdr || role(1) || quic_port(2 LE) || [tcp_port(2 LE) || [ipv4(4)]] || tag(16)`.
+/// A frame carrying an address but no TCP port writes the port as zero.
 pub fn encode_xfer_stream(
     key: &[u8; 32],
     sender: &[u8; 32],
@@ -3356,12 +3364,17 @@ pub fn encode_xfer_stream(
     role: XferStreamRole,
     ports: XferStreamPorts,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 5 + XFER_MAC_LEN);
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 9 + XFER_MAC_LEN);
     put_xfer_header(&mut out, XFER_STREAM_PLAIN_VERSION, sender, target, xfer_id);
     out.push(role.code());
     out.extend_from_slice(&ports.quic.to_le_bytes());
-    if let Some(tcp) = ports.tcp.filter(|p| *p != 0) {
-        out.extend_from_slice(&tcp.to_le_bytes());
+    let tcp = ports.tcp.filter(|p| *p != 0);
+    let public_ip = ports.public_ip.filter(|ip| !ip.is_unspecified());
+    if tcp.is_some() || public_ip.is_some() {
+        out.extend_from_slice(&tcp.unwrap_or(0).to_le_bytes());
+    }
+    if let Some(ip) = public_ip {
+        out.extend_from_slice(&ip.octets());
     }
     append_xfer_tag(key, &mut out);
     out
@@ -3386,7 +3399,11 @@ pub fn decode_xfer_stream(
         .get(3..5)
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
         .filter(|p| *p != 0);
-    Some((sender, target, xfer_id, role, XferStreamPorts { quic, tcp }))
+    let public_ip = rest
+        .get(5..9)
+        .map(|b| std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+        .filter(|ip| !ip.is_unspecified());
+    Some((sender, target, xfer_id, role, XferStreamPorts { quic, tcp, public_ip }))
 }
 
 /// Capability behind a transfer's QUIC stream request.
@@ -6021,26 +6038,37 @@ mod tests {
     }
 
     fn quic_only(quic: u16) -> XferStreamPorts {
-        XferStreamPorts { quic, tcp: None }
+        XferStreamPorts { quic, tcp: None, public_ip: None }
     }
 
     #[test]
     fn xfer_stream_frame_round_trips_and_is_routed_as_a_transfer() {
         let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
-        let both = XferStreamPorts { quic: 4662, tcp: Some(4661) };
+        let both = XferStreamPorts { quic: 4662, tcp: Some(4661), public_ip: None };
+        let addressed = XferStreamPorts {
+            quic: 4662,
+            tcp: Some(4661),
+            public_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+        };
+        let address_only = XferStreamPorts {
+            quic: 4662,
+            tcp: None,
+            public_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 8)),
+        };
         for role in [XferStreamRole::Serve, XferStreamRole::Fetch] {
-            for ports in [quic_only(4662), both] {
+            for ports in [quic_only(4662), both, addressed, address_only] {
                 let frame = encode_xfer_stream(&K, &s, &t, &id, role, ports);
                 assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
                 assert_eq!(decode_xfer_stream(&opened(&frame)), Some((s, t, id, role, ports)));
             }
         }
-        // Appended fields are a later build's business, not a refusal.
-        let mut body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, both));
+        // Fields past the address are a later build's business, not a refusal.
+        let mut body =
+            opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, addressed));
         body.extend_from_slice(&[0xEE; 12]);
-        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, both)));
+        assert_eq!(decode_xfer_stream(&body), Some((s, t, id, XferStreamRole::Serve, addressed)));
         // A zero TCP port is no port, on either side of the wire.
-        let zero_tcp = XferStreamPorts { quic: 9, tcp: Some(0) };
+        let zero_tcp = XferStreamPorts { quic: 9, tcp: Some(0), public_ip: None };
         let body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, zero_tcp));
         assert_eq!(decode_xfer_stream(&body).map(|f| f.4), Some(quic_only(9)));
     }
@@ -7155,7 +7183,7 @@ mod tests {
             &[2u8; 32],
             &[3u8; 16],
             XferStreamRole::Serve,
-            XferStreamPorts { quic: 4662, tcp: Some(4661) },
+            XferStreamPorts { quic: 4662, tcp: Some(4661), public_ip: None },
         );
         assert_eq!(v1_6_7_branch(&stream), V167Branch::DroppedWithDebugLog);
         // It reaches that dispatch at all only through the envelope v1.6.7 also

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
+  import { fly, slide } from 'svelte/transition';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -9,7 +10,22 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { copyToClipboard, disambiguatedMemberName, formatBytes, formatRelativeTime, shortPubkey } from '$lib/utils';
+  import {
+    copyToClipboard,
+    disambiguatedMemberName,
+    formatBytes,
+    formatDurationSecs,
+    formatRelativeTime,
+    formatSpeed,
+    shortPubkey,
+  } from '$lib/utils';
+  import {
+    keepXferSamples,
+    noteXferBytes,
+    xferRate,
+    xferSecondsLeft,
+    type RateSamples,
+  } from '$lib/xferRate';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -2054,6 +2070,87 @@
         return m.channels_xfer_failed();
     }
   }
+
+  const XFER_FAILED = new Set(['stalled', 'source_gone', 'failed', 'busy', 'too_large', 'not_allowed']);
+
+  function xferTone(t: ChannelTransferInfo): 'awaiting' | 'moving' | 'done' | 'failed' | 'ended' {
+    switch (t.status) {
+      case 'awaiting':
+        return 'awaiting';
+      case 'offered':
+      case 'accepted':
+      case 'active':
+        return 'moving';
+      case 'complete':
+        return 'done';
+      default:
+        return XFER_FAILED.has(t.status) ? 'failed' : 'ended';
+    }
+  }
+
+  function xferPct(t: ChannelTransferInfo): number {
+    return t.size > 0 ? Math.min(100, Math.floor((t.transferred / t.size) * 100)) : 0;
+  }
+
+  /** Every transfer's latest progress, for its speed. Kept across rooms, so
+   *  walking away and back does not start the number over. */
+  let xferSamples = $state.raw<RateSamples>(new Map());
+  $effect(() => {
+    const all = Object.values($channelTransfers);
+    const now = Date.now();
+    untrack(() => {
+      let next = keepXferSamples(xferSamples, new Set(all.map((t) => t.xfer_id)));
+      for (const t of all) {
+        if (t.status === 'active') next = noteXferBytes(next, t.xfer_id, t.transferred, now);
+      }
+      xferSamples = next;
+    });
+  });
+
+  /** Ticks while something here is moving, so a speed that stopped being
+   *  reported goes away instead of sitting there looking live. */
+  let xferNow = $state(Date.now());
+  let roomXferMoving = $derived(roomTransfers.some((t) => t.status === 'active'));
+  $effect(() => {
+    if (!roomXferMoving) return;
+    const timer = setInterval(() => (xferNow = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
+  let membersToggleLabel = $derived.by(() => {
+    if (membersOpen) return m.channels_hide_members();
+    const show = m.channels_show_members();
+    return roomOffersWaiting > 0
+      ? `${show} (${m.channels_xfer_waiting_badge({ count: roomOffersWaiting })})`
+      : show;
+  });
+  let roomXferRate = $derived(
+    roomTransfers.reduce(
+      (sum, t) => (t.status === 'active' ? sum + xferRate(xferSamples, t.xfer_id, xferNow) : sum),
+      0,
+    ),
+  );
+
+  /** Collapsed to its header by the user; an arriving offer opens it again,
+   *  since the buttons that answer it are inside. */
+  let xferCollapsed = $state(false);
+
+  /** A new offer in the room on screen brings the members pane out with the
+   *  drawer open, where Accept and Deny are. Not on narrow layouts, where
+   *  the pane covers the conversation: there the badge on the toggle says it. */
+  const offersSeen = new Set<string>();
+  $effect(() => {
+    const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
+    if (fresh.length === 0) return;
+    for (const t of fresh) offersSeen.add(t.xfer_id);
+    untrack(() => {
+      xferCollapsed = false;
+      if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
+        membersOpen = true;
+      }
+    });
+  });
 </script>
 
 <div class="page-header">
@@ -2639,12 +2736,12 @@
                   </button>
                 {/if}
                 <button
-                  class="icon-btn"
+                  class="icon-btn members-toggle"
                   class:on={membersOpen}
                   onclick={() => (membersOpen = !membersOpen)}
-                  title={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                  title={membersToggleLabel}
                   aria-pressed={membersOpen}
-                  aria-label={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                  aria-label={membersToggleLabel}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="6" cy="6" r="2.2"/>
@@ -2652,6 +2749,9 @@
                     <circle cx="11.5" cy="6.5" r="1.7"/>
                     <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
                   </svg>
+                  {#if !membersOpen && roomOffersWaiting > 0}
+                    <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
+                  {/if}
                 </button>
                 <button
                   class="icon-btn"
@@ -2909,77 +3009,6 @@
                       wait: slowModeLabel(selected.slow_mode_secs),
                     })}
               </p>
-            {/if}
-            {#if roomTransfers.length > 0}
-              <!-- Polite, not assertive: an arriving offer is worth announcing
-                   but must not cut across whatever is being read. -->
-              <div class="xfer-panel" aria-live="polite">
-                {#each roomTransfers as t (t.xfer_id)}
-                  {@const pct = t.size > 0 ? Math.min(100, Math.round((t.transferred / t.size) * 100)) : 0}
-                  {@const busy = respondingTo.includes(t.xfer_id)}
-                  <div class="xfer-row" class:awaiting={t.status === 'awaiting'}>
-                    <div class="xfer-text">
-                      <span class="xfer-name"><bdi dir="auto">{t.name}</bdi></span>
-                      <span class="xfer-meta">
-                        {formatBytes(t.size)} &middot; {transferLabel(t)}
-                      </span>
-                      {#if t.status === 'active' || t.status === 'accepted'}
-                        <div
-                          class="xfer-progress"
-                          role="progressbar"
-                          aria-label={t.name}
-                          aria-valuemin="0"
-                          aria-valuemax={t.size}
-                          aria-valuenow={Math.min(t.transferred, t.size)}
-                          aria-valuetext="{pct}%"
-                        >
-                          <div class="xfer-progress-fill" style="width: {pct}%"></div>
-                        </div>
-                      {/if}
-                    </div>
-                    <div class="xfer-actions">
-                      {#if t.status === 'awaiting'}
-                        <!-- Accepting while banned pulls room traffic we have no
-                             business receiving, and the backend refuses it.
-                             Declining stays open: that is how the offer clears. -->
-                        <button
-                          type="button"
-                          disabled={busy || selectedBanned}
-                          onclick={() => handleRespondTransfer(t.xfer_id, true)}
-                        >
-                          {m.channels_xfer_accept()}
-                        </button>
-                        <button
-                          type="button"
-                          class="ghost"
-                          disabled={busy}
-                          onclick={() => handleRespondTransfer(t.xfer_id, false)}
-                        >
-                          {m.channels_xfer_decline()}
-                        </button>
-                      {:else if t.status === 'offered' || t.status === 'accepted' || t.status === 'active'}
-                        <button
-                          type="button"
-                          class="ghost danger"
-                          disabled={busy}
-                          onclick={() => handleCancelTransfer(t.xfer_id)}
-                        >
-                          {m.common_cancel()}
-                        </button>
-                      {:else if t.status === 'complete' && t.direction === 'receive'}
-                        <button
-                          type="button"
-                          class="ghost"
-                          onclick={() =>
-                            void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
-                        >
-                          {m.library_open_folder()}
-                        </button>
-                      {/if}
-                    </div>
-                  </div>
-                {/each}
-              </div>
             {/if}
             {#if searchOpen}
               <form
@@ -3257,6 +3286,148 @@
                   </li>
                 {/each}
               </ul>
+            {/if}
+            {#if roomTransfers.length > 0}
+              <section
+                class="xfer-drawer"
+                aria-label={m.channels_xfer_panel_title()}
+                transition:fly={{ y: 48, duration: 240 }}
+              >
+                <button
+                  type="button"
+                  class="xfer-drawer-head"
+                  aria-expanded={!xferCollapsed}
+                  aria-controls={xferCollapsed ? undefined : 'xfer-drawer-body'}
+                  title={xferCollapsed ? m.channels_xfer_show_panel() : m.channels_xfer_hide_panel()}
+                  onclick={() => (xferCollapsed = !xferCollapsed)}
+                >
+                  <svg class="xfer-drawer-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 13V3M2.5 5.5 5 3l2.5 2.5"/>
+                    <path d="M11 3v10M8.5 10.5 11 13l2.5-2.5"/>
+                  </svg>
+                  <span class="members-label">{m.channels_xfer_panel_title()}</span>
+                  <span class="xfer-drawer-count">{roomTransfers.length}</span>
+                  {#if roomXferRate > 0}
+                    <span class="xfer-drawer-rate">{formatSpeed(roomXferRate)}</span>
+                  {/if}
+                  <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m4 6 4 4 4-4"/>
+                  </svg>
+                </button>
+                {#if !xferCollapsed}
+                  <!-- Polite, not assertive: an arriving offer is worth announcing
+                       but must not cut across whatever is being read. The
+                       per-second numbers are hidden from it; the progress bar
+                       carries the figure for anyone who asks. -->
+                  <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: 180 }}>
+                    {#each roomTransfers as t (t.xfer_id)}
+                      {@const tone = xferTone(t)}
+                      {@const pct = xferPct(t)}
+                      {@const rate = t.status === 'active' ? xferRate(xferSamples, t.xfer_id, xferNow) : 0}
+                      {@const left = xferSecondsLeft(t.size, t.transferred, rate)}
+                      {@const busy = respondingTo.includes(t.xfer_id)}
+                      <article class="xfer-card tone-{tone}" transition:slide={{ duration: 180 }}>
+                        <div class="xfer-card-top">
+                          <span class="xfer-dir" class:send={t.direction === 'send'} aria-hidden="true">
+                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                              {#if t.direction === 'send'}
+                                <path d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"/>
+                              {:else}
+                                <path d="M8 3.5v9M4.5 9 8 12.5 11.5 9"/>
+                              {/if}
+                            </svg>
+                          </span>
+                          <div class="xfer-text">
+                            <span class="xfer-name" title={t.name}><bdi dir="auto">{t.name}</bdi></span>
+                            <span class="xfer-meta">
+                              {#if tone === 'moving' && t.transferred > 0}
+                                {formatBytes(t.transferred)} / {formatBytes(t.size)}
+                              {:else}
+                                {formatBytes(t.size)}
+                              {/if}
+                            </span>
+                          </div>
+                        </div>
+                        <p class="xfer-status">{transferLabel(t)}</p>
+                        {#if t.status === 'accepted' || t.status === 'active'}
+                          <div
+                            class="xfer-progress"
+                            class:indeterminate={t.transferred === 0}
+                            role="progressbar"
+                            aria-label={t.name}
+                            aria-valuemin="0"
+                            aria-valuemax={t.size}
+                            aria-valuenow={Math.min(t.transferred, t.size)}
+                            aria-valuetext="{pct}%"
+                          >
+                            <div class="xfer-progress-fill" style="width: {pct}%"></div>
+                          </div>
+                          <div class="xfer-stats" aria-hidden="true">
+                            {#if t.transferred === 0}
+                              <span>{m.channels_xfer_starting()}</span>
+                            {:else}
+                              <span class="xfer-pct">{pct}%</span>
+                              {#if rate > 0}
+                                <span class="xfer-speed">{formatSpeed(rate)}</span>
+                              {/if}
+                              {#if left !== null}
+                                <span class="xfer-left">
+                                  {m.channels_xfer_time_left({ time: formatDurationSecs(left) })}
+                                </span>
+                              {/if}
+                            {/if}
+                          </div>
+                        {/if}
+                        {#if t.status === 'awaiting'}
+                          <!-- Accepting while banned pulls room traffic we have no
+                               business receiving, and the backend refuses it.
+                               Denying stays open: that is how the offer clears. -->
+                          <div class="xfer-actions two">
+                            <button
+                              type="button"
+                              class="primary"
+                              disabled={busy || selectedBanned}
+                              onclick={() => handleRespondTransfer(t.xfer_id, true)}
+                            >
+                              {m.channels_xfer_accept()}
+                            </button>
+                            <button
+                              type="button"
+                              class="secondary"
+                              disabled={busy}
+                              onclick={() => handleRespondTransfer(t.xfer_id, false)}
+                            >
+                              {m.channels_xfer_decline()}
+                            </button>
+                          </div>
+                        {:else if tone === 'moving'}
+                          <div class="xfer-actions">
+                            <button
+                              type="button"
+                              class="ghost xfer-cancel"
+                              disabled={busy}
+                              onclick={() => handleCancelTransfer(t.xfer_id)}
+                            >
+                              {m.common_cancel()}
+                            </button>
+                          </div>
+                        {:else if t.status === 'complete' && t.direction === 'receive'}
+                          <div class="xfer-actions">
+                            <button
+                              type="button"
+                              class="secondary"
+                              onclick={() =>
+                                void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+                            >
+                              {m.library_open_folder()}
+                            </button>
+                          </div>
+                        {/if}
+                      </article>
+                    {/each}
+                  </div>
+                {/if}
+              </section>
             {/if}
           </aside>
           </div>
@@ -4280,43 +4451,155 @@
     color: var(--text-primary);
   }
 
-  .xfer-panel {
+  /* Transfers live at the foot of the members pane, beside the people they
+     are with. `margin-top: auto` keeps it there when the roster above is a
+     one-line placeholder rather than the list that would push it down. */
+  .xfer-drawer {
+    margin-top: auto;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-bottom: 1px solid var(--border);
+    max-height: 62%;
+    min-height: 0;
+    border-top: 1px solid var(--border);
     background: var(--bg-surface);
+    box-shadow: 0 -8px 18px -14px rgba(0, 0, 0, 0.35);
   }
 
-  .xfer-row {
+  .xfer-drawer-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 14px;
+    gap: 6px;
+    width: 100%;
+    padding: 9px 12px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-muted);
+    text-align: start;
+    flex-shrink: 0;
   }
 
-  .xfer-row + .xfer-row {
-    border-top: 1px solid var(--border);
+  .xfer-drawer-head:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
-  /* An offer waiting on the user is the only row that needs to be noticed;
+  .xfer-drawer-head:focus-visible { outline-offset: -2px; }
+
+  .xfer-drawer-icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  .xfer-drawer-count {
+    margin-right: auto;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .xfer-drawer-rate {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .xfer-drawer-chevron {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    transition: transform var(--transition-slow) ease;
+  }
+
+  .xfer-drawer-chevron.flipped { transform: rotate(180deg); }
+
+  .xfer-drawer-body {
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 8px 8px;
+  }
+
+  .xfer-card {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+  }
+
+  /* An offer waiting on the user is the only card that needs to be noticed;
      the rest are progress the user already knows about. */
-  .xfer-row.awaiting {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  .xfer-card.tone-awaiting {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 7%, var(--bg-secondary));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+
+  .xfer-card.tone-ended { opacity: 0.75; }
+
+  .xfer-card-top {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .xfer-dir {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-md);
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
+  }
+
+  .xfer-dir.send {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+
+  .xfer-card.tone-failed .xfer-dir {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+  }
+
+  .xfer-dir svg {
+    width: 15px;
+    height: 15px;
   }
 
   .xfer-text {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
     min-width: 0;
     flex: 1;
   }
 
   .xfer-name {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -4325,26 +4608,125 @@
   .xfer-meta {
     font-size: 11px;
     color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
   }
 
+  .xfer-status {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.35;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .xfer-card.tone-done .xfer-status { color: var(--success); }
+  .xfer-card.tone-failed .xfer-status { color: var(--danger); }
+
   .xfer-progress {
-    height: 3px;
-    margin-top: 4px;
+    position: relative;
+    height: 6px;
     border-radius: var(--radius-pill);
-    background: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
   }
 
+  /* Reports arrive about once a second; easing over most of that makes the
+     bar glide instead of stepping. */
   .xfer-progress-fill {
     height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 65%, #fff));
+    transition: width 900ms linear;
+  }
+
+  /* Accepted but nothing through yet: movement says it is working without
+     claiming a figure. */
+  .xfer-progress.indeterminate .xfer-progress-fill { display: none; }
+
+  .xfer-progress.indeterminate::after {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 35%;
+    border-radius: inherit;
     background: var(--accent);
-    transition: width var(--transition-fast) linear;
+    opacity: 0.7;
+    animation: xfer-indeterminate 1.3s ease-in-out infinite;
+  }
+
+  @keyframes xfer-indeterminate {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(290%); }
+  }
+
+  .xfer-stats {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: -2px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .xfer-pct {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .xfer-speed {
+    font-weight: 600;
+    color: var(--accent);
+  }
+
+  .xfer-left {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .xfer-actions {
     display: flex;
     gap: 6px;
-    flex-shrink: 0;
+  }
+
+  .xfer-actions button {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .xfer-actions button.xfer-cancel {
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    color: var(--danger);
+  }
+
+  .xfer-actions button.xfer-cancel:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    color: var(--danger);
+  }
+
+  .members-toggle { position: relative; }
+
+  .toggle-badge {
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 9.5px;
+    font-weight: 700;
+    line-height: 15px;
+    text-align: center;
+    box-shadow: 0 0 0 2px var(--bg-tertiary);
+    pointer-events: none;
   }
 
   .succession-form {

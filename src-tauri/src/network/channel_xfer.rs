@@ -176,14 +176,31 @@ pub(super) async fn offer_xfer_stream(
     size: u64,
     root: [u8; 32],
 ) {
+    let xfer_hex = hex::encode(xfer_id);
     if chat_attach::quic_endpoint(state).is_none() {
+        info!("Ember Transfer: {xfer_hex} uses the block protocol: no QUIC endpoint yet");
         return;
     }
-    let Some(peer_addr) = member_direct_addr(state, &peer) else {
+    // A direct session picks the right ports for how the member reaches us (a
+    // LAN member dials our local ones). Without one — most members, who are
+    // reached through the room relay — the public ports and our public address
+    // are what they can dial.
+    let peer_addr = member_direct_addr(state, &peer);
+    let public_ip = state.external_ip.filter(|ip| !crate::security::is_special_use_v4(*ip));
+    if peer_addr.is_none() && public_ip.is_none() {
+        info!(
+            "Ember Transfer: {xfer_hex} uses the block protocol: no direct session to the \
+             member and no public address to give them"
+        );
+        return;
+    }
+    let Some(port) = chat_attach::quic_port_for(state, peer_addr) else {
+        info!("Ember Transfer: {xfer_hex} uses the block protocol: no QUIC port to name");
         return;
     };
-    let Some(port) = chat_attach::quic_port_for(state, Some(peer_addr)) else {
-        return;
+    let tcp = match peer_addr {
+        Some(addr) => tcp_port_for(state, addr),
+        None => Some(advertised_tcp_port(state)).filter(|p| *p != 0),
     };
     let Some(capability) = ember::channel::derive_xfer_stream_capability(
         &state.local_ed25519_seed,
@@ -214,8 +231,14 @@ pub(super) async fn offer_xfer_stream(
         ember::channel::XferStreamRole::Serve,
         ember::channel::XferStreamPorts {
             quic: port,
-            tcp: tcp_port_for(state, peer_addr),
+            tcp,
+            public_ip,
         },
+    );
+    info!(
+        "Ember Transfer: offering {xfer_hex} as a direct stream (QUIC {port}, TCP {}{})",
+        tcp.map_or_else(|| "none".to_string(), |p| p.to_string()),
+        if peer_addr.is_some() { ", direct session" } else { ", via public address" }
     );
     send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
 }
@@ -295,7 +318,12 @@ pub(super) async fn start_xfer_stream_fetch(
     db: &Arc<Database>,
     xfer_id: [u8; 16],
 ) -> bool {
+    let xfer_hex = hex::encode(xfer_id);
     let Some((sender, ports, _)) = state.xfer_stream_ports.remove(&xfer_id) else {
+        info!(
+            "Ember Transfer: {xfer_hex} uses the block protocol: the sender offered no direct \
+             stream (an older build, or no address to give)"
+        );
         return false;
     };
     let Some((channel_id, peer, key, size, root)) = state
@@ -309,12 +337,26 @@ pub(super) async fn start_xfer_stream_fetch(
         return false;
     }
     let Some(endpoint) = chat_attach::quic_endpoint(state) else {
+        info!("Ember Transfer: {xfer_hex} uses the block protocol: no QUIC endpoint yet");
         return false;
     };
-    let Some(peer_addr) = member_direct_addr(state, &peer) else {
+    // The session's address when we hold one; otherwise the public address the
+    // sender named, and only a publicly routable one — a room member must not
+    // be able to point our dial at something on our own network.
+    let peer_addr = member_direct_addr(state, &peer);
+    let Some(peer_ip) = peer_addr.map(|a| a.ip()).or_else(|| {
+        ports
+            .public_ip
+            .filter(|ip| !crate::security::is_special_use_v4(*ip))
+            .map(std::net::IpAddr::V4)
+    }) else {
+        info!(
+            "Ember Transfer: {xfer_hex} uses the block protocol: no direct session to the \
+             sender and no public address from it"
+        );
         return false;
     };
-    let Some(target) = chat_attach::dial_target(peer_addr.ip(), ports.quic) else {
+    let Some(target) = chat_attach::dial_target(peer_ip, ports.quic) else {
         return false;
     };
     let Some(capability) = ember::channel::derive_xfer_stream_capability(
@@ -330,7 +372,7 @@ pub(super) async fn start_xfer_stream_fetch(
     // key; the grant is what limits the stream to this transfer.
     let tcp = ports
         .tcp
-        .and_then(|port| chat_attach::dial_target(peer_addr.ip(), port))
+        .and_then(|port| chat_attach::dial_target(peer_ip, port))
         .and_then(|addr| {
             Some(RoomTcpFallback {
                 addr,
@@ -355,7 +397,7 @@ pub(super) async fn start_xfer_stream_fetch(
 
     // Our own port, so the sender can punch toward us while we dial. Sent
     // before the dial starts; without a port we still dial, just unpunched.
-    if let Some(our_port) = chat_attach::quic_port_for(state, Some(peer_addr)) {
+    if let Some(our_port) = chat_attach::quic_port_for(state, peer_addr) {
         let plain = ember::channel::encode_xfer_stream(
             &key,
             &state.local_ed25519_pubkey,
@@ -365,10 +407,15 @@ pub(super) async fn start_xfer_stream_fetch(
             ember::channel::XferStreamPorts {
                 quic: our_port,
                 tcp: None,
+                public_ip: None,
             },
         );
         send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
     }
+    info!(
+        "Ember Transfer: fetching {xfer_hex} as a direct stream{}",
+        if peer_addr.is_some() { "" } else { " at the sender's public address" }
+    );
 
     let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let task_verified = verified.clone();
@@ -699,6 +746,7 @@ async fn sync_xfer_streams(
         recv.set_streaming(false);
         let reason = match outcome.result {
             StreamFetchResult::Complete => {
+                info!("Ember Transfer: {} arrived over a direct stream", recv.name);
                 recv.note_streamed(recv.size);
                 recv.stream_verified = true;
                 finish_xfer_recv(state, xfer_id);

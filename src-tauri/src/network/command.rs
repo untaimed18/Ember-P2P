@@ -3454,12 +3454,7 @@ async fn handle_command_inner(
             );
             let _ = tx.send(Ok(()));
             if accept {
-                if !start_xfer_stream_fetch(socket, state, db, xfer_id).await {
-                    debug!(
-                        "Ember Transfer: {} will use the block protocol (no direct stream)",
-                        hex::encode(xfer_id)
-                    );
-                }
+                start_xfer_stream_fetch(socket, state, db, xfer_id).await;
             } else {
                 state.xfer_stream_ports.remove(&xfer_id);
             }

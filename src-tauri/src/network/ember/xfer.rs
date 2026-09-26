@@ -47,6 +47,36 @@ pub const CHANNEL_FILES_DIR: &str = "Channel Files";
 /// block would cost more than the transfer.
 const PROGRESS_STEP_PCT: u8 = 1;
 
+/// ...and at least this often while bytes are moving, however little. The UI
+/// works out the transfer speed from successive reports, and a percent of a
+/// large file on a slow link can be minutes apart.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// When a transfer's progress is next worth telling the UI.
+#[derive(Default)]
+struct ProgressReporter {
+    pct: u8,
+    bytes: u64,
+    at: Option<Instant>,
+}
+
+impl ProgressReporter {
+    /// `Some(pct)` when a whole step has passed, when a second has passed with
+    /// bytes moved, or on `always`.
+    fn due(&mut self, pct: u8, bytes: u64, always: bool) -> Option<u8> {
+        let stepped = pct / PROGRESS_STEP_PCT > self.pct / PROGRESS_STEP_PCT;
+        let timely = bytes > self.bytes
+            && self.at.is_none_or(|at| at.elapsed() >= PROGRESS_MIN_INTERVAL);
+        if !(stepped || timely || always) {
+            return None;
+        }
+        self.pct = self.pct.max(pct);
+        self.bytes = bytes;
+        self.at = Some(Instant::now());
+        Some(pct)
+    }
+}
+
 /// How much longer than the recipient's prompt the sender holds an unanswered
 /// offer open. See [`SendState::is_stalled`].
 const OFFER_GRACE_SECS: u64 = 30;
@@ -151,7 +181,7 @@ pub struct SendState {
     read_pos: Option<u64>,
     /// Bytes served over a QUIC stream, when the transfer went that way.
     streamed: u64,
-    reported_pct: u8,
+    reporter: ProgressReporter,
 }
 
 impl SendState {
@@ -178,7 +208,7 @@ impl SendState {
             handle: None,
             read_pos: None,
             streamed: 0,
-            reported_pct: 0,
+            reporter: ProgressReporter::default(),
         }
     }
 
@@ -227,19 +257,15 @@ impl SendState {
             .min(self.size)
     }
 
-    /// Percentage to report, if it has moved a whole step since last time.
+    /// Percentage to report, if it is due. See [`ProgressReporter::due`].
     pub fn progress_step(&mut self) -> Option<u8> {
-        let pct = self
-            .bytes_sent()
+        let bytes = self.bytes_sent();
+        let pct = bytes
             .saturating_mul(100)
             .checked_div(self.size)
             .unwrap_or(100)
             .min(100) as u8;
-        if pct / PROGRESS_STEP_PCT > self.reported_pct / PROGRESS_STEP_PCT {
-            self.reported_pct = pct;
-            return Some(pct);
-        }
-        None
+        self.reporter.due(pct, bytes, false)
     }
 
     pub fn total_blocks(&self) -> u64 {
@@ -361,7 +387,7 @@ pub struct RecvState {
     /// No block below this is missing, so [`Self::next_requests`] starts
     /// here rather than walking every block already received each tick.
     first_missing: u64,
-    reported_pct: u8,
+    reporter: ProgressReporter,
 }
 
 impl RecvState {
@@ -406,7 +432,7 @@ impl RecvState {
             streamed: 0,
             stream_verified: false,
             first_missing: 0,
-            reported_pct: 0,
+            reporter: ProgressReporter::default(),
         }
     }
 
@@ -547,19 +573,15 @@ impl RecvState {
         self.file.get_ref().sync_all()
     }
 
-    /// Percentage to report, if it has moved a whole step since last time.
+    /// Percentage to report, if it is due. See [`ProgressReporter::due`].
     pub fn progress_step(&mut self) -> Option<u8> {
-        let pct = self
-            .bytes_received()
+        let bytes = self.bytes_received();
+        let pct = bytes
             .saturating_mul(100)
             .checked_div(self.size)
             .unwrap_or(100)
             .min(100) as u8;
-        if pct / PROGRESS_STEP_PCT > self.reported_pct / PROGRESS_STEP_PCT || pct >= 100 {
-            self.reported_pct = pct;
-            return Some(pct);
-        }
-        None
+        self.reporter.due(pct, bytes, pct >= 100)
     }
 
     /// Blocks to ask for now, grouped into contiguous runs.
@@ -779,6 +801,21 @@ mod tests {
         assert!(send.accepted);
         assert_eq!(send.bytes_sent(), XFER_BLOCK_SIZE as u64 * 2);
         assert_eq!(send.progress_step(), Some(50));
+    }
+
+    /// Within a percent, progress still reaches the UI once a second while
+    /// bytes are moving — the speed shown is worked out from these reports —
+    /// and never when nothing moved.
+    #[test]
+    fn progress_is_reported_each_second_while_bytes_move() {
+        let mut reporter = ProgressReporter::default();
+        assert_eq!(reporter.due(0, 10, false), Some(0));
+        assert_eq!(reporter.due(0, 20, false), None, "not twice inside a second");
+        reporter.at = Instant::now().checked_sub(Duration::from_millis(1_100));
+        assert_eq!(reporter.due(0, 30, false), Some(0));
+        reporter.at = Instant::now().checked_sub(Duration::from_millis(1_100));
+        assert_eq!(reporter.due(0, 30, false), None, "nothing moved");
+        assert_eq!(reporter.due(1, 31, false), Some(1), "a whole step is reported at once");
     }
 
     /// A stream that stopped moving is not kept alive by being looked at.
