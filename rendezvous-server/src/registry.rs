@@ -38,6 +38,22 @@ pub const NAME_RELEASE_SECS: i64 = 365 * 24 * 60 * 60;
 /// handover landed. The grace gives the nominee's client time to notice the
 /// owner has gone quiet and act.
 pub const NOMINEE_GRACE_SECS: i64 = 30 * 24 * 60 * 60;
+/// How long a room's previous name stays reserved to it after a rename.
+///
+/// Members on older builds, stale invite links and Discover records still in
+/// the DHT go on showing the old name for a while. Freeing it at once would let
+/// anyone claim it in that window and be taken for the room that just left it.
+/// The owner may rename back to it until then.
+pub const RETIRED_NAME_HOLD_SECS: i64 = 30 * 24 * 60 * 60;
+/// Least time between two renames of one room. A room that keeps changing its
+/// name is one its members stop recognising.
+pub const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
+/// Retired names one room may hold at once. Each is a name nobody else can
+/// claim for [`RETIRED_NAME_HOLD_SECS`], so without a ceiling a room renaming
+/// once a day could sit on thirty names at a time. Past it the oldest is freed
+/// outright: it is the one members and stale links are least likely to still
+/// show.
+pub const MAX_RETIRED_NAMES: usize = 3;
 /// Free a Channel username that has not been seen in a room for this long.
 pub const USERNAME_IDLE_SECS: i64 = 365 * 24 * 60 * 60;
 /// Silence windows a nomination may carry, mirroring the range the clients
@@ -116,6 +132,22 @@ pub struct ChannelNameRecord {
     /// retried handover recognise that it already happened.
     #[serde(default)]
     pub handed_over_from: String,
+    /// Unix seconds this stopped being the room's name, or 0 while it is. A
+    /// retired name is not listed and cannot be claimed by another room until
+    /// [`RETIRED_NAME_HOLD_SECS`] have passed.
+    #[serde(default)]
+    pub retired_at: i64,
+    /// Unix seconds of the rename that gave the room this name, or 0 if it
+    /// was never renamed. Enforces [`RENAME_INTERVAL_SECS`].
+    #[serde(default)]
+    pub renamed_at: i64,
+    /// User key of whoever took the room over in the handover that bound this
+    /// name to its current channel, or empty when unknown (a transfer to
+    /// someone the owner never nominated, or a record older than this field).
+    /// Only this key's handover retries count as the successor being alive;
+    /// see [`ChannelRegistry::handover_channel_name`].
+    #[serde(default)]
+    pub inheritor: String,
 }
 
 impl ChannelNameRecord {
@@ -123,10 +155,18 @@ impl ChannelNameRecord {
         self.claim_after_days > 0 && !self.nominee.is_empty()
     }
 
+    /// The room's current name: neither destroyed nor left behind by a rename.
+    fn is_current(&self) -> bool {
+        !self.deleted && self.retired_at == 0
+    }
+
     /// Whether the owner has been silent long enough that the name is free.
     fn abandoned(&self, now: i64) -> bool {
         if self.deleted {
             return false;
+        }
+        if self.retired_at > 0 {
+            return now.saturating_sub(self.retired_at) > RETIRED_NAME_HOLD_SECS;
         }
         let ts = if self.refreshed_at > 0 {
             self.refreshed_at
@@ -331,6 +371,8 @@ pub enum RegistryError {
     /// The registry on disk could not be loaded, so nothing may be written
     /// until an operator restores it. Answered with 503.
     ReadOnly,
+    /// The room was renamed less than [`RENAME_INTERVAL_SECS`] ago.
+    RenameTooSoon,
 }
 
 impl ChannelRegistry {
@@ -408,7 +450,7 @@ impl ChannelRegistry {
     fn live_name_of_channel(&self, channel_id: &str) -> Option<String> {
         self.names_of_channel(channel_id)
             .iter()
-            .find(|name| self.names.get(*name).is_some_and(|rec| !rec.deleted))
+            .find(|name| self.names.get(*name).is_some_and(ChannelNameRecord::is_current))
             .cloned()
     }
 
@@ -668,6 +710,13 @@ impl ChannelRegistry {
         if self.reap_abandoned_names(candidates, now) {
             self.touch();
         }
+        // One name per room. A claim for a different one is refused rather
+        // than read as a rename: owners re-claim on a timer with whatever name
+        // their device holds, and a stale one — trimmed by an older build,
+        // restored from a backup, left by a failed local write — would
+        // otherwise rename the room with nobody having asked. Renaming is
+        // [`Self::rename_channel_name_at`], and so is going back to a name this
+        // room retired: the exact-key block below refuses that here too.
         if self
             .live_name_of_channel(&id)
             .is_some_and(|existing| existing != normalized)
@@ -696,24 +745,25 @@ impl ChannelRegistry {
             return Err(RegistryError::Taken);
         }
         if let Some(existing) = self.names.get_mut(&normalized) {
-            if existing.deleted {
+            // A retired name of this very room counts as taken here: going
+            // back to it is a rename, with the interval that comes with one.
+            if existing.deleted
+                || existing.retired_at != 0
+                || !(existing.channel_id.eq_ignore_ascii_case(&id)
+                    && existing.pubkey.eq_ignore_ascii_case(&pk))
+            {
                 return Err(RegistryError::Taken);
             }
-            if existing.channel_id.eq_ignore_ascii_case(&id)
-                && existing.pubkey.eq_ignore_ascii_case(&pk)
-            {
-                let changed = existing.private != private || existing.display != display;
-                existing.private = private;
-                existing.display = display;
-                existing.refreshed_at = now;
-                if changed {
-                    self.touch_durable();
-                } else {
-                    self.touch();
-                }
-                return Ok(());
+            let changed = existing.private != private || existing.display != display;
+            existing.private = private;
+            existing.display = display;
+            existing.refreshed_at = now;
+            if changed {
+                self.touch_durable();
+            } else {
+                self.touch();
             }
-            return Err(RegistryError::Taken);
+            return Ok(());
         }
         // Only reached when this is a genuinely new name — every refresh and
         // re-case path above returns before here — so the cap cannot lock an
@@ -741,10 +791,172 @@ impl ChannelRegistry {
                 claim_after_days: 0,
                 created_at: now,
                 handed_over_from: String::new(),
+                retired_at: 0,
+                renamed_at: 0,
+                inheritor: String::new(),
             },
         );
         self.touch_durable();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn rename_channel_name(
+        &mut self,
+        channel_id: &str,
+        pubkey_hex: &str,
+        name: &str,
+        private: bool,
+    ) -> Result<(), RegistryError> {
+        self.rename_channel_name_at(channel_id, pubkey_hex, name, private, unix_now())
+    }
+
+    /// Move a room from the name it holds to `name`, signed by the channel key.
+    ///
+    /// The old name is retired rather than freed, and stays this room's for
+    /// [`RETIRED_NAME_HOLD_SECS`] so nobody can take it and pass for the room
+    /// while members and links still show it; the owner may rename back to it
+    /// in that time. At most once per [`RENAME_INTERVAL_SECS`].
+    ///
+    /// Asking for the name the room already holds is a refresh (or a
+    /// re-casing), so a retry after a lost answer succeeds rather than reading
+    /// as a second rename. A room with no name here yet simply claims one.
+    pub fn rename_channel_name_at(
+        &mut self,
+        channel_id: &str,
+        pubkey_hex: &str,
+        name: &str,
+        private: bool,
+        now: i64,
+    ) -> Result<(), RegistryError> {
+        self.writable()?;
+        let display = strip_invisible(name);
+        let normalized = normalize_channel_name(name).ok_or(RegistryError::InvalidName)?;
+        let id = channel_id.to_ascii_lowercase();
+        let pk = pubkey_hex.to_ascii_lowercase();
+        if id.len() != 32
+            || pk.len() != 64
+            || hex::decode(&id).map(|b| b.len()).unwrap_or(0) != 16
+            || hex::decode(&pk).map(|b| b.len()).unwrap_or(0) != 32
+        {
+            return Err(RegistryError::InvalidName);
+        }
+        if self.deleted.contains(&id) {
+            return Err(RegistryError::Taken);
+        }
+        let skeleton = confusable_key(&normalized);
+        // The same records the claim path reaps before judging, for the same
+        // reason: an abandoned one among them must read as free.
+        let mut candidates = vec![normalized.clone()];
+        candidates.extend_from_slice(self.names_of_channel(&id));
+        if let Some(lookalikes) = self.by_skeleton.get(&skeleton) {
+            candidates.extend_from_slice(lookalikes);
+        }
+        if self.reap_abandoned_names(candidates, now) {
+            self.touch();
+        }
+        let from = match self.live_name_of_channel(&id) {
+            Some(from) if from != normalized => from,
+            _ => return self.claim_channel_name_at(channel_id, pubkey_hex, name, private, now),
+        };
+        let Some(current) = self.names.get(&from) else {
+            return Err(RegistryError::InvalidName);
+        };
+        if !current.pubkey.eq_ignore_ascii_case(&pk) {
+            return Err(RegistryError::Forbidden);
+        }
+        if current.renamed_at > 0 && now.saturating_sub(current.renamed_at) < RENAME_INTERVAL_SECS {
+            return Err(RegistryError::RenameTooSoon);
+        }
+        // Lookalikes held by other rooms, tombstones included, exactly as for
+        // a claim. Skipped when the exact key is on record; the block below
+        // decides that case.
+        if !self.names.contains_key(&normalized)
+            && self.by_skeleton.get(&skeleton).is_some_and(|lookalikes| {
+                lookalikes.iter().any(|existing| {
+                    self.names
+                        .get(existing)
+                        .is_some_and(|rec| !rec.channel_id.eq_ignore_ascii_case(&id))
+                })
+            })
+        {
+            return Err(RegistryError::Taken);
+        }
+        if let Some(existing) = self.names.get(&normalized) {
+            // Only one of this room's own retired names may be taken back.
+            if existing.deleted
+                || existing.retired_at == 0
+                || !(existing.channel_id.eq_ignore_ascii_case(&id)
+                    && existing.pubkey.eq_ignore_ascii_case(&pk))
+            {
+                return Err(RegistryError::Taken);
+            }
+        } else if self.names.len() >= MAX_CHANNEL_NAMES {
+            self.reap_stale(now);
+            if self.names.len() >= MAX_CHANNEL_NAMES {
+                return Err(RegistryError::Full);
+            }
+        }
+        self.apply_rename(&from, normalized, display, private, now);
+        self.release_surplus_retired_names(&id);
+        self.touch_durable();
+        Ok(())
+    }
+
+    /// Move a room from the name it holds, `from`, to `to`, retiring `from`.
+    ///
+    /// What belongs to the room rather than to the word travels with it: its
+    /// seniority in the directory, its nominee, the handover it came from.
+    /// `to` is either a name not on record or one this room retired earlier;
+    /// the caller has checked which.
+    fn apply_rename(&mut self, from: &str, to: String, display: String, private: bool, now: i64) {
+        let Some(old) = self.names.get_mut(from) else {
+            return;
+        };
+        old.retired_at = now;
+        let renamed = ChannelNameRecord {
+            channel_id: old.channel_id.clone(),
+            pubkey: old.pubkey.clone(),
+            private,
+            deleted: false,
+            display,
+            refreshed_at: now,
+            nominee: old.nominee.clone(),
+            claim_after_days: old.claim_after_days,
+            created_at: old.created_at,
+            handed_over_from: old.handed_over_from.clone(),
+            retired_at: 0,
+            renamed_at: now,
+            inheritor: old.inheritor.clone(),
+        };
+        // Replaced in place when it is one of this room's retired names: same
+        // key and same room, so neither index needs to move.
+        if let Some(existing) = self.names.get_mut(&to) {
+            *existing = renamed;
+        } else {
+            self.insert_name(to, renamed);
+        }
+    }
+
+    /// Free the oldest of `channel_id`'s retired names past
+    /// [`MAX_RETIRED_NAMES`].
+    fn release_surplus_retired_names(&mut self, channel_id: &str) {
+        let mut retired: Vec<(i64, String)> = self
+            .names_of_channel(channel_id)
+            .iter()
+            .filter_map(|name| {
+                let rec = self.names.get(name)?;
+                (!rec.deleted && rec.retired_at > 0).then(|| (rec.retired_at, name.clone()))
+            })
+            .collect();
+        if retired.len() <= MAX_RETIRED_NAMES {
+            return;
+        }
+        retired.sort();
+        let surplus = retired.len() - MAX_RETIRED_NAMES;
+        for (_, name) in retired.into_iter().take(surplus) {
+            self.remove_name(&name);
+        }
     }
 
     /// Record who may inherit this room's name, signed by the channel key.
@@ -832,15 +1044,38 @@ impl ChannelRegistry {
             // This exact handover already happened, e.g. a retry after its
             // first answer was lost. Anything else holding the successor's
             // name is a conflict.
-            let already_done = self.names.get(&held).is_some_and(|rec| {
-                rec.pubkey.eq_ignore_ascii_case(&new_pk)
-                    && rec.handed_over_from.eq_ignore_ascii_case(&old_id)
-            });
-            return if already_done {
-                Ok(())
-            } else {
-                Err(RegistryError::Taken)
+            let Some(rec) = self.names.get_mut(&held) else {
+                return Err(RegistryError::Taken);
             };
+            if !(rec.pubkey.eq_ignore_ascii_case(&new_pk)
+                && rec.handed_over_from.eq_ignore_ascii_case(&old_id))
+            {
+                return Err(RegistryError::Taken);
+            }
+            // A successor whose device holds a name other than the registry's
+            // — one an older build trimmed, say — has every name claim
+            // refused, falls back to retrying this handover, and ends up here
+            // on each refresh pass. That makes this the only request showing
+            // the room is alive, so it has to count as a refresh, or the room
+            // leaves Discover after a week and loses its name after a year
+            // while still in use.
+            //
+            // Nothing above checked the signer's authority, though, so only
+            // the key that took the room over counts; anyone else's request
+            // would keep a dead room's name held. When that key is not on
+            // record — a transfer to someone never nominated, or a handover
+            // older than the field — the first retry names it. That is the
+            // successor's own client, the only one with a reason to send it,
+            // and the outgoing owner's key is kept out since its retries say
+            // nothing about the successor.
+            if rec.inheritor.is_empty() && channel_id_of_key(&signer).as_deref() != Some(old_id.as_str()) {
+                rec.inheritor = signer.clone();
+            }
+            if rec.inheritor == signer {
+                rec.refreshed_at = now;
+                self.touch();
+            }
+            return Ok(());
         }
         let Some(name) = self.live_name_of_channel(&old_id) else {
             return Err(RegistryError::InvalidName);
@@ -857,6 +1092,9 @@ impl ChannelRegistry {
             return Err(RegistryError::Forbidden);
         }
         let previous_id = rec.channel_id.to_ascii_lowercase();
+        // An explicit transfer may go to anyone, not only the nominee, so the
+        // registry does not know the new owner's key; see the retry above.
+        rec.inheritor = if by_nominee { signer.clone() } else { String::new() };
         rec.channel_id = new_id.clone();
         rec.pubkey = new_pk;
         rec.refreshed_at = now;
@@ -947,7 +1185,7 @@ impl ChannelRegistry {
             .iter()
             .filter(|(_, rec)| {
                 !rec.private
-                    && !rec.deleted
+                    && rec.is_current()
                     && !self.deleted.contains(&rec.channel_id)
                     && now.saturating_sub(rec.refreshed_at) <= CHANNEL_DIRECTORY_STALE_SECS
             })
@@ -1395,6 +1633,13 @@ fn confusable_key(name: &str) -> String {
     skeleton(&name.to_lowercase()).collect()
 }
 
+/// Channel id (lowercase hex) a room key hashes to, mirroring
+/// `channel_id_matches_pubkey` in `main.rs`, or `None` for a malformed key.
+fn channel_id_of_key(pubkey_hex: &str) -> Option<String> {
+    let pubkey = hex::decode(pubkey_hex).ok().filter(|b| b.len() == 32)?;
+    Some(hex::encode(&blake3::hash(&pubkey).as_bytes()[..16]))
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1701,13 +1946,22 @@ mod tests {
             .handover_channel_name(&old_id, &new_id, &new_pk, &old_pk, unix_now())
             .is_ok());
 
-        // One name per room, so the successor must release "Lobby" first; that
-        // is the pre-existing rule, not something the confusable scan added.
+        // One name per room, so a plain claim for another is refused ...
         assert_eq!(
             reg.claim_channel_name(&new_id, &new_pk, "Lounge", false),
             Err(RegistryError::Taken)
         );
-        assert!(reg.delete_channel(&new_id, &new_pk).is_ok());
+        // ... and a rename, the same as for any owner, retires "Lobby" to the
+        // successor rather than keeping it alongside "Lounge".
+        assert!(reg.rename_channel_name(&new_id, &new_pk, "Lounge", false).is_ok());
+        let listing = reg.public_directory();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name, "Lounge");
+        assert_eq!(
+            reg.claim_channel_name(&old_id, &old_pk, "Lobby", false),
+            Err(RegistryError::Taken),
+            "the room it came from cannot take the retired name back"
+        );
     }
 
     /// An owner-deleted name never comes back, so a lookalike of one must not
@@ -1786,16 +2040,248 @@ mod tests {
         assert!(reg.public_directory().is_empty());
     }
 
+    /// Owners re-claim on a timer with whatever name their device holds, so a
+    /// claim for a different name must never rename the room by itself.
     #[test]
     fn one_channel_cannot_claim_a_second_name() {
         let mut reg = ChannelRegistry::in_memory();
         let id = "11".repeat(16);
         let pk = "22".repeat(32);
-        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
         assert_eq!(
-            reg.claim_channel_name(&id, &pk, "Elsewhere", false),
+            reg.claim_channel_name_at(&id, &pk, "Elsewhere", false, t0 + 10),
             Err(RegistryError::Taken)
         );
+        assert_eq!(
+            reg.claim_channel_name_at(&id, &pk, "Lobby Chat", false, t0 + 10),
+            Err(RegistryError::Taken),
+            "nor a stale or trimmed form of the name"
+        );
+        let listed = reg.public_directory_at(t0 + 10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Lobby");
+    }
+
+    #[test]
+    fn a_second_name_is_a_rename_that_retires_the_first() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Elsewhere", false, t0 + 10).is_ok());
+        let listed = reg.public_directory_at(t0 + 10);
+        assert_eq!(listed.len(), 1, "still one listing for the room");
+        assert_eq!(listed[0].name, "Elsewhere");
+        assert!(reg.has_channel(&id));
+        assert!(
+            reg.claim_channel_name_at(&id, &pk, "Elsewhere", false, t0 + 20).is_ok(),
+            "the owner's refresh now claims the new name"
+        );
+        assert_eq!(
+            reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0 + 20),
+            Err(RegistryError::Taken),
+            "and a device still holding the old one cannot rename the room back"
+        );
+    }
+
+    #[test]
+    fn a_rename_needs_the_rooms_key() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert_eq!(
+            reg.rename_channel_name(&id, &"99".repeat(32), "Elsewhere", false),
+            Err(RegistryError::Forbidden)
+        );
+    }
+
+    /// A retry after a lost answer asks for the name the room now holds, and
+    /// must succeed rather than read as a second rename inside the day.
+    #[test]
+    fn renaming_to_the_current_name_is_a_refresh() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Den", false, t0 + 5).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Den", false, t0 + 6).is_ok());
+        assert!(
+            reg.rename_channel_name_at(&id, &pk, "DEN", false, t0 + 7).is_ok(),
+            "nor is a re-casing"
+        );
+        assert_eq!(reg.public_directory_at(t0 + 7)[0].name, "DEN");
+        assert_eq!(reg.names.get("den").unwrap().renamed_at, t0 + 5);
+    }
+
+    #[test]
+    fn a_room_with_no_name_yet_claims_one_by_renaming() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.rename_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg.has_channel(&id));
+    }
+
+    #[test]
+    fn a_retired_name_stays_the_rooms_for_thirty_days() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let other_id = "33".repeat(16);
+        let other_pk = "44".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Elsewhere", false, t0).is_ok());
+        assert_eq!(
+            reg.claim_channel_name_at(&other_id, &other_pk, "Lobby", false, t0 + 86_400),
+            Err(RegistryError::Taken),
+            "nobody else can pose as the room while members still see the old name"
+        );
+        assert_eq!(
+            reg.claim_channel_name_at(&other_id, &other_pk, "L\u{03BF}bby", false, t0 + 86_400),
+            Err(RegistryError::Taken),
+            "nor under a lookalike of it"
+        );
+        let after_hold = t0 + RETIRED_NAME_HOLD_SECS + 1;
+        // The room keeps refreshing its current name, so only the retired one lapses.
+        assert!(reg.claim_channel_name_at(&id, &pk, "Elsewhere", false, after_hold).is_ok());
+        assert!(reg.claim_channel_name_at(&other_id, &other_pk, "Lobby", false, after_hold).is_ok());
+    }
+
+    #[test]
+    fn the_owner_can_rename_back_to_a_retired_name() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Elsewhere", false, t0).is_ok());
+        let later = t0 + RENAME_INTERVAL_SECS;
+        assert_eq!(
+            reg.claim_channel_name_at(&id, &pk, "LOBBY", false, later),
+            Err(RegistryError::Taken),
+            "a plain claim never takes a retired name back"
+        );
+        assert!(reg.rename_channel_name_at(&id, &pk, "LOBBY", false, later).is_ok());
+        let listed = reg.public_directory_at(later);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "LOBBY");
+    }
+
+    /// Each retired name is one nobody else may claim for a month, so a room
+    /// cannot collect them without limit.
+    #[test]
+    fn a_room_keeps_only_its_newest_retired_names() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let other_id = "33".repeat(16);
+        let other_pk = "44".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Name0", false, t0).is_ok());
+        for i in 1..=MAX_RETIRED_NAMES + 1 {
+            let at = t0 + i as i64 * RENAME_INTERVAL_SECS;
+            assert!(reg.rename_channel_name_at(&id, &pk, &format!("Name{i}"), false, at).is_ok());
+        }
+        let now = t0 + (MAX_RETIRED_NAMES as i64 + 1) * RENAME_INTERVAL_SECS;
+        let retired = reg
+            .names_of_channel(&id)
+            .iter()
+            .filter(|name| reg.names.get(*name).is_some_and(|rec| rec.retired_at > 0))
+            .count();
+        assert_eq!(retired, MAX_RETIRED_NAMES);
+        assert!(!reg.names.contains_key("name0"), "the oldest was freed");
+        assert!(reg.claim_channel_name_at(&other_id, &other_pk, "Name0", false, now).is_ok());
+        assert_eq!(
+            reg.claim_channel_name_at(&"55".repeat(16), &"66".repeat(32), "Name1", false, now),
+            Err(RegistryError::Taken),
+            "the newer ones are still held"
+        );
+    }
+
+    #[test]
+    fn a_room_renames_at_most_once_a_day() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(
+            reg.rename_channel_name_at(&id, &pk, "First", false, t0 + 5).is_ok(),
+            "the first rename is not held back by the room being new"
+        );
+        assert_eq!(
+            reg.rename_channel_name_at(&id, &pk, "Second", false, t0 + RENAME_INTERVAL_SECS - 1),
+            Err(RegistryError::RenameTooSoon)
+        );
+        assert_eq!(
+            reg.rename_channel_name_at(&id, &pk, "Lobby", false, t0 + 60),
+            Err(RegistryError::RenameTooSoon),
+            "going back to the old name is a rename too"
+        );
+        assert!(
+            reg.claim_channel_name_at(&id, &pk, "first", false, t0 + 60).is_ok(),
+            "re-casing the current name is a refresh, not a rename"
+        );
+        assert!(reg
+            .rename_channel_name_at(&id, &pk, "Second", false, t0 + 5 + RENAME_INTERVAL_SECS)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_rename_keeps_the_rooms_seniority_and_nominee() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        let nominee = "55".repeat(32);
+        let t0 = 1_000_000;
+        assert!(reg.claim_channel_name_at(&id, &pk, "Lobby", false, t0).is_ok());
+        assert!(reg.set_channel_nominee(&id, &pk, &nominee, 30).is_ok());
+        assert!(reg.rename_channel_name_at(&id, &pk, "Elsewhere", false, t0 + 999).is_ok());
+        let rec = reg.names.get("elsewhere").expect("renamed record");
+        assert_eq!(rec.created_at, t0);
+        assert_eq!(rec.nominee, nominee);
+        assert_eq!(rec.claim_after_days, 30);
+    }
+
+    #[test]
+    fn a_rename_cannot_take_another_rooms_name() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), "Taken", false).is_ok());
+        assert_eq!(
+            reg.rename_channel_name(&id, &pk, "Taken", false),
+            Err(RegistryError::Taken)
+        );
+        assert_eq!(
+            reg.rename_channel_name(&id, &pk, "T\u{0430}ken", false),
+            Err(RegistryError::Taken),
+            "nor a lookalike of it"
+        );
+        assert_eq!(reg.public_directory().iter().filter(|l| l.channel_id == id).count(), 1);
+        assert_eq!(reg.public_directory()[0].name, "Lobby");
+    }
+
+    #[test]
+    fn deleting_a_renamed_room_retires_every_name_it_held() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+        assert!(reg.rename_channel_name(&id, &pk, "Elsewhere", false).is_ok());
+        assert!(reg.delete_channel(&id, &pk).is_ok());
+        for name in ["Lobby", "Elsewhere"] {
+            assert_eq!(
+                reg.claim_channel_name(&"33".repeat(16), &"44".repeat(32), name, false),
+                Err(RegistryError::Taken)
+            );
+        }
     }
 
     #[test]
@@ -2512,13 +2998,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_successors_handover_retry_keeps_its_room_alive() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let owner = user_key(0);
+        let old_id = channel_id_of_key(&owner).unwrap();
+        let (new_id, new_pk) = (room_id(1), user_key(1));
+        let nominee = user_key(2);
+        assert!(reg.claim_channel_name_at(&old_id, &owner, "Lobby", false, t0).is_ok());
+        assert!(reg.set_channel_nominee(&old_id, &owner, &nominee, 7).is_ok());
+        let takeover = t0 + 8 * 86_400;
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &nominee, takeover)
+            .is_ok());
+
+        // Its device holds some other name, so its claims are refused and it
+        // retries the handover instead: that has to count as a refresh.
+        let later = takeover + 6 * 86_400;
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &nominee, later).is_ok());
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, later);
+
+        let stranger = user_key(9);
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &stranger, later + 86_400)
+            .is_ok());
+        assert_eq!(
+            reg.names.get("lobby").unwrap().refreshed_at,
+            later,
+            "nobody else's request keeps the room's name held"
+        );
+    }
+
+    /// After an explicit transfer the registry does not know the new owner's
+    /// key, so the first retry names it.
+    #[test]
+    fn an_explicit_transfers_first_retry_names_the_successor() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let owner = user_key(0);
+        let old_id = channel_id_of_key(&owner).unwrap();
+        let (new_id, new_pk) = (room_id(1), user_key(1));
+        let heir = user_key(3);
+        assert!(reg.claim_channel_name_at(&old_id, &owner, "Lobby", false, t0).is_ok());
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &owner, t0).is_ok());
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &heir, t0 + 10).is_ok());
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 10);
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &new_pk, &user_key(9), t0 + 20)
+            .is_ok());
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 10);
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &heir, t0 + 30).is_ok());
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 30);
+    }
+
     /// A retried handover (its first answer lost, or answered 503 while the
     /// write was still pending) must read as done, not as "name taken".
     #[test]
     fn a_repeated_handover_is_idempotent() {
         let mut reg = ChannelRegistry::in_memory();
         let t0 = 1_700_000_000;
-        let (old_id, new_id) = (room_id(0), room_id(1));
+        // The outgoing owner's retry: its key really is the old room's.
+        let old_id = channel_id_of_key(&user_key(0)).unwrap();
+        let new_id = room_id(1);
         assert!(reg.claim_channel_name_at(&old_id, &user_key(0), "Lobby", false, t0).is_ok());
         assert!(reg
             .handover_channel_name(&old_id, &new_id, &user_key(1), &user_key(0), t0)
@@ -2537,6 +3079,12 @@ mod tests {
             reg.handover_channel_name(&room_id(7), &new_id, &user_key(1), &user_key(0), t0 + 5),
             Err(RegistryError::Taken),
             "nor is one from a different room"
+        );
+
+        assert_eq!(
+            reg.names.get("lobby").unwrap().refreshed_at,
+            t0,
+            "the outgoing owner's retry says nothing about the successor being alive"
         );
 
         // A successor that already held a name of its own is still refused.

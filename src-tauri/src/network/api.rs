@@ -624,6 +624,13 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
+    /// Live composing signal for a room, one hop to members we already hold a
+    /// session with. Never queued, relayed, or stored; the next keystroke
+    /// refreshes it.
+    SendChannelTyping {
+        channel_id: [u8; 16],
+        typing: bool,
+    },
     /// Drop an in-flight Ember `FIND_VALUE` the caller has already given
     /// up on, so the search slot is not held until [`ember::dht::search`]
     /// times out on its own (60s). Discover presence probes wait 6s.

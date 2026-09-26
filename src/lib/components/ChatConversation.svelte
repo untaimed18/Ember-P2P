@@ -19,10 +19,32 @@
   import {
     deleteChannelMessage,
     getChannelMessages,
+    getChannelPins,
     markChannelMessagesRead,
     sendChannelMessage,
+    sendChannelTyping,
+    setChannelMessagePinned,
+    CHANNEL_PIN_MAX,
+    REPLY_REFERENCE_BYTES,
+    type ChannelInfo,
     type ChannelMessageInfo,
+    type ChannelPinInfo,
+    type ChannelReplyParent,
   } from '$lib/api/channels';
+  import {
+    clampPinIndex,
+    nextPinIndex,
+    pinAction,
+    pinIndexAfterChange,
+    resolvePins,
+  } from '$lib/channelPins';
+  import {
+    cachedReplyExcerpt,
+    getPendingReply,
+    resolveReplyQuote,
+    setPendingReply,
+    type PendingReply,
+  } from '$lib/channelReply';
   import { activeChatHash, clearUnread, friendLabel, friendNames, onlineFriends } from '$lib/stores/friends';
   import { clearChannelUnread, noteChannelOnScreen } from '$lib/stores/channels';
   import {
@@ -34,22 +56,50 @@
     REACTION_DOWN,
     REACTION_HEART,
     type ChannelReactionInfo,
+    type ChannelReactionTally,
   } from '$lib/api/channels';
+  import {
+    CURATED_REACTIONS,
+    QUICK_REACTIONS,
+    REACTION_GRID_COLUMNS,
+    coalesceRefresh,
+    curatedReaction,
+    formatReactors,
+    gridMove,
+    mergeReactionTallies,
+    resolvePickerPlacement,
+    visibleReactors,
+  } from '$lib/channelReactions';
+  import {
+    dropTypist,
+    nextTypistExpiry,
+    noteTypist,
+    outgoingTypingAction,
+    pruneTypists,
+    shouldAnnounceTyping,
+    typingLineSegments,
+    visibleTypists,
+    type Typists,
+  } from '$lib/channelTyping';
+  import { portal } from '$lib/actions/portal';
+  import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
   import {
+    copyToClipboard,
     formatCalendarDate,
     formatClockTime,
     insertMention,
     isAppVisible,
-    linkifyMessage,
     mentionTokenAt,
     shortPubkey,
   } from '$lib/utils';
+  import { formatMessage, type FormatBlock, type InlineNode } from '$lib/messageFormat';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { openExternalUrl } from '$lib/api/settings';
-  import { toast, toastError } from '$lib/stores/toast';
+  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
 
@@ -74,6 +124,16 @@
     /** The room's wait between messages, or 0 when it is off or this member is
      *  exempt. Drives the composer countdown; the backend enforces it. */
     slowModeSecs?: number;
+    /** An announcement-only room this member may not post in: the composer
+     *  becomes a note and Reply is withdrawn. False for the owner and
+     *  moderators. Reactions stay open. */
+    announceOnly?: boolean;
+    /** Wire ids of the room's pinned messages, oldest pin first. */
+    pinnedMsgIds?: string[];
+    /** This device owns the room, so Pin and Unpin are offered. */
+    canPin?: boolean;
+    /** A command returned the room's new state — a pin or unpin. */
+    onchannelupdate?: (info: ChannelInfo) => void;
     memberNames?: Record<string, string>;
     /** Senders hidden on this device. Presentational only — their messages are
      *  still received and stored, they just aren't drawn. */
@@ -99,6 +159,14 @@
     edited_at?: number;
     /** Channels only: the wire id other members address this line by. */
     msg_id?: string;
+    /** Channels only: wire id of the line this one replies to. */
+    reply_to?: string | null;
+    /** Channels only: the parent was written by us. */
+    reply_to_me?: boolean;
+    /** Channels only: the parent as the backend last read it. */
+    reply_parent?: ChannelReplyParent | null;
+    /** Channels only: the parent was removed from this device. */
+    reply_parent_deleted?: boolean;
   };
 
   /**
@@ -123,6 +191,10 @@
     youAreBanned = false,
     youAreKeyBehind = false,
     slowModeSecs = 0,
+    announceOnly = false,
+    pinnedMsgIds = [],
+    canPin = false,
+    onchannelupdate,
     memberNames = {},
     ignoredSenders = [],
     mentionName = '',
@@ -256,6 +328,15 @@
   let lastTypingSentAt = 0;
   const TYPING_REFRESH_MS = 2000;
   const TYPING_HOLD_MS = 5000;
+  /** Rooms only: who is composing here, and when each indicator lapses. */
+  let roomTypists: Typists = $state(new Map());
+  let roomTypistsNow = $state(Date.now());
+  let roomTypistsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Rooms only: the last signal this device sent, and to which room — the
+   *  stop on the way out has to reach the room being left, not the next one. */
+  let roomTypingSentOn = false;
+  let roomTypingSentAt = 0;
+  let roomTypingChannel = '';
   let removingMessage = $state<number | null>(null);
   /** Undo for this component's "room is on screen" claim. */
   let releaseChannelOnScreen: (() => void) | null = null;
@@ -289,6 +370,13 @@
    */
   let unreadMarkerId = $state<number | null>(null);
   let markerResolved = false;
+  /** Extra history pages fetched on open to find where a long unread run
+   *  starts. Past this the divider sits on the oldest loaded line. */
+  const UNREAD_SEEK_PAGES = 4;
+  /** The divider has been on screen since this conversation opened. */
+  let unreadDividerSeen = $state(false);
+  /** The divider is drawn and sits above the viewport, unseen. */
+  let unreadDividerAbove = $state(false);
 
   function fromChannelRow(row: ChannelMessageInfo): ConvMessage {
     return {
@@ -306,11 +394,20 @@
       sender_pubkey: row.sender_pubkey,
       edited_at: row.edited_at,
       msg_id: row.msg_id,
+      reply_to: row.reply_to ?? null,
+      reply_to_me: row.reply_to_me === true,
+      reply_parent: row.reply_parent ?? null,
+      reply_parent_deleted: row.reply_parent_deleted === true,
     };
   }
 
-  /** Reaction tallies for this room, keyed by wire message id. */
-  let reactions = $state<Record<string, ChannelReactionInfo>>({});
+  /** Reaction tallies for this room, keyed by wire message id. Raw, and
+   *  replaced through `mergeReactionTallies`: each row reads its own entry, and
+   *  an entry that keeps its identity is a row with nothing to redraw. */
+  let reactions = $state.raw<Record<string, ChannelReactionInfo>>({});
+  /** Bumped on every read and on leaving the room, so a response that comes
+   *  back after either is dropped rather than drawn over the newer state. */
+  let reactionSeq = 0;
   /** Which message is open in the inline editor, and the text being typed. */
   let editingId = $state<number | null>(null);
   let editDraft = $state('');
@@ -324,21 +421,167 @@
     action: 'add' | 'remove';
   } | null>(null);
   let reactionPulseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The "more reactions" grid, open for one line at a time. */
+  let picker = $state<{ msg: ConvMessage & { msg_id: string }; trigger: HTMLElement } | null>(null);
+  let pickerEl: HTMLElement | undefined = $state();
+  let pickerIndex = $state(0);
+  /** Null until measured, so the first frame is not drawn in the wrong place. */
+  let pickerPos = $state<{ left: number; top: number } | null>(null);
   let editInputEl: HTMLTextAreaElement | undefined = $state();
 
-  async function refreshReactions() {
+  /** The line the composer is answering, or null. Rooms only, and kept per room
+   *  alongside the draft (see `getPendingReply`). */
+  let replyTarget = $state<PendingReply | null>(null);
+  /** Wire ids removed from this device since the room opened. A reply's quote
+   *  snapshot predates the removal, so this is what turns it into "deleted". */
+  let removedMsgIds = $state<ReadonlySet<string>>(new Set());
+  let ignoredSet = $derived(new Set(ignoredSenders.map((key) => key.toLowerCase())));
+
+  function isIgnoredSender(pubkey: string | undefined): boolean {
+    return !!pubkey && ignoredSet.has(pubkey.toLowerCase());
+  }
+
+  /** Loaded lines by wire id, for quotes and the reply bar. Ignored senders'
+   *  lines stay in: a quote of one is drawn as hidden rather than falling back
+   *  to the backend's snapshot, which would name them. */
+  let messagesByMsgId = $derived(
+    new Map(
+      messages
+        .filter((msg): msg is ConvMessage & { msg_id: string } => !!msg.msg_id)
+        .map((msg) => [msg.msg_id, msg]),
+    ),
+  );
+  /** Pages a quote click may walk back for its parent before giving up. */
+  const REPLY_SEEK_PAGES = 10;
+
+  /** Whether a line can be answered: rooms only, and only a line with a wire id
+   *  every member shares — a handoff copy's synthetic id means nothing to them. */
+  function canReply(msg: ConvMessage): boolean {
+    return (
+      isChannel &&
+      msg.id > 0 &&
+      msg.msg_id?.length === 32 &&
+      !youAreBanned &&
+      !youAreKeyBehind &&
+      !announceOnly &&
+      !chatLocked
+    );
+  }
+
+  /** The backend's read of each pinned line, which the bar resolves against
+   *  what is loaded. Re-read whenever the pin list itself changes. */
+  let pinLookups = $state<ChannelPinInfo[]>([]);
+  /** Which pin the bar shows, counted from the newest. */
+  let pinIndex = $state(0);
+  let pinBusy = $state(false);
+  /** The pin list as a value. The page hands over a fresh array on every room
+   *  list refresh, and anything keyed on the array itself re-fetched the pins
+   *  and sent the bar back to the first one each time. */
+  let pinIdsKey = $derived(isChannel ? pinnedMsgIds.join(',') : '');
+  let stablePinnedIds = $derived(pinIdsKey ? pinIdsKey.split(',') : []);
+  let pinEntries = $derived(
+    isChannel ? resolvePins(stablePinnedIds, pinLookups, messagesByMsgId, removedMsgIds) : [],
+  );
+  let shownPinIndex = $derived(clampPinIndex(pinIndex, pinEntries.length));
+  /** What the bar last showed, to tell a new pin from one taken away. */
+  let lastPins: { channel: string; ids: string[] } = { channel: '', ids: [] };
+
+  $effect(() => {
+    const ids = stablePinnedIds;
+    const channel = channelId;
+    untrack(() => {
+      const prev = lastPins.channel === channel ? lastPins.ids : [];
+      pinIndex = pinIndexAfterChange(prev, ids, pinIndex);
+      lastPins = { channel, ids };
+    });
+    if (!isChannel || ids.length === 0) {
+      pinLookups = [];
+      return;
+    }
+    let cancelled = false;
+    untrack(() => {
+      getChannelPins(channel)
+        .then((rows) => {
+          if (!cancelled) pinLookups = rows;
+        })
+        .catch((e) => {
+          // The bar then shows each pin as not available yet, which is true
+          // enough and keeps the room readable.
+          console.warn('ChatConversation: failed to load pinned messages', e);
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function jumpToPin(id: number) {
+    void focusMessage(id, {
+      maxPages: REPLY_SEEK_PAGES,
+      onMissing: () => toast(m.channels_pinned_unavailable()),
+    });
+  }
+
+  async function setPinned(msgId: string, pinned: boolean) {
+    const channel = channelId;
+    if (!channel || pinBusy) return;
+    pinBusy = true;
+    try {
+      const info = await setChannelMessagePinned(channel, msgId, pinned);
+      if (channel === channelId) onchannelupdate?.(info);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      pinBusy = false;
+    }
+  }
+
+  function startReply(msg: ConvMessage) {
+    const channel = channelId;
+    if (!channel || !msg.msg_id || !canReply(msg)) return;
+    if (editingId !== null) {
+      // An edit with changes is not thrown away for a reply: the reader goes
+      // back to it, and can reply once it is saved or cancelled.
+      const editing = messages.find((line) => line.id === editingId);
+      if (editing && editDraft.trim() !== editing.message) {
+        editInputEl?.focus();
+        return;
+      }
+      cancelEdit();
+    }
+    const target: PendingReply = {
+      id: msg.id,
+      msgId: msg.msg_id,
+      senderPubkey: msg.sender_pubkey ?? '',
+      text: msg.message,
+    };
+    replyTarget = target;
+    setPendingReply(channel, target);
+    void tick().then(() => focusComposer());
+  }
+
+  function cancelReply() {
+    replyTarget = null;
+    if (channelId) setPendingReply(channelId, null);
+  }
+
+  /** One read in flight and at most one waiting: every member's reaction lands
+   *  as its own event, and a busy line would otherwise fire a full re-read for
+   *  each, answered in whatever order the backend gets to them. */
+  const refreshReactions = coalesceRefresh(async () => {
     const channel = channelId;
     if (!channel) return;
+    const seq = ++reactionSeq;
     try {
       const rows = await getChannelReactions(channel);
-      if (channel !== channelId) return;
-      reactions = Object.fromEntries(rows.map((row) => [row.msg_id, row]));
+      if (seq !== reactionSeq || channel !== channelId) return;
+      reactions = mergeReactionTallies(reactions, rows);
     } catch (e) {
       // A tally that fails to load leaves the bubbles bare rather than the room
       // unreadable, so this is not worth an error banner.
       console.warn('ChatConversation: failed to load reactions', e);
     }
-  }
+  });
 
   /**
    * Whether this line is still ours to revise.
@@ -366,20 +609,45 @@
     editError = null;
   }
 
+  /**
+   * After the reader closes the editor: back to the line's Edit button, or the
+   * composer once the edit window has taken the button away. The textarea that
+   * held focus is gone, and focus would otherwise fall to `<body>`. Left alone
+   * when the reader has already moved on to something else.
+   */
+  function restoreFocusAfterEdit(id: number) {
+    void tick().then(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
+      const edit = messagesContainerEl?.querySelector<HTMLElement>(
+        `[data-msg-id="${id}"] .bubble-edit-btn`,
+      );
+      if (edit) edit.focus();
+      else focusComposer();
+    });
+  }
+
+  function closeEditor(id: number) {
+    cancelEdit();
+    restoreFocusAfterEdit(id);
+  }
+
   async function commitEdit(msg: ConvMessage) {
     const channel = channelId;
     const text = editDraft.trim();
     if (!channel || editBusy) return;
     if (!text || text === msg.message) {
-      cancelEdit();
+      closeEditor(msg.id);
       return;
     }
     // Same UTF-8 byte guard `handleSend` applies, for the same reason: the
     // textarea's `maxlength` counts characters and the backend counts bytes, so
     // an emoji-heavy revision passed here and came back as a generic failure with
     // nothing to tell the user which limit they had hit.
-    if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
-      editError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
+    // A revised reply keeps its signed reference, which counts against the cap.
+    const maxBytes = MAX_MESSAGE_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
+    if (new TextEncoder().encode(text).length > maxBytes) {
+      editError = m.chat_message_too_long({ max: maxBytes });
       return;
     }
     editBusy = true;
@@ -392,7 +660,7 @@
             ? { ...m, message: updated.message, edited_at: updated.edited_at }
             : m,
         );
-        cancelEdit();
+        closeEditor(msg.id);
       }
     } catch (e: unknown) {
       if (channel === channelId) editError = translateError(e, m.channels_edit_failed());
@@ -405,13 +673,20 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      cancelEdit();
+      closeEditor(msg.id);
       return;
     }
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !isComposing(e)) {
       e.preventDefault();
       void commitEdit(msg);
     }
+  }
+
+  /** An IME is mid-composition: its Enter commits the candidate, and treating
+   *  it as "send" would post half a word. 229 covers WebKit, which reports the
+   *  keydown that ends a composition with `isComposing` already false. */
+  function isComposing(e: KeyboardEvent): boolean {
+    return e.isComposing || e.keyCode === 229;
   }
 
   /** Toggle our reaction: pressing the one we already hold withdraws it. */
@@ -436,11 +711,178 @@
       await setChannelMessageReaction(channel, msg.id, next);
       if (channel === channelId) await refreshReactions();
     } catch (e: unknown) {
-      if (channel === channelId) sendError = translateError(e, m.error_operation_failed());
+      // A toast, not the composer's banner: that one is about the line being
+      // written and stays until the next send.
+      if (channel === channelId) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       reactionBusy = null;
     }
   }
+
+  interface ReactionChip {
+    code: number;
+    count: number;
+    members: string[];
+  }
+
+  /**
+   * The chips under one line. On someone else's line the quick three are always
+   * there to press (zero counts included, shown on hover until anyone reacts),
+   * followed by whatever else has been picked; on our own line, which we cannot
+   * react to, only reactions somebody holds.
+   */
+  function reactionChips(tally: ChannelReactionInfo | undefined, ownMessage: boolean): ReactionChip[] {
+    const held = new Map<number, ChannelReactionTally>(
+      (tally?.reactions ?? []).map((t) => [t.reaction, t]),
+    );
+    const chip = (code: number): ReactionChip => ({
+      code,
+      count: held.get(code)?.count ?? 0,
+      members: held.get(code)?.members ?? [],
+    });
+    const quick = QUICK_REACTIONS.map(chip);
+    const rest = (tally?.reactions ?? [])
+      .filter((t) => !QUICK_REACTIONS.includes(t.reaction) && curatedReaction(t.reaction))
+      .map((t) => chip(t.reaction));
+    const all = [...quick, ...rest];
+    return ownMessage ? all.filter((c) => c.count > 0) : all;
+  }
+
+  /** "Heart: Ada, Bo and 3 others", or just "Heart" while nobody holds it.
+   *  Ignored members are counted among the others, never named. */
+  function reactionChipLabel(chip: ReactionChip): string {
+    const name = curatedReaction(chip.code)?.label() ?? '';
+    if (chip.count === 0) return name;
+    const names = formatReactors(
+      visibleReactors(chip.members, ignoredSet).map((key) => senderLabel(key)),
+      chip.count,
+    );
+    return m.channels_reaction_by({ reaction: name, names });
+  }
+
+  function openPicker(msg: ConvMessage, trigger: HTMLElement) {
+    if (!msg.msg_id || msg.direction === 'sent' || reactionBusy !== null) return;
+    if (picker?.msg.msg_id === msg.msg_id) {
+      closePicker(true);
+      return;
+    }
+    const mine = reactions[msg.msg_id]?.mine ?? REACTION_NONE;
+    const at = CURATED_REACTIONS.findIndex((r) => r.code === mine);
+    pickerIndex = at >= 0 ? at : 0;
+    pickerPos = null;
+    picker = { msg: { ...msg, msg_id: msg.msg_id }, trigger };
+  }
+
+  function closePicker(restoreFocus: boolean) {
+    const trigger = picker?.trigger;
+    picker = null;
+    pickerPos = null;
+    if (restoreFocus && trigger?.isConnected) trigger.focus();
+  }
+
+  function choosePickedReaction(code: number) {
+    const msg = picker?.msg;
+    closePicker(true);
+    if (msg) void toggleReaction(msg, code);
+  }
+
+  function placePicker() {
+    if (!picker || !pickerEl) return;
+    if (!picker.trigger.isConnected) {
+      closePicker(false);
+      return;
+    }
+    const { left, top } = resolvePickerPlacement(
+      picker.trigger.getBoundingClientRect(),
+      { width: pickerEl.offsetWidth, height: pickerEl.offsetHeight },
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    pickerPos = { left, top };
+  }
+
+  function focusPickerItem(index: number) {
+    pickerIndex = index;
+    pickerEl?.querySelectorAll<HTMLButtonElement>('.reaction-picker-item')[index]?.focus();
+  }
+
+  /** Attached natively by the picker's effect; see there for why. */
+  function onPickerKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      // The picker, and nothing behind it: the room page and the dock both
+      // answer Escape further up, and one press should close one thing.
+      e.preventDefault();
+      e.stopPropagation();
+      closePicker(true);
+      return;
+    }
+    if (e.key === 'Tab') {
+      // The grid sits at the end of <body>, so Tab would leave for nowhere
+      // useful. Hand focus back to the line it was opened from instead.
+      e.preventDefault();
+      e.stopPropagation();
+      closePicker(true);
+      return;
+    }
+    const next = gridMove(pickerIndex, e.key, REACTION_GRID_COLUMNS, CURATED_REACTIONS.length);
+    if (next !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      focusPickerItem(next);
+    }
+  }
+
+  // Placed once it has a size, then kept beside its trigger while the
+  // transcript scrolls or the window resizes. Outside presses close it, and so
+  // does focus leaving it by keyboard.
+  $effect(() => {
+    if (!picker || !pickerEl) return;
+    const panel = pickerEl;
+    placePicker();
+    const index = untrack(() => pickerIndex);
+    void tick().then(() => focusPickerItem(index));
+    const trigger = picker.trigger;
+    // Native, on the panel itself, not `onkeydown` in the markup. The panel is
+    // portalled out of the component tree, so Svelte's delegated handler would
+    // run from its listener on `document` — the same node the room page
+    // listens on for Escape, where `stopPropagation` can no longer keep the
+    // page's handler from closing its panes too. Stopped here, the event never
+    // reaches `document` at all.
+    const onKeyDown = (e: KeyboardEvent) => onPickerKeydown(e);
+    const onFocusOut = (e: FocusEvent) => {
+      const next = e.relatedTarget as Node | null;
+      // Null is focus going nowhere in particular — a press on bare page,
+      // which the pointer handler below already deals with, or the window
+      // losing focus, which is no reason to close.
+      if (!picker || !next) return;
+      if (panel.contains(next) || trigger.contains(next)) return;
+      closePicker(false);
+    };
+    panel.addEventListener('keydown', onKeyDown);
+    panel.addEventListener('focusout', onFocusOut);
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (!picker || !target) return;
+      if (pickerEl?.contains(target) || picker.trigger.contains(target)) return;
+      closePicker(false);
+      // A press on something focusable keeps the focus it just took; a press
+      // on bare transcript would otherwise leave focus on <body>.
+      setTimeout(() => {
+        const active = document.activeElement;
+        if ((!active || active === document.body) && trigger.isConnected) trigger.focus();
+      }, 0);
+    };
+    const onReflow = () => placePicker();
+    document.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('resize', onReflow);
+    window.addEventListener('scroll', onReflow, true);
+    return () => {
+      panel.removeEventListener('keydown', onKeyDown);
+      panel.removeEventListener('focusout', onFocusOut);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('resize', onReflow);
+      window.removeEventListener('scroll', onReflow, true);
+    };
+  });
 
   function senderLabel(pubkey?: string): string {
     if (!pubkey) return '';
@@ -495,11 +937,18 @@
           edited_at: number;
         }>('ember:channel-message-edited', (event) => {
           if (event.payload.channel_id !== room) return;
-          messages = messages.map((msg) =>
-            msg.msg_id === event.payload.msg_id || msg.id === event.payload.id
-              ? { ...msg, message: event.payload.message, edited_at: event.payload.edited_at }
-              : msg,
-          );
+          const edited = event.payload.msg_id;
+          messages = messages.map((msg) => {
+            if (msg.msg_id === edited || msg.id === event.payload.id) {
+              return { ...msg, message: event.payload.message, edited_at: event.payload.edited_at };
+            }
+            // A reply whose parent is paged out quotes the backend's snapshot,
+            // which would otherwise keep the words the parent no longer says.
+            if (edited && msg.reply_to === edited && msg.reply_parent) {
+              return { ...msg, reply_parent: { ...msg.reply_parent, excerpt: event.payload.message } };
+            }
+            return msg;
+          });
           // A line we were editing has been revised under us — most likely from
           // this account on another device. Drop the stale draft rather than let
           // it overwrite the newer text.
@@ -572,14 +1021,29 @@
       oldestDbId = null;
       unreadMarkerId = null;
       markerResolved = false;
+      unreadDividerSeen = false;
+      unreadDividerAbove = false;
       // Scroll position belongs to the conversation being left, not the one
       // being opened: `loadMessages` lands this one on its own unread marker
       // or at the bottom.
       scrolledAway = false;
       missedWhileAway = false;
+      // A jump asked for in the room being left means nothing in this one.
+      queuedFocus = null;
+      focusedId = null;
+      if (focusTimer) {
+        clearTimeout(focusTimer);
+        focusTimer = null;
+      }
       // Reactions and any half-finished edit belong to the room being left.
+      reactionSeq++;
       reactions = {};
+      picker = null;
+      pickerPos = null;
       cancelEdit();
+      // A pending reply is per room, like the draft restored above.
+      replyTarget = channel ? getPendingReply(channel) : null;
+      removedMsgIds = new Set();
       if (channel) void refreshReactions();
       (async () => {
         try {
@@ -615,12 +1079,15 @@
           void sendChatTyping(friend, false).catch(() => {});
         }
         activeChatHash.set(null);
+      } else {
+        stopRoomTyping();
       }
       friendTyping = false;
       if (typingHoldTimer) {
         clearTimeout(typingHoldTimer);
         typingHoldTimer = null;
       }
+      clearRoomTypists();
     };
   });
 
@@ -652,10 +1119,19 @@
           // Set when the line first reached us as a revision, which is how
           // catch-up serves one that was edited before we ever saw it.
           edited_at?: number;
+          reply_to?: string | null;
+          reply_to_me?: boolean;
+          reply_parent?: ChannelReplyParent | null;
+          reply_parent_deleted?: boolean;
         }>('ember:channel-message', (event) => {
           if (gen !== loadGen) return;
           if (event.payload.channel_id !== channel) return;
           if (messages.some((mm) => mm.id === event.payload.id)) return;
+          // The line they were composing has landed, so they are not typing it
+          // any more — whether or not a stop ever reaches us.
+          if (event.payload.direction === 'received') {
+            roomTypists = dropTypist(roomTypists, event.payload.sender_pubkey);
+          }
           const wasPinned = isPinnedToBottom();
           const next: ConvMessage[] = [...messages, {
             id: event.payload.id,
@@ -668,10 +1144,17 @@
             sender_pubkey: event.payload.sender_pubkey,
             edited_at: event.payload.edited_at ?? 0,
             msg_id: event.payload.msg_id,
+            reply_to: event.payload.reply_to ?? null,
+            reply_to_me: event.payload.reply_to_me === true,
+            reply_parent: event.payload.reply_parent ?? null,
+            reply_parent_deleted: event.payload.reply_parent_deleted === true,
           }];
           commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
           noteMissedMessage(wasPinned, event.payload.direction);
-          if (event.payload.direction === 'received' && isAppVisible()) {
+          // Not while the open is still seeking back for the first unread line:
+          // clearing `read` now would stop that seek short and misplace the
+          // divider. The read after the load covers this line too.
+          if (event.payload.direction === 'received' && isAppVisible() && markerResolved) {
             markAsRead();
           }
         });
@@ -704,6 +1187,29 @@
         else unlistenDelivery = deliveryFn;
       } catch (e) {
         console.warn('ChatConversation: failed to register channel delivery listener', e);
+      }
+      // Per open room rather than in a store: an indicator means nothing for a
+      // room nobody is looking at, and the backend has already checked the
+      // signature, the roster, the ban list and the clock.
+      try {
+        const typingFn = await listen<{
+          channel_id: string;
+          member_pubkey: string;
+          typing: boolean;
+        }>('ember:channel-typing', (event) => {
+          if (gen !== loadGen) return;
+          if (event.payload.channel_id !== channel) return;
+          const now = Date.now();
+          roomTypists = event.payload.typing
+            ? noteTypist(roomTypists, event.payload.member_pubkey, now)
+            : dropTypist(roomTypists, event.payload.member_pubkey);
+          roomTypistsNow = now;
+          scheduleRoomTypistsExpiry();
+        });
+        if (gen !== loadGen) typingFn();
+        else unlistenTyping = typingFn;
+      } catch (e) {
+        console.warn('ChatConversation: failed to register channel typing listener', e);
       }
       return true;
     }
@@ -762,8 +1268,9 @@
           noteMissedMessage(wasPinned, direction);
           // Only acknowledge what the user can actually see. A mounted
           // conversation in a minimized window would otherwise mark the
-          // message read and suppress its badge, losing it entirely.
-          if (direction === 'received' && isAppVisible()) {
+          // message read and suppress its badge, losing it entirely. Held
+          // until the unread divider is placed, as in the room listener.
+          if (direction === 'received' && isAppVisible() && markerResolved) {
             markAsRead();
           }
       });
@@ -903,6 +1410,20 @@
       // database, so anything recomputed after that would find nothing — the
       // marker has to be a decision made once, not a derived value.
       if (unreadMarkerId === null && !markerResolved) {
+        // A first page that is unread all the way to its oldest line does not
+        // say where the reader left off — the boundary is further back. Page
+        // back for it now rather than when the divider is wanted: `markAsRead`
+        // runs as soon as this returns and clears the flags that would tell.
+        // Bounded, because a room left for a month can hold thousands of
+        // unread lines, and every page is DOM the transcript has to carry.
+        for (let page = 0; page < UNREAD_SEEK_PAGES && hasMoreHistory; page++) {
+          const oldest = messages[0];
+          if (!oldest || oldest.direction !== 'received' || oldest.read) break;
+          const before = oldestDbId;
+          await loadOlderMessages();
+          if (gen !== loadGen) return;
+          if (oldestDbId === before) break;
+        }
         markerResolved = true;
         // Skipping ignored senders, because the divider is drawn from the same
         // list the transcript renders. Landing it on a line that is filtered out
@@ -1002,6 +1523,8 @@
     // The bumped generation silenced the old attachment listener along with
     // the rest, so it has to be registered again too.
     if (!channel && gen === loadGen) await setupAttachments(gen, hash);
+    // Live lines held back while the first load had not placed the divider.
+    if (gen === loadGen) void markAsRead();
   }
 
   async function markAsRead() {
@@ -1048,11 +1571,123 @@
     void sendChatTyping(friendHash, on).catch(() => {});
   }
 
+  /** Whether this device may tell the room it is composing. Slow mode counts:
+   *  "typing" from someone who cannot send yet promises a line that is not
+   *  coming. Visibility counts too, because the chat can be popped out into a
+   *  window of its own that is minimised while its text stays put. So does an
+   *  announcement-only room this member may not post in (`announceOnly` is
+   *  already false for the owner and moderators). */
+  function roomTypingAllowed(): boolean {
+    return (
+      isChannel &&
+      !youAreBanned &&
+      !youAreKeyBehind &&
+      !chatLocked &&
+      !announceOnly &&
+      slowModeLeft === 0 &&
+      isAppVisible()
+    );
+  }
+
+  function sendRoomTyping(channel: string, on: boolean) {
+    roomTypingSentOn = on;
+    roomTypingSentAt = Date.now();
+    roomTypingChannel = channel;
+    void sendChannelTyping(channel, on).catch(() => {});
+  }
+
+  function notifyRoomTyping(text: string) {
+    const action = outgoingTypingAction({
+      hasText: text.trim().length > 0,
+      allowed: roomTypingAllowed(),
+      lastSentOn: roomTypingSentOn && roomTypingChannel === channelId,
+      lastSentAt: roomTypingSentAt,
+      now: Date.now(),
+    });
+    if (action) sendRoomTyping(channelId, action === 'start');
+  }
+
+  function stopRoomTyping() {
+    if (roomTypingSentOn && roomTypingChannel) sendRoomTyping(roomTypingChannel, false);
+  }
+
+  function clearRoomTypists() {
+    roomTypists = new Map();
+    if (roomTypistsTimer) {
+      clearTimeout(roomTypistsTimer);
+      roomTypistsTimer = null;
+    }
+  }
+
+  /** One timer for the soonest lapse, re-armed after each, so an idle room
+   *  holds no interval at all. */
+  function scheduleRoomTypistsExpiry() {
+    if (roomTypistsTimer) {
+      clearTimeout(roomTypistsTimer);
+      roomTypistsTimer = null;
+    }
+    const soonest = nextTypistExpiry(roomTypists);
+    if (soonest === null) return;
+    roomTypistsTimer = setTimeout(() => {
+      roomTypistsTimer = null;
+      roomTypistsNow = Date.now();
+      roomTypists = pruneTypists(roomTypists, roomTypistsNow);
+      scheduleRoomTypistsExpiry();
+    }, Math.max(0, soonest - Date.now()) + 50);
+  }
+
+  let roomTypingSegments = $derived(
+    isChannel
+      ? typingLineSegments(
+          visibleTypists(roomTypists, roomTypistsNow, ignoredSenders).map((pk) => senderLabel(pk)),
+          {
+            one: (name) => m.channels_typing_one({ name }),
+            two: (first, second) => m.channels_typing_two({ first, second }),
+            several: () => m.channels_typing_several(),
+          },
+        )
+      : [],
+  );
+
+  /** What the room's typing live region says. Separate from the visible line,
+   *  which follows every typist; this only speaks when the room goes from
+   *  nobody typing to somebody, and not more than once per gap. */
+  let roomTypingAnnouncement = $state('');
+  let roomTypingActive = $derived(roomTypingSegments.length > 0 && !loading && !loadError);
+  let roomTypingWasActive = false;
+  let roomTypingAnnouncedAt = -Infinity;
+
+  $effect(() => {
+    const active = roomTypingActive;
+    untrack(() => {
+      const now = Date.now();
+      if (
+        shouldAnnounceTyping({
+          active,
+          wasActive: roomTypingWasActive,
+          lastAnnouncedAt: roomTypingAnnouncedAt,
+          now,
+        })
+      ) {
+        roomTypingAnnouncedAt = now;
+        roomTypingAnnouncement = roomTypingSegments.map((segment) => segment.text).join('');
+      } else if (!active) {
+        // Emptied, so the next announcement is a change the reader hears.
+        roomTypingAnnouncement = '';
+      }
+      roomTypingWasActive = active;
+    });
+  });
+
   function notifyOutgoingTyping(text = inputText) {
+    if (isChannel) {
+      notifyRoomTyping(text);
+      return;
+    }
     // The backend drops this when there is no live session. Gating on the
     // UI online set used to swallow composing entirely: that store can lag
     // the session (or miss a friend-online event), while chat still delivers.
-    if (isChannel || chatDisabled || chatLocked) return;
+    if (chatDisabled || chatLocked) return;
     const on = text.trim().length > 0;
     if (!on) {
       if (lastTypingSentOn) sendOutgoingTyping(false);
@@ -1065,6 +1700,10 @@
   }
 
   function stopOutgoingTyping() {
+    if (isChannel) {
+      stopRoomTyping();
+      return;
+    }
     if (lastTypingSentOn) sendOutgoingTyping(false);
   }
 
@@ -1088,8 +1727,13 @@
   $effect(() => {
     if (typeof document === 'undefined') return;
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') void markAsRead();
-      else stopOutgoingTyping();
+      // Mid-open is left to the read that follows the load, for the reason the
+      // live listeners give.
+      if (document.visibilityState === 'visible') {
+        if (markerResolved) void markAsRead();
+      } else {
+        stopOutgoingTyping();
+      }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -1097,7 +1741,7 @@
 
   function scrollToBottom() {
     requestAnimationFrame(() => {
-      messagesEnd?.scrollIntoView({ behavior: 'smooth' });
+      messagesEnd?.scrollIntoView({ behavior: prefersReducedMotion.current ? 'auto' : 'smooth' });
     });
   }
 
@@ -1107,14 +1751,61 @@
    *
    * Re-entering a busy room used to drop them at the newest line with nothing
    * saying where they had got to, so catching up meant scrolling up and
-   * guessing. Falls back to the bottom if the marker row is not on screen —
-   * which it will not be if the divider sits above what the first page loaded.
+   * guessing. Falls back to the bottom if the marker row is not drawn — its
+   * sender is ignored, say.
    */
   function scrollToUnreadMarker() {
     requestAnimationFrame(() => {
       const el = messagesContainerEl?.querySelector<HTMLElement>('.conv-unread-divider');
       if (el) el.scrollIntoView({ block: 'center' });
       else messagesEnd?.scrollIntoView();
+      checkUnreadDivider();
+    });
+  }
+
+  /**
+   * Keep the "Jump to first unread" pill honest.
+   *
+   * Opening a conversation lands on the divider, so this is for the reader who
+   * ends up below it without having seen it: a search hit or mention jump that
+   * lands further down, or "Jump to latest" pressed straight away. Once the
+   * divider has been on screen the pill is gone for good — it is a way back to
+   * something missed, not a permanent control. Being *above* the divider (the
+   * reader scrolled back past it) hides it too, since the way on is down.
+   */
+  function checkUnreadDivider() {
+    if (unreadMarkerId === null || unreadDividerSeen) {
+      unreadDividerAbove = false;
+      return;
+    }
+    const box = messagesContainerEl;
+    // Zero height means the pane is hidden (a collapsed dock), where every rect
+    // reads as zero and "above the viewport" would be a guess.
+    if (!box || box.clientHeight === 0) return;
+    const divider = box.querySelector<HTMLElement>('.conv-unread-divider');
+    if (!divider) {
+      unreadDividerAbove = false;
+      return;
+    }
+    const view = box.getBoundingClientRect();
+    const at = divider.getBoundingClientRect();
+    if (at.bottom <= view.top) {
+      unreadDividerAbove = true;
+    } else {
+      if (at.top < view.bottom) unreadDividerSeen = true;
+      unreadDividerAbove = false;
+    }
+  }
+
+  function jumpToFirstUnread() {
+    const divider = messagesContainerEl?.querySelector<HTMLElement>('.conv-unread-divider');
+    if (!divider) {
+      unreadDividerAbove = false;
+      return;
+    }
+    divider.scrollIntoView({
+      block: 'center',
+      behavior: prefersReducedMotion.current ? 'auto' : 'smooth',
     });
   }
 
@@ -1158,6 +1849,7 @@
     const pinned = isPinnedToBottom();
     scrolledAway = !pinned;
     if (pinned) missedWhileAway = false;
+    checkUnreadDivider();
   }
 
   function jumpToLatest() {
@@ -1251,10 +1943,19 @@
   let focusing = false;
   /** A hit picked while an earlier jump is still paging. Held rather than
    *  dropped, and run after: two jumps interleaved would each see the other's
-   *  `loadOlderMessages` as "no progress" and wrongly report the message gone. */
-  let queuedFocus: number | null = null;
+   *  `loadOlderMessages` as "no progress" and wrongly report the message gone.
+   *  Carries the conversation it was asked in, since ids are per conversation. */
+  let queuedFocus: { id: number; opts: FocusOptions; gen: number } | null = null;
   let focusTimer: ReturnType<typeof setTimeout> | null = null;
   const FOCUS_MARK_MS = 2600;
+
+  interface FocusOptions {
+    /** Older pages this jump may load before calling the message unreachable.
+     *  Unset means as far as the in-memory cap allows. */
+    maxPages?: number;
+    /** Instead of `onfocusmissing`, whose wording is the search's. */
+    onMissing?: () => void;
+  }
 
   /**
    * Bring a stored message into view, paging history back until it is loaded.
@@ -1265,17 +1966,20 @@
    * with no path back to the live tail. Local SQLite, so the round trips are
    * cheap; the in-memory cap still bounds how far back it can go.
    */
-  async function focusMessage(id: number) {
+  async function focusMessage(id: number, opts: FocusOptions = {}) {
     if (id <= 0) return;
     if (focusing) {
-      queuedFocus = id;
+      queuedFocus = { id, opts, gen: loadGen };
       return;
     }
     const gen = loadGen;
     focusing = true;
+    const missing = opts.onMissing ?? onfocusmissing;
+    let pagesLoaded = 0;
     try {
       while (!messages.some((message) => message.id === id)) {
         const before = oldestDbId;
+        if (opts.maxPages !== undefined && pagesLoaded >= opts.maxPages) break;
         // Already paged past it: the row is not in this conversation's stored
         // history any more (removed locally, or trimmed by the live cap).
         if (before === null || before <= id) break;
@@ -1298,26 +2002,32 @@
         if (loadingOlder) break;
         if (oldestDbId !== before) continue;
         await loadOlderMessages();
+        pagesLoaded++;
         if (gen !== loadGen) return;
         // No progress means the page came back empty or the cap kicked in;
         // without this the loop would spin on an unreachable id.
         if (oldestDbId === before) break;
       }
+      if (gen !== loadGen) return;
       // Loaded is not the same as drawn: an ignored sender's message stays in
       // `messages` but never reaches the DOM, and scrolling to it would do
       // nothing at all. Report it rather than appear to ignore the click.
       if (!visibleMessages.some((message) => message.id === id)) {
-        onfocusmissing?.();
+        missing?.();
         return;
       }
       focusedId = id;
       await tick();
+      if (gen !== loadGen) return;
       // After the render, and after the scroll anchoring `loadOlderMessages`
       // queues for itself — otherwise that restore lands on top of this jump.
       requestAnimationFrame(() => {
         messagesContainerEl
           ?.querySelector(`[data-msg-id="${id}"]`)
-          ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          ?.scrollIntoView({
+            block: 'center',
+            behavior: prefersReducedMotion.current ? 'auto' : 'smooth',
+          });
       });
       if (focusTimer) clearTimeout(focusTimer);
       focusTimer = setTimeout(() => {
@@ -1328,8 +2038,18 @@
       focusing = false;
       const next = queuedFocus;
       queuedFocus = null;
-      if (next !== null && next !== id) void focusMessage(next);
+      if (next !== null && next.gen === loadGen && next.id !== id) {
+        void focusMessage(next.id, next.opts);
+      }
     }
+  }
+
+  /** Follow a reply's quote to the line it answers. */
+  function jumpToReplyParent(id: number) {
+    void focusMessage(id, {
+      maxPages: REPLY_SEEK_PAGES,
+      onMissing: () => toast(m.channels_reply_unavailable()),
+    });
   }
 
   $effect(() => {
@@ -1470,7 +2190,7 @@
       // back on screen against a row already deleted, so reloading the
       // transcript dropped it. A delete that fails after a successful send
       // leaves a visible duplicate instead, which is recoverable.
-      const sent = await sendChannelMessage(channel, restore.message);
+      const sent = await sendChannelMessage(channel, restore.message, restore.reply_to);
       await deleteChannelMessage(channel, msg.id).catch((e) =>
         console.warn('ChatConversation: could not drop the abandoned room line', e),
       );
@@ -1493,28 +2213,41 @@
     const text = inputText.trim();
     if (!text || sending || youAreBanned || youAreKeyBehind || chatDisabled || chatLocked) return;
     if (slowModeLeft > 0) return;
+    const channel = channelId;
+    const reply = channel ? replyTarget : null;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
     // can be under 4096 chars yet over 4096 bytes and be rejected server-side
-    // with a generic error.
-    if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
-      sendError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
+    // with a generic error. A reply's signed reference rides in the same 4096.
+    const maxBytes = MAX_MESSAGE_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0);
+    if (new TextEncoder().encode(text).length > maxBytes) {
+      sendError = m.chat_message_too_long({ max: maxBytes });
       return;
     }
-    const channel = channelId;
     const waitSecs = slowModeSecs;
     const h = friendHash;
     const key = conversationKey;
     sending = true;
     sendError = null;
-    stopOutgoingTyping();
+    if (channel) {
+      // The line landing takes the indicator down on every receiver, so a stop
+      // here would only spend a datagram per member. The next keystroke starts
+      // a fresh one.
+      roomTypingSentOn = false;
+    } else {
+      stopOutgoingTyping();
+    }
     try {
       if (channel) {
-        const sent = await sendChannelMessage(channel, text);
+        const sent = await sendChannelMessage(channel, text, reply?.msgId);
+        // Only the reply this send carried: one chosen while it was in flight
+        // is a new intention, not this message's.
+        if (reply && getPendingReply(channel)?.msgId === reply.msgId) setPendingReply(channel, null);
         if (channel === channelId) {
           if (!messages.some((message) => message.id === sent.id)) {
             messages = [...messages, fromChannelRow(sent)];
           }
+          if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
           inputText = '';
           scrollToBottom();
           if (waitSecs > 0) {
@@ -1549,6 +2282,12 @@
             slowModeNow = Date.now();
           }
         }
+        // The parent is no longer here to answer. Drop the reply so the text,
+        // still in the composer, can go as a plain line on the next press.
+        if (coded?.code === 'channels_reply_target_invalid' && reply) {
+          setPendingReply(channel, null);
+          if (channel === channelId && replyTarget?.msgId === reply.msgId) replyTarget = null;
+        }
         if (channel === channelId) sendError = failed;
         else toastError(failed);
       } else if (h === friendHash) {
@@ -1576,6 +2315,38 @@
     el.focus();
   }
 
+  /** The raw text, markers and all: formatting is only how it is drawn, and
+   *  pasting it into another Ember (or anything Markdown-aware) keeps it. */
+  async function copyMessageText(msg: ConvMessage) {
+    if (await copyToClipboard(msg.message)) toastSuccess(m.chat_copied_text());
+    else toastError(m.chat_copy_failed());
+  }
+
+  /** Which code block just reported "Copied", as `msgId:blockIndex`. */
+  let copiedCodeKey = $state<string | null>(null);
+  let copiedCodeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function copyCodeBlock(key: string, text: string) {
+    if (!(await copyToClipboard(text))) {
+      toastError(m.chat_copy_failed());
+      return;
+    }
+    copiedCodeKey = key;
+    if (copiedCodeTimer) clearTimeout(copiedCodeTimer);
+    copiedCodeTimer = setTimeout(() => {
+      copiedCodeKey = null;
+      copiedCodeTimer = null;
+    }, 1500);
+  }
+
+  /** Composer formatting cheat-sheet. The dock and the rooms page can both
+   *  mount a conversation, so its id has to be per instance. */
+  let formatHelpOpen = $state(false);
+  const formatSheetId = $props.id();
+  /** Describes the composer while it is replying, so a screen reader hears who
+   *  the line will answer on focus. */
+  const replyBarId = `${formatSheetId}-reply`;
+
   /** Forget one message on this device only. The protocol has no redaction, so
    *  every other member keeps their copy — the label says so rather than
    *  implying a delete that cannot happen. */
@@ -1586,7 +2357,12 @@
     try {
       await deleteChannelMessage(channel, id);
       if (channel === channelId) {
+        const removed = messages.find((msg) => msg.id === id)?.msg_id;
         messages = messages.filter((msg) => msg.id !== id);
+        if (removed) {
+          removedMsgIds = new Set([...removedMsgIds, removed]);
+          if (replyTarget?.msgId === removed) cancelReply();
+        }
       }
     } catch (e: unknown) {
       if (channel === channelId) {
@@ -1678,6 +2454,9 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    // Every key belongs to the IME while it is composing, arrows and Enter
+    // included: they move between and commit its candidates.
+    if (isComposing(e)) return;
     // Ahead of Enter-to-send: while the list is open, Enter picks a name.
     if (mentionOpen) {
       if (e.key === 'ArrowDown') {
@@ -1703,6 +2482,15 @@
         mentionDismissed = true;
         return;
       }
+    }
+    if (e.key === 'Escape' && replyTarget) {
+      // The reply, and nothing behind it: the room page closes panes on
+      // Escape from `document` without checking `defaultPrevented`, so only
+      // stopping the event here keeps one press from doing both.
+      e.preventDefault();
+      e.stopPropagation();
+      cancelReply();
+      return;
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1789,7 +2577,7 @@
    * segmentation and the mention test off the template and into that derived
    * stopped them running once per *render*, but they still ran once per
    * *message* on each rebuild: at the 2000-message cap, one incoming line
-   * meant two thousand `linkifyMessage` scans and two thousand regex tests to
+   * meant two thousand `formatMessage` passes and two thousand regex tests to
    * produce output identical to the previous frame for all but one row. That,
    * not the number of mounted bubbles, is what a busy room actually costs.
    *
@@ -1803,7 +2591,7 @@
     edited: number;
     day: number | null;
     mentionsMe: boolean;
-    segments: ReturnType<typeof linkifyMessage>;
+    blocks: FormatBlock[];
   };
   let rowCache = new Map<number, CachedRow>();
   /** The pattern the cache was built against. A rename changes who is
@@ -1831,8 +2619,10 @@
               // `null` means the row carries no usable date — a zero timestamp
               // is "unknown", and must not produce a 1970 separator.
               day: msg.timestamp > 0 ? startOfDay(msg.timestamp) : null,
+              // Tested against the raw text, so a name inside `**…**` or next
+              // to a code span still counts; formatting is display-only.
               mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
-              segments: linkifyMessage(msg.message),
+              blocks: formatMessage(msg.message),
             };
       next.set(msg.id, row);
       return row;
@@ -1842,7 +2632,7 @@
     // message's neighbours, so inserting a line can change the row above it.
     // Both are plain comparisons rather than regex work.
     return messages.map((msg, i) => {
-      const { day, mentionsMe, segments } = derivedRows[i];
+      const { day, mentionsMe, blocks } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
       const newDay = day !== null && (i === 0 || derivedRows[i - 1].day !== day);
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
@@ -1850,13 +2640,20 @@
       // An undated row neither opens nor closes a day, so it stays with its run.
       const sameDayAsNext =
         hasNext && (day === null || derivedRows[i + 1].day === null || derivedRows[i + 1].day === day);
+      // Someone answering one of our lines is addressed to us the way a
+      // mention is, so it is marked the same way. The backend's verdict covers
+      // a parent paged out of view; a loaded one is checked directly.
+      const repliesToMe =
+        msg.direction === 'received' &&
+        !!msg.reply_to &&
+        (msg.reply_to_me === true || messagesByMsgId.get(msg.reply_to)?.direction === 'sent');
       return {
         msg,
         daySeparator: newDay ? dayLabel(msg.timestamp) : null,
         startsRun: newDay || !sameAuthorAsPrev,
         endsRun: !sameAuthorAsNext || !sameDayAsNext,
-        mentionsMe,
-        segments,
+        mentionsMe: mentionsMe || repliesToMe,
+        blocks,
       };
     });
   });
@@ -1897,6 +2694,15 @@
   let slowModeLeft = $derived(
     nextSendAt > slowModeNow ? Math.ceil((nextSendAt - slowModeNow) / 1000) : 0,
   );
+
+  // Take our indicator down the moment we stop being able to send the line it
+  // promises, rather than leave it up until it lapses on everyone's screen.
+  $effect(() => {
+    if (!isChannel) return;
+    if (youAreBanned || youAreKeyBehind || chatLocked || announceOnly || slowModeLeft > 0) {
+      untrack(() => stopRoomTyping());
+    }
+  });
 
   /** The room changed, so a wait owed to the previous one does not follow. */
   $effect(() => {
@@ -1956,9 +2762,16 @@
     if (lastTypingSentOn && friendHash) {
       void sendChatTyping(friendHash, false).catch(() => {});
     }
+    stopRoomTyping();
+    if (roomTypistsTimer) { clearTimeout(roomTypistsTimer); roomTypistsTimer = null; }
     if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
     if (reactionPulseTimer) { clearTimeout(reactionPulseTimer); reactionPulseTimer = null; }
+    if (copiedCodeTimer) { clearTimeout(copiedCodeTimer); copiedCodeTimer = null; }
   });
+
+  let showUnreadJump = $derived(
+    unreadMarkerId !== null && !unreadDividerSeen && unreadDividerAbove && !loading,
+  );
 </script>
 
 {#snippet attachmentRow(a: ChatAttachment)}
@@ -1985,6 +2798,70 @@
     {/if}
   </div>
 {/snippet}
+
+<!-- The quick three keep the drawn icons rooms have always had; the rest of
+     the curated set is the emoji itself. -->
+{#snippet reactionGlyph(code: number)}
+  {#if code === REACTION_HEART}
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+      <path d="M8 13.4S2.6 10.1 2.6 6.7A3.05 3.05 0 0 1 8 4.05a3.05 3.05 0 0 1 5.4 2.65C13.4 10.1 8 13.4 8 13.4z"/>
+    </svg>
+  {:else if code === REACTION_UP}
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+      <path d="M5 14V7l3.2-4.5a1.4 1.4 0 0 1 2.4 1.3L9.7 6.5H13a1.3 1.3 0 0 1 1.2 1.7l-1.3 4.6a1.7 1.7 0 0 1-1.6 1.2H5zM2.6 14h2.4V7H2.6z"/>
+    </svg>
+  {:else if code === REACTION_DOWN}
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+      <path d="M11 2v7l-3.2 4.5a1.4 1.4 0 0 1-2.4-1.3l.9-2.7H3a1.3 1.3 0 0 1-1.2-1.7l1.3-4.6A1.7 1.7 0 0 1 4.7 2H11zm2.4 0h-2.4v7h2.4z"/>
+    </svg>
+  {:else}
+    <span class="reaction-emoji" aria-hidden="true">{curatedReaction(code)?.emoji ?? ''}</span>
+  {/if}
+{/snippet}
+
+<!-- Opened from a line's "more reactions" button. The host stays where Svelte
+     put it; only the panel moves to <body>, out of the transcript's clipping
+     and any transform on the dock around it. -->
+{#if picker}
+  <div class="reaction-picker-host">
+    <div
+      class="reaction-picker"
+      class:placed={pickerPos !== null}
+      role="menu"
+      tabindex="-1"
+      aria-label={m.channels_reaction_picker()}
+      style:left={pickerPos ? `${pickerPos.left}px` : undefined}
+      style:top={pickerPos ? `${pickerPos.top}px` : undefined}
+      bind:this={pickerEl}
+      use:portal
+    >
+      {#each CURATED_REACTIONS as reaction, i (reaction.code)}
+        {@const held = (reactions[picker.msg.msg_id]?.mine ?? REACTION_NONE) === reaction.code}
+        <button
+          type="button"
+          class="reaction-picker-item"
+          class:active={held}
+          role="menuitemradio"
+          aria-checked={held}
+          tabindex={i === pickerIndex ? 0 : -1}
+          title={reaction.label()}
+          aria-label={reaction.label()}
+          onfocus={() => (pickerIndex = i)}
+          onclick={() => choosePickedReaction(reaction.code)}
+        >{reaction.emoji}</button>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+<!-- Written without whitespace between tags: the bubble is `pre-wrap`, so any
+     newline or indent here would be drawn inside the message. -->
+{#snippet inlineNodes(nodes: InlineNode[])}{#each nodes as node, i (i)}{#if node.type === 'text'}{node.text}{:else if node.type === 'link'}<button
+      type="button"
+      class="bubble-link"
+      title={node.href}
+      onclick={() => void askOpenLink(node.href)}
+    >{node.text}</button>{:else if node.type === 'code'}<code class="fmt-code">{node.text}</code>{:else if node.type === 'bold'}<strong>{@render inlineNodes(node.children)}</strong>{:else if node.type === 'italic'}<em>{@render inlineNodes(node.children)}</em>{:else}<s>{@render inlineNodes(node.children)}</s>{/if}{/each}{/snippet}
 
 <div class="conversation" class:channel={isChannel}>
   {#if !hideHeader}
@@ -2031,6 +2908,64 @@
   </div>
   {/if}
 
+  {#if isChannel && pinEntries.length > 0}
+    {@const pin = pinEntries[shownPinIndex]}
+    <!-- Its own row above the transcript rather than floating over it, so the
+         first lines are never hidden under it. One pin at a time: the bar is a
+         pointer to the message, not a second transcript. -->
+    <div class="conv-pin-bar" role="region" aria-label={m.channels_pinned_label()}>
+      <svg class="conv-pin-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+        <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
+      </svg>
+      {#if pin.kind === 'message' && isIgnoredSender(pin.senderPubkey)}
+        <!-- Still counted, so "1 of 3" stays true, but neither named nor
+             quoted, and nothing to jump to: the line itself is not drawn. -->
+        <span class="conv-pin-target unavailable">{m.channels_message_hidden_member()}</span>
+      {:else if pin.kind === 'message'}
+        {@const who = senderLabel(pin.senderPubkey)}
+        {@const excerpt = cachedReplyExcerpt(pin.text)}
+        <button
+          type="button"
+          class="conv-pin-target"
+          onclick={() => jumpToPin(pin.id)}
+          title={m.channels_pinned_jump()}
+          aria-label={m.channels_pinned_aria({ name: who, text: excerpt })}
+        >
+          <bdi dir="auto" class="conv-reply-who">{who}</bdi><span class="conv-reply-sep" aria-hidden="true">:</span>
+          <bdi dir="auto" class="conv-reply-excerpt">{excerpt}</bdi>
+        </button>
+      {:else}
+        <span class="conv-pin-target unavailable">{m.channels_pinned_unavailable()}</span>
+      {/if}
+      {#if pinEntries.length > 1}
+        <button
+          type="button"
+          class="conv-pin-cycle"
+          onclick={() => (pinIndex = nextPinIndex(shownPinIndex, pinEntries.length))}
+          title={m.channels_pinned_next()}
+          aria-label={m.channels_pinned_next_count({ index: shownPinIndex + 1, total: pinEntries.length })}
+        >
+          {m.channels_pinned_count({ index: shownPinIndex + 1, total: pinEntries.length })}
+        </button>
+      {/if}
+      {#if canPin}
+        <button
+          type="button"
+          class="conv-reply-cancel"
+          disabled={pinBusy}
+          onclick={() => void setPinned(pin.msgId, false)}
+          title={m.channels_unpin_message()}
+          aria-label={m.channels_unpin_message()}
+        >
+          <IconX size={11} />
+        </button>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- Anchors the unread pill to the transcript's top edge, which moves with
+       whether the header is shown. -->
+  <div class="conv-transcript">
   <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
     {#if liveError && !loading && !loadError}
       <div class="conv-live-error" role="status">
@@ -2124,11 +3059,41 @@
             written; only its bidi influence is scoped to this element.
           -->
           <!--
-            Segments, never markup: each run is a text node, so nothing a
-            member types can become HTML. A link is a `<button>` rather than an
-            `<a href>` so the webview itself has no navigable target — the only
-            way out is the confirmed, scheme-checked backend opener.
+            A node tree, never markup: `formatMessage` only decides which of a
+            few fixed elements each run of text sits in, and every run is a
+            text node, so nothing a member types can become HTML. A link is a
+            `<button>` rather than an `<a href>` so the webview itself has no
+            navigable target — the only way out is the confirmed,
+            scheme-checked backend opener. A code block is a block of its own,
+            so it takes `dir="auto"` itself rather than sitting in the `<bdi>`.
           -->
+          {#if isChannel && row.msg.reply_to}
+            {@const quote = resolveReplyQuote(row.msg, messagesByMsgId, removedMsgIds)}
+            {#if quote?.kind === 'parent' && isIgnoredSender(quote.senderPubkey)}
+              <!-- Not a button: the parent is not drawn, so there is nowhere
+                   to jump, and its author is not named. -->
+              <div class="bubble-quote unavailable">{m.channels_message_hidden_member()}</div>
+            {:else if quote?.kind === 'parent'}
+              {@const who = senderLabel(quote.senderPubkey)}
+              {@const excerpt = cachedReplyExcerpt(quote.text)}
+              <!-- Plain text nodes only, like the bubble body: the excerpt has
+                   its formatting markers removed rather than rendered. -->
+              <button
+                type="button"
+                class="bubble-quote"
+                onclick={() => jumpToReplyParent(quote.id)}
+                title={m.channels_reply_jump()}
+                aria-label={m.channels_reply_quote_aria({ name: who, text: excerpt })}
+              >
+                <bdi dir="auto" class="bubble-quote-who">{who}</bdi>
+                <bdi dir="auto" class="bubble-quote-text">{excerpt}</bdi>
+              </button>
+            {:else if quote}
+              <div class="bubble-quote unavailable">
+                {quote.kind === 'deleted' ? m.channels_reply_deleted() : m.channels_reply_unavailable()}
+              </div>
+            {/if}
+          {/if}
           {#if editingId === row.msg.id}
             <!-- Edited in place rather than in the composer at the bottom: that
                  one owns per-conversation drafts, the slow-mode countdown and
@@ -2149,7 +3114,7 @@
               {/if}
               <div class="bubble-edit-actions">
                 <span class="bubble-edit-hint">{m.channels_edit_hint()}</span>
-                <button type="button" class="bubble-edit-cancel" onclick={cancelEdit} disabled={editBusy}>
+                <button type="button" class="bubble-edit-cancel" onclick={() => closeEditor(row.msg.id)} disabled={editBusy}>
                   {m.common_cancel()}
                 </button>
                 <button
@@ -2163,21 +3128,83 @@
               </div>
             </div>
           {:else}
-          <div class="bubble-text"><bdi dir="auto">{#each row.segments as seg, i (i)}{#if seg.href}<button
+          <div class="bubble-text">{#each row.blocks as block, bi (bi)}{#if block.type === 'text'}<bdi dir="auto">{@render inlineNodes(block.children)}</bdi>{:else}{@const codeKey = `${row.msg.id}:${bi}`}<div class="fmt-codeblock"><!-- Focusable so a long line can be scrolled sideways from the keyboard: a scroll container is the one non-widget that needs a tab stop. --><!-- svelte-ignore a11y_no_noninteractive_tabindex --><pre dir="auto" tabindex="0" role="group" aria-label={m.chat_code_block_label()}><code>{block.text}</code></pre><button
                   type="button"
-                  class="bubble-link"
-                  title={seg.href}
-                  onclick={() => void askOpenLink(seg.href!)}
-                >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
+                  class="fmt-codeblock-copy"
+                  onclick={() => void copyCodeBlock(codeKey, block.text)}
+                  title={m.chat_copy_code()}
+                  aria-label={m.chat_copy_code()}
+                >{copiedCodeKey === codeKey ? m.common_copied() : m.common_copy()}</button></div>{/if}{/each}</div>
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
             {@render messageTimestamp(row.msg)}
           {/if}
-          <!-- Channels only, and only for rows the DB can actually address:
-               live bubbles carry negative synthetic ids. -->
-          {#if isChannel && row.msg.id > 0}
-            <div class="bubble-tools">
-              {#if canEdit(row.msg) && editingId !== row.msg.id}
+          <!-- Copy is offered on every line. Edit and remove are channels
+               only, and only for rows the DB can actually address: live
+               bubbles carry negative synthetic ids. -->
+          {#if editingId !== row.msg.id || (isChannel && row.msg.id > 0)}
+            <!-- One tab stop per line, arrows along it: five stops a message
+                 made the transcript a slog to tab through. -->
+            <div class="bubble-tools" role="toolbar" aria-label={m.chat_message_actions()} use:rovingToolbar>
+              {#if editingId !== row.msg.id}
+                <button
+                  type="button"
+                  class="bubble-copy-btn"
+                  onclick={() => void copyMessageText(row.msg)}
+                  title={m.chat_copy_text()}
+                  aria-label={m.chat_copy_text()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>
+                    <path d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/>
+                  </svg>
+                </button>
+              {/if}
+              {#if editingId !== row.msg.id && canReply(row.msg)}
+                <button
+                  type="button"
+                  class="bubble-reply-btn"
+                  onclick={() => startReply(row.msg)}
+                  title={m.channels_reply()}
+                  aria-label={m.channels_reply()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <path d="M6.5 4 2.5 8l4 4"/>
+                    <path d="M2.5 8h7a4 4 0 0 1 4 4v1"/>
+                  </svg>
+                </button>
+              {/if}
+              {#if isChannel && canPin && row.msg.id > 0 && row.msg.msg_id?.length === 32 && editingId !== row.msg.id}
+                {@const action = pinAction(row.msg.msg_id, stablePinnedIds, CHANNEL_PIN_MAX)}
+                {@const pinLabel =
+                  action === 'unpin'
+                    ? m.channels_unpin_message()
+                    : action === 'full'
+                      ? m.channels_pin_full({ max: CHANNEL_PIN_MAX })
+                      : m.channels_pin_message()}
+                <!-- At the cap it stays visible and says why, rather than
+                     vanishing or quietly replacing the oldest pin. Not
+                     `disabled`, so the tooltip still shows on hover. -->
+                <button
+                  type="button"
+                  class="bubble-pin-btn"
+                  class:active={action === 'unpin'}
+                  class:unavailable={action === 'full'}
+                  aria-disabled={action === 'full' || pinBusy}
+                  aria-pressed={action === 'unpin'}
+                  onclick={() => {
+                    if (action === 'full') toast(pinLabel);
+                    else if (row.msg.msg_id) void setPinned(row.msg.msg_id, action === 'pin');
+                  }}
+                  title={pinLabel}
+                  aria-label={pinLabel}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
+                  </svg>
+                </button>
+              {/if}
+              {#if isChannel && row.msg.id > 0 && canEdit(row.msg) && editingId !== row.msg.id}
                 <button
                   class="bubble-edit-btn"
                   onclick={() => startEdit(row.msg)}
@@ -2189,15 +3216,17 @@
                   </svg>
                 </button>
               {/if}
-              <button
-                class="bubble-remove"
-                disabled={removingMessage === row.msg.id}
-                onclick={() => handleRemoveMessage(row.msg.id)}
-                title={m.channels_remove_local()}
-                aria-label={m.channels_remove_local()}
-              >
-                <IconX size={11} />
-              </button>
+              {#if isChannel && row.msg.id > 0}
+                <button
+                  class="bubble-remove"
+                  disabled={removingMessage === row.msg.id}
+                  onclick={() => handleRemoveMessage(row.msg.id)}
+                  title={m.channels_remove_local()}
+                  aria-label={m.channels_remove_local()}
+                >
+                  <IconX size={11} />
+                </button>
+              {/if}
             </div>
           {/if}
           {#if isChannel}
@@ -2205,69 +3234,70 @@
               {#if row.msg.msg_id?.length === 32}
                 {@const tally = reactions[row.msg.msg_id]}
                 {@const mine = tally?.mine ?? REACTION_NONE}
-                {@const hasAny = (tally?.up ?? 0) + (tally?.down ?? 0) + (tally?.heart ?? 0) > 0}
+                {@const hasAny = (tally?.reactions.length ?? 0) > 0}
                 {@const ownMessage = row.msg.direction === 'sent'}
+                {@const pickerHere = picker?.msg.msg_id === row.msg.msg_id}
                 {#if !ownMessage || hasAny}
-                <div class="bubble-reactions" class:has-any={hasAny} class:readonly={ownMessage}>
-                  {#if !ownMessage || (tally?.heart ?? 0) > 0}
-                  <button
-                    type="button"
-                    class="reaction-btn heart"
-                    class:active={mine === REACTION_HEART}
-                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_HEART && reactionPulse?.action === 'add'}
-                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_HEART && reactionPulse?.action === 'remove'}
-                    disabled={ownMessage || reactionBusy !== null}
-                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_HEART); }}
-                    title={m.channels_reaction_heart()}
-                    aria-label={m.channels_reaction_heart()}
-                    aria-pressed={mine === REACTION_HEART}
-                    tabindex={ownMessage ? -1 : undefined}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
-                      <path d="M8 13.4S2.6 10.1 2.6 6.7A3.05 3.05 0 0 1 8 4.05a3.05 3.05 0 0 1 5.4 2.65C13.4 10.1 8 13.4 8 13.4z"/>
-                    </svg>
-                    {#if (tally?.heart ?? 0) > 0}<span class="reaction-count">{tally?.heart}</span>{/if}
-                  </button>
-                  {/if}
-                  {#if !ownMessage || (tally?.up ?? 0) > 0}
-                  <button
-                    type="button"
-                    class="reaction-btn"
-                    class:active={mine === REACTION_UP}
-                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_UP && reactionPulse?.action === 'add'}
-                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_UP && reactionPulse?.action === 'remove'}
-                    disabled={ownMessage || reactionBusy !== null}
-                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_UP); }}
-                    title={m.channels_reaction_up()}
-                    aria-label={m.channels_reaction_up()}
-                    aria-pressed={mine === REACTION_UP}
-                    tabindex={ownMessage ? -1 : undefined}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
-                      <path d="M5 14V7l3.2-4.5a1.4 1.4 0 0 1 2.4 1.3L9.7 6.5H13a1.3 1.3 0 0 1 1.2 1.7l-1.3 4.6a1.7 1.7 0 0 1-1.6 1.2H5zM2.6 14h2.4V7H2.6z"/>
-                    </svg>
-                    {#if (tally?.up ?? 0) > 0}<span class="reaction-count">{tally?.up}</span>{/if}
-                  </button>
-                  {/if}
-                  {#if !ownMessage || (tally?.down ?? 0) > 0}
-                  <button
-                    type="button"
-                    class="reaction-btn"
-                    class:active={mine === REACTION_DOWN}
-                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_DOWN && reactionPulse?.action === 'add'}
-                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_DOWN && reactionPulse?.action === 'remove'}
-                    disabled={ownMessage || reactionBusy !== null}
-                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_DOWN); }}
-                    title={m.channels_reaction_down()}
-                    aria-label={m.channels_reaction_down()}
-                    aria-pressed={mine === REACTION_DOWN}
-                    tabindex={ownMessage ? -1 : undefined}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
-                      <path d="M11 2v7l-3.2 4.5a1.4 1.4 0 0 1-2.4-1.3l.9-2.7H3a1.3 1.3 0 0 1-1.2-1.7l1.3-4.6A1.7 1.7 0 0 1 4.7 2H11zm2.4 0h-2.4v7h2.4z"/>
-                    </svg>
-                    {#if (tally?.down ?? 0) > 0}<span class="reaction-count">{tally?.down}</span>{/if}
-                  </button>
+                <div class="bubble-reactions" class:has-any={hasAny} class:readonly={ownMessage} class:picker-open={pickerHere}>
+                  {#each reactionChips(tally, ownMessage) as chip (chip.code)}
+                    {@const label = reactionChipLabel(chip)}
+                    {#if ownMessage}
+                      <!-- Nothing to press on our own line, but who reacted is
+                           still worth a hover, so a label rather than a dead
+                           button that swallows the tooltip. -->
+                      <span
+                        class="reaction-btn static"
+                        class:heart={chip.code === REACTION_HEART}
+                        class:emoji={!QUICK_REACTIONS.includes(chip.code)}
+                        role="img"
+                        title={label}
+                        aria-label={label}
+                      >
+                        {@render reactionGlyph(chip.code)}
+                        <span class="reaction-count" aria-hidden="true">{chip.count}</span>
+                      </span>
+                    {:else}
+                      <!-- `aria-disabled`, not `disabled`, while a reaction is
+                           in flight: disabling the chip just pressed would
+                           drop its focus to <body>. `toggleReaction` refuses. -->
+                      <button
+                        type="button"
+                        class="reaction-btn"
+                        class:heart={chip.code === REACTION_HEART}
+                        class:emoji={!QUICK_REACTIONS.includes(chip.code)}
+                        class:active={mine === chip.code}
+                        class:pulse-add={reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === chip.code && reactionPulse?.action === 'add'}
+                        class:pulse-remove={reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === chip.code && reactionPulse?.action === 'remove'}
+                        aria-disabled={reactionBusy !== null}
+                        onclick={() => void toggleReaction(row.msg, chip.code)}
+                        title={label}
+                        aria-label={label}
+                        aria-pressed={mine === chip.code}
+                      >
+                        {@render reactionGlyph(chip.code)}
+                        {#if chip.count > 0}<span class="reaction-count" aria-hidden="true">{chip.count}</span>{/if}
+                      </button>
+                    {/if}
+                  {/each}
+                  {#if !ownMessage}
+                    <button
+                      type="button"
+                      class="reaction-btn reaction-more"
+                      class:active={pickerHere}
+                      aria-disabled={reactionBusy !== null}
+                      onclick={(e) => openPicker(row.msg, e.currentTarget)}
+                      title={m.channels_reaction_more()}
+                      aria-label={m.channels_reaction_more()}
+                      aria-haspopup="menu"
+                      aria-expanded={pickerHere}
+                    >
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                        <path d="M13.2 8.6A5.5 5.5 0 1 1 7.4 2.5"/>
+                        <path d="M5.4 9.6a3 3 0 0 0 5 0"/>
+                        <path d="M5.9 6.4h.01M9.6 6.4h.01"/>
+                        <path d="M12.5 1.5v4M10.5 3.5h4"/>
+                      </svg>
+                    </button>
                   {/if}
                 </div>
                 {/if}
@@ -2341,11 +3371,28 @@
     {/if}
     <div bind:this={messagesEnd}></div>
   </div>
-
+  {#if showUnreadJump}
+    <button
+      class="conv-jump conv-jump-unread has-unseen"
+      type="button"
+      onclick={jumpToFirstUnread}
+      title={m.chat_jump_to_unread()}
+      aria-label={m.chat_jump_to_unread()}
+    >
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+        <path d="M8 13V4M4.5 7.5 8 4l3.5 3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>{m.chat_jump_to_unread()}</span>
+    </button>
+  {/if}
+  <!-- Inside the transcript's box rather than measured up from the bottom of
+       the pane, so the reply bar, an error line or a taller composer below
+       cannot end up under it. -->
   {#if scrolledAway && messages.length > 0 && !loading}
     <button
       class="conv-jump"
       class:has-unseen={missedWhileAway}
+      class:above-typing={roomTypingActive}
       type="button"
       onclick={jumpToLatest}
       title={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
@@ -2356,6 +3403,28 @@
       </svg>
       <span>{missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
     </button>
+  {/if}
+  </div>
+
+  {#if isChannel}
+    <!-- Floats over the foot of the transcript, like the jump control: a row
+         that came and went with every typist would shove the conversation up
+         and down under the reader. The live region is its own element and
+         stays mounted, so what it says is decided by `roomTypingAnnouncement`
+         rather than by every change to the visible line. -->
+    <div class="conv-room-typing-anchor">
+      <span class="sr-only" role="status" aria-live="polite">{roomTypingAnnouncement}</span>
+      {#if roomTypingActive}
+        <div class="conv-typing conv-room-typing">
+          <span class="conv-room-typing-text">
+            {#each roomTypingSegments as segment, i (i)}
+              {#if segment.kind === 'name'}<bdi dir="auto">{segment.text}</bdi>{:else}{segment.text}{/if}
+            {/each}
+          </span>
+          <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+        </div>
+      {/if}
+    </div>
   {/if}
 
   {#if sendError}
@@ -2368,9 +3437,57 @@
     <div class="conv-disabled" role="status">{m.channels_key_behind()}</div>
   {:else if chatLocked}
     <div class="conv-disabled" role="status">{m.chat_locked_notice()}</div>
+  {:else if isChannel && announceOnly}
+    <div class="conv-disabled" role="status">{m.channels_announce_only_notice()}</div>
   {:else if chatDisabled}
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
+    {#if isChannel && replyTarget}
+      {@const target = replyTarget}
+      {@const current = messagesByMsgId.get(target.msgId)}
+      {@const targetHidden = isIgnoredSender(current?.sender_pubkey ?? target.senderPubkey)}
+      <div class="conv-reply-bar">
+        <svg class="conv-reply-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+          <path d="M6.5 4 2.5 8l4 4"/>
+          <path d="M2.5 8h7a4 4 0 0 1 4 4v1"/>
+        </svg>
+        <button
+          type="button"
+          class="conv-reply-target"
+          id={replyBarId}
+          onclick={() => jumpToReplyParent(target.id)}
+          title={m.channels_reply_jump()}
+        >
+          <span class="conv-reply-label">{m.channels_replying_to()}</span>
+          {#if targetHidden}
+            <span class="conv-reply-excerpt">{m.channels_message_hidden_member()}</span>
+          {:else}
+            <bdi dir="auto" class="conv-reply-who">{senderLabel(current?.sender_pubkey ?? target.senderPubkey)}</bdi><span class="conv-reply-sep" aria-hidden="true">:</span>
+            <bdi dir="auto" class="conv-reply-excerpt">{cachedReplyExcerpt(current?.message ?? target.text)}</bdi>
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="conv-reply-cancel"
+          onclick={() => {
+            cancelReply();
+            focusComposer();
+          }}
+          onkeydown={(e) => {
+            if (e.key !== 'Escape') return;
+            // Only the reply, not the room's own Escape handling.
+            e.preventDefault();
+            e.stopPropagation();
+            cancelReply();
+            focusComposer();
+          }}
+          title={m.channels_reply_cancel()}
+          aria-label={m.channels_reply_cancel()}
+        >
+          <IconX size={11} />
+        </button>
+      </div>
+    {/if}
     <div class="conv-input-area">
       {#if mentionOpen}
         <!-- A listbox the textarea owns rather than a focusable menu: focus has
@@ -2433,6 +3550,7 @@
         onblur={() => (mentionStart = -1)}
         placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
         aria-label={m.chat_input_label()}
+        aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
         maxlength="4096"
         rows="2"
         readonly={sending}
@@ -2444,6 +3562,43 @@
           {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
         </span>
       {/if}
+      <!-- A cheat-sheet rather than toolbar buttons: the markers are typed, and
+           a row of B/I/S controls would crowd a composer the dock already
+           keeps narrow. Closes on focus leaving it, so it never lingers. -->
+      <div
+        class="conv-format-help"
+        onfocusout={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) formatHelpOpen = false;
+        }}
+      >
+        <button
+          type="button"
+          class="conv-format-toggle"
+          class:open={formatHelpOpen}
+          onclick={() => (formatHelpOpen = !formatHelpOpen)}
+          onkeydown={(e) => {
+            if (e.key === 'Escape' && formatHelpOpen) {
+              // Only the sheet, not the room's own Escape handling.
+              e.preventDefault();
+              e.stopPropagation();
+              formatHelpOpen = false;
+            }
+          }}
+          title={m.chat_format_help()}
+          aria-label={m.chat_format_help()}
+          aria-expanded={formatHelpOpen}
+          aria-controls={formatSheetId}
+        >Aa</button>
+        {#if formatHelpOpen}
+          <div class="conv-format-sheet" id={formatSheetId} role="note" aria-label={m.chat_format_help()}>
+            <div class="conv-format-row"><code>**{m.chat_format_bold()}**</code><strong>{m.chat_format_bold()}</strong></div>
+            <div class="conv-format-row"><code>*{m.chat_format_italic()}*</code><em>{m.chat_format_italic()}</em></div>
+            <div class="conv-format-row"><code>~~{m.chat_format_strike()}~~</code><s>{m.chat_format_strike()}</s></div>
+            <div class="conv-format-row"><code>`{m.chat_format_code()}`</code><code class="fmt-code">{m.chat_format_code()}</code></div>
+            <p class="conv-format-note">{m.chat_format_code_block()}</p>
+          </div>
+        {/if}
+      </div>
       <button
         type="button"
         class="conv-send"
@@ -2472,10 +3627,6 @@
     flex: 1;
     min-height: 0;
     background: var(--bg-primary);
-    /* Anchors `.conv-jump`, which floats over the transcript rather than
-       occupying a row in the column — a control that pushed the composer down
-       every time the reader scrolled up would move the target they are aiming
-       for. */
     position: relative;
   }
 
@@ -2574,6 +3725,18 @@
   .conv-status.encrypted {
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     color: var(--accent);
+  }
+
+  /* Anchors both `.conv-jump` pills, which float over the transcript rather
+     than occupying a row in the column — a control that pushed the composer
+     down every time the reader scrolled up would move the target they are
+     aiming for. */
+  .conv-transcript {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    position: relative;
   }
 
   .conv-messages {
@@ -2937,6 +4100,66 @@
     white-space: pre-wrap;
   }
 
+  /* Tinted from `currentColor` so the same rule reads on an accent-filled sent
+     bubble and a surface-coloured received one. */
+  .fmt-code {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: color-mix(in srgb, currentColor 12%, transparent);
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+    overflow-wrap: anywhere;
+  }
+
+  .fmt-codeblock {
+    position: relative;
+    margin: 4px 0;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* `pre`, not `pre-wrap`: code keeps its line structure and scrolls sideways
+     instead of wrapping into something that no longer reads as code. */
+  .fmt-codeblock pre {
+    margin: 0;
+    padding: 6px 8px;
+    padding-inline-end: 48px;
+    border-radius: 5px;
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow-x: auto;
+    tab-size: 4;
+  }
+
+  .fmt-codeblock pre:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .fmt-codeblock-copy {
+    position: absolute;
+    top: 4px;
+    inset-inline-end: 4px;
+    padding: 1px 6px;
+    border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+    border-radius: 4px;
+    background: color-mix(in srgb, currentColor 8%, transparent);
+    color: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    opacity: 0.8;
+  }
+
+  .fmt-codeblock-copy:hover,
+  .fmt-codeblock-copy:focus-visible {
+    opacity: 1;
+  }
+
   /* A button that has to sit inside wrapping text, so every bit of button
      chrome is stripped and the line-box geometry left to the paragraph. */
   .bubble-link {
@@ -3160,6 +4383,313 @@
     background: color-mix(in srgb, currentColor 16%, transparent);
   }
 
+  /* Friend bubbles have no header strip to park the cluster in, so it rides
+     the top edge the way a room's does rather than covering the text. */
+  .conversation:not(.channel) .bubble-tools {
+    top: -8px;
+    z-index: 3;
+  }
+
+  /* Styled like a room's edit control in both panes: it floats over the
+     bubble's edge, so it needs its own fill to read on either bubble colour. */
+  .bubble-copy-btn,
+  .bubble-reply-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-primary);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .bubble-copy-btn:hover,
+  .bubble-reply-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  /* The line a reply answers, above its text. Tinted from `currentColor` like
+     inline code, so one rule reads on an accent-filled sent bubble and a
+     surface-coloured received one; the edge bar is what says "quote". */
+  .bubble-quote {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    margin: 0 0 6px;
+    padding: 3px 8px;
+    border: none;
+    border-inline-start: 2px solid color-mix(in srgb, currentColor 55%, transparent);
+    border-radius: 4px;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.35;
+    text-align: start;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  button.bubble-quote {
+    cursor: pointer;
+  }
+
+  button.bubble-quote:hover {
+    background: color-mix(in srgb, currentColor 15%, transparent);
+  }
+
+  button.bubble-quote:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+  }
+
+  .bubble-quote-who {
+    flex-shrink: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
+  }
+
+  .bubble-quote-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.85;
+  }
+
+  .bubble-quote.unavailable {
+    font-style: italic;
+    opacity: 0.75;
+  }
+
+  /* "Replying to …" sits on the composer's own surface, directly above it, so
+     it reads as part of what is about to be sent. */
+  .conv-reply-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px 0;
+    border-top: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    flex-shrink: 0;
+    min-width: 0;
+  }
+
+  .conversation.channel .conv-reply-bar {
+    background: var(--bg-tertiary);
+  }
+
+  :global([data-theme="dark"]) .conversation.channel .conv-reply-bar {
+    background: var(--bg-secondary);
+  }
+
+  /* The composer's top border would draw a line between the bar and the box
+     it belongs to. */
+  .conv-reply-bar + .conv-input-area {
+    border-top: none;
+    padding-top: 6px;
+  }
+
+  .conv-reply-icon {
+    flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .conv-reply-target {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+    padding: 2px 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+    white-space: nowrap;
+    overflow: hidden;
+    cursor: pointer;
+  }
+
+  .conv-reply-target:hover .conv-reply-excerpt {
+    color: var(--text-primary);
+  }
+
+  .conv-reply-target:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 3px;
+  }
+
+  .conv-reply-label {
+    flex-shrink: 0;
+  }
+
+  .conv-reply-who {
+    flex-shrink: 0;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .conv-reply-sep {
+    flex-shrink: 0;
+    margin-inline-start: -4px;
+  }
+
+  .conv-reply-excerpt {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .conv-reply-cancel {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .conv-reply-cancel:hover,
+  .conv-reply-cancel:focus-visible {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  /* The room's pins, one line above the transcript. Quiet on purpose: it is
+     read once and then only when wanted, and must not compete with the
+     messages under it. */
+  .conv-pin-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    flex-shrink: 0;
+    min-width: 0;
+  }
+
+  .conversation.channel .conv-pin-bar {
+    background: var(--bg-tertiary);
+  }
+
+  :global([data-theme="dark"]) .conversation.channel .conv-pin-bar {
+    background: var(--bg-secondary);
+  }
+
+  .conv-pin-icon {
+    flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .conv-pin-target {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+    padding: 2px 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  button.conv-pin-target {
+    cursor: pointer;
+  }
+
+  button.conv-pin-target:hover .conv-reply-excerpt {
+    color: var(--text-primary);
+  }
+
+  button.conv-pin-target:focus-visible,
+  .conv-pin-cycle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 3px;
+  }
+
+  .conv-pin-target.unavailable {
+    font-style: italic;
+    opacity: 0.8;
+  }
+
+  .conv-pin-cycle {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+
+  .conv-pin-cycle:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .bubble-pin-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-primary);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .bubble-pin-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .bubble-pin-btn.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+
+  .bubble-pin-btn.unavailable {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   /* An edit marker belongs with the timestamp, not the text: it is metadata about
      when the line was last touched, which is exactly what the rest of that row
      already says. */
@@ -3268,14 +4798,29 @@
 
   .bubble-reactions.has-any,
   .conv-msg:hover .bubble-reactions,
-  .bubble-reactions:focus-within {
+  .bubble-reactions:focus-within,
+  .bubble-reactions.picker-open {
     opacity: 1;
   }
 
   .conversation.channel .bubble-reactions.has-any,
   .conversation.channel .conv-msg:hover .bubble-reactions,
-  .conversation.channel .bubble-reactions:focus-within {
+  .conversation.channel .bubble-reactions:focus-within,
+  .conversation.channel .bubble-reactions.picker-open {
     pointer-events: auto;
+  }
+
+  /* Once a tally makes the row permanent, the picker trigger is still a hover
+     control: it holds its place so revealing it does not shift the chips. */
+  .bubble-reactions.has-any .reaction-more {
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .conv-msg:hover .bubble-reactions .reaction-more,
+  .bubble-reactions:focus-within .reaction-more,
+  .bubble-reactions.picker-open .reaction-more {
+    opacity: 1;
   }
 
   /* A pointer that cannot hover has no way to reveal any of these, so on a touch
@@ -3284,7 +4829,8 @@
   @media (hover: none) {
     .bubble-remove,
     .bubble-tools,
-    .bubble-reactions {
+    .bubble-reactions,
+    .bubble-reactions.has-any .reaction-more {
       opacity: 1;
       pointer-events: auto;
     }
@@ -3327,11 +4873,11 @@
       drop-shadow(0 1px 1.1px color-mix(in srgb, #000 26%, transparent));
   }
 
-  .reaction-btn:hover:not(:disabled) {
+  .reaction-btn:hover:not([aria-disabled='true']):not(.static) {
     transform: translateY(-1px);
   }
 
-  .conversation.channel .reaction-btn:hover:not(:disabled) {
+  .conversation.channel .reaction-btn:hover:not([aria-disabled='true']):not(.static) {
     color: var(--reaction-gold);
     background:
       linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
@@ -3342,7 +4888,7 @@
       0 1px 3px color-mix(in srgb, var(--reaction-gold) 28%, transparent);
   }
 
-  .reaction-btn:active:not(:disabled) {
+  .reaction-btn:active:not([aria-disabled='true']) {
     transform: scale(0.94);
   }
 
@@ -3377,7 +4923,7 @@
     stroke: color-mix(in srgb, var(--reaction-heart) 68%, #7a121c);
   }
 
-  .conversation.channel .reaction-btn.heart:hover:not(:disabled) {
+  .conversation.channel .reaction-btn.heart:hover:not([aria-disabled='true']):not(.static) {
     color: var(--reaction-heart);
     background:
       linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
@@ -3445,17 +4991,123 @@
     100% { transform: scale(1); opacity: 1; }
   }
 
-  .reaction-btn:disabled {
+  .reaction-btn[aria-disabled='true'],
+  .reaction-btn.static {
     cursor: default;
-  }
-
-  .conversation.channel .bubble-reactions.readonly .reaction-btn {
-    pointer-events: none;
   }
 
   .reaction-count {
     font-weight: 600;
     color: color-mix(in srgb, var(--reaction-gold) 65%, var(--text-primary));
+  }
+
+  /* Emoji chips carry their own colour, so the gold wash stays on the frame and
+     the count; the glyph is sized to sit level with the drawn icons. */
+  .reaction-emoji {
+    font-size: 13px;
+    line-height: 1;
+  }
+
+  .conversation.channel .reaction-btn.emoji .reaction-count {
+    color: var(--text-primary);
+  }
+
+  /* The trigger is an outline icon: the gold fill the reaction icons take would
+     turn it into a solid blob. */
+  .conversation.channel .reaction-btn.reaction-more {
+    color: var(--text-secondary);
+    border-color: color-mix(in srgb, var(--text-secondary) 22%, transparent);
+  }
+
+  .conversation.channel .reaction-btn.reaction-more svg {
+    fill: none;
+    stroke: currentColor;
+    filter: none;
+  }
+
+  .conversation.channel .reaction-btn.reaction-more:hover:not([aria-disabled='true']),
+  .conversation.channel .reaction-btn.reaction-more.active {
+    color: var(--text-primary);
+  }
+
+  .reaction-picker-host {
+    display: contents;
+  }
+
+  /* Lives at the end of <body> (see the `portal` action), so nothing here may
+     depend on `.conversation` around it — only the theme's root variables. */
+  .reaction-picker {
+    position: fixed;
+    left: 0;
+    top: 0;
+    z-index: 9999;
+    display: grid;
+    grid-template-columns: repeat(5, 32px);
+    gap: 2px;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-lg);
+    visibility: hidden;
+  }
+
+  .reaction-picker.placed {
+    visibility: visible;
+    animation: reaction-picker-in 0.12s ease-out;
+  }
+
+  @keyframes reaction-picker-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
+  }
+
+  .reaction-picker-item {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background var(--transition-fast) ease, transform 0.12s ease;
+  }
+
+  .reaction-picker-item:hover {
+    background: var(--bg-hover);
+    transform: scale(1.12);
+  }
+
+  .reaction-picker-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+    background: var(--bg-hover);
+  }
+
+  .reaction-picker-item.active {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  /* app.css already shortens every animation under reduced motion; these are
+     removed outright, since a scale that still fires for 0.01ms is a flicker. */
+  @media (prefers-reduced-motion: reduce) {
+    .reaction-picker.placed,
+    .conversation.channel .reaction-btn.pulse-add,
+    .conversation.channel .reaction-btn.pulse-remove,
+    .conversation.channel .reaction-btn.heart.pulse-add,
+    .conversation.channel .reaction-btn.heart.pulse-remove {
+      animation: none;
+    }
+
+    .reaction-btn:hover:not([aria-disabled='true']):not(.static),
+    .reaction-picker-item:hover {
+      transform: none;
+    }
   }
 
   /* Resend sits beside the failure caption under its own bubble, so it
@@ -3485,14 +5137,14 @@
     cursor: default;
   }
 
-  /* Floats just above the composer. `has-unseen` is the accent case: the
-     difference between "you scrolled up" and "you scrolled up and missed
-     something" is the whole reason this exists, so it is carried by colour and
-     not only by the label. */
+  /* Floats at the foot of the transcript, just above whatever sits below it.
+     `has-unseen` is the accent case: the difference between "you scrolled up"
+     and "you scrolled up and missed something" is the whole reason this
+     exists, so it is carried by colour and not only by the label. */
   .conv-jump {
     position: absolute;
     inset-inline-end: 18px;
-    bottom: 76px;
+    bottom: 12px;
     z-index: 4;
     display: inline-flex;
     align-items: center;
@@ -3517,6 +5169,23 @@
     border-color: var(--accent);
     background: var(--accent);
     color: var(--on-accent);
+  }
+
+  /* Clear of the typing pill, which hangs over the same strip on a narrow
+     dock. */
+  .conv-jump.above-typing {
+    bottom: 34px;
+  }
+
+  /* The way back up sits at the top edge, centred, so it cannot be mistaken
+     for the jump-to-latest pill in the bottom corner. */
+  .conv-jump-unread {
+    top: 8px;
+    bottom: auto;
+    inset-inline-end: auto;
+    left: 50%;
+    transform: translateX(-50%);
+    white-space: nowrap;
   }
 
   .conv-error {
@@ -3572,6 +5241,41 @@
   @keyframes conv-typing-bounce {
     0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
     40% { opacity: 1; transform: translateY(-2px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-typing-dots span {
+      animation: none;
+      opacity: 0.6;
+    }
+  }
+
+  /* Zero height in the column; its content hangs above it, over the foot of
+     the transcript. */
+  .conv-room-typing-anchor {
+    position: relative;
+    height: 0;
+    flex-shrink: 0;
+  }
+
+  .conv-room-typing {
+    position: absolute;
+    inset-inline-start: 14px;
+    bottom: 4px;
+    z-index: 3;
+    max-width: 60%;
+    padding: 2px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-surface);
+    pointer-events: none;
+  }
+
+  .conv-room-typing-text {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
   }
 
   .conv-input-area {
@@ -3638,6 +5342,69 @@
   .mention-option.active {
     background: var(--accent);
     color: var(--on-accent);
+  }
+
+  /* Static, so the sheet anchors to the composer row (the same box the mention
+     list uses) rather than to this small button. */
+  .conv-format-help {
+    display: flex;
+    align-self: center;
+  }
+
+  .conv-format-toggle {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .conv-format-toggle:hover,
+  .conv-format-toggle.open {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .conv-format-sheet {
+    position: absolute;
+    bottom: calc(100% - 4px);
+    inset-inline-end: 14px;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-width: 260px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+    box-shadow: var(--shadow-md);
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  .conv-format-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 14px;
+  }
+
+  .conv-format-row > code:first-child {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .conv-format-note {
+    margin: 3px 0 0;
+    color: var(--text-secondary);
+    font-size: 11px;
   }
 
   /* Aligned to the bottom of the row so it sits level with the send button

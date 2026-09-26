@@ -254,6 +254,9 @@ const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 /// Channel-name claim that also commits to the published display string.
 /// See [`build_channel_name_display_v4_msg`].
 const OP_CHANNEL_NAME_DISPLAY_V4: u8 = 0x2b;
+/// Rename of a room's registry name. Its own opcode, so no claim signature —
+/// which an owner's client re-sends on a timer — can ever be read as one.
+const OP_CHANNEL_RENAME_V4: u8 = 0x2c;
 
 /// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
 const SIGNED_IP_V4: u8 = 4;
@@ -808,6 +811,32 @@ fn build_channel_name_display_v4_msg(
     message
 }
 
+/// Signed form of a rename: the same layout as
+/// [`build_channel_name_display_v4_msg`] under [`OP_CHANNEL_RENAME_V4`].
+fn build_channel_rename_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    normalized: &str,
+    display: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 4 + normalized.len() + 4 + display.len() + 1 + 8,
+    );
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_RENAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
+    message.extend_from_slice(normalized.as_bytes());
+    message.extend_from_slice(&(display.len() as u32).to_le_bytes());
+    message.extend_from_slice(display.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
 fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
     let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
     message.extend_from_slice(RDV_V4_DOMAIN);
@@ -880,6 +909,9 @@ fn registry_error_status(err: registry::RegistryError) -> StatusCode {
         // neither 400 nor 409: the server has no capacity to record it.
         registry::RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
         registry::RegistryError::ReadOnly => StatusCode::SERVICE_UNAVAILABLE,
+        // Distinct from 429, which is the per-IP limiter: the client tells the
+        // owner when they can rename again rather than to slow down.
+        registry::RegistryError::RenameTooSoon => StatusCode::TOO_EARLY,
     }
 }
 
@@ -3720,6 +3752,80 @@ async fn claim_channel_name_v4(
     acknowledge_registry_write(&state, result, durable_generation).await
 }
 
+/// `POST /v4/channels/rename` — same body as `/v4/channels/name`, signed with
+/// [`build_channel_rename_v4_msg`]. Kept apart from claims so that only an
+/// owner who asked to rename can: see `ChannelRegistry::claim_channel_name_at`.
+async fn rename_channel_name_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelNameRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Some(normalized) = registry::normalize_channel_name(&body.name) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let (Some(channel_id), Some(pubkey), Some(sig)) = (
+        decode_hex_channel_id(&body.channel_id),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !channel_id_matches_pubkey(&pubkey, &channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    // No legacy form: every client that knows this endpoint signs the display.
+    let display = registry::strip_invisible(&body.name);
+    let signed =
+        build_channel_rename_v4_msg(&channel_id, &pubkey, &normalized, &display, body.private, body.ts);
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    // Replaying an older rename would move the room back to a name it left.
+    // The newest may repeat: it names the room's current name, which the
+    // registry answers as a refresh, so a retry after a lost answer succeeds.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &pubkey,
+        replay_scope(OP_CHANNEL_RENAME_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
+    {
+        return status;
+    }
+    let channel_hex = hex::encode(channel_id);
+    // A rename of a room the registry already knows writes no new room, so it
+    // is never charged the creation budget. One it has never seen is a claim
+    // in all but name, and is charged exactly as `claim_channel_name_v4`
+    // would charge it.
+    let is_new_room = !state.channels_registry.read().await.has_channel(&channel_hex);
+    if is_new_room && !check_channel_create_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let mut registry = state.channels_registry.write().await;
+    let result = registry.rename_channel_name_at(
+        &channel_hex,
+        &hex::encode(pubkey),
+        &body.name,
+        body.private,
+        now_unix_secs(),
+    );
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
+}
+
 async fn delete_channel_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -6145,6 +6251,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v4/punch/ack", post(punch_ack_v4))
         .route("/v4/channels/username", post(claim_channel_username_v4))
         .route("/v4/channels/name", post(claim_channel_name_v4))
+        .route("/v4/channels/rename", post(rename_channel_name_v4))
         .route("/v4/channels/delete", post(delete_channel_v4))
         .route("/v4/channels/nominee", post(set_channel_nominee_v4))
         .route("/v4/channels/handover", post(handover_channel_name_v4))
@@ -9592,6 +9699,175 @@ mod relay_ticket_tests {
         );
     }
 
+    async fn post_rename(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        channel_id: &[u8; 16],
+        name: &str,
+        ts: i64,
+        signed: &[u8],
+    ) -> StatusCode {
+        rename_channel_name_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(ChannelNameRequest {
+                channel_id: hex::encode(channel_id),
+                pubkey: hex::encode(key.verifying_key().to_bytes()),
+                name: name.to_string(),
+                private: false,
+                ts,
+                sig: hex::encode(key.sign(signed).to_bytes()),
+            }),
+        )
+        .await
+    }
+
+    fn rename_msg(key: &ed25519_dalek::SigningKey, name: &str, ts: i64) -> Vec<u8> {
+        let pubkey = key.verifying_key().to_bytes();
+        let display = registry::strip_invisible(name);
+        build_channel_rename_v4_msg(
+            &test_channel_id(&pubkey),
+            &pubkey,
+            &display.to_lowercase(),
+            &display,
+            false,
+            ts,
+        )
+    }
+
+    async fn directory_names(state: &AppState) -> Vec<String> {
+        let dir = channel_directory_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Query(DirectoryQuery::default()),
+        )
+        .await
+        .expect("directory");
+        dir.0["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// End to end over HTTP: only a rename signed as one, by the room's own
+    /// key, moves the room's name; a claim for another name does not.
+    #[tokio::test]
+    async fn channel_rename_needs_its_own_signature_and_the_rooms_key() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let channel_id = test_channel_id(&owner_pk);
+        let ts = now_unix_secs();
+        let addr: SocketAddr = "8.8.8.8:1000".parse().unwrap();
+
+        let claim =
+            build_channel_name_display_v4_msg(&channel_id, &owner_pk, "lobby", "Lobby", false, ts - 10);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Lobby".to_string(),
+                    private: false,
+                    ts: ts - 10,
+                    sig: hex::encode(owner.sign(&claim).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // A claim signature on the rename endpoint is not a rename.
+        let claim_for_den =
+            build_channel_name_display_v4_msg(&channel_id, &owner_pk, "den", "Den", false, ts - 9);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 9, &claim_for_den).await,
+            StatusCode::FORBIDDEN
+        );
+        // Nor does a plain claim for another name rename the room.
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Den".to_string(),
+                    private: false,
+                    ts: ts - 8,
+                    sig: hex::encode(owner.sign(&build_channel_name_display_v4_msg(
+                        &channel_id, &owner_pk, "den", "Den", false, ts - 8,
+                    ))
+                    .to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        // Signed as a rename, but by a key that is not the room's.
+        assert_eq!(
+            post_rename(&state, &other, &channel_id, "Den", ts - 7, &rename_msg(&other, "Den", ts - 7))
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(directory_names(&state).await, vec!["Lobby".to_string()]);
+
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 6, &rename_msg(&owner, "Den", ts - 6))
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(directory_names(&state).await, vec!["Den".to_string()]);
+    }
+
+    /// A second rename inside the day is 425, distinct from the limiter's 429;
+    /// an older rename cannot be replayed to move the room back; and the
+    /// newest one may be retried after a lost answer.
+    #[tokio::test]
+    async fn channel_rename_is_rationed_and_replay_safe() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        let channel_id = test_channel_id(&owner.verifying_key().to_bytes());
+        let ts = now_unix_secs();
+
+        // A room the registry has not seen gets its first name this way.
+        let first = rename_msg(&owner, "Lobby", ts - 10);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Lobby", ts - 10, &first).await,
+            StatusCode::OK
+        );
+        let second = rename_msg(&owner, "Den", ts - 5);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 5, &second).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 5, &second).await,
+            StatusCode::OK,
+            "the newest rename may be retried"
+        );
+        assert_ne!(
+            post_rename(&state, &owner, &channel_id, "Lobby", ts - 10, &first).await,
+            StatusCode::OK,
+            "an older one may not be replayed"
+        );
+        let third = rename_msg(&owner, "Attic", ts);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Attic", ts, &third).await,
+            StatusCode::TOO_EARLY
+        );
+        assert_eq!(directory_names(&state).await, vec!["Den".to_string()]);
+    }
+
     /// The two signed forms must not be interchangeable, or the new opcode
     /// buys nothing.
     #[test]
@@ -9608,6 +9884,11 @@ mod relay_ticket_tests {
         assert_ne!(
             build_channel_name_display_v4_msg(&channel_id, &pubkey, "ab", "cd", false, ts),
             build_channel_name_display_v4_msg(&channel_id, &pubkey, "abc", "d", false, ts)
+        );
+        assert_ne!(
+            build_channel_name_display_v4_msg(&channel_id, &pubkey, "lobby", "Lobby", false, ts),
+            build_channel_rename_v4_msg(&channel_id, &pubkey, "lobby", "Lobby", false, ts),
+            "a claim is never a rename"
         );
     }
 

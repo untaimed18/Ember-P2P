@@ -1959,6 +1959,18 @@ mod tests {
         assert_eq!(sanitize_chat_text(&big).len(), 4096);
     }
 
+    /// A room reply's parent id rides in Unicode tag characters at the end of
+    /// the signed text (`channel::with_reply_trailer`). Receivers keep a line's
+    /// signature only if sanitising leaves its text unchanged, so filtering tag
+    /// characters here would quietly stop replies being re-served — and would
+    /// do the same to every build already in the field that shares this filter.
+    #[test]
+    fn sanitize_chat_text_keeps_the_room_reply_trailer() {
+        let wire =
+            crate::network::ember::channel::with_reply_trailer("ok", Some(&[0xABu8; 16]));
+        assert_eq!(sanitize_chat_text(&wire), wire);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn restricted_windows_directory_keeps_current_user_access() {

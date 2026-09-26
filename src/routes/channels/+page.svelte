@@ -30,6 +30,7 @@
     joinChannel,
     leaveChannel,
     listChannelMembers,
+    markChannelMessagesRead,
     channelPresenceConfig,
     setChannelFocus,
     pickAndOfferChannelTransfer,
@@ -38,6 +39,7 @@
     rotateChannelRoomKey,
     setChannelInvitePolicy,
     setChannelSlowMode,
+    setChannelAnnounceOnly,
     SLOW_MODE_CHOICES,
     claimChannelOwnership,
     claimChannelUsername,
@@ -47,6 +49,7 @@
     transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
+    renameChannel,
     type ChannelInfo,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
@@ -62,8 +65,12 @@
   import {
     activeChannelId,
     channels as channelsStore,
+    channelNotifyLevels,
+    channelUnreadMentions,
     clearChannelUnread,
-    forgetChannelMute,
+    favouriteChannels,
+    forgetChannelFavourite,
+    forgetChannelNotifyLevel,
     hiddenChannels,
     hideChannel,
     ignoredMembers,
@@ -71,22 +78,33 @@
     ignoreMemberEverywhere,
     ignoreScopeFor,
     forgetChannelIgnores,
-    mutedChannels,
+    notifyLevelOf,
     refreshChannels,
     unhideChannel,
     replaceChannel,
     setChannelInRoom,
     setChannelMemberCount,
+    setChannelNotifyLevel,
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
     takeStashedChannelSelection,
-    toggleChannelMute,
+    toggleChannelFavourite,
     toggleMemberIgnore,
     toggleMemberIgnoreInChannel,
+    unreadBadgeTone,
     channelTransfers,
     mergeChannelTransfers,
+    type ChannelNotifyLevel,
   } from '$lib/stores/channels';
+  import {
+    cycleIndex,
+    highlightIndex,
+    rankRooms,
+    searchEnterTarget,
+    sectionRooms,
+  } from '$lib/channelSections';
+  import { isApplePlatform, shortcutModAria } from '$lib/platform';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
   let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
@@ -109,7 +127,10 @@
    *  remounted, and a counter would have restarted at the same number. */
   let gatherWalk = '';
   let pendingNotifyEmpty = $state(false);
-  let discovered: GatheredChannelInfo[] = $state([]);
+  /** Raw: only ever replaced whole, and a deep proxy made every read in the
+   *  per-row lookups below pay for tracking a list that can run to hundreds. */
+  let discovered: GatheredChannelInfo[] = $state.raw([]);
+  let discoveredById = $derived(new Map(discovered.map((item) => [item.channel_id, item])));
   let copyingInvite = $state(false);
   let deletingOwned = $state(false);
   let transferring = $state(false);
@@ -131,9 +152,16 @@
   let savingModeration = $state(false);
   let moderatingMember = $state<string | null>(null);
   let claiming = $state(false);
-  /** Matches MAX_CHANNEL_NAME_CHARS in src-tauri/src/commands/channels.rs, and
-   *  the width the list column is sized to hold. */
-  const CHANNEL_NAME_MAX = 20;
+  /** Matches MAX_CHANNEL_NAME_CHARS in src-tauri/src/commands/channels.rs. */
+  const CHANNEL_NAME_MAX = 32;
+  /** Matches MAX_CHANNEL_NAME there: the published record's ceiling, which
+   *  a CJK name reaches at about 21 characters, well inside the count. */
+  const CHANNEL_NAME_MAX_BYTES = 64;
+  const utf8 = new TextEncoder();
+  let createNameTooLong = $derived(utf8.encode(createName.trim()).length > CHANNEL_NAME_MAX_BYTES);
+  let renameDraft = $state('');
+  let renaming = $state(false);
+  let renameTooLong = $derived(utf8.encode(renameDraft.trim()).length > CHANNEL_NAME_MAX_BYTES);
   /** Matches the backend default; the backend clamps to 7–365 either way. */
   const DEFAULT_CLAIM_DAYS = 14;
   const CLAIM_WINDOWS = [7, 14, 30, 90, 180, 365];
@@ -288,7 +316,20 @@
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
     return m.channels_owner_inactive({ name: who, days: left });
   });
-  let selectedMuted = $derived(!!selected && $mutedChannels.includes(selected.channel_id));
+  let selectedNotifyLevel = $derived<ChannelNotifyLevel>(
+    selected ? notifyLevelOf($channelNotifyLevels, selected.channel_id) : 'all',
+  );
+  const NOTIFY_CHOICES: { level: ChannelNotifyLevel; label: () => string }[] = [
+    { level: 'all', label: () => m.channels_notify_all() },
+    { level: 'mentions', label: () => m.channels_notify_mentions() },
+    { level: 'none', label: () => m.channels_notify_none() },
+  ];
+  let roomDesktopAlertsOff = $derived(
+    !!$appSettings && (!$appSettings.notifications_enabled || !$appSettings.notify_channel_message),
+  );
+  function notifyLevelLabel(level: ChannelNotifyLevel): string {
+    return (NOTIFY_CHOICES.find((choice) => choice.level === level) ?? NOTIFY_CHOICES[0]).label();
+  }
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
@@ -299,6 +340,11 @@
     selected && !selected.is_owner && !selected.you_are_moderator
       ? selected.slow_mode_secs
       : 0,
+  );
+  /** Posting is closed to this member: an announcement-only room they neither
+   *  own nor moderate. The same exemption as slow mode. */
+  let selectedAnnounceBlocked = $derived(
+    !!selected && selected.announce_only && !selected.is_owner && !selected.you_are_moderator,
   );
   /**
    * Handles the composer can complete after `@`.
@@ -323,6 +369,9 @@
       members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
     ),
   );
+  /** Discover rows from the last pass, by room id. Plain rather than state:
+   *  written from inside `directoryList`, and read only there. */
+  let discoverRowCache = new Map<string, ChannelInfo>();
   let directoryList = $derived.by(() => {
     const hidden = new Set(
       $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
@@ -339,41 +388,71 @@
       if (hidden.has(ch.channel_id) && !ch.in_room) continue;
       byId.set(ch.channel_id, ch);
     }
-    for (const item of discovered) {
+    const rows = new Map<string, ChannelInfo>();
+    for (const item of discoveredById.values()) {
       if (hidden.has(item.channel_id) || byId.has(item.channel_id)) continue;
-      byId.set(item.channel_id, {
-        channel_id: item.channel_id,
-        pubkey: item.pubkey,
-        name: item.name,
-        visibility: 'public',
-        is_owner: false,
-        topic: '',
-        welcome: '',
-        joined_at: 0,
-        last_active: 0,
-        member_count: item.member_count ?? 0,
-        unread: 0,
-        you_are_banned: false,
-        you_are_moderator: false,
-        successor_id: '',
-        predecessor_id: '',
-        successor_nominee: '',
-        claim_after_days: 0,
-        moderation_updated_at: 0,
-        can_claim: false,
-        key_behind: false,
-        owner_pubkey: '',
-        in_room: item.joined,
-        deleted: false,
-        // A room we have not joined tells us nothing about its invite policy,
-        // and the control that reads this is owner-only anyway.
-        invites_owner_only: false,
-        // Likewise: its slow mode arrives with the moderation record on join.
-        slow_mode_secs: 0,
-      });
+      const row = discoverRow(item, discoverRowCache.get(item.channel_id));
+      rows.set(item.channel_id, row);
+      byId.set(item.channel_id, row);
     }
+    discoverRowCache = rows;
     return [...byId.values()];
   });
+
+  /**
+   * A directory listing drawn as a room row, reusing the previous row while
+   * nothing it shows has changed.
+   *
+   * `directoryList` re-runs on every channels-store write — each unread bump —
+   * and a fresh object per listing handed every keyed Discover row a new item,
+   * so a busy room re-rendered the whole directory once a message.
+   */
+  function discoverRow(item: GatheredChannelInfo, prev: ChannelInfo | undefined): ChannelInfo {
+    const memberCount = item.member_count ?? 0;
+    if (
+      prev
+      && prev.pubkey === item.pubkey
+      && prev.name === item.name
+      && prev.member_count === memberCount
+      && prev.in_room === item.joined
+    ) {
+      return prev;
+    }
+    return {
+      channel_id: item.channel_id,
+      pubkey: item.pubkey,
+      name: item.name,
+      visibility: 'public',
+      is_owner: false,
+      topic: '',
+      welcome: '',
+      joined_at: 0,
+      last_active: 0,
+      member_count: memberCount,
+      // No roster until joined; ranking reads the directory's count instead.
+      roster_count: 0,
+      unread: 0,
+      you_are_banned: false,
+      you_are_moderator: false,
+      successor_id: '',
+      predecessor_id: '',
+      successor_nominee: '',
+      claim_after_days: 0,
+      moderation_updated_at: 0,
+      can_claim: false,
+      key_behind: false,
+      owner_pubkey: '',
+      in_room: item.joined,
+      deleted: false,
+      // A room we have not joined tells us nothing about its invite policy,
+      // and the control that reads this is owner-only anyway.
+      invites_owner_only: false,
+      // Likewise: its slow mode arrives with the moderation record on join.
+      slow_mode_secs: 0,
+      announce_only: false,
+      pinned_msg_ids: [],
+    };
+  }
   let leaveTargetName = $derived(
     directoryList.find((c) => c.channel_id === leaveTargetId)?.name
       ?? channelList.find((c) => c.channel_id === leaveTargetId)?.name
@@ -384,32 +463,22 @@
   let forgetTargetName = $derived(
     directoryList.find((c) => c.channel_id === forgetTargetId)?.name
       ?? channelList.find((c) => c.channel_id === forgetTargetId)?.name
-      ?? discovered.find((c) => c.channel_id === forgetTargetId)?.name
+      ?? (forgetTargetId ? discoveredById.get(forgetTargetId)?.name : undefined)
       ?? '',
   );
   /** Rooms with a row on this device. A Discover-only listing has no row to
    *  delete, so removing one is a hide and nothing more. */
   let storedChannelIds = $derived(new Set(channelList.map((c) => c.channel_id)));
   /**
-   * Largest rooms first, then by name. Ranked on the roster size the directory
-   * reports, not on the chip's present-now count for the open room: that one
-   * moves as people come and go, and would shuffle the list under the pointer
-   * the moment a room is opened.
+   * Largest rooms first; see `rankRooms`. Joined rooms rank on their whole
+   * roster (`roster_count`), Discover rooms on the size the directory
+   * reports. Neither is the chip's present-now count, which moves as people
+   * come and go and would shuffle the list under the pointer.
    */
-  let sortedChannels = $derived.by(() => {
-    const gathered = new Map(discovered.map((item) => [item.channel_id, item.member_count]));
-    const total = (ch: ChannelInfo) =>
-      ch.in_room ? ch.member_count : gathered.get(ch.channel_id) ?? ch.member_count;
-    return directoryList
-      .map((ch) => ({ ch, total: total(ch) }))
-      .sort(
-        (a, b) =>
-          b.total - a.total
-          || a.ch.name.localeCompare(b.ch.name)
-          || a.ch.channel_id.localeCompare(b.ch.channel_id),
-      )
-      .map(({ ch }) => ch);
-  });
+  let directoryCounts = $derived(
+    new Map([...discoveredById].map(([id, item]) => [id, item.member_count])),
+  );
+  let sortedChannels = $derived(rankRooms(directoryList, directoryCounts));
   let visibleChannels = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
     const list = sortedChannels;
@@ -419,6 +488,30 @@
         ch.name.toLowerCase().includes(q) ||
         ch.topic.toLowerCase().includes(q),
     );
+  });
+  let favouriteSet = $derived(new Set($favouriteChannels));
+  let roomSections = $derived(sectionRooms(visibleChannels, $favouriteChannels));
+  /** Every joined room in display order, whatever the search box holds:
+   *  Alt+↑/↓ steps through the rooms you are in, not the ones a half-typed
+   *  query happens to leave on screen. */
+  let joinedInOrder = $derived(sectionRooms(sortedChannels, $favouriteChannels).yours);
+  /** Every row in the order it is drawn, which is the order the search box's
+   *  arrow keys walk. */
+  let orderedRows = $derived([...roomSections.yours, ...roomSections.discover]);
+  let unreadJoinedIds = $derived(
+    channelList.filter((c) => c.in_room && c.unread > 0).map((c) => c.channel_id),
+  );
+  let markingAllRead = $state(false);
+  let listSearchEl: HTMLInputElement | undefined = $state();
+  let listScrollEl: HTMLDivElement | undefined = $state();
+  /** The room the search box's arrow keys are on, by id. An index went stale
+   *  whenever a Discover batch landed or a count moved, and the highlight
+   *  jumped to whichever room slid into that slot. */
+  let listHighlightId = $state<string | null>(null);
+  let listHighlight = $derived(highlightIndex(orderedRows, listHighlightId));
+  let highlightedRow = $derived(listHighlight >= 0 ? orderedRows[listHighlight] : null);
+  $effect(() => {
+    if (listHighlightId !== null && listHighlight < 0) listHighlightId = null;
   });
   /** Senders hidden in the room on screen: those ignored everywhere, plus
    *  anyone scoped to this one. */
@@ -447,8 +540,25 @@
     node.focus();
   }
 
+  /** Focus goes back to the trigger: the item that was pressed is inside a
+   *  menu that is no longer drawn, and focus left there falls to the body. */
   function closeCardMenu(from: HTMLElement) {
-    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+    const details = from.closest('details') as HTMLDetailsElement | null;
+    details?.removeAttribute('open');
+    details?.querySelector('summary')?.focus();
+  }
+
+  /** Arrow keys walk an open menu's items, from its trigger or from inside. */
+  function moveMenuFocus(menu: HTMLElement, e: KeyboardEvent) {
+    const items = [...menu.querySelectorAll<HTMLElement>('[role^="menuitem"]:not(:disabled)')];
+    if (items.length === 0) return;
+    e.preventDefault();
+    const at = items.indexOf(document.activeElement as HTMLElement);
+    const next =
+      e.key === 'Home' ? 0
+      : e.key === 'End' ? items.length - 1
+      : cycleIndex(at, items.length, e.key === 'ArrowDown' ? 1 : -1);
+    items[next]?.focus();
   }
 
   function closeCardMenus(keepContaining?: Element | null) {
@@ -463,14 +573,204 @@
     closeCardMenus(target);
   }
 
+  /** A menu closes once focus moves somewhere else — Tab included, since its
+   *  items sit out of the tab order and Tab from one moves straight past the
+   *  menu. Focus going nowhere is left to the pointerdown handler: WebKit does
+   *  not focus a clicked button, so a click on an item reads as focus leaving,
+   *  and closing then would swallow the click. */
+  function onCardMenuFocusOut(e: FocusEvent) {
+    const menu = e.target instanceof Element ? e.target.closest('.card-more[open]') : null;
+    if (!menu) return;
+    const next = e.relatedTarget instanceof Node ? e.relatedTarget : null;
+    if (!next || menu.contains(next)) return;
+    (menu as HTMLDetailsElement).open = false;
+  }
+
+  /**
+   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list.
+   *
+   * On `document`, which runs ahead of the dock's `window` listener, and the
+   * dock stands down on `defaultPrevented` — so claiming Ctrl+K here is what
+   * keeps it from opening its switcher too. Keys pressed inside the dock are
+   * left alone, which is what lets the dock keep Ctrl+K while the user is
+   * working there. With no list on screen to search, the key passes through.
+   */
+  function onPageShortcut(e: KeyboardEvent) {
+    if (e.defaultPrevented) return;
+    const menuKey =
+      !e.altKey && !e.ctrlKey && !e.metaKey
+      && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key);
+    const roomStep =
+      e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+      && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
+    const searchKey =
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K');
+    // Everything below costs a DOM query, and this runs on every keypress.
+    if (!menuKey && !roomStep && !searchKey) return;
+    if (document.querySelector('[aria-modal="true"]')) return;
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    if (target?.closest('.chat-dock')) return;
+    if (menuKey) {
+      const menu = target?.closest('.card-more[open]')?.querySelector<HTMLElement>('.card-more-menu');
+      if (menu) moveMenuFocus(menu, e);
+      return;
+    }
+    if (roomStep) {
+      // Alt+↓ opens a native select, and on macOS Option+arrows move the caret
+      // by paragraph, so those keep their own meaning.
+      if (target?.tagName === 'SELECT') return;
+      if (
+        isApplePlatform()
+        && (target?.tagName === 'TEXTAREA' || target?.tagName === 'INPUT' || target?.isContentEditable)
+      ) {
+        return;
+      }
+      // Switching rooms goes through `selectChannel`, which re-seeds the
+      // rename, topic and welcome drafts — so stepping away from a half-typed
+      // edit would throw it out. The composer is exempt: its draft is kept
+      // per room.
+      const renameDirty =
+        !!selected && selected.is_owner && roomInfoOpen && renameDraft !== selected.name;
+      if (
+        editingModeration
+        || renameDirty
+        || target?.closest('.succession-form, .moderation-form, .add-form')
+      ) {
+        return;
+      }
+      const rooms = joinedInOrder;
+      if (rooms.length === 0) return;
+      e.preventDefault();
+      const at = rooms.findIndex((c) => c.channel_id === selectedId);
+      const next = rooms[cycleIndex(at, rooms.length, e.key === 'ArrowDown' ? 1 : -1)];
+      if (next && next.channel_id !== selectedId) void selectChannel(next.channel_id);
+      return;
+    }
+    if (!listSearchEl) return;
+    e.preventDefault();
+    void focusListSearch();
+  }
+
+  async function focusListSearch() {
+    if (listCollapsed && selected) listCollapsed = false;
+    // Narrow layouts draw one pane at a time, and the list is the one behind an
+    // open room. Nothing else would bring it forward.
+    if (selected && listSearchEl && listSearchEl.getClientRects().length === 0) clearSelection();
+    await tick();
+    listSearchEl?.focus();
+    listSearchEl?.select();
+  }
+
+  async function moveListHighlight(step: 1 | -1) {
+    const id = orderedRows[cycleIndex(listHighlight, orderedRows.length, step)]?.channel_id ?? null;
+    listHighlightId = id;
+    if (!id) return;
+    await tick();
+    listScrollEl
+      ?.querySelector(`[data-room-id="${id}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function openListRow(ch: ChannelInfo) {
+    listHighlightId = null;
+    if (!ch.in_room) {
+      void joinCard(ch);
+      return;
+    }
+    listQuery = '';
+    await selectChannel(ch.channel_id);
+    // Picking a room from the keyboard is a request to talk in it; leaving
+    // focus in the search box would send the next keystrokes there instead.
+    await tick();
+    document.querySelector<HTMLTextAreaElement>('.conversation-pane textarea:not([disabled])')?.focus();
+  }
+
+  function onListSearchKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      if (!listQuery && listHighlightId === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      listQuery = '';
+      listHighlightId = null;
+      return;
+    }
+    // Alt+arrows switch rooms; that belongs to the page handler.
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (orderedRows.length === 0) return;
+      e.preventDefault();
+      void moveListHighlight(e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (e.key === 'Enter') {
+      const row = searchEnterTarget(orderedRows, highlightedRow, listQuery);
+      if (!row || e.isComposing) return;
+      e.preventDefault();
+      void openListRow(row);
+    }
+  }
+
+  /** Marks each room on its own, and clears its pill only once that room's
+   *  write has landed — a pill cleared ahead of a failed mark comes back on
+   *  the next refresh, which reads as the button not working.
+   *
+   *  Every joined room, not only those the search leaves on screen; the
+   *  button's label and tooltip say so. */
+  async function markAllRead() {
+    const ids = unreadJoinedIds;
+    if (markingAllRead || ids.length === 0) return;
+    markingAllRead = true;
+    try {
+      const results = await Promise.allSettled(
+        ids.map(async (id) => {
+          await markChannelMessagesRead(id);
+          clearChannelUnread(id);
+        }),
+      );
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      // The per-room error names one room's failure and carries backend detail;
+      // the toast is about the batch.
+      if (failed) {
+        console.warn('Channels: mark all as read failed for some rooms', failed.reason);
+        toastError(m.channels_mark_all_read_failed());
+      }
+    } finally {
+      markingAllRead = false;
+    }
+  }
+
+  /** Opens a room row's menu upward when there is no room for it below: the
+   *  list scrolls, and a menu hanging off the last row would be cut off. */
+  function placeRowMenu(e: Event) {
+    const details = e.currentTarget as HTMLDetailsElement;
+    const menu = details.querySelector<HTMLElement>('.card-more-menu');
+    if (!menu) return;
+    delete menu.dataset.up;
+    if (!details.open || !listScrollEl) return;
+    const box = listScrollEl.getBoundingClientRect();
+    const rect = menu.getBoundingClientRect();
+    const above = details.getBoundingClientRect().top - box.top;
+    if (rect.bottom > box.bottom && above > rect.height) menu.dataset.up = '';
+  }
+
   function onPageKeydown(e: KeyboardEvent) {
-    if (e.key !== 'Escape') return;
+    if (e.key !== 'Escape') {
+      onPageShortcut(e);
+      return;
+    }
+    // Something closer to the press already handled it — a picker or menu
+    // that closes itself on Escape — so it must not close this page's pane too.
+    if (e.defaultPrevented) return;
     // The dock answers Escape on `window`, which this `document` listener runs
     // ahead of — and it stands down on `defaultPrevented`, so a press in the
     // dock's composer or search would close this page's pane instead.
     if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
     if (document.querySelector('.card-more[open]')) {
+      const owner = document.activeElement?.closest('.card-more[open]');
       closeCardMenus();
+      owner?.querySelector('summary')?.focus();
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -743,6 +1043,7 @@
     // between store init and this visit.
     void mergeChannelTransfers();
     document.addEventListener('pointerdown', onCardMenuPointerDown);
+    document.addEventListener('focusout', onCardMenuFocusOut);
     document.addEventListener('keydown', onPageKeydown);
     // Local arithmetic against a clock, not a poll: nothing is fetched here.
     // A second is the resolution the mesh now works at, so anything coarser
@@ -762,6 +1063,7 @@
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
+      document.removeEventListener('focusout', onCardMenuFocusOut);
       document.removeEventListener('keydown', onPageKeydown);
       // Leaving the page is not leaving the room, but it does mean nobody is
       // reading this roster, so it goes back to the resting walk rate.
@@ -836,13 +1138,14 @@
         // moderation drafts are component state and the layout keys this page
         // on the pathname — so navigating away and back keeps the selection
         // while resetting everything around it. Re-seed both: otherwise the
-        // members pane sits on its loading text forever, and the owner's topic
-        // and welcome come up blank, which saving from there would persist.
+        // members pane sits on its loading text forever, and the owner's topic,
+        // welcome and name come up blank, which saving from there would persist.
         const ch = $channelsStore.find((c) => c.channel_id === current);
         if (!editingModeration) {
           editTopic = ch?.topic ?? '';
           editWelcome = ch?.welcome ?? '';
         }
+        renameDraft = ch?.name ?? '';
         if (members.length === 0) await refreshMembers(current, true);
       } else if (
         $channelsStore.some((c) => c.in_room && !c.deleted) &&
@@ -895,14 +1198,15 @@
     }
   }
 
-  /** Confirmed size for the directory chip. `null` means the probe did not
+  /** Confirmed size for the directory chip: who is present now in a joined
+   *  room, the directory's figure for the rest. `null` means the probe did not
    *  answer, which must not look like an empty room. */
   function directoryMemberCount(ch: ChannelInfo): number | null {
     if (ch.in_room && ch.channel_id === selectedId && members.length > 0) {
       return presentCount(members, presenceNow);
     }
     if (!ch.in_room) {
-      const gathered = discovered.find((item) => item.channel_id === ch.channel_id);
+      const gathered = discoveredById.get(ch.channel_id);
       if (gathered) return gathered.member_count;
     }
     // Joined rooms include this device, so a 0 from the table is "not
@@ -932,6 +1236,7 @@
     editTopic = ch.topic ?? '';
     editWelcome = ch.welcome ?? '';
     editingModeration = false;
+    renameDraft = ch.name;
     roomInfoOpen = false;
     resetSearch();
     // Ahead of the fetch: a roster that fails to load must not leave an unread
@@ -1092,6 +1397,7 @@
     try {
       await leaveChannel(id);
       clearDraft(`ch:${id}`);
+      forgetChannelFavourite(id);
       void refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1230,7 +1536,8 @@
     // successful delete even if the following refresh throws — otherwise
     // Discover would resurrect the room.
     hideChannel(id);
-    forgetChannelMute(id);
+    forgetChannelNotifyLevel(id);
+    forgetChannelFavourite(id);
     forgetChannelIgnores(id);
     let deleted = false;
     try {
@@ -1252,7 +1559,8 @@
     deletingOwned = true;
     try {
       await deleteOwnedChannel(id);
-      forgetChannelMute(id);
+      forgetChannelNotifyLevel(id);
+      forgetChannelFavourite(id);
       forgetChannelIgnores(id);
       activeChannelId.set(null);
       members = [];
@@ -1302,6 +1610,23 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       savingModeration = false;
+    }
+  }
+
+  async function handleRename() {
+    const id = selectedId;
+    const name = renameDraft.trim();
+    if (!id || renaming || !name || name === selected?.name || renameTooLong) return;
+    renaming = true;
+    try {
+      const updated = await renameChannel(id, name);
+      replaceChannel(updated);
+      renameDraft = updated.name;
+      toastSuccess(m.channels_rename_saved());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      renaming = false;
     }
   }
 
@@ -1370,11 +1695,33 @@
   let savingInvitePolicy = $state(false);
   let inviteOwnerOnly = $state(false);
   let savingSlowMode = $state(false);
+  let savingAnnounce = $state(false);
+  let announceOnly = $state(false);
 
   $effect(() => {
     if (savingInvitePolicy) return;
     inviteOwnerOnly = selected?.invites_owner_only ?? false;
   });
+
+  $effect(() => {
+    if (savingAnnounce) return;
+    announceOnly = selected?.announce_only ?? false;
+  });
+
+  async function handleAnnounceOnly(on: boolean) {
+    const id = selectedId;
+    if (!id || savingAnnounce) return;
+    savingAnnounce = true;
+    try {
+      replaceChannel(await setChannelAnnounceOnly(id, on));
+    } catch (e) {
+      announceOnly = !on;
+      toastError(translateError(e, m.error_operation_failed()));
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingAnnounce = false;
+    }
+  }
 
   function slowModeLabel(secs: number): string {
     if (secs <= 0) return m.channels_slow_mode_off();
@@ -1529,14 +1876,17 @@
   }
 
   /** Right-click opens the same menu the button does, rather than a second one
-   *  that would have to be kept in step with it. */
-  function openMemberMenu(e: MouseEvent) {
+   *  that would have to be kept in step with it. Shared by member and room rows. */
+  function openCardMenu(e: MouseEvent) {
     const row = e.currentTarget as HTMLElement;
     const menu = row.querySelector('details.card-more') as HTMLDetailsElement | null;
     if (!menu) return;
     e.preventDefault();
     closeCardMenus(menu);
     menu.open = true;
+    // Nothing was focused to open it, so without this the arrow keys and
+    // Escape would be talking to whatever had focus before.
+    menu.querySelector<HTMLElement>('[role^="menuitem"]:not(:disabled)')?.focus();
   }
 
   /**
@@ -1811,10 +2161,13 @@
           <!-- The field simply stops accepting input at the cap, which reads as
                a broken key without a count next to it. `maxlength` already
                tells a screen reader the limit, so this is for the eye only. -->
-          <span class="name-count" aria-hidden="true">{createName.length}/{CHANNEL_NAME_MAX}</span>
+          <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{createName.length}/{CHANNEL_NAME_MAX}</span>
           <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
-          <button type="submit" disabled={!createName.trim() || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
+          <button type="submit" disabled={!createName.trim() || createNameTooLong || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
         </div>
+        {#if createNameTooLong}
+          <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+        {/if}
         <!-- Said at the moment the choice is made, not buried in a panel. A
              public room's content key is derived from the address in its
              public listing, so discovering the room is the same as being able
@@ -1920,35 +2273,79 @@
                 type="text"
                 class="search-input"
                 bind:value={listQuery}
+                bind:this={listSearchEl}
                 placeholder={m.channels_list_search_placeholder()}
                 aria-label={m.channels_list_search_placeholder()}
-                onkeydown={(e) => {
-                  if (e.key !== 'Escape' || !listQuery) return;
-                  e.preventDefault();
-                  e.stopPropagation();
-                  listQuery = '';
-                }}
+                aria-keyshortcuts={`${shortcutModAria()}+K`}
+                oninput={() => (listHighlightId = null)}
+                onblur={() => (listHighlightId = null)}
+                onkeydown={onListSearchKeydown}
               />
               {#if listQuery}
                 <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
               {/if}
+              <!-- The arrow keys move a highlight the search box cannot
+                   describe on its own, so the room under it is read out. -->
+              <span class="sr-only" aria-live="polite">{highlightedRow?.name ?? ''}</span>
             </div>
           {/if}
-          <div class="list-scroll">
+          <div class="list-scroll" bind:this={listScrollEl}>
+            <!-- The header stays while a search hides every joined room, so
+                 "Mark all rooms as read" — which covers them all regardless —
+                 does not come and go with the query. -->
+            {#if roomSections.yours.length > 0 || unreadJoinedIds.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours">{m.channels_section_yours()}</h3>
+                {#if unreadJoinedIds.length > 0}
+                  <button
+                    type="button"
+                    class="list-section-action"
+                    title={m.channels_mark_all_read_title()}
+                    disabled={markingAllRead}
+                    aria-busy={markingAllRead ? 'true' : undefined}
+                    onclick={markAllRead}
+                  >{m.channels_mark_all_read()}</button>
+                {/if}
+              </div>
+              {#if roomSections.yours.length > 0}
+                <div role="list" aria-labelledby="rooms-section-yours">
+                  {#each roomSections.yours as ch (ch.channel_id)}
+                    {@render roomRow(ch)}
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+            {#if roomSections.discover.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-discover">{m.channels_section_discover()}</h3>
+              </div>
+              <div role="list" aria-labelledby="rooms-section-discover">
+                {#each roomSections.discover as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
             {#if visibleChannels.length === 0}
               <p class="muted list-empty">{m.channels_no_matches()}</p>
-            {:else}
-              {#each visibleChannels as ch (ch.channel_id)}
+            {/if}
+          </div>
+        </aside>
+
+        {#snippet roomRow(ch: ChannelInfo)}
                 {@const memberCount = directoryMemberCount(ch)}
                 <!-- A room whose ownership moved is dimmed rather than
                      labelled: the card carries no prose now, and opening it
                      shows the successor banner that actually explains it. -->
                 <div
                   class="chan-row"
+                  role="listitem"
                   class:active={ch.in_room && ch.channel_id === selectedId}
+                  class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
+                  data-room-id={ch.channel_id}
                   title={ch.successor_id ? m.channels_transferred_badge() : undefined}
+                  oncontextmenu={ch.in_room ? openCardMenu : undefined}
                 >
                   <button
                     type="button"
@@ -1984,9 +2381,22 @@
                          by its name, and everything else about it is one click
                          away inside. -->
                     <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
+                    {#if ch.in_room && favouriteSet.has(ch.channel_id)}
+                      <span class="chan-fav" role="img" title={m.channels_favourite_badge()} aria-label={m.channels_favourite_badge()}>
+                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <path d="M8 1.8l1.85 3.75 4.15.6-3 2.92.7 4.13L8 11.25 4.3 13.2l.7-4.13-3-2.92 4.15-.6z"/>
+                        </svg>
+                      </span>
+                    {/if}
                     {#if memberCount !== null}
                       {@const count = memberCount}
-                      <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
+                      <!-- Joined rooms show who is here now but rank on the
+                           whole roster, so the label names both; otherwise a
+                           3 sitting above a 5 reads as a broken sort. -->
+                      {@const countLabel = ch.in_room
+                        ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
+                        : m.channels_members_n({ count })}
+                      <span class="chan-members" title={countLabel} aria-label={countLabel}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <circle cx="6" cy="6" r="2.2"/>
                           <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
@@ -1997,19 +2407,50 @@
                       </span>
                     {/if}
                     {#if ch.in_room && ch.unread > 0}
+                      {@const mentioned = $channelUnreadMentions.includes(ch.channel_id)}
                       <!-- A bare number beside a room name says nothing on its
-                           own to a screen reader. -->
+                           own to a screen reader. Grey when the room's level
+                           would not interrupt for what it holds; see
+                           `unreadBadgeTone`. -->
                       <span
                         class="unread"
-                        class:silenced={$mutedChannels.includes(ch.channel_id)}
-                        aria-label={ch.unread === 1
-                          ? m.channels_unread_title_one()
-                          : m.channels_unread_title_other({ count: ch.unread })}
-                      >{ch.unread}</span>
+                        class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
+                        aria-label={mentioned
+                          ? m.channels_unread_mention_aria({ count: ch.unread })
+                          : ch.unread === 1
+                            ? m.channels_unread_title_one()
+                            : m.channels_unread_title_other({ count: ch.unread })}
+                      >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread}</span>
                     {/if}
                   </button>
                   <div class="chan-door-col">
                     {#if ch.in_room}
+                      {@const rowLevel = notifyLevelOf($channelNotifyLevels, ch.channel_id)}
+                      {@const rowFavourite = favouriteSet.has(ch.channel_id)}
+                      <details class="card-more row-more" ontoggle={placeRowMenu}>
+                        <summary
+                          class="card-more-btn"
+                          title={m.channels_room_options({ name: ch.name })}
+                          aria-haspopup="menu"
+                          aria-label={m.channels_room_options({ name: ch.name })}
+                        >
+                          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                            <circle cx="3.5" cy="8" r="1.4"/>
+                            <circle cx="8" cy="8" r="1.4"/>
+                            <circle cx="12.5" cy="8" r="1.4"/>
+                          </svg>
+                        </summary>
+                        <div class="card-more-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleChannelFavourite(ch.channel_id); }}
+                          >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
+                          <div class="menu-sep" role="separator"></div>
+                          {@render notifyChoices(ch.channel_id, rowLevel)}
+                        </div>
+                      </details>
                       <button
                         type="button"
                         class="chan-door chan-leave"
@@ -2046,10 +2487,47 @@
                     {/if}
                   </div>
                 </div>
-              {/each}
-            {/if}
+        {/snippet}
+
+        {#snippet notifyChoices(channelId: string, current: ChannelNotifyLevel)}
+          <div role="group" aria-label={m.channels_notify_heading()}>
+            <span class="menu-heading" aria-hidden="true">{m.channels_notify_heading()}</span>
+            {#each NOTIFY_CHOICES as choice (choice.level)}
+              <button
+                type="button"
+                role="menuitemradio"
+                tabindex="-1"
+                class="menu-radio"
+                aria-checked={current === choice.level}
+                onclick={(e) => { closeCardMenu(e.currentTarget); setChannelNotifyLevel(channelId, choice.level); }}
+              >
+                <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
+                </svg>
+                {choice.label()}
+              </button>
+            {/each}
           </div>
-        </aside>
+          <!-- These levels govern toasts; a desktop notification also needs
+               the room-message switch in Settings, which is off by default,
+               so "Mentions only" otherwise reads as a promise it cannot keep. -->
+          {#if roomDesktopAlertsOff && current !== 'none'}
+            <div class="menu-sep" role="separator"></div>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex="-1"
+              class="menu-note"
+              onclick={(e) => {
+                closeCardMenu(e.currentTarget);
+                void goto('/settings?section=notifications').catch((err) => console.warn('Failed to open settings:', err));
+              }}
+            >
+              <span>{m.channels_notify_desktop_off()}</span>
+              <span class="menu-note-action">{m.channels_notify_desktop_off_action({ setting: m.settings_notify_channel_message() })}</span>
+            </button>
+          {/if}
+        {/snippet}
 
         <section class="conversation-pane" class:hidden-when-list={!selected}>
           {#if !selected}
@@ -2112,6 +2590,22 @@
                 {/if}
               </div>
               <div class="conv-actions">
+                <!-- Beside the padlock, as another fact about the room itself.
+                     Shown to everyone: an owner or moderator still needs to
+                     know that nobody else can answer here. -->
+                {#if selected.announce_only}
+                  <span
+                    class="enc-lock"
+                    role="img"
+                    title={m.channels_announce_badge_title()}
+                    aria-label={m.channels_announce_badge_title()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
+                      <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
+                    </svg>
+                  </span>
+                {/if}
                 <span class="enc-lock" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
@@ -2167,22 +2661,28 @@
                     <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
                   </svg>
                 </button>
-                <button
-                  class="icon-btn"
-                  class:on={selectedMuted}
-                  onclick={() => toggleChannelMute(selectedChannelId)}
-                  title={selectedMuted ? m.channels_unmute() : m.channels_mute()}
-                  aria-pressed={selectedMuted}
-                  aria-label={selectedMuted ? m.channels_unmute() : m.channels_mute()}
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
-                    <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
-                    {#if selectedMuted}
-                      <path d="M2.6 2.6l10.8 10.8"/>
-                    {/if}
-                  </svg>
-                </button>
+                <details class="card-more notify-more">
+                  <summary
+                    class="icon-btn"
+                    class:on={selectedNotifyLevel !== 'all'}
+                    title={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    aria-haspopup="menu"
+                    aria-label={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
+                      <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
+                      {#if selectedNotifyLevel === 'none'}
+                        <path d="M2.6 2.6l10.8 10.8"/>
+                      {:else if selectedNotifyLevel === 'mentions'}
+                        <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
+                      {/if}
+                    </svg>
+                  </summary>
+                  <div class="card-more-menu" role="menu">
+                    {@render notifyChoices(selectedChannelId, selectedNotifyLevel)}
+                  </div>
+                </details>
                 <!-- Splits the four view toggles from the two actions that
                      actually change something. -->
                 <span class="conv-actions-sep" aria-hidden="true"></span>
@@ -2225,6 +2725,35 @@
               </div>
             {/if}
             {#if selected.is_owner && roomInfoOpen}
+              {#if !selected.successor_id}
+                <form
+                  class="succession-form"
+                  onsubmit={(e) => {
+                    e.preventDefault();
+                    void handleRename();
+                  }}
+                >
+                  <p class="succession-title">{m.channels_rename_title()}</p>
+                  <p class="succession-hint">{m.channels_rename_hint()}</p>
+                  <div class="rename-row">
+                    <input
+                      bind:value={renameDraft}
+                      maxlength={CHANNEL_NAME_MAX}
+                      placeholder={m.channels_name_placeholder()}
+                      aria-label={m.channels_rename_title()}
+                      disabled={renaming}
+                    />
+                    <span class="name-count" class:over={renameTooLong} aria-hidden="true">{renameDraft.length}/{CHANNEL_NAME_MAX}</span>
+                    <button
+                      type="submit"
+                      disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}
+                    >{renaming ? m.common_loading() : m.channels_rename_save()}</button>
+                  </div>
+                  {#if renameTooLong}
+                    <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+                  {/if}
+                </form>
+              {/if}
               <form
                 class="moderation-form"
                 onsubmit={(e) => {
@@ -2264,6 +2793,16 @@
                   label={m.channels_invite_policy_label()}
                   disabled={savingInvitePolicy}
                   onchange={(v) => void handleInvitePolicy(v)}
+                />
+              </div>
+              <div class="succession-form">
+                <p class="succession-title">{m.channels_announce_title()}</p>
+                <p class="succession-hint">{m.channels_announce_hint()}</p>
+                <ToggleSwitch
+                  bind:checked={announceOnly}
+                  label={m.channels_announce_label()}
+                  disabled={savingAnnounce}
+                  onchange={(v) => void handleAnnounceOnly(v)}
                 />
               </div>
               <div class="succession-form">
@@ -2484,6 +3023,10 @@
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
                 slowModeSecs={selectedSlowMode}
+                announceOnly={selectedAnnounceBlocked}
+                pinnedMsgIds={selected?.pinned_msg_ids ?? []}
+                canPin={selected?.is_owner ?? false}
+                onchannelupdate={replaceChannel}
                 memberNames={memberNames}
                 ignoredSenders={roomIgnoredKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
@@ -2542,7 +3085,7 @@
                   {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
                   <li
                     class:banned={mem.banned}
-                    oncontextmenu={memberHasMenu(mem) ? openMemberMenu : undefined}
+                    oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
                   >
                     <div
                       class="member-avatar"
@@ -2597,12 +3140,14 @@
                           <button
                             type="button"
                             role="menuitem"
+                            tabindex="-1"
                             disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}</button>
                           <button
                             type="button"
                             role="menuitem"
+                            tabindex="-1"
                             disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
                           >{friendRelation === 'mutual'
@@ -2622,6 +3167,7 @@
                             <button
                               type="button"
                               role="menuitem"
+                              tabindex="-1"
                               disabled={!selectedId}
                               onclick={(e) => { closeCardMenu(e.currentTarget); if (selectedId) toggleMemberIgnoreInChannel(mem.member_pubkey, selectedId, mem.nickname); }}
                             >{ignoreScope === 'room'
@@ -2631,6 +3177,7 @@
                           <button
                             type="button"
                             role="menuitem"
+                            tabindex="-1"
                             onclick={(e) => {
                               closeCardMenu(e.currentTarget);
                               if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
@@ -2644,6 +3191,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
                               >{m.channels_unban()}</button>
@@ -2651,6 +3199,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 class="menu-item-danger"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleBan(mem.member_pubkey); }}
@@ -2662,6 +3211,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleRemoveModerator(mem.member_pubkey); }}
                               >{m.channels_remove_moderator()}</button>
@@ -2669,6 +3219,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleAddModerator(mem.member_pubkey); }}
                               >{m.channels_add_moderator()}</button>
@@ -2677,6 +3228,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 class="menu-item-danger"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); requestTransfer(mem); }}
@@ -2940,36 +3492,42 @@
     flex-shrink: 0;
   }
 
+  .name-count.over,
+  .form-hint.name-too-long {
+    color: var(--danger);
+  }
+
   /* Fixed track widths rather than minmax(): collapsing the list animates
      `grid-template-columns`, and browsers only interpolate that when the track
      values are plain lengths. With minmax() the sidebar would jump.
 
-     Sized to hold a full-length room name. Names cap at 20 characters, which
-     leaves the name about 162px here once the avatar, member count and door
-     button have taken theirs — enough that a name at the limit reads whole
-     instead of trailing off. Held at one width rather than measured per room:
-     the cap already bounds the worst case to a few dozen pixels, and a column
-     that resized itself would do so repeatedly while Discover streams rooms
-     in. The narrower members-open track is gone for the same reason — a name
-     should not shorten because a roster opened beside it. */
+     Names cap at 32 characters. The name gets about 210px here once the
+     avatar, member count and door button have taken theirs, which holds some
+     26 characters whole; past that it ellipsises, with the full name in the
+     row's tooltip and the room header. Holding all 32 would take about 410px,
+     and at the smallest window that leaves the conversation some 230px.
+     Held at one width rather than measured per room: a column that resized
+     itself would do so repeatedly while Discover streams rooms in. The
+     narrower members-open track is gone for the same reason — a name should
+     not shorten because a roster opened beside it. */
   .workspace {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 312px minmax(0, 1fr);
+    grid-template-columns: 360px minmax(0, 1fr);
     gap: 10px;
     position: relative;
     transition: grid-template-columns var(--transition-slow) ease;
   }
 
   /* Keep a zero-width members track while a room is open so the roster can
-     ease in and out instead of popping. The list stays 312px either way. */
+     ease in and out instead of popping. The list stays 360px either way. */
   .workspace.has-members {
-    grid-template-columns: 312px minmax(0, 1fr) 0;
+    grid-template-columns: 360px minmax(0, 1fr) 0;
   }
 
   .workspace.members-open {
-    grid-template-columns: 312px minmax(0, 1fr) 228px;
+    grid-template-columns: 360px minmax(0, 1fr) 228px;
   }
 
   .workspace.list-collapsed {
@@ -3116,6 +3674,47 @@
   }
 
   .list-empty { padding: 16px 10px; text-align: center; font-size: 12px; }
+
+  /* Sized like the dock switcher's section labels, so the two lists read as
+     one family. A fixed height keeps the header from growing when its action
+     appears and disappears. */
+  .list-section {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 22px;
+    margin: 10px 0 2px;
+    padding: 0 6px 0 8px;
+  }
+
+  .list-section:first-child { margin-top: 0; }
+
+  .list-section-label {
+    margin: 0;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .list-section-action {
+    font-size: 11px;
+    font-family: inherit;
+    padding: 2px 6px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-accent);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .list-section-action:hover:not(:disabled),
+  .list-section-action:focus-visible { background: var(--bg-hover); }
+
+  .list-section-action:disabled { opacity: 0.5; cursor: wait; }
 
   .form-hint {
     margin: 0 0 10px;
@@ -3321,7 +3920,34 @@
   .chan-row.moved .chan-name,
   .chan-row.moved .chan-avatar { opacity: 0.55; }
 
-  .chan-row:hover { background: var(--bg-hover); }
+  .chan-row:hover,
+  .chan-row.highlighted { background: var(--bg-hover); }
+
+  /* The search box keeps focus while its arrows steer, so the row carries the
+     ring focus would otherwise have drawn. */
+  .chan-row.highlighted { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+  .chan-fav {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-inline-start: -4px;
+    color: var(--warning);
+  }
+
+  .chan-fav svg { width: 11px; height: 11px; }
+
+  /* Hidden until the row is reached, like Remove on a Discover row, and in
+     the same slot, so joined and unjoined rows line up. */
+  .row-more > summary {
+    opacity: 0;
+    transition:
+      opacity var(--transition-fast) ease,
+      background-color var(--transition-fast) ease;
+  }
+
+  .chan-row:hover .row-more > summary,
+  .chan-row:focus-within .row-more > summary,
+  .row-more[open] > summary { opacity: 1; }
 
   .chan-row.active {
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
@@ -3398,8 +4024,9 @@
     color: var(--on-accent);
     font-size: 11px;
     font-weight: 700;
-    display: grid;
-    place-items: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     padding: 0 5px;
     flex-shrink: 0;
   }
@@ -3408,6 +4035,11 @@
   .unread.silenced {
     background: var(--bg-tertiary);
     color: var(--text-secondary);
+  }
+
+  .unread-at {
+    margin-inline-end: 1px;
+    font-weight: 800;
   }
 
   /* A room arrives as a movement rather than in a single frame. That matters
@@ -3706,6 +4338,17 @@
     padding: 12px 14px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
+  }
+
+  .rename-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .rename-row input {
+    flex: 1;
+    min-width: 0;
   }
 
   .succession-title {
@@ -4073,6 +4716,65 @@
   .card-more-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
   .menu-item-danger:hover:not(:disabled) { color: var(--danger); }
 
+  /* Set from `placeRowMenu`, out of the compiler's sight. */
+  .card-more-menu:global([data-up]) {
+    top: auto;
+    bottom: calc(100% + 4px);
+  }
+
+  .card-more-menu [role='group'] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .menu-sep {
+    height: 1px;
+    margin: 4px 2px;
+    background: var(--ctx-border);
+  }
+
+  .menu-heading {
+    padding: 4px 10px 2px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .card-more-menu .menu-radio {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-inline-start: 6px;
+  }
+
+  .menu-check {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .card-more-menu .menu-note {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: 220px;
+    white-space: normal;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+  }
+
+  .menu-note-action { color: var(--text-accent); }
+
+  /* The header's bell is an `icon-btn` that happens to open a menu, so it
+     keeps that size rather than the row menus' smaller trigger. */
+  .notify-more > summary {
+    width: 30px;
+    height: 30px;
+  }
+
   .empty-state {
     text-align: center;
     padding: 56px 24px;
@@ -4109,7 +4811,7 @@
     .workspace,
     .workspace.has-members,
     .workspace.members-open {
-      grid-template-columns: 312px minmax(0, 1fr);
+      grid-template-columns: 360px minmax(0, 1fr);
     }
 
     /* The members pane floats over the chat at this width, so a collapsed list

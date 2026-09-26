@@ -1015,6 +1015,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_history_sync_times: HashMap::new(),
+        channel_typing_recv_times: HashMap::new(),
+        channel_typing_sent_times: HashMap::new(),
         channel_gossip_sent_times: VecDeque::new(),
         channel_gossip_local_times: VecDeque::new(),
         channel_origin_retry: VecDeque::new(),

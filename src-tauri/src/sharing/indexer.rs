@@ -1212,7 +1212,8 @@ mod tests {
         let dir = measure_fixture("agree");
         let flag = AtomicBool::new(false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let measure = FileIndexer::measure_directories(&[dir.clone()], deadline, &flag);
+        let measure =
+            FileIndexer::measure_directories(std::slice::from_ref(&dir), deadline, &flag);
         let discovered = FileIndexer::discover_directory(&dir.to_string_lossy());
         assert!(measure.complete);
         assert_eq!(measure.files, discovered.files.len() as u64);
@@ -1242,7 +1243,7 @@ mod tests {
         }
         let flag = AtomicBool::new(false);
         let measure =
-            FileIndexer::measure_directories(&[dir.clone()], std::time::Instant::now(), &flag);
+            FileIndexer::measure_directories(std::slice::from_ref(&dir), std::time::Instant::now(), &flag);
         assert!(!measure.complete);
         assert!(measure.files < 303);
         let _ = std::fs::remove_dir_all(&dir);

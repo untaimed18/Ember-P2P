@@ -25,6 +25,7 @@ mod rendezvous_room_selection_tests {
             joined_at: 0,
             last_active: 0,
             member_count: 0,
+            roster_count: 0,
             unread: 0,
             successor_id: String::new(),
             predecessor_id: String::new(),
@@ -39,6 +40,9 @@ mod rendezvous_room_selection_tests {
             deleted: false,
             invites_owner_only: false,
             slow_mode_secs: 0,
+            announce_only: false,
+            pinned_msg_ids: Vec::new(),
+            renamed_at: 0,
         }
     }
 
@@ -158,6 +162,117 @@ mod rendezvous_room_selection_tests {
 }
 
 #[cfg(test)]
+mod owner_room_policy_ingest_tests {
+    use super::ingest_channel_moderation_records;
+    use crate::network::ember::channel::ChannelIdentity;
+    use crate::network::ember::dht::publish::{ModerationTail, SignedRecord};
+    use crate::storage::database::Database;
+
+    fn blob(ident: &ChannelIdentity, tail: &ModerationTail) -> Vec<u8> {
+        let record = SignedRecord::channel_moderation(
+            "Topic",
+            "Welcome",
+            &[],
+            &[],
+            tail,
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("fits");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    fn policy_tail(announce: bool, pins: Vec<[u8; 16]>) -> ModerationTail {
+        ModerationTail {
+            owner_pubkey: Some([0x77; 32]),
+            key_epoch: Some(0),
+            successor_nominee: Some([0; 32]),
+            claim_after_days: Some(0),
+            invites_owner_only: Some(false),
+            announce_only: announce.then_some(true),
+            pinned_msg_ids: pins,
+            ..Default::default()
+        }
+    }
+
+    /// A member takes the announce flag and the pins from the owner's newest
+    /// snapshot only, and a newer one that leaves them out turns them off.
+    #[test]
+    fn announce_and_pins_come_only_from_the_newest_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-room-policy-ingest-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let ident = ChannelIdentity::generate();
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel(&id_hex, &hex::encode(ident.pubkey), "Lobby", "public", false, None, None)
+            .expect("insert channel");
+
+        let pins = vec![[0xA1; 16], [0xA2; 16]];
+        assert!(ingest_channel_moderation_records(
+            &db,
+            ident.channel_id,
+            &[blob(&ident, &policy_tail(true, pins.clone()))],
+        ));
+        let row = db.get_channel(&id_hex).unwrap().unwrap();
+        assert!(row.announce_only);
+        assert_eq!(row.pinned_msg_ids, vec!["a1".repeat(16), "a2".repeat(16)]);
+
+        // A snapshot newer than anything a storer can hand back arrives
+        // first; the ordinary one after it is older and changes nothing.
+        let future = chrono::Utc::now().timestamp() + 3_600;
+        assert!(db
+            .apply_channel_moderation(
+                &id_hex, "Topic", "Welcome", future, &[], &[], None, None, None, None, None,
+                None,
+            )
+            .unwrap());
+        assert!(!ingest_channel_moderation_records(
+            &db,
+            ident.channel_id,
+            &[blob(&ident, &policy_tail(false, Vec::new()))],
+        ));
+        let row = db.get_channel(&id_hex).unwrap().unwrap();
+        assert!(row.announce_only, "an older snapshot cannot reopen the room");
+        assert_eq!(row.pinned_msg_ids.len(), 2, "or take its pins down");
+
+        // In a second room, the newest snapshot saying nothing is "off".
+        let other = ChannelIdentity::generate();
+        let other_hex = hex::encode(other.channel_id);
+        db.insert_channel(&other_hex, &hex::encode(other.pubkey), "Den", "public", false, None, None)
+            .expect("insert channel");
+        assert!(ingest_channel_moderation_records(
+            &db,
+            other.channel_id,
+            &[blob(&other, &policy_tail(true, pins))],
+        ));
+        assert!(ingest_channel_moderation_records(
+            &db,
+            other.channel_id,
+            &[blob(&other, &policy_tail(false, Vec::new()))],
+        ));
+        let row = db.get_channel(&other_hex).unwrap().unwrap();
+        assert!(!row.announce_only);
+        assert!(row.pinned_msg_ids.is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
 mod channel_roster_snapshot_tests {
     use super::{ChannelRosterSnapshot, CHANNEL_ROSTER_SNAPSHOT_TTL};
     use crate::storage::database::StoredChannelMember;
@@ -268,6 +383,7 @@ mod channel_view_cache_tests {
                 joined_at: 0,
                 last_active: 0,
                 member_count: 0,
+                roster_count: 0,
                 unread: 0,
                 successor_id: String::new(),
                 predecessor_id: String::new(),
@@ -282,6 +398,9 @@ mod channel_view_cache_tests {
                 deleted: false,
                 invites_owner_only: false,
                 slow_mode_secs: 0,
+                announce_only: false,
+                pinned_msg_ids: Vec::new(),
+                renamed_at: 0,
             },
             content_keys: Vec::new(),
             roster: None,
@@ -2021,21 +2140,39 @@ pub(super) fn ingest_channel_moderation_records(
     let Some(moderation) = best else {
         return false;
     };
-    db.apply_channel_moderation(
-        &channel_id_hex,
-        &moderation.topic,
-        &moderation.welcome,
-        moderation.timestamp,
-        &moderation.banned_pubkeys,
-        &moderation.moderator_pubkeys,
-        moderation.tail.owner_pubkey.as_ref(),
-        moderation.tail.successor_nominee.as_ref(),
-        moderation.tail.claim_after_days,
-        moderation.tail.key_epoch,
-        moderation.tail.invites_owner_only,
-        moderation.tail.slow_mode_secs,
-    )
-    .unwrap_or(false)
+    let applied = db
+        .apply_channel_moderation(
+            &channel_id_hex,
+            &moderation.topic,
+            &moderation.welcome,
+            moderation.timestamp,
+            &moderation.banned_pubkeys,
+            &moderation.moderator_pubkeys,
+            moderation.tail.owner_pubkey.as_ref(),
+            moderation.tail.successor_nominee.as_ref(),
+            moderation.tail.claim_after_days,
+            moderation.tail.key_epoch,
+            moderation.tail.invites_owner_only,
+            moderation.tail.slow_mode_secs,
+        )
+        .unwrap_or(false);
+    // Only from a snapshot just accepted as the owner's newest, so an older
+    // record replayed from a slow storer cannot rename the room back. Never on
+    // the owner's own device: its name is the one it renamed the room to, and
+    // a snapshot of its own from before the rename — which one stamped in the
+    // same second still counts as newest — would quietly undo it here while
+    // the registry and every member moved on.
+    if applied {
+        if let Some(name) = moderation.tail.room_name.as_deref().filter(|_| !ch.is_owner) {
+            let _ = db.apply_owner_room_name(&channel_id_hex, name);
+        }
+        let _ = db.apply_owner_room_policy(
+            &channel_id_hex,
+            moderation.tail.announce_only == Some(true),
+            &moderation.tail.pinned_msg_ids,
+        );
+    }
+    applied
 }
 
 /// Owners re-STORE the records only they can sign, so the 24h DHT TTL cannot
@@ -2162,6 +2299,25 @@ pub(super) async fn maybe_publish_owned_channel_records(
                 slow_mode_secs: match ch.slow_mode_secs.clamp(0, u16::MAX as i64) as u16 {
                     0 => None,
                     secs => Some(secs),
+                },
+                // Carried on every republish once the room has been renamed, so
+                // a member who was offline for the edit still catches up.
+                room_name: (ch.renamed_at > 0).then(|| ch.name.clone()),
+                // Both on every republish for the same reason as slow mode, and
+                // absent when unused so other rooms' tails are unchanged. Pins
+                // this device has since removed are left out; `channel_moderation`
+                // sheds any that no longer fit. The removal check decrypts
+                // nothing and is skipped for a room with no pins, which keeps
+                // it cheap enough for this task.
+                announce_only: ch.announce_only.then_some(true),
+                pinned_msg_ids: {
+                    let removed = db
+                        .channel_messages_removed(&ch.channel_id, &ch.pinned_msg_ids)
+                        .unwrap_or_default();
+                    ch.pinned_msg_id_bytes()
+                        .into_iter()
+                        .filter(|id| !removed.contains(&hex::encode(id)))
+                        .collect()
                 },
             },
             channel_id,

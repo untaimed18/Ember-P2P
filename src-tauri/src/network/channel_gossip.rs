@@ -912,6 +912,23 @@ pub(super) async fn handle_inbound_channel_gossip(
         .await;
         return;
     }
+    if let Some((member, typing)) = ember::channel::decode_channel_typing(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
+        apply_channel_typing(
+            state,
+            db,
+            app_handle,
+            gossip.channel_id,
+            gossip.timestamp,
+            member,
+            typing,
+        );
+        return;
+    }
     // Handoff frames are not gated on `opened`. Each carries its own authority —
     // the room's signature on an offer, the pending nominee's on a ready — so
     // the key that sealed it adds nothing, and a nominee who has not fetched
@@ -1200,6 +1217,9 @@ pub(super) async fn handle_inbound_channel_gossip(
         opened,
         gossip.ttl,
     );
+    // The same derivation `insert_channel_message` stores, so the event and the
+    // row agree on what this line answers.
+    let reply_to = ember::channel::chat_reply_parent_hex(&cleaned, &msg_id_hex);
     // Awaited, not detached: the dedup verdict, the stored row and the roster
     // write decide what this frame does next, and the next frame for the same
     // line has to see this one's row. What moves is the blocking itself — the
@@ -1212,6 +1232,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         let msg_id_hex = msg_id_hex.clone();
         let cleaned = cleaned.clone();
         let local_hex = hex::encode(state.local_ed25519_pubkey);
+        let reply_to = reply_to.clone();
         tokio::task::spawn_blocking(move || {
             // Either we already hold the line, or we held it and were told to
             // forget it. Both mean do not store it again; both still pass it
@@ -1237,6 +1258,12 @@ pub(super) async fn handle_inbound_channel_gossip(
             ) {
                 Ok(row_id) => ChatLineIngest::Stored {
                     row_id,
+                    // A parent that fails to read is a quote drawn as
+                    // unavailable, not a line lost.
+                    reply: reply_to
+                        .as_deref()
+                        .and_then(|parent| db.channel_reply_lookup(&channel_id_hex, parent).ok())
+                        .unwrap_or_default(),
                     // First line from someone this device did not already
                     // hold: the roster has to grow, and XOR-neighbors may have
                     // changed, so do not wait for the next presence walk or the
@@ -1265,7 +1292,11 @@ pub(super) async fn handle_inbound_channel_gossip(
             }
             return;
         }
-        ChatLineIngest::Stored { row_id, member } => {
+        ChatLineIngest::Stored {
+            row_id,
+            reply,
+            member,
+        } => {
             note_channel_sync_ingest(state, gossip.channel_id, gossip.ttl);
             if let Some(member) = member {
                 match member {
@@ -1298,6 +1329,8 @@ pub(super) async fn handle_inbound_channel_gossip(
                 // talking.
                 note_channel_member_alive(state, gossip.channel_id, &sender_pk, now);
             }
+            let reply_to_me =
+                reply_parent_is_ours(reply.parent.as_ref(), &state.local_ed25519_pubkey);
             let _ = app_handle.emit(
                 "ember:channel-message",
                 serde_json::json!({
@@ -1305,13 +1338,24 @@ pub(super) async fn handle_inbound_channel_gossip(
                     "channel_id": channel_id_hex,
                     "sender_pubkey": sender_hex,
                     "direction": "received",
-                    "message": cleaned,
+                    // The body. The stored copy keeps the signed trailer.
+                    "message": ember::channel::chat_display_text(&cleaned),
+                    // The author's signed send time (`now` above is
+                    // `gossip.timestamp`), not when it reached us: catch-up
+                    // serves old lines through this same event, and this is how
+                    // the UI tells them from live ones and keeps them quiet.
                     "timestamp": now,
                     // Carried so a line that arrives live can be reacted to
                     // straight away. Reactions name a message by its wire id, and
                     // without this the bubble held no way to be addressed until
                     // the room was next read from disk.
                     "msg_id": msg_id_hex,
+                    "reply_to": reply_to,
+                    // Someone answering one of our lines, which notifications
+                    // treat the way they treat a mention.
+                    "reply_to_me": reply_to_me,
+                    "reply_parent": reply.parent,
+                    "reply_parent_deleted": reply.deleted,
                 }),
             );
         }
@@ -1332,9 +1376,26 @@ enum ChatLineIngest {
     /// its inner `None` is a write that failed.
     Stored {
         row_id: i64,
+        reply: crate::storage::database::ChannelReplyLookup,
         member: Option<Option<ChannelMemberWrite>>,
     },
     Failed(String),
+}
+
+/// Whether a reply's parent was written by this device's identity.
+///
+/// Compared by key, not by the parent row's `direction`: our own line can come
+/// back to us as `received` — restored from a catch-up after this device lost
+/// its copy — and is still ours.
+fn reply_parent_is_ours(
+    parent: Option<&crate::storage::database::ChannelReplyParent>,
+    local_pubkey: &[u8; 32],
+) -> bool {
+    parent.is_some_and(|parent| {
+        parent
+            .sender_pubkey
+            .eq_ignore_ascii_case(&hex::encode(local_pubkey))
+    })
 }
 
 pub(super) async fn apply_channel_handoff_offer(
@@ -1937,6 +1998,137 @@ pub(super) enum ChannelUnicast {
 
 // --- Ember Transfer -------------------------------------------------------
 
+/// Show a member's verified typing signal, or drop it.
+///
+/// The whole of what one does here: no storage, no presence touch, no relay,
+/// and no dedup slot released on refusal, since nobody retransmits a typing
+/// frame. Anything that entered the database would be something catch-up
+/// could serve, and a signal is only true for the few seconds after it left.
+pub(super) fn apply_channel_typing(
+    state: &mut NetworkState,
+    db: &Database,
+    app_handle: &tauri::AppHandle,
+    channel_id: [u8; 16],
+    timestamp: i64,
+    member: [u8; 32],
+    typing: bool,
+) {
+    let local = state.local_ed25519_pubkey;
+    let roster_status = channel_member_status_cached(state, db, channel_id, &member);
+    let verdict = ember::channel::admit_channel_typing(
+        &member,
+        &local,
+        roster_status,
+        timestamp,
+        chrono::Utc::now().timestamp(),
+        || {
+            ember::channel::typing_recv_allow(
+                &mut state.channel_typing_recv_times,
+                channel_id,
+                &member,
+                std::time::Instant::now(),
+            )
+        },
+    );
+    if let Err(reason) = verdict {
+        debug!(
+            "Ember channel gossip: dropped a typing signal in {} ({reason:?})",
+            hex::encode(channel_id)
+        );
+        return;
+    }
+    let _ = app_handle.emit(
+        "ember:channel-typing",
+        serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "member_pubkey": hex::encode(member),
+            "typing": typing,
+        }),
+    );
+}
+
+/// Tell the members we hold a live session with that we are (or have stopped)
+/// composing in `channel_id`. Fire-and-forget: nothing is queued or retried,
+/// because a late typing signal is a wrong one.
+pub(super) async fn send_channel_typing(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    typing: bool,
+) {
+    if db.chat_locked() {
+        return;
+    }
+    let Some(view) = cached_channel_view(state, db, channel_id) else {
+        return;
+    };
+    if !view.row.in_room_now() {
+        return;
+    }
+    let local = state.local_ed25519_pubkey;
+    // A banned member's frames are dropped by everyone, so sending would only
+    // spend datagrams; the UI hides the composer in that state regardless.
+    if channel_member_banned(state, db, channel_id, &local) {
+        return;
+    }
+    let Some(key) = view.content_keys.first().copied() else {
+        return;
+    };
+    let present = channel_member_pubkeys_cached(state, db, channel_id);
+    let mut contacts: HashMap<[u8; 32], ember::dht::EmberContact> = HashMap::new();
+    let Some(recipients) = ember::channel::typing_recipients(&local, &present, |pk| {
+        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+        let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() else {
+            return false;
+        };
+        if !ember_has_live_session(state, &contact) {
+            return false;
+        }
+        contacts.insert(*pk, contact);
+        true
+    }) else {
+        return;
+    };
+    if recipients.is_empty() {
+        return;
+    }
+    // Charged only once there is somebody to send to, so a room with nobody
+    // reachable does not use up the allowance a moment later needs.
+    if !ember::channel::typing_send_allow(
+        &mut state.channel_typing_sent_times,
+        channel_id,
+        std::time::Instant::now(),
+    ) {
+        return;
+    }
+    let ts = chrono::Utc::now().timestamp();
+    let mut msg_id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+    let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
+    let plain =
+        ember::channel::encode_channel_typing(&signing, &local, &channel_id, &msg_id, ts, typing);
+    let body = ember::channel::ChannelGossip::sealed(
+        channel_id,
+        msg_id,
+        &key,
+        ts.max(0) as u64,
+        &plain,
+        ember::channel::CHANNEL_TYPING_TTL,
+        ts,
+    )
+    .encode();
+    // Seen before it leaves, so a peer echoing it back is dropped at dedup.
+    let _ = remember_channel_gossip(state, msg_id);
+    for pk in recipients {
+        let Some(contact) = contacts.get(&pk) else {
+            continue;
+        };
+        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+        send_ember_dht_frame_established(socket, state, contact, &frame).await;
+    }
+}
+
 /// Apply a member's revision of their own line and pass it on.
 ///
 /// Every check that decides whether the revision is legitimate is in
@@ -2004,7 +2196,7 @@ pub(super) async fn handle_inbound_channel_edit(
                     "channel_id": channel_id_hex,
                     "id": id,
                     "msg_id": target_hex,
-                    "message": cleaned,
+                    "message": ember::channel::chat_display_text(&cleaned),
                     "edited_at": edit.edited_at,
                 }),
             );
@@ -2018,6 +2210,11 @@ pub(super) async fn handle_inbound_channel_edit(
             // and stored unread, so the sidebar could light up for the room the
             // user was looking at. It is a new line here, so announce it as one
             // and let the live path append it and settle its unread state.
+            let reply_to = ember::channel::chat_reply_parent_hex(&cleaned, &target_hex);
+            let reply = reply_to
+                .as_deref()
+                .and_then(|parent| db.channel_reply_lookup(channel_id_hex, parent).ok())
+                .unwrap_or_default();
             let _ = app_handle.emit(
                 "ember:channel-message",
                 serde_json::json!({
@@ -2025,10 +2222,17 @@ pub(super) async fn handle_inbound_channel_edit(
                     "channel_id": channel_id_hex,
                     "sender_pubkey": sender_hex,
                     "direction": "received",
-                    "message": cleaned,
+                    "message": ember::channel::chat_display_text(&cleaned),
                     "timestamp": edit.original_timestamp,
                     "msg_id": target_hex,
                     "edited_at": edit.edited_at,
+                    "reply_to": reply_to,
+                    "reply_to_me": reply_parent_is_ours(
+                        reply.parent.as_ref(),
+                        &state.local_ed25519_pubkey,
+                    ),
+                    "reply_parent": reply.parent,
+                    "reply_parent_deleted": reply.deleted,
                 }),
             );
         }

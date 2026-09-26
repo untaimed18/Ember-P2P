@@ -1275,6 +1275,13 @@ pub(super) struct NetworkState {
     /// the asker spends less than we do.
     pub(super) channel_history_sync_times:
         HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
+    /// Inbound typing signals keyed by (room, signed author). Apart from the
+    /// chat budget so a member's typing cannot spend what their next line needs.
+    pub(super) channel_typing_recv_times:
+        HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
+    /// Typing signals this device has sent, per room. Each one is a datagram
+    /// to every reachable member, so the ceiling holds whatever the UI asks.
+    pub(super) channel_typing_sent_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Last history-sync request per (channel_id, neighbor pubkey), stamped on
     /// the attempt whether or not any path to the neighbor was found.
     pub(super) channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,

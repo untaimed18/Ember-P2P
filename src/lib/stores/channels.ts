@@ -7,6 +7,7 @@ import {
   type ChannelTransferInfo,
 } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
+import { appSettings } from '$lib/stores/settings';
 import { toast } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
@@ -46,74 +47,265 @@ export function takeStashedChannelSelection(): boolean {
 const CHANNEL_ID_RE = /^[0-9a-f]{32}$/i;
 const MEMBER_PUBKEY_RE = /^[0-9a-f]{64}$/i;
 const TOAST_GAP_MS = 15_000;
+/** Lines that name the user get their own, shorter per-room gap: answering
+ *  them is the point, but exempting them outright let any member flood
+ *  toasts by mentioning or replying over and over. */
+const MENTION_TOAST_GAP_MS = 3_000;
+/** A line sent longer ago than this is history arriving, not somebody talking
+ *  now: catch-up re-serves a room's recent past through the same event as live
+ *  chat, and on reconnect every reply and mention in it would interrupt at once.
+ *  Generous enough for clock skew and a slow mesh. */
+const LIVE_LINE_MAX_AGE_MS = 2 * 60_000;
 const lastToastAt = new Map<string, number>();
+const lastMentionToastAt = new Map<string, number>();
+/** Keyed `room:sender`. One member naming the user repeatedly still waits
+ *  the full gap between toasts; a second member is not held up by the first. */
+const lastMentionToastFrom = new Map<string, number>();
+
+type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+function browserStorage(): StorageLike | null {
+  return typeof localStorage === 'undefined' ? null : localStorage;
+}
+
+/** A stored list of room ids. Normalised on the way in: everything else
+ *  compares against the lowercase hex the backend emits, so a stray uppercase
+ *  entry would style a badge one way while the toast went the other. */
+function parseChannelIds(raw: string | null): string[] {
+  if (!raw) return [];
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return [
+    ...new Set(
+      parsed
+        .filter((id): id is string => typeof id === 'string' && CHANNEL_ID_RE.test(id))
+        .map((id) => id.toLowerCase()),
+    ),
+  ];
+}
 
 /**
- * Rooms the user has silenced.
+ * How loudly a room may interrupt: every message, only lines that name you,
+ * or nothing at all.
  *
  * A device preference rather than room state, so it lives in `localStorage`
- * instead of the channels table: muting is about this machine's notifications,
+ * instead of the channels table: it is about this machine's notifications,
  * not something the other members should learn or inherit. Deliberately
  * survives `cleanupChannelsStore` — turning Ember off and on again should not
  * un-silence a room.
  *
- * Suppresses the toast only. Unread counts keep accruing, because a muted room
- * is one you want to read later rather than one you want to miss.
+ * Governs toasts, desktop notifications and how the unread pill is drawn.
+ * Unread counts keep accruing at every level, because a quiet room is one you
+ * want to read later rather than one you want to miss.
  */
-const MUTED_KEY = 'ember.channels.muted.v1';
+export type ChannelNotifyLevel = 'all' | 'mentions' | 'none';
+type QuietLevel = Exclude<ChannelNotifyLevel, 'all'>;
 
-function loadMuted(): string[] {
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(MUTED_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Normalised on the way in: everything else compares against the lowercase
-    // hex the backend emits, so a stray uppercase entry would style the badge
-    // as muted while the toast still fired.
-    return parsed
-      .filter((id): id is string => typeof id === 'string' && CHANNEL_ID_RE.test(id))
-      .map((id) => id.toLowerCase());
-  } catch {
-    return [];
+/** Only the quiet rooms are stored; a room with no entry hears everything. */
+const NOTIFY_KEY = 'ember.channels.notify.v1';
+/** The on/off mute this replaced, a list of ids that all meant `none`. */
+const LEGACY_MUTED_KEY = 'ember.channels.muted.v1';
+
+function parseNotifyLevels(raw: string): Record<string, QuietLevel> {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const out: Record<string, QuietLevel> = {};
+  for (const [key, level] of Object.entries(parsed)) {
+    if (!CHANNEL_ID_RE.test(key) || (level !== 'mentions' && level !== 'none')) continue;
+    out[key.toLowerCase()] = level;
   }
-}
-
-export const mutedChannels = writable<string[]>(loadMuted());
-
-mutedChannels.subscribe((ids) => {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(MUTED_KEY, JSON.stringify(ids));
-  } catch {
-    // Quota exceeded / private mode. The mute still holds for this session.
-  }
-});
-
-export function toggleChannelMute(channelId: string): void {
-  const id = channelId.toLowerCase();
-  mutedChannels.update((ids) =>
-    ids.includes(id) ? ids.filter((existing) => existing !== id) : [...ids, id],
-  );
+  return out;
 }
 
 /**
- * Sidebar aggregate. Muted rooms are excluded on purpose: the per-room pill
- * still shows their count, because muting means "later" rather than "never",
- * but a silenced room has no business putting a number on the nav rail.
+ * Read the stored levels, converting the old mute list the first time.
+ *
+ * The legacy key is consulted only while the new one is absent, and dropped
+ * once its contents are safely written under the new name — so a room muted
+ * before this existed stays silent, and a later "All messages" is not undone
+ * by the old list being read again. If the write fails the old list is left
+ * where it is and the conversion simply runs again next launch.
+ */
+export function loadChannelNotifyLevels(
+  storage: StorageLike | null = browserStorage(),
+): Record<string, QuietLevel> {
+  if (!storage) return {};
+  try {
+    const raw = storage.getItem(NOTIFY_KEY);
+    if (raw !== null) return parseNotifyLevels(raw);
+    const legacyRaw = storage.getItem(LEGACY_MUTED_KEY);
+    if (legacyRaw === null) return {};
+    let legacy: string[] = [];
+    try {
+      legacy = parseChannelIds(legacyRaw);
+    } catch {
+      // Unreadable: nothing to carry over, but still worth retiring the key.
+    }
+    const levels: Record<string, QuietLevel> = Object.fromEntries(
+      legacy.map((id) => [id, 'none' as const]),
+    );
+    try {
+      storage.setItem(NOTIFY_KEY, JSON.stringify(levels));
+      storage.removeItem(LEGACY_MUTED_KEY);
+    } catch {
+      /* Quota exceeded / private mode. */
+    }
+    return levels;
+  } catch {
+    return {};
+  }
+}
+
+export const channelNotifyLevels = writable<Record<string, QuietLevel>>(loadChannelNotifyLevels());
+
+channelNotifyLevels.subscribe((levels) => {
+  const storage = browserStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(NOTIFY_KEY, JSON.stringify(levels));
+  } catch {
+    // Quota exceeded / private mode. The level still holds for this session.
+  }
+});
+
+export function notifyLevelOf(
+  levels: Record<string, QuietLevel>,
+  channelId: string,
+): ChannelNotifyLevel {
+  return levels[channelId.toLowerCase()] ?? 'all';
+}
+
+export function setChannelNotifyLevel(channelId: string, level: ChannelNotifyLevel): void {
+  const id = channelId.toLowerCase();
+  if (!CHANNEL_ID_RE.test(id)) return;
+  channelNotifyLevels.update((levels) => {
+    if ((levels[id] ?? 'all') === level) return levels;
+    const { [id]: _previous, ...rest } = levels;
+    return level === 'all' ? rest : { ...rest, [id]: level };
+  });
+}
+
+/** Whether a received line may interrupt — toast or desktop notification. */
+export function channelMayAlert(level: ChannelNotifyLevel, mentionsMe: boolean): boolean {
+  return level === 'all' || (level === 'mentions' && mentionsMe);
+}
+
+/**
+ * How a room's unread pill is drawn.
+ *
+ * `loud` is the accent pill and counts toward the nav rail; `quiet` is the
+ * grey one and does not. A mentions-only room goes loud only while it holds a
+ * line that names you, which is the one thing its owner asked to hear about.
+ * "Nothing" stays quiet even then — it is a request for silence, not a filter.
+ */
+export function unreadBadgeTone(
+  level: ChannelNotifyLevel,
+  hasUnreadMention: boolean,
+): 'loud' | 'quiet' {
+  if (level === 'all') return 'loud';
+  return level === 'mentions' && hasUnreadMention ? 'loud' : 'quiet';
+}
+
+/**
+ * Rooms holding an unread line that names this user.
+ *
+ * Session only: the database counts unread but keeps no record of which of
+ * those lines were mentions, so after a restart a mentions-only room's
+ * backlog is drawn quiet until somebody names the user again.
+ */
+export const channelUnreadMentions = writable<string[]>([]);
+
+/** The same match `ChatConversation` highlights with: the name as a whole
+ *  word, case-insensitive, `@` optional. Compiled once per name. */
+let mentionCache: { name: string; pattern: RegExp | null } = { name: '', pattern: null };
+
+export function messageMentionsName(message: string, name: string): boolean {
+  const trimmed = name.trim();
+  if (!trimmed || !message) return false;
+  if (mentionCache.name !== trimmed) {
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let pattern: RegExp | null = null;
+    try {
+      pattern = new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)`, 'iu');
+    } catch {
+      pattern = null;
+    }
+    mentionCache = { name: trimmed, pattern };
+  }
+  return mentionCache.pattern?.test(message) ?? false;
+}
+
+function myChannelName(): string {
+  const settings = get(appSettings);
+  return settings?.channel_username || settings?.nickname || '';
+}
+
+/**
+ * Sidebar aggregate: the rooms whose pill is loud. A quiet room keeps its
+ * count on its own pill, because quiet means "later" rather than "never", but
+ * has no business putting a number on the nav rail.
  */
 export const totalChannelUnread = derived(
-  [channels, mutedChannels],
-  ([list, muted]) =>
+  [channels, channelNotifyLevels, channelUnreadMentions],
+  ([list, levels, mentioned]) =>
     list.reduce(
       (sum, channel) =>
-        !channel.in_room || channel.deleted || muted.includes(channel.channel_id)
+        !channel.in_room
+        || channel.deleted
+        || unreadBadgeTone(
+          notifyLevelOf(levels, channel.channel_id),
+          mentioned.includes(channel.channel_id),
+        ) === 'quiet'
           ? sum
           : sum + Math.max(0, channel.unread),
       0,
     ),
 );
+
+/**
+ * Joined rooms the user pinned to the top of "Your rooms".
+ *
+ * Local and per device like the levels above. Only rooms the user is in can
+ * be favourites, so leaving one drops it — `refreshChannels` prunes anything
+ * the database no longer has the user standing in.
+ */
+const FAVOURITES_KEY = 'ember.channels.favourites.v1';
+
+export function loadChannelFavourites(storage: StorageLike | null = browserStorage()): string[] {
+  if (!storage) return [];
+  try {
+    return parseChannelIds(storage.getItem(FAVOURITES_KEY));
+  } catch {
+    return [];
+  }
+}
+
+export const favouriteChannels = writable<string[]>(loadChannelFavourites());
+
+favouriteChannels.subscribe((ids) => {
+  const storage = browserStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(FAVOURITES_KEY, JSON.stringify(ids));
+  } catch {
+    // Quota exceeded / private mode. Holds for this session.
+  }
+});
+
+export function toggleChannelFavourite(channelId: string): void {
+  const id = channelId.toLowerCase();
+  if (!CHANNEL_ID_RE.test(id)) return;
+  favouriteChannels.update((ids) =>
+    ids.includes(id) ? ids.filter((existing) => existing !== id) : [...ids, id],
+  );
+}
+
+export function forgetChannelFavourite(channelId: string): void {
+  const id = channelId.toLowerCase();
+  favouriteChannels.update((ids) =>
+    ids.includes(id) ? ids.filter((existing) => existing !== id) : ids,
+  );
+}
 
 /**
  * Public rooms this device has taken off its list.
@@ -382,7 +574,7 @@ export function toggleMemberIgnoreInChannel(
 
 /** Drop a deleted room from every scoped entry, so the preference list cannot
  *  accumulate ids for rooms the user will never see again. An entry left with
- *  no rooms goes with it. Mirrors {@link forgetChannelMute}. */
+ *  no rooms goes with it. Mirrors {@link forgetChannelNotifyLevel}. */
 export function forgetChannelIgnores(channelId: string): void {
   const id = channelId.toLowerCase();
   ignoredMembers.update((list) => {
@@ -401,14 +593,12 @@ export function forgetChannelIgnores(channelId: string): void {
   });
 }
 
-/** Drop a room's mute. Used when the owner deletes it, so the preference
- *  list cannot accumulate ids for rooms the user will never see again.
- *  Leave keeps the row (and the mute) because the user can walk back in. */
-export function forgetChannelMute(channelId: string): void {
-  const id = channelId.toLowerCase();
-  mutedChannels.update((ids) =>
-    ids.includes(id) ? ids.filter((existing) => existing !== id) : ids,
-  );
+/** Drop a room's notification level. Used when the room is deleted or removed
+ *  from the list, so the preference cannot accumulate ids for rooms the user
+ *  will never see again. Leave keeps the row (and the level) because the user
+ *  can walk back in. */
+export function forgetChannelNotifyLevel(channelId: string): void {
+  setChannelNotifyLevel(channelId, 'all');
 }
 
 let initialized = false;
@@ -463,12 +653,31 @@ export function mergeChannelUnreadFromSnapshot(
  */
 export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
 
-/** How many incoming Ember Transfer offers are still waiting for a decision. */
+/** Whether an incoming offer may interrupt from this room. The toast and the
+ *  nav badge both ask, so a room set to "Nothing" or an ignored sender cannot
+ *  put a number on the rail that the toast was not allowed to announce. */
+function offerMayAlert(
+  levels: Record<string, QuietLevel>,
+  ignored: IgnoredMember[],
+  channelId: string,
+  peerPubkey?: string,
+): boolean {
+  // A file offer is addressed to this user alone, so a mentions-only room
+  // lets it through the way it would a line naming them.
+  if (notifyLevelOf(levels, channelId) === 'none') return false;
+  return !peerPubkey || !isMemberIgnored(ignored, peerPubkey, channelId);
+}
+
+/** How many incoming Ember Transfer offers are still waiting for a decision
+ *  and are allowed to say so. */
 export const awaitingChannelOffers = derived(
-  channelTransfers,
-  (xfers) =>
+  [channelTransfers, channelNotifyLevels, ignoredMembers],
+  ([xfers, levels, ignored]) =>
     Object.values(xfers).filter(
-      (xfer) => xfer.direction === 'receive' && xfer.status === 'awaiting',
+      (xfer) =>
+        xfer.direction === 'receive'
+        && xfer.status === 'awaiting'
+        && offerMayAlert(levels, ignored, xfer.channel_id, xfer.peer_pubkey),
     ).length,
 );
 
@@ -508,8 +717,7 @@ function toastXferOffer(channelId: string, peerPubkey?: string): void {
   if (isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId)) {
     return;
   }
-  if (get(mutedChannels).includes(channelId)) return;
-  if (peerPubkey && isMemberIgnored(get(ignoredMembers), peerPubkey, channelId)) return;
+  if (!offerMayAlert(get(channelNotifyLevels), get(ignoredMembers), channelId, peerPubkey)) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
   toast(
     room
@@ -534,6 +742,46 @@ export async function mergeChannelTransfers(): Promise<void> {
   }
 }
 
+/**
+ * Move a room's star and notification level onto the room it handed off to.
+ *
+ * Both are keyed by room id, and an ownership handoff carries the conversation
+ * to a new id — so the star was pruned once the user left the old room, and
+ * the level sat on an id nothing reads any more. Waits until the user is in
+ * the successor, because a star is only kept for rooms they stand in.
+ *
+ * Moved rather than copied. "All messages" is stored as no entry, so a level
+ * left behind on the old room would be carried again, on every refresh, over
+ * a successor the user had since turned back up to All. A level the successor
+ * already has was set there on purpose and wins.
+ */
+function carryPrefsToSuccessors(list: ChannelInfo[]): void {
+  const standingIn = new Set(
+    list.filter((channel) => channel.in_room && !channel.deleted).map((channel) => channel.channel_id),
+  );
+  const moves = list.flatMap((channel) => {
+    const next = channel.successor_id.toLowerCase();
+    return next && next !== channel.channel_id && standingIn.has(next)
+      ? [[channel.channel_id, next] as const]
+      : [];
+  });
+  if (moves.length === 0) return;
+  let favourites = get(favouriteChannels);
+  let levels = get(channelNotifyLevels);
+  for (const [from, to] of moves) {
+    if (favourites.includes(from)) {
+      favourites = favourites.filter((id) => id !== from);
+      if (!favourites.includes(to)) favourites = [...favourites, to];
+    }
+    if (from in levels) {
+      const { [from]: level, ...rest } = levels;
+      levels = to in rest ? rest : { ...rest, [to]: level };
+    }
+  }
+  if (favourites !== get(favouriteChannels)) favouriteChannels.set(favourites);
+  if (levels !== get(channelNotifyLevels)) channelNotifyLevels.set(levels);
+}
+
 export async function refreshChannels(): Promise<void> {
   const epoch = storeEpoch;
   const startRev = unreadRevision;
@@ -554,11 +802,29 @@ export async function refreshChannels(): Promise<void> {
   for (const [id, rev] of [...unreadDirty]) {
     if (rev <= startRev) unreadDirty.delete(id);
   }
+  carryPrefsToSuccessors(list);
   const keep = new Set(list.filter((channel) => !channel.deleted).map((channel) => channel.channel_id));
-  mutedChannels.update((ids) => {
-    const next = ids.filter((id) => keep.has(id));
-    return next.length === ids.length ? ids : next;
-  });
+  const levels = get(channelNotifyLevels);
+  if (Object.keys(levels).some((id) => !keep.has(id))) {
+    channelNotifyLevels.set(
+      Object.fromEntries(Object.entries(levels).filter(([id]) => keep.has(id))),
+    );
+  }
+  // Pruned against the snapshot rather than on each leave, so walking out by
+  // any route drops the star with it, and a leave that failed and rolled back
+  // keeps it.
+  const standingIn = new Set(
+    list.filter((channel) => channel.in_room && !channel.deleted).map((channel) => channel.channel_id),
+  );
+  const favourites = get(favouriteChannels);
+  if (favourites.some((id) => !standingIn.has(id))) {
+    favouriteChannels.set(favourites.filter((id) => standingIn.has(id)));
+  }
+  const unreadNow = new Map(get(channels).map((channel) => [channel.channel_id, channel.unread]));
+  const mentioned = get(channelUnreadMentions);
+  if (mentioned.some((id) => !standingIn.has(id) || !unreadNow.get(id))) {
+    channelUnreadMentions.set(mentioned.filter((id) => standingIn.has(id) && !!unreadNow.get(id)));
+  }
 }
 
 export function replaceChannel(updated: ChannelInfo): void {
@@ -603,6 +869,11 @@ export function setChannelMemberCount(channelId: string, count: number): void {
 }
 
 export function clearChannelUnread(channelId: string): void {
+  // Written only when there is something to drop, for the same reason as the
+  // same-array return below: this runs inside a component effect.
+  if (get(channelUnreadMentions).includes(channelId)) {
+    channelUnreadMentions.update((ids) => ids.filter((id) => id !== channelId));
+  }
   channels.update((list) => {
     // Hand back the same array when there is nothing to clear. Allocating a
     // fresh one regardless re-invalidated every `$channels` reader, and
@@ -650,13 +921,15 @@ function channelIsOnScreen(channelId: string): boolean {
   return visibleChannels.has(channelId.toLowerCase());
 }
 
-export function bumpChannelUnread(channelId: string): void {
+export function bumpChannelUnread(channelId: string, mentionsMe = false): void {
   if (isAppVisible() && channelIsOnScreen(channelId)) return;
   if (isAppVisible() && get(activeChannelId) === channelId) return;
+  let bumped = false;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
       return list;
     }
+    bumped = true;
     touchUnread(channelId);
     return list.map((channel) =>
       channel.channel_id === channelId
@@ -664,6 +937,15 @@ export function bumpChannelUnread(channelId: string): void {
         : channel,
     );
   });
+  if (bumped && mentionsMe) noteUnreadMention(channelId);
+}
+
+/** Flag a room's unread as including a mention, if it has unread to flag. */
+function noteUnreadMention(channelId: string): void {
+  if (get(channelUnreadMentions).includes(channelId)) return;
+  const row = get(channels).find((channel) => channel.channel_id === channelId);
+  if (!row || !row.in_room || row.deleted || row.unread <= 0) return;
+  channelUnreadMentions.update((ids) => [...ids, channelId]);
 }
 
 function validChannelId(raw: unknown): string | null {
@@ -676,7 +958,66 @@ function previewText(raw: unknown): string {
   return text.length > 80 ? `${text.slice(0, 77)}…` : text;
 }
 
-function maybeToastChannelMessage(channelId: string, message: string, senderPubkey?: string) {
+/** Whether a received line names this user, or replies to them, from someone
+ *  they have not hidden in that room — an ignored member cannot make a quiet
+ *  room loud. */
+function receivedMentionsMe(
+  channelId: string,
+  message: string,
+  senderPubkey?: string,
+  replyToMe = false,
+): boolean {
+  if (senderPubkey && isMemberIgnored(get(ignoredMembers), senderPubkey, channelId)) return false;
+  return replyToMe || messageMentionsName(message, myChannelName());
+}
+
+/**
+ * Whether a received line may interrupt now, recording it if so.
+ *
+ * Ordinary lines share one slot per room. A line addressed to the user is let
+ * through the ordinary gap — that is the one it must not swallow — but still
+ * waits out a short per-room gap and a full-length one per sender, so a member
+ * cannot turn replies into a toast flood. Either kind restarts the ordinary
+ * gap, so chatter straight after a mention does not toast on top of it.
+ */
+export function claimChannelToastSlot(
+  channelId: string,
+  senderPubkey: string | undefined,
+  mentionsMe: boolean,
+  now = Date.now(),
+): boolean {
+  if (mentionsMe) {
+    const fromKey = `${channelId}:${(senderPubkey ?? '').toLowerCase()}`;
+    if (now - (lastMentionToastAt.get(channelId) ?? -Infinity) < MENTION_TOAST_GAP_MS) return false;
+    if (now - (lastMentionToastFrom.get(fromKey) ?? -Infinity) < TOAST_GAP_MS) return false;
+    lastMentionToastAt.set(channelId, now);
+    lastMentionToastFrom.set(fromKey, now);
+  } else if (now - (lastToastAt.get(channelId) ?? -Infinity) < TOAST_GAP_MS) {
+    return false;
+  }
+  lastToastAt.set(channelId, now);
+  return true;
+}
+
+/** Whether a received line, stamped `sentAtSecs` (the author's signed send
+ *  time, Unix seconds), is too old to interrupt for. A missing or malformed
+ *  stamp is treated as live, as every line was before the check existed. */
+export function channelLineIsStale(sentAtSecs: unknown, now = Date.now()): boolean {
+  if (typeof sentAtSecs !== 'number' || !Number.isFinite(sentAtSecs)) return false;
+  return now - sentAtSecs * 1000 > LIVE_LINE_MAX_AGE_MS;
+}
+
+function maybeToastChannelMessage(
+  channelId: string,
+  message: string,
+  senderPubkey?: string,
+  mentionsMe = false,
+  sentAtSecs?: number,
+) {
+  // Ahead of the pacing slot, so a burst of history does not use it up and
+  // swallow the first live line after it. Unread and mention flags have
+  // already moved by now; only the interruption is skipped.
+  if (channelLineIsStale(sentAtSecs)) return;
   // Whether the user already has this room on screen. No longer an early
   // return: it still suppresses the in-app toast, but it used to suppress the
   // desktop notification with it, and `isAppVisible` answers this far too
@@ -685,17 +1026,14 @@ function maybeToastChannelMessage(channelId: string, message: string, senderPubk
   // applies its own visible-*and*-focused test.
   const roomOnScreen =
     isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId);
-  if (get(mutedChannels).includes(channelId)) return;
+  if (!channelMayAlert(notifyLevelOf(get(channelNotifyLevels), channelId), mentionsMe)) return;
   // Ignoring somebody is presentational, and a toast quoting them is the least
   // ignorable presentation there is: it interrupts whatever page the user is on
   // with the text they asked not to see. The unread count still moves, which is
   // the documented half of the bargain. Scoped per room, so someone hidden in
   // one room can still interrupt from another — which is the point of scoping.
   if (senderPubkey && isMemberIgnored(get(ignoredMembers), senderPubkey, channelId)) return;
-  const now = Date.now();
-  const prev = lastToastAt.get(channelId) ?? 0;
-  if (now - prev < TOAST_GAP_MS) return;
-  lastToastAt.set(channelId, now);
+  if (!claimChannelToastSlot(channelId, senderPubkey, mentionsMe)) return;
   const row = get(channels).find((channel) => channel.channel_id === channelId);
   if (row && (!row.in_room || row.deleted)) return;
   const name = row?.name ?? m.nav_channels();
@@ -723,12 +1061,16 @@ export async function initChannelsStore() {
         direction?: string;
         message?: string;
         sender_pubkey?: string;
+        reply_to_me?: boolean;
+        /** The author's signed send time, Unix seconds. */
+        timestamp?: number;
       }>('ember:channel-message', (event) => {
         const channelId = validChannelId(event.payload?.channel_id);
         if (!channelId) return;
         if (event.payload.direction && event.payload.direction !== 'received') {
           return;
         }
+        const sentAt = event.payload.timestamp;
         if (!get(channels).some((channel) => channel.channel_id === channelId)) {
           // No bump afterwards. The row is missing because this is the first
           // line from a room that only just appeared, and the count the fetch
@@ -741,17 +1083,26 @@ export async function initChannelsStore() {
           // least idea which room just spoke.
           const message = event.payload.message ?? '';
           const sender = event.payload.sender_pubkey;
+          const replyToMe = event.payload.reply_to_me === true;
           refreshChannels()
             .catch(() => {})
-            .then(() => maybeToastChannelMessage(channelId, message, sender));
+            .then(() => {
+              const mentionsMe = receivedMentionsMe(channelId, message, sender, replyToMe);
+              if (mentionsMe) noteUnreadMention(channelId);
+              maybeToastChannelMessage(channelId, message, sender, mentionsMe, sentAt);
+            });
           return;
         }
-        bumpChannelUnread(channelId);
-        maybeToastChannelMessage(
+        const message = event.payload.message ?? '';
+        const sender = event.payload.sender_pubkey;
+        const mentionsMe = receivedMentionsMe(
           channelId,
-          event.payload.message ?? '',
-          event.payload.sender_pubkey,
+          message,
+          sender,
+          event.payload.reply_to_me === true,
         );
+        bumpChannelUnread(channelId, mentionsMe);
+        maybeToastChannelMessage(channelId, message, sender, mentionsMe, sentAt);
       }),
     );
     // The Channels page registers a handoff listener too, and when it is mounted
@@ -841,6 +1192,8 @@ export function cleanupChannelsStore() {
   unreadDirty.clear();
   visibleChannels.clear();
   lastToastAt.clear();
+  lastMentionToastAt.clear();
+  lastMentionToastFrom.clear();
   lastOpenedChannelId = null;
   // Cleared with the room it refers to. Left standing, the next visit read as
   // "the user had something open, leave their selection alone" while the room
@@ -850,6 +1203,7 @@ export function cleanupChannelsStore() {
   for (const timer of xferClearTimers.values()) clearTimeout(timer);
   xferClearTimers.clear();
   channelTransfers.set({});
+  channelUnreadMentions.set([]);
   channels.set([]);
   activeChannelId.set(null);
 }

@@ -41,6 +41,7 @@ const OP_CHANNEL_DELETE_V4: u8 = 0x28;
 const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
 const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 const OP_CHANNEL_NAME_DISPLAY_V4: u8 = 0x2b;
+const OP_CHANNEL_RENAME_V4: u8 = 0x2c;
 const SIGNED_IP_V4: u8 = 4;
 const SIGNED_IP_V6: u8 = 6;
 
@@ -2801,11 +2802,17 @@ pub(crate) enum ChannelRegistryError {
     Taken,
     Forbidden,
     Invalid,
+    /// The room was renamed within the registry's rename interval.
+    TooSoon,
+    /// The server predates the operation (no such route).
+    Unsupported,
 }
 
 fn map_registry_status(status: reqwest::StatusCode) -> ChannelRegistryError {
     if status == reqwest::StatusCode::CONFLICT {
         ChannelRegistryError::Taken
+    } else if status == reqwest::StatusCode::TOO_EARLY {
+        ChannelRegistryError::TooSoon
     } else if status == reqwest::StatusCode::FORBIDDEN {
         ChannelRegistryError::Forbidden
     } else if status == reqwest::StatusCode::BAD_REQUEST {
@@ -2823,6 +2830,14 @@ fn build_channel_username_v4_msg(pubkey: &[u8; 32], name: &str, ts: i64) -> Vec<
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(&ts.to_le_bytes());
     message
+}
+
+/// The key the registry files a channel name under: its
+/// `normalize_channel_name`, which is [`strip_invisible`] then a full Unicode
+/// lowercase. Two names with the same key are one name there, so a change
+/// between them is a re-casing rather than a rename.
+pub(crate) fn channel_name_registry_key(name: &str) -> String {
+    strip_invisible(name).to_lowercase()
 }
 
 /// Mirror of the rendezvous server's `strip_invisible`, so the display string
@@ -2905,6 +2920,32 @@ fn build_channel_name_legacy_v4_msg(
     message.extend_from_slice(channel_id);
     message.extend_from_slice(pubkey);
     message.extend_from_slice(name.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// A rename: the display-committing claim's layout under its own opcode, so a
+/// claim — which the owner loop re-sends on a timer — can never be read as one.
+fn build_channel_rename_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    normalized: &str,
+    display: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 4 + normalized.len() + 4 + display.len() + 1 + 8,
+    );
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_RENAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
+    message.extend_from_slice(normalized.as_bytes());
+    message.extend_from_slice(&(display.len() as u32).to_le_bytes());
+    message.extend_from_slice(display.as_bytes());
     message.push(u8::from(private));
     message.extend_from_slice(&ts.to_le_bytes());
     message
@@ -3101,7 +3142,7 @@ pub(crate) async fn claim_channel_name(
     // under, and the display string it will publish. Signing only the former
     // left the published bytes uncovered by any signature.
     let display = strip_invisible(name);
-    let signed_name = display.to_lowercase();
+    let signed_name = channel_name_registry_key(name);
     let key = signing_key_from_secret(secret);
 
     let post = |signed: Vec<u8>| {
@@ -3162,6 +3203,68 @@ pub(crate) async fn claim_channel_name(
         return Err(map_registry_status(legacy.status()));
     }
     Err(map_registry_status(resp.status()))
+}
+
+/// Rename a room's registry name with the **channel** key.
+///
+/// A claim for a different name is refused outright, so this is the only way
+/// a room's name changes. Asking for the name the room already holds is a
+/// refresh there, which makes a retry after a lost answer safe.
+pub(crate) async fn rename_channel_name(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    name: &str,
+    private: bool,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let display = strip_invisible(name);
+    let signed = build_channel_rename_v4_msg(
+        channel_id,
+        pubkey,
+        &channel_name_registry_key(name),
+        &display,
+        private,
+        ts,
+    );
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/rename",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "name": name,
+            "private": private,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let status = resp.status();
+    let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(map_rename_status(status))
+}
+
+/// A server that predates `/v4/channels/rename` has no such route: axum
+/// answers 404, or 405 behind a proxy that matches the path prefix.
+fn map_rename_status(status: reqwest::StatusCode) -> ChannelRegistryError {
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        ChannelRegistryError::Unsupported
+    } else {
+        map_registry_status(status)
+    }
 }
 
 /// Tombstone a room. Signed with the **channel** key so the server cannot
@@ -3446,6 +3549,29 @@ mod relay_ticket_tests {
         assert_eq!(strip_invisible("ロビー"), "ロビー");
     }
 
+    /// The server lowercases the whole of Unicode, not just ASCII, so names
+    /// differing only in non-ASCII case are one registry name.
+    #[test]
+    fn the_registry_key_folds_case_like_the_server() {
+        assert_eq!(channel_name_registry_key(" Ca\u{200B}FÉ "), "café");
+        assert_eq!(channel_name_registry_key("ΛΌΜΠΙ"), channel_name_registry_key("λόμπι"));
+        assert_ne!(channel_name_registry_key("Lobby"), channel_name_registry_key("Lοbby"));
+    }
+
+    #[test]
+    fn a_missing_rename_route_reads_as_an_old_server() {
+        assert_eq!(
+            map_rename_status(reqwest::StatusCode::NOT_FOUND),
+            ChannelRegistryError::Unsupported
+        );
+        assert_eq!(
+            map_rename_status(reqwest::StatusCode::METHOD_NOT_ALLOWED),
+            ChannelRegistryError::Unsupported
+        );
+        assert_eq!(map_rename_status(reqwest::StatusCode::TOO_EARLY), ChannelRegistryError::TooSoon);
+        assert_eq!(map_rename_status(reqwest::StatusCode::CONFLICT), ChannelRegistryError::Taken);
+    }
+
     #[test]
     fn current_privacy_operation_codes_are_stable() {
         assert_eq!(OP_RELAY_TICKET_ACCEPT, 0x09);
@@ -3463,6 +3589,7 @@ mod relay_ticket_tests {
         assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
         assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
         assert_eq!(OP_CHANNEL_NAME_DISPLAY_V4, 0x2b);
+        assert_eq!(OP_CHANNEL_RENAME_V4, 0x2c);
     }
 
     #[test]

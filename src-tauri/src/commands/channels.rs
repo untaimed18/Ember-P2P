@@ -16,19 +16,26 @@ use crate::network::ember::channel::{
 };
 use crate::network::ember::dht::publish::{
     ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
-    CHANNEL_WELCOME_MAX,
+    CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
 };
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
-use crate::storage::database::{ChannelEditOutcome, StoredChannel, StoredChannelMember};
+use crate::storage::database::{
+    ChannelEditOutcome, ChannelReplyLookup, ChannelReplyParent, Database, StoredChannel,
+    StoredChannelMember,
+};
 use tauri_plugin_dialog::DialogExt;
 
-/// Room names are bounded by what a directory row can show rather than by what
-/// the record could carry: twenty characters fit the list at every width the
-/// page uses, so a name reaches other members intact instead of ellipsised.
-/// Counted in characters, not bytes — a byte cap of this size would leave a
-/// CJK name six characters to work with.
-const MAX_CHANNEL_NAME_CHARS: usize = 20;
+/// Room names are bounded in characters, not only by the record's bytes: a
+/// byte cap alone would give an English name 64 characters and a CJK one 21.
+/// Thirty-two is as far as the characters can go before [`MAX_CHANNEL_NAME`]
+/// is what decides for most scripts anyway; the list shows some 26 whole and
+/// ellipsises the rest.
+///
+/// Builds from before this was raised trim a longer name to their own twenty
+/// characters when it arrives (see [`discovered_room_name`] and the invite
+/// path), so a long name reads cut short there rather than failing to join.
+const MAX_CHANNEL_NAME_CHARS: usize = 32;
 
 /// Rooms one device may own at once, counting every room it has created and
 /// not deleted.
@@ -66,7 +73,10 @@ pub(crate) const SLOW_MODE_CHOICES: [u16; 6] = [0, 5, 10, 30, 60, 300];
 const LOCAL_SEND_PER_MINUTE: usize = 20;
 
 /// Byte ceiling the published record imposes whatever the character count
-/// says. Twenty astral emoji satisfy the character cap and still overrun this.
+/// says, and the one Rendezvous reserves names under. Twenty-two CJK
+/// characters satisfy the character cap and still overrun this. Not raised
+/// with the character cap: an invite carrying a longer name is one older
+/// builds refuse to parse.
 const MAX_CHANNEL_NAME: usize = 64;
 const MAX_CHANNEL_MESSAGE: usize = 4096;
 const DEFAULT_FIND_TIMEOUT_MS: u64 = 30_000;
@@ -93,7 +103,11 @@ pub struct ChannelInfo {
     pub welcome: String,
     pub joined_at: i64,
     pub last_active: i64,
+    /// Members seen inside the presence window, including us.
     pub member_count: i64,
+    /// Everyone on this device's roster for the room, present or not; see
+    /// `StoredChannel::roster_count`. Stable enough to rank rooms by.
+    pub roster_count: i64,
     pub unread: i64,
     pub you_are_banned: bool,
     pub you_are_moderator: bool,
@@ -124,6 +138,10 @@ pub struct ChannelInfo {
     pub invites_owner_only: bool,
     /// Seconds a member must wait between messages; 0 when slow mode is off.
     pub slow_mode_secs: i64,
+    /// Only the owner and moderators may post.
+    pub announce_only: bool,
+    /// Hex wire ids of the owner's pinned messages, oldest pin first.
+    pub pinned_msg_ids: Vec<String>,
 }
 
 impl ChannelInfo {
@@ -141,6 +159,7 @@ impl ChannelInfo {
             joined_at: row.joined_at,
             last_active: row.last_active,
             member_count: row.member_count,
+            roster_count: row.roster_count,
             unread: row.unread,
             you_are_banned,
             you_are_moderator,
@@ -156,6 +175,8 @@ impl ChannelInfo {
             deleted: row.deleted,
             invites_owner_only: row.invites_owner_only,
             slow_mode_secs: row.slow_mode_secs,
+            announce_only: row.announce_only,
+            pinned_msg_ids: row.pinned_msg_ids,
         }
     }
 
@@ -241,6 +262,18 @@ pub struct ChannelMessageInfo {
     /// Received lines are always delivered. A sent line is queued until the
     /// flood reaches somebody, and failed once the retry gives up.
     pub delivery: String,
+    /// Wire id of the line this one replies to, or `None` for a plain line.
+    /// Signed by the author as part of the text (see
+    /// [`channel::with_reply_trailer`]); `message` is the body without it.
+    pub reply_to: Option<String>,
+    /// The parent was written by this device's identity, so the reply is
+    /// addressed to us the way a mention is. False whenever the parent is not
+    /// held here, since nothing else says who wrote it.
+    pub reply_to_me: bool,
+    /// The parent as this device holds it, for drawing the quote.
+    pub reply_parent: Option<ChannelReplyParent>,
+    /// The parent was removed from this device rather than never received.
+    pub reply_parent_deleted: bool,
 }
 
 /// The stored `delivery` integer as the UI names it.
@@ -248,8 +281,13 @@ fn channel_delivery_label(delivery: i64) -> String {
     crate::storage::database::Database::delivery_label(delivery).to_string()
 }
 
-impl From<crate::storage::database::ChannelMessageRow> for ChannelMessageInfo {
-    fn from(row: crate::storage::database::ChannelMessageRow) -> Self {
+/// Whether a reply's parent was written by `mine`, our own identity in hex.
+fn reply_parent_is_mine(parent: Option<&ChannelReplyParent>, mine: &str) -> bool {
+    parent.is_some_and(|parent| parent.sender_pubkey.eq_ignore_ascii_case(mine))
+}
+
+impl ChannelMessageInfo {
+    fn from_row(row: crate::storage::database::ChannelMessageRow, mine: &str) -> Self {
         Self {
             id: row.id,
             sender_pubkey: row.sender_pubkey,
@@ -260,20 +298,39 @@ impl From<crate::storage::database::ChannelMessageRow> for ChannelMessageInfo {
             edited_at: row.edited_at,
             msg_id: row.msg_id,
             delivery: channel_delivery_label(row.delivery),
+            reply_to_me: reply_parent_is_mine(row.reply_parent.as_ref(), mine),
+            reply_to: row.reply_to,
+            reply_parent: row.reply_parent,
+            reply_parent_deleted: row.reply_parent_deleted,
         }
     }
 }
 
 /// Reaction tally for one line, as the UI draws it.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
 pub struct ChannelReactionInfo {
     pub msg_id: String,
-    pub up: u32,
-    pub down: u32,
-    pub heart: u32,
+    /// One entry per curated reaction somebody holds, in code order so chips do
+    /// not trade places as counts change.
+    pub reactions: Vec<ChannelReactionTally>,
     /// This device's own reaction, so the button can show as pressed. 0 is none.
     pub mine: u8,
 }
+
+/// How many members hold one reaction on one line, and a few of who they are.
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ChannelReactionTally {
+    pub reaction: u8,
+    pub count: u32,
+    /// Member keys, this device's first when it is among them and the rest in
+    /// the order they reacted. Capped at [`REACTION_MEMBERS_SHOWN`]: the label
+    /// names a handful and says "and N others" for the remainder, and a busy
+    /// room should not ship its whole roster per chip on every refresh.
+    pub members: Vec<String>,
+}
+
+/// Member keys carried per chip. More than any label names.
+const REACTION_MEMBERS_SHOWN: usize = 8;
 
 #[derive(serde::Serialize)]
 pub struct ChannelInviteInfo {
@@ -381,6 +438,14 @@ fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, taken: &
         crate::network::rendezvous::ChannelRegistryError::Unavailable => coded(
             "channels_registry_unavailable",
             "The name registry is unreachable; try again when online",
+        ),
+        crate::network::rendezvous::ChannelRegistryError::TooSoon => coded(
+            "channels_rename_too_soon",
+            "A room can be renamed once a day",
+        ),
+        crate::network::rendezvous::ChannelRegistryError::Unsupported => coded(
+            "channels_rename_unsupported",
+            "Renaming rooms isn't available on this server yet",
         ),
     }
 }
@@ -1562,7 +1627,11 @@ pub async fn get_channel_messages(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_messages_failed", "Failed to load messages", e))?;
-    Ok(rows.into_iter().map(ChannelMessageInfo::from).collect())
+    let mine = hex::encode(state.identity.ed25519_public_key);
+    Ok(rows
+        .into_iter()
+        .map(|row| ChannelMessageInfo::from_row(row, &mine))
+        .collect())
 }
 
 /// Substring search over one room's stored history. Local only — nothing is
@@ -1588,7 +1657,11 @@ pub async fn search_channel_messages(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_messages_failed", "Failed to search messages", e))?;
-    Ok(rows.into_iter().map(ChannelMessageInfo::from).collect())
+    let mine = hex::encode(state.identity.ed25519_public_key);
+    Ok(rows
+        .into_iter()
+        .map(|row| ChannelMessageInfo::from_row(row, &mine))
+        .collect())
 }
 
 /// Revise one of your own lines, within [`channel::CHANNEL_EDIT_WINDOW_SECS`].
@@ -1611,7 +1684,10 @@ pub async fn edit_channel_message(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let channel_id_bytes = channel_id_bytes(&channel_id)?;
-    let cleaned = crate::security::sanitize_chat_text(&message);
+    let sanitized = crate::security::sanitize_chat_text(&message);
+    // The reply reference is re-attached below from the stored line, never taken
+    // from what was typed.
+    let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
     if cleaned.is_empty() || cleaned.len() > MAX_CHANNEL_MESSAGE {
         return Err(coded(
             "channels_message_size_invalid",
@@ -1676,6 +1752,22 @@ pub async fn edit_channel_message(
             )
         })?;
     let msg_id_bytes = parse_msg_id(&target.msg_id)?;
+    // A revision of a reply is still a reply. The edit frame can stand in for
+    // the original on a catch-up, so it has to carry the same signed reference
+    // or a member who only ever receives the revision loses the quote — and
+    // receivers keep the original's `reply_to` regardless, so dropping it here
+    // would only make this device disagree with everyone else.
+    let reply_parent = target
+        .reply_to
+        .as_deref()
+        .and_then(|parent| <[u8; 16]>::try_from(hex::decode(parent).ok()?).ok());
+    let wire_text = channel::with_reply_trailer(&cleaned, reply_parent.as_ref());
+    if wire_text.len() > MAX_CHANNEL_MESSAGE {
+        return Err(coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        ));
+    }
     let edit_sig = channel::edit_author_signature(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
         &sender_pk,
@@ -1683,7 +1775,7 @@ pub async fn edit_channel_message(
         &msg_id_bytes,
         target.timestamp,
         edited_at,
-        &cleaned,
+        &wire_text,
     );
 
     // The queue slot is claimed before the row is written, because the write
@@ -1700,7 +1792,7 @@ pub async fn edit_channel_message(
     let id_for_edit = channel_id.clone();
     let msg_id_for_edit = target.msg_id.clone();
     let sender_for_edit = sender.clone();
-    let text_for_edit = cleaned.clone();
+    let text_for_edit = wire_text.clone();
     let sig_hex = hex::encode(edit_sig);
     let original_ts = target.timestamp;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1762,7 +1854,7 @@ pub async fn edit_channel_message(
         target.timestamp,
         edited_at,
         &edit_sig,
-        &cleaned,
+        &wire_text,
     );
     let mut envelope_id = [0u8; 16];
     OsRng.fill_bytes(&mut envelope_id);
@@ -1792,8 +1884,10 @@ pub async fn edit_channel_message(
         }),
     );
 
+    let reply = reply_lookup_for(&state, &channel_id, target.reply_to.as_deref()).await;
     Ok(ChannelMessageInfo {
         id: message_id,
+        reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: target.direction,
         message: cleaned,
@@ -1806,16 +1900,44 @@ pub async fn edit_channel_message(
         // original already answered.
         delivery: channel_delivery_label(crate::storage::database::CHAT_DELIVERED),
         msg_id: target.msg_id,
+        reply_to: target.reply_to,
+        reply_parent: reply.parent,
+        reply_parent_deleted: reply.deleted,
     })
+}
+
+/// The quote for a line this device has just written, or nothing.
+///
+/// Best-effort: the line itself is already stored and sent by the time this
+/// runs, so a failed read costs the returned bubble its quote until the room
+/// is next read from disk, and is not worth failing the command over.
+async fn reply_lookup_for(
+    state: &AppState,
+    channel_id: &str,
+    reply_to: Option<&str>,
+) -> ChannelReplyLookup {
+    let Some(parent) = reply_to else {
+        return ChannelReplyLookup::default();
+    };
+    let db = state.db.clone();
+    let channel_id = channel_id.to_string();
+    let parent = parent.to_string();
+    tokio::task::spawn_blocking(move || db.channel_reply_lookup(&channel_id, &parent))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
 }
 
 /// Set or clear this device's reaction to one line.
 ///
-/// `reaction` is [`channel::REACTION_NONE`] to take a reaction back,
-/// [`channel::REACTION_UP`], [`channel::REACTION_DOWN`], or
-/// [`channel::REACTION_HEART`]. Clearing is stored rather than deleted, because
-/// the row carries the timestamp that stops a stale frame reasserting what was
-/// withdrawn.
+/// `reaction` is [`channel::REACTION_NONE`] to take a reaction back, or one of
+/// the curated codes up to [`channel::REACTION_CURATED_MAX`]. A member holds one
+/// reaction per line and picking another replaces it — the row is keyed that
+/// way on every build since reactions shipped, so a second concurrent reaction
+/// would silently displace the first on any v1.6.x peer and in what it
+/// re-serves. Clearing is stored rather than deleted, because the row carries
+/// the timestamp that stops a stale frame reasserting what was withdrawn.
 #[tauri::command]
 pub async fn set_channel_message_reaction(
     state: tauri::State<'_, AppState>,
@@ -1826,7 +1948,10 @@ pub async fn set_channel_message_reaction(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let channel_id_bytes = channel_id_bytes(&channel_id)?;
-    if reaction > channel::REACTION_HEART {
+    // Only codes this build draws. Anything past them is stored when a newer
+    // build sends it, but minting one here would put a reaction on the wire
+    // that nobody running this version can see or take back from the UI.
+    if reaction > channel::REACTION_CURATED_MAX {
         return Err(coded(
             "channels_reaction_invalid",
             "Unsupported reaction",
@@ -1929,6 +2054,26 @@ pub async fn set_channel_message_reaction(
     Ok(())
 }
 
+/// Tell the room we are (or have stopped) composing.
+///
+/// Best effort from end to end. Every check that matters — joined, not banned,
+/// chat unlocked, room small enough — runs on the network task against its
+/// cached view, so this costs no database read per keystroke; and a full
+/// command queue drops the signal rather than waiting, since the next
+/// keystroke sends a fresh one and a late one would be wrong.
+#[tauri::command]
+pub async fn send_channel_typing(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    typing: bool,
+) -> Result<(), String> {
+    let channel_id = channel_id_bytes(&parse_channel_id(&channel_id)?)?;
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::SendChannelTyping { channel_id, typing });
+    Ok(())
+}
+
 /// Every live reaction tally in a room, so the UI can draw counts in one read
 /// rather than a query per bubble.
 #[tauri::command]
@@ -1943,31 +2088,57 @@ pub async fn get_channel_reactions(
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load reactions", e))?;
-    let mut tallies: std::collections::HashMap<String, ChannelReactionInfo> =
-        std::collections::HashMap::new();
+    Ok(tally_channel_reactions(rows, &mine))
+}
+
+/// Fold a room's live reaction rows into one tally per line.
+///
+/// `rows` are `(msg_id, member, reaction)` in the order members reacted, which
+/// is the order names are listed in. A code past the curated set belongs to a
+/// newer build: it is counted nowhere rather than lumped in with a mark it is
+/// not, and a line holding only such reactions gets no tally at all, so it draws
+/// exactly as it would with none.
+fn tally_channel_reactions(rows: Vec<(String, String, u8)>, mine: &str) -> Vec<ChannelReactionInfo> {
+    use std::collections::BTreeMap;
+    // Per line, per code: (count, members). BTreeMaps give code order within a
+    // line and a stable line order for callers that compare results.
+    let mut lines: BTreeMap<String, (u8, BTreeMap<u8, (u32, Vec<String>)>)> = BTreeMap::new();
     for (msg_id, member, reaction) in rows {
-        let entry = tallies
-            .entry(msg_id.clone())
-            .or_insert_with(|| ChannelReactionInfo {
-                msg_id,
-                up: 0,
-                down: 0,
-                heart: 0,
-                mine: channel::REACTION_NONE,
-            });
-        match reaction {
-            channel::REACTION_UP => entry.up = entry.up.saturating_add(1),
-            channel::REACTION_DOWN => entry.down = entry.down.saturating_add(1),
-            channel::REACTION_HEART => entry.heart = entry.heart.saturating_add(1),
-            // A reaction a newer build drew and this one does not. Counted
-            // nowhere rather than lumped in with a mark it is not.
-            _ => {}
+        let line = lines
+            .entry(msg_id)
+            .or_insert_with(|| (channel::REACTION_NONE, BTreeMap::new()));
+        let is_mine = member.eq_ignore_ascii_case(mine);
+        if is_mine {
+            line.0 = reaction;
         }
-        if member.eq_ignore_ascii_case(&mine) {
-            entry.mine = reaction;
+        if !channel::reaction_is_curated(reaction) {
+            continue;
+        }
+        let (count, members) = line.1.entry(reaction).or_insert_with(|| (0, Vec::new()));
+        *count = count.saturating_add(1);
+        if is_mine {
+            members.insert(0, member);
+            members.truncate(REACTION_MEMBERS_SHOWN);
+        } else if members.len() < REACTION_MEMBERS_SHOWN {
+            members.push(member);
         }
     }
-    Ok(tallies.into_values().collect())
+    lines
+        .into_iter()
+        .filter(|(_, (_, codes))| !codes.is_empty())
+        .map(|(msg_id, (mine, codes))| ChannelReactionInfo {
+            msg_id,
+            reactions: codes
+                .into_iter()
+                .map(|(reaction, (count, members))| ChannelReactionTally {
+                    reaction,
+                    count,
+                    members,
+                })
+                .collect(),
+            mine,
+        })
+        .collect()
 }
 
 /// Remove one message from this device. Deliberately does not propagate: the
@@ -1994,11 +2165,19 @@ pub async fn delete_channel_message(
     Ok(())
 }
 
+/// Send a line to a room, optionally as a reply to one already in it.
+///
+/// `reply_to` is the parent's wire id. It must name a line this device holds
+/// in this room: the reference is signed into the text and every member will
+/// show it, so it is checked against something real rather than passed through
+/// — and a line the sender cannot see is not one they can meaningfully answer.
+/// Receivers are not held to this, since a reply can outrun its parent.
 #[tauri::command]
 pub async fn send_channel_message(
     state: tauri::State<'_, AppState>,
     channel_id: String,
     message: String,
+    reply_to: Option<String>,
 ) -> Result<ChannelMessageInfo, String> {
     require_ember(&state).await?;
     if state.db.chat_locked() {
@@ -2007,8 +2186,27 @@ pub async fn send_channel_message(
             "Chat history is locked; restore the key file to send",
         ));
     }
-    let cleaned = crate::security::sanitize_chat_text(&message);
-    if cleaned.is_empty() || cleaned.len() > MAX_CHANNEL_MESSAGE {
+    let sanitized = crate::security::sanitize_chat_text(&message);
+    // A trailer pasted in with copied text would otherwise make this a reply to
+    // whatever the copied line answered.
+    let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
+    let reply_parent = match reply_to.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(parent) => {
+            let mut id = [0u8; 16];
+            hex::decode_to_slice(parent, &mut id).map_err(|_| {
+                coded(
+                    "channels_reply_target_invalid",
+                    "The message you are replying to is not in this room",
+                )
+            })?;
+            Some(id)
+        }
+    };
+    let wire_text = channel::with_reply_trailer(&cleaned, reply_parent.as_ref());
+    // The cap is on what goes on the wire, which a reply's trailer is part of:
+    // every receiver, old builds included, refuses a line over 4096 bytes.
+    if cleaned.is_empty() || wire_text.len() > MAX_CHANNEL_MESSAGE {
         return Err(coded(
             "channels_message_size_invalid",
             "Message must be between 1 and 4096 bytes",
@@ -2047,6 +2245,22 @@ pub async fn send_channel_message(
             "New messages are locked until this device has the current room key",
         ));
     }
+    // Before slow mode: in a room nobody but its staff may post in, a wait is
+    // not the reason this line cannot go out.
+    let refuses = {
+        let db = state.db.clone();
+        let row = row.clone();
+        let our = sender.clone();
+        tokio::task::spawn_blocking(move || announce_only_refuses(&db, &row, &our))
+            .await
+            .unwrap_or(true)
+    };
+    if refuses {
+        return Err(coded(
+            "channels_announce_only",
+            "Only the owner and moderators can post in this room",
+        ));
+    }
     // The room's own rule, set by its owner and carried on the signed
     // moderation record. Whoever runs the room is exempt: they are the ones
     // answering questions and posting the notice that made it necessary.
@@ -2081,6 +2295,17 @@ pub async fn send_channel_message(
             ));
         }
     }
+    // Ahead of the rate budget below, like every other refusal. Looked up by
+    // this room's id, so a line from another room — even one this device holds
+    // — is refused too.
+    let reply_to_hex = reply_parent.map(hex::encode);
+    let reply = reply_lookup_for(&state, &channel_id, reply_to_hex.as_deref()).await;
+    if reply_to_hex.is_some() && reply.parent.is_none() {
+        return Err(coded(
+            "channels_reply_target_invalid",
+            "The message you are replying to is not in this room",
+        ));
+    }
     // Our own ceiling, which no room turns off. Checked last so a message
     // refused for any reason above does not spend budget.
     if !local_send_allowed(&channel_id) {
@@ -2105,10 +2330,10 @@ pub async fn send_channel_message(
         &channel_id_bytes,
         &msg_id,
         sent_at,
-        &cleaned,
+        &wire_text,
     );
     let key = channel::content_key(&join_secret);
-    let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &cleaned);
+    let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &wire_text);
     let gossip = channel::ChannelGossip::sealed(
         channel_id_bytes,
         msg_id,
@@ -2127,7 +2352,8 @@ pub async fn send_channel_message(
     let db = state.db.clone();
     let id = channel_id.clone();
     let sender2 = sender.clone();
-    let text = cleaned.clone();
+    // Stored as signed, trailer and all, so a catch-up re-serves the same bytes.
+    let text = wire_text.clone();
     let msg_id_hex = hex::encode(msg_id);
     let author_sig_hex = hex::encode(author_sig);
     let row_id = tokio::task::spawn_blocking(move || {
@@ -2195,6 +2421,7 @@ pub async fn send_channel_message(
 
     Ok(ChannelMessageInfo {
         id: row_id,
+        reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: "sent".into(),
         message: cleaned,
@@ -2203,6 +2430,9 @@ pub async fn send_channel_message(
         edited_at: 0,
         msg_id: hex::encode(msg_id),
         delivery: channel_delivery_label(crate::storage::database::CHAT_QUEUED),
+        reply_to: reply_to_hex,
+        reply_parent: reply.parent,
+        reply_parent_deleted: reply.deleted,
     })
 }
 
@@ -2353,7 +2583,27 @@ async fn commit_channel_moderation(
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
-    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    commit_channel_moderation_with(state, owned, topic, welcome, bans, mods, PinFit::Shed).await
+}
+
+/// What a commit does with pins the record has no room for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinFit {
+    /// Drop the oldest. Every edit but a pin: a ban or a welcome must never be
+    /// refused because of a pin, which is the least of what the snapshot holds.
+    Shed,
+    /// Refuse the commit. The owner pinning a message asked for exactly that
+    /// pin, and shedding it — or an older one they did not choose — would
+    /// report success for something other than what they did.
+    Require,
+}
+
+/// The tail an owner commit of `owned` publishes, before any pin is shed.
+///
+/// Everything comes from `owned.row` except what another path may have moved
+/// under it, so a caller that commits a change in memory — a rename, a policy
+/// flag — publishes exactly that change.
+async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> ModerationTail {
     // We are the owner on this path, so our identity is what every member needs
     // in order to refuse a moderator's ban aimed at us, and our epoch is how
     // they tell they are behind and go looking for the key sealed to them.
@@ -2361,18 +2611,30 @@ async fn commit_channel_moderation(
     // Re-read rather than trusting `owned.row`: a ban rotates the key before
     // committing, so the snapshot in hand is one epoch stale and members would
     // never learn to go looking for the new one.
-    let live_epoch = {
+    let (live_epoch, removed_pins) = {
         let db = state.db.clone();
         let id = owned.row.channel_id.clone();
-        tokio::task::spawn_blocking(move || db.get_channel(&id))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .map(|row| row.key_epoch)
-            .unwrap_or(owned.row.key_epoch)
+        let pins = owned.row.pinned_msg_ids.clone();
+        let fallback = (owned.row.key_epoch, Vec::new());
+        tokio::task::spawn_blocking(move || {
+            let row = db.get_channel_lite(&id).ok().flatten()?;
+            // A pin this device has removed is pruned here, which is the
+            // owner's next commit of any kind.
+            let removed = db.channel_messages_removed(&id, &pins).unwrap_or_default();
+            Some((row.key_epoch, removed))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(fallback)
     };
-    let tail = ModerationTail {
+    let pinned_msg_ids = owned
+        .row
+        .pinned_msg_id_bytes()
+        .into_iter()
+        .filter(|id| !removed_pins.contains(&hex::encode(id)))
+        .collect::<Vec<_>>();
+    ModerationTail {
         owner_pubkey: Some(our_pk),
         key_epoch: Some(live_epoch.max(0) as u64),
         // Always written, zeros when there is no nominee: that is what lets an
@@ -2396,7 +2658,53 @@ async fn commit_channel_moderation(
             0 => None,
             secs => Some(secs),
         },
-    };
+        // Only once the room has been renamed; see `ModerationTail::room_name`.
+        // Taken from the row in hand, which the rename path fills with the new
+        // name before committing, rather than re-read from the database.
+        room_name: (owned.row.renamed_at > 0).then(|| owned.row.name.clone()),
+        // Absent when off, like slow mode, so a room that never uses either
+        // keeps publishing the tail it always has.
+        announce_only: owned.row.announce_only.then_some(true),
+        pinned_msg_ids,
+    }
+}
+
+/// Whether `tail`'s pins all fit a record for this snapshot.
+fn owner_pins_fit(
+    topic: &str,
+    welcome: &str,
+    bans: &[[u8; 32]],
+    mods: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> bool {
+    crate::network::ember::dht::publish::moderation_pin_capacity(topic, welcome, bans, mods, tail)
+        >= tail.pinned_msg_ids.len()
+}
+
+async fn commit_channel_moderation_with(
+    state: &AppState,
+    owned: &OwnedChannel,
+    topic: &str,
+    welcome: &str,
+    bans: &[[u8; 32]],
+    mods: &[[u8; 32]],
+    pin_fit: PinFit,
+) -> Result<(), String> {
+    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    let our_pk = state.identity.ed25519_public_key;
+    let tail = owner_moderation_tail(state, owned).await;
+    if pin_fit == PinFit::Require && !owner_pins_fit(topic, welcome, bans, mods, &tail) {
+        return Err(coded(
+            "channels_pins_no_room",
+            "This room's published settings have no space for another pin. Unpin a \
+             message, shorten the welcome message, or remove a ban.",
+        ));
+    }
+    // What the record will carry, and so what this device stores: the owner's
+    // pin bar should show what members will see, not a pin that was shed.
+    let tail = crate::network::ember::dht::publish::fit_moderation_pins(
+        topic, welcome, bans, mods, &tail,
+    );
     let record = SignedRecord::channel_moderation(
         topic,
         welcome,
@@ -2440,6 +2748,8 @@ async fn commit_channel_moderation(
     let tail_epoch = tail.key_epoch;
     let tail_owner_only = tail.invites_owner_only;
     let tail_slow_mode = tail.slow_mode_secs;
+    let tail_announce = tail.announce_only == Some(true);
+    let tail_pins = tail.pinned_msg_ids.clone();
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
     let topic_s = topic.to_string();
@@ -2447,7 +2757,7 @@ async fn commit_channel_moderation(
     let bans_v = bans.to_vec();
     let mods_v = mods.to_vec();
     let applied = tokio::task::spawn_blocking(move || {
-        db.apply_channel_moderation(
+        let applied = db.apply_channel_moderation(
             &id,
             &topic_s,
             &welcome_s,
@@ -2460,7 +2770,14 @@ async fn commit_channel_moderation(
             tail_epoch,
             tail_owner_only,
             tail_slow_mode,
-        )
+        )?;
+        // Before the record is queued, like the rest of the snapshot, so a
+        // failed write is an edit that did not happen rather than one that
+        // reaches the room while this device forgets it.
+        if applied {
+            db.apply_owner_room_policy(&id, tail_announce, &tail_pins)?;
+        }
+        Ok::<_, anyhow::Error>(applied)
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -2565,6 +2882,21 @@ async fn load_joined_channel(
         ));
     }
     Ok(row)
+}
+
+/// Whether an announcement-only room stops this device starting a new line.
+///
+/// The owner and the moderators the owner's snapshot names may post; nobody
+/// else. Enforced here, by the sender, and nowhere on receipt — see
+/// `ModerationTail::announce_only` for why a receiver cannot judge it without
+/// splitting the room. Edits and reactions are not new lines and stay open.
+/// A moderator lookup that fails reads as "not one", like slow mode's.
+fn announce_only_refuses(db: &Database, row: &StoredChannel, our_pubkey_hex: &str) -> bool {
+    if !row.announce_only || row.is_owner {
+        return false;
+    }
+    !db.channel_member_is_moderator(&row.channel_id, our_pubkey_hex)
+        .unwrap_or(false)
 }
 
 /// Whether this device holds moderator rights in a room. Used to exempt the
@@ -3133,6 +3465,185 @@ pub async fn set_channel_slow_mode(
     channel_info_from_id(&state, &channel_id).await
 }
 
+/// Owner-set: only the owner and moderators may post in this room.
+///
+/// For a room that exists to carry notices — releases, a club's schedule —
+/// where replies belong somewhere else. Rides the owner-signed moderation
+/// snapshot like slow mode, and like slow mode it is each member's client that
+/// declines to send; nothing is dropped on receipt (see
+/// `ModerationTail::announce_only`). Reactions stay open.
+#[tauri::command]
+pub async fn set_channel_announce_only(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    announce_only: bool,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    // In memory, not written first — see `set_channel_invite_policy`.
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            announce_only,
+            ..owned.row.clone()
+        },
+        ..owned
+    };
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    commit_channel_moderation(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+        &mods,
+    )
+    .await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// The pin list after pinning or unpinning `msg_id`, oldest pin first.
+///
+/// `Ok(None)` is "nothing to change" — pinning what is already pinned, or
+/// unpinning what is not — so a double click is not an error. Pinning past
+/// [`CHANNEL_PIN_MAX`] is refused rather than silently replacing the oldest:
+/// the owner chose those pins, and which one to give up is theirs to say.
+fn next_pins(current: &[String], msg_id: &str, pinned: bool) -> Result<Option<Vec<String>>, String> {
+    let held = current.iter().any(|id| id == msg_id);
+    if pinned == held {
+        return Ok(None);
+    }
+    if !pinned {
+        return Ok(Some(current.iter().filter(|id| *id != msg_id).cloned().collect()));
+    }
+    if current.len() >= CHANNEL_PIN_MAX {
+        return Err(coded(
+            "channels_pins_full",
+            format!("A room can have {CHANNEL_PIN_MAX} pinned messages. Unpin one first."),
+        ));
+    }
+    let mut next = current.to_vec();
+    next.push(msg_id.to_string());
+    Ok(Some(next))
+}
+
+/// Owner-only: pin a message to the top of the room, or take a pin down.
+///
+/// Pins ride the owner-signed moderation snapshot, so members see them within
+/// a refresh and a patched client cannot forge one. The pin commit refuses
+/// rather than sheds when the record is full ([`PinFit::Require`]); every other
+/// commit sheds the oldest pin first.
+#[tauri::command]
+pub async fn set_channel_message_pinned(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    msg_id: String,
+    pinned: bool,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let msg_id = msg_id.trim().to_ascii_lowercase();
+    if msg_id.len() != 32 || !msg_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(coded(
+            "channels_pin_target_invalid",
+            "That message is not in this room",
+        ));
+    }
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    if pinned {
+        // Looked up by this room's id, so a line from another room is refused
+        // too, exactly as a reply's parent is.
+        let lookup = reply_lookup_for(&state, &channel_id, Some(&msg_id)).await;
+        if lookup.parent.is_none() {
+            return Err(coded(
+                "channels_pin_target_invalid",
+                "That message is not in this room",
+            ));
+        }
+    }
+    let Some(pins) = next_pins(&owned.row.pinned_msg_ids, &msg_id, pinned)? else {
+        return channel_info_from_id(&state, &channel_id).await;
+    };
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            pinned_msg_ids: pins,
+            ..owned.row.clone()
+        },
+        ..owned
+    };
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    commit_channel_moderation_with(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+        &mods,
+        if pinned { PinFit::Require } else { PinFit::Shed },
+    )
+    .await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// One pinned message as the room's pin bar draws it.
+#[derive(serde::Serialize)]
+pub struct ChannelPinInfo {
+    pub msg_id: String,
+    /// The line as this device holds it now, or `None` when it is not here —
+    /// not yet synced, or trimmed from history.
+    pub message: Option<ChannelReplyParent>,
+    /// Absent because it was removed here, which the bar hides rather than
+    /// calling "not available yet".
+    pub deleted: bool,
+}
+
+/// The room's pins, oldest first, each resolved against local history the way
+/// a reply's quote is.
+#[tauri::command]
+pub async fn get_channel_pins(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<Vec<ChannelPinInfo>, String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let row = db
+            .get_channel_lite(&channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
+        row.pinned_msg_ids
+            .into_iter()
+            .map(|msg_id| {
+                let lookup = db.channel_reply_lookup(&channel_id, &msg_id)?;
+                Ok(ChannelPinInfo {
+                    msg_id,
+                    message: lookup.parent,
+                    deleted: lookup.deleted,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_pins_failed", "Failed to load pinned messages", e))
+}
+
 async fn apply_local_mod_ban(
     state: &AppState,
     row: &StoredChannel,
@@ -3303,6 +3814,163 @@ pub async fn update_channel_moderation(
     let owned = load_owned_channel(&state, &channel_id).await?;
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    commit_channel_moderation(&state, &owned, &topic, &welcome, &bans, &mods).await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// Least time between two renames of one room. The registry holds the same
+/// line (`RENAME_INTERVAL_SECS` in the rendezvous server) and is what enforces
+/// it; this copy only lets the owner hear so without a round trip.
+const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// Rename a room this device owns.
+///
+/// The registry decides whether the name is free, so nothing changes here
+/// until it has granted it; the name it gives up stays reserved to this room
+/// for a while, so nobody can take it and be mistaken for the room. Members
+/// learn the new name from the owner's moderation snapshot, the record that
+/// already carries the topic, which they fetch every few minutes while in the
+/// room — so one who is offline picks it up when they are back.
+#[tauri::command]
+pub async fn rename_channel(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    name: String,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let name = sanitize_channel_name(&name)?;
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    if !owned.row.successor_id.is_empty() {
+        return Err(coded(
+            "channels_handoff_failed",
+            "This room has already been transferred",
+        ));
+    }
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    let topic = owned.row.topic.clone();
+    let welcome = owned.row.welcome.clone();
+    let renamed_at = owned.row.renamed_at;
+    if owned.row.name == name {
+        // Already this device's name. If a rename recorded it, the snapshot
+        // carrying it may be what failed last time — the registry and this
+        // database had already moved — so commit it again rather than leave
+        // members on the old name with nothing left to retry. Idempotent: the
+        // same snapshot again, under a newer timestamp.
+        if renamed_at > 0 {
+            commit_channel_moderation(&state, &owned, &topic, &welcome, &bans, &mods).await?;
+        }
+        return channel_info_from_id(&state, &channel_id).await;
+    }
+    // Two names with one registry key are one name there, so a change between
+    // them is a re-casing — a refresh, not rationed — rather than a rename.
+    let renames_key = crate::network::rendezvous::channel_name_registry_key(&owned.row.name)
+        != crate::network::rendezvous::channel_name_registry_key(&name);
+    let now = chrono::Utc::now().timestamp();
+    if renames_key && renamed_at > 0 && now.saturating_sub(renamed_at) < RENAME_INTERVAL_SECS {
+        return Err(coded(
+            "channels_rename_too_soon",
+            "A room can be renamed once a day",
+        ));
+    }
+    // A re-casing marks the room renamed without starting the once-a-day
+    // clock, which the registry does not start either: the name still has to
+    // ride the snapshot or members would never see the new casing.
+    let stamp = if renames_key { now } else { renamed_at.max(1) };
+    // The room as it will be, in memory, so the snapshot committed below
+    // carries exactly the name granted, whatever the database reads by then.
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            name: name.clone(),
+            renamed_at: stamp,
+            ..owned.row.clone()
+        },
+        ..owned
+    };
+    // Checked before the registry is asked. The name rides the snapshot with
+    // the pins, and past this point the commit would have to shed pins to fit
+    // it — or, the registry having granted the name, leave members on the old
+    // one. Neither is what the owner asked for.
+    if !owner_pins_fit(
+        &topic,
+        &welcome,
+        &bans,
+        &mods,
+        &owner_moderation_tail(&state, &owned).await,
+    ) {
+        return Err(coded(
+            "channels_rename_pins_no_room",
+            "The new name doesn't fit alongside this room's pins. Choose a shorter name \
+             or unpin a message.",
+        ));
+    }
+
+    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    let url = rendezvous_url(&state).await;
+    let seed = owned.ident.signing_key.to_bytes();
+    // A claim for a different name is refused by the registry, so only an
+    // actual rename goes through the rename operation. A re-casing is still
+    // a claim, which also keeps it working against a server without renames.
+    let granted = if renames_key {
+        registry_call(crate::network::rendezvous::rename_channel_name(
+            &url,
+            &owned.ident.channel_id,
+            &owned.ident.pubkey,
+            &seed,
+            &name,
+            private,
+        ))
+        .await
+    } else {
+        registry_call(crate::network::rendezvous::claim_channel_name(
+            &url,
+            &owned.ident.channel_id,
+            &owned.ident.pubkey,
+            &seed,
+            &name,
+            private,
+        ))
+        .await
+    };
+    granted.map_err(|e| registry_fail(e, "channels_name_taken"))?;
+
+    {
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        let new_name = name.clone();
+        tokio::task::spawn_blocking(move || db.rename_owned_channel(&id, &new_name, stamp))
+            .await
+            .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+            .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to save room info", e))?;
+    }
+
+    if !private {
+        let record = SignedRecord::channel_index(
+            &name,
+            owned.ident.channel_id,
+            owned.ident.pubkey,
+            false,
+            &owned.ident.signing_key,
+        );
+        // Not fatal: the owner loop republishes the listing, and Discover also
+        // reads the registry, which already has the new name.
+        if let Err(e) = queue_signed_record(&state, record).await {
+            tracing::warn!(
+                channel_id = %channel_id,
+                error = %e,
+                "renamed room's index record did not publish"
+            );
+        }
+    }
+
     commit_channel_moderation(&state, &owned, &topic, &welcome, &bans, &mods).await?;
     channel_info_from_id(&state, &channel_id).await
 }
@@ -4877,6 +5545,86 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 mod tests {
     use super::*;
 
+    /// In an announcement-only room the owner and the snapshot's moderators
+    /// send; everyone else is refused before anything goes on the wire. A room
+    /// without the flag refuses nobody.
+    #[test]
+    fn announce_only_rooms_refuse_everyone_but_the_owner_and_moderators() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-announce-send-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let member_room = "ab".repeat(16);
+        let owned_room = "cd".repeat(16);
+        db.insert_channel(&member_room, &"01".repeat(32), "News", "public", false, None, None)
+            .expect("insert member room");
+        db.insert_channel(&owned_room, &"02".repeat(32), "Mine", "public", true, None, None)
+            .expect("insert owned room");
+        let moderator = [0x5Au8; 32];
+        let member = hex::encode([0x6Bu8; 32]);
+        assert!(db
+            .apply_channel_moderation(
+                &member_room, "", "", 1, &[], &[moderator], None, None, None, None, None, None,
+            )
+            .unwrap());
+
+        let row = db.get_channel(&member_room).unwrap().unwrap();
+        assert!(!announce_only_refuses(&db, &row, &member), "open room");
+
+        db.apply_owner_room_policy(&member_room, true, &[]).unwrap();
+        let row = db.get_channel(&member_room).unwrap().unwrap();
+        assert!(announce_only_refuses(&db, &row, &member), "a member is refused");
+        assert!(
+            !announce_only_refuses(&db, &row, &hex::encode(moderator)),
+            "a moderator posts"
+        );
+
+        db.apply_owner_room_policy(&owned_room, true, &[]).unwrap();
+        let owned = db.get_channel(&owned_room).unwrap().unwrap();
+        assert!(!announce_only_refuses(&db, &owned, &member), "the owner posts");
+
+        // A moderator the next snapshot drops is refused from then on.
+        assert!(db
+            .apply_channel_moderation(
+                &member_room, "", "", 2, &[], &[], None, None, None, None, None, None,
+            )
+            .unwrap());
+        let row = db.get_channel(&member_room).unwrap().unwrap();
+        assert!(announce_only_refuses(&db, &row, &hex::encode(moderator)));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn pinning_adds_unpinning_removes_and_the_cap_refuses() {
+        let a = "aa".repeat(16);
+        let b = "bb".repeat(16);
+        let c = "cc".repeat(16);
+        let d = "dd".repeat(16);
+        assert_eq!(next_pins(&[], &a, true).unwrap(), Some(vec![a.clone()]));
+        assert_eq!(next_pins(std::slice::from_ref(&a), &a, true).unwrap(), None, "already pinned");
+        assert_eq!(next_pins(std::slice::from_ref(&a), &b, false).unwrap(), None, "not pinned");
+        assert_eq!(
+            next_pins(&[a.clone(), b.clone()], &a, false).unwrap(),
+            Some(vec![b.clone()])
+        );
+        let full = vec![a.clone(), b.clone(), c.clone()];
+        assert_eq!(full.len(), CHANNEL_PIN_MAX);
+        let err = next_pins(&full, &d, true).unwrap_err();
+        assert!(err.contains("channels_pins_full"), "{err}");
+        // Unpinning from a full list is always allowed.
+        assert_eq!(next_pins(&full, &b, false).unwrap(), Some(vec![a, c]));
+    }
+
     #[test]
     fn channel_username_rejects_anonymous_and_out_of_range() {
         assert!(sanitize_channel_username("A").is_err());
@@ -4887,6 +5635,17 @@ mod tests {
         assert_eq!(sanitize_channel_username("Ada").unwrap(), "Ada");
         assert_eq!(sanitize_channel_username("Ada1").unwrap(), "Ada1");
         assert_eq!(username_claim_key("Ada"), "ada");
+    }
+
+    #[test]
+    fn a_room_name_may_run_to_32_characters_within_64_bytes() {
+        assert!(sanitize_channel_name(&"a".repeat(32)).is_ok());
+        assert!(sanitize_channel_name(&"a".repeat(33)).is_err());
+        // Two bytes a character: the character cap is the one that binds.
+        assert!(sanitize_channel_name(&"ж".repeat(32)).is_ok());
+        // Three bytes a character: the record's byte ceiling binds first.
+        assert!(sanitize_channel_name(&"房".repeat(21)).is_ok());
+        assert!(sanitize_channel_name(&"房".repeat(22)).is_err());
     }
 
     /// Discover names come from whoever published the record, which is the one
@@ -4913,6 +5672,192 @@ mod tests {
         // room that never had a name already shows.
         assert_eq!(discovered_room_name("\u{200B}\u{FEFF}", &id), &id[..8]);
         assert_eq!(discovered_room_name("", &id), &id[..8]);
+    }
+
+    fn reaction_row(msg: &str, member: &str, reaction: u8) -> (String, String, u8) {
+        (msg.to_string(), member.to_string(), reaction)
+    }
+
+    #[test]
+    fn reaction_tallies_count_mixed_codes_in_code_order_with_me_named_first() {
+        let me = "cd".repeat(32);
+        let rows = vec![
+            reaction_row("m1", "ada", 8),
+            reaction_row("m1", "bo", channel::REACTION_UP),
+            reaction_row("m1", "cy", 8),
+            reaction_row("m1", &me.to_ascii_uppercase(), 8),
+            reaction_row("m1", "di", channel::REACTION_CURATED_MAX),
+            reaction_row("m2", "ada", channel::REACTION_HEART),
+        ];
+        let tallies = tally_channel_reactions(rows, &me);
+        assert_eq!(
+            tallies,
+            vec![
+                ChannelReactionInfo {
+                    msg_id: "m1".into(),
+                    reactions: vec![
+                        ChannelReactionTally {
+                            reaction: channel::REACTION_UP,
+                            count: 1,
+                            members: vec!["bo".into()],
+                        },
+                        ChannelReactionTally {
+                            reaction: 8,
+                            count: 3,
+                            members: vec![me.to_ascii_uppercase(), "ada".into(), "cy".into()],
+                        },
+                        ChannelReactionTally {
+                            reaction: channel::REACTION_CURATED_MAX,
+                            count: 1,
+                            members: vec!["di".into()],
+                        },
+                    ],
+                    mine: 8,
+                },
+                ChannelReactionInfo {
+                    msg_id: "m2".into(),
+                    reactions: vec![ChannelReactionTally {
+                        reaction: channel::REACTION_HEART,
+                        count: 1,
+                        members: vec!["ada".into()],
+                    }],
+                    mine: channel::REACTION_NONE,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reaction_tallies_skip_codes_past_the_curated_set() {
+        let me = "cd".repeat(32);
+        let future = channel::REACTION_CURATED_MAX + 1;
+        let rows = vec![
+            reaction_row("m1", "ada", future),
+            reaction_row("m1", "bo", channel::REACTION_DOWN),
+            reaction_row("m2", "ada", u8::MAX),
+        ];
+        let tallies = tally_channel_reactions(rows, &me);
+        // Not folded into any drawn code, and a line holding nothing drawable
+        // has no tally, so it renders as a line nobody reacted to.
+        assert_eq!(tallies.len(), 1);
+        assert_eq!(tallies[0].msg_id, "m1");
+        assert_eq!(
+            tallies[0].reactions,
+            vec![ChannelReactionTally {
+                reaction: channel::REACTION_DOWN,
+                count: 1,
+                members: vec!["bo".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn reaction_members_are_capped_but_the_count_is_not() {
+        let me = "cd".repeat(32);
+        let mut rows: Vec<_> = (0..REACTION_MEMBERS_SHOWN + 4)
+            .map(|i| reaction_row("m1", &format!("member{i}"), channel::REACTION_UP))
+            .collect();
+        // Reacted last, so without the rule it would fall past the cap.
+        rows.push(reaction_row("m1", &me, channel::REACTION_UP));
+        let tallies = tally_channel_reactions(rows, &me);
+        let tally = &tallies[0].reactions[0];
+        assert_eq!(tally.count as usize, REACTION_MEMBERS_SHOWN + 5);
+        assert_eq!(tally.members.len(), REACTION_MEMBERS_SHOWN);
+        assert_eq!(tally.members[0], me);
+        assert_eq!(tally.members[1], "member0");
+    }
+
+    /// `get_channel_reactions`' tally exactly as v1.6.7 shipped it
+    /// (`git show v1.6.7:src-tauri/src/commands/channels.rs`), so the property
+    /// released builds depend on is checked against their logic rather than
+    /// against a description of it.
+    fn v1_6_7_tally(rows: Vec<(String, String, u8)>, mine: &str) -> Vec<(String, u32, u32, u32, u8)> {
+        struct Info {
+            msg_id: String,
+            up: u32,
+            down: u32,
+            heart: u32,
+            mine: u8,
+        }
+        let mut tallies: std::collections::HashMap<String, Info> = std::collections::HashMap::new();
+        for (msg_id, member, reaction) in rows {
+            let entry = tallies.entry(msg_id.clone()).or_insert_with(|| Info {
+                msg_id,
+                up: 0,
+                down: 0,
+                heart: 0,
+                mine: 0,
+            });
+            match reaction {
+                1 => entry.up = entry.up.saturating_add(1),
+                2 => entry.down = entry.down.saturating_add(1),
+                3 => entry.heart = entry.heart.saturating_add(1),
+                _ => {}
+            }
+            if member.eq_ignore_ascii_case(mine) {
+                entry.mine = reaction;
+            }
+        }
+        let mut out: Vec<_> = tallies
+            .into_values()
+            .map(|t| (t.msg_id, t.up, t.down, t.heart, t.mine))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_v1_6_build_ignores_every_new_code_rather_than_misreading_it() {
+        use ed25519_dalek::SigningKey;
+
+        // The reaction frame, its signature and its decoder are unchanged since
+        // v1.6.7, so running the current decoder is running theirs.
+        let channel_id = [7u8; 16];
+        let target = [9u8; 16];
+        let entries: Vec<channel::ChannelReaction> = (channel::REACTION_UP
+            ..=channel::REACTION_CURATED_MAX)
+            .map(|code| {
+                let sk = SigningKey::from_bytes(&[code; 32]);
+                let member = sk.verifying_key().to_bytes();
+                let reacted_at = 1_700_000_000 + i64::from(code);
+                channel::ChannelReaction {
+                    target_msg_id: target,
+                    member,
+                    reaction: code,
+                    reacted_at,
+                    signature: channel::reaction_signature(
+                        &sk,
+                        &member,
+                        &channel_id,
+                        &target,
+                        reacted_at,
+                        code,
+                    ),
+                }
+            })
+            .collect();
+        let frame = channel::encode_channel_reactions(&entries);
+        let decoded = channel::decode_channel_reactions(&frame, &channel_id)
+            .expect("the frame must not be dropped whole");
+        assert_eq!(decoded.len(), entries.len(), "no entry may fail its signature");
+
+        let rows: Vec<_> = decoded
+            .iter()
+            .map(|e| (hex::encode(e.target_msg_id), hex::encode(e.member), e.reaction))
+            .collect();
+        let old = v1_6_7_tally(rows.clone(), "");
+        // One member each on 👍, 👎 and ❤️; the seventeen new codes add to none.
+        assert_eq!(old, vec![(hex::encode(target), 1, 1, 1, 0)]);
+
+        // And only new codes: counts all zero, which v1.6.7's `hasAny` reads as
+        // a line with no reactions, drawing nothing rather than a wrong mark.
+        let only_new: Vec<_> = rows.into_iter().filter(|(_, _, code)| *code > 3).collect();
+        assert_eq!(v1_6_7_tally(only_new.clone(), ""), vec![(hex::encode(target), 0, 0, 0, 0)]);
+
+        // This build counts each of them under its own code.
+        let new = tally_channel_reactions(only_new, "");
+        let codes: Vec<u8> = new[0].reactions.iter().map(|t| t.reaction).collect();
+        assert_eq!(codes, (4..=channel::REACTION_CURATED_MAX).collect::<Vec<_>>());
     }
 }
 

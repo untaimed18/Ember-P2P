@@ -1365,6 +1365,16 @@ const XFER_BLOCK_DATA_SEALED_VERSION: u8 = 21;
 /// a batch of one — so the periodic digest can carry a slice of the roster in a
 /// single frame rather than a datagram per member.
 const PRESENCE_BEACON_PLAIN_VERSION: u8 = 22;
+/// A member is (or has stopped) composing a line. Ephemeral: sent one hop to
+/// members we hold a live session with, never relayed, stored, or re-served.
+///
+/// A new number rather than a flag on anything older because v1.6.x routes
+/// by this byte alone and drops a number it does not know without scoring
+/// the hop — every one of its decoders checks the byte first and the chat
+/// fallthrough ends in a `debug!`. See
+/// `a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched`.
+const TYPING_PLAIN_VERSION: u8 = 23;
+const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
@@ -1477,6 +1487,138 @@ pub fn decode_channel_chat_plain(
         return None;
     }
     Some((pk, text, sig))
+}
+
+/// Opens the reply trailer: U+E0001 LANGUAGE TAG.
+///
+/// Deprecated since Unicode 5.1 and never part of an emoji tag sequence, so no
+/// text a person types — including a subdivision flag, whose tags run
+/// U+E0020..U+E007F — can end in this by accident.
+const REPLY_TRAILER_LEAD: char = '\u{E0001}';
+/// U+E0072 TAG LATIN SMALL LETTER R. Names the one trailer there is, and leaves
+/// the other tag letters free for a later signed field to use the same way.
+const REPLY_TRAILER_KIND: char = '\u{E0072}';
+/// Tag characters mirror printable ASCII at this offset: U+E0030 is tag `0`.
+const TAG_BASE: u32 = 0xE0000;
+/// Lead, kind, and the parent's 16-byte id as 32 lowercase hex digits.
+pub const REPLY_TRAILER_CHARS: usize = 2 + 32;
+/// Every tag character is four bytes of UTF-8, and the byte count is what the
+/// 4096-byte message cap measures — so a reply leaves this much less room.
+pub const REPLY_TRAILER_BYTES: usize = REPLY_TRAILER_CHARS * 4;
+
+/// The chat text a reply is signed and sent as: `body` followed, when this is a
+/// reply, by the parent's id written in Unicode tag characters.
+///
+/// Why the reference rides inside the text rather than beside it. The chat
+/// frame is `version || sender || signature || text`, with the text running to
+/// the end of the frame and the signature covering all of it
+/// ([`chat_sig_preimage`]); the edit frame is built the same way. There is no
+/// spare field, no flags byte, and no room after the text — anything appended
+/// *is* text to every build that exists. That leaves three ways to carry a
+/// signed reference, and this is the only one that keeps both properties asked
+/// of it:
+///
+/// * a new frame version would be signed, but every v1.6 build drops frames it
+///   does not know ([`decode_channel_chat_plain`] refuses any other version
+///   byte), so a reply would simply never appear for them;
+/// * a separate annotation frame beside an ordinary line would keep the line
+///   readable, but a relay could drop the annotation on its own, catch-up would
+///   have to carry a second kind of row, and every reply would spend two frames
+///   of its author's rate allowance;
+/// * inside the signed text, the reference is covered by the same signature as
+///   the words, cannot be stripped or retargeted without breaking it, and is
+///   re-served byte-for-byte by every member, old or new, who stores the line.
+///
+/// Tag characters make the third one invisible to builds that know nothing of
+/// it. They are default-ignorable code points — rendered as nothing, not as a
+/// missing-glyph box — with neutral bidi class, and none of them is removed by
+/// [`crate::security::sanitize_chat_text`] on either side of the wire, which
+/// matters because a line whose text changes under sanitising loses its
+/// signature on receipt. A v1.6 build therefore verifies the line, stores it,
+/// re-serves it, and draws exactly the body. What it cannot help is that the
+/// invisible characters come along if someone copies the line out of it.
+pub fn with_reply_trailer(body: &str, parent: Option<&[u8; 16]>) -> String {
+    let Some(parent) = parent else {
+        return body.to_string();
+    };
+    let mut out = String::with_capacity(body.len() + REPLY_TRAILER_BYTES);
+    out.push_str(body);
+    out.push(REPLY_TRAILER_LEAD);
+    out.push(REPLY_TRAILER_KIND);
+    for digit in hex::encode(parent).bytes() {
+        out.push(tag_char(digit));
+    }
+    out
+}
+
+fn tag_char(ascii: u8) -> char {
+    char::from_u32(TAG_BASE + u32::from(ascii)).unwrap_or(REPLY_TRAILER_LEAD)
+}
+
+/// `text` without its reply trailer, and the parent it named.
+///
+/// Strict on purpose: exactly one trailer, at the very end, in lowercase hex,
+/// after a non-empty body. That is the form [`with_reply_trailer`] writes, so a
+/// parsed reference always re-encodes to the bytes it came from, and anything
+/// looser — upper-case digits, a trailer mid-text, a bare trailer with nothing
+/// to reply with — is left as the ordinary (invisible) text it would be to an
+/// older build.
+pub fn split_reply_trailer(text: &str) -> (&str, Option<[u8; 16]>) {
+    let mut tail = text.char_indices().rev().take(REPLY_TRAILER_CHARS);
+    let mut digits = [0u8; 32];
+    for slot in digits.iter_mut().rev() {
+        let Some((_, c)) = tail.next() else {
+            return (text, None);
+        };
+        let ascii = (c as u32).wrapping_sub(TAG_BASE);
+        match u8::try_from(ascii) {
+            Ok(b @ (b'0'..=b'9' | b'a'..=b'f')) => *slot = b,
+            _ => return (text, None),
+        }
+    }
+    let (Some((_, kind)), Some((start, lead))) = (tail.next(), tail.next()) else {
+        return (text, None);
+    };
+    if kind != REPLY_TRAILER_KIND || lead != REPLY_TRAILER_LEAD || start == 0 {
+        return (text, None);
+    }
+    let mut parent = [0u8; 16];
+    if hex::decode_to_slice(digits, &mut parent).is_err() {
+        return (text, None);
+    }
+    (&text[..start], Some(parent))
+}
+
+/// What a member sees of a stored or received line: the body, trailer removed.
+pub fn chat_display_text(text: &str) -> &str {
+    split_reply_trailer(text).0
+}
+
+/// Drop every reply trailer from the end of text the local user typed.
+///
+/// A line copied out of a build that shows the trailer as nothing carries it
+/// along invisibly, and pasting that back in would otherwise send a reply to
+/// whatever the copied line was answering — or, with a reply of our own on top,
+/// two trailers of which receivers would honour only the outer one.
+pub fn strip_reply_trailers(text: &str) -> &str {
+    let mut body = text;
+    loop {
+        match split_reply_trailer(body) {
+            (rest, Some(_)) => body = rest,
+            (rest, None) => return rest,
+        }
+    }
+}
+
+/// The parent a stored line replies to, as the database keeps it.
+///
+/// `None` for a line that names itself: a signed self-reference is harmless but
+/// means nothing, and storing it would give the transcript a quote that points
+/// at its own bubble. `own_msg_id` is the stored hex id, which for a handoff
+/// copy is not hex at all — that case can never equal a real parent id.
+pub fn chat_reply_parent_hex(text: &str, own_msg_id: &str) -> Option<String> {
+    let parent = hex::encode(split_reply_trailer(text).1?);
+    (!parent.eq_ignore_ascii_case(own_msg_id)).then_some(parent)
 }
 
 const CHAT_MSG_ID_DOMAIN: &[u8] = b"ember-channel-chat-msg-id-v1\0";
@@ -2133,10 +2275,32 @@ pub struct ChannelChatEdit {
 /// another frame version. An unrecognised value is stored and re-served rather
 /// than dropped, so a room running a newer build does not lose its reactions
 /// every time they pass through this one — this build simply does not draw them.
+///
+/// Codes are an index into a curated emoji table the UI owns
+/// (`src/lib/channelReactions.ts`), never a code point: one byte on the wire, no
+/// glyph a receiver cannot draw, and a tally that every build computes the same
+/// way. A code is permanent once shipped. v1.6.x draws 1–3 and counts every
+/// other value nowhere, so reusing a number for a different emoji would show
+/// on those builds as the old mark — append, never renumber.
 pub const REACTION_NONE: u8 = 0;
 pub const REACTION_UP: u8 = 1;
 pub const REACTION_DOWN: u8 = 2;
 pub const REACTION_HEART: u8 = 3;
+/// Highest code this build lets a member send and counts in a tally. 4–20 are
+/// the curated set after the original three (😂 😮 😢 😡 🎉 🙏 🔥 👀 ✅ ❌ 💯 🤔
+/// 👏 🚀 ⭐ 😊 👋, in that order). Anything above is a later build's and is kept
+/// and re-served like any other value, just not counted.
+pub const REACTION_CURATED_MAX: u8 = 20;
+
+// The three codes v1.6.x draws. Moving any of them would make those builds
+// show a member's new reaction as a different mark than the one they picked.
+const _: () = assert!(REACTION_UP == 1 && REACTION_DOWN == 2 && REACTION_HEART == 3);
+
+/// Whether this build draws `reaction`. [`REACTION_NONE`] is a withdrawal, not
+/// a reaction, so it is not one of them.
+pub fn reaction_is_curated(reaction: u8) -> bool {
+    (REACTION_UP..=REACTION_CURATED_MAX).contains(&reaction)
+}
 
 /// Reactions one frame may carry. 121 bytes each, so a full batch is under 4 KiB
 /// and stays inside the budget a chat line already occupies.
@@ -2265,6 +2429,229 @@ pub fn decode_channel_reactions(
         });
     }
     Some(out)
+}
+
+/// How often a composing member's client refreshes its typing signal, and the
+/// window both ends meter typing frames over.
+pub const CHANNEL_TYPING_REFRESH_SECS: u64 = 4;
+/// Typing frames one device may originate into one room per refresh window:
+/// a refresh, a stop, and a fresh start after a message is sent.
+pub const CHANNEL_TYPING_SEND_PER_WINDOW: usize = 3;
+/// Typing frames accepted from one member of one room per refresh window.
+/// Above what an honest sender is allowed, so the sender's own ceiling is the
+/// one that bites and this only ever refuses a client that ignores it.
+pub const CHANNEL_TYPING_RECV_PER_WINDOW: usize = 4;
+const _: () = assert!(
+    CHANNEL_TYPING_RECV_PER_WINDOW > CHANNEL_TYPING_SEND_PER_WINDOW,
+    "a receiver must admit everything an honest sender is allowed to send"
+);
+/// A typing frame older than this is dropped. The indicator it would raise
+/// lasts about six seconds, so anything older describes a moment already over,
+/// and a replay of a captured frame buys at most this much false "typing".
+pub const CHANNEL_TYPING_MAX_AGE_SECS: i64 = 10;
+/// A typing frame dated further ahead than this is dropped. Symmetric with the
+/// age bound: a clock that far off would otherwise hold an indicator open.
+pub const CHANNEL_TYPING_MAX_FUTURE_SECS: i64 = 10;
+/// Present members above which this device stops sending typing signals.
+///
+/// Sending is one datagram per reachable member, so its cost grows with the
+/// room while its value shrinks: in a room this size "several people are
+/// typing" is the most the line could say. Receiving is unaffected — a member
+/// of a smaller view of the room still shows what reaches it.
+pub const CHANNEL_TYPING_MAX_ROOM: usize = 50;
+/// Hop budget written on a typing envelope. One, so even a path that decrements
+/// and forwards (a moderator action's, say) gets `None` from
+/// [`ChannelGossip::decremented_ttl`] and stops here.
+pub const CHANNEL_TYPING_TTL: u8 = 1;
+/// `version || member(32) || state(1) || sig(64)`.
+const TYPING_FRAME_LEN: usize = 1 + 32 + 1 + 64;
+
+/// What a typing signal's signature covers.
+///
+/// The room, envelope id and envelope time are inside for the same reasons as
+/// chat's: the content key proves only that a frame came from somebody in the
+/// room, so without them any member could relabel a captured signal as another
+/// member's, move it into another room, or re-date it past the staleness check.
+fn typing_sig_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    member: &[u8; 32],
+    typing: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TYPING_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 1);
+    out.extend_from_slice(TYPING_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(member);
+    out.push(u8::from(typing));
+    out
+}
+
+pub fn encode_channel_typing(
+    signing_key: &SigningKey,
+    member: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    typing: bool,
+) -> Vec<u8> {
+    let sig = crypto::sign(
+        signing_key,
+        &typing_sig_preimage(channel_id, msg_id, timestamp, member, typing),
+    );
+    let mut out = Vec::with_capacity(TYPING_FRAME_LEN);
+    out.push(TYPING_PLAIN_VERSION);
+    out.extend_from_slice(member);
+    out.push(u8::from(typing));
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// The member a typing signal names and whether they are composing, or nothing
+/// if it is malformed or not signed by that member for this envelope.
+pub fn decode_channel_typing(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], bool)> {
+    if bytes.len() != TYPING_FRAME_LEN || bytes[0] != TYPING_PLAIN_VERSION {
+        return None;
+    }
+    let typing = match bytes[33] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let member: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let sig: [u8; 64] = bytes[34..].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&member)?;
+    if !crypto::verify(
+        &author,
+        &typing_sig_preimage(channel_id, msg_id, timestamp, &member, typing),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((member, typing))
+}
+
+/// Whether a typing envelope's time is close enough to now to mean anything.
+///
+/// Far tighter than [`gossip_timestamp_ok`], which has to let catch-up replay
+/// lines from days ago. A typing signal is only ever live.
+pub fn typing_timestamp_fresh(timestamp: i64, now: i64) -> bool {
+    timestamp >= now.saturating_sub(CHANNEL_TYPING_MAX_AGE_SECS)
+        && timestamp <= now.saturating_add(CHANNEL_TYPING_MAX_FUTURE_SECS)
+}
+
+/// Admit one outbound typing frame for `channel_id`, or refuse it.
+///
+/// The frontend already paces itself; this is the ceiling that holds whatever
+/// it does, since each admitted frame is a datagram to every reachable member.
+pub fn typing_send_allow(
+    sent: &mut HashMap<[u8; 16], VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    now: Instant,
+) -> bool {
+    rate_window_allow(
+        sent.entry(channel_id).or_default(),
+        now,
+        Duration::from_secs(CHANNEL_TYPING_REFRESH_SECS),
+        CHANNEL_TYPING_SEND_PER_WINDOW,
+    )
+}
+
+/// Admit one inbound typing frame from `author` in `channel_id`, or refuse it.
+///
+/// Its own map rather than the chat budget's: sharing it would let a member's
+/// typing spend the allowance their next line needs. Same refuse-when-full rule
+/// as [`author_gossip_allow`], for the same reason.
+pub fn typing_recv_allow(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let key = (channel_id, *author);
+    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
+        return false;
+    }
+    rate_window_allow(
+        seen.entry(key).or_default(),
+        now,
+        Duration::from_secs(CHANNEL_TYPING_REFRESH_SECS),
+        CHANNEL_TYPING_RECV_PER_WINDOW,
+    )
+}
+
+/// Why an authenticated typing frame was not shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingRefusal {
+    /// Our own signal, echoed back by a peer.
+    Own,
+    Stale,
+    /// The author is banned, or not on the roster at all. A signal introduces
+    /// nobody: a member who has not yet announced themselves has nothing to
+    /// be shown typing in.
+    NotAMember,
+    RateLimited,
+}
+
+/// Decide whether a verified typing frame from `member` is shown.
+///
+/// `roster_status` is `Database::channel_member_status`'s answer: `Some(false)`
+/// on the roster and unbanned, `Some(true)` banned, `None` unknown. The rate
+/// check runs last and only for a frame that passed everything else, so a
+/// refused frame is not charged to the member it names.
+pub fn admit_channel_typing(
+    member: &[u8; 32],
+    local: &[u8; 32],
+    roster_status: Option<bool>,
+    timestamp: i64,
+    now: i64,
+    rate_ok: impl FnOnce() -> bool,
+) -> Result<(), TypingRefusal> {
+    if member == local {
+        return Err(TypingRefusal::Own);
+    }
+    if !typing_timestamp_fresh(timestamp, now) {
+        return Err(TypingRefusal::Stale);
+    }
+    if roster_status != Some(false) {
+        return Err(TypingRefusal::NotAMember);
+    }
+    if !rate_ok() {
+        return Err(TypingRefusal::RateLimited);
+    }
+    Ok(())
+}
+
+/// The members a typing signal goes to: every present member but us that
+/// `reachable` says we hold a live session with. `None` when the room is over
+/// [`CHANNEL_TYPING_MAX_ROOM`], which is the caller's cue to send nothing.
+///
+/// Live sessions only, and deliberately so. The overlay and the rendezvous
+/// tunnel both exist to make a line arrive eventually, which a typing signal
+/// has no use for, and the tunnel's outbox is bounded: filling it with typing
+/// would refuse the chat line queued behind it.
+pub fn typing_recipients(
+    local: &[u8; 32],
+    present: &[[u8; 32]],
+    mut reachable: impl FnMut(&[u8; 32]) -> bool,
+) -> Option<Vec<[u8; 32]>> {
+    if present.len() > CHANNEL_TYPING_MAX_ROOM {
+        return None;
+    }
+    Some(
+        present
+            .iter()
+            .filter(|pk| *pk != local && reachable(pk))
+            .copied()
+            .collect(),
+    )
 }
 
 fn mod_action_preimage(
@@ -3770,6 +4157,162 @@ mod tests {
         }
     }
 
+    const PARENT: [u8; 16] = [
+        0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8,
+        0xf9,
+    ];
+
+    #[test]
+    fn a_reply_trailer_round_trips_and_a_plain_line_is_untouched() {
+        assert_eq!(with_reply_trailer("hello", None), "hello");
+        assert_eq!(split_reply_trailer("hello"), ("hello", None));
+
+        let wire = with_reply_trailer("hello\nworld", Some(&PARENT));
+        assert_eq!(wire.chars().count(), "hello\nworld".chars().count() + REPLY_TRAILER_CHARS);
+        assert_eq!(wire.len(), "hello\nworld".len() + REPLY_TRAILER_BYTES);
+        assert_eq!(split_reply_trailer(&wire), ("hello\nworld", Some(PARENT)));
+        assert_eq!(chat_display_text(&wire), "hello\nworld");
+        // Every character added is a default-ignorable tag character, which is
+        // what makes the trailer draw as nothing on a build that ignores it.
+        assert!(wire[..].strip_prefix("hello\nworld").unwrap().chars().all(|c| {
+            ('\u{E0000}'..='\u{E0FFF}').contains(&c)
+        }));
+
+        assert_eq!(
+            chat_reply_parent_hex(&wire, &hex::encode(CHAT_MSG_ID)),
+            Some(hex::encode(PARENT))
+        );
+        assert_eq!(
+            chat_reply_parent_hex(&wire, &hex::encode(PARENT).to_ascii_uppercase()),
+            None,
+            "a line naming itself as its parent is not a reply"
+        );
+        assert_eq!(chat_reply_parent_hex("hello", "00"), None);
+    }
+
+    #[test]
+    fn only_the_exact_trailer_form_is_read_as_a_reply() {
+        let wire = with_reply_trailer("hi", Some(&PARENT));
+
+        // Nothing to reply with: left alone, as the invisible text it is.
+        let bare = with_reply_trailer("", Some(&PARENT));
+        assert_eq!(split_reply_trailer(&bare), (bare.as_str(), None));
+
+        // Upper-case tag digits would not re-encode to the same bytes.
+        let upper: String = wire
+            .chars()
+            .map(|c| match c as u32 {
+                x @ 0xE0061..=0xE0066 => char::from_u32(x - 0x20).unwrap(),
+                _ => c,
+            })
+            .collect();
+        assert_ne!(upper, wire);
+        assert_eq!(split_reply_trailer(&upper).1, None);
+
+        // One digit short, a trailer mid-text, and a flag's tag sequence.
+        let mut short = wire.clone();
+        short.pop();
+        assert_eq!(split_reply_trailer(&short).1, None);
+        let buried = format!("{wire} and more");
+        assert_eq!(split_reply_trailer(&buried).1, None);
+        let flag = "go \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+        assert_eq!(split_reply_trailer(flag), (flag, None));
+        let flag_reply = with_reply_trailer(flag, Some(&PARENT));
+        assert_eq!(split_reply_trailer(&flag_reply), (flag, Some(PARENT)));
+
+        // Pasted trailers go, however many; the body before them stays.
+        let doubled = with_reply_trailer(&wire, Some(&[7u8; 16]));
+        assert_eq!(split_reply_trailer(&doubled), (wire.as_str(), Some([7u8; 16])));
+        assert_eq!(strip_reply_trailers(&doubled), "hi");
+        assert_eq!(strip_reply_trailers("plain"), "plain");
+    }
+
+    /// The compatibility claim, checked against the decoder a v1.6 build runs.
+    ///
+    /// `decode_channel_chat_plain` and `sanitize_chat_text` are byte-for-byte
+    /// what v1.6.0 through v1.6.7 shipped, so this is the old receive path, not a
+    /// model of it: the line verifies, sanitising leaves it unchanged (so the
+    /// signature is kept and the line is re-served), it fits the 4096-byte cap
+    /// the old receiver checks, and the text it hands on is the body plus
+    /// characters that draw as nothing.
+    #[test]
+    fn a_reply_verifies_and_survives_the_v1_6_receive_path_unchanged() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let body = "x".repeat(4096 - REPLY_TRAILER_BYTES);
+        let wire = with_reply_trailer(&body, Some(&PARENT));
+        assert_eq!(wire.len(), 4096, "the longest reply a sender allows fits the old cap");
+
+        let frame = chat_frame(&alice, &wire);
+        let (pk, text, _sig) =
+            decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+                .expect("an old build must accept a reply as an ordinary signed line");
+        assert_eq!(pk, alice.verifying_key().to_bytes());
+        assert_eq!(text, wire);
+        let cleaned = crate::security::sanitize_chat_text(&text);
+        assert_eq!(cleaned, text, "sanitising must not touch the trailer, or the signature is dropped");
+        assert!(!cleaned.is_empty() && cleaned.len() <= 4096);
+        assert_eq!(split_reply_trailer(&text), (body.as_str(), Some(PARENT)));
+    }
+
+    #[test]
+    fn the_authors_signature_covers_the_reply_reference() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let wire = with_reply_trailer("agreed", Some(&PARENT));
+        let frame = chat_frame(&alice, &wire);
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_some());
+
+        // Retargeted at another line, and stripped back to a plain line, by a
+        // relay that holds the room key but not the author's signing key.
+        let sig: [u8; 64] = frame[33..97].try_into().unwrap();
+        let pk = alice.verifying_key().to_bytes();
+        let retargeted = encode_channel_chat_plain_presigned(
+            &pk,
+            &sig,
+            &with_reply_trailer("agreed", Some(&[0xEEu8; 16])),
+        );
+        let stripped = encode_channel_chat_plain_presigned(&pk, &sig, "agreed");
+        for forged in [retargeted, stripped] {
+            assert!(
+                decode_channel_chat_plain(&forged, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+                "the parent a line answers is part of what its author signed"
+            );
+        }
+        // Any single byte of the trailer.
+        for at in (frame.len() - REPLY_TRAILER_BYTES)..frame.len() {
+            let mut tampered = frame.clone();
+            tampered[at] ^= 0x01;
+            assert!(
+                decode_channel_chat_plain(&tampered, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+                    .is_none(),
+                "trailer byte {at} must not be malleable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_of_a_reply_carries_the_same_signed_reference() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let revised = with_reply_trailer("agreed, mostly", Some(&PARENT));
+        let frame = edit_frame(&alice, &revised, CHAT_TS + 30);
+        let edit = decode_channel_chat_edit(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(split_reply_trailer(&edit.text), ("agreed, mostly", Some(PARENT)));
+        assert_eq!(crate::security::sanitize_chat_text(&edit.text), edit.text);
+
+        let pk = alice.verifying_key().to_bytes();
+        let stripped = encode_channel_chat_edit_presigned(
+            &pk,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            CHAT_TS + 30,
+            &edit.signature,
+            "agreed, mostly",
+        );
+        assert!(
+            decode_channel_chat_edit(&stripped, &CHAT_CHANNEL).is_none(),
+            "an edit's reference is signed too, so a relay cannot detach the quote"
+        );
+    }
+
     #[test]
     fn the_edit_window_needs_both_the_authors_clock_and_our_own() {
         let sent = 1_000_000i64;
@@ -3840,6 +4383,54 @@ mod tests {
         let frame = encode_channel_reactions(std::slice::from_ref(&future));
         let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
         assert_eq!(decoded, vec![future]);
+    }
+
+    #[test]
+    fn every_curated_reaction_round_trips_in_the_frame_v1_6_parses() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entries: Vec<ChannelReaction> = (REACTION_UP..=REACTION_CURATED_MAX)
+            .map(|code| {
+                let mut target = CHAT_MSG_ID;
+                target[0] = code;
+                reaction_entry(&alice, target, code, CHAT_TS + i64::from(code))
+            })
+            .collect();
+        assert!(entries.len() <= CHANNEL_REACTION_MAX_PER_FRAME);
+        let frame = encode_channel_reactions(&entries);
+        // The layout v1.6.x decodes: same version byte, same 121-byte entry,
+        // the code a single byte in the same place. A richer set that needed a
+        // wider field would have been a new frame those builds drop whole.
+        assert_eq!(frame[0], 20);
+        assert_eq!(REACTION_ENTRY_LEN, 121);
+        assert_eq!(frame.len(), 2 + entries.len() * 121);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(frame[2 + i * REACTION_ENTRY_LEN + 48], entry.reaction);
+        }
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn a_curated_code_is_bound_by_the_signature() {
+        // Relabelling 🎉 as 👍 in transit must not survive: the code is what
+        // old builds count, so a hop rewriting it would put words in a
+        // member's mouth on exactly the builds that cannot see the original.
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entry = reaction_entry(&alice, CHAT_MSG_ID, 8, CHAT_TS + 1);
+        let mut frame = encode_channel_reactions(std::slice::from_ref(&entry));
+        frame[2 + 48] = REACTION_UP;
+        assert_eq!(decode_channel_reactions(&frame, &CHAT_CHANNEL), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_curated_range_starts_after_none_and_stops_at_the_last_shipped_code() {
+        assert!(!reaction_is_curated(REACTION_NONE));
+        for code in [REACTION_UP, REACTION_DOWN, REACTION_HEART] {
+            assert!(reaction_is_curated(code), "{code} must keep its v1.6 meaning");
+        }
+        assert!(reaction_is_curated(REACTION_CURATED_MAX));
+        assert!(!reaction_is_curated(REACTION_CURATED_MAX + 1));
+        assert!(!reaction_is_curated(u8::MAX));
     }
 
     #[test]
@@ -6065,6 +6656,345 @@ mod tests {
                 "the room on screen is the one worth walking more often"
             );
         }
+    }
+
+    fn typing_frame(sk: &SigningKey, typing: bool) -> Vec<u8> {
+        let pk = sk.verifying_key().to_bytes();
+        encode_channel_typing(sk, &pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, typing)
+    }
+
+    #[test]
+    fn a_typing_frame_round_trips_and_names_only_the_member_who_signed_it() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        for typing in [true, false] {
+            let frame = typing_frame(&alice, typing);
+            assert_eq!(frame.len(), TYPING_FRAME_LEN);
+            assert_eq!(
+                decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS),
+                Some((alice_pk, typing))
+            );
+        }
+
+        let frame = typing_frame(&alice, true);
+        // Moved into another room, onto another envelope, or re-dated.
+        assert!(decode_channel_typing(&frame, &[9u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &[9u8; 16], CHAT_TS).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+        // Relabelled as somebody else's, by a member who holds the room key but
+        // not that member's signing key.
+        let bob = SigningKey::generate(&mut OsRng);
+        let mut relabelled = frame.clone();
+        relabelled[1..33].copy_from_slice(&bob.verifying_key().to_bytes());
+        assert!(decode_channel_typing(&relabelled, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let forged = encode_channel_typing(&bob, &alice_pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, true);
+        assert!(decode_channel_typing(&forged, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // "Stopped" turned into "typing", and a state byte that is neither.
+        let mut flipped = typing_frame(&alice, false);
+        flipped[33] = 1;
+        assert!(decode_channel_typing(&flipped, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut odd = frame.clone();
+        odd[33] = 2;
+        assert!(decode_channel_typing(&odd, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // Truncated or padded.
+        assert!(decode_channel_typing(&frame[..frame.len() - 1], &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut padded = frame.clone();
+        padded.push(0);
+        assert!(decode_channel_typing(&padded, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    #[test]
+    fn a_typing_frame_survives_the_room_envelope() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let key = [5u8; 32];
+        let plain = typing_frame(&alice, true);
+        let sealed = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &key,
+            CHAT_TS as u64,
+            &plain,
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        );
+        let wire = sealed.encode();
+        let back = ChannelGossip::decode(&wire).expect("the ordinary envelope");
+        assert_eq!(back.decrypt(&key).as_deref(), Some(plain.as_slice()));
+        assert!(back.decrypt(&[6u8; 32]).is_none(), "only room members can read it");
+        assert_eq!(
+            decode_channel_typing(&plain, &back.channel_id, &back.msg_id, back.timestamp),
+            Some((alice.verifying_key().to_bytes(), true))
+        );
+    }
+
+    #[test]
+    fn typing_is_only_believed_for_a_few_seconds_either_side_of_now() {
+        let now = 1_700_000_000;
+        assert!(typing_timestamp_fresh(now, now));
+        assert!(typing_timestamp_fresh(now - CHANNEL_TYPING_MAX_AGE_SECS, now));
+        assert!(!typing_timestamp_fresh(now - CHANNEL_TYPING_MAX_AGE_SECS - 1, now));
+        assert!(typing_timestamp_fresh(now + CHANNEL_TYPING_MAX_FUTURE_SECS, now));
+        assert!(!typing_timestamp_fresh(now + CHANNEL_TYPING_MAX_FUTURE_SECS + 1, now));
+        // Old enough that `gossip_timestamp_ok` would still take it for catch-up.
+        assert!(gossip_timestamp_ok(now - 3600, now));
+        assert!(!typing_timestamp_fresh(now - 3600, now));
+        assert!(!typing_timestamp_fresh(i64::MIN, now));
+        assert!(!typing_timestamp_fresh(i64::MAX, now));
+    }
+
+    #[test]
+    fn a_typing_signal_is_shown_only_for_a_fresh_unbanned_member_under_budget() {
+        let local = [1u8; 32];
+        let ada = [2u8; 32];
+        let now = 1_700_000_000;
+        let charged = std::cell::Cell::new(0);
+        let rate = |ok: bool| {
+            let charged = &charged;
+            move || {
+                charged.set(charged.get() + 1);
+                ok
+            }
+        };
+
+        assert_eq!(admit_channel_typing(&ada, &local, Some(false), now, now, rate(true)), Ok(()));
+        assert_eq!(charged.get(), 1);
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now, now, rate(false)),
+            Err(TypingRefusal::RateLimited)
+        );
+        assert_eq!(charged.get(), 2);
+
+        // Refused before the budget is touched, so none of these is charged to
+        // the member they name.
+        charged.set(0);
+        assert_eq!(
+            admit_channel_typing(&local, &local, Some(false), now, now, rate(true)),
+            Err(TypingRefusal::Own)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now - 60, now, rate(true)),
+            Err(TypingRefusal::Stale)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now + 60, now, rate(true)),
+            Err(TypingRefusal::Stale)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(true), now, now, rate(true)),
+            Err(TypingRefusal::NotAMember),
+            "a banned member is not shown typing"
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, None, now, now, rate(true)),
+            Err(TypingRefusal::NotAMember),
+            "a signal introduces nobody"
+        );
+        assert_eq!(charged.get(), 0);
+    }
+
+    #[test]
+    fn typing_is_rate_limited_per_member_per_room_on_its_own_budget() {
+        let room = [1u8; 16];
+        let ada = [2u8; 32];
+        let bo = [3u8; 32];
+        let t0 = Instant::now();
+        let mut seen = HashMap::new();
+        for _ in 0..CHANNEL_TYPING_RECV_PER_WINDOW {
+            assert!(typing_recv_allow(&mut seen, room, &ada, t0));
+        }
+        assert!(!typing_recv_allow(&mut seen, room, &ada, t0));
+        // Somebody else, or the same member elsewhere, is not held back.
+        assert!(typing_recv_allow(&mut seen, room, &bo, t0));
+        assert!(typing_recv_allow(&mut seen, [9u8; 16], &ada, t0));
+        // Once the window has rolled past, Ada is admitted again.
+        let later = t0 + Duration::from_millis(CHANNEL_TYPING_REFRESH_SECS * 1000 + 1);
+        assert!(typing_recv_allow(&mut seen, room, &ada, later));
+
+        // Apart from chat: typing at the full allowance leaves the author's
+        // chat budget untouched.
+        let mut chat = HashMap::new();
+        for _ in 0..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(author_gossip_allow(&mut chat, room, &ada, t0));
+        }
+
+        // A full map refuses a newcomer rather than growing.
+        let mut full: HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>> = HashMap::new();
+        for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
+            let mut author = [0u8; 32];
+            author[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(typing_recv_allow(&mut full, room, &author, t0));
+        }
+        assert!(!typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        prune_rate_windows(&mut full, later + Duration::from_secs(60), Duration::from_secs(60));
+        assert!(full.is_empty());
+        assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], later));
+    }
+
+    #[test]
+    fn this_device_sends_at_most_a_few_typing_frames_per_room_per_window() {
+        let room = [1u8; 16];
+        let t0 = Instant::now();
+        let mut sent = HashMap::new();
+        for _ in 0..CHANNEL_TYPING_SEND_PER_WINDOW {
+            assert!(typing_send_allow(&mut sent, room, t0));
+        }
+        assert!(!typing_send_allow(&mut sent, room, t0 + Duration::from_secs(1)));
+        assert!(typing_send_allow(&mut sent, [2u8; 16], t0), "per room");
+        let later = t0 + Duration::from_millis(CHANNEL_TYPING_REFRESH_SECS * 1000 + 1);
+        assert!(typing_send_allow(&mut sent, room, later));
+    }
+
+    #[test]
+    fn typing_goes_one_hop_to_reachable_members_and_not_at_all_in_a_large_room() {
+        let local = [0u8; 32];
+        let member = |i: u8| [i; 32];
+        let present: Vec<[u8; 32]> = (0..=5).map(member).collect();
+        // Us excluded, and only members with a live session.
+        assert_eq!(
+            typing_recipients(&local, &present, |pk| pk[0] % 2 == 1),
+            Some(vec![member(1), member(3), member(5)])
+        );
+        assert_eq!(typing_recipients(&local, &present, |_| false), Some(Vec::new()));
+
+        let at_limit: Vec<[u8; 32]> = (0..CHANNEL_TYPING_MAX_ROOM as u8).map(member).collect();
+        assert_eq!(
+            typing_recipients(&local, &at_limit, |_| true).map(|r| r.len()),
+            Some(CHANNEL_TYPING_MAX_ROOM - 1)
+        );
+        let over: Vec<[u8; 32]> = (0..=CHANNEL_TYPING_MAX_ROOM as u8).map(member).collect();
+        assert_eq!(typing_recipients(&local, &over, |_| true), None);
+
+        // Nobody passes it on: the hop budget written on it is already spent.
+        let sealed = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &[5u8; 32],
+            1,
+            b"x",
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        );
+        assert!(sealed.decremented_ttl().is_none());
+    }
+
+    /// Typing never reaches anything that stores or re-serves.
+    ///
+    /// Catch-up serves what the database holds — chat lines, edits folded into
+    /// them, and reactions — and those enter only through the decoders below,
+    /// every one of which refuses a typing frame. The typing branch itself
+    /// writes nothing (`apply_channel_typing`), so there is nothing for a
+    /// catch-up to find.
+    #[test]
+    fn a_typing_frame_is_refused_by_every_decoder_that_stores_or_acts() {
+        let alice = SigningKey::generate(&mut OsRng);
+        for typing in [true, false] {
+            let plain = typing_frame(&alice, typing);
+            assert!(decode_channel_chat_plain(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_chat_edit(&plain, &CHAT_CHANNEL).is_none());
+            assert!(decode_channel_reactions(&plain, &CHAT_CHANNEL).is_none());
+            assert!(decode_channel_mod_action(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_sync_request(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_presence_beacons(&plain, &CHAT_CHANNEL, 0, CHAT_TS).is_none());
+            assert!(decode_channel_handoff_offer(&plain, &CHAT_CHANNEL, &[7u8; 32]).is_none());
+            assert!(decode_channel_handoff_ready(&plain, &CHAT_CHANNEL).is_none());
+            assert!(xfer_frame_peek(&plain).is_none());
+        }
+        // And the other way round: no stored kind reads as typing.
+        let chat = chat_frame(&alice, "hello");
+        assert!(decode_channel_typing(&chat, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let reactions =
+            encode_channel_reactions(&[reaction_entry(&alice, CHAT_MSG_ID, REACTION_UP, CHAT_TS)]);
+        assert!(decode_channel_typing(&reactions, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    /// Where a decrypted plaintext goes in v1.6.7's `handle_inbound_channel_gossip`
+    /// (`git show v1.6.7:src-tauri/src/network/mod.rs`, the function at line
+    /// 18659).
+    ///
+    /// Copied from that build rather than read from this one, whose constants
+    /// are free to move. Every v1.6.7 decoder opens with `bytes[0] != ITS_VERSION`
+    /// (`git show v1.6.7:src-tauri/src/network/ember/channel.rs`), so the first
+    /// byte and the order below are the whole of its routing; the length checks
+    /// after it can only refuse more. A plaintext no branch claims reaches the
+    /// chat decoder's `else`, which is `debug!(..); return;` — no reputation
+    /// event, no relay, no write, and the hop was already admitted by
+    /// `channel_gossip_inbound_ok`, which v1.6.7 documents and implements as
+    /// unscored.
+    #[derive(Debug, PartialEq, Eq)]
+    enum V167Branch {
+        Transfer,
+        Presence,
+        HandoffOffer,
+        HandoffReady,
+        SyncRequest,
+        ModAction,
+        Edit,
+        Reactions,
+        Chat,
+        DroppedWithDebugLog,
+    }
+
+    fn v1_6_7_branch(plain: &[u8]) -> V167Branch {
+        // XFER_OFFER, _REPLY, _BLOCK_REQUEST, _BLOCK_DATA_SEALED, _CANCEL, _DONE.
+        const V167_XFER: [u8; 6] = [9, 10, 11, 21, 13, 14];
+        let Some(&first) = plain.first() else {
+            return V167Branch::DroppedWithDebugLog;
+        };
+        match first {
+            b if V167_XFER.contains(&b) => V167Branch::Transfer,
+            22 => V167Branch::Presence,
+            6 => V167Branch::HandoffOffer,
+            17 => V167Branch::HandoffReady,
+            18 => V167Branch::SyncRequest,
+            16 => V167Branch::ModAction,
+            19 => V167Branch::Edit,
+            20 => V167Branch::Reactions,
+            15 => V167Branch::Chat,
+            _ => V167Branch::DroppedWithDebugLog,
+        }
+    }
+
+    #[test]
+    fn a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched() {
+        let alice = SigningKey::generate(&mut OsRng);
+        // The model routes what this build sends the way v1.6.7 did.
+        assert_eq!(v1_6_7_branch(&chat_frame(&alice, "hi")), V167Branch::Chat);
+        assert_eq!(v1_6_7_branch(&edit_frame(&alice, "hi", CHAT_TS + 1)), V167Branch::Edit);
+        assert_eq!(
+            v1_6_7_branch(&encode_channel_reactions(&[reaction_entry(
+                &alice,
+                CHAT_MSG_ID,
+                REACTION_UP,
+                CHAT_TS
+            )])),
+            V167Branch::Reactions
+        );
+        for typing in [true, false] {
+            assert_eq!(
+                v1_6_7_branch(&typing_frame(&alice, typing)),
+                V167Branch::DroppedWithDebugLog
+            );
+        }
+        // The number is not one v1.6.7 ever used or retired, so no old peer
+        // reads it as something else.
+        const V167_ASSIGNED_OR_RETIRED: [u8; 22] =
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&TYPING_PLAIN_VERSION));
+        // It reaches that dispatch at all only through the envelope v1.6.7 also
+        // speaks: outer version 1, the same header, and a hop budget it would
+        // not forward on even if it knew the frame.
+        let wire = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &[5u8; 32],
+            1,
+            &typing_frame(&alice, true),
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        )
+        .encode();
+        assert_eq!(wire[0], 1);
+        assert_eq!(wire[33], CHANNEL_TYPING_TTL);
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

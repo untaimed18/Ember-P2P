@@ -27,8 +27,8 @@
     channels as channelsStore,
     hiddenChannels,
     ignoredMembers,
-    mutedChannels,
-    toggleChannelMute,
+    channelNotifyLevels,
+    setChannelNotifyLevel,
     toggleMemberIgnore,
     unhideChannel,
   } from '$lib/stores/channels';
@@ -1578,6 +1578,9 @@
     const name = channelNamesById.get(channelId.toLowerCase())?.trim();
     return name || shortPubkey(channelId);
   }
+
+  /** Rooms turned down from "All messages", with the level each is at. */
+  let quietRooms = $derived(Object.entries($channelNotifyLevels));
 
   function handleResetSpamData() {
     spamResetConfirmOpen = true;
@@ -3801,26 +3804,29 @@
                 <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
               </div>
               <div class="channels-pref-action">
-                <span class="channels-pref-count">{$mutedChannels.length}</span>
+                <span class="channels-pref-count">{quietRooms.length}</span>
                 <button
                   type="button"
                   class="ghost"
-                  disabled={$mutedChannels.length === 0}
+                  disabled={quietRooms.length === 0}
                   onclick={() => { mutedClearConfirmOpen = true; }}
                 >{m.settings_channels_clear()}</button>
               </div>
             </div>
-            {#if $mutedChannels.length > 0}
+            {#if quietRooms.length > 0}
               <ul class="ignored-list">
-                {#each $mutedChannels as channelId (channelId)}
+                {#each quietRooms as [channelId, level] (channelId)}
                   <li>
                     <span class="ignored-name">
                       <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                      <span class="ignored-scope">{level === 'mentions'
+                        ? m.channels_notify_mentions()
+                        : m.channels_notify_none()}</span>
                     </span>
                     <button
                       type="button"
                       class="ghost"
-                      onclick={() => toggleChannelMute(channelId)}
+                      onclick={() => setChannelNotifyLevel(channelId, 'all')}
                     >{m.channels_unmute()}</button>
                   </li>
                 {/each}
@@ -4341,7 +4347,7 @@
   message={m.settings_channels_clear_muted_message()}
   confirmLabel={m.settings_channels_clear()}
   danger={true}
-  onconfirm={() => { mutedChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+  onconfirm={() => { channelNotifyLevels.set({}); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
 />
 
 <ConfirmDialog

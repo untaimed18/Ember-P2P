@@ -157,6 +157,8 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_channel_claim.clear();
     state.channel_gossip_from_times.clear();
     state.channel_gossip_author_times.clear();
+    state.channel_typing_recv_times.clear();
+    state.channel_typing_sent_times.clear();
     state.channel_history_sync_at.clear();
     state.channel_history_sync_mark.clear();
     state.channel_history_sync_ingested.clear();

@@ -27,7 +27,22 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 54;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 57;
+
+/// Longest room name kept from a moderation snapshot. Keep in step with
+/// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
+/// a room under.
+const ROOM_NAME_MAX_CHARS: usize = 32;
+
+/// [`StoredChannel::roster_count`] for the `channels` row aliased `c`.
+///
+/// A lifted ban leaves its row behind at `last_seen = 0`, naming someone this
+/// device may never have seen in the room, so a never-seen row counts only
+/// when it is a moderator — the owner's own record vouching for them.
+const CHANNEL_ROSTER_COUNT_SQL: &str = "(SELECT COUNT(*) FROM channel_members r
+                     WHERE r.channel_id = c.channel_id
+                       AND r.banned = 0
+                       AND (r.last_seen > 0 OR r.moderator = 1))";
 
 /// A friend row with no public key bound to its hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +107,37 @@ pub struct ChannelMessageRow {
     /// friend-chat vocabulary because it means the same three things. Received
     /// rows are always delivered — we have it, which is the whole claim.
     pub delivery: i64,
+    /// Hex wire id of the line this one replies to. `message` is the body alone;
+    /// the signed trailer carrying this id is stripped on the way out.
+    pub reply_to: Option<String>,
+    /// That line as this device holds it now, or `None` when it is not here.
+    pub reply_parent: Option<ChannelReplyParent>,
+    /// The parent is missing because the user removed it from this device, as
+    /// opposed to never having received it.
+    pub reply_parent_deleted: bool,
+}
+
+/// What a reply's quote needs of the line it answers.
+///
+/// Read at the time the reply is read, so a parent revised since shows its
+/// current words, and carried with the reply so the quote can be drawn — and
+/// jumped to by row id — without the parent being among the loaded pages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChannelReplyParent {
+    /// Local row id, which is what the transcript pages by.
+    pub id: i64,
+    pub sender_pubkey: String,
+    /// The start of the parent's body, trailer removed. Bounded by
+    /// [`Database::REPLY_EXCERPT_CHARS`]; the UI cuts it to one line.
+    pub excerpt: String,
+}
+
+/// A reply's parent as this device knows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelReplyLookup {
+    pub parent: Option<ChannelReplyParent>,
+    /// Absent because it was removed here; see [`ChannelMessageRow::reply_parent_deleted`].
+    pub deleted: bool,
 }
 
 /// One line as it goes back on the wire for a member catching up.
@@ -122,6 +168,10 @@ pub struct ChannelEditTarget {
     pub direction: String,
     pub timestamp: i64,
     pub first_seen_at: i64,
+    /// The parent this line replies to, so a revision can carry the same signed
+    /// reference forward rather than silently turning the reply into a plain
+    /// line.
+    pub reply_to: Option<String>,
 }
 
 /// What a verified edit frame did to our copy of the line it names.
@@ -200,6 +250,17 @@ pub struct CachedChannel {
     pub name: String,
 }
 
+/// The `channels.pinned_msg_ids` column: comma-separated hex wire ids. Anything
+/// that is not one is skipped rather than failing the whole row.
+fn parse_pinned_msg_ids(stored: &str) -> Vec<String> {
+    stored
+        .split(',')
+        .map(str::trim)
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// One joined channel, as listed in the Channels page.
 #[derive(Debug, Clone)]
 pub struct StoredChannel {
@@ -213,6 +274,11 @@ pub struct StoredChannel {
     pub joined_at: i64,
     pub last_active: i64,
     pub member_count: i64,
+    /// Everyone this device knows to be in the room, present or not: roster
+    /// rows that are neither banned nor a placeholder left by a lifted ban.
+    /// Unlike `member_count` it does not move as people come and go, which is
+    /// what makes it usable as a sort key. 0 from the lite queries.
+    pub roster_count: i64,
     pub unread: i64,
     /// Empty unless this room's owner published a successor mapping.
     pub successor_id: String,
@@ -253,9 +319,29 @@ pub struct StoredChannel {
     /// Seconds a member must wait between messages, 0 when the owner has not
     /// turned slow mode on. Carried on the signed moderation record.
     pub slow_mode_secs: i64,
+    /// Only the owner and moderators may post. Carried on the signed
+    /// moderation record; false for rooms whose owner never set it.
+    pub announce_only: bool,
+    /// Hex wire ids of the owner's pinned messages, oldest pin first.
+    pub pinned_msg_ids: Vec<String>,
+    /// Unix seconds of this device's last rename of a room it owns, 0 if never.
+    /// Non-zero is what puts the name on the owner's moderation snapshot.
+    pub renamed_at: i64,
 }
 
 impl StoredChannel {
+    /// [`Self::pinned_msg_ids`] as the wire ids a moderation snapshot carries.
+    pub fn pinned_msg_id_bytes(&self) -> Vec<[u8; 16]> {
+        self.pinned_msg_ids
+            .iter()
+            .filter_map(|id| {
+                let mut out = [0u8; 16];
+                hex::decode_to_slice(id, &mut out).ok()?;
+                Some(out)
+            })
+            .collect()
+    }
+
     /// Presence, send, and gossip: only while we are actually in the room
     /// and it has not been tombstoned.
     pub fn in_room_now(&self) -> bool {
@@ -2631,6 +2717,61 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "friends", "intro_secret", "BLOB")?;
             set_version(&tx, 54)?;
+            tx.commit()?;
+        }
+
+        if version < 55 {
+            // When the owner last renamed a room they own, or 0. Enforces the
+            // registry's once-a-day rule before asking it, and tells the
+            // moderation snapshot to carry the name to members.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "renamed_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 55)?;
+            tx.commit()?;
+        }
+
+        if version < 56 {
+            // The line a room message replies to, as its hex wire id, or NULL.
+            //
+            // Derived from the stored text rather than taken as a separate
+            // input: the reference travels inside the signed text (see
+            // `channel::with_reply_trailer`), and the text column keeps exactly
+            // what was signed so a catch-up can re-serve it. The column exists
+            // so reads can find the parent without re-parsing every body, and it
+            // is fixed when the row is written — an edit cannot move a quote
+            // after people have answered it. No backfill: no build before this
+            // one wrote a trailer.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "channel_messages", "reply_to", "TEXT")?;
+            set_version(&tx, 56)?;
+            tx.commit()?;
+        }
+
+        if version < 57 {
+            // Announcement-only rooms and pinned messages, both carried on the
+            // owner's moderation snapshot. Off and none are how every room
+            // behaved before, so an upgrade changes nothing until an owner
+            // sets them. Pins are comma-separated hex wire ids, oldest first —
+            // at most three, so a side table would buy nothing.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "announce_only",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "pinned_msg_ids",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 57)?;
             tx.commit()?;
         }
 
@@ -6203,7 +6344,8 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
+                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC"
         );
@@ -6225,7 +6367,8 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
+                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -6332,7 +6475,8 @@ impl Database {
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
-                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
+                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at
                  FROM channels c WHERE c.channel_id = ?1",
                 params![channel_id],
                 Self::stored_channel_from_row,
@@ -6359,7 +6503,8 @@ impl Database {
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
-                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
+                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at
                  FROM channels c WHERE c.channel_id = ?1"
                 ),
                 params![channel_id],
@@ -6395,6 +6540,13 @@ impl Database {
             deleted: row.get::<_, i64>(21).unwrap_or(0) != 0,
             invites_owner_only: row.get::<_, i64>(22).unwrap_or(0) != 0,
             slow_mode_secs: row.get::<_, i64>(23).unwrap_or(0),
+            announce_only: row.get::<_, i64>(24).unwrap_or(0) != 0,
+            pinned_msg_ids: row
+                .get::<_, String>(25)
+                .map(|s| parse_pinned_msg_ids(&s))
+                .unwrap_or_default(),
+            roster_count: row.get(26)?,
+            renamed_at: row.get::<_, i64>(27).unwrap_or(0),
         })
     }
 
@@ -7138,10 +7290,23 @@ impl Database {
                 successor_owner_seed,
                 join_secret.as_ref(),
             )?;
+            // Announce-only travels: it is how the room is run, and a successor
+            // that quietly reopened the floor to everyone is not the room its
+            // members followed. Pins deliberately do not. They name messages
+            // by wire id, and `finish_channel_handoff` copies history under
+            // fresh local ids that nothing else holds, so a carried pin would
+            // name a line the successor room does not have.
             tx.execute(
-                "UPDATE channels SET predecessor_id = ?2, topic = ?3, welcome = ?4
+                "UPDATE channels SET predecessor_id = ?2, topic = ?3, welcome = ?4,
+                     announce_only = ?5
                  WHERE channel_id = ?1",
-                params![successor_channel_id, old_channel_id, old.topic, old.welcome],
+                params![
+                    successor_channel_id,
+                    old_channel_id,
+                    old.topic,
+                    old.welcome,
+                    i64::from(old.announce_only)
+                ],
             )?;
             // `ban_revised_at` travels with the row. It is the watermark
             // that orders competing ban gossip, so dropping it reset
@@ -7185,7 +7350,7 @@ impl Database {
             // under the successor's, and re-signing here is the forgery the
             // signature exists to prevent. The copy stays readable locally and
             // is not re-served to anyone else.
-            let _ = self.insert_channel_message(
+            let copied = self.insert_channel_message(
                 successor_channel_id,
                 &row.sender_pubkey,
                 &row.direction,
@@ -7195,6 +7360,16 @@ impl Database {
                 "",
                 row.read,
             );
+            // `row.message` is the body without its signed trailer, which could
+            // not verify here anyway, so the quote is carried by pointing the
+            // copy at its parent's copy. Oldest first, so that copy is already
+            // written; local-only like the rest of a handoff copy.
+            if let (Ok(copy_id), Some(parent)) = (copied, row.reply_parent.as_ref()) {
+                let _ = self.conn.lock().execute(
+                    "UPDATE channel_messages SET reply_to = ?1 WHERE id = ?2",
+                    params![format!("handoff-{old_channel_id}-{}", parent.id), copy_id],
+                );
+            }
         }
         let _ = self.clear_handoff_pending(old_channel_id);
         Ok(())
@@ -8143,6 +8318,110 @@ impl Database {
         Ok(true)
     }
 
+    /// Take the room name from an owner snapshot that
+    /// [`Self::apply_channel_moderation`] has just accepted — which is what
+    /// makes it the newest the owner has signed. Trimmed the way a Discover or
+    /// invite name is, since it reaches us the same way. Returns whether the
+    /// stored name changed.
+    pub fn apply_owner_room_name(&self, channel_id: &str, name: &str) -> anyhow::Result<bool> {
+        let name = crate::security::sanitize_remote_text(name, ROOM_NAME_MAX_CHARS);
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE channels SET name = ?2 WHERE channel_id = ?1 AND name <> ?2",
+            params![channel_id, name],
+        )?;
+        drop(conn);
+        if changed > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(changed > 0)
+    }
+
+    /// Take the announce flag and the pins from an owner snapshot that
+    /// [`Self::apply_channel_moderation`] has just accepted, the same way
+    /// [`Self::apply_owner_room_name`] takes the name — so an older record
+    /// replayed from a slow storer cannot unpin or reopen the room.
+    ///
+    /// Written whatever the record says, absence included: the writer leaves
+    /// both out when off, so absent means "off" and "none", as for slow mode.
+    /// Returns whether either changed.
+    pub fn apply_owner_room_policy(
+        &self,
+        channel_id: &str,
+        announce_only: bool,
+        pinned_msg_ids: &[[u8; 16]],
+    ) -> anyhow::Result<bool> {
+        let pins = pinned_msg_ids
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",");
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE channels SET announce_only = ?2, pinned_msg_ids = ?3
+             WHERE channel_id = ?1 AND (announce_only <> ?2 OR pinned_msg_ids <> ?3)",
+            params![channel_id, i64::from(announce_only), pins],
+        )?;
+        drop(conn);
+        if changed > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(changed > 0)
+    }
+
+    /// Which of `msg_ids` this device has been told to forget in this room.
+    ///
+    /// An owner's commit drops those from the pins it publishes. A pin merely
+    /// not held here is kept: history is trimmed per room, and the oldest pin
+    /// in a busy room is exactly the one that would fall out of it.
+    ///
+    /// Runs on the owner republish pass, on the network task, once per owned
+    /// room: an existence check and a tombstone lookup per pin, with no body
+    /// decrypted, and nothing at all for a room without pins.
+    pub fn channel_messages_removed(
+        &self,
+        channel_id: &str,
+        msg_ids: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        if msg_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut removed = Vec::new();
+        for id in msg_ids {
+            let held: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2)",
+                params![channel_id, id],
+                |row| row.get(0),
+            )?;
+            if !held && Self::channel_msg_tombstoned_locked(&conn, channel_id, id)? {
+                removed.push(id.clone());
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Record an owner's rename of their room, once the registry has granted
+    /// the name.
+    pub fn rename_owned_channel(
+        &self,
+        channel_id: &str,
+        name: &str,
+        renamed_at: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET name = ?2, renamed_at = ?3 WHERE channel_id = ?1",
+            params![channel_id, name, renamed_at],
+        )?;
+        drop(conn);
+        bump_channel_roster_generation(channel_id);
+        Ok(())
+    }
+
     /// Rooms this device owns and has not deleted, which is what the creation
     /// cap counts. Leaving a room you own does not give the slot back: the name
     /// is still claimed and the room is still yours to delete.
@@ -8375,6 +8654,9 @@ impl Database {
     /// before signatures existed. Only a row that has one can be re-served to
     /// another member, since a re-serve replays the original rather than
     /// signing afresh.
+    ///
+    /// `message` is the text exactly as signed, reply trailer included; the
+    /// `reply_to` column is read out of it here.
     pub fn insert_channel_message(
         &self,
         channel_id: &str,
@@ -8412,9 +8694,12 @@ impl Database {
                 params![held_id],
             )?;
         }
+        // From the text as stored, so the column can never disagree with the
+        // signed trailer a catch-up re-serves.
+        let reply_to = crate::network::ember::channel::chat_reply_parent_hex(message, msg_id);
         tx.execute(
-            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at, reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 channel_id,
                 sender_pubkey,
@@ -8427,7 +8712,8 @@ impl Database {
                 // Our clock, not the author's: this is what closes the edit
                 // window against a backdated revision, so it must not be
                 // something the sender can choose.
-                chrono::Utc::now().timestamp()
+                chrono::Utc::now().timestamp(),
+                reply_to
             ],
         )?;
         if tx.changes() == 0 {
@@ -8545,28 +8831,112 @@ impl Database {
             if hits.len() as i64 >= limit {
                 break;
             }
-            let Ok(message) = Self::decrypt_channel_message_body(
+            let Ok(stored_text) = Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) else {
                 continue;
             };
+            let message = crate::network::ember::channel::chat_display_text(&stored_text);
             if message.to_lowercase().contains(&needle) {
                 hits.push(ChannelMessageRow {
                     id,
                     sender_pubkey: sender,
                     direction,
-                    message,
+                    message: message.to_string(),
                     timestamp,
                     read,
                     edited_at,
                     msg_id,
                     // Search results are a jump target, not a transcript, so
-                    // they carry no bubble status of their own.
+                    // they carry no bubble status of their own — nor a quote.
                     delivery: CHAT_DELIVERED,
+                    reply_to: None,
+                    reply_parent: None,
+                    reply_parent_deleted: false,
                 });
             }
         }
         Ok(hits)
+    }
+
+    /// Longest parent excerpt a reply carries: more than any quote shows, so
+    /// the UI cuts it rather than the backend, and small enough that a page of
+    /// replies stays cheap to send.
+    pub const REPLY_EXCERPT_CHARS: usize = 280;
+
+    /// The line `parent_msg_id` names, as a reply's quote needs it.
+    ///
+    /// Read now rather than when the reply arrived, so a parent revised since
+    /// is quoted as it reads today.
+    fn channel_reply_lookup_locked(
+        conn: &Connection,
+        chat_key: Option<&[u8; 32]>,
+        channel_id: &str,
+        parent_msg_id: &str,
+    ) -> anyhow::Result<ChannelReplyLookup> {
+        let held: Option<(i64, String, String, String, i64)> = conn
+            .query_row(
+                "SELECT id, sender_pubkey, direction, message, timestamp
+                 FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+                params![channel_id, parent_msg_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        if let Some((id, sender_pubkey, direction, stored, timestamp)) = held {
+            let excerpt = match chat_key.map(|key| {
+                Self::decrypt_channel_message_body(key, id, channel_id, &direction, timestamp, &stored)
+            }) {
+                Some(Ok(text)) => crate::network::ember::channel::chat_display_text(&text)
+                    .chars()
+                    .take(Self::REPLY_EXCERPT_CHARS)
+                    .collect(),
+                _ => CHAT_UNAVAILABLE_TEXT.to_string(),
+            };
+            return Ok(ChannelReplyLookup {
+                parent: Some(ChannelReplyParent {
+                    id,
+                    sender_pubkey,
+                    excerpt,
+                }),
+                deleted: false,
+            });
+        }
+        Ok(ChannelReplyLookup {
+            parent: None,
+            deleted: Self::channel_msg_tombstoned_locked(conn, channel_id, parent_msg_id)?,
+        })
+    }
+
+    /// Whether `msg_id` has been deleted in this room, in either tombstone
+    /// form: the bare id, or `id/sender` for a row that could not prove the id
+    /// was its own (`channel_tombstone_key`).
+    fn channel_msg_tombstoned_locked(
+        conn: &Connection,
+        channel_id: &str,
+        msg_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_message_tombstones
+                 WHERE channel_id = ?1 AND (msg_id = ?2 OR substr(msg_id, 1, ?3) = ?4))",
+            params![channel_id, msg_id, msg_id.len() as i64 + 1, format!("{msg_id}/")],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// [`Self::channel_reply_lookup_locked`] for one parent, for a reply that
+    /// has just been sent or received.
+    pub fn channel_reply_lookup(
+        &self,
+        channel_id: &str,
+        parent_msg_id: &str,
+    ) -> anyhow::Result<ChannelReplyLookup> {
+        let conn = self.conn.lock();
+        Self::channel_reply_lookup_locked(
+            &conn,
+            self.chat_key.as_deref(),
+            channel_id,
+            parent_msg_id,
+        )
     }
 
     /// Lines kept per room; older ones are pruned on insert.
@@ -8699,9 +9069,10 @@ impl Database {
         limit: i64,
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<ChannelMessageRow>> {
-        let rows: Vec<(i64, String, String, String, i64, bool, i64, String, i64)> = {
+        type PageRow = (i64, String, String, String, i64, bool, i64, String, i64, Option<String>);
+        let (rows, parents) = {
             let conn = self.conn.lock();
-            let read_row = |row: &rusqlite::Row<'_>| {
+            let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<PageRow> {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -8712,11 +9083,12 @@ impl Database {
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
                 ))
             };
-            if let Some(bid) = before_id {
+            let rows: Vec<PageRow> = if let Some(bid) = before_id {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery, reply_to
                      FROM channel_messages WHERE channel_id = ?1 AND id < ?2
                      ORDER BY id DESC LIMIT ?3",
                 )?;
@@ -8724,19 +9096,48 @@ impl Database {
                 mapped.collect::<Result<Vec<_>, _>>()?
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id, delivery, reply_to
                      FROM channel_messages WHERE channel_id = ?1
                      ORDER BY id DESC LIMIT ?2",
                 )?;
                 let mapped = stmt.query_map(params![channel_id, limit], read_row)?;
                 mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            // One lookup per distinct parent, under the same lock as the page,
+            // so a quote and the page it sits in describe one moment. A page is
+            // at most a couple of hundred rows and each lookup is a unique-index
+            // seek.
+            let mut parents: std::collections::HashMap<String, ChannelReplyLookup> =
+                std::collections::HashMap::new();
+            for (.., reply_to) in &rows {
+                if let Some(parent) = reply_to {
+                    if !parents.contains_key(parent) {
+                        let lookup = Self::channel_reply_lookup_locked(
+                            &conn,
+                            self.chat_key.as_deref(),
+                            channel_id,
+                            parent,
+                        )?;
+                        parents.insert(parent.clone(), lookup);
+                    }
+                }
             }
+            (rows, parents)
+        };
+        let reply_fields = |reply_to: Option<String>| {
+            let lookup = reply_to
+                .as_ref()
+                .and_then(|parent| parents.get(parent))
+                .cloned()
+                .unwrap_or_default();
+            (reply_to, lookup.parent, lookup.deleted)
         };
         let Some(chat_key) = self.chat_key.as_deref() else {
             return Ok(rows
                 .into_iter()
                 .map(
-                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id, delivery)| {
+                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id, delivery, reply_to)| {
+                        let (reply_to, reply_parent, reply_parent_deleted) = reply_fields(reply_to);
                         ChannelMessageRow {
                             id,
                             sender_pubkey: sender,
@@ -8747,22 +9148,32 @@ impl Database {
                             edited_at,
                             msg_id,
                             delivery,
+                            reply_to,
+                            reply_parent,
+                            reply_parent_deleted,
                         }
                     },
                 )
                 .collect());
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id, delivery) in rows {
+        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id, delivery, reply_to) in
+            rows
+        {
             let message = match Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
-                Ok(message) => message,
+                // The body the member sees. The stored text keeps the signed
+                // trailer for re-serving; `reply_to` already says what it held.
+                Ok(message) => {
+                    crate::network::ember::channel::chat_display_text(&message).to_string()
+                }
                 Err(error) => {
                     tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
                     CHAT_UNAVAILABLE_TEXT.to_string()
                 }
             };
+            let (reply_to, reply_parent, reply_parent_deleted) = reply_fields(reply_to);
             messages.push(ChannelMessageRow {
                 id,
                 sender_pubkey: sender,
@@ -8773,6 +9184,9 @@ impl Database {
                 edited_at,
                 msg_id,
                 delivery,
+                reply_to,
+                reply_parent,
+                reply_parent_deleted,
             });
         }
         Ok(messages)
@@ -9049,7 +9463,7 @@ impl Database {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
-                "SELECT msg_id, sender_pubkey, direction, timestamp, first_seen_at
+                "SELECT msg_id, sender_pubkey, direction, timestamp, first_seen_at, reply_to
                  FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
                 params![channel_id, id],
                 |row| {
@@ -9059,6 +9473,7 @@ impl Database {
                         direction: row.get(2)?,
                         timestamp: row.get(3)?,
                         first_seen_at: row.get(4)?,
+                        reply_to: row.get(5)?,
                     })
                 },
             )
@@ -9192,17 +9607,21 @@ impl Database {
                 {
                     return Ok(ChannelEditOutcome::OutsideWindow);
                 }
+                // The revision stands in for a line we never held, so its trailer
+                // is the only word on what that line replied to. A revision of a
+                // row we do hold leaves `reply_to` as the original set it.
                 tx.execute(
                     "INSERT INTO channel_messages
-                        (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at)
-                     VALUES (?1, ?2, 'received', ?3, ?4, 0, ?5, '', ?6)",
+                        (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at, reply_to)
+                     VALUES (?1, ?2, 'received', ?3, ?4, 0, ?5, '', ?6, ?7)",
                     params![
                         channel_id,
                         editor_pubkey,
                         CHAT_CIPHERTEXT_PREFIX,
                         original_timestamp,
                         msg_id,
-                        now
+                        now,
+                        crate::network::ember::channel::chat_reply_parent_hex(text, msg_id)
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -9321,6 +9740,9 @@ impl Database {
     /// cleared reaction has to stay on disk to carry its `reacted_at`, or a stale
     /// frame reasserting the old one would win the newer-wins comparison against
     /// a missing row.
+    ///
+    /// Ordered by when each member reacted, which is the order the UI names
+    /// them in; the key breaks ties so the same rows always read back the same.
     pub fn channel_message_reactions(
         &self,
         channel_id: &str,
@@ -9328,7 +9750,8 @@ impl Database {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT msg_id, member_pubkey, reaction FROM channel_message_reactions
-             WHERE channel_id = ?1 AND reaction <> 0",
+             WHERE channel_id = ?1 AND reaction <> 0
+             ORDER BY reacted_at, member_pubkey",
         )?;
         let mapped = stmt.query_map(params![channel_id], |row| {
             Ok((
@@ -12431,6 +12854,171 @@ mod tests {
     }
 
     #[test]
+    fn a_room_rename_reaches_a_member_and_the_owner_remembers_when() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-rename-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(&channel_id, &"cd".repeat(32), "Lobby", "public", false, None, None)
+            .expect("insert channel");
+
+        // A member: the name arrives with an owner snapshot.
+        assert!(db.apply_owner_room_name(&channel_id, "Lounge").unwrap());
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().name, "Lounge");
+        assert!(
+            !db.apply_owner_room_name(&channel_id, "Lounge").unwrap(),
+            "the same name again is not a change"
+        );
+        // Trimmed like any name that comes off the network, and nothing left
+        // to show is not a name.
+        assert!(db
+            .apply_owner_room_name(&channel_id, &format!("Lo\u{200B}bby {}", "x".repeat(100)))
+            .unwrap());
+        let trimmed = db.get_channel(&channel_id).unwrap().unwrap().name;
+        assert!(!trimmed.contains('\u{200B}'));
+        assert_eq!(trimmed.chars().count(), ROOM_NAME_MAX_CHARS);
+        assert!(!db.apply_owner_room_name(&channel_id, "\u{200B}\u{FEFF}").unwrap());
+
+        // An owner: the rename is stamped so the next one can be rationed.
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().renamed_at, 0);
+        db.rename_owned_channel(&channel_id, "Den", 1_234).unwrap();
+        let renamed = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(renamed.name, "Den");
+        assert_eq!(renamed.renamed_at, 1_234);
+        assert_eq!(
+            db.list_channels_lite().unwrap()[0].renamed_at,
+            1_234,
+            "the owner loop reads it from the roster query it already runs"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// v57 adds the announce flag and the pin list to an existing profile,
+    /// both starting off, and the policy write stores and clears them.
+    #[test]
+    fn announce_only_and_pins_migrate_and_apply() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-v57-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(&channel_id, &"cd".repeat(32), "Lobby", "public", false, None, None)
+            .expect("insert channel");
+        // Back to a v56 profile, with the room already in it.
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE channels DROP COLUMN announce_only;
+                 ALTER TABLE channels DROP COLUMN pinned_msg_ids;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (56);",
+            )
+            .expect("roll back to v56");
+        }
+        drop(db);
+
+        let db = Database::open_at(&path).expect("reopen and migrate");
+        assert_eq!(db.schema_version(), 57);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 57);
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!row.announce_only, "an upgraded room is open to everyone");
+        assert!(row.pinned_msg_ids.is_empty());
+
+        let pins = [[0xA1u8; 16], [0xB2u8; 16]];
+        assert!(db.apply_owner_room_policy(&channel_id, true, &pins).unwrap());
+        assert!(
+            !db.apply_owner_room_policy(&channel_id, true, &pins).unwrap(),
+            "the same policy again is not a change"
+        );
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(row.announce_only);
+        assert_eq!(row.pinned_msg_ids, vec!["a1".repeat(16), "b2".repeat(16)]);
+        assert_eq!(row.pinned_msg_id_bytes(), pins.to_vec());
+        // The lite read the network loop republishes from carries them too.
+        let lite = db.get_channel_lite(&channel_id).unwrap().unwrap();
+        assert!(lite.announce_only);
+        assert_eq!(lite.pinned_msg_ids.len(), 2);
+
+        assert!(db.apply_owner_room_policy(&channel_id, false, &[]).unwrap());
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!row.announce_only);
+        assert!(row.pinned_msg_ids.is_empty());
+
+        // Idempotent: opening again does not fail on columns that exist.
+        drop(db);
+        let again = Database::open_at(&path).expect("reopen at the current version");
+        assert_eq!(again.schema_version(), 57);
+
+        drop(again);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A pin the owner removed from this device is reported for pruning; one
+    /// merely not held — never synced, or trimmed from history — is not.
+    #[test]
+    fn only_removed_pins_are_reported_for_pruning() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-pin-prune-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(&channel_id, &"cd".repeat(32), "Lobby", "public", true, None, None)
+            .expect("insert channel");
+        let kept = "11".repeat(16);
+        let removed = "22".repeat(16);
+        let never_held = "33".repeat(16);
+        let author = "ee".repeat(32);
+        db.insert_channel_message(&channel_id, &author, "received", "kept", &kept, 100, "", true)
+            .expect("insert kept");
+        let gone = db
+            .insert_channel_message(&channel_id, &author, "received", "gone", &removed, 101, "", true)
+            .expect("insert removed");
+        assert!(db.delete_channel_message(&channel_id, gone).unwrap());
+
+        let pins = vec![kept.clone(), removed.clone(), never_held.clone()];
+        assert_eq!(db.channel_messages_removed(&channel_id, &pins).unwrap(), vec![removed]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn stored_pin_lists_skip_what_is_not_a_wire_id() {
+        assert_eq!(
+            parse_pinned_msg_ids(&format!("{},zz,, {} ,{}", "AB".repeat(16), "cd".repeat(16), "1".repeat(31))),
+            vec!["ab".repeat(16), "cd".repeat(16)]
+        );
+        assert!(parse_pinned_msg_ids("").is_empty());
+    }
+
+    #[test]
     fn channels_round_trip_secrets_and_messages() {
         let path = std::env::temp_dir().join(format!(
             "ember-channels-{}-{}.db",
@@ -12690,6 +13278,254 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ember-{tag}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn remove_temp_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_reply_is_stored_as_signed_and_read_back_as_body_and_quote() {
+        use crate::network::ember::channel::with_reply_trailer;
+        let path = temp_db_path("channel-reply");
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        let alice = "a1".repeat(32);
+        let bob = "b0".repeat(32);
+        db.insert_channel(&channel_id, &bob, "Lobby", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let parent_id = bound_chat_msg_id(&channel_id, &alice, now);
+        let parent_bytes: [u8; 16] = hex::decode(&parent_id).unwrap().try_into().unwrap();
+        let parent_row = db
+            .insert_channel_message(
+                &channel_id, &alice, "received", "the plan **is** set", &parent_id, now,
+                &"11".repeat(64), false,
+            )
+            .unwrap();
+        let reply_wire = with_reply_trailer("agreed", Some(&parent_bytes));
+        let reply_id = bound_chat_msg_id(&channel_id, &bob, now + 1);
+        let reply_row = db
+            .insert_channel_message(
+                &channel_id, &bob, "sent", &reply_wire, &reply_id, now + 1, &"22".repeat(64),
+                true,
+            )
+            .unwrap();
+
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        let reply = rows.iter().find(|row| row.id == reply_row).unwrap();
+        assert_eq!(reply.message, "agreed", "the member sees the body, not the trailer");
+        assert_eq!(reply.reply_to.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(
+            reply.reply_parent,
+            Some(ChannelReplyParent {
+                id: parent_row,
+                sender_pubkey: alice.clone(),
+                excerpt: "the plan **is** set".into(),
+            })
+        );
+        assert!(!reply.reply_parent_deleted);
+        let parent = rows.iter().find(|row| row.id == parent_row).unwrap();
+        assert_eq!(parent.reply_to, None);
+
+        // What goes back on the wire is exactly what the author signed.
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        let served = sync.iter().find(|row| row.msg_id == reply_id).unwrap();
+        assert_eq!(served.message, reply_wire);
+
+        let hits = db.search_channel_messages(&channel_id, "agreed", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message, "agreed");
+
+        // The quote follows the parent: revised, then removed from this device.
+        assert!(matches!(
+            db.apply_channel_message_edit(
+                &channel_id, &parent_id, &alice, now, now + 30, "the plan changed", "33", now + 30,
+            )
+            .unwrap(),
+            ChannelEditOutcome::Applied(_)
+        ));
+        let revised = db.channel_reply_lookup(&channel_id, &parent_id).unwrap();
+        assert_eq!(revised.parent.unwrap().excerpt, "the plan changed");
+        assert!(db.delete_channel_message(&channel_id, parent_row).unwrap());
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        let reply = rows.iter().find(|row| row.id == reply_row).unwrap();
+        assert_eq!(reply.reply_to.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(reply.reply_parent, None);
+        assert!(reply.reply_parent_deleted, "removed here, as opposed to never received");
+
+        // A parent this device never held is simply missing.
+        let unheld = db.channel_reply_lookup(&channel_id, &"cc".repeat(16)).unwrap();
+        assert_eq!(unheld, ChannelReplyLookup::default());
+
+        // A line naming itself is not a reply.
+        let own_id = bound_chat_msg_id(&channel_id, &alice, now + 2);
+        let own_bytes: [u8; 16] = hex::decode(&own_id).unwrap().try_into().unwrap();
+        let selfish = db
+            .insert_channel_message(
+                &channel_id,
+                &alice,
+                "received",
+                &with_reply_trailer("me again", Some(&own_bytes)),
+                &own_id,
+                now + 2,
+                &"44".repeat(64),
+                false,
+            )
+            .unwrap();
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        let selfish = rows.iter().find(|row| row.id == selfish).unwrap();
+        assert_eq!(selfish.reply_to, None);
+        assert_eq!(selfish.message, "me again");
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn an_edit_of_a_reply_keeps_the_reference_it_was_sent_with() {
+        use crate::network::ember::channel::with_reply_trailer;
+        let path = temp_db_path("channel-reply-edit");
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        db.insert_channel(&channel_id, &author, "Lobby", "public", true, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let parent = [0x5Au8; 16];
+        let parent_hex = hex::encode(parent);
+
+        let msg_id = bound_chat_msg_id(&channel_id, &author, now);
+        let id = db
+            .insert_channel_message(
+                &channel_id,
+                &author,
+                "sent",
+                &with_reply_trailer("fist draft", Some(&parent)),
+                &msg_id,
+                now,
+                &"11".repeat(64),
+                true,
+            )
+            .unwrap();
+        let target = db.channel_message_edit_target(&channel_id, id).unwrap().unwrap();
+        assert_eq!(target.reply_to.as_deref(), Some(parent_hex.as_str()));
+
+        let revised = with_reply_trailer("first draft", Some(&parent));
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &author, now, now + 10, &revised, "22", now + 10,
+            )
+            .unwrap(),
+            ChannelEditOutcome::Applied(id)
+        );
+        let row = &db.get_channel_messages(&channel_id, 10, None).unwrap()[0];
+        assert_eq!(row.message, "first draft");
+        assert_eq!(row.reply_to.as_deref(), Some(parent_hex.as_str()));
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert_eq!(sync[0].message, revised, "the revision is re-served as signed");
+
+        // A revision cannot move or drop the quote once people may have answered
+        // it: the column is fixed when the row is written.
+        db.apply_channel_message_edit(
+            &channel_id, &msg_id, &author, now, now + 20, "no trailer", "33", now + 20,
+        )
+        .unwrap();
+        let row = &db.get_channel_messages(&channel_id, 10, None).unwrap()[0];
+        assert_eq!(row.message, "no trailer");
+        assert_eq!(row.reply_to.as_deref(), Some(parent_hex.as_str()));
+
+        // A revision standing in for a line never held brings its reference.
+        let other = "ef".repeat(32);
+        let unseen = bound_chat_msg_id(&channel_id, &other, now);
+        let created = db
+            .apply_channel_message_edit(
+                &channel_id,
+                &unseen,
+                &other,
+                now,
+                now + 5,
+                &with_reply_trailer("caught up", Some(&parent)),
+                "44",
+                now + 5,
+            )
+            .unwrap();
+        let ChannelEditOutcome::Created(created) = created else {
+            panic!("expected the revision to create the line, got {created:?}");
+        };
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        let row = rows.iter().find(|row| row.id == created).unwrap();
+        assert_eq!(row.message, "caught up");
+        assert_eq!(row.reply_to.as_deref(), Some(parent_hex.as_str()));
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn migration_56_adds_reply_to_beside_an_existing_history() {
+        use crate::network::ember::channel::with_reply_trailer;
+        let path = temp_db_path("channel-reply-migration");
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let db = Database::open_at(&path).expect("open db");
+            db.insert_channel(&channel_id, &author, "Lobby", "public", true, None, None)
+                .unwrap();
+            db.insert_channel_message(
+                &channel_id, &author, "sent", "from before", "m1", now, "", true,
+            )
+            .unwrap();
+            // Back to a v55 profile: same history, no column.
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE channel_messages DROP COLUMN reply_to;
+                 DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (55);",
+            )
+            .expect("roll back to v55");
+        }
+        let db = Database::open_at(&path).expect("migrate from v55");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message, "from before");
+        assert_eq!(rows[0].reply_to, None);
+
+        let parent = [0x11u8; 16];
+        db.insert_channel_message(
+            &channel_id,
+            &author,
+            "sent",
+            &with_reply_trailer("after", Some(&parent)),
+            "m2",
+            now + 1,
+            "",
+            true,
+        )
+        .unwrap();
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        assert_eq!(rows[0].message, "after");
+        assert_eq!(rows[0].reply_to, Some(hex::encode(parent)));
+
+        drop(db);
+        remove_temp_db(&path);
     }
 
     fn bound_chat_msg_id(channel_id: &str, author: &str, timestamp: i64) -> String {
@@ -13241,6 +14077,74 @@ mod tests {
     }
 
     #[test]
+    fn channel_reactions_keep_codes_this_build_does_not_draw_and_read_back_in_order() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-reaction-codes-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "ab".repeat(16);
+        let me = "cd".repeat(32);
+        let ada = "a1".repeat(32);
+        let bo = "b2".repeat(32);
+        let later = "c3".repeat(32);
+        db.insert_channel(&channel_id, &me, "Lobby", "public", true, None, None)
+            .unwrap();
+        let msg_id = "aa".repeat(16);
+        db.insert_channel_message(
+            &channel_id,
+            &me,
+            "sent",
+            "party time",
+            &msg_id,
+            1_700_000_000,
+            &"11".repeat(64),
+            true,
+        )
+        .unwrap();
+
+        // Inserted out of time order, so the read has to be what orders them.
+        db.set_channel_message_reaction(&channel_id, &msg_id, &bo, 8, 30, "bb")
+            .unwrap();
+        db.set_channel_message_reaction(&channel_id, &msg_id, &ada, 17, 20, "aa")
+            .unwrap();
+        // A code a newer build drew: stored like any other so it is re-served
+        // to the rest of the room rather than lost at this hop.
+        db.set_channel_message_reaction(&channel_id, &msg_id, &later, 250, 40, "cc")
+            .unwrap();
+
+        let rows = db.channel_message_reactions(&channel_id).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (msg_id.clone(), ada.clone(), 17),
+                (msg_id.clone(), bo.clone(), 8),
+                (msg_id.clone(), later.clone(), 250),
+            ]
+        );
+        let served = db
+            .list_channel_reactions_for_sync(&channel_id, std::slice::from_ref(&msg_id), 32)
+            .unwrap();
+        assert!(served
+            .iter()
+            .any(|(_, member, reaction, at, sig)| member == &later
+                && *reaction == 250
+                && *at == 40
+                && sig == "cc"));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
     fn channel_member_upsert_keeps_nickname_and_last_seen_monotonic() {
         let path = std::env::temp_dir().join(format!(
             "ember-member-upsert-{}-{}.db",
@@ -13381,6 +14285,82 @@ mod tests {
             db.count_fresh_channel_members(&channel_id, now, PRESENCE_FRESH_SECS)
                 .unwrap(),
             1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn roster_count_keeps_absent_members_and_drops_banned_ones() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-roster-count-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.upsert_channel_member(&channel_id, &"11".repeat(32), "Us", now, None)
+            .unwrap();
+        db.upsert_channel_member(
+            &channel_id,
+            &"22".repeat(32),
+            "Away",
+            now - PRESENCE_FRESH_SECS - 30,
+            None,
+        )
+        .unwrap();
+        let listed = db.list_channels().unwrap();
+        assert_eq!(listed[0].member_count, 1, "only one is present");
+        assert_eq!(
+            listed[0].roster_count, 2,
+            "someone who stepped out is still a member"
+        );
+
+        let banned_pk = "33".repeat(32);
+        db.upsert_channel_member(&channel_id, &banned_pk, "Banned", now, None)
+            .unwrap();
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &banned_pk, true, now)
+            .unwrap());
+        // A ban on someone never seen here leaves a row once it is lifted.
+        let stranger = "44".repeat(32);
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &stranger, true, now)
+            .unwrap());
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &stranger, false, now + 1)
+            .unwrap());
+        assert_eq!(
+            db.list_channels().unwrap()[0].roster_count,
+            2,
+            "neither a banned member nor a lifted ban on a stranger is a member"
+        );
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().roster_count,
+            2,
+            "the single-row read reports the same figure the list does"
+        );
+        assert_eq!(
+            db.get_channel_lite(&channel_id).unwrap().unwrap().roster_count,
+            0,
+            "the lite read skips the count"
         );
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -14042,6 +15022,7 @@ mod tests {
             .unwrap();
         db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
+        db.apply_owner_room_policy(&old_id, true, &[[0x0Fu8; 16]]).unwrap();
 
         let seed = [0x44u8; 32];
         assert!(db
@@ -14052,6 +15033,11 @@ mod tests {
         assert!(successor.is_owner, "the claimant owns the successor");
         assert_eq!(successor.predecessor_id, old_id);
         assert_eq!(successor.name, "Room");
+        assert!(successor.announce_only, "the room stays announce-only");
+        assert!(
+            successor.pinned_msg_ids.is_empty(),
+            "pins name ids the successor's copied history does not carry"
+        );
         assert_eq!(
             db.load_channel_owner_seed(&successor_id).unwrap(),
             Some(seed),

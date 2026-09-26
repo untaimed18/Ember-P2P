@@ -453,6 +453,11 @@
     if (e.key === 'k' || e.key === 'K') {
       // The find-anything gesture, and the reason the list can be long: with
       // fifty conversations allowed, typing a name has to beat scrolling to it.
+      //
+      // Shared with the Channels page, whose room search answers it unless
+      // focus is in here. That page listens on `document`, ahead of this
+      // `window` listener, and claims the key with `preventDefault` — which the
+      // `defaultPrevented` guard above turns into this branch standing down.
       e.preventDefault();
       if (switcherOpen) searchEl?.focus();
       else openSwitcher();

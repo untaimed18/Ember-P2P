@@ -3097,6 +3097,13 @@ async fn handle_command_inner(
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
 
+        NetworkCommand::SendChannelTyping { channel_id, typing } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            send_channel_typing(socket, state, db, channel_id, typing).await;
+        }
+
         NetworkCommand::RefreshChannelMembers { channel_id } => {
             if !settings.ember_native_enabled || db.chat_locked() {
                 return;

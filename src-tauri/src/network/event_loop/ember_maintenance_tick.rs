@@ -99,6 +99,19 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
             std::time::Instant::now(),
             std::time::Duration::from_secs(60),
         );
+        // Typing windows are a few seconds long, so a minute is ample and
+        // keeps the inbound map from refusing newcomers once a busy room
+        // has cycled through enough composers to fill it.
+        ember::channel::prune_rate_windows(
+            &mut state.channel_typing_recv_times,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(60),
+        );
+        ember::channel::prune_rate_windows(
+            &mut state.channel_typing_sent_times,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(60),
+        );
         // And the hop admission map, which was the one being
         // missed. It refuses any unseen hop once
         // `CHANNEL_GOSSIP_IN_PEER_CAP` slots are held, and DHT
