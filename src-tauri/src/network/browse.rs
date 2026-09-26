@@ -32,6 +32,9 @@ pub(crate) struct PendingBrowseRequest {
     /// ahead of this request's answer. `None` when none arrived, which is
     /// what a peer that predates the scope frame always produces.
     pub(crate) scope: Option<HashSet<[u8; 16]>>,
+    /// Distinct files the friend would list without the answer's size cap
+    /// (`EMBER_EXT_BROWSE_SUMMARY`). `None` from a peer that predates it.
+    pub(crate) total: Option<u32>,
 }
 
 pub(crate) type PendingBrowseRequests = HashMap<[u8; 16], VecDeque<PendingBrowseRequest>>;
@@ -64,6 +67,7 @@ pub(crate) fn enqueue_browse_request(
         session_id,
         dispatched: false,
         scope: None,
+        total: None,
     });
     Ok(())
 }
@@ -98,6 +102,58 @@ pub(crate) fn take_browse_scope(
         return None;
     }
     head.scope.take()
+}
+
+/// [`attach_browse_scope`] for a summary frame: same head, same session rule.
+pub(crate) fn attach_browse_summary(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    session_id: u64,
+    total: u32,
+) -> bool {
+    let Some(head) = pending.get_mut(&friend).and_then(|queue| queue.front_mut()) else {
+        return false;
+    };
+    if head.session_id != session_id || !head.dispatched {
+        return false;
+    }
+    head.total = Some(total);
+    true
+}
+
+/// [`take_browse_scope`] for the summary total.
+pub(crate) fn take_browse_total(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    session_id: u64,
+) -> Option<u32> {
+    let head = pending.get_mut(&friend)?.front_mut()?;
+    if head.session_id != session_id {
+        return None;
+    }
+    head.total.take()
+}
+
+/// Summary body version understood by [`parse_browse_summary`].
+const BROWSE_SUMMARY_V1: u8 = 0x01;
+
+/// `EMBER_EXT_BROWSE_SUMMARY` body: a version byte, then the total as a
+/// little-endian `u32`.
+pub(crate) fn encode_browse_summary(total: u32) -> Vec<u8> {
+    let mut out = vec![BROWSE_SUMMARY_V1];
+    out.extend_from_slice(&total.to_le_bytes());
+    out
+}
+
+/// `None` for an unknown version or a short body. Bytes past the total are
+/// ignored so a later version can append fields without breaking this one.
+pub(crate) fn parse_browse_summary(body: &[u8]) -> Option<u32> {
+    let (&version, rest) = body.split_first()?;
+    if version != BROWSE_SUMMARY_V1 {
+        return None;
+    }
+    let total: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(total))
 }
 
 /// Scope body version understood by [`parse_browse_scope`].
@@ -509,6 +565,39 @@ mod scope_tests {
         let scope = take_browse_scope(&mut pending, friend, 7).unwrap();
         assert!(scope.contains(&[1u8; 16]));
         assert_eq!(take_browse_scope(&mut pending, friend, 7), None);
+    }
+
+    #[test]
+    fn browse_summary_round_trips_and_tolerates_appended_fields() {
+        assert_eq!(parse_browse_summary(&encode_browse_summary(4_213)), Some(4_213));
+        let mut extended = encode_browse_summary(9);
+        extended.extend_from_slice(&[0xFF; 6]);
+        assert_eq!(parse_browse_summary(&extended), Some(9));
+    }
+
+    #[test]
+    fn browse_summary_rejects_short_or_unknown_bodies() {
+        assert_eq!(parse_browse_summary(&[]), None);
+        assert_eq!(parse_browse_summary(&[BROWSE_SUMMARY_V1, 1, 2, 3]), None);
+        let mut future = encode_browse_summary(5);
+        future[0] = 0x02;
+        assert_eq!(parse_browse_summary(&future), None);
+    }
+
+    #[test]
+    fn browse_summary_attaches_only_to_the_dispatched_head_of_its_session() {
+        let friend = [0x44u8; 16];
+        let mut pending = PendingBrowseRequests::new();
+        enqueue_browse_request(&mut pending, friend, "req".into(), 7).unwrap();
+        assert!(!attach_browse_summary(&mut pending, friend, 7, 10));
+
+        pending.get_mut(&friend).unwrap().front_mut().unwrap().dispatched = true;
+        assert!(!attach_browse_summary(&mut pending, friend, 8, 10));
+        assert!(attach_browse_summary(&mut pending, friend, 7, 10));
+
+        assert_eq!(take_browse_total(&mut pending, friend, 8), None);
+        assert_eq!(take_browse_total(&mut pending, friend, 7), Some(10));
+        assert_eq!(take_browse_total(&mut pending, friend, 7), None);
     }
 
     #[test]

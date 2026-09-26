@@ -1759,6 +1759,11 @@ mod tests {
         assert!(!TransferFailureCode::DownloadFolderUnavailable.message().contains("/home"));
     }
 
+    // The registry lock is held across the await on purpose: it serialises
+    // tests that swap the process-global approved-root registry, and the
+    // folder check under test is the window it has to cover. Current-thread
+    // runtime, so there is no executor thread for the guard to strand.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_download_folder_that_is_not_an_approved_root_is_tagged() {
         let _registry = crate::security::filesystem::test_registry_lock();

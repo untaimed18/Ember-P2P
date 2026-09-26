@@ -1004,6 +1004,16 @@ pub async fn run_friend_session_over_transport(
                                                 },
                                             }).await;
                                         }
+                                        Some((super::messages::EMBER_EXT_BROWSE_SUMMARY, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberBrowseSummary {
+                                                    ember_hash: peer_ember_hash,
+                                                    session_id: session_ember_session_handle.session_id(),
+                                                    body: body.to_vec(),
+                                                },
+                                            }).await;
+                                        }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(

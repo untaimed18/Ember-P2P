@@ -57,6 +57,13 @@
   import ShareFolderBrowser from '$lib/components/ShareFolderBrowser.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import {
+    FILE_TYPE_FILTERS,
+    extensionFromPath,
+    fileTypeFilterLabel,
+    fileTypeKey,
+    type FileTypeFilter,
+  } from '$lib/fileTypes';
+  import {
     ancestorFolderPaths,
     buildLibraryFolderTree,
     flattenLibraryFolderTree,
@@ -434,8 +441,8 @@
     };
   });
   let searchInputEl: HTMLInputElement | undefined = $state(undefined);
-  const typeFilterOptions = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
-  type TypeFilter = (typeof typeFilterOptions)[number];
+  const typeFilterOptions = FILE_TYPE_FILTERS;
+  type TypeFilter = FileTypeFilter;
   let typeFilter: TypeFilter = $state('All');
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
@@ -1689,52 +1696,14 @@
   }
 
   // --- File type display ---
-  const audioExts = new Set([
-    'aac','ac3','aif','aifc','aiff','amr','ape','au','aud','audio','cda',
-    'dmf','dsm','dts','far','flac','it','m1a','m2a','m4a','mdl','med',
-    'mid','midi','mka','mod','mp1','mp2','mp3','mpa','mpc','mtm','ogg',
-    'opus','psm','ptm','ra','rmi','s3m','snd','stm','umx','wav','wma','xm',
-  ]);
-  const videoExts = new Set([
-    '3g2','3gp','3gp2','3gpp','amv','asf','avi','bik','divx','dvr-ms',
-    'flc','fli','flic','flv','hdmov','ifo','m1v','m2t','m2ts','m2v',
-    'm4b','m4v','mkv','mov','movie','mp1v','mp2v','mp4','mpe','mpeg',
-    'mpg','mpv','mpv1','mpv2','ogm','pva','qt','ram','ratdvd','rm',
-    'rmm','rmvb','rv','smil','smk','swf','tp','ts','vid','video','vob',
-    'vp6','webm','wm','wmv','xvid',
-  ]);
   /** Formats WebView2 / Media Foundation commonly decode without extra codecs. */
   const playableAudioExts = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'wav']);
   const playableVideoExts = new Set(['m4v', 'mov', 'mp4', 'webm']);
-  const imageExts = new Set([
-    'bmp','emf','gif','ico','jfif','jpe','jpeg','jpg','pct','pcx','pic',
-    'pict','png','psd','psp','svg','tga','tif','tiff','webp','wmf','wmp','xif',
-  ]);
-  const archiveExts = new Set([
-    '7z','ace','alz','arc','arj','bz2','cab','cbr','cbz','gz','hqx',
-    'lha','lzh','msi','pak','par','par2','rar','sit','sitx','tar',
-    'tbz2','tgz','xpi','xz','z','zip',
-  ]);
-  const docExts = new Set([
-    'chm','css','diz','doc','docx','dot','djvu','epub','hlp','htm',
-    'html','lit','mobi','azw','nfo','ods','odt','odp','pdf','pps',
-    'ppt','pptx','ps','rtf','text','txt','wri','xls','xlsx','xml',
-  ]);
-  const isoExts = new Set([
-    'bin','bwa','bwi','bws','bwt','ccd','cue','dmg','img','iso',
-    'mdf','mds','nrg','sub','toast',
-  ]);
   function playableKind(ext: string): 'audio' | 'video' | null {
     const lower = ext.toLowerCase();
     if (playableAudioExts.has(lower)) return 'audio';
     if (playableVideoExts.has(lower)) return 'video';
     return null;
-  }
-  function extensionFromPath(path: string): string {
-    const base = path.replace(/^.*[/\\]/, '');
-    const dot = base.lastIndexOf('.');
-    if (dot <= 0 || dot === base.length - 1) return '';
-    return base.slice(dot + 1);
   }
   let selectedPlayableKind = $derived(
     selectedFile ? playableKind(selectedFile.extension || extensionFromPath(selectedFile.path)) : null,
@@ -1743,30 +1712,9 @@
    *  both the player itself and the Open button that assumes one exists. */
   let inAppPlayerKind = $derived(IS_LINUX_DESKTOP ? null : selectedPlayableKind);
   function fileType(ext: string): string {
-    const lower = ext.toLowerCase();
-    if (audioExts.has(lower)) return m.library_type_audio();
-    if (videoExts.has(lower)) return m.library_type_video();
-    if (imageExts.has(lower)) return m.library_type_image();
-    if (archiveExts.has(lower)) return m.library_type_archive();
-    if (docExts.has(lower)) return m.library_type_document();
-    if (isoExts.has(lower)) return m.library_type_cd_dvd();
+    const key = fileTypeKey(ext);
+    if (key) return fileTypeFilterLabel(key);
     return ext ? ext.toUpperCase() : '\u2014';
-  }
-
-  // Stable, locale-independent category key used by the type filter. The
-  // `typeFilter` state holds the English option *values* ('Audio', 'Video',
-  // ...), so the filter must compare against these keys rather than against
-  // `fileType()`, whose return value is translated (e.g. 'Vídeo' in Spanish)
-  // and would never match the stored value in non-English locales.
-  function fileTypeKey(ext: string): TypeFilter | '' {
-    const lower = ext.toLowerCase();
-    if (audioExts.has(lower)) return 'Audio';
-    if (videoExts.has(lower)) return 'Video';
-    if (imageExts.has(lower)) return 'Image';
-    if (archiveExts.has(lower)) return 'Archive';
-    if (docExts.has(lower)) return 'Document';
-    if (isoExts.has(lower)) return 'CD/DVD';
-    return '';
   }
 
   function formatTransferred(session: number, alltime: number): string {
@@ -2886,14 +2834,7 @@
     </div>
     <select class="filter-type" bind:value={typeFilter} aria-label={m.library_type_filter_aria()}>
       {#each typeFilterOptions as opt}
-        <option value={opt}>{opt === 'All' ? m.library_all_types() : (
-          opt === 'Audio' ? m.library_type_audio() :
-          opt === 'Video' ? m.library_type_video() :
-          opt === 'Image' ? m.library_type_image() :
-          opt === 'Archive' ? m.library_type_archive() :
-          opt === 'Document' ? m.library_type_document() :
-          opt === 'CD/DVD' ? m.library_type_cd_dvd() : opt
-        )}</option>
+        <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
     </select>
     <button

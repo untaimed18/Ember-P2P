@@ -2044,6 +2044,7 @@ pub fn run() {
             commands::sharing::get_shared_files,
             commands::sharing::get_shared_files_if_changed,
             commands::sharing::get_shared_file_count,
+            commands::sharing::library_has_hashes,
             commands::sharing::get_shared_folders,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,

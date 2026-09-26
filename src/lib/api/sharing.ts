@@ -160,6 +160,12 @@ export async function getSharedFileCount(): Promise<{ count: number; total_bytes
   return invoke('get_shared_file_count');
 }
 
+/** Which of `hashes` are in the library (shared or not), lowercased. At most
+ *  5,000 per call. */
+export async function libraryHasHashes(hashes: string[]): Promise<string[]> {
+  return invoke('library_has_hashes', { hashes });
+}
+
 export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
 }

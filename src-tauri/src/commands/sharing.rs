@@ -4556,6 +4556,64 @@ pub async fn get_shared_file_count(
     Ok(SharedFileStats { count, total_bytes })
 }
 
+/// Upper bound on hashes per [`library_has_hashes`] call. A friend browse
+/// shows at most 1,000 rows; this only bounds a runaway caller.
+const MAX_LIBRARY_HASH_CHECK: usize = 5_000;
+
+/// Which of `hashes` (eD2K MD4 hex, any case) are in the library, shared or
+/// not, returned lowercased. Lets a caller mark files the user already has
+/// without shipping the whole `Vec<FileInfo>` over IPC.
+#[tauri::command]
+pub async fn library_has_hashes(
+    state: tauri::State<'_, AppState>,
+    hashes: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if hashes.len() > MAX_LIBRARY_HASH_CHECK {
+        return Err(coded_ctx(
+            "sharing_batch_too_large",
+            format!("Too many hashes in one batch (max {MAX_LIBRARY_HASH_CHECK})"),
+            MAX_LIBRARY_HASH_CHECK,
+        ));
+    }
+    let cached = state.cached_shared_files.read().await;
+    Ok(hashes_in_library(
+        &hashes,
+        cached.iter().map(|f| f.hash.as_str()),
+    ))
+}
+
+fn hashes_in_library<'a>(
+    hashes: &[String],
+    library_hashes: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    // Only a 32-char MD4 hex can match a library row, so anything else is
+    // dropped before it is copied.
+    let mut wanted: HashSet<String> = hashes
+        .iter()
+        .filter(|h| h.len() == 32)
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    let mut found = Vec::new();
+    for hash in library_hashes {
+        if wanted.is_empty() {
+            break;
+        }
+        // Still-hashing rows carry an empty hash.
+        if hash.is_empty() {
+            continue;
+        }
+        let hit = if hash.bytes().any(|b| b.is_ascii_uppercase()) {
+            wanted.take(hash.to_ascii_lowercase().as_str())
+        } else {
+            wanted.take(hash)
+        };
+        if let Some(h) = hit {
+            found.push(h);
+        }
+    }
+    found
+}
+
 #[tauri::command]
 pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let config = state.config.read().await;
@@ -6769,6 +6827,33 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashes_in_library_matches_case_insensitively_and_skips_unhashed_rows() {
+        let wanted = vec![
+            "AABBCCDDEEFF00112233445566778899".to_string(),
+            "0000000000000000000000000000abcd".to_string(),
+            String::new(),
+            "abc".to_string(),
+        ];
+        let library = [
+            "",
+            "abc",
+            "aabbccddeeff00112233445566778899",
+            "aabbccddeeff00112233445566778899",
+            "ffffffffffffffffffffffffffffffff",
+        ];
+        assert_eq!(
+            hashes_in_library(&wanted, library),
+            vec!["aabbccddeeff00112233445566778899".to_string()],
+        );
+
+        let upper_library = ["0000000000000000000000000000ABCD"];
+        assert_eq!(
+            hashes_in_library(&wanted, upper_library),
+            vec!["0000000000000000000000000000abcd".to_string()],
+        );
+    }
 
     fn indexed_file(path: &str, hash: &str) -> FileInfo {
         FileInfo {

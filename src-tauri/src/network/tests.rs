@@ -1185,15 +1185,19 @@ fn a_tcp_batch_cannot_spend_the_udp_sweeps_budget() {
 fn the_more_results_gate_is_reachable() {
     // The batch size that makes a server worth asking again.
     const FULL_BATCH: u32 = 200;
-    assert!(
-        MAX_SERVER_MORE_REQUESTS >= 1,
-        "at least one follow-up page, or the loop is decorative"
-    );
-    assert!(
-        MAX_UDP_SEARCH_SOURCES >= FULL_BATCH * ED2K_SEARCH_SOURCE_CAP,
-        "the sweep's backstop has to outlast a whole well-sourced batch, or \
-         it stops being a backstop and starts being the limit"
-    );
+    const {
+        assert!(
+            MAX_SERVER_MORE_REQUESTS >= 1,
+            "at least one follow-up page, or the loop is decorative"
+        )
+    };
+    const {
+        assert!(
+            MAX_UDP_SEARCH_SOURCES >= FULL_BATCH * ED2K_SEARCH_SOURCE_CAP,
+            "the sweep's backstop has to outlast a whole well-sourced batch, or \
+             it stops being a backstop and starts being the limit"
+        )
+    };
 
     // The gate no longer consults a source budget at all, so its two halves
     // can no longer contradict each other: a batch large enough to ask about

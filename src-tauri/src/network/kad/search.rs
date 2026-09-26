@@ -1805,10 +1805,12 @@ mod tests {
         assert!(state.should_stop_querying());
 
         // The window that buys back: it used to be a flat 20s.
-        assert!(
-            PENDING_TIMEOUT_SECS < 20,
-            "the margin is meant to be the query timeout, not a larger round number"
-        );
+        const {
+            assert!(
+                PENDING_TIMEOUT_SECS < 20,
+                "the margin is meant to be the query timeout, not a larger round number"
+            )
+        };
     }
 
     #[test]

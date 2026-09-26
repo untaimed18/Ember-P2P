@@ -494,9 +494,10 @@ fn apply_downloads(db: &Database, download_folder: &str, manifest: &Manifest) ->
                 // Undo what reached the final names: a partial copy is dropped
                 // while its source is still staged, a finished move goes back.
                 for (staged, at_final) in [(&part, &final_part), (&met, &final_met)] {
-                    if staged.exists() {
-                        let _ = std::fs::remove_file(at_final);
-                    } else if at_final.exists() && move_or_copy(at_final, staged, &mut |_| {}).is_ok() {
+                    let drop_final = staged.exists()
+                        || (at_final.exists()
+                            && move_or_copy(at_final, staged, &mut |_| {}).is_ok());
+                    if drop_final {
                         let _ = std::fs::remove_file(at_final);
                     }
                 }
@@ -520,6 +521,69 @@ fn apply_downloads(db: &Database, download_folder: &str, manifest: &Manifest) ->
         );
     }
     Ok(placed)
+}
+
+fn imported_transfer(download: &StagedDownload) -> crate::types::Transfer {
+    use crate::types::{Transfer, TransferDirection, TransferHealth, TransferStatus};
+    let progress = if download.file_size == 0 {
+        0.0
+    } else {
+        download.completed as f64 / download.file_size as f64 * 100.0
+    };
+    Transfer {
+        id: download.id.clone(),
+        file_name: download.file_name.clone(),
+        file_hash: download.file_hash.clone(),
+        peer_id: String::new(),
+        peer_name: String::new(),
+        direction: TransferDirection::Download,
+        status: if download.paused {
+            TransferStatus::Paused
+        } else {
+            TransferStatus::Searching
+        },
+        progress,
+        speed: 0,
+        total_size: download.file_size,
+        transferred: download.completed,
+        completed_size: download.completed,
+        started_at: chrono::Utc::now().timestamp(),
+        failure_reason: None,
+        failure_code: None,
+        failure_kind: None,
+        failure_stage: None,
+        priority: "auto".to_string(),
+        sources: 0,
+        active_sources: 0,
+        queued_sources: 0,
+        queue_rank: None,
+        last_seen_complete: None,
+        last_received: None,
+        health: TransferHealth::Healthy,
+        health_reason: None,
+        health_code: None,
+        stalled_since: None,
+        category: String::new(),
+        wait_time: 0,
+        upload_time: 0,
+        a4af_sources: 0,
+        max_sources: 0,
+        preview_priority: false,
+        preview_ready: false,
+        ember_sources: 0,
+        client_software: String::new(),
+        country_code: None,
+        user_hash: None,
+        ember_hash: None,
+        expected_aich: None,
+        ember_file_hash: None,
+        completed_path: None,
+        up_part_status: None,
+        up_part_count: None,
+        up_peer_part_status: None,
+        ember_verified: false,
+        friends_only: false,
+    }
 }
 
 #[cfg(test)]
@@ -880,68 +944,5 @@ mod tests {
         discard(&data).unwrap();
         assert!(part.exists());
         let _ = std::fs::remove_dir_all(&root);
-    }
-}
-
-fn imported_transfer(download: &StagedDownload) -> crate::types::Transfer {
-    use crate::types::{Transfer, TransferDirection, TransferHealth, TransferStatus};
-    let progress = if download.file_size == 0 {
-        0.0
-    } else {
-        download.completed as f64 / download.file_size as f64 * 100.0
-    };
-    Transfer {
-        id: download.id.clone(),
-        file_name: download.file_name.clone(),
-        file_hash: download.file_hash.clone(),
-        peer_id: String::new(),
-        peer_name: String::new(),
-        direction: TransferDirection::Download,
-        status: if download.paused {
-            TransferStatus::Paused
-        } else {
-            TransferStatus::Searching
-        },
-        progress,
-        speed: 0,
-        total_size: download.file_size,
-        transferred: download.completed,
-        completed_size: download.completed,
-        started_at: chrono::Utc::now().timestamp(),
-        failure_reason: None,
-        failure_code: None,
-        failure_kind: None,
-        failure_stage: None,
-        priority: "auto".to_string(),
-        sources: 0,
-        active_sources: 0,
-        queued_sources: 0,
-        queue_rank: None,
-        last_seen_complete: None,
-        last_received: None,
-        health: TransferHealth::Healthy,
-        health_reason: None,
-        health_code: None,
-        stalled_since: None,
-        category: String::new(),
-        wait_time: 0,
-        upload_time: 0,
-        a4af_sources: 0,
-        max_sources: 0,
-        preview_priority: false,
-        preview_ready: false,
-        ember_sources: 0,
-        client_software: String::new(),
-        country_code: None,
-        user_hash: None,
-        ember_hash: None,
-        expected_aich: None,
-        ember_file_hash: None,
-        completed_path: None,
-        up_part_status: None,
-        up_part_count: None,
-        up_peer_part_status: None,
-        ember_verified: false,
-        friends_only: false,
     }
 }

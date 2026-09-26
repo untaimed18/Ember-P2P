@@ -318,6 +318,13 @@ pub const EMBER_EXT_ATTACH_CANCEL: u8 = 0x0A;
 /// ignores it and treats the listing as unrestricted, as it always did.
 pub const EMBER_EXT_BROWSE_SCOPE: u8 = 0x0B;
 
+/// [`OP_EMBER_EXT`] sub-type: how many distinct files the sender would list
+/// to this friend if the browse answer that follows had no size cap. Body is
+/// [`crate::network::browse::encode_browse_summary`]. A separate frame for the
+/// same reason as [`EMBER_EXT_BROWSE_SCOPE`]; a peer that predates it ignores
+/// it and simply cannot tell the listing was cut short.
+pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -3327,6 +3334,7 @@ mod tests {
             EMBER_EXT_ATTACH_REPLY,
             EMBER_EXT_ATTACH_CANCEL,
             EMBER_EXT_BROWSE_SCOPE,
+            EMBER_EXT_BROWSE_SUMMARY,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

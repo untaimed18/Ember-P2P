@@ -1097,6 +1097,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberBrowseScope { .. }
+        | UploadEventKind::EmberBrowseSummary { .. }
         | UploadEventKind::EmberBrowseSessionReady { .. }
         | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }

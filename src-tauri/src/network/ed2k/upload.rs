@@ -2341,6 +2341,13 @@ pub enum UploadEventKind {
         session_id: u64,
         body: Vec<u8>,
     },
+    /// A friend's `EMBER_EXT_BROWSE_SUMMARY` for the browse answer that
+    /// follows on `session_id`. `body` is still encoded.
+    EmberBrowseSummary {
+        ember_hash: [u8; 16],
+        session_id: u64,
+        body: Vec<u8>,
+    },
     /// An on-demand browse dial established a new friend session. The network
     /// loop binds the opaque session ID to the queued request before sending
     /// the wire packet, so a reply from a retired session can never complete
@@ -13062,6 +13069,21 @@ impl UploadHandler {
                                         .send(UploadEvent {
                                             transfer_id: String::new(),
                                             kind: UploadEventKind::EmberBrowseScope {
+                                                ember_hash: eh,
+                                                session_id: session.session_id(),
+                                                body: body.to_vec(),
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_BROWSE_SUMMARY, body)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberBrowseSummary {
                                                 ember_hash: eh,
                                                 session_id: session.session_id(),
                                                 body: body.to_vec(),

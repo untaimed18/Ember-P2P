@@ -999,11 +999,19 @@ pub(in crate::network) async fn on_upload_event(
             let catalog_authoritative = known_files.is_authoritative();
             // Mutual friends see friends-only files alongside
             // public ones — that is the whole point of the scope.
-            for f in files
-                .iter()
-                .filter(|f| f.is_friend_visible())
-                .take(MAX_BROWSE_ANSWER_FILES)
-            {
+            // Newest first, so a library too large for one answer shows
+            // what was added most recently rather than index order; and
+            // one row per hash, so copies of a file in two shared folders
+            // don't spend two of the answer's slots.
+            let mut visible: Vec<&FileInfo> =
+                files.iter().filter(|f| f.is_friend_visible()).collect();
+            visible.sort_by_key(|f| std::cmp::Reverse(f.modified_at));
+            let mut seen_hashes: std::collections::HashSet<[u8; 16]> =
+                std::collections::HashSet::new();
+            let mut total_unique: u32 = 0;
+            let mut approx_bytes = 8usize;
+            let mut answer_full = false;
+            for f in visible {
                 let Ok(hash_bytes) = hex::decode(&f.hash) else {
                     continue;
                 };
@@ -1012,6 +1020,15 @@ pub(in crate::network) async fn on_upload_event(
                 }
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&hash_bytes);
+                if !seen_hashes.insert(hash) {
+                    continue;
+                }
+                total_unique = total_unique.saturating_add(1);
+                // Keep walking once the answer is full: the rest still
+                // count toward the total the summary frame reports.
+                if answer_full || encoded_entries.len() >= MAX_BROWSE_ANSWER_FILES {
+                    continue;
+                }
                 let name_bytes = f.name.as_bytes().to_vec();
                 let aich = if f.aich_hash.len() == 40 {
                     let mut root = [0u8; 20];
@@ -1043,21 +1060,20 @@ pub(in crate::network) async fn on_upload_event(
                 {
                     restricted_entries.push(hash);
                 }
-                encoded_entries.push((hash, f.size, name_bytes, aich, ember));
                 // Rough pre-cap so encode stays under the frame budget.
-                let approx = encoded_entries.iter().fold(8usize, |acc, e| {
-                    acc + 16
-                        + 8
-                        + 2
-                        + e.2.len()
-                        + 1
-                        + if e.3.is_some() { 20 } else { 0 }
-                        + 32
-                });
-                if approx >= MAX_BROWSE_ANSWER_BYTES {
-                    break;
+                approx_bytes += 16
+                    + 8
+                    + 2
+                    + name_bytes.len()
+                    + 1
+                    + if aich.is_some() { 20 } else { 0 }
+                    + 32;
+                encoded_entries.push((hash, f.size, name_bytes, aich, ember));
+                if approx_bytes >= MAX_BROWSE_ANSWER_BYTES {
+                    answer_full = true;
                 }
             }
+            let mut scope_delivered = true;
             // Pre-EBR1 requesters predate the scope frame too. It goes
             // first on the same stream so it is already attached to the
             // pending request when the answer lands.
@@ -1074,6 +1090,24 @@ pub(in crate::network) async fn on_upload_event(
                         session_id,
                     );
                     encoded_entries.retain(|(h, ..)| !restricted_entries.contains(h));
+                    scope_delivered = false;
+                }
+            }
+            // Skipped when the scope was lost: the answer then omits
+            // friends-only rows the total still counts, and a total that
+            // disagrees with the listing is worse than none.
+            if supports_ebr1 && scope_delivered {
+                let summary = crate::network::browse::encode_browse_summary(total_unique);
+                let frame = ed2k::messages::build_ember_ext_frame(
+                    ed2k::messages::EMBER_EXT_BROWSE_SUMMARY,
+                    &summary,
+                );
+                if let Err(e) = send_browse_response_to_origin(reply_tx, frame) {
+                    tracing::debug!(
+                        "Browse summary to {} on session {} dropped: {e}",
+                        hex::encode(browse_eh),
+                        session_id,
+                    );
                 }
             }
             let res_payload = if supports_ebr1 {
@@ -1219,6 +1253,39 @@ pub(in crate::network) async fn on_upload_event(
         return;
     }
 
+    if let UploadEventKind::EmberBrowseSummary {
+        ember_hash: summary_eh,
+        session_id,
+        ref body,
+    } = event.kind
+    {
+        if !friend_hashes.read().await.contains(&summary_eh) {
+            return;
+        }
+        match crate::network::browse::parse_browse_summary(body) {
+            Some(total) => {
+                if !crate::network::browse::attach_browse_summary(
+                    &mut state.pending_browse_requests,
+                    summary_eh,
+                    session_id,
+                    total,
+                ) {
+                    debug!(
+                        "Ignoring browse summary from {} with no request pending on session {}",
+                        hex::encode(summary_eh),
+                        session_id
+                    );
+                }
+            }
+            None => debug!(
+                "Friend {} sent an unparseable browse summary ({} bytes)",
+                hex::encode(summary_eh),
+                body.len()
+            ),
+        }
+        return;
+    }
+
     if let UploadEventKind::EmberBrowseResponse {
         ember_hash: browse_eh,
         session_id,
@@ -1236,6 +1303,11 @@ pub(in crate::network) async fn on_upload_event(
             session_id,
         )
         .unwrap_or_default();
+        let total = crate::network::browse::take_browse_total(
+            &mut state.pending_browse_requests,
+            browse_eh,
+            session_id,
+        );
         let listed: Vec<[u8; 16]> = entries
             .iter()
             .filter_map(|(hash, ..)| parse_ed2k_hash16(hash))
@@ -1280,6 +1352,7 @@ pub(in crate::network) async fn on_upload_event(
                 "user_hash": hash_hex,
                 "request_id": request_id,
                 "files": files,
+                "total": total,
             }));
             dispatch_browse_head(state, app_handle, browse_eh).await;
         } else {
