@@ -10,7 +10,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -54,8 +54,8 @@ pub const CLAIM_AFTER_DAYS_MAX: u32 = 365;
 /// generating a throwaway keypair. A username claim is retained for
 /// [`USERNAME_IDLE_SECS`] and a tombstone is retained forever, so unbounded
 /// growth here is permanent: it does not recover when the flood stops, and
-/// because [`ChannelRegistry::persist`] rewrites the whole document, every
-/// later request pays for the accumulated size.
+/// because every flush rewrites the whole document, every later flush pays for
+/// the accumulated size.
 ///
 /// Refusing past the cap rather than evicting is deliberate. Evicting a
 /// username hands someone else's handle to whoever asks next, and evicting a
@@ -65,6 +65,22 @@ pub const CLAIM_AFTER_DAYS_MAX: u32 = 365;
 pub const MAX_USERNAMES: usize = 100_000;
 pub const MAX_CHANNEL_NAMES: usize = 100_000;
 pub const MAX_DELETED: usize = 100_000;
+
+/// Listings per `/v4/channels/directory` page. A listing is at most ~270 bytes
+/// of JSON (32 + 64 hex characters of ids plus a 64-byte display name that
+/// escaping can at most double), so a full page stays well under the client's
+/// 256 KiB response bound — including for clients that predate paging and
+/// only ever read the first page.
+pub const DIRECTORY_PAGE_SIZE: usize = 500;
+/// Listings the directory serves in total, across all pages, in rank order.
+/// Matches what a paging client follows (ten pages).
+pub const MAX_DIRECTORY_LISTINGS: usize = 5_000;
+/// A cached ranking is rebuilt at least this often, since listings drop out on
+/// age as well as on writes.
+const DIRECTORY_CACHE_MAX_AGE_SECS: i64 = 60;
+/// Writes invalidate the cached ranking, but it is rebuilt no more often than
+/// this: a rebuild is a scan of every name, and every owner refresh is a write.
+const DIRECTORY_REBUILD_MIN_SECS: i64 = if cfg!(test) { 0 } else { 2 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelNameRecord {
@@ -91,11 +107,33 @@ pub struct ChannelNameRecord {
     /// Days of owner silence before `nominee` may move the name. 0 disables it.
     #[serde(default)]
     pub claim_after_days: u32,
+    /// Unix seconds the name was first claimed; kept across handovers. Ranks
+    /// the directory by seniority. 0 in files written before this field
+    /// existed, which ranks those rooms ahead of every newer one.
+    #[serde(default)]
+    pub created_at: i64,
+    /// Channel id this name was last handed over from, or empty. Lets a
+    /// retried handover recognise that it already happened.
+    #[serde(default)]
+    pub handed_over_from: String,
 }
 
 impl ChannelNameRecord {
     fn has_nominee(&self) -> bool {
         self.claim_after_days > 0 && !self.nominee.is_empty()
+    }
+
+    /// Whether the owner has been silent long enough that the name is free.
+    fn abandoned(&self, now: i64) -> bool {
+        if self.deleted {
+            return false;
+        }
+        let ts = if self.refreshed_at > 0 {
+            self.refreshed_at
+        } else {
+            now
+        };
+        now.saturating_sub(ts) > self.release_after_secs()
     }
 
     /// Owner silence after which [`ChannelRegistry::reap_stale`] frees the name.
@@ -115,6 +153,52 @@ pub struct DirectoryListing {
     pub name: String,
 }
 
+/// Position in the ranked directory: `(created_at, channel_id)`, which is
+/// unique per live listing and never changes while a room holds its name, so
+/// "strictly after the last one you saw" pages consistently while rooms come
+/// and go. On the wire it is `"<created_at>.<channel_id>"`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirectoryCursor {
+    created_at: i64,
+    channel_id: String,
+}
+
+impl DirectoryCursor {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (created_at, channel_id) = raw.split_once('.')?;
+        if created_at.is_empty()
+            || created_at.len() > 19
+            || !created_at.bytes().all(|b| b.is_ascii_digit())
+            || channel_id.len() != 32
+            || !channel_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self {
+            created_at: created_at.parse().ok()?,
+            channel_id: channel_id.to_ascii_lowercase(),
+        })
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{}.{}", self.created_at, self.channel_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct DirectoryPage {
+    pub channels: Vec<DirectoryListing>,
+    /// Present only while listings remain after this page.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug)]
+struct RankedDirectory {
+    generation: u64,
+    built_at: i64,
+    entries: Vec<(DirectoryCursor, DirectoryListing)>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RegistryFile {
     #[serde(default)]
@@ -131,11 +215,9 @@ struct RegistryFile {
 
 /// Borrowed mirror of [`RegistryFile`] used for writing.
 ///
-/// `persist` runs on every claim, nomination, delete and reap, and building an
-/// owned `RegistryFile` copied all four maps each time — including `deleted`,
-/// which is a permanent tombstone set that only ever grows, so the cost of a
-/// save climbed with the server's whole deletion history. Serde emits an
-/// identical document either way.
+/// Building an owned `RegistryFile` would copy all four maps on every flush —
+/// including `deleted`, a permanent tombstone set that only ever grows. Serde
+/// emits an identical document either way.
 ///
 /// The tombstones themselves are deliberately kept forever: only an owner can
 /// destroy a room, and `owner_delete_keeps_the_name_retired` pins that such a
@@ -149,7 +231,7 @@ struct RegistryFileRef<'a> {
     username_activity: &'a HashMap<String, i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ChannelRegistry {
     path: Option<PathBuf>,
     usernames: HashMap<String, String>,
@@ -157,24 +239,69 @@ pub struct ChannelRegistry {
     names: HashMap<String, ChannelNameRecord>,
     deleted: HashSet<String>,
     username_activity: HashMap<String, i64>,
-    /// Ticket dispenser and completion gate for [`Self::persist`]. See
+    /// Lowercase channel id -> keys in `names` whose record names that id,
+    /// deleted records included.
+    by_channel: HashMap<String, Vec<String>>,
+    /// [`confusable_key`] -> keys in `names` with that skeleton, deleted
+    /// records included (a lookalike of a retired name stays refused).
+    by_skeleton: HashMap<String, Vec<String>>,
+    /// Set by every mutation, cleared when a snapshot is taken for writing.
+    /// Shared with the [`PersistJob`] so a failed write can re-arm it.
+    dirty: Arc<AtomicBool>,
+    /// Bumped by every mutation; invalidates the cached directory ranking and
+    /// identifies what a [`PersistJob`] covers.
+    generation: u64,
+    /// Generation of the latest mutation that must be on disk before it is
+    /// acknowledged (see [`Self::touch_durable`]).
+    durable_generation: u64,
+    directory_cache: Mutex<Option<Arc<RankedDirectory>>>,
+    /// Ticket dispenser and completion gate for [`PersistJob::write`]. See
     /// [`PersistGate`].
     persist_gate: Arc<PersistGate>,
     /// Set when the file on disk could not be read and no backup could stand
     /// in for it. See [`load_registry_file`].
     read_only: bool,
+    /// Set once the final shutdown snapshot has been taken: later writes are
+    /// refused rather than acknowledged and then lost.
+    closed: bool,
 }
 
-/// Serialises the registry's disk writes and keeps them off the request path.
+/// A serialised registry snapshot waiting to be written to disk.
 ///
-/// `persist` runs while the caller holds the `channels_registry` write lock,
-/// and the write itself is `create` + `write_all` + `sync_all` + one or two
-/// renames. Performed inline that parked a Tokio worker on an fsync and
-/// blocked every other channel endpoint for its duration. The write now goes
-/// to `spawn_blocking`, which means two of them can be in flight at once, so
-/// ordering has to be enforced explicitly: each write takes a monotonic
-/// ticket, and a write whose ticket is older than what has already landed is
-/// dropped rather than rewinding the file to stale content.
+/// Taken under the registry lock (a read lock is enough) and written after
+/// it is released, on a blocking thread.
+pub struct PersistJob {
+    gate: Arc<PersistGate>,
+    ticket: u64,
+    generation: u64,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl PersistJob {
+    /// Registry generation this snapshot includes every mutation up to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Blocking. Returns whether the snapshot (or a newer one) is on disk;
+    /// on failure the registry is marked dirty again so the next flush retries.
+    pub fn write(self) -> bool {
+        let ok = write_registry(&self.gate, self.ticket, &self.path, &self.bytes);
+        if !ok {
+            self.dirty.store(true, Ordering::Release);
+        }
+        ok
+    }
+}
+
+/// Orders the registry's disk writes.
+///
+/// Snapshots are written on blocking threads, so two can be in flight at
+/// once: each takes a monotonic ticket when it is serialised, and a write
+/// whose ticket is older than what has already landed is dropped rather than
+/// rewinding the file to stale content.
 #[derive(Debug)]
 struct PersistGate {
     next_ticket: AtomicU64,
@@ -207,17 +334,36 @@ pub enum RegistryError {
 }
 
 impl ChannelRegistry {
-    pub fn in_memory() -> Self {
-        Self {
-            path: None,
-            usernames: HashMap::new(),
-            by_pubkey: HashMap::new(),
-            names: HashMap::new(),
-            deleted: HashSet::new(),
-            username_activity: HashMap::new(),
-            persist_gate: Arc::new(PersistGate::new()),
-            read_only: false,
+    fn from_parts(path: Option<PathBuf>, parsed: RegistryFile, read_only: bool) -> Self {
+        let mut by_pubkey = HashMap::new();
+        for (name, pubkey) in &parsed.usernames {
+            by_pubkey.insert(pubkey.to_ascii_lowercase(), name.clone());
         }
+        let mut reg = Self {
+            path,
+            usernames: parsed.usernames,
+            by_pubkey,
+            names: HashMap::with_capacity(parsed.names.len()),
+            deleted: parsed.deleted,
+            username_activity: parsed.username_activity,
+            by_channel: HashMap::new(),
+            by_skeleton: HashMap::new(),
+            dirty: Arc::new(AtomicBool::new(false)),
+            generation: 0,
+            durable_generation: 0,
+            directory_cache: Mutex::new(None),
+            persist_gate: Arc::new(PersistGate::new()),
+            read_only,
+            closed: false,
+        };
+        for (name, rec) in parsed.names {
+            reg.insert_name(name, rec);
+        }
+        reg
+    }
+
+    pub fn in_memory() -> Self {
+        Self::from_parts(None, RegistryFile::default(), false)
     }
 
     pub fn load(path: PathBuf) -> Self {
@@ -225,24 +371,71 @@ impl ChannelRegistry {
             let _ = fs::create_dir_all(parent);
         }
         let (parsed, read_only) = load_registry_file(&path);
-        let mut by_pubkey = HashMap::new();
-        for (name, pubkey) in &parsed.usernames {
-            by_pubkey.insert(pubkey.to_ascii_lowercase(), name.clone());
-        }
-        let mut reg = Self {
-            path: Some(path),
-            usernames: parsed.usernames,
-            by_pubkey,
-            names: parsed.names,
-            deleted: parsed.deleted,
-            username_activity: parsed.username_activity,
-            persist_gate: Arc::new(PersistGate::new()),
-            read_only,
-        };
+        let mut reg = Self::from_parts(Some(path), parsed, read_only);
         if reg.grandfather_legacy_timestamps(unix_now()) {
-            reg.persist();
+            reg.touch();
         }
         reg
+    }
+
+    fn insert_name(&mut self, name: String, rec: ChannelNameRecord) {
+        self.by_channel
+            .entry(rec.channel_id.to_ascii_lowercase())
+            .or_default()
+            .push(name.clone());
+        self.by_skeleton
+            .entry(confusable_key(&name))
+            .or_default()
+            .push(name.clone());
+        self.names.insert(name, rec);
+    }
+
+    fn remove_name(&mut self, name: &str) -> Option<ChannelNameRecord> {
+        let rec = self.names.remove(name)?;
+        detach_name(&mut self.by_channel, &rec.channel_id.to_ascii_lowercase(), name);
+        detach_name(&mut self.by_skeleton, &confusable_key(name), name);
+        Some(rec)
+    }
+
+    /// Keys in `names` whose record names `channel_id` (lowercase).
+    fn names_of_channel(&self, channel_id: &str) -> &[String] {
+        self.by_channel
+            .get(channel_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn live_name_of_channel(&self, channel_id: &str) -> Option<String> {
+        self.names_of_channel(channel_id)
+            .iter()
+            .find(|name| self.names.get(*name).is_some_and(|rec| !rec.deleted))
+            .cloned()
+    }
+
+    /// Forget every name in `candidates` whose owner has gone quiet for good.
+    fn reap_abandoned_names(&mut self, candidates: Vec<String>, now: i64) -> bool {
+        let mut changed = false;
+        for name in candidates {
+            if self.names.get(&name).is_some_and(|rec| rec.abandoned(now)) {
+                self.remove_name(&name);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn username_idle(&self, pubkey: &str, now: i64) -> bool {
+        let ts = self.username_activity.get(pubkey).copied().unwrap_or(now);
+        now.saturating_sub(ts) > USERNAME_IDLE_SECS
+    }
+
+    fn release_username(&mut self, name: &str) -> bool {
+        let Some(pk) = self.usernames.remove(name) else {
+            return false;
+        };
+        self.by_pubkey.remove(&pk);
+        self.username_activity.remove(&pk);
+        true
     }
 
     /// Whether [`Self::load`] could not read the registry and is refusing
@@ -252,43 +445,95 @@ impl ChannelRegistry {
     }
 
     fn writable(&self) -> Result<(), RegistryError> {
-        if self.read_only {
+        if self.read_only || self.closed {
             Err(RegistryError::ReadOnly)
         } else {
             Ok(())
         }
     }
 
-    fn persist(&self) {
-        if self.read_only {
-            return;
+    /// Record that state changed. Nothing is written here: the owner of the
+    /// registry flushes a snapshot on its own schedule (see
+    /// [`Self::take_persist_job`]), so a burst of refreshes costs one write.
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if !self.read_only && self.path.is_some() {
+            self.dirty.store(true, Ordering::Release);
         }
-        let Some(path) = &self.path else {
-            return;
-        };
+    }
+
+    /// Record a change nothing would recreate if it were lost — a new claim, a
+    /// tombstone, a handover, a nomination, a privacy change — as opposed to a
+    /// refresh the owner repeats anyway. Callers wait for
+    /// [`Self::durable_generation`] to reach disk before acknowledging.
+    fn touch_durable(&mut self) {
+        self.touch();
+        if !self.read_only && self.path.is_some() {
+            self.durable_generation = self.generation;
+        }
+    }
+
+    /// Only moves on a registry that persists, so an in-memory registry never
+    /// makes a caller wait.
+    pub fn durable_generation(&self) -> u64 {
+        self.durable_generation
+    }
+
+    /// Whether a mutation has not been handed to a [`PersistJob`] yet.
+    #[cfg(test)]
+    pub fn has_pending_writes(&self) -> bool {
+        !self.read_only && self.path.is_some() && self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Serialise the registry for writing if anything changed since the last
+    /// snapshot. Needs only `&self`, so callers can hold a read lock.
+    ///
+    /// Tickets follow snapshot order: clearing `dirty` and taking the ticket
+    /// both happen under the caller's lock, and a second snapshot can only
+    /// find `dirty` set again after a mutation, which needs the write lock
+    /// this caller is holding off.
+    pub fn take_persist_job(&self) -> Option<PersistJob> {
+        if self.read_only {
+            return None;
+        }
+        let path = self.path.as_ref()?;
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return None;
+        }
         let file = RegistryFileRef {
             usernames: &self.usernames,
             names: &self.names,
             deleted: &self.deleted,
             username_activity: &self.username_activity,
         };
-        let Ok(json) = serde_json::to_vec_pretty(&file) else {
-            return;
-        };
-        let path = path.clone();
-        let gate = self.persist_gate.clone();
-        // Ticket taken here, under the registry write lock the caller holds,
-        // so tickets are issued in the same order the mutations happened.
-        let ticket = gate.next_ticket.fetch_add(1, Ordering::AcqRel) + 1;
-
-        // `load` runs before the server is serving and may not be inside a
-        // runtime, so fall back to writing inline there.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(move || write_registry(&gate, ticket, &path, &json));
+        let bytes = match serde_json::to_vec(&file) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "could not serialise the channels registry");
+                self.dirty.store(true, Ordering::Release);
+                return None;
             }
-            Err(_) => write_registry(&gate, ticket, &path, &json),
-        }
+        };
+        let ticket = self.persist_gate.next_ticket.fetch_add(1, Ordering::AcqRel) + 1;
+        Some(PersistJob {
+            gate: self.persist_gate.clone(),
+            ticket,
+            generation: self.generation,
+            path: path.clone(),
+            bytes,
+            dirty: self.dirty.clone(),
+        })
+    }
+
+    /// Refuse every later write. Called under the write lock right before the
+    /// final shutdown snapshot, so nothing acknowledged after it can be lost.
+    pub fn close_for_shutdown(&mut self) {
+        self.closed = true;
+    }
+
+    #[cfg(test)]
+    pub fn flush_blocking(&self) -> bool {
+        self.take_persist_job().map_or(true, PersistJob::write)
     }
 
     pub fn claim_username(&mut self, pubkey_hex: &str, name: &str) -> Result<(), RegistryError> {
@@ -302,25 +547,39 @@ impl ChannelRegistry {
         now: i64,
     ) -> Result<(), RegistryError> {
         self.writable()?;
-        self.reap_stale(now);
         let normalized = normalize_username(name).ok_or(RegistryError::InvalidName)?;
         let pk = pubkey_hex.to_ascii_lowercase();
         if pk.len() != 64 || hex::decode(&pk).map(|b| b.len()).unwrap_or(0) != 32 {
             return Err(RegistryError::InvalidName);
         }
+        // Only the handle being claimed can change this claim's outcome, so
+        // only it is reaped here; the sweeper reaps the rest.
+        if self
+            .usernames
+            .get(&normalized)
+            .is_some_and(|owner| self.username_idle(owner, now))
+            && self.release_username(&normalized)
+        {
+            self.touch();
+        }
         if let Some(owner) = self.usernames.get(&normalized) {
             if owner.eq_ignore_ascii_case(&pk) {
                 self.username_activity.insert(pk, now);
-                self.persist();
+                self.touch();
                 return Ok(());
             }
             return Err(RegistryError::Taken);
         }
         if let Some(old) = self.by_pubkey.remove(&pk) {
             self.usernames.remove(&old);
+            self.touch();
         }
-        // Checked after the rename path above, which is net-neutral on size,
-        // and after `reap_stale` has had its chance to free an idle handle.
+        // Checked after the rename path above, which is net-neutral on size.
+        // At the cap every idle handle is reaped first, so a full map of
+        // abandoned handles does not refuse a live claimant.
+        if self.usernames.len() >= MAX_USERNAMES {
+            self.reap_stale(now);
+        }
         if self.usernames.len() >= MAX_USERNAMES {
             tracing::warn!(
                 usernames = self.usernames.len(),
@@ -331,7 +590,7 @@ impl ChannelRegistry {
         self.usernames.insert(normalized.clone(), pk.clone());
         self.by_pubkey.insert(pk.clone(), normalized);
         self.username_activity.insert(pk, now);
-        self.persist();
+        self.touch_durable();
         Ok(())
     }
 
@@ -358,10 +617,8 @@ impl ChannelRegistry {
     /// the refresh path, and refusing that would eventually free the name of a
     /// room that is very much alive.
     pub fn has_channel(&self, channel_id: &str) -> bool {
-        let id = channel_id.to_ascii_lowercase();
-        self.names
-            .values()
-            .any(|rec| !rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+        self.live_name_of_channel(&channel_id.to_ascii_lowercase())
+            .is_some()
     }
 
     pub fn claim_channel_name(
@@ -383,7 +640,6 @@ impl ChannelRegistry {
         now: i64,
     ) -> Result<(), RegistryError> {
         self.writable()?;
-        self.reap_stale(now);
         let display = strip_invisible(name);
         let normalized = normalize_channel_name(name).ok_or(RegistryError::InvalidName)?;
         let id = channel_id.to_ascii_lowercase();
@@ -398,33 +654,46 @@ impl ChannelRegistry {
         if self.deleted.contains(&id) {
             return Err(RegistryError::Taken);
         }
-        for (existing_name, rec) in &self.names {
-            if rec.deleted || !rec.channel_id.eq_ignore_ascii_case(&id) {
-                continue;
-            }
-            if existing_name != &normalized {
-                return Err(RegistryError::Taken);
-            }
-            break;
+        let skeleton = confusable_key(&normalized);
+        // Every record the checks below consult: the exact name, this room's
+        // own name, and every lookalike. An abandoned one among them must read
+        // as free, exactly as if the whole registry had been reaped first —
+        // which is what this used to do on every claim. Nominee grace is part
+        // of `abandoned`, so a nominated room is not freed early here either.
+        let mut candidates = vec![normalized.clone()];
+        candidates.extend_from_slice(self.names_of_channel(&id));
+        if let Some(lookalikes) = self.by_skeleton.get(&skeleton) {
+            candidates.extend_from_slice(lookalikes);
+        }
+        if self.reap_abandoned_names(candidates, now) {
+            self.touch();
+        }
+        if self
+            .live_name_of_channel(&id)
+            .is_some_and(|existing| existing != normalized)
+        {
+            return Err(RegistryError::Taken);
         }
         // Reject a name that merely *looks* like one already on record. Scoped
         // to other rooms, so an owner refreshing or re-casing its own claim
         // still passes, and skipped when the exact key already exists because
         // the block below handles that case with the owner check it needs.
-        if !self.names.contains_key(&normalized) {
-            let candidate = confusable_key(&normalized);
-            // Tombstones count. The exact-key path below refuses a
-            // owner-deleted name permanently, so exempting those rows here
-            // would have left a homoglyph of a retired name claimable while
-            // the name itself never comes back — the impersonation this check
-            // exists to stop, aimed at a room that no longer has an owner to
-            // notice.
-            if self.names.iter().any(|(existing_name, rec)| {
-                !rec.channel_id.eq_ignore_ascii_case(&id)
-                    && confusable_key(existing_name) == candidate
-            }) {
-                return Err(RegistryError::Taken);
-            }
+        //
+        // Tombstones count. The exact-key path below refuses an owner-deleted
+        // name permanently, so exempting those rows here would have left a
+        // homoglyph of a retired name claimable while the name itself never
+        // comes back — the impersonation this check exists to stop, aimed at a
+        // room that no longer has an owner to notice.
+        if !self.names.contains_key(&normalized)
+            && self.by_skeleton.get(&skeleton).is_some_and(|lookalikes| {
+                lookalikes.iter().any(|existing| {
+                    self.names
+                        .get(existing)
+                        .is_some_and(|rec| !rec.channel_id.eq_ignore_ascii_case(&id))
+                })
+            })
+        {
+            return Err(RegistryError::Taken);
         }
         if let Some(existing) = self.names.get_mut(&normalized) {
             if existing.deleted {
@@ -433,10 +702,15 @@ impl ChannelRegistry {
             if existing.channel_id.eq_ignore_ascii_case(&id)
                 && existing.pubkey.eq_ignore_ascii_case(&pk)
             {
+                let changed = existing.private != private || existing.display != display;
                 existing.private = private;
                 existing.display = display;
                 existing.refreshed_at = now;
-                self.persist();
+                if changed {
+                    self.touch_durable();
+                } else {
+                    self.touch();
+                }
                 return Ok(());
             }
             return Err(RegistryError::Taken);
@@ -445,13 +719,16 @@ impl ChannelRegistry {
         // re-case path above returns before here — so the cap cannot lock an
         // existing room out of keeping its own claim alive.
         if self.names.len() >= MAX_CHANNEL_NAMES {
+            self.reap_stale(now);
+        }
+        if self.names.len() >= MAX_CHANNEL_NAMES {
             tracing::warn!(
                 names = self.names.len(),
                 "channel name registry is at its cap; refusing new claims"
             );
             return Err(RegistryError::Full);
         }
-        self.names.insert(
+        self.insert_name(
             normalized,
             ChannelNameRecord {
                 channel_id: id,
@@ -462,9 +739,11 @@ impl ChannelRegistry {
                 refreshed_at: now,
                 nominee: String::new(),
                 claim_after_days: 0,
+                created_at: now,
+                handed_over_from: String::new(),
             },
         );
-        self.persist();
+        self.touch_durable();
         Ok(())
     }
 
@@ -490,23 +769,25 @@ impl ChannelRegistry {
             return Err(RegistryError::InvalidName);
         }
         let Some(rec) = self
-            .names
-            .values_mut()
-            .find(|rec| !rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+            .live_name_of_channel(&id)
+            .and_then(|name| self.names.get_mut(&name))
         else {
             return Err(RegistryError::InvalidName);
         };
         if !rec.pubkey.eq_ignore_ascii_case(&pk) {
             return Err(RegistryError::Forbidden);
         }
-        if clearing {
-            rec.nominee = String::new();
-            rec.claim_after_days = 0;
+        let (nominee, claim_after_days) = if clearing {
+            (String::new(), 0)
         } else {
-            rec.nominee = nominee;
-            rec.claim_after_days = claim_after_days;
+            (nominee, claim_after_days)
+        };
+        if rec.nominee == nominee && rec.claim_after_days == claim_after_days {
+            return Ok(());
         }
-        self.persist();
+        rec.nominee = nominee;
+        rec.claim_after_days = claim_after_days;
+        self.touch_durable();
         Ok(())
     }
 
@@ -547,18 +828,24 @@ impl ChannelRegistry {
         if self.deleted.contains(&old_id) || self.deleted.contains(&new_id) {
             return Err(RegistryError::Taken);
         }
-        if self
-            .names
-            .values()
-            .any(|rec| !rec.deleted && rec.channel_id.eq_ignore_ascii_case(&new_id))
-        {
-            return Err(RegistryError::Taken);
+        if let Some(held) = self.live_name_of_channel(&new_id) {
+            // This exact handover already happened, e.g. a retry after its
+            // first answer was lost. Anything else holding the successor's
+            // name is a conflict.
+            let already_done = self.names.get(&held).is_some_and(|rec| {
+                rec.pubkey.eq_ignore_ascii_case(&new_pk)
+                    && rec.handed_over_from.eq_ignore_ascii_case(&old_id)
+            });
+            return if already_done {
+                Ok(())
+            } else {
+                Err(RegistryError::Taken)
+            };
         }
-        let Some(rec) = self
-            .names
-            .values_mut()
-            .find(|rec| !rec.deleted && rec.channel_id.eq_ignore_ascii_case(&old_id))
-        else {
+        let Some(name) = self.live_name_of_channel(&old_id) else {
+            return Err(RegistryError::InvalidName);
+        };
+        let Some(rec) = self.names.get_mut(&name) else {
             return Err(RegistryError::InvalidName);
         };
         let by_owner = rec.pubkey.eq_ignore_ascii_case(&signer);
@@ -569,15 +856,19 @@ impl ChannelRegistry {
         if !by_owner && !by_nominee {
             return Err(RegistryError::Forbidden);
         }
-        rec.channel_id = new_id;
+        let previous_id = rec.channel_id.to_ascii_lowercase();
+        rec.channel_id = new_id.clone();
         rec.pubkey = new_pk;
         rec.refreshed_at = now;
+        rec.handed_over_from = previous_id.clone();
         // The nomination belonged to the previous owner; the new one publishes
         // their own, and leaving it would let the old nominee take the name a
         // second time.
         rec.nominee = String::new();
         rec.claim_after_days = 0;
-        self.persist();
+        detach_name(&mut self.by_channel, &previous_id, &name);
+        self.by_channel.entry(new_id).or_default().push(name);
+        self.touch_durable();
         Ok(())
     }
 
@@ -589,12 +880,17 @@ impl ChannelRegistry {
         self.writable()?;
         let id = channel_id.to_ascii_lowercase();
         let pk = pubkey_hex.to_ascii_lowercase();
+        let held = self.names_of_channel(&id).to_vec();
+        if held.iter().any(|name| {
+            self.names
+                .get(name)
+                .is_some_and(|rec| !rec.pubkey.eq_ignore_ascii_case(&pk))
+        }) {
+            return Err(RegistryError::Forbidden);
+        }
         let mut found = false;
-        for rec in self.names.values_mut() {
-            if rec.channel_id.eq_ignore_ascii_case(&id) {
-                if !rec.pubkey.eq_ignore_ascii_case(&pk) {
-                    return Err(RegistryError::Forbidden);
-                }
+        for name in &held {
+            if let Some(rec) = self.names.get_mut(name) {
                 rec.deleted = true;
                 found = true;
             }
@@ -616,24 +912,37 @@ impl ChannelRegistry {
             );
             return Err(RegistryError::Full);
         }
-        if !found {
-            // Owner can tombstone an id even if the name claim never landed,
-            // so Discover cannot keep serving a room they have destroyed.
-            self.deleted.insert(id);
-            self.persist();
-            return Ok(());
-        }
+        // Owner can tombstone an id even if the name claim never landed, so
+        // Discover cannot keep serving a room they have destroyed.
         self.deleted.insert(id);
-        self.persist();
+        self.touch_durable();
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn public_directory(&self) -> Vec<DirectoryListing> {
         self.public_directory_at(unix_now())
     }
 
+    #[cfg(test)]
     pub fn public_directory_at(&self, now: i64) -> Vec<DirectoryListing> {
-        let mut out: Vec<DirectoryListing> = self
+        self.ranked_directory(now)
+            .into_iter()
+            .map(|(_, listing)| listing)
+            .collect()
+    }
+
+    /// Every listing the directory serves, in rank order: oldest claim first,
+    /// capped at [`MAX_DIRECTORY_LISTINGS`].
+    ///
+    /// Seniority rather than recency, because recency is what a flood has: a
+    /// script standing up names (and refreshing them) looks exactly as active
+    /// as a real room, but it cannot make its names older than rooms that were
+    /// already listed. Only rooms whose owner refreshed within
+    /// [`CHANNEL_DIRECTORY_STALE_SECS`] are listed at all, so an established
+    /// room that has gone quiet stops holding a slot.
+    fn ranked_directory(&self, now: i64) -> Vec<(DirectoryCursor, DirectoryListing)> {
+        let mut out: Vec<(DirectoryCursor, DirectoryListing)> = self
             .names
             .iter()
             .filter(|(_, rec)| {
@@ -642,18 +951,82 @@ impl ChannelRegistry {
                     && !self.deleted.contains(&rec.channel_id)
                     && now.saturating_sub(rec.refreshed_at) <= CHANNEL_DIRECTORY_STALE_SECS
             })
-            .map(|(name, rec)| DirectoryListing {
-                channel_id: rec.channel_id.clone(),
-                pubkey: rec.pubkey.clone(),
-                name: if rec.display.is_empty() {
-                    name.clone()
-                } else {
-                    rec.display.clone()
-                },
+            .map(|(name, rec)| {
+                (
+                    DirectoryCursor {
+                        created_at: rec.created_at.max(0),
+                        channel_id: rec.channel_id.to_ascii_lowercase(),
+                    },
+                    DirectoryListing {
+                        channel_id: rec.channel_id.clone(),
+                        pubkey: rec.pubkey.clone(),
+                        name: if rec.display.is_empty() {
+                            name.clone()
+                        } else {
+                            rec.display.clone()
+                        },
+                    },
+                )
             })
             .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        if out.len() > MAX_DIRECTORY_LISTINGS {
+            out.select_nth_unstable_by(MAX_DIRECTORY_LISTINGS - 1, |a, b| a.0.cmp(&b.0));
+            out.truncate(MAX_DIRECTORY_LISTINGS);
+        }
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// One page of the ranked directory, starting strictly after `cursor`.
+    pub fn directory_page(&self, cursor: Option<&DirectoryCursor>, limit: usize) -> DirectoryPage {
+        self.directory_page_at(cursor, limit, unix_now(), DIRECTORY_REBUILD_MIN_SECS)
+    }
+
+    /// The ranking is cached, so serving a page costs a binary search and a
+    /// copy of at most `limit` listings rather than a scan and sort of every
+    /// name. Writes invalidate it, but it is rebuilt at most once per
+    /// `rebuild_min_secs`, so a page can lag a write by that long.
+    pub fn directory_page_at(
+        &self,
+        cursor: Option<&DirectoryCursor>,
+        limit: usize,
+        now: i64,
+        rebuild_min_secs: i64,
+    ) -> DirectoryPage {
+        let ranked = self.cached_ranking(now, rebuild_min_secs);
+        let start = cursor.map_or(0, |cursor| {
+            ranked.entries.partition_point(|(key, _)| key <= cursor)
+        });
+        let end = start.saturating_add(limit.max(1)).min(ranked.entries.len());
+        let page = &ranked.entries[start.min(end)..end];
+        DirectoryPage {
+            channels: page.iter().map(|(_, listing)| listing.clone()).collect(),
+            next_cursor: (end < ranked.entries.len())
+                .then(|| page.last().map(|(key, _)| key.encode()))
+                .flatten(),
+        }
+    }
+
+    fn cached_ranking(&self, now: i64, rebuild_min_secs: i64) -> Arc<RankedDirectory> {
+        let mut cache = self
+            .directory_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(cached) = cache.as_ref() {
+            let age = now.saturating_sub(cached.built_at);
+            let usable = (0..DIRECTORY_CACHE_MAX_AGE_SECS).contains(&age)
+                && (cached.generation == self.generation || age < rebuild_min_secs);
+            if usable {
+                return cached.clone();
+            }
+        }
+        let built = Arc::new(RankedDirectory {
+            generation: self.generation,
+            built_at: now,
+            entries: self.ranked_directory(now),
+        });
+        *cache = Some(built.clone());
+        built
     }
 
     /// Drop abandoned usernames and room names. Owner-deleted names stay
@@ -664,48 +1037,32 @@ impl ChannelRegistry {
     /// talking. Forgetting the claim frees the name and takes the room out of
     /// the directory without evicting anyone, and it keeps the tombstone list
     /// bounded by real deletions instead of growing forever.
+    ///
+    /// Runs from the sweeper, not from claims: a claim reaps only the records
+    /// that decide its own outcome, which gives it the same answer.
     pub fn reap_stale(&mut self, now: i64) -> bool {
-        if self.read_only {
+        if self.read_only || self.closed {
             return false;
         }
         let mut changed = self.grandfather_legacy_timestamps(now);
         let idle_names: Vec<String> = self
             .usernames
             .iter()
-            .filter_map(|(name, pk)| {
-                let ts = self.username_activity.get(pk).copied().unwrap_or(now);
-                (now.saturating_sub(ts) > USERNAME_IDLE_SECS).then(|| name.clone())
-            })
+            .filter(|(_, pk)| self.username_idle(pk, now))
+            .map(|(name, _)| name.clone())
             .collect();
         for name in idle_names {
-            if let Some(pk) = self.usernames.remove(&name) {
-                self.by_pubkey.remove(&pk);
-                self.username_activity.remove(&pk);
-                changed = true;
-            }
+            changed |= self.release_username(&name);
         }
         let abandoned: Vec<String> = self
             .names
             .iter()
-            .filter_map(|(name, rec)| {
-                if rec.deleted {
-                    return None;
-                }
-                let ts = if rec.refreshed_at > 0 {
-                    rec.refreshed_at
-                } else {
-                    now
-                };
-                (now.saturating_sub(ts) > rec.release_after_secs()).then(|| name.clone())
-            })
+            .filter(|(_, rec)| rec.abandoned(now))
+            .map(|(name, _)| name.clone())
             .collect();
-        for name in abandoned {
-            if self.names.remove(&name).is_some() {
-                changed = true;
-            }
-        }
+        changed |= self.reap_abandoned_names(abandoned, now);
         if changed {
-            self.persist();
+            self.touch();
         }
         changed
     }
@@ -750,9 +1107,9 @@ impl ChannelRegistry {
         if self.deleted.contains(&id) {
             return true;
         }
-        self.names
-            .values()
-            .any(|rec| rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+        self.names_of_channel(&id)
+            .iter()
+            .any(|name| self.names.get(name).is_some_and(|rec| rec.deleted))
     }
 
     /// One page of [`Self::deleted_ids`], starting after `after`.
@@ -769,6 +1126,15 @@ impl ChannelRegistry {
             None => 0,
         };
         all.into_iter().skip(start).take(limit).collect()
+    }
+}
+
+fn detach_name(index: &mut HashMap<String, Vec<String>>, key: &str, name: &str) {
+    if let Some(names) = index.get_mut(key) {
+        names.retain(|existing| existing != name);
+        if names.is_empty() {
+            index.remove(key);
+        }
     }
 }
 
@@ -902,7 +1268,7 @@ fn load_registry_file(dest: &Path) -> (RegistryFile, bool) {
 /// ordering: `atomic_write` on Windows moves the destination aside before
 /// renaming, and two of those interleaving would fight over the same backup
 /// path.
-fn write_registry(gate: &PersistGate, ticket: u64, dest: &Path, bytes: &[u8]) {
+fn write_registry(gate: &PersistGate, ticket: u64, dest: &Path, bytes: &[u8]) -> bool {
     let mut written = match gate.written.lock() {
         Ok(guard) => guard,
         // Another writer panicked mid-write. The file is still consistent —
@@ -913,14 +1279,15 @@ fn write_registry(gate: &PersistGate, ticket: u64, dest: &Path, bytes: &[u8]) {
     };
     if *written >= ticket {
         // A newer snapshot is already on disk; this one would rewind it.
-        return;
+        return true;
     }
     let tmp = dest.with_extension("json.tmp");
     if atomic_write(&tmp, dest, bytes).is_err() {
         tracing::warn!(path = %dest.display(), "could not persist the channels registry");
-        return;
+        return false;
     }
     *written = ticket;
+    true
 }
 
 fn atomic_write(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1078,9 +1445,8 @@ mod tests {
     #[test]
     fn the_username_map_refuses_new_claims_at_its_cap() {
         let mut reg = ChannelRegistry::in_memory();
-        // Filled directly rather than through `claim_username`: every claim
-        // runs `reap_stale` over the whole map, so seeding the cap through the
-        // public path would be quadratic.
+        // Filled directly rather than through `claim_username`, which would
+        // spend the creation budget a hundred thousand times over.
         let now = unix_now();
         for i in 0..MAX_USERNAMES {
             let pk = format!("{i:064x}");
@@ -1268,14 +1634,14 @@ mod tests {
         assert!(reg.claim_channel_name(&gone, &gone_pk, "Gone", false).is_ok());
         assert!(reg.delete_channel(&gone, &gone_pk).is_ok());
 
-        let borrowed = serde_json::to_vec_pretty(&RegistryFileRef {
+        let borrowed = serde_json::to_vec(&RegistryFileRef {
             usernames: &reg.usernames,
             names: &reg.names,
             deleted: &reg.deleted,
             username_activity: &reg.username_activity,
         })
         .expect("borrowed form serialises");
-        let owned = serde_json::to_vec_pretty(&RegistryFile {
+        let owned = serde_json::to_vec(&RegistryFile {
             usernames: reg.usernames.clone(),
             names: reg.names.clone(),
             deleted: reg.deleted.clone(),
@@ -1450,6 +1816,7 @@ mod tests {
             let mut reg = ChannelRegistry::load(path.clone());
             assert!(reg.claim_username(&alice, "Ada").is_ok());
             assert!(reg.claim_channel_name(&id, &pk, "Lobby", false).is_ok());
+            assert!(reg.flush_blocking());
         }
         let mut reloaded = ChannelRegistry::load(path.clone());
         assert_eq!(reloaded.public_directory().len(), 1);
@@ -1814,6 +2181,7 @@ mod tests {
         let mut reg = ChannelRegistry::load(path.to_path_buf());
         assert!(!reg.is_read_only());
         assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+        assert!(reg.flush_blocking());
     }
 
     fn holds_ada(reg: &ChannelRegistry) -> bool {
@@ -1826,6 +2194,7 @@ mod tests {
         let mut reg = ChannelRegistry::load(dir.registry());
         assert!(!reg.is_read_only());
         assert!(reg.claim_username(&"aa".repeat(32), "Ada").is_ok());
+        assert!(reg.flush_blocking());
         assert!(dir.registry().exists());
         assert_eq!(dir.corrupt_copies(), 0);
     }
@@ -1866,6 +2235,8 @@ mod tests {
             Err(RegistryError::ReadOnly)
         );
         assert!(!reg.reap_stale(unix_now()));
+        assert!(!reg.has_pending_writes());
+        assert!(reg.take_persist_job().is_none(), "read-only never produces a write");
 
         assert_eq!(
             fs::read(dir.registry()).unwrap(),
@@ -1940,5 +2311,389 @@ mod tests {
         let dir = ScratchDir::new("empty");
         fs::write(dir.registry(), b"").unwrap();
         assert!(ChannelRegistry::load(dir.registry()).is_read_only());
+    }
+
+    fn user_key(i: usize) -> String {
+        format!("{:064x}", i + 1)
+    }
+
+    fn room_id(i: usize) -> String {
+        format!("{:032x}", i + 1)
+    }
+
+    /// A burst of refreshes is one write, taken when the owner flushes, and in
+    /// compact form.
+    #[test]
+    fn writes_are_debounced_until_a_flush() {
+        let dir = ScratchDir::new("debounce");
+        let mut reg = ChannelRegistry::load(dir.registry());
+        assert!(!reg.has_pending_writes(), "loading an empty registry writes nothing");
+        for i in 0..50 {
+            assert!(reg.claim_username(&user_key(i), &format!("user{i}")).is_ok());
+        }
+        assert!(!dir.registry().exists(), "no claim writes the file itself");
+        assert!(reg.has_pending_writes());
+
+        let job = reg.take_persist_job().expect("mutations leave a snapshot to write");
+        assert!(reg.take_persist_job().is_none(), "one snapshot covers the whole burst");
+        assert!(!reg.has_pending_writes());
+        assert!(job.write());
+        let bytes = fs::read(dir.registry()).unwrap();
+        assert!(!bytes.contains(&b'\n'), "snapshots are written compact");
+
+        let reloaded = ChannelRegistry::load(dir.registry());
+        assert!(reloaded.holds_username(&user_key(49), "user49"));
+
+        assert!(reg.claim_username(&user_key(0), "user0").is_ok());
+        assert!(reg.has_pending_writes(), "a refresh re-arms the flush");
+    }
+
+    /// Only changes nothing would recreate are durable; refreshes and an
+    /// in-memory registry never make a caller wait for disk.
+    #[test]
+    fn only_state_creating_writes_are_durable() {
+        let dir = ScratchDir::new("durable");
+        let mut reg = ChannelRegistry::load(dir.registry());
+        let t0 = 1_700_000_000;
+        let mut last = reg.durable_generation();
+        let mut step = |reg: &ChannelRegistry, durable: bool, what: &str| {
+            let now = reg.durable_generation();
+            assert_eq!(now > last, durable, "{what}");
+            last = now;
+        };
+        assert!(reg.claim_username_at(&user_key(0), "Ada", t0).is_ok());
+        step(&reg, true, "a new username");
+        assert!(reg.claim_username_at(&user_key(0), "Ada", t0 + 1).is_ok());
+        step(&reg, false, "a username refresh");
+        assert!(reg.claim_channel_name_at(&room_id(0), &user_key(0), "Lobby", false, t0).is_ok());
+        step(&reg, true, "a new room name");
+        assert!(reg.claim_channel_name_at(&room_id(0), &user_key(0), "Lobby", false, t0 + 1).is_ok());
+        step(&reg, false, "a room refresh");
+        assert!(reg.claim_channel_name_at(&room_id(0), &user_key(0), "Lobby", true, t0 + 2).is_ok());
+        step(&reg, true, "going private");
+        assert!(reg.set_channel_nominee(&room_id(0), &user_key(0), &user_key(5), 7).is_ok());
+        step(&reg, true, "a nomination");
+        assert!(reg.set_channel_nominee(&room_id(0), &user_key(0), &user_key(5), 7).is_ok());
+        step(&reg, false, "an unchanged nomination");
+        assert!(reg
+            .handover_channel_name(&room_id(0), &room_id(1), &user_key(1), &user_key(0), t0 + 3)
+            .is_ok());
+        step(&reg, true, "a handover");
+        assert!(reg.delete_channel(&room_id(1), &user_key(1)).is_ok());
+        step(&reg, true, "a delete");
+        let job = reg.take_persist_job().unwrap();
+        assert_eq!(job.generation(), reg.generation, "a snapshot covers every mutation so far");
+
+        let mut memory = ChannelRegistry::in_memory();
+        assert!(memory.claim_username_at(&user_key(0), "Ada", t0).is_ok());
+        assert_eq!(memory.durable_generation(), 0);
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_by_the_next_flush() {
+        let dir = ScratchDir::new("retry");
+        let nested = dir.0.join("nested");
+        let path = nested.join("channels.json");
+        let mut reg = ChannelRegistry::load(path.clone());
+        assert!(reg.claim_username(&user_key(0), "Ada").is_ok());
+        fs::remove_dir_all(&nested).unwrap();
+        assert!(!reg.take_persist_job().unwrap().write());
+        assert!(reg.has_pending_writes(), "the lost write is still owed");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(reg.flush_blocking());
+        assert!(ChannelRegistry::load(path).holds_username(&user_key(0), "Ada"));
+    }
+
+    /// Two snapshots can be in flight at once; the older must never land last.
+    #[test]
+    fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let dir = ScratchDir::new("order");
+        let mut reg = ChannelRegistry::load(dir.registry());
+        assert!(reg.claim_username(&user_key(0), "Ada").is_ok());
+        let older = reg.take_persist_job().unwrap();
+        assert!(reg.claim_username(&user_key(1), "Bob").is_ok());
+        let newer = reg.take_persist_job().unwrap();
+        assert!(newer.write());
+        assert!(older.write(), "a superseded snapshot is simply dropped");
+        let reloaded = ChannelRegistry::load(dir.registry());
+        assert!(reloaded.holds_username(&user_key(1), "Bob"));
+    }
+
+    /// The final snapshot carries the last acknowledged write, and nothing is
+    /// acknowledged after it.
+    #[test]
+    fn closing_for_shutdown_flushes_and_refuses_later_writes() {
+        let dir = ScratchDir::new("shutdown");
+        let mut reg = ChannelRegistry::load(dir.registry());
+        assert!(reg.claim_username(&user_key(0), "Ada").is_ok());
+        reg.close_for_shutdown();
+        assert!(reg.take_persist_job().expect("pending write").write());
+        assert_eq!(
+            reg.claim_username(&user_key(1), "Bob"),
+            Err(RegistryError::ReadOnly)
+        );
+        assert!(!reg.reap_stale(unix_now() + 2 * USERNAME_IDLE_SECS));
+        assert!(!reg.has_pending_writes());
+        assert!(ChannelRegistry::load(dir.registry()).holds_username(&user_key(0), "Ada"));
+    }
+
+    /// Claims no longer reap the whole registry, so each must still find an
+    /// abandoned name free on its own — the exact name, a lookalike of it, and
+    /// the claimant room's own lapsed name.
+    #[test]
+    fn a_claim_reaps_exactly_the_abandoned_records_it_depends_on() {
+        let t0 = 1_700_000_000;
+        let released = t0 + NAME_RELEASE_SECS + 1;
+        let mut reg = ChannelRegistry::in_memory();
+        assert!(reg.claim_channel_name_at(&room_id(0), &user_key(0), "Lobby", false, t0).is_ok());
+        assert!(reg.claim_channel_name_at(&room_id(1), &user_key(1), "Lounge", false, t0).is_ok());
+        assert!(reg.claim_channel_name_at(&room_id(2), &user_key(2), "Attic", false, t0).is_ok());
+
+        assert_eq!(
+            reg.claim_channel_name_at(&room_id(3), &user_key(3), "Lobby", false, released - 1),
+            Err(RegistryError::Taken),
+            "not yet released"
+        );
+        assert!(reg
+            .claim_channel_name_at(&room_id(3), &user_key(3), "Lobby", false, released)
+            .is_ok());
+        assert!(
+            reg.claim_channel_name_at(&room_id(4), &user_key(4), "L\u{03BF}unge", false, released)
+                .is_ok(),
+            "a lookalike of an abandoned name is free once it is"
+        );
+        assert!(
+            reg.claim_channel_name_at(&room_id(2), &user_key(2), "Cellar", false, released)
+                .is_ok(),
+            "a returning owner's lapsed name no longer pins their room"
+        );
+        assert!(reg.names.len() == 3 && !reg.names.contains_key("attic"));
+    }
+
+    #[test]
+    fn a_nominated_name_is_only_freed_by_a_claim_after_its_grace() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        nominated_lobby(&mut reg, CLAIM_AFTER_DAYS_MAX, t0);
+        let deadline = t0 + i64::from(CLAIM_AFTER_DAYS_MAX) * 86_400 + NOMINEE_GRACE_SECS;
+        assert_eq!(
+            reg.claim_channel_name_at(&"99".repeat(16), &"88".repeat(32), "Lobby", false, deadline),
+            Err(RegistryError::Taken)
+        );
+        assert!(reg
+            .claim_channel_name_at(&"99".repeat(16), &"88".repeat(32), "Lobby", false, deadline + 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn channel_indexes_follow_handover_delete_and_reap() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let (old_id, new_id) = (room_id(0), room_id(1));
+        assert!(reg.claim_channel_name_at(&old_id, &user_key(0), "Lobby", false, t0).is_ok());
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &user_key(1), &user_key(0), t0)
+            .is_ok());
+        assert!(!reg.has_channel(&old_id));
+        assert!(reg.has_channel(&new_id.to_uppercase()));
+        assert_eq!(reg.names["lobby"].created_at, t0, "a handover keeps seniority");
+        assert!(reg.delete_channel(&new_id, &user_key(1)).is_ok());
+        assert!(reg.is_deleted(&new_id));
+        assert!(!reg.has_channel(&new_id));
+
+        let lapsed = room_id(2);
+        assert!(reg.claim_channel_name_at(&lapsed, &user_key(2), "Attic", false, t0).is_ok());
+        assert!(reg.reap_stale(t0 + NAME_RELEASE_SECS + 1));
+        assert!(reg.by_channel.get(&lapsed).is_none());
+        assert!(reg.by_skeleton.get(&confusable_key("attic")).is_none());
+        assert!(
+            reg.by_skeleton.contains_key(&confusable_key("lobby")),
+            "a tombstoned name keeps its skeleton"
+        );
+    }
+
+    /// A retried handover (its first answer lost, or answered 503 while the
+    /// write was still pending) must read as done, not as "name taken".
+    #[test]
+    fn a_repeated_handover_is_idempotent() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let (old_id, new_id) = (room_id(0), room_id(1));
+        assert!(reg.claim_channel_name_at(&old_id, &user_key(0), "Lobby", false, t0).is_ok());
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id, &user_key(1), &user_key(0), t0)
+            .is_ok());
+        let generation = reg.generation;
+        assert!(reg
+            .handover_channel_name(&old_id, &new_id.to_uppercase(), &user_key(1), &user_key(0), t0 + 5)
+            .is_ok());
+        assert_eq!(reg.generation, generation, "the retry changes nothing");
+        assert_eq!(
+            reg.handover_channel_name(&old_id, &new_id, &user_key(2), &user_key(0), t0 + 5),
+            Err(RegistryError::Taken),
+            "a different successor key is not the same handover"
+        );
+        assert_eq!(
+            reg.handover_channel_name(&room_id(7), &new_id, &user_key(1), &user_key(0), t0 + 5),
+            Err(RegistryError::Taken),
+            "nor is one from a different room"
+        );
+
+        // A successor that already held a name of its own is still refused.
+        assert!(reg.claim_channel_name_at(&room_id(2), &user_key(2), "Attic", false, t0).is_ok());
+        assert!(reg.claim_channel_name_at(&room_id(3), &user_key(3), "Cellar", false, t0).is_ok());
+        assert_eq!(
+            reg.handover_channel_name(&room_id(2), &room_id(3), &user_key(3), &user_key(2), t0),
+            Err(RegistryError::Taken)
+        );
+    }
+
+    fn walk_directory(reg: &ChannelRegistry, limit: usize, now: i64) -> (Vec<String>, usize) {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let page = reg.directory_page_at(cursor.as_ref(), limit, now, 0);
+            pages += 1;
+            assert!(page.channels.len() <= limit);
+            ids.extend(page.channels.into_iter().map(|listing| listing.channel_id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(DirectoryCursor::parse(&next).expect("own cursor")),
+                None => return (ids, pages),
+            }
+        }
+    }
+
+    #[test]
+    fn directory_pages_cover_every_listing_once_in_rank_order() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        for i in 0..1_203 {
+            // Several rooms per second, so ties on `created_at` are exercised.
+            let at = t0 + (i as i64 * 7919) % 400;
+            assert!(reg
+                .claim_channel_name_at(&room_id(i), &user_key(i), &format!("room{i}"), false, at)
+                .is_ok());
+        }
+        let now = t0 + 400;
+        let expected: Vec<String> = reg
+            .public_directory_at(now)
+            .into_iter()
+            .map(|listing| listing.channel_id)
+            .collect();
+        assert_eq!(expected.len(), 1_203);
+        let (walked, pages) = walk_directory(&reg, DIRECTORY_PAGE_SIZE, now);
+        assert_eq!(pages, 3);
+        assert_eq!(walked, expected, "pages reproduce the ranking exactly");
+
+        let ranked = reg.ranked_directory(now);
+        assert!(ranked.windows(2).all(|pair| pair[0].0 < pair[1].0), "strict order");
+
+        // A room created mid-walk ranks last, so it is picked up rather than
+        // shifting rows under a cursor already handed out.
+        let first = reg.directory_page_at(None, DIRECTORY_PAGE_SIZE, now, 0);
+        assert!(reg
+            .claim_channel_name_at(&room_id(5_000), &user_key(5_000), "latecomer", false, now)
+            .is_ok());
+        let cursor = DirectoryCursor::parse(first.next_cursor.as_deref().unwrap()).unwrap();
+        let (rest, _) = {
+            let mut ids = Vec::new();
+            let mut cursor = Some(cursor);
+            loop {
+                let page = reg.directory_page_at(cursor.as_ref(), DIRECTORY_PAGE_SIZE, now, 0);
+                ids.extend(page.channels.into_iter().map(|listing| listing.channel_id));
+                match page.next_cursor {
+                    Some(next) => cursor = DirectoryCursor::parse(&next),
+                    None => break (ids, ()),
+                }
+            }
+        };
+        assert_eq!(rest.len(), 1_203 - DIRECTORY_PAGE_SIZE + 1);
+        assert_eq!(rest.last(), Some(&room_id(5_000)));
+    }
+
+    #[test]
+    fn a_flood_of_new_rooms_cannot_push_established_ones_out() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        for i in 0..10 {
+            assert!(reg
+                .claim_channel_name_at(&room_id(i), &user_key(i), &format!("est{i}"), false, t0)
+                .is_ok());
+        }
+        let flood_at = t0 + 3_600;
+        for i in 10..(10 + MAX_DIRECTORY_LISTINGS + 50) {
+            assert!(reg
+                .claim_channel_name_at(&room_id(i), &user_key(i), &format!("f{i}"), false, flood_at)
+                .is_ok());
+        }
+        let listed = reg.public_directory_at(flood_at);
+        assert_eq!(listed.len(), MAX_DIRECTORY_LISTINGS, "the directory is capped");
+        for i in 0..10 {
+            assert_eq!(listed[i].channel_id, room_id(i), "established rooms rank first");
+        }
+        let (walked, pages) = walk_directory(&reg, DIRECTORY_PAGE_SIZE, flood_at);
+        assert_eq!(walked.len(), MAX_DIRECTORY_LISTINGS);
+        assert_eq!(pages, MAX_DIRECTORY_LISTINGS / DIRECTORY_PAGE_SIZE);
+    }
+
+    /// A client that predates paging reads one page and must accept it: its
+    /// response limit is 256 KiB, whatever the names contain.
+    #[test]
+    fn a_first_page_of_worst_case_names_fits_a_legacy_client() {
+        let mut reg = ChannelRegistry::in_memory();
+        let now = unix_now();
+        for i in 0..(DIRECTORY_PAGE_SIZE + 10) {
+            let name = format!("{i:04}{}", "\"".repeat(CHANNEL_NAME_MAX - 4));
+            assert_eq!(name.len(), CHANNEL_NAME_MAX);
+            assert!(reg
+                .claim_channel_name_at(&room_id(i), &user_key(i), &name, false, now)
+                .is_ok());
+        }
+        let page = reg.directory_page(None, DIRECTORY_PAGE_SIZE);
+        assert_eq!(page.channels.len(), DIRECTORY_PAGE_SIZE);
+        assert!(page.next_cursor.is_some());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "channels": page.channels,
+            "next_cursor": page.next_cursor,
+        }))
+        .unwrap();
+        assert!(body.len() < 256 * 1024, "first page is {} bytes", body.len());
+    }
+
+    #[test]
+    fn directory_cursors_round_trip_and_reject_garbage() {
+        let cursor = DirectoryCursor::parse(&format!("1700000000.{}", "AB".repeat(16))).unwrap();
+        assert_eq!(cursor.encode(), format!("1700000000.{}", "ab".repeat(16)));
+        for bad in [
+            "",
+            ".",
+            "12",
+            "-1.00000000000000000000000000000000",
+            "1.0000000000000000000000000000000",
+            "1.0000000000000000000000000000000g",
+            "99999999999999999999.00000000000000000000000000000000",
+            "1.00000000000000000000000000000000.1",
+        ] {
+            assert!(DirectoryCursor::parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// Writes invalidate the cached ranking but rebuild it at most once per
+    /// interval, and age alone forces a rebuild.
+    #[test]
+    fn the_directory_ranking_is_cached_between_rebuilds() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        assert!(reg.claim_channel_name_at(&room_id(0), &user_key(0), "Lobby", false, t0).is_ok());
+        let count = |reg: &ChannelRegistry, now| reg.directory_page_at(None, 10, now, 2).channels.len();
+        assert_eq!(count(&reg, t0), 1);
+        assert!(reg.claim_channel_name_at(&room_id(1), &user_key(1), "Lounge", false, t0).is_ok());
+        assert_eq!(count(&reg, t0 + 1), 1, "a write inside the interval is not rebuilt yet");
+        assert_eq!(count(&reg, t0 + 2), 2);
+
+        // With no writes at all, a listing still ages out once the cache does.
+        let stale = t0 + CHANNEL_DIRECTORY_STALE_SECS + 1;
+        assert_eq!(count(&reg, stale), 0);
     }
 }
