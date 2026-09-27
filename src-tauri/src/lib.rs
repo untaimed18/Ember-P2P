@@ -2132,6 +2132,7 @@ pub fn run() {
             commands::channels::set_channel_invite_policy,
             commands::channels::set_channel_slow_mode,
             commands::channels::set_channel_announce_only,
+            commands::channels::set_channel_language,
             commands::channels::set_channel_message_pinned,
             commands::channels::get_channel_pins,
             commands::channels::delete_owned_channel,

@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 57;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 58;
 
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
@@ -327,6 +327,9 @@ pub struct StoredChannel {
     /// Unix seconds of this device's last rename of a room it owns, 0 if never.
     /// Non-zero is what puts the name on the owner's moderation snapshot.
     pub renamed_at: i64,
+    /// The room's default language code, empty for none. Carried on the
+    /// signed moderation record; see `ModerationTail::language`.
+    pub language: String,
 }
 
 impl StoredChannel {
@@ -2772,6 +2775,16 @@ impl Database {
                 "TEXT NOT NULL DEFAULT ''",
             )?;
             set_version(&tx, 57)?;
+            tx.commit()?;
+        }
+
+        if version < 58 {
+            // A room's default language, carried on the owner's moderation
+            // snapshot. Empty is "none", which is every room until its owner
+            // picks one.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "channels", "language", "TEXT NOT NULL DEFAULT ''")?;
+            set_version(&tx, 58)?;
             tx.commit()?;
         }
 
@@ -6350,7 +6363,7 @@ impl Database {
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
                     c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
-                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at
+                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at, c.language
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC"
         );
@@ -6373,7 +6386,7 @@ impl Database {
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
                     c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
-                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at
+                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at, c.language
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -6481,7 +6494,7 @@ impl Database {
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
                         c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
-                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at
+                    c.announce_only, c.pinned_msg_ids, 0, c.renamed_at, c.language
                  FROM channels c WHERE c.channel_id = ?1",
                 params![channel_id],
                 Self::stored_channel_from_row,
@@ -6509,7 +6522,7 @@ impl Database {
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
                         c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs,
-                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at
+                    c.announce_only, c.pinned_msg_ids, {CHANNEL_ROSTER_COUNT_SQL}, c.renamed_at, c.language
                  FROM channels c WHERE c.channel_id = ?1"
                 ),
                 params![channel_id],
@@ -6552,6 +6565,7 @@ impl Database {
                 .unwrap_or_default(),
             roster_count: row.get(26)?,
             renamed_at: row.get::<_, i64>(27).unwrap_or(0),
+            language: row.get::<_, String>(28).unwrap_or_default(),
         })
     }
 
@@ -7303,14 +7317,15 @@ impl Database {
             // name a line the successor room does not have.
             tx.execute(
                 "UPDATE channels SET predecessor_id = ?2, topic = ?3, welcome = ?4,
-                     announce_only = ?5
+                     announce_only = ?5, language = ?6
                  WHERE channel_id = ?1",
                 params![
                     successor_channel_id,
                     old_channel_id,
                     old.topic,
                     old.welcome,
-                    i64::from(old.announce_only)
+                    i64::from(old.announce_only),
+                    old.language
                 ],
             )?;
             // `ban_revised_at` travels with the row. It is the watermark
@@ -8345,36 +8360,76 @@ impl Database {
         Ok(changed > 0)
     }
 
-    /// Take the announce flag and the pins from an owner snapshot that
+    /// Take the announce flag, the pins and the language from an owner snapshot that
     /// [`Self::apply_channel_moderation`] has just accepted, the same way
     /// [`Self::apply_owner_room_name`] takes the name — so an older record
     /// replayed from a slow storer cannot unpin or reopen the room.
     ///
     /// Written whatever the record says, absence included: the writer leaves
-    /// both out when off, so absent means "off" and "none", as for slow mode.
-    /// Returns whether either changed.
+    /// all three out when unset, so absent means "off", "none" and "no
+    /// language", as for slow mode. Returns whether any changed.
     pub fn apply_owner_room_policy(
         &self,
         channel_id: &str,
         announce_only: bool,
         pinned_msg_ids: &[[u8; 16]],
+        language: Option<&str>,
     ) -> anyhow::Result<bool> {
         let pins = pinned_msg_ids
             .iter()
             .map(hex::encode)
             .collect::<Vec<_>>()
             .join(",");
+        let language = language.unwrap_or("");
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "UPDATE channels SET announce_only = ?2, pinned_msg_ids = ?3
-             WHERE channel_id = ?1 AND (announce_only <> ?2 OR pinned_msg_ids <> ?3)",
-            params![channel_id, i64::from(announce_only), pins],
+            "UPDATE channels SET announce_only = ?2, pinned_msg_ids = ?3, language = ?4
+             WHERE channel_id = ?1
+               AND (announce_only <> ?2 OR pinned_msg_ids <> ?3 OR language <> ?4)",
+            params![channel_id, i64::from(announce_only), pins, language],
         )?;
         drop(conn);
         if changed > 0 {
             bump_channel_roster_generation(channel_id);
         }
         Ok(changed > 0)
+    }
+
+    /// [`Self::insert_channel`] for a room we are creating with a default
+    /// language, both under one lock. A roster read landing between two
+    /// separate writes would cache the row without its language, and the owner
+    /// loop's first republish — due at once for a new room — would sign that.
+    /// Later changes ride [`Self::apply_owner_room_policy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_channel_with_language(
+        &self,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        is_owner: bool,
+        owner_seed: Option<&[u8; 32]>,
+        join_secret: Option<&[u8; 32]>,
+        language: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        self.insert_channel_locked(
+            &tx,
+            channel_id,
+            pubkey,
+            name,
+            visibility,
+            is_owner,
+            owner_seed,
+            join_secret,
+        )?;
+        tx.execute(
+            "UPDATE channels SET language = ?2 WHERE channel_id = ?1",
+            params![channel_id, language],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Which of `msg_ids` this device has been told to forget in this room.
@@ -12940,16 +12995,15 @@ mod tests {
         drop(db);
 
         let db = Database::open_at(&path).expect("reopen and migrate");
-        assert_eq!(db.schema_version(), 57);
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 57);
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
         let row = db.get_channel(&channel_id).unwrap().unwrap();
         assert!(!row.announce_only, "an upgraded room is open to everyone");
         assert!(row.pinned_msg_ids.is_empty());
 
         let pins = [[0xA1u8; 16], [0xB2u8; 16]];
-        assert!(db.apply_owner_room_policy(&channel_id, true, &pins).unwrap());
+        assert!(db.apply_owner_room_policy(&channel_id, true, &pins, None).unwrap());
         assert!(
-            !db.apply_owner_room_policy(&channel_id, true, &pins).unwrap(),
+            !db.apply_owner_room_policy(&channel_id, true, &pins, None).unwrap(),
             "the same policy again is not a change"
         );
         let row = db.get_channel(&channel_id).unwrap().unwrap();
@@ -12961,7 +13015,7 @@ mod tests {
         assert!(lite.announce_only);
         assert_eq!(lite.pinned_msg_ids.len(), 2);
 
-        assert!(db.apply_owner_room_policy(&channel_id, false, &[]).unwrap());
+        assert!(db.apply_owner_room_policy(&channel_id, false, &[], None).unwrap());
         let row = db.get_channel(&channel_id).unwrap().unwrap();
         assert!(!row.announce_only);
         assert!(row.pinned_msg_ids.is_empty());
@@ -12969,9 +13023,66 @@ mod tests {
         // Idempotent: opening again does not fail on columns that exist.
         drop(db);
         let again = Database::open_at(&path).expect("reopen at the current version");
-        assert_eq!(again.schema_version(), 57);
+        assert_eq!(again.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
 
         drop(again);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// v58 adds the default language to an existing profile, starting at
+    /// none; the policy write stores and clears it, and the create path sets it.
+    #[test]
+    fn channel_language_migrates_and_applies() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-v58-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(&channel_id, &"cd".repeat(32), "Lobby", "public", false, None, None)
+            .expect("insert channel");
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE channels DROP COLUMN language;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (57);",
+            )
+            .expect("roll back to v57");
+        }
+        drop(db);
+
+        let db = Database::open_at(&path).expect("reopen and migrate");
+        assert_eq!(db.schema_version(), 58);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 58);
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.language, "", "an upgraded room has no default language");
+
+        assert!(db.apply_owner_room_policy(&channel_id, false, &[], Some("de")).unwrap());
+        assert!(
+            !db.apply_owner_room_policy(&channel_id, false, &[], Some("de")).unwrap(),
+            "the same language again is not a change"
+        );
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().language, "de");
+        assert_eq!(db.get_channel_lite(&channel_id).unwrap().unwrap().language, "de");
+        assert_eq!(db.list_channels().unwrap()[0].language, "de");
+
+        assert!(db.apply_owner_room_policy(&channel_id, false, &[], None).unwrap());
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().language, "");
+
+        let created = "ef".repeat(16);
+        db.insert_channel_with_language(&created, &"01".repeat(32), "Tokyo", "public", false, None, None, "ja")
+            .unwrap();
+        assert_eq!(db.get_channel(&created).unwrap().unwrap().language, "ja");
+
+        drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
@@ -15027,7 +15138,7 @@ mod tests {
             .unwrap();
         db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
-        db.apply_owner_room_policy(&old_id, true, &[[0x0Fu8; 16]]).unwrap();
+        db.apply_owner_room_policy(&old_id, true, &[[0x0Fu8; 16]], Some("it")).unwrap();
 
         let seed = [0x44u8; 32];
         assert!(db
@@ -15039,6 +15150,7 @@ mod tests {
         assert_eq!(successor.predecessor_id, old_id);
         assert_eq!(successor.name, "Room");
         assert!(successor.announce_only, "the room stays announce-only");
+        assert_eq!(successor.language, "it", "and keeps its language");
         assert!(
             successor.pinned_msg_ids.is_empty(),
             "pins name ids the successor's copied history does not carry"

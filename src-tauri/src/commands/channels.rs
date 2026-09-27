@@ -142,6 +142,8 @@ pub struct ChannelInfo {
     pub announce_only: bool,
     /// Hex wire ids of the owner's pinned messages, oldest pin first.
     pub pinned_msg_ids: Vec<String>,
+    /// The room's default language code, empty for none.
+    pub language: String,
 }
 
 impl ChannelInfo {
@@ -177,6 +179,7 @@ impl ChannelInfo {
             slow_mode_secs: row.slow_mode_secs,
             announce_only: row.announce_only,
             pinned_msg_ids: row.pinned_msg_ids,
+            language: row.language,
         }
     }
 
@@ -745,6 +748,7 @@ pub async fn create_channel(
     state: tauri::State<'_, AppState>,
     name: String,
     private: bool,
+    language: Option<String>,
 ) -> Result<ChannelInviteInfo, String> {
     require_ember(&state).await?;
     if state.db.chat_locked() {
@@ -754,6 +758,7 @@ pub async fn create_channel(
         ));
     }
     let name = sanitize_channel_name(&name)?;
+    let language = parse_channel_language(language.as_deref())?;
     // Counted before the name is claimed, so a refusal costs the namespace
     // nothing and the user is not told a room exists that does not.
     let db_count = state.db.clone();
@@ -790,7 +795,7 @@ pub async fn create_channel(
     let db_pk = pubkey_hex.clone();
     let db_name = name.clone();
     tokio::task::spawn_blocking(move || {
-        db.insert_channel(
+        db.insert_channel_with_language(
             &db_id,
             &db_pk,
             &db_name,
@@ -798,6 +803,7 @@ pub async fn create_channel(
             true,
             Some(&seed),
             if private { Some(&join_secret) } else { None },
+            language.unwrap_or(""),
         )
     })
     .await
@@ -874,18 +880,29 @@ pub async fn create_channel(
             "room created but its presence record did not publish"
         );
     }
+    // Names us as owner from the very first record, so a member who joins
+    // before any moderation edit already knows who cannot be banned.
+    let mut opening = ModerationTail {
+        owner_pubkey: Some(state.identity.ed25519_public_key),
+        key_epoch: Some(0),
+        ..Default::default()
+    };
+    // The language is the tail's last field, so the ones before it have to be
+    // written for it to be placed — as a new room's values, the same ones the
+    // owner loop's first republish carries. Without it here, this device would
+    // fetch its own opening record back and read it as "no language".
+    if language.is_some() {
+        opening.successor_nominee = Some([0u8; 32]);
+        opening.claim_after_days = Some(0);
+        opening.invites_owner_only = Some(false);
+        opening.language = language;
+    }
     let moderation = SignedRecord::channel_moderation(
         "",
         "",
         &[],
         &[],
-        // Names us as owner from the very first record, so a member who joins
-        // before any moderation edit already knows who cannot be banned.
-        &ModerationTail {
-            owner_pubkey: Some(state.identity.ed25519_public_key),
-            key_epoch: Some(0),
-            ..Default::default()
-        },
+        &opening,
         ident.channel_id,
         ident.pubkey,
         private,
@@ -2666,6 +2683,7 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
         // keeps publishing the tail it always has.
         announce_only: owned.row.announce_only.then_some(true),
         pinned_msg_ids,
+        language: crate::network::ember::dht::publish::channel_language(&owned.row.language),
     }
 }
 
@@ -2750,6 +2768,7 @@ async fn commit_channel_moderation_with(
     let tail_slow_mode = tail.slow_mode_secs;
     let tail_announce = tail.announce_only == Some(true);
     let tail_pins = tail.pinned_msg_ids.clone();
+    let tail_language = tail.language;
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
     let topic_s = topic.to_string();
@@ -2775,7 +2794,7 @@ async fn commit_channel_moderation_with(
         // failed write is an edit that did not happen rather than one that
         // reaches the room while this device forgets it.
         if applied {
-            db.apply_owner_room_policy(&id, tail_announce, &tail_pins)?;
+            db.apply_owner_room_policy(&id, tail_announce, &tail_pins, tail_language)?;
         }
         Ok::<_, anyhow::Error>(applied)
     })
@@ -3492,6 +3511,66 @@ pub async fn set_channel_announce_only(
     let owned = OwnedChannel {
         row: StoredChannel {
             announce_only,
+            ..owned.row.clone()
+        },
+        ..owned
+    };
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    commit_channel_moderation(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+        &mods,
+    )
+    .await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// A room language from the UI: absent or empty is "none", anything else has
+/// to be a code a moderation record can carry.
+fn parse_channel_language(code: Option<&str>) -> Result<Option<&'static str>, String> {
+    match code.map(str::trim).filter(|c| !c.is_empty()) {
+        None => Ok(None),
+        Some(code) => crate::network::ember::dht::publish::channel_language(code)
+            .map(Some)
+            .ok_or_else(|| {
+                coded(
+                    "channels_language_invalid",
+                    "That is not one of the languages a room can be marked with",
+                )
+            }),
+    }
+}
+
+/// Owner-set: the language the room is meant to be held in, or none.
+///
+/// Shown to members as a flag beside the room's name, and nothing more — it
+/// filters nothing and stops no one writing in another language. Rides the
+/// owner-signed moderation snapshot like the posting rule.
+#[tauri::command]
+pub async fn set_channel_language(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    language: Option<String>,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let language = parse_channel_language(language.as_deref())?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    // In memory, not written first — see `set_channel_invite_policy`.
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            language: language.unwrap_or("").to_string(),
             ..owned.row.clone()
         },
         ..owned
@@ -5612,7 +5691,7 @@ mod tests {
         let row = db.get_channel(&member_room).unwrap().unwrap();
         assert!(!announce_only_refuses(&db, &row, &member), "open room");
 
-        db.apply_owner_room_policy(&member_room, true, &[]).unwrap();
+        db.apply_owner_room_policy(&member_room, true, &[], None).unwrap();
         let row = db.get_channel(&member_room).unwrap().unwrap();
         assert!(announce_only_refuses(&db, &row, &member), "a member is refused");
         assert!(
@@ -5620,7 +5699,7 @@ mod tests {
             "a moderator posts"
         );
 
-        db.apply_owner_room_policy(&owned_room, true, &[]).unwrap();
+        db.apply_owner_room_policy(&owned_room, true, &[], None).unwrap();
         let owned = db.get_channel(&owned_room).unwrap().unwrap();
         assert!(!announce_only_refuses(&db, &owned, &member), "the owner posts");
 

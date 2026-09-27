@@ -43,6 +43,7 @@ mod rendezvous_room_selection_tests {
             announce_only: false,
             pinned_msg_ids: Vec::new(),
             renamed_at: 0,
+            language: String::new(),
         }
     }
 
@@ -199,8 +200,9 @@ mod owner_room_policy_ingest_tests {
         }
     }
 
-    /// A member takes the announce flag and the pins from the owner's newest
-    /// snapshot only, and a newer one that leaves them out turns them off.
+    /// A member takes the announce flag, the pins and the language from the
+    /// owner's newest snapshot only, and a newer one that leaves them out
+    /// turns them off.
     #[test]
     fn announce_and_pins_come_only_from_the_newest_snapshot() {
         let path = std::env::temp_dir().join(format!(
@@ -219,14 +221,19 @@ mod owner_room_policy_ingest_tests {
             .expect("insert channel");
 
         let pins = vec![[0xA1; 16], [0xA2; 16]];
+        let with_language = ModerationTail {
+            language: Some("fr"),
+            ..policy_tail(true, pins.clone())
+        };
         assert!(ingest_channel_moderation_records(
             &db,
             ident.channel_id,
-            &[blob(&ident, &policy_tail(true, pins.clone()))],
+            &[blob(&ident, &with_language)],
         ));
         let row = db.get_channel(&id_hex).unwrap().unwrap();
         assert!(row.announce_only);
         assert_eq!(row.pinned_msg_ids, vec!["a1".repeat(16), "a2".repeat(16)]);
+        assert_eq!(row.language, "fr");
 
         // A snapshot newer than anything a storer can hand back arrives
         // first; the ordinary one after it is older and changes nothing.
@@ -245,6 +252,7 @@ mod owner_room_policy_ingest_tests {
         let row = db.get_channel(&id_hex).unwrap().unwrap();
         assert!(row.announce_only, "an older snapshot cannot reopen the room");
         assert_eq!(row.pinned_msg_ids.len(), 2, "or take its pins down");
+        assert_eq!(row.language, "fr", "or clear its language");
 
         // In a second room, the newest snapshot saying nothing is "off".
         let other = ChannelIdentity::generate();
@@ -254,8 +262,15 @@ mod owner_room_policy_ingest_tests {
         assert!(ingest_channel_moderation_records(
             &db,
             other.channel_id,
-            &[blob(&other, &policy_tail(true, pins))],
+            &[blob(
+                &other,
+                &ModerationTail {
+                    language: Some("de"),
+                    ..policy_tail(true, pins)
+                }
+            )],
         ));
+        assert_eq!(db.get_channel(&other_hex).unwrap().unwrap().language, "de");
         assert!(ingest_channel_moderation_records(
             &db,
             other.channel_id,
@@ -264,6 +279,7 @@ mod owner_room_policy_ingest_tests {
         let row = db.get_channel(&other_hex).unwrap().unwrap();
         assert!(!row.announce_only);
         assert!(row.pinned_msg_ids.is_empty());
+        assert_eq!(row.language, "", "a newer snapshot without one clears it");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -401,6 +417,7 @@ mod channel_view_cache_tests {
                 announce_only: false,
                 pinned_msg_ids: Vec::new(),
                 renamed_at: 0,
+                language: String::new(),
             },
             content_keys: Vec::new(),
             roster: None,
@@ -2172,8 +2189,9 @@ pub(super) fn ingest_channel_moderation_records(
             &channel_id_hex,
             moderation.tail.announce_only == Some(true),
             &moderation.tail.pinned_msg_ids,
+            moderation.tail.language,
         ) {
-            tracing::warn!("Channel {channel_id_hex}: could not apply the owner's pins and posting rule: {e}");
+            tracing::warn!("Channel {channel_id_hex}: could not apply the owner's pins, posting rule and language: {e}");
         }
     }
     applied
@@ -2323,6 +2341,9 @@ pub(super) async fn maybe_publish_owned_channel_records(
                         .filter(|id| !removed.contains(&hex::encode(id)))
                         .collect()
                 },
+                // Every republish, like the pins, so a member who joins later
+                // still sees the room's language.
+                language: ember::dht::publish::channel_language(&ch.language),
             },
             channel_id,
             ident.pubkey,

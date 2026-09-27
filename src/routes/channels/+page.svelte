@@ -9,6 +9,13 @@
   import ChatConversation from '$lib/components/ChatConversation.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
+  import {
+    type ChannelLanguage,
+    channelLanguageFlagSrc,
+    channelLanguageName,
+    isChannelLanguage,
+  } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
   import {
     copyToClipboard,
@@ -57,6 +64,7 @@
     setChannelInvitePolicy,
     setChannelSlowMode,
     setChannelAnnounceOnly,
+    setChannelLanguage,
     SLOW_MODE_CHOICES,
     claimChannelOwnership,
     claimChannelUsername,
@@ -154,6 +162,7 @@
   let transferring = $state(false);
   let createName = $state('');
   let createPrivate = $state(false);
+  let createLanguage = $state<ChannelLanguage | null>(null);
   let joinUri = $state('');
   let error: string | null = $state(null);
   let leaveOpen = $state(false);
@@ -478,6 +487,8 @@
       slow_mode_secs: 0,
       announce_only: false,
       pinned_msg_ids: [],
+      // The directory listing does not carry it; it arrives on join.
+      language: '',
     };
   }
   let leaveTargetName = $derived(
@@ -1337,9 +1348,10 @@
     error = null;
     creating = true;
     try {
-      const invite = await createChannel(createName.trim(), createPrivate);
+      const invite = await createChannel(createName.trim(), createPrivate, createLanguage);
       createName = '';
       createPrivate = false;
+      createLanguage = null;
       composeMode = null;
       deepLinkJoin = false;
       // The clipboard write needs nothing from the list refresh, so overlap
@@ -1751,6 +1763,29 @@
       await refreshChannels().catch(() => {});
     } finally {
       savingAnnounce = false;
+    }
+  }
+
+  let savingLanguage = $state(false);
+  let roomLanguage = $state<ChannelLanguage | null>(null);
+
+  $effect(() => {
+    if (savingLanguage) return;
+    const code = selected?.language;
+    roomLanguage = isChannelLanguage(code) ? code : null;
+  });
+
+  async function handleLanguage(language: ChannelLanguage | null) {
+    const id = selectedId;
+    if (!id || savingLanguage) return;
+    savingLanguage = true;
+    try {
+      replaceChannel(await setChannelLanguage(id, language));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingLanguage = false;
     }
   }
 
@@ -2291,6 +2326,10 @@
         {#if createNameTooLong}
           <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
         {/if}
+        <div class="create-language">
+          <span class="create-language-label" aria-hidden="true">{m.channels_language_label()}</span>
+          <ChannelLanguagePicker bind:value={createLanguage} disabled={creating} />
+        </div>
         <!-- Said at the moment the choice is made, not buried in a panel. A
              public room's content key is derived from the address in its
              public listing, so discovering the room is the same as being able
@@ -2503,7 +2542,18 @@
                          Public/Private badge are gone: the room is identified
                          by its name, and everything else about it is one click
                          away inside. -->
-                    <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
+                    <span class="chan-title">
+                      <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
+                      {#if isChannelLanguage(ch.language)}
+                        {@const languageName = channelLanguageName(ch.language)}
+                        <img
+                          class="chan-flag"
+                          src={channelLanguageFlagSrc(ch.language)}
+                          alt={m.channels_language_flag_title({ language: languageName })}
+                          title={m.channels_language_flag_title({ language: languageName })}
+                        />
+                      {/if}
+                    </span>
                     {#if ch.in_room && favouriteSet.has(ch.channel_id)}
                       <span class="chan-fav" role="img" title={m.channels_favourite_badge()} aria-label={m.channels_favourite_badge()}>
                         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -2704,7 +2754,18 @@
                 {/if}
               </div>
               <div class="conv-heading">
-                <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
+                <div class="conv-title">
+                  <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
+                  {#if isChannelLanguage(selected.language)}
+                    {@const languageName = channelLanguageName(selected.language)}
+                    <img
+                      class="conv-flag"
+                      src={channelLanguageFlagSrc(selected.language)}
+                      alt={m.channels_language_flag_title({ language: languageName })}
+                      title={m.channels_language_flag_title({ language: languageName })}
+                    />
+                  {/if}
+                </div>
                 {#if selected.topic.trim()}
                   <p class="topic has-topic" title={selected.topic}>
                     <span class="topic-mark" aria-hidden="true">#</span>
@@ -2913,6 +2974,16 @@
                   {savingModeration ? m.channels_saving() : m.channels_save_moderation()}
                 </button>
               </form>
+              <div class="succession-form">
+                <p class="succession-title">{m.channels_language_label()}</p>
+                <p class="succession-hint" id="room-language-hint">{m.channels_language_hint()}</p>
+                <ChannelLanguagePicker
+                  bind:value={roomLanguage}
+                  disabled={savingLanguage}
+                  describedby="room-language-hint"
+                  onchange={(v) => void handleLanguage(v)}
+                />
+              </div>
               <div class="succession-form">
                 <p class="succession-title">{m.channels_invite_policy_title()}</p>
                 <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
@@ -3692,6 +3763,23 @@
     color: var(--warning);
   }
 
+  .create-language {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+  }
+
+  .name-too-long + .create-language {
+    margin-top: 0;
+  }
+
+  .create-language-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
   .name-count {
     font-size: 11px;
     color: var(--text-muted);
@@ -4214,14 +4302,34 @@
 
   /* The name is the only thing that gives way when the row is tight. The
      count is two glyphs, and hiding it would make a busy room look empty. */
-  .chan-name {
+  .chan-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     flex: 1;
+    min-width: 0;
+  }
+
+  .chan-name {
+    flex: 0 1 auto;
     min-width: 0;
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  /* A recognition aid beside the name, so it stays small and stays put when
+     a long name ellipsises. */
+  .chan-flag {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
+  }
+
+  .chan-row.moved .chan-flag { opacity: 0.55; }
 
   .unread {
     min-width: 18px;
@@ -4292,14 +4400,31 @@
     flex: 1;
     min-width: 0;
   }
+  .conv-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    max-width: 100%;
+    min-width: 0;
+  }
+
   .conv-heading h3 {
     margin: 0;
+    min-width: 0;
     font-size: 14px;
     font-weight: 650;
     line-height: 1.2;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .conv-flag {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
 
   .topic {

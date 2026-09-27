@@ -18,7 +18,7 @@
     "test:release-policy": "node --test scripts/*.test.mjs",
     "test:unit": "npm run paraglide:compile && vitest run",
     "test:unit:watch": "npm run paraglide:compile && vitest",
-    "postinstall": "node -e \"const fs=require('fs'),p=require('path'),s=p.join('node_modules','circle-flags','flags'),d=p.join('static','flags');if(!fs.existsSync(s)){process.exit(0);}fs.mkdirSync(d,{recursive:true});fs.readdirSync(s).filter(f=>f.endsWith('.svg')).forEach(f=>fs.copyFileSync(p.join(s,f),p.join(d,f)));console.log('Copied flag SVGs to static/flags/');\""
+    "postinstall": "node scripts/copy-flags.mjs"
   },
   "license": "GPL-3.0-only",
   "engines": {

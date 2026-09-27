@@ -64,6 +64,7 @@ function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelIn
     slow_mode_secs: 0,
     announce_only: false,
     pinned_msg_ids: [],
+    language: '',
     ...partial,
   } as ChannelInfo;
 }

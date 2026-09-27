@@ -45,6 +45,9 @@ export interface ChannelInfo {
   announce_only: boolean;
   /** Wire ids of the owner's pinned messages, oldest pin first. */
   pinned_msg_ids: string[];
+  /** The owner's default language code for the room, empty for none. Shown as
+   *  a flag; nothing is filtered on it. */
+  language: string;
 }
 
 /** Most messages a room can pin, mirroring `CHANNEL_PIN_MAX` in
@@ -191,8 +194,12 @@ export async function listChannels(): Promise<ChannelInfo[]> {
   return invoke('list_channels');
 }
 
-export async function createChannel(name: string, privateChannel: boolean): Promise<ChannelInviteInfo> {
-  return invoke('create_channel', { name, private: privateChannel });
+export async function createChannel(
+  name: string,
+  privateChannel: boolean,
+  language: string | null = null,
+): Promise<ChannelInviteInfo> {
+  return invoke('create_channel', { name, private: privateChannel, language });
 }
 
 export async function joinChannel(uri: string): Promise<ChannelInfo> {
@@ -455,6 +462,14 @@ export async function setChannelAnnounceOnly(
   announceOnly: boolean,
 ): Promise<ChannelInfo> {
   return invoke('set_channel_announce_only', { channelId, announceOnly });
+}
+
+/** `null` clears the room's default language. */
+export async function setChannelLanguage(
+  channelId: string,
+  language: string | null,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_language', { channelId, language });
 }
 
 /** Owner only. Pin or unpin one message by its wire id. */
