@@ -2467,6 +2467,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
                     channel_id,
                     ident.pubkey,
                     false,
+                    Some(ch.language.as_str()).filter(|l| !l.is_empty()),
                     &ident.signing_key,
                 );
                 if let Some(index_id) = state

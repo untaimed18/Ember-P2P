@@ -14,6 +14,7 @@
     type ChannelLanguage,
     channelLanguageFlagSrc,
     channelLanguageName,
+    channelLanguageSearchText,
     isChannelLanguage,
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
@@ -451,6 +452,7 @@
       && prev.name === item.name
       && prev.member_count === memberCount
       && prev.in_room === item.joined
+      && prev.language === item.language
     ) {
       return prev;
     }
@@ -487,8 +489,8 @@
       slow_mode_secs: 0,
       announce_only: false,
       pinned_msg_ids: [],
-      // The directory listing does not carry it; it arrives on join.
-      language: '',
+      // From the room's signed listing, so it shows before joining.
+      language: item.language ?? '',
     };
   }
   let leaveTargetName = $derived(
@@ -521,10 +523,14 @@
     const q = listQuery.trim().toLowerCase();
     const list = sortedChannels;
     if (!q) return list;
+    // "German" finds German rooms, but not from a letter or two, which every
+    // language name would match.
+    const byLanguage = q.length >= 3;
     return list.filter(
       (ch) =>
         ch.name.toLowerCase().includes(q) ||
-        ch.topic.toLowerCase().includes(q),
+        ch.topic.toLowerCase().includes(q) ||
+        (byLanguage && isChannelLanguage(ch.language) && channelLanguageSearchText(ch.language).includes(q)),
     );
   });
   let favouriteSet = $derived(new Set($favouriteChannels));

@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 58;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 59;
 
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
@@ -248,6 +248,8 @@ pub struct CachedChannel {
     pub channel_id: String,
     pub pubkey: String,
     pub name: String,
+    /// Default language code from the listing, empty for none.
+    pub language: String,
 }
 
 /// The `channels.pinned_msg_ids` column: comma-separated hex wire ids. Anything
@@ -2785,6 +2787,20 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "channels", "language", "TEXT NOT NULL DEFAULT ''")?;
             set_version(&tx, 58)?;
+            tx.commit()?;
+        }
+
+        if version < 59 {
+            // The language a room's public listing carries, cached with the
+            // rest of the listing so Discover shows it before its walk returns.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_index_cache",
+                "language",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 59)?;
             tx.commit()?;
         }
 
@@ -6421,7 +6437,7 @@ impl Database {
     /// timeout still knows everything the previous one did about the other
     /// fifteen. Clearing the table each time would empty the cache precisely
     /// when the network is least able to refill it.
-    pub fn cache_channel_listings(&self, rows: &[(String, String, String)]) -> anyhow::Result<()> {
+    pub fn cache_channel_listings(&self, rows: &[CachedChannel]) -> anyhow::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -6430,15 +6446,16 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO channel_index_cache (channel_id, pubkey, name, last_seen)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO channel_index_cache (channel_id, pubkey, name, language, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(channel_id) DO UPDATE SET
                     pubkey = excluded.pubkey,
                     name = excluded.name,
+                    language = excluded.language,
                     last_seen = excluded.last_seen",
             )?;
-            for (channel_id, pubkey, name) in rows {
-                stmt.execute(params![channel_id, pubkey, name, now])?;
+            for row in rows {
+                stmt.execute(params![row.channel_id, row.pubkey, row.name, row.language, now])?;
             }
         }
         tx.execute(
@@ -6460,7 +6477,7 @@ impl Database {
     pub fn list_cached_channels(&self) -> anyhow::Result<Vec<CachedChannel>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT channel_id, pubkey, name FROM channel_index_cache
+            "SELECT channel_id, pubkey, name, language FROM channel_index_cache
              ORDER BY last_seen DESC",
         )?;
         let rows = stmt
@@ -6469,6 +6486,7 @@ impl Database {
                     channel_id: row.get(0)?,
                     pubkey: row.get(1)?,
                     name: row.get(2)?,
+                    language: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -13033,6 +13051,7 @@ mod tests {
 
     /// v58 adds the default language to an existing profile, starting at
     /// none; the policy write stores and clears it, and the create path sets it.
+    /// v59 does the same for the Discover cache.
     #[test]
     fn channel_language_migrates_and_applies() {
         let path = std::env::temp_dir().join(format!(
@@ -13052,6 +13071,7 @@ mod tests {
             let conn = db.conn.lock();
             conn.execute_batch(
                 "ALTER TABLE channels DROP COLUMN language;
+                 ALTER TABLE channel_index_cache DROP COLUMN language;
                  DELETE FROM schema_version;
                  INSERT INTO schema_version (version) VALUES (57);",
             )
@@ -13060,8 +13080,8 @@ mod tests {
         drop(db);
 
         let db = Database::open_at(&path).expect("reopen and migrate");
-        assert_eq!(db.schema_version(), 58);
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 58);
+        assert_eq!(db.schema_version(), 59);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 59);
         let row = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(row.language, "", "an upgraded room has no default language");
 
@@ -13081,6 +13101,18 @@ mod tests {
         db.insert_channel_with_language(&created, &"01".repeat(32), "Tokyo", "public", false, None, None, "ja")
             .unwrap();
         assert_eq!(db.get_channel(&created).unwrap().unwrap().language, "ja");
+
+        // v59: Discover's cache keeps the listing's language.
+        let cached = |language: &str| CachedChannel {
+            channel_id: created.clone(),
+            pubkey: "01".repeat(32),
+            name: "Tokyo".to_string(),
+            language: language.to_string(),
+        };
+        db.cache_channel_listings(&[cached("ja")]).unwrap();
+        assert_eq!(db.list_cached_channels().unwrap()[0].language, "ja");
+        db.cache_channel_listings(&[cached("")]).unwrap();
+        assert_eq!(db.list_cached_channels().unwrap()[0].language, "", "a cleared language clears");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

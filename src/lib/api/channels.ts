@@ -188,6 +188,8 @@ export interface GatheredChannelInfo {
   /** Members announcing themselves right now, or null when we could not find
    *  out. A confirmed 0 is not the same as an unanswered probe. */
   member_count: number | null;
+  /** Default language code from the room's signed listing, empty for none. */
+  language: string;
 }
 
 export async function listChannels(): Promise<ChannelInfo[]> {

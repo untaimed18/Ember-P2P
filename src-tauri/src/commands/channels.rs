@@ -21,8 +21,8 @@ use crate::network::ember::dht::publish::{
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
 use crate::storage::database::{
-    ChannelEditOutcome, ChannelReplyLookup, ChannelReplyParent, Database, StoredChannel,
-    StoredChannelMember,
+    CachedChannel, ChannelEditOutcome, ChannelReplyLookup, ChannelReplyParent, Database,
+    StoredChannel, StoredChannelMember,
 };
 use tauri_plugin_dialog::DialogExt;
 
@@ -343,7 +343,7 @@ pub struct ChannelInviteInfo {
     pub private: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct GatheredChannelInfo {
     pub channel_id: String,
     pub pubkey: String,
@@ -354,6 +354,8 @@ pub struct GatheredChannelInfo {
     /// could not find out. A confirmed 0 and an unanswered probe have to stay
     /// distinguishable, or a card can never drop a count it has outlived.
     pub member_count: Option<i64>,
+    /// Default language code from the room's signed listing, empty for none.
+    pub language: String,
 }
 
 async fn require_ember(state: &AppState) -> Result<(), String> {
@@ -849,6 +851,7 @@ pub async fn create_channel(
             ident.channel_id,
             ident.pubkey,
             false,
+            language,
             &ident.signing_key,
         );
         // Not fatal — the room exists locally and the owner maintenance loop
@@ -880,29 +883,21 @@ pub async fn create_channel(
             "room created but its presence record did not publish"
         );
     }
-    // Names us as owner from the very first record, so a member who joins
-    // before any moderation edit already knows who cannot be banned.
-    let mut opening = ModerationTail {
-        owner_pubkey: Some(state.identity.ed25519_public_key),
-        key_epoch: Some(0),
-        ..Default::default()
-    };
-    // The language is the tail's last field, so the ones before it have to be
-    // written for it to be placed — as a new room's values, the same ones the
-    // owner loop's first republish carries. Without it here, this device would
-    // fetch its own opening record back and read it as "no language".
-    if language.is_some() {
-        opening.successor_nominee = Some([0u8; 32]);
-        opening.claim_after_days = Some(0);
-        opening.invites_owner_only = Some(false);
-        opening.language = language;
-    }
     let moderation = SignedRecord::channel_moderation(
         "",
         "",
         &[],
         &[],
-        &opening,
+        // Names us as owner from the very first record, so a member who joins
+        // before any moderation edit already knows who cannot be banned. The
+        // language too, or this device would fetch its own opening record back
+        // and read it as "no language".
+        &ModerationTail {
+            owner_pubkey: Some(state.identity.ed25519_public_key),
+            key_epoch: Some(0),
+            language,
+            ..Default::default()
+        },
         ident.channel_id,
         ident.pubkey,
         private,
@@ -3586,6 +3581,25 @@ pub async fn set_channel_language(
         &mods,
     )
     .await?;
+    // The listing is what Discover shows before anyone joins, so it has to
+    // change with the snapshot rather than wait for the owner loop's renewal.
+    if owned.row.visibility != CHANNEL_KIND_PRIVATE {
+        let record = SignedRecord::channel_index(
+            &owned.row.name,
+            owned.ident.channel_id,
+            owned.ident.pubkey,
+            false,
+            language,
+            &owned.ident.signing_key,
+        );
+        if let Err(e) = queue_signed_record(&state, record).await {
+            tracing::warn!(
+                channel_id = %channel_id,
+                error = %e,
+                "room's index record did not publish its new language"
+            );
+        }
+    }
     channel_info_from_id(&state, &channel_id).await
 }
 
@@ -4037,6 +4051,7 @@ pub async fn rename_channel(
             owned.ident.channel_id,
             owned.ident.pubkey,
             false,
+            Some(owned.row.language.as_str()).filter(|l| !l.is_empty()),
             &owned.ident.signing_key,
         );
         // Not fatal: the owner loop republishes the listing, and Discover also
@@ -4837,17 +4852,18 @@ async fn probe_public_member_counts(
     Some(out)
 }
 
-/// Turn one shard's raw `FOUND_VALUE` blobs into public room listings.
+/// Turn one shard's raw `FOUND_VALUE` blobs into public room listings, each
+/// with the signed timestamp of the record it came from.
 ///
-/// `seen` is threaded across shards so a record several storers hold is listed
-/// once. Private rooms publish an index record too and are dropped here: theirs
-/// exists so a holder of the invite can confirm the room, not so a browse can
-/// find it.
+/// Several storers can hold different generations of one room's record, so
+/// the same room can appear more than once; [`merge_signed_listing`] keeps the
+/// newest. Private rooms publish an index record too and are dropped here:
+/// theirs exists so a holder of the invite can confirm the room, not so a
+/// browse can find it.
 fn listings_from_blobs(
     blobs: Vec<Vec<u8>>,
     joined_ids: &std::collections::HashSet<String>,
-    seen: &mut std::collections::HashSet<String>,
-) -> Vec<GatheredChannelInfo> {
+) -> Vec<(GatheredChannelInfo, i64)> {
     let mut out = Vec::new();
     for blob in blobs {
         let Some(rec) = SignedRecord::from_value_blob(&blob) else {
@@ -4859,28 +4875,81 @@ fn listings_from_blobs(
         if !rec.channel_store_ok() {
             continue;
         }
-        let id_hex = hex::encode(rec.file_hash);
-        if !seen.insert(id_hex.clone()) {
-            continue;
-        }
-        let private = rec
+        // Only an index record is signed by the room's own key. A storer
+        // accepts a presence record under any key, from anyone, so one filed
+        // in a shard would otherwise pass as the room's listing and put a
+        // stranger's name and language on it.
+        let Some(meta) = rec
             .channel
             .as_ref()
-            .map(|m| m.is_private())
-            .unwrap_or(false);
+            .filter(|m| m.kind == crate::network::ember::dht::publish::CHANNEL_KIND_INDEX)
+        else {
+            continue;
+        };
+        let private = meta.is_private();
         if private {
             continue;
         }
-        out.push(GatheredChannelInfo {
-            channel_id: id_hex.clone(),
-            pubkey: hex::encode(rec.ember_file_hash),
-            name: discovered_room_name(&rec.file_name, &id_hex),
-            private,
-            joined: joined_ids.contains(&id_hex),
-            member_count: None,
-        });
+        let id_hex = hex::encode(rec.file_hash);
+        out.push((
+            GatheredChannelInfo {
+                channel_id: id_hex.clone(),
+                pubkey: hex::encode(rec.ember_file_hash),
+                name: discovered_room_name(&rec.file_name, &id_hex),
+                private,
+                joined: joined_ids.contains(&id_hex),
+                member_count: None,
+                language: crate::network::ember::dht::publish::channel_language_from_file_size(
+                    rec.file_size,
+                )
+                .unwrap_or("")
+                .to_string(),
+            },
+            rec.timestamp,
+        ));
     }
     out
+}
+
+/// Fold one signed listing into the rows gathered so far. Returns the row to
+/// re-emit when it adds a room or changes one.
+///
+/// Where a gathered row came from: its index in the output, the timestamp of
+/// the newest signed listing folded into it, and whether the Rendezvous
+/// directory supplied it.
+type ListingOrigin = (usize, Option<i64>, bool);
+
+/// `signed_at` tracks each row's [`ListingOrigin`]. The directory is unsigned
+/// and knows nothing of the room's language, so signed listings for one of
+/// its rooms bring the language in and leave the registry's name standing
+/// whatever order storers answer in. Between signed listings the newest wins
+/// outright, so a storer still holding a stale generation cannot put back a
+/// name or language the owner has since changed.
+fn merge_signed_listing(
+    out: &mut Vec<GatheredChannelInfo>,
+    signed_at: &mut std::collections::HashMap<String, ListingOrigin>,
+    listing: GatheredChannelInfo,
+    timestamp: i64,
+) -> Option<GatheredChannelInfo> {
+    match signed_at.get_mut(&listing.channel_id) {
+        None => {
+            signed_at.insert(listing.channel_id.clone(), (out.len(), Some(timestamp), false));
+            out.push(listing.clone());
+            Some(listing)
+        }
+        Some((i, seen, from_directory)) => {
+            if seen.is_some_and(|prev| prev >= timestamp) {
+                return None;
+            }
+            let row = &mut out[*i];
+            if !*from_directory {
+                row.name = listing.name;
+            }
+            *seen = Some(timestamp);
+            row.language = listing.language;
+            Some(row.clone())
+        }
+    }
 }
 
 /// Display name for a room nobody here has joined, from a name its publisher
@@ -5012,7 +5081,8 @@ pub async fn gather_channels(
         .map(|key| find_raw_keys(&state, vec![key]))
         .collect();
 
-    let mut seen = std::collections::HashSet::new();
+    let mut signed_at: std::collections::HashMap<String, ListingOrigin> =
+        std::collections::HashMap::new();
     let mut out: Vec<GatheredChannelInfo> = Vec::new();
     for listing in directory {
         let id = listing.channel_id.to_ascii_lowercase();
@@ -5035,7 +5105,10 @@ pub async fn gather_channels(
         if hex::encode(channel::channel_id_from_pubkey(&pubkey)) != id {
             continue;
         }
-        seen.insert(id.clone());
+        if signed_at.contains_key(&id) {
+            continue;
+        }
+        signed_at.insert(id.clone(), (out.len(), None, true));
         let name = discovered_room_name(&listing.name, &id);
         out.push(GatheredChannelInfo {
             joined: joined_ids.contains(&id),
@@ -5044,6 +5117,7 @@ pub async fn gather_channels(
             name,
             private: false,
             member_count: None,
+            language: String::new(),
         });
     }
     if !out.is_empty() {
@@ -5051,16 +5125,19 @@ pub async fn gather_channels(
     }
 
     while let Some(shard) = walks.next().await {
-        let found = listings_from_blobs(shard.unwrap_or_default(), &joined_ids, &mut seen);
-        let found: Vec<_> = found
-            .into_iter()
-            .filter(|c| !deleted.contains(&c.channel_id))
-            .collect();
-        if found.is_empty() {
-            continue;
+        let mut changed = Vec::new();
+        for (listing, timestamp) in listings_from_blobs(shard.unwrap_or_default(), &joined_ids) {
+            if deleted.contains(&listing.channel_id) {
+                continue;
+            }
+            if let Some(row) = merge_signed_listing(&mut out, &mut signed_at, listing, timestamp) {
+                changed.retain(|c: &GatheredChannelInfo| c.channel_id != row.channel_id);
+                changed.push(row);
+            }
         }
-        emit(&found);
-        out.extend(found);
+        if !changed.is_empty() {
+            emit(&changed);
+        }
     }
 
     // A room the user has not joined shows no roster, so the directory is the
@@ -5082,9 +5159,14 @@ pub async fn gather_channels(
         }
     }
 
-    let listings: Vec<(String, String, String)> = out
+    let listings: Vec<CachedChannel> = out
         .iter()
-        .map(|c| (c.channel_id.clone(), c.pubkey.clone(), c.name.clone()))
+        .map(|c| CachedChannel {
+            channel_id: c.channel_id.clone(),
+            pubkey: c.pubkey.clone(),
+            name: c.name.clone(),
+            language: c.language.clone(),
+        })
         .collect();
     if !listings.is_empty() {
         let db = state.db.clone();
@@ -5131,6 +5213,7 @@ pub async fn cached_channels(
             // Nobody's presence is cached, so the size stays unknown until the
             // walk this cache is standing in for comes back.
             member_count: None,
+            language: c.language,
         })
         .collect())
 }
@@ -5786,6 +5869,83 @@ mod tests {
         // room that never had a name already shows.
         assert_eq!(discovered_room_name("\u{200B}\u{FEFF}", &id), &id[..8]);
         assert_eq!(discovered_room_name("", &id), &id[..8]);
+    }
+
+    fn listing(id: &str, name: &str, language: &str) -> GatheredChannelInfo {
+        GatheredChannelInfo {
+            channel_id: id.to_string(),
+            pubkey: "00".repeat(32),
+            name: name.to_string(),
+            private: false,
+            joined: false,
+            member_count: None,
+            language: language.to_string(),
+        }
+    }
+
+    /// The directory row comes first and carries no language; the room's own
+    /// signed listing fills it in, the newest generation wins, and a stale one
+    /// a slow storer still holds changes nothing.
+    #[test]
+    fn signed_listings_bring_the_language_and_the_newest_one_wins() {
+        let id = "ab".repeat(16);
+        let mut out = vec![listing(&id, "Registry Name", "")];
+        let mut signed_at =
+            std::collections::HashMap::from([(id.clone(), (0usize, None, true))]);
+
+        let row = merge_signed_listing(&mut out, &mut signed_at, listing(&id, "Signed", "de"), 100)
+            .expect("the language is news");
+        assert_eq!(row.language, "de");
+        assert_eq!(row.name, "Registry Name", "the registry keeps the name");
+
+        assert!(
+            merge_signed_listing(&mut out, &mut signed_at, listing(&id, "Old", ""), 50).is_none(),
+            "an older generation is ignored"
+        );
+        assert_eq!(out[0].language, "de");
+
+        let row = merge_signed_listing(&mut out, &mut signed_at, listing(&id, "Renamed", "fr"), 200)
+            .expect("a newer generation replaces the language");
+        assert_eq!(
+            (row.name.as_str(), row.language.as_str()),
+            ("Registry Name", "fr"),
+            "whatever order storers answer in, the registry keeps the name"
+        );
+
+        // A room only the DHT knows: the newest signed listing names it.
+        let other = "cd".repeat(16);
+        let row = merge_signed_listing(&mut out, &mut signed_at, listing(&other, "New", "ja"), 10)
+            .expect("a room only the DHT knows is added");
+        assert_eq!(row.language, "ja");
+        assert_eq!(out.len(), 2);
+        let row = merge_signed_listing(&mut out, &mut signed_at, listing(&other, "Newer", ""), 20)
+            .expect("its newer listing replaces it");
+        assert_eq!((row.name.as_str(), row.language.as_str()), ("Newer", ""));
+    }
+
+    /// Only an index record — signed by the room's own key — is a listing. A
+    /// presence record anyone can sign, filed in the room's shard, must not
+    /// pass as one and put its name and language on the room.
+    #[test]
+    fn a_planted_presence_record_is_not_a_listing() {
+        let room = ChannelIdentity::generate();
+        let index = SignedRecord::channel_index(
+            "Lobby", room.channel_id, room.pubkey, false, Some("de"), &room.signing_key,
+        );
+        let stranger = crypto::signing_key_from_bytes(&[0x77u8; 32]);
+        let planted = SignedRecord::channel_presence(
+            "Fake", room.channel_id, room.pubkey, &[0u8; 32], false, 0, &[0u8; 32], &stranger,
+        );
+        assert!(planted.channel_store_ok(), "storers accept it, which is the problem");
+        let blob = |r: &SignedRecord| [r.data.clone(), r.signature.to_vec()].concat();
+
+        let found = listings_from_blobs(
+            vec![blob(&planted), blob(&index)],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(found.len(), 1, "only the room's own listing is read");
+        assert_eq!(found[0].0.name, "Lobby");
+        assert_eq!(found[0].0.language, "de");
     }
 
     fn reaction_row(msg: &str, member: &str, reaction: u8) -> (String, String, u8) {

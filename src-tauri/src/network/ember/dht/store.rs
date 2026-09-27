@@ -3529,6 +3529,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         assert_eq!(record_ttl(&index.data), CHANNEL_INDEX_TTL);
@@ -3568,6 +3569,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         let ttl = CHANNEL_INDEX_TTL.as_secs() as i64;
@@ -3598,6 +3600,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         assert!(inside.store(

@@ -94,46 +94,10 @@ pub const CHANNEL_PIN_MAX: usize = 3;
 /// Wire width of one pinned message's id — the gossip `msg_id`.
 const CHANNEL_PIN_ID_LEN: usize = 16;
 
-/// Languages an owner can mark as a room's default, as language codes.
-///
-/// A code's wire id is its position plus one, which is why this list is
-/// append-only: reordering or removing an entry would relabel every room that
-/// already carries a later one. Zero is never written — "no default language"
-/// is the field left off. A byte this build has no entry for comes from a
-/// later build's longer list and reads as no language.
-///
-/// One byte because that is all the worst-case moderation snapshot had left
-/// (see [`ModerationTail::language`]). Mirrored by `CHANNEL_LANGUAGES` in
-/// `src/lib/channelLanguages.ts`, which owns names and flags.
-pub const CHANNEL_LANGUAGES: &[&str] = &[
-    "en", "es", "fr", "de", "pt", "it", "ru", "zh", "ja", "ko", "ar", "hi", "tr", "pl", "nl", "sv",
-    "uk", "vi", "id", "th", "fa", "he", "el", "cs", "ro", "hu", "da", "fi", "no", "bn", "ms",
-    "fil", "bg", "hr", "sr", "sk", "ca",
-];
-const _: () = assert!(CHANNEL_LANGUAGES.len() < u8::MAX as usize);
-
-/// The registry entry for `code`, or `None` if rooms cannot carry it.
-pub fn channel_language(code: &str) -> Option<&'static str> {
-    CHANNEL_LANGUAGES.iter().copied().find(|c| *c == code)
-}
-
-fn channel_language_wire_id(code: &str) -> Option<u8> {
-    CHANNEL_LANGUAGES
-        .iter()
-        .position(|c| *c == code)
-        .map(|i| (i + 1) as u8)
-}
-
-fn channel_language_from_wire(id: u8) -> Option<&'static str> {
-    usize::from(id)
-        .checked_sub(1)
-        .and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
-}
-
 /// Largest [`ModerationTail::encode`] output with no pins: `owner_pubkey(32) +
 /// key_epoch(8) + successor_nominee(32) + claim_after_days(2) +
 /// invites_owner_only(1) + slow_mode_secs(2) + room_name(1 + 64) +
-/// announce_only(1) + pin_count(1) + language(1)`.
+/// announce_only(1) + pin_count(1)`.
 ///
 /// Every field the encoder can write has to be counted here. This budget is
 /// what [`moderation_snapshot_fits`] reserves, so a field left out of the sum
@@ -144,7 +108,7 @@ fn channel_language_from_wire(id: u8) -> Option<&'static str> {
 /// and dropped before anything else is, so they can never be what pushes a
 /// snapshot over.
 const MODERATION_TAIL_MAX_LEN: usize =
-    32 + 8 + 32 + 2 + 1 + 2 + 1 + CHANNEL_NAME_MAX + 1 + 1 + 1;
+    32 + 8 + 32 + 2 + 1 + 2 + 1 + CHANNEL_NAME_MAX + 1 + 1;
 
 /// Fixed cost of a moderation `extra` blob: the three length prefixes plus a
 /// fully-populated tail.
@@ -167,11 +131,10 @@ const MODERATION_EXTRA_FIXED_LEN: usize = 2 + 2 + 2 + MODERATION_TAIL_MAX_LEN;
 /// tail or grows either list now fails to compile instead of silently
 /// un-publishing rooms.
 ///
-/// With the announce flag, the pin count and the language counted, the worst
-/// case is exactly 1165 of 1165 bytes: no slack. Even a single 16-byte pin
-/// cannot be reserved without shrinking a limit rooms already publish at,
-/// which is why pin entries are fitted per record instead — and why a field
-/// added after the language has to be fitted the same way.
+/// With the announce flag and the pin count counted, the worst case is 1164 of
+/// 1165 bytes: one byte of slack. Even a single 16-byte pin cannot be reserved
+/// without shrinking a limit rooms already publish at, which is why pin
+/// entries are fitted per record instead.
 const _: () = assert!(
     RECORD_HEADER_LEN
         + CHANNEL_NAME_MAX
@@ -865,6 +828,51 @@ pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
     u64::from(kind) | (u64::from(flags) << 8)
 }
 
+/// Languages an owner can mark as a room's default, as language codes.
+///
+/// A code's wire id is its position plus one, which is why this list is
+/// append-only: reordering or removing an entry would relabel every room that
+/// already carries a later one. Zero means no default language. A byte this
+/// build has no entry for comes from a later build's longer list and reads as
+/// no language. Mirrored by `CHANNEL_LANGUAGES` in
+/// `src/lib/channelLanguages.ts`, which owns names and flags.
+pub const CHANNEL_LANGUAGES: &[&str] = &[
+    "en", "es", "fr", "de", "pt", "it", "ru", "zh", "ja", "ko", "ar", "hi", "tr", "pl", "nl", "sv",
+    "uk", "vi", "id", "th", "fa", "he", "el", "cs", "ro", "hu", "da", "fi", "no", "bn", "ms",
+    "fil", "bg", "hr", "sr", "sk", "ca",
+];
+const _: () = assert!(CHANNEL_LANGUAGES.len() < u8::MAX as usize);
+
+/// The registry entry for `code`, or `None` if rooms cannot carry it.
+pub fn channel_language(code: &str) -> Option<&'static str> {
+    CHANNEL_LANGUAGES.iter().copied().find(|c| *c == code)
+}
+
+fn channel_language_wire_id(code: &str) -> u8 {
+    CHANNEL_LANGUAGES
+        .iter()
+        .position(|c| *c == code)
+        .map_or(0, |i| (i + 1) as u8)
+}
+
+/// The language a channel record's `file_size` carries in its third byte.
+///
+/// That byte, like the five above it, was always written as zero and never
+/// read: every build masks `file_size` down to the kind and flag bytes, and
+/// the size filter that reads the whole value only runs for file searches. So
+/// an index or moderation record can carry the language without a byte of
+/// its trailer, and every storer that accepted the record before still does.
+/// The signature covers it like the rest of the header.
+pub fn channel_language_from_file_size(file_size: u64) -> Option<&'static str> {
+    let id = ((file_size >> 16) & 0xff) as usize;
+    id.checked_sub(1).and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+}
+
+fn pack_channel_file_size_with_language(kind: u8, flags: u8, language: Option<&str>) -> u64 {
+    pack_channel_file_size(kind, flags)
+        | (u64::from(language.map_or(0, channel_language_wire_id)) << 16)
+}
+
 pub fn channel_kind_from_data(data: &[u8]) -> Option<u8> {
     // `file_size` sits at offset 65 in the fixed header and is little-endian,
     // so the low byte — the kind — is `data[65]`.
@@ -990,12 +998,15 @@ impl SignedRecord {
         )
     }
 
-    /// Public/private index listing, signed by the **channel** key.
+    /// Public/private index listing, signed by the **channel** key. The
+    /// language rides in `file_size` (see [`channel_language_from_file_size`]),
+    /// so Discover can show it before anyone joins.
     pub fn channel_index(
         name: &str,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         private: bool,
+        language: Option<&str>,
         signing_key: &SigningKey,
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
@@ -1005,7 +1016,7 @@ impl SignedRecord {
             channel::index_key_for_channel(&channel_id),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_INDEX, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_INDEX, flags, language),
             name,
             None,
             Some(Vec::new()),
@@ -1118,7 +1129,7 @@ impl SignedRecord {
             channel::moderation_key(&channel_id),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_MODERATION, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_MODERATION, flags, tail.language),
             topic,
             None,
             Some(extra),
@@ -1554,8 +1565,9 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_MODERATION {
             return None;
         }
-        let (welcome, banned_pubkeys, moderator_pubkeys, tail) =
+        let (welcome, banned_pubkeys, moderator_pubkeys, mut tail) =
             decode_moderation_extra(&meta.extra)?;
+        tail.language = channel_language_from_file_size(rec.file_size);
         Some(ChannelModeration {
             topic: rec.file_name,
             welcome,
@@ -1841,7 +1853,7 @@ pub struct ModerationTail {
     ///
     /// Encoded as a count byte and that many 16-byte ids. The count and the
     /// field before it are in the compile-time budget; the entries are not,
-    /// because the worst-case snapshot leaves no spare byte and reserving
+    /// because the worst-case snapshot leaves one spare byte and reserving
     /// even one pin would mean shrinking the welcome or a list below what
     /// rooms already publish. Instead a record carries as many of the newest
     /// pins as fit beside everything else ([`moderation_pin_capacity`]) and
@@ -1854,15 +1866,13 @@ pub struct ModerationTail {
     /// The language the owner expects the room to be held in, shown beside
     /// its name. Advisory: nothing is filtered on it.
     ///
-    /// One byte, a [`CHANNEL_LANGUAGES`] wire id, because that was the whole
-    /// of the worst-case snapshot's slack; a code string would have pushed a
-    /// room at every maximum past the record cap. Written after the pins, so a
-    /// room with a language and no pins writes a zero pin count first. Absent
-    /// means no default language, and nothing is written, as for slow mode.
-    ///
-    /// Older builds, as for [`Self::announce_only`]: 1.6.x stops reading after
-    /// slow mode and keeps the rest of the snapshot without the language; builds
-    /// before 1.6.0 refuse tail bytes they cannot place.
+    /// Not part of the encoded tail: [`SignedRecord::channel_moderation`]
+    /// writes it into the record's `file_size` (see
+    /// [`channel_language_from_file_size`]) and
+    /// [`SignedRecord::parse_channel_moderation`] reads it back, so it costs
+    /// the tail's byte budget nothing and every build that reads a snapshot
+    /// today keeps reading it. The public index record carries it the same
+    /// way, which is what lets Discover show it before anyone joins.
     pub language: Option<&'static str>,
 }
 
@@ -1892,8 +1902,7 @@ impl ModerationTail {
         out.push(u8::from(owner_only));
         let pins = self.pins_to_encode();
         let announce = self.announce_only == Some(true);
-        let language = self.language.and_then(channel_language_wire_id);
-        let later = announce || !pins.is_empty() || language.is_some();
+        let later = announce || !pins.is_empty();
         // A later field needs the one before it written to be located, so a
         // room with a name, an announce flag or pins and no slow mode writes an
         // explicit zero, which reads as "off" exactly as absence does.
@@ -1915,17 +1924,13 @@ impl ModerationTail {
             return;
         }
         out.push(u8::from(announce));
-        if pins.is_empty() && language.is_none() {
+        if pins.is_empty() {
             return;
         }
         out.push(pins.len() as u8);
         for id in pins {
             out.extend_from_slice(id);
         }
-        let Some(language) = language else {
-            return;
-        };
-        out.push(language);
     }
 
     /// The newest [`CHANNEL_PIN_MAX`] pins, which is all a record ever carries.
@@ -2029,10 +2034,6 @@ impl ModerationTail {
         }
         let excess = tail.pinned_msg_ids.len().saturating_sub(CHANNEL_PIN_MAX);
         tail.pinned_msg_ids.drain(..excess);
-        rest = &rest[pins_end..];
-        if let Some(&id) = rest.first() {
-            tail.language = channel_language_from_wire(id);
-        }
         // Anything past the last field this build knows is a newer one's
         // addition, and is ignored rather than refused. A moderation record is
         // a whole governance snapshot, so rejecting it over an unreadable
@@ -2078,7 +2079,7 @@ mod moderation_budget_tests {
             room_name: Some("n".repeat(CHANNEL_NAME_MAX)),
             announce_only: Some(true),
             pinned_msg_ids: vec![[0x31; 16], [0x32; 16], [0x33; 16]],
-            language: Some("pt"),
+            language: None,
         }
     }
 
@@ -2099,102 +2100,86 @@ mod moderation_budget_tests {
         one_pin.encode(&mut out);
         assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN + CHANNEL_PIN_ID_LEN);
 
-        // No pins: a zero count still has to be written to place the language.
+        // No pins: the count byte is not written, so the budget over-reserves
+        // by exactly that one byte.
         let no_pins = ModerationTail {
             pinned_msg_ids: Vec::new(),
             ..tail()
         };
         let mut out = Vec::new();
         no_pins.encode(&mut out);
-        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN);
-
-        // Neither: both bytes are left off.
-        let neither = ModerationTail {
-            pinned_msg_ids: Vec::new(),
-            language: None,
-            ..tail()
-        };
-        let mut out = Vec::new();
-        neither.encode(&mut out);
-        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN - 2);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN - 1);
     }
 
+    /// The language rides in `file_size`, not the tail: every trailer byte is
+    /// unchanged by it, and a reader that only looks at the kind and flag
+    /// bytes — every released build — sees the record it always did.
     #[test]
-    fn the_language_survives_a_round_trip_with_and_without_pins() {
-        for pins in [Vec::new(), vec![[0x31; 16]]] {
-            let original = ModerationTail {
-                pinned_msg_ids: pins,
+    fn the_language_rides_in_file_size_and_leaves_the_trailer_alone() {
+        let ident = crate::network::ember::channel::ChannelIdentity::generate();
+        let plain = SignedRecord::channel_moderation(
+            "t", "w", &[], &[], &tail(), ident.channel_id, ident.pubkey, false, &ident.signing_key,
+        )
+        .expect("fits");
+        let tagged = SignedRecord::channel_moderation(
+            "t",
+            "w",
+            &[],
+            &[],
+            &ModerationTail {
+                language: Some("ja"),
                 ..tail()
-            };
-            let mut out = Vec::new();
-            original.encode(&mut out);
-            assert_eq!(ModerationTail::decode(&out), Some(original));
-        }
-    }
+            },
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("fits");
+        assert_eq!(plain.data.len(), tagged.data.len(), "no trailer byte is spent on it");
+        let (plain_meta, tagged_meta) = (plain.channel.unwrap(), tagged.channel.unwrap());
+        assert_eq!(plain_meta.extra, tagged_meta.extra);
+        assert_eq!(plain_meta.kind, tagged_meta.kind);
+        assert_eq!(plain_meta.flags, tagged_meta.flags);
+        assert_eq!(channel_kind_from_data(&tagged.data), Some(CHANNEL_KIND_MODERATION));
+        assert_eq!(channel_flags_from_data(&tagged.data), Some(0));
 
-    /// A room that sets nothing after the name publishes the bytes it did
-    /// before the field existed.
-    #[test]
-    fn a_room_without_a_language_writes_nothing_new() {
-        let bare = ModerationTail {
-            room_name: None,
-            announce_only: None,
-            pinned_msg_ids: Vec::new(),
-            language: None,
-            ..tail()
-        };
-        let mut out = Vec::new();
-        bare.encode(&mut out);
-        assert_eq!(out.len(), 32 + 8 + 32 + 2 + 1 + 2);
-    }
+        let parsed = SignedRecord::parse_channel_moderation(&[tagged.data.clone(), tagged.signature.to_vec()].concat(), &ident.channel_id)
+            .expect("parses");
+        assert_eq!(parsed.tail.language, Some("ja"));
+        let parsed = SignedRecord::parse_channel_moderation(&[plain.data.clone(), plain.signature.to_vec()].concat(), &ident.channel_id)
+            .expect("parses");
+        assert_eq!(parsed.tail.language, None);
 
-    /// An id from a later build's longer list is no language, not a
-    /// malformed record, and a language this build does not list is not
-    /// written.
-    #[test]
-    fn unknown_languages_are_dropped_not_refused() {
-        let mut out = Vec::new();
-        ModerationTail {
-            pinned_msg_ids: Vec::new(),
-            language: None,
-            ..tail()
-        }
-        .encode(&mut out);
-        out.push(0); // zero pin count
-        out.push(u8::MAX);
-        let decoded = ModerationTail::decode(&out).expect("decodes");
-        assert_eq!(decoded.language, None);
-        assert_eq!(decoded.announce_only, Some(true));
-
-        let mut out = Vec::new();
-        ModerationTail {
-            pinned_msg_ids: Vec::new(),
-            language: Some("xx"),
-            announce_only: None,
-            ..tail()
-        }
-        .encode(&mut out);
-        assert_eq!(ModerationTail::decode(&out).expect("decodes").language, None);
+        let index = SignedRecord::channel_index(
+            "Lobby", ident.channel_id, ident.pubkey, false, Some("de"), &ident.signing_key,
+        );
+        assert!(index.channel_store_ok());
+        assert_eq!(channel_language_from_file_size(index.file_size), Some("de"));
+        assert_eq!(index.channel.as_ref().unwrap().kind, CHANNEL_KIND_INDEX);
+        let reread = SignedRecord::from_value_blob(&[index.data.clone(), index.signature.to_vec()].concat()).expect("reparses");
+        assert_eq!(channel_language_from_file_size(reread.file_size), Some("de"));
     }
 
     #[test]
-    fn language_wire_ids_are_stable() {
-        assert_eq!(channel_language_wire_id("en"), Some(1));
-        assert_eq!(channel_language_wire_id("ca"), Some(CHANNEL_LANGUAGES.len() as u8));
-        assert_eq!(channel_language_from_wire(0), None);
-        assert_eq!(channel_language_from_wire(1), Some("en"));
+    fn language_wire_ids_are_stable_and_unknown_ones_read_as_none() {
+        let with = |id: u64| pack_channel_file_size(CHANNEL_KIND_INDEX, 0) | (id << 16);
+        assert_eq!(channel_language_from_file_size(with(0)), None);
+        assert_eq!(channel_language_from_file_size(with(1)), Some("en"));
+        assert_eq!(channel_language_from_file_size(with(255)), None);
+        assert_eq!(channel_language_from_file_size(pack_channel_file_size(CHANNEL_KIND_INDEX, 1)), None);
         for code in CHANNEL_LANGUAGES {
-            assert_eq!(
-                channel_language_from_wire(channel_language_wire_id(code).unwrap()),
-                Some(*code)
-            );
+            let packed = pack_channel_file_size_with_language(CHANNEL_KIND_INDEX, 1, Some(code));
+            assert_eq!(channel_language_from_file_size(packed), Some(*code));
+            assert_eq!(packed & 0xffff, pack_channel_file_size(CHANNEL_KIND_INDEX, 1));
         }
+        assert_eq!(channel_language_wire_id("xx"), 0);
     }
 
     /// The slack the budget comment claims, so the next field added knows what
     /// it has to work with.
     #[test]
-    fn the_worst_case_snapshot_leaves_no_slack() {
+    fn the_worst_case_snapshot_leaves_one_byte() {
         let worst = RECORD_HEADER_LEN
             + CHANNEL_NAME_MAX
             + CHANNEL_TRAILER_MIN_LEN
@@ -2202,7 +2187,7 @@ mod moderation_budget_tests {
             + CHANNEL_WELCOME_MAX
             + 32 * (CHANNEL_BAN_LIST_MAX + CHANNEL_MOD_LIST_MAX);
         assert_eq!(messages::MAX_STORE_RECORD_BYTES, 1165);
-        assert_eq!(worst, 1165);
+        assert_eq!(worst, 1164);
     }
 
     /// A room at every other maximum has no room left for a pin, so its pins
@@ -2221,7 +2206,7 @@ mod moderation_budget_tests {
         // Two bans short of the cap frees 64 bytes: three pins' worth at 48.
         let fewer = &bans[..CHANNEL_BAN_LIST_MAX - 2];
         assert_eq!(moderation_pin_capacity(&topic, &welcome, fewer, &mods, &tail()), 3);
-        // One short frees 32: two pins, not three.
+        // One short frees 32 plus the byte of slack: two pins, not three.
         let one_fewer = &bans[..CHANNEL_BAN_LIST_MAX - 1];
         assert_eq!(moderation_pin_capacity(&topic, &welcome, one_fewer, &mods, &tail()), 2);
         let fitted = fit_moderation_pins(&topic, &welcome, one_fewer, &mods, &tail());
@@ -2230,7 +2215,7 @@ mod moderation_budget_tests {
             vec![[0x32; 16], [0x33; 16]],
             "the newest pins survive"
         );
-        // A welcome 20 bytes short of full leaves 20: exactly one pin.
+        // A welcome 20 bytes short of full leaves 21: exactly one pin.
         let shorter = "w".repeat(CHANNEL_WELCOME_MAX - 20);
         assert_eq!(moderation_pin_capacity(&topic, &shorter, &bans, &mods, &tail()), 1);
 
@@ -3280,6 +3265,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         assert_eq!(record.record_type, RECORD_TYPE_CHANNEL);
@@ -3308,6 +3294,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         record.keyword_hash = channel::index_key(index_other_shard(&ident.channel_id));
@@ -3846,16 +3833,15 @@ mod tests {
             room_name: Some("Lobby".to_string()),
             announce_only: Some(true),
             pinned_msg_ids: vec![[0xA1u8; 16], [0xA2u8; 16]],
-            language: Some("ko"),
+            language: None,
         };
         const TO_SLOW: usize = 32 + 8 + 32 + 2 + 1 + 2;
         const TO_NAME: usize = TO_SLOW + 1 + 5;
         const TO_ANNOUNCE: usize = TO_NAME + 1;
-        const TO_PINS: usize = TO_ANNOUNCE + 1 + 2 * 16;
-        const FULL_TAIL: usize = TO_PINS + 1;
+        const FULL_TAIL: usize = TO_ANNOUNCE + 1 + 2 * 16;
         let base = encode_moderation_extra("hi", &[], &[], &full);
         let prefix_len = base.len() - FULL_TAIL;
-        let legitimate = [0, 32, 40, 72, 74, 75, TO_SLOW, TO_NAME, TO_ANNOUNCE, TO_PINS, FULL_TAIL];
+        let legitimate = [0, 32, 40, 72, 74, 75, TO_SLOW, TO_NAME, TO_ANNOUNCE, FULL_TAIL];
         for tail_len in 0..=FULL_TAIL {
             let mut truncated = base.clone();
             truncated.truncate(prefix_len + tail_len);
@@ -3874,12 +3860,6 @@ mod tests {
         let decoded = decode_moderation_extra(&flag_only).expect("decodes").3;
         assert_eq!(decoded.announce_only, Some(true));
         assert!(decoded.pinned_msg_ids.is_empty());
-        // Stopping after the pins reads as "no language".
-        let mut pins_only = base.clone();
-        pins_only.truncate(prefix_len + TO_PINS);
-        let decoded = decode_moderation_extra(&pins_only).expect("decodes").3;
-        assert_eq!(decoded.pinned_msg_ids.len(), 2);
-        assert_eq!(decoded.language, None);
     }
 
     /// The decoder released builds run (v1.6.0 through v1.6.7), verbatim but
@@ -3961,7 +3941,7 @@ mod tests {
                     room_name: name,
                     announce_only: Some(true),
                     pinned_msg_ids: vec![[0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]],
-                    language: Some("de"),
+                    language: None,
                 };
                 let mut out = Vec::new();
                 tail.encode(&mut out);
@@ -3989,6 +3969,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         let truncated = &record.data[..record.data.len() - 1];
