@@ -483,8 +483,14 @@ pub struct DhtStore {
     /// Records refused for want of a free key slot, after eviction was tried.
     key_cap_rejections: u64,
     /// Signature did not verify against the claimed publisher key.
+    ///
+    /// Checked after the creation-date window, so a body that is both forged
+    /// and out of date is counted under `timestamp_rejections` instead.
     signature_rejections: u64,
-    /// Creation timestamp too far in the future, or already past TTL.
+    /// Creation timestamp too far in the future, or already past TTL. Includes
+    /// bodies whose signature was never checked because this refused them
+    /// first, here or in the inbound path's
+    /// [`DhtStore::created_at_admissible`] pre-check.
     timestamp_rejections: u64,
     /// Per-IP source-record cap (`max_sources_per_ip`).
     source_ip_cap_rejections: u64,
@@ -950,34 +956,20 @@ impl DhtStore {
             );
             return false;
         }
+        // Before the signature, because it needs only the body: an expired
+        // persisted record at startup, or a stale one off the wire, is refused
+        // without an Ed25519 check.
+        let ttl_secs = record_ttl(&data).as_secs() as i64;
+        let now_unix = chrono::Utc::now().timestamp();
+        if !self.admit_created_at(&key, created_at, ttl_secs, now_unix) {
+            return false;
+        }
         if !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
                 "DHT store: signature verification failed for key {} from publisher {}",
                 hex::encode(key),
                 hex::encode(publisher_key),
-            );
-            return false;
-        }
-
-        // Derive remaining lifetime from the signed creation time.
-        let ttl_secs = record_ttl(&data).as_secs() as i64;
-        let now_unix = chrono::Utc::now().timestamp();
-        if created_at > now_unix + CLOCK_SKEW_TOLERANCE_SECS {
-            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
-            debug!(
-                "DHT store: rejecting record for key {} dated {}s in the future",
-                hex::encode(key),
-                created_at - now_unix,
-            );
-            return false;
-        }
-        let age = now_unix.saturating_sub(created_at).max(0);
-        if age >= ttl_secs {
-            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
-            debug!(
-                "DHT store: rejecting record for key {} already past TTL (age {age}s)",
-                hex::encode(key),
             );
             return false;
         }
@@ -1211,6 +1203,40 @@ impl DhtStore {
         // means this record is what puts the publisher on this key.
         self.publisher_index.charge(&publisher_key, cost, mine == 0);
         self.enforce_byte_budget(&key);
+        true
+    }
+
+    /// Whether [`Self::store_attributed`] would admit a body of `data`'s type
+    /// dated `created_at`: not implausibly far in the future and not already
+    /// past its TTL. A refusal is counted under `timestamp`, as the store
+    /// itself counts it.
+    ///
+    /// Needs only the body, so the inbound path asks it before paying for a
+    /// signature check. `store_attributed` asks again rather than rely on it.
+    pub fn created_at_admissible(&mut self, key: &[u8; 16], data: &[u8], created_at: i64) -> bool {
+        let ttl_secs = record_ttl(data).as_secs() as i64;
+        self.admit_created_at(key, created_at, ttl_secs, chrono::Utc::now().timestamp())
+    }
+
+    fn admit_created_at(&mut self, key: &[u8; 16], created_at: i64, ttl_secs: i64, now_unix: i64) -> bool {
+        if created_at > now_unix + CLOCK_SKEW_TOLERANCE_SECS {
+            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
+            debug!(
+                "DHT store: rejecting record for key {} dated {}s in the future",
+                hex::encode(key),
+                created_at - now_unix,
+            );
+            return false;
+        }
+        let age = now_unix.saturating_sub(created_at).max(0);
+        if age >= ttl_secs {
+            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
+            debug!(
+                "DHT store: rejecting record for key {} already past TTL (age {age}s)",
+                hex::encode(key),
+            );
+            return false;
+        }
         true
     }
 
@@ -3238,6 +3264,28 @@ mod tests {
         assert!(!store.store([1u8; 16], d, sig));
         assert_eq!(store.total_records(), 0);
         assert_eq!(store.reject_stats().timestamp, 1);
+    }
+
+    /// The date window needs only the body, so it is decided before the
+    /// signature: a forgery that is also out of date is counted as out of date,
+    /// and one that is in date is still caught by the signature.
+    #[test]
+    fn an_out_of_date_forgery_is_refused_on_its_date() {
+        let mut store = DhtStore::new();
+        let (sk, _) = keypair();
+        let (d, mut sig) = signed_body_at([1u8; 16], &[1], &sk, 0);
+        sig[0] ^= 1;
+        assert!(!store.created_at_admissible(&[1u8; 16], &d, 0));
+        assert!(!store.store([1u8; 16], d, sig));
+        let stats = store.reject_stats();
+        assert_eq!(stats.timestamp, 2, "the pre-check and the store count alike");
+        assert_eq!(stats.signature, 0);
+
+        let (d, mut sig) = signed_body([1u8; 16], &[1], &sk);
+        sig[0] ^= 1;
+        assert!(!store.store([1u8; 16], d, sig));
+        assert_eq!(store.reject_stats().signature, 1);
+        assert_eq!(store.total_records(), 0);
     }
 
     #[test]

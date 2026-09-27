@@ -310,16 +310,20 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             }
         }
         ember::dht::search::SearchType::FindValue => {
-            if let Some(search) = state.ember_search.get(search_id) {
+            // Removed before the consumers below so the gathered records move to
+            // them instead of being copied. None of them look the search up.
+            let mut search = state.ember_search.remove(search_id);
+            if let Some(search) = &search {
                 record_ember_find_value_quality(&mut state.ember_diagnostics, search);
             }
-            let held = state
-                .ember_search
-                .get(search_id)
-                .map(|s| s.results.clone())
+            let held = search
+                .as_mut()
+                .map(|s| std::mem::take(&mut s.results))
                 .unwrap_or_default();
-            let records: Vec<Vec<u8>> = held.iter().map(|r| r.data.clone()).collect();
-            if records.is_empty() {
+            let into_blobs = |held: Vec<ember::dht::search::SearchResultRecord>| -> Vec<Vec<u8>> {
+                held.into_iter().map(|r| r.data).collect()
+            };
+            if held.is_empty() {
                 state.ember_diagnostics.ember_dht_search_misses = state
                     .ember_diagnostics
                     .ember_dht_search_misses
@@ -332,7 +336,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             }
             if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
                 // Dev/command value lookup: hand the raw blobs to the waiter.
-                let _ = tx.send(records);
+                let _ = tx.send(into_blobs(held));
             } else if let Some((_transfer_id, file_hash)) =
                 state.ember_download_source_searches.remove(&search_id)
             {
@@ -407,19 +411,19 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some(channel_id) =
                 state.ember_channel_presence_searches.remove(&search_id)
             {
-                buffer_channel_presence_records(state, channel_id, records);
+                buffer_channel_presence_records(state, channel_id, into_blobs(held));
             } else if let Some(channel_id) =
                 state.ember_channel_claim_searches.remove(&search_id)
             {
                 state
                     .ember_pending_channel_claim
-                    .push((channel_id, records));
+                    .push((channel_id, into_blobs(held)));
             } else if let Some((channel_id, epoch)) =
                 state.ember_channel_epoch_searches.remove(&search_id)
             {
                 state
                     .ember_pending_channel_epoch
-                    .push((channel_id, epoch, records));
+                    .push((channel_id, epoch, into_blobs(held)));
             } else if let Some(channel_id) =
                 state.ember_channel_moderation_searches.remove(&search_id)
             {
@@ -427,20 +431,16 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // search nobody answered says nothing about the owner — it says
                 // we could not reach the network — and succession must not read
                 // the two the same way.
-                let answered = state
-                    .ember_search
-                    .get(search_id)
-                    .map(|s| s.responded_count())
-                    .unwrap_or(0);
+                let answered = search.as_ref().map_or(0, |s| s.responded_count());
                 state
                     .ember_pending_channel_moderation
-                    .push((channel_id, records, answered));
+                    .push((channel_id, into_blobs(held), answered));
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {
                 state
                     .ember_pending_channel_handoff
-                    .push((channel_id, records));
+                    .push((channel_id, into_blobs(held)));
             }
         }
     }

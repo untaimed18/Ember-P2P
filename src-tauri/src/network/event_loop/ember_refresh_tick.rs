@@ -292,7 +292,7 @@ fn prune_ember_peer_caches(
         .retain(|(ip, port), contact| {
             contact.last_seen > session_contact_cutoff
                 || state.ember_keyless_peers.contains_key(&(*ip, *port))
-                || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
+                || state.known_ember_peers.has_host(*ip)
         });
     // The bridge's "already attempted" set has no TTL of its own;
     // bound it to the two caches it mirrors. Once a peer ages out

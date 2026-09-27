@@ -385,8 +385,8 @@ enum StoreOutcome {
     Stored,
     /// The same publisher signature arrived again inside the replay window.
     Replay,
-    /// Failed verification, key binding, anti-reflection, proximity, or a
-    /// store capacity limit.
+    /// Failed verification, key binding, anti-reflection, the creation-date
+    /// window, proximity, or a store capacity limit.
     Rejected,
 }
 
@@ -439,14 +439,25 @@ pub struct EmberDht {
     /// for one of these, so an ACKed buddy cannot aim connect-back for an
     /// arbitrary file_hash.
     proxy_file_grants: HashMap<(EmberNodeId, [u8; 16]), Instant>,
+    /// Every `proxy_file_grants` entry with its grant time, ordered by that
+    /// time, so expiry and the cap only ever pop from the front. A pair whose
+    /// time the map no longer holds is a grant since renewed, and is skipped.
+    proxy_grant_order: VecDeque<((EmberNodeId, [u8; 16]), Instant)>,
     /// Recent `CALLBACK_REQ`s we bounced, for the per-searcher and per-address
     /// budgets.
     callback_forwards: VecDeque<(Instant, EmberNodeId, IpAddr)>,
     /// Recent `CALLBACK`s we honoured with a connect-back, per buddy.
     callback_connects: VecDeque<(Instant, EmberNodeId, IpAddr)>,
     /// Inbound STORE records refused before they reached the store: the
-    /// publisher signature did not parse, or the DHT key did not match the
-    /// record's own content key.
+    /// body did not parse, a channel record was malformed, the DHT key did
+    /// not match the record's own content key, or the publisher signature did
+    /// not verify.
+    ///
+    /// The signature is checked after every structural and binding rule and
+    /// after the store's creation-date window, so a forged record that also
+    /// breaks one of those is counted under that rule — here for the key and
+    /// channel rules, in `store_reject_source_ip` or the store's `timestamp`
+    /// for the others — without ever being verified.
     store_reject_verify: u64,
     /// Source records whose declared IP did not match the Noise sender
     /// (anti-reflection), excluding firewalled sources.
@@ -460,6 +471,10 @@ pub struct EmberDht {
     /// Inbound records of a type this build does not know that we stored.
     /// Counted, never refused — see `accept_record`.
     unknown_record_types_stored: u64,
+    /// Calls to [`Self::verify_inbound_record`], so tests can show which
+    /// refusals were decided without an Ed25519 check.
+    #[cfg(test)]
+    inbound_record_verifications: u64,
     /// The wire-version range each peer has told us it can decode, learned from
     /// the block on a signed `PING` or `PONG`.
     ///
@@ -573,6 +588,7 @@ impl EmberDht {
             our_proxy_buddies: HashMap::new(),
             pending_proxy_asks: HashMap::new(),
             proxy_file_grants: HashMap::new(),
+            proxy_grant_order: VecDeque::new(),
             callback_forwards: VecDeque::new(),
             callback_connects: VecDeque::new(),
             store_reject_verify: 0,
@@ -580,6 +596,8 @@ impl EmberDht {
             store_reject_proximity: 0,
             keyword_key_off_name: 0,
             unknown_record_types_stored: 0,
+            #[cfg(test)]
+            inbound_record_verifications: 0,
             peer_versions: HashMap::new(),
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
@@ -1121,12 +1139,17 @@ impl EmberDht {
         record_signature: [u8; 64],
         from: SocketAddr,
     ) -> StoreOutcome {
-        // Parse + verify the publisher-signed record, and bind the DHT key to
-        // the record's own content key so a publisher can't scatter a record
-        // under unrelated keys. `from_wire` verifies the Ed25519 signature;
-        // `DhtStore::store` checks it again (defence in depth) and enforces
-        // capacity.
-        let Some(parsed) = SignedRecord::from_wire(&record, record_signature) else {
+        // Everything down to `verify_inbound_record` reads a body nobody has
+        // vouched for yet. That is sound only because each of those checks can
+        // refuse and none can admit — the one exception being a byte-identical
+        // copy of a record we already verified, which is exactly as authentic.
+        // The verification still gates every insert and every replay
+        // acknowledged on the strength of signed fields. Its place in the order
+        // is the point: junk is refused for the price of reading it, and the
+        // Ed25519 check is paid only by a record that would be kept if genuine.
+        // `DhtStore::store` checks the signature again (defence in depth) and
+        // enforces capacity.
+        let Some(parsed) = SignedRecord::parse_unverified(&record, record_signature) else {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         };
@@ -1154,9 +1177,27 @@ impl EmberDht {
             return StoreOutcome::Rejected;
         }
 
+        if key != parsed.keyword_hash {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+        // For a keyword record the word itself is not carried, so `keyword_hash`
+        // cannot be recomputed and the check above is all there is. A source
+        // record's key *is* derivable from its own signed body — the publisher
+        // derived it as `source_key(file_hash)` — so anything else is a record
+        // filed where it does not belong. That matters beyond tidiness: the key
+        // is what decides XOR distance, and distance is what the store's key cap
+        // and byte budget rank evictions by, so a free choice of key is a choice
+        // of which of our records to displace.
+        if parsed.record_type == RECORD_TYPE_SOURCE && key != source_key(&parsed.file_hash) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+
         // Slice 14: collapse identical STORE frames (same publisher
-        // signature) for a short window so a retransmit storm can't re-verify
-        // the same blob forever. Periodic republish still lands after the TTL.
+        // signature) for a short window, so a retransmit storm is answered from
+        // what we hold rather than verified and stored again each time.
+        // Periodic republish still lands after the TTL.
         let mut hasher = blake3::Hasher::new();
         hasher.update(&parsed.publisher_key);
         hasher.update(&record_signature);
@@ -1181,35 +1222,60 @@ impl EmberDht {
             self.store_sig_order.retain(|k| live.contains_key(k));
             self.store_sig_swept_at = Some(now_inst);
         }
-        if self
+        let sig_seen = self
             .store_sig_seen
             .get(&sig_key)
-            .is_some_and(|t| now_inst.saturating_duration_since(*t) < STORE_SIG_REPLAY_TTL)
+            .is_some_and(|t| now_inst.saturating_duration_since(*t) < STORE_SIG_REPLAY_TTL);
+        // A replay only counts as one if we still hold what it stands for.
+        // This cache is keyed on the signature alone and is cleared by TTL
+        // or size pressure — never by eviction — so a record the byte
+        // budget or a key-cap displacement had already dropped still
+        // classified as a replay, and `STORE_BATCH` set its accepted bit on
+        // the strength of "we already hold this exact record". The
+        // publisher then retired a file counting a replica that was gone.
+        //
+        // "Hold" means byte for byte, and that is what lets this answer come
+        // before the signature check. The cache key pairs an unverified body's
+        // publisher field with a signature nobody has checked, so a match alone
+        // would acknowledge any body that carried one we had seen; a body
+        // identical to one the store verified on insert is exactly as authentic
+        // as that one was.
+        if sig_seen
+            && self
+                .store
+                .live_records(&key)
+                .any(|h| h.signature == record_signature && h.data == record)
         {
-            let held = self.store.get_live(&key);
-            // A replay only counts as one if we still hold what it stands for.
-            // This cache is keyed on the signature alone and is cleared by TTL
-            // or size pressure — never by eviction — so a record the byte
-            // budget or a key-cap displacement had already dropped still
-            // classified as a replay, and `STORE_BATCH` set its accepted bit on
-            // the strength of "we already hold this exact record". The
-            // publisher then retired a file counting a replica that was gone.
-            let still_held = held.iter().any(|h| h.signature == record_signature);
-            // The other way a seen signature stops being held is the publisher
-            // superseding it with a republish. That is not an eviction to make
-            // good: `DhtStore::store` finds the newer copy, keeps it, and
-            // reports success — so every replay of the retired copy was
-            // reported as a fresh store, re-armed this cache entry, and paid a
-            // second Ed25519 verification for the privilege.
-            let superseded = !still_held
-                && held.iter().any(|h| {
-                    h.publisher_key == parsed.publisher_key
-                        && file_hash_from_record_data(&h.data) == Some(parsed.file_hash)
-                        && h.created_at > parsed.timestamp
-                });
-            if still_held || superseded {
-                return StoreOutcome::Replay;
-            }
+            return StoreOutcome::Replay;
+        }
+
+        if !self.store.created_at_admissible(&key, &record, parsed.timestamp) {
+            return StoreOutcome::Rejected;
+        }
+
+        if !self.verify_inbound_record(&parsed) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+
+        // The other way a seen signature stops being held is the publisher
+        // superseding it with a republish. That is not an eviction to make
+        // good: `DhtStore::store` finds the newer copy, keeps it, and
+        // reports success — so every replay of the retired copy was
+        // reported as a fresh store, re-armed this cache entry, and paid a
+        // second Ed25519 verification for the privilege.
+        //
+        // Only past the verification, because what decides it — file hash and
+        // creation date — is read from the body, and those are the fields a
+        // forger would choose to make an unverified body look superseded.
+        if sig_seen
+            && self.store.live_records(&key).any(|h| {
+                h.publisher_key == parsed.publisher_key
+                    && file_hash_from_record_data(&h.data) == Some(parsed.file_hash)
+                    && h.created_at > parsed.timestamp
+            })
+        {
+            return StoreOutcome::Replay;
         }
 
         // A firewalled source's declared address is exempt from the bind
@@ -1224,23 +1290,8 @@ impl EmberDht {
             _ => None,
         };
 
-        if key != parsed.keyword_hash {
-            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
-        }
-        // For a keyword record the word itself is not carried, so `keyword_hash`
-        // cannot be recomputed and the check above is all there is. A source
-        // record's key *is* derivable from its own signed body — the publisher
-        // derived it as `source_key(file_hash)` — so anything else is a record
-        // filed where it does not belong. That matters beyond tidiness: the key
-        // is what decides XOR distance, and distance is what the store's key cap
-        // and byte budget rank evictions by, so a free choice of key is a choice
-        // of which of our records to displace.
-        if parsed.record_type == RECORD_TYPE_SOURCE && key != source_key(&parsed.file_hash) {
-            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
-        }
-        // The keyword half of that argument, measured rather than enforced.
+        // The keyword half of the source-key argument above, measured rather
+        // than enforced.
         //
         // The word is not on the wire, but the *name* is — signed beside the key
         // — and the publish loop derives its keywords from that name, so a storer
@@ -1266,6 +1317,9 @@ impl EmberDht {
         {
             self.keyword_key_off_name = self.keyword_key_off_name.saturating_add(1);
         }
+        // Cheap, but past the verification anyway: a replay of something we
+        // hold must still be acknowledged after our distance to its key has
+        // grown, and the count above must see every genuine record, kept or not.
         if !self.store_proximity_ok(&key) {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
             return StoreOutcome::Rejected;
@@ -1308,6 +1362,17 @@ impl EmberDht {
         } else {
             StoreOutcome::Rejected
         }
+    }
+
+    /// The publisher-signature check for a record that arrived unverified
+    /// through [`SignedRecord::parse_unverified`]. Callers ask it last, once
+    /// every rule that can refuse the record without crypto has passed.
+    fn verify_inbound_record(&mut self, parsed: &SignedRecord) -> bool {
+        #[cfg(test)]
+        {
+            self.inbound_record_verifications += 1;
+        }
+        parsed.verify()
     }
 
     /// Whether we should take on one more `PROXY_STORE` fan-out for `sender`,
@@ -1661,19 +1726,36 @@ impl EmberDht {
             asks.retain(|(_, _, at)| now.saturating_duration_since(*at) < PROXY_STORE_ASK_TTL);
             !asks.is_empty()
         });
-        self.proxy_file_grants
-            .retain(|_, at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL);
-        if self.proxy_file_grants.len() > Self::MAX_PROXY_FILE_GRANTS {
-            let excess = self.proxy_file_grants.len() - Self::MAX_PROXY_FILE_GRANTS;
-            let mut oldest: Vec<((EmberNodeId, [u8; 16]), Instant)> = self
-                .proxy_file_grants
-                .iter()
-                .map(|(key, at)| (*key, *at))
-                .collect();
-            oldest.sort_unstable_by_key(|(_, at)| *at);
-            for (key, _) in oldest.into_iter().take(excess) {
+        // Expired grants are a prefix of the order, and past the cap the
+        // oldest go first, so both stop at the first live grant that is
+        // neither.
+        while let Some(&(key, at)) = self.proxy_grant_order.front() {
+            let live = self.proxy_file_grants.get(&key) == Some(&at);
+            if live
+                && now.saturating_duration_since(at) < CALLBACK_CLIENT_TTL
+                && self.proxy_file_grants.len() <= Self::MAX_PROXY_FILE_GRANTS
+            {
+                break;
+            }
+            self.proxy_grant_order.pop_front();
+            if live {
                 self.proxy_file_grants.remove(&key);
             }
+        }
+    }
+
+    fn note_proxy_grant(&mut self, key: (EmberNodeId, [u8; 16]), now: Instant) {
+        if self.proxy_file_grants.insert(key, now) == Some(now) {
+            return;
+        }
+        let pos = self.proxy_grant_order.partition_point(|(_, at)| *at <= now);
+        self.proxy_grant_order.insert(pos, (key, now));
+        // Renewals leave their earlier pair behind; drop those once they
+        // outnumber the live ones, which keeps this amortised O(1).
+        if self.proxy_grant_order.len() > 2 * self.proxy_file_grants.len() + 64 {
+            let grants = &self.proxy_file_grants;
+            self.proxy_grant_order
+                .retain(|(key, at)| grants.get(key) == Some(at));
         }
     }
 
@@ -1695,7 +1777,7 @@ impl EmberDht {
             self.pending_proxy_asks.remove(&buddy);
         }
         self.note_proxy_buddy(buddy, now);
-        self.proxy_file_grants.insert((buddy, file_hash), now);
+        self.note_proxy_grant((buddy, file_hash), now);
         true
     }
 
@@ -2307,9 +2389,9 @@ impl EmberDht {
     /// frames wire decode turned away, plus the bodies the store's own length
     /// floor refused.
     ///
-    /// One cause reached from two sides. `accept_record` bails at `from_wire`
-    /// before the store is asked, so the wire path can only ever reach the
-    /// first; the paths that skip wire decode entirely — `store_own_record`,
+    /// One cause reached from two sides. `accept_record` bails at
+    /// `parse_unverified` before the store is asked, so the wire path can only
+    /// ever reach the first; the paths that skip wire decode entirely — `store_own_record`,
     /// the proxy replica, restore — can only ever reach the second. Nothing
     /// double-counts, and splitting them would leave the store's half with no
     /// diagnostic surfacing it.
@@ -2329,9 +2411,9 @@ impl EmberDht {
     /// Verified inbound keyword records whose key no word in their own signed
     /// name hashes to.
     ///
-    /// Counted where the record is known to be genuine and new — past
-    /// `from_wire` and past the replay collapse — so a retransmit storm cannot
-    /// inflate it, and unsigned junk cannot appear here at all. Counted before
+    /// Counted where the record is known to be genuine and new — past the
+    /// signature check and past the replay collapse — so a retransmit storm
+    /// cannot inflate it, and unsigned junk cannot appear here at all. Counted before
     /// the proximity gate and the store's caps, because the question is what
     /// publishers are doing rather than what we happened to keep.
     ///
@@ -2717,7 +2799,10 @@ impl EmberDht {
                 // `accept_proxy_forward` is what stops a peer amplifying its
                 // *own* record without limit, and is charged last so only a
                 // frame that would otherwise have been honoured spends budget.
-                if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
+                //
+                // Parsed unverified so every binding below refuses first, as
+                // in `accept_record`; the record signature is checked last.
+                if let Some(parsed) = SignedRecord::parse_unverified(&record, record_signature) {
                     let is_fw_source = parsed.record_type == RECORD_TYPE_SOURCE
                         && parsed
                             .source_contact
@@ -2732,6 +2817,7 @@ impl EmberDht {
                         && key == source_key(&parsed.file_hash)
                         && publisher_is_sender
                         && self.trailer_names_us(parsed.source_contact.as_ref(), msg.sender_id, now)
+                        && self.verify_inbound_record(&parsed)
                     {
                         // Budget, callback table, and the local replica are
                         // committed only after the caller obtains a publish
@@ -3182,7 +3268,14 @@ fn intersect_live_records<'a>(
     }
 
     let mut allowed: Option<HashSet<[u8; 16]>> = None;
-    for key in keys.iter().skip(1) {
+    for (i, key) in keys.iter().enumerate().skip(1) {
+        // A repeated secondary narrows to the set it already narrowed to, and
+        // one query can name a hot key many times over. Compared against the
+        // earlier secondaries only: the primary named as a secondary still
+        // narrows, dropping records that declare no file hash.
+        if keys[1..i].contains(key) {
+            continue;
+        }
         // Iterated, not collected: a secondary key is read only for the file
         // hashes its records declare, and a hot key holds up to
         // `MAX_RECORDS_PER_KEY` of them. Collecting each of the seven a
@@ -4266,6 +4359,149 @@ mod tests {
         assert_eq!(b.store_stats(), (1, 1), "the live store is unchanged");
     }
 
+    /// A forged record that also breaks a rule readable from its body is
+    /// refused on that rule, without the Ed25519 check a flood would otherwise
+    /// buy one of per record.
+    #[test]
+    fn junk_is_refused_before_its_signature_is_checked() {
+        let mut a = dht(22);
+        let mut b = dht(23);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(22, 4672);
+
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
+        let mut forged_sig = record.signature;
+        forged_sig[0] ^= 1;
+
+        let misfiled = [0xEEu8; 16];
+        assert_ne!(misfiled, record.keyword_hash);
+        let (_rid, frame) = a.build_store(misfiled, record.data.clone(), forged_sig);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        assert!(!on_b.stored_record);
+        assert!(on_b.responses.is_empty(), "no STORE_ACK for a refused record");
+        assert_eq!(b.store_reject_verify, 1, "counted under the key binding");
+
+        let mut stale = record.data.clone();
+        stale[105..113].copy_from_slice(&0i64.to_le_bytes());
+        let (_rid, frame) = a.build_store(record.keyword_hash, stale, forged_sig);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1001);
+        assert!(!on_b.stored_record);
+        assert!(on_b.responses.is_empty());
+        assert_eq!(b.store_reject_stats().timestamp, 1, "counted under the date window");
+        assert_eq!(b.store_reject_stats().signature, 0, "the store never saw it either");
+
+        assert_eq!(
+            b.inbound_record_verifications, 0,
+            "neither refusal needed a signature check"
+        );
+        assert_eq!(b.store_stats(), (0, 0));
+
+        // The same record intact still costs exactly the one check.
+        let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(b.handle_message(&frame, a_addr, a_noise, 1002).stored_record);
+        assert_eq!(b.inbound_record_verifications, 1);
+    }
+
+    /// A byte-identical retransmit of a record we hold is answered from the
+    /// store: acknowledged as placed, and never verified a second time.
+    #[test]
+    fn an_identical_replay_is_acknowledged_without_a_second_verification() {
+        let mut a = dht(24);
+        let mut b = dht(25);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(24, 4672);
+        let b_addr = addr(25, 4672);
+
+        let record = a.build_keyword_record("debian", [8u8; 16], [0u8; 32], 2048, "debian.iso");
+        let key = record.keyword_hash;
+        let (_rid, first) = a.build_store(key, record.data.clone(), record.signature);
+        assert!(b.handle_message(&first, a_addr, a_noise, 1000).stored_record);
+        assert_eq!(b.inbound_record_verifications, 1);
+        let held_at = b.store.get_live(&key)[0].stored_at;
+
+        let (single_rid, single) = a.build_store(key, record.data.clone(), record.signature);
+        let replay = b.handle_message(&single, a_addr, a_noise, 1001);
+        assert!(replay.store_replay_rejected);
+        assert!(!replay.stored_record);
+        assert_eq!(replay.responses.len(), 1, "still acknowledged");
+        let on_a = a.handle_message(&replay.responses[0], b_addr, b_noise, 1002);
+        assert_eq!(on_a.store_ack_request_id, Some(single_rid));
+
+        let entry = messages::BatchedRecord {
+            key,
+            record: record.data.clone(),
+            record_signature: record.signature,
+        };
+        let (_rid, batch, _taken) = a.build_store_batch(&[entry]).expect("a batch");
+        let replay = b.handle_message(&batch, a_addr, a_noise, 1003);
+        assert!(replay.store_replay_rejected);
+        let on_a = a.handle_message(&replay.responses[0], b_addr, b_noise, 1004);
+        assert_eq!(
+            on_a.store_batch_ack.map(|(_, accepted)| accepted),
+            Some(1),
+            "a batched replay still sets its accepted bit"
+        );
+
+        assert_eq!(
+            b.inbound_record_verifications, 1,
+            "neither replay paid for a verification"
+        );
+        assert_eq!(b.store_stats(), (1, 1));
+        assert_eq!(
+            b.store.get_live(&key)[0].stored_at,
+            held_at,
+            "a replay does not re-store"
+        );
+    }
+
+    /// The replay fast path matches bytes, not just the cache key. A copy with
+    /// one signature byte flipped misses the cache and is verified; a body
+    /// carrying the held record's own signature over different bytes hits the
+    /// cache and is verified too. Both are refused, unacknowledged, and leave
+    /// the held record exactly as it was.
+    #[test]
+    fn a_near_copy_of_a_held_record_is_verified_and_refused() {
+        let mut a = dht(26);
+        let mut b = dht(27);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(26, 4672);
+
+        let record = a.build_keyword_record("fedora", [7u8; 16], [0u8; 32], 1024, "fedora.iso");
+        let key = record.keyword_hash;
+        let (_rid, first) = a.build_store(key, record.data.clone(), record.signature);
+        assert!(b.handle_message(&first, a_addr, a_noise, 1000).stored_record);
+        let held_at = b.store.get_live(&key)[0].stored_at;
+        let rejected_before = b.store_reject_verify;
+
+        let mut flipped_sig = record.signature;
+        flipped_sig[63] ^= 1;
+        let (_rid, frame) = a.build_store(key, record.data.clone(), flipped_sig);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1001);
+        assert!(!on_b.stored_record);
+        assert!(!on_b.store_replay_rejected, "not the record we hold");
+        assert!(on_b.responses.is_empty(), "no STORE_ACK");
+
+        let mut altered = record.data.clone();
+        altered[115] ^= 1;
+        let (_rid, frame) = a.build_store(key, altered, record.signature);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1002);
+        assert!(!on_b.stored_record);
+        assert!(
+            !on_b.store_replay_rejected,
+            "a seen signature over other bytes is not a replay"
+        );
+        assert!(on_b.responses.is_empty());
+
+        assert_eq!(b.inbound_record_verifications, 3, "both were verified");
+        assert_eq!(b.store_reject_verify, rejected_before + 2);
+        let held = b.store.get_live(&key);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].signature, record.signature);
+        assert_eq!(held[0].data, record.data);
+        assert_eq!(held[0].stored_at, held_at, "neither refreshed the held copy");
+    }
+
     /// A query with more keywords than the count-prefixed run can name must still
     /// intersect on all of them. The surplus rides in the constraint block, and
     /// the responder merges the two runs before intersecting — so where a key
@@ -5020,6 +5256,171 @@ mod tests {
         assert_eq!(parsed.file_hash, [1u8; 16]);
     }
 
+    /// `intersect_live_records` reads each distinct secondary once. That has to
+    /// give exactly what intersecting every key as named does, repeats and the
+    /// primary-as-secondary case included.
+    #[test]
+    fn repeated_find_value_keys_intersect_as_if_each_were_read() {
+        fn every_key_read(store: &DhtStore, keys: &[[u8; 16]]) -> Option<([u8; 16], Vec<[u8; 64]>)> {
+            let primary = *keys.first()?;
+            let primary_recs = store.get_live(&primary);
+            if primary_recs.is_empty() {
+                return None;
+            }
+            let mut allowed: Option<HashSet<[u8; 16]>> = None;
+            for key in &keys[1..] {
+                let held: Vec<_> = store.live_records(key).collect();
+                if held.is_empty() {
+                    continue;
+                }
+                let hashes: HashSet<[u8; 16]> = held
+                    .iter()
+                    .filter_map(|r| file_hash_from_record_data(&r.data))
+                    .collect();
+                allowed = Some(match allowed {
+                    None => hashes,
+                    Some(prev) => prev.intersection(&hashes).copied().collect(),
+                });
+            }
+            let hit: Vec<_> = match &allowed {
+                None => primary_recs.clone(),
+                Some(set) => primary_recs
+                    .iter()
+                    .copied()
+                    .filter(|r| file_hash_from_record_data(&r.data).is_some_and(|h| set.contains(&h)))
+                    .collect(),
+            };
+            let chosen = if hit.is_empty() { primary_recs } else { hit };
+            Some((primary, chosen.iter().map(|r| r.signature).collect()))
+        }
+
+        let a = dht(37);
+        let mut store = DhtStore::new();
+        let words = ["ubuntu", "server", "desktop", "arm"];
+        let mut key_of = HashMap::new();
+        for (i, name) in [
+            "ubuntu server arm",
+            "ubuntu desktop",
+            "ubuntu server",
+            "server arm",
+            "desktop arm",
+            "ubuntu",
+        ]
+        .iter()
+        .enumerate()
+        {
+            for word in name.split(' ') {
+                let rec = a.build_keyword_record(word, [i as u8 + 1; 16], [0u8; 32], 10, name);
+                key_of.insert(word, rec.keyword_hash);
+                assert!(store.store(rec.keyword_hash, rec.data.clone(), rec.signature));
+            }
+        }
+        let missing = [0xEEu8; 16];
+
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..400 {
+            let len = 1 + (next() % messages::MAX_FIND_VALUE_KEYS_TOTAL as u64) as usize;
+            let keys: Vec<[u8; 16]> = (0..len)
+                .map(|_| match next() % 5 {
+                    4 => missing,
+                    w => key_of[words[w as usize]],
+                })
+                .collect();
+            let got = intersect_live_records(&store, &keys)
+                .map(|(key, recs)| (key, recs.iter().map(|r| r.signature).collect::<Vec<_>>()));
+            assert_eq!(got, every_key_read(&store, &keys), "keys {keys:?}");
+        }
+    }
+
+    /// Grants are evicted from an ordered queue rather than by sorting the map;
+    /// which grants survive each prune has to be exactly what the sort chose.
+    #[test]
+    fn proxy_grant_eviction_matches_sorting_the_map() {
+        type Key = (EmberNodeId, [u8; 16]);
+        fn prune_by_sort(grants: &mut HashMap<Key, Instant>, now: Instant) {
+            grants.retain(|_, at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL);
+            if grants.len() > EmberDht::MAX_PROXY_FILE_GRANTS {
+                let excess = grants.len() - EmberDht::MAX_PROXY_FILE_GRANTS;
+                let mut oldest: Vec<(Key, Instant)> = grants.iter().map(|(k, at)| (*k, *at)).collect();
+                oldest.sort_unstable_by_key(|(_, at)| *at);
+                for (key, _) in oldest.into_iter().take(excess) {
+                    grants.remove(&key);
+                }
+            }
+        }
+
+        let mut dht = dht(38);
+        let mut model: HashMap<Key, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Distinct grant times, since the sort breaks ties arbitrarily. Mostly
+        // rising like a real clock, now and then earlier than the last.
+        let mut used = HashSet::new();
+        let mut clock_us = 0u64;
+        let mut stamp = |r: u64| {
+            clock_us += 2_000;
+            let mut us = if r.is_multiple_of(16) {
+                clock_us.saturating_sub((r >> 8) % 1_000_000)
+            } else {
+                clock_us
+            };
+            while !used.insert(us) {
+                us += 1;
+            }
+            t0 + Duration::from_micros(us)
+        };
+        let key = |n: u64| {
+            let mut file = [0u8; 16];
+            file[..8].copy_from_slice(&(n / 7).to_le_bytes());
+            (EmberNodeId([(n % 7) as u8; 16]), file)
+        };
+        /// The order `complete_proxy_store_ask` runs them in.
+        fn grant(dht: &mut EmberDht, model: &mut HashMap<Key, Instant>, k: Key, now: Instant) {
+            dht.prune_proxy_asks(now);
+            prune_by_sort(model, now);
+            dht.note_proxy_grant(k, now);
+            model.insert(k, now);
+        }
+
+        // Past the cap, with a fifth of the grants renewing an earlier key —
+        // live, or already evicted.
+        let ops = (EmberDht::MAX_PROXY_FILE_GRANTS + 1_500) * 5 / 4;
+        for step in 0..ops as u64 {
+            let r = next();
+            let k = if r.is_multiple_of(5) { key(next() % (step + 1)) } else { key(step) };
+            grant(&mut dht, &mut model, k, stamp(r));
+            if step.is_multiple_of(64) {
+                assert_eq!(dht.proxy_file_grants, model, "step {step}");
+            }
+        }
+        assert!(model.len() >= EmberDht::MAX_PROXY_FILE_GRANTS, "the cap has to bind");
+        assert!(dht.proxy_grant_order.len() <= 2 * model.len() + 64);
+
+        // Then expiry, sweeping away progressively more of what is left.
+        let span = clock_us;
+        for cut in [span / 4, span / 2, span * 3 / 4, span + 2_000_000] {
+            let at = t0 + CALLBACK_CLIENT_TTL + Duration::from_micros(cut);
+            dht.prune_proxy_asks(at);
+            prune_by_sort(&mut model, at);
+            assert_eq!(dht.proxy_file_grants, model, "sweep at {cut}us");
+            grant(&mut dht, &mut model, key(next()), at);
+            assert_eq!(dht.proxy_file_grants, model, "grant after sweep at {cut}us");
+        }
+        assert_eq!(model.len(), 4, "only the grants made after a sweep outlive the last one");
+    }
+
     fn source_contact_at(last: u8) -> SourceContact {
         SourceContact {
             ip: std::net::Ipv4Addr::new(10, 0, 0, last),
@@ -5509,6 +5910,44 @@ mod tests {
         assert_ne!(rid, 0);
         assert_eq!(fwd.file_name, "buddy.mkv");
         assert_eq!(fwd.keyword_hash, key);
+    }
+
+    /// `PROXY_STORE` follows the same order as a plain STORE: a forgery that
+    /// breaks a binding is refused unverified, and one that passes them all is
+    /// refused by the signature check it then pays for.
+    #[test]
+    fn proxy_store_checks_the_record_signature_last() {
+        let mut publisher = dht(87);
+        let mut buddy = dht(88);
+        let pub_noise = publisher.local_noise_pub;
+        let pub_addr = addr(87, 4672);
+
+        let contact = firewalled_for_buddy(87, &mut publisher, &mut buddy, 2000);
+        let record = publisher.build_source_record([6u8; 16], [0u8; 32], 42, "order.mkv", contact);
+        let key = record.keyword_hash;
+        let mut forged_sig = record.signature;
+        forged_sig[0] ^= 1;
+        let before = buddy.inbound_record_verifications;
+
+        let (_rid, frame) = publisher.build_proxy_store([0xEEu8; 16], record.data.clone(), forged_sig);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
+        assert!(on_buddy.proxy_store_forward.is_none());
+        assert_eq!(
+            buddy.inbound_record_verifications, before,
+            "a misfiled record is refused without a signature check"
+        );
+
+        let (_rid, frame) = publisher.build_proxy_store(key, record.data.clone(), forged_sig);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2001);
+        assert!(
+            on_buddy.proxy_store_forward.is_none(),
+            "a forged signature is never forwarded"
+        );
+        assert_eq!(buddy.inbound_record_verifications, before + 1);
+
+        let (_rid, frame) = publisher.build_proxy_store(key, record.data.clone(), record.signature);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2002);
+        assert!(on_buddy.proxy_store_forward.is_some());
     }
 
     #[test]

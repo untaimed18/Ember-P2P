@@ -1894,6 +1894,19 @@ pub(super) async fn run_ember_maintenance(
     result
 }
 
+/// Whether `EmberDht::handle_incoming` reads `session_contacts` for a frame of
+/// this type. Only the requests it answers with a contact list do, so every
+/// other frame can skip copying the session map. Keep in step with the engine's
+/// `closest_excluding` callers.
+pub(super) fn ember_dht_frame_reads_session_contacts(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        ember::dht::messages::MSG_FIND_NODE
+            | ember::dht::messages::MSG_ANNOUNCE_PEER
+            | ember::dht::messages::MSG_FIND_VALUE
+    )
+}
+
 /// Handle one decrypted Ember DHT frame: feed it to the DHT engine
 /// (which verifies the signature/identity binding, learns the sender as
 /// a contact, and produces any signed reply), then encrypt and send the
@@ -1929,7 +1942,7 @@ pub(super) async fn handle_ember_dht_message(
         return;
     }
 
-    let (known_sender, store_records) = if is_store {
+    let (known_sender, store_records, held_at_from) = if is_store {
         // Prefer the peer's cryptographic identity for the STORE budget when
         // we already know it, so several genuine peers behind one NAT do not
         // share (and exhaust) a single allowance.
@@ -1944,10 +1957,8 @@ pub(super) async fn handle_ember_dht_message(
         // static key matches this session ties the budget to the peer that
         // encrypted the frame. Anyone else falls back to the address budget,
         // which is where an unproven sender belongs.
-        let sender = state
-            .ember_dht
-            .routing()
-            .contact_at(from)
+        let held = state.ember_dht.routing().contact_at(from);
+        let sender = held
             .filter(|c| c.is_verified() && c.noise_pub == remote_noise_pub)
             .map(|c| c.node_id.0);
         // A batch's record count is its first payload byte. Reading it here
@@ -1958,9 +1969,9 @@ pub(super) async fn handle_ember_dht_message(
         } else {
             1
         };
-        (sender, records)
+        (sender, records, Some(held.is_some()))
     } else {
-        (None, 0)
+        (None, 0, None)
     };
 
     if !state
@@ -1972,9 +1983,13 @@ pub(super) async fn handle_ember_dht_message(
 
     let now = chrono::Utc::now().timestamp();
     // Whether this address was a stranger, read before `handle_message`, which
-    // adds the asker to the routing table at its top.
-    let was_stranger = state.ember_dht.routing().contact_at(from).is_none();
-    let session_extras: Vec<_> = if ember_share_session_contacts_with(from) {
+    // adds the asker to the routing table at its top. Nothing between the STORE
+    // lookup above and here touches the table, so that answer still holds.
+    let was_stranger =
+        !held_at_from.unwrap_or_else(|| state.ember_dht.routing().contact_at(from).is_some());
+    let session_extras: Vec<_> = if ember_dht_frame_reads_session_contacts(msg_type)
+        && ember_share_session_contacts_with(from)
+    {
         state
             .ember_session_dht_contacts
             .values()

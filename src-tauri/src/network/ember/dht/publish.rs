@@ -1441,11 +1441,9 @@ impl SignedRecord {
 
     /// Verify this record's signature against the embedded publisher key.
     ///
-    /// The live paths never need this: `from_wire` and `from_value_blob`
-    /// both verify before handing back a record, so anything parsed is
-    /// already checked. Kept as the standalone predicate those tests
-    /// assert through.
-    #[allow(dead_code)]
+    /// [`Self::from_wire`] is [`Self::parse_unverified`] followed by exactly
+    /// this, so a caller that parses unverified, runs cheaper checks, and then
+    /// asks this has admitted precisely what `from_wire` would have.
     pub fn verify(&self) -> bool {
         if let Some(pk) = crypto::verifying_key_from_bytes(&self.publisher_key) {
             crypto::verify(&pk, &self.data, &self.signature)
@@ -1602,11 +1600,7 @@ impl SignedRecord {
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         let parsed = Self::parse_unverified(data, signature)?;
-        let pk = crypto::verifying_key_from_bytes(&parsed.publisher_key)?;
-        if !crypto::verify(&pk, data, &signature) {
-            return None;
-        }
-        Some(parsed)
+        parsed.verify().then_some(parsed)
     }
 
     /// Parse a record body's structure **without checking its signature**.
@@ -1614,10 +1608,13 @@ impl SignedRecord {
     /// Everything returned is derived from `data` alone, so it says nothing
     /// about who wrote it: a caller that does not verify must not act on the
     /// identity fields. It exists for callers that verify separately — and
-    /// would otherwise pay twice. `DhtStore::restore` is the one that matters:
-    /// it runs synchronously at startup against a 20,000-record ceiling sized
-    /// on one Ed25519 check each, so a second one per record is a real launch
-    /// cost rather than a micro-optimisation.
+    /// would otherwise pay twice. `DhtStore::restore` is one: it runs
+    /// synchronously at startup against a 20,000-record ceiling sized on one
+    /// Ed25519 check each, so a second one per record is a real launch cost
+    /// rather than a micro-optimisation. The inbound STORE and `PROXY_STORE`
+    /// paths are the other: they refuse on these fields first and call
+    /// [`Self::verify`] only for a record that survives, so junk costs no
+    /// signature check at all.
     pub fn parse_unverified(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
         //          size(8) + pub_key(32) + timestamp(8) + name_len(2) = 115

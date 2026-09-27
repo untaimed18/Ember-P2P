@@ -70,6 +70,21 @@ const MAX_STORE_IDENTITIES_PER_ADDR: u32 = 8;
 
 const MAX_IP_ENTRIES: usize = 10_000;
 
+/// How often a counter map past half of [`MAX_IP_ENTRIES`] is swept for idle
+/// entries.
+///
+/// An idle entry has been idle for at least a full window of its own, so the
+/// next frame from its address resets it to exactly the state a fresh entry
+/// starts in: keeping it a while longer changes nothing but the map's size.
+const TRIM_INTERVAL: Duration = Duration::from_secs(1);
+
+/// From this size a map is swept on every frame, whatever the interval says.
+///
+/// A frame adds at most two keys to a map before the next sweep (a STORE's
+/// node and address budgets), so sweeping from two short of the cap means the
+/// capacity refusals always see the map a per-frame sweep would have left.
+const TRIM_EVERY_FRAME_AT: usize = MAX_IP_ENTRIES - 2;
+
 /// A two-bucket approximation of a sliding window.
 ///
 /// A single counter that resets wholesale is a *fixed* window, which lets a
@@ -199,6 +214,10 @@ pub struct DhtProtection {
     /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
     /// routing table's view of network size.
     max_stores: u32,
+    /// When the counter maps were last swept on the interval.
+    trimmed_at: Option<Instant>,
+    /// [`TRIM_INTERVAL`], as a field so a test can sweep on every frame.
+    trim_interval: Duration,
 }
 
 impl Default for DhtProtection {
@@ -216,6 +235,8 @@ impl DhtProtection {
             dropped_rate: 0,
             dropped_store_addr_ceiling: 0,
             max_stores: super::scale::NetworkScale::Bootstrap.max_stores_per_minute(),
+            trimmed_at: None,
+            trim_interval: TRIM_INTERVAL,
         }
     }
 
@@ -280,7 +301,10 @@ impl DhtProtection {
     /// Charges on success, so a caller must call this exactly once per frame
     /// and pass only frames it admitted to [`Self::allow_typed`].
     pub fn allow_frame(&mut self, ip: IpAddr) -> bool {
-        let now = Instant::now();
+        self.allow_frame_at(ip, Instant::now())
+    }
+
+    fn allow_frame_at(&mut self, ip: IpAddr, now: Instant) -> bool {
         self.maybe_trim(now);
 
         if self.msg_counters.len() >= MAX_IP_ENTRIES && !self.msg_counters.contains_key(&ip) {
@@ -320,8 +344,17 @@ impl DhtProtection {
         sender_id: Option<[u8; 16]>,
         store_records: u32,
     ) -> bool {
-        let now = Instant::now();
+        self.allow_typed_at(ip, msg_type, sender_id, store_records, Instant::now())
+    }
 
+    fn allow_typed_at(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+        now: Instant,
+    ) -> bool {
         if matches!(
             msg_type,
             MSG_STORE_RECORD | MSG_PROXY_STORE | MSG_STORE_BATCH
@@ -501,21 +534,33 @@ impl DhtProtection {
     }
 
     fn maybe_trim(&mut self, now: Instant) {
-        if self.msg_counters.len() > MAX_IP_ENTRIES / 2 {
+        let due = self
+            .trimmed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= self.trim_interval);
+        let wants = |len: usize| len > MAX_IP_ENTRIES / 2 && (due || len >= TRIM_EVERY_FRAME_AT);
+        let (msg, store, lookup) = (
+            wants(self.msg_counters.len()),
+            wants(self.store_counters.len()),
+            wants(self.lookup_counters.len()),
+        );
+        if due && (msg || store || lookup) {
+            self.trimmed_at = Some(now);
+        }
+        if msg {
             self.msg_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
                     .unwrap_or(false)
             });
         }
-        if self.store_counters.len() > MAX_IP_ENTRIES / 2 {
+        if store {
             self.store_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < STORE_WINDOW * 2)
                     .unwrap_or(false)
             });
         }
-        if self.lookup_counters.len() > MAX_IP_ENTRIES / 2 {
+        if lookup {
             self.lookup_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < LOOKUP_WINDOW * 2)
@@ -873,5 +918,118 @@ mod tests {
         // A full window of silence resets cleanly.
         let t2 = t1 + window * 2;
         assert!(c.allow(t2, window, limit));
+    }
+
+    /// The idle-entry sweep runs on an interval rather than on every frame once
+    /// a map is past half full. Every admission decision and every counter has
+    /// to come out exactly as a sweep on every frame would leave them — in
+    /// particular the capacity refusals, which are the only place the entries
+    /// the interval leaves behind could show.
+    #[test]
+    fn sweeping_on_an_interval_decides_exactly_as_sweeping_every_frame() {
+        let mut every_frame = DhtProtection::new();
+        every_frame.trim_interval = Duration::ZERO;
+        let mut interval = DhtProtection::new();
+
+        let ip = |n: u32| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n));
+        let t0 = Instant::now();
+        // Idle in every map from the first frame on.
+        let idle_since = t0;
+        let mut now = t0 + STORE_WINDOW * 3;
+        let counter = |start: Instant| WindowCounter {
+            count: 3,
+            previous: 2,
+            window_start: Some(start),
+        };
+        let fill = |p: &mut DhtProtection, first: u32, n: u32, start: Instant| {
+            for i in first..first + n {
+                p.msg_counters.insert(ip(i), counter(start));
+                p.store_counters
+                    .insert(StoreBudgetKey::Addr(ip(i)), counter(start));
+                p.lookup_counters
+                    .insert(StoreBudgetKey::Addr(ip(i)), counter(start));
+            }
+        };
+        // Busy addresses just short of the cap under a layer of idle ones that
+        // leaves each map short of sweeping on every frame, so new addresses
+        // soon hit the capacity refusals.
+        const BUSY: u32 = MAX_IP_ENTRIES as u32 - 30;
+        for p in [&mut every_frame, &mut interval] {
+            fill(p, 0, BUSY, now);
+            fill(p, BUSY, 20, idle_since);
+        }
+
+        let mut seed = 0xA076_1D64_78BD_642Fu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let types = [MSG_PING, MSG_STORE_RECORD, MSG_STORE_BATCH, MSG_FIND_NODE, MSG_FIND_VALUE];
+        let mut skipped_a_sweep = false;
+        for frame in 0..3_000u32 {
+            now += Duration::from_millis(30);
+            match frame {
+                // Idle entries enough to pass half the cap: only the interval
+                // sweeps them.
+                1_000 => {
+                    for p in [&mut every_frame, &mut interval] {
+                        fill(p, 20_000, 6_000, idle_since);
+                    }
+                }
+                // And the cap again, from a fresh set of busy addresses.
+                2_000 => {
+                    for p in [&mut every_frame, &mut interval] {
+                        fill(p, 40_000, BUSY, now);
+                        fill(p, 40_000 + BUSY, 20, idle_since);
+                    }
+                }
+                _ => {}
+            }
+            let r = next();
+            let busy_base = if frame < 2_000 { 0 } else { 40_000 };
+            let from = if r.is_multiple_of(3) {
+                ip(busy_base + (r >> 8) as u32 % BUSY)
+            } else {
+                ip(60_000 + (r >> 8) as u32 % 300)
+            };
+            let msg_type = types[(r >> 40) as usize % types.len()];
+            let sender = match (r >> 48) % 4 {
+                0 => None,
+                n => Some([n as u8 ^ (r >> 56) as u8; 16]),
+            };
+            let records = 1 + (r >> 20) as u32 % 4;
+
+            let a = every_frame.allow_frame_at(from, now)
+                && every_frame.allow_typed_at(from, msg_type, sender, records, now);
+            let b = interval.allow_frame_at(from, now)
+                && interval.allow_typed_at(from, msg_type, sender, records, now);
+            assert_eq!(a, b, "frame {frame}");
+            assert_eq!(
+                every_frame.dropped_rate_limited(),
+                interval.dropped_rate_limited(),
+                "frame {frame}"
+            );
+            assert_eq!(
+                every_frame.dropped_store_addr_ceiling(),
+                interval.dropped_store_addr_ceiling(),
+                "frame {frame}"
+            );
+            skipped_a_sweep |= interval.msg_counters.len() > every_frame.msg_counters.len();
+            // What the interval leaves behind never takes a map past the cap.
+            for (held, swept) in [
+                (interval.msg_counters.len(), every_frame.msg_counters.len()),
+                (interval.store_counters.len(), every_frame.store_counters.len()),
+                (interval.lookup_counters.len(), every_frame.lookup_counters.len()),
+            ] {
+                assert!(held <= swept.max(MAX_IP_ENTRIES), "frame {frame}: {held} vs {swept}");
+            }
+        }
+        assert!(skipped_a_sweep, "the interval has to have left idle entries in place");
+        assert!(
+            every_frame.dropped_rate_limited() > 0,
+            "the maps have to reach their cap for the comparison to mean anything"
+        );
     }
 }

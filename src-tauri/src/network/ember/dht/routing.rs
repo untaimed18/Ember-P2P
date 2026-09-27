@@ -57,6 +57,66 @@ impl Bucket {
     }
 }
 
+/// What the per-frame paths ask of the bucket residents, kept current so they
+/// do not walk the table.
+///
+/// Covers `Bucket::contacts` only, never a replacement cache. Every path that
+/// moves a contact into or out of a bucket, or changes a resident's address or
+/// verified state, has to report it here.
+#[derive(Default)]
+struct ResidentIndex {
+    /// Residents that are [`EmberContact::is_verified`].
+    verified: usize,
+    /// Residents by address. Several node IDs can claim one address, in no
+    /// particular order.
+    by_addr: HashMap<SocketAddr, Vec<EmberNodeId>>,
+}
+
+impl ResidentIndex {
+    fn insert(&mut self, contact: &EmberContact) {
+        if contact.is_verified() {
+            self.verified += 1;
+        }
+        self.by_addr
+            .entry(contact.addr)
+            .or_default()
+            .push(contact.node_id);
+    }
+
+    fn remove(&mut self, contact: &EmberContact) {
+        if contact.is_verified() {
+            self.verified = self.verified.saturating_sub(1);
+        }
+        self.unlink(contact.node_id, contact.addr);
+    }
+
+    fn restamp(&mut self, was_verified: bool, is_verified: bool) {
+        match (was_verified, is_verified) {
+            (false, true) => self.verified += 1,
+            (true, false) => self.verified = self.verified.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn readdress(&mut self, node_id: EmberNodeId, from: SocketAddr, to: SocketAddr) {
+        if from != to {
+            self.unlink(node_id, from);
+            self.by_addr.entry(to).or_default().push(node_id);
+        }
+    }
+
+    fn unlink(&mut self, node_id: EmberNodeId, addr: SocketAddr) {
+        if let Some(ids) = self.by_addr.get_mut(&addr) {
+            if let Some(i) = ids.iter().position(|id| *id == node_id) {
+                ids.swap_remove(i);
+            }
+            if ids.is_empty() {
+                self.by_addr.remove(&addr);
+            }
+        }
+    }
+}
+
 /// Result of attempting to add a contact to the routing table.
 pub enum AddResult {
     /// Contact was added or updated.
@@ -95,6 +155,23 @@ fn judgeable_ip(addr: &SocketAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Cut `entries` — `(distance, scan position, contact)` — down to the `count`
+/// nearest, nearest first.
+///
+/// The scan position breaks distance ties, so the result is exactly a stable
+/// sort by distance followed by `take(count)`, without sorting what is dropped.
+fn keep_nearest<T>(entries: &mut Vec<([u8; 16], usize, T)>, count: usize) {
+    if count == 0 {
+        entries.clear();
+        return;
+    }
+    if entries.len() > count {
+        entries.select_nth_unstable_by_key(count - 1, |e| (e.0, e.1));
+        entries.truncate(count);
+    }
+    entries.sort_unstable_by_key(|e| (e.0, e.1));
+}
+
 /// Ember DHT routing table: 128 buckets indexed by XOR distance bit position.
 pub struct RoutingTable {
     local_id: EmberNodeId,
@@ -116,6 +193,7 @@ pub struct RoutingTable {
     /// hovering near a boundary from demoting and re-admitting the same
     /// contacts forever.
     enforced_scale: scale::NetworkScale,
+    residents: ResidentIndex,
 }
 
 impl RoutingTable {
@@ -131,6 +209,7 @@ impl RoutingTable {
             global_ip_count: HashMap::new(),
             ip_gate: dht_common::IpAdmissionGate::new(block_private_ips),
             enforced_scale: scale::NetworkScale::Bootstrap,
+            residents: ResidentIndex::default(),
         }
     }
 
@@ -307,6 +386,7 @@ impl RoutingTable {
             let contact = self.buckets[idx].contacts.remove(pos).unwrap();
             self.release_subnet(contact.subnet_key());
             self.release_ip(contact.addr.ip());
+            self.residents.remove(&contact);
             self.add_to_cache(idx, contact, target);
             moved.push((idx, node_id));
         }
@@ -458,13 +538,19 @@ impl RoutingTable {
                 bucket.last_activity = now;
                 clamped += 1;
             }
-            for c in bucket
+            let resident_len = bucket.contacts.len();
+            for (i, c) in bucket
                 .contacts
                 .iter_mut()
                 .chain(bucket.replacement_cache.iter_mut())
+                .enumerate()
             {
                 if c.last_seen > limit {
+                    let was_verified = c.is_verified();
                     c.last_seen = now;
+                    if i < resident_len {
+                        self.residents.restamp(was_verified, c.is_verified());
+                    }
                     clamped += 1;
                 }
             }
@@ -529,18 +615,11 @@ impl RoutingTable {
         let mut promoted = 0;
         let now = chrono::Utc::now().timestamp();
         for idx in 0..self.buckets.len() {
-            // `scale()` walks the whole table, so do not pay for it on the
-            // 128 buckets that have nothing parked — which is all of them in
-            // steady state.
             if self.buckets[idx].replacement_cache.is_empty() {
                 continue;
             }
-            // Read once per bucket rather than once per promotion. This is a
-            // full 128-bucket walk, and paying it per promotion mattered
-            // precisely when it hurt most: right after `evict_filtered_contacts`
-            // fires on an `ipfilter.dat` load, many buckets have parked leads
-            // and free slots at once, so a single call could mean thousands of
-            // whole-table walks on the task that also drains the UDP socket.
+            // Read once per bucket rather than once per promotion, so a
+            // bucket's whole batch is judged under one tier.
             // The tier can only tighten as verified contacts are promoted, and
             // only refuses admissions, so at worst one bucket's batch is
             // admitted a tier late — bounded, and re-evaluated on the next call.
@@ -561,6 +640,7 @@ impl RoutingTable {
                     .entry(contact.subnet_key())
                     .or_insert(0) += 1;
                 *self.global_ip_count.entry(contact.addr.ip()).or_insert(0) += 1;
+                self.residents.insert(&contact);
                 self.buckets[idx].contacts.push_back(contact);
                 promoted += 1;
                 filled = true;
@@ -620,11 +700,8 @@ impl RoutingTable {
         }
 
         // Diversity limits scale with how much of the network we can see, so
-        // read them once before borrowing a bucket. Carried into
-        // `add_to_cache` rather than recomputed there: `scale()` walks all 128
-        // buckets, and `merge_gossip_contacts` runs this whole path once per
-        // contact in a FOUND_NODE — most of which land in the cache on a warm
-        // table, so recomputing doubled the walks for a frame.
+        // read them once before borrowing a bucket and carry them into
+        // `add_to_cache`.
         //
         // The enforced tier floors this so a pruned table cannot re-admit
         // through the front door what `enforce_scale_quotas` just demoted —
@@ -756,6 +833,8 @@ impl RoutingTable {
                     bucket
                         .replacement_cache
                         .retain(|c| c.node_id != contact.node_id);
+                    self.residents.remove(&evicted);
+                    self.residents.insert(&contact);
                     bucket.contacts.push_back(contact);
                     bucket.last_activity = chrono::Utc::now().timestamp();
                     self.release_subnet(evicted.subnet_key());
@@ -814,6 +893,7 @@ impl RoutingTable {
             bucket
                 .replacement_cache
                 .retain(|c| c.node_id != contact.node_id);
+            self.residents.insert(&contact);
             bucket.contacts.push_back(contact);
             bucket.last_activity = chrono::Utc::now().timestamp();
             *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
@@ -835,6 +915,8 @@ impl RoutingTable {
                 bucket
                     .replacement_cache
                     .retain(|c| c.node_id != contact.node_id);
+                self.residents.remove(&evicted);
+                self.residents.insert(&contact);
                 bucket.contacts.push_back(contact);
                 bucket.last_activity = chrono::Utc::now().timestamp();
                 self.release_subnet(evicted.subnet_key());
@@ -903,6 +985,7 @@ impl RoutingTable {
 
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
+        let (old_addr, was_verified) = (existing.addr, existing.is_verified());
         if contact.addr != existing.addr {
             if !admit_new_addr {
                 // Refused move: keep the entry exactly as it stands. It used to
@@ -958,6 +1041,8 @@ impl RoutingTable {
         existing.ed25519_pub = contact.ed25519_pub;
         existing.last_seen = contact.last_seen;
         existing.failed_queries = 0;
+        self.residents.readdress(existing.node_id, old_addr, existing.addr);
+        self.residents.restamp(was_verified, existing.is_verified());
         let bucket = &mut self.buckets[bucket_idx];
         bucket.contacts.push_back(existing);
         bucket.last_activity = contact.last_seen;
@@ -1060,6 +1145,7 @@ impl RoutingTable {
         let removed = bucket.contacts.remove(pos).unwrap();
         self.release_subnet(removed.subnet_key());
         self.release_ip(removed.addr.ip());
+        self.residents.remove(&removed);
 
         // Promote the best replacement-cache entry that still satisfies the
         // diversity limits. Blindly promoting the newest entry (the original
@@ -1086,6 +1172,7 @@ impl RoutingTable {
                     "Evicted dead contact {}, replaced with {}",
                     removed.node_id, replacement.node_id
                 );
+                self.residents.insert(&replacement);
                 self.buckets[bucket_idx].contacts.push_back(replacement);
                 // Same reason `promote_cached_contacts` stamps it: a bucket
                 // whose contents just changed is not idle, and leaving it at
@@ -1122,6 +1209,7 @@ impl RoutingTable {
         let removed = bucket.contacts.remove(pos).unwrap();
         self.release_subnet(removed.subnet_key());
         self.release_ip(removed.addr.ip());
+        self.residents.remove(&removed);
         true
     }
 
@@ -1177,8 +1265,10 @@ impl RoutingTable {
             // could still be picked as the "oldest" eviction candidate.
             let mut contact = bucket.contacts.remove(pos).unwrap();
             let now = chrono::Utc::now().timestamp();
+            let was_verified = contact.is_verified();
             contact.last_seen = now;
             contact.failed_queries = 0;
+            self.residents.restamp(was_verified, contact.is_verified());
             bucket.contacts.push_back(contact);
             bucket.last_activity = now;
         }
@@ -1219,6 +1309,39 @@ impl RoutingTable {
         // identity happened to be filed first. A verified entry is one we have
         // exchanged signed frames with at that address, so it is the one the
         // datagram actually belongs to.
+        //
+        // Within each rank the first in table order wins: lowest bucket, then
+        // position in it.
+        let found = self
+            .residents
+            .by_addr
+            .get(&addr)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let idx = self.local_id.bucket_index(id)?;
+                let bucket = self.buckets.get(idx)?;
+                let pos = bucket.find(id)?;
+                let contact = &bucket.contacts[pos];
+                Some(((!contact.is_verified(), idx, pos), contact))
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, contact)| contact);
+        #[cfg(test)]
+        assert!(
+            std::ptr::eq(
+                found.map_or(std::ptr::null(), |c| c as *const EmberContact),
+                self.contact_at_by_scan(addr)
+                    .map_or(std::ptr::null(), |c| c as *const EmberContact),
+            ),
+            "the address index disagrees with a table scan for {addr}"
+        );
+        found
+    }
+
+    /// [`Self::contact_at`] by walking every bucket, which the index must match.
+    #[cfg(test)]
+    fn contact_at_by_scan(&self, addr: SocketAddr) -> Option<&EmberContact> {
         let mut fallback = None;
         for contact in self.buckets.iter().flat_map(|b| b.contacts.iter()) {
             if contact.addr != addr {
@@ -1234,11 +1357,38 @@ impl RoutingTable {
 
     /// How many contacts we have actually heard from.
     pub fn verified_len(&self) -> usize {
+        #[cfg(test)]
+        assert_eq!(
+            self.residents.verified,
+            self.verified_len_by_scan(),
+            "the verified count drifted from the table"
+        );
+        self.residents.verified
+    }
+
+    /// [`Self::verified_len`] by walking every bucket, which the count must match.
+    #[cfg(test)]
+    fn verified_len_by_scan(&self) -> usize {
         self.buckets
             .iter()
             .flat_map(|b| b.contacts.iter())
             .filter(|c| c.is_verified())
             .count()
+    }
+
+    /// Panics unless the resident index describes exactly the bucket contents.
+    #[cfg(test)]
+    fn assert_residents_indexed(&self) {
+        assert_eq!(self.residents.verified, self.verified_len_by_scan());
+        let mut expected: HashMap<SocketAddr, Vec<EmberNodeId>> = HashMap::new();
+        for c in self.buckets.iter().flat_map(|b| b.contacts.iter()) {
+            expected.entry(c.addr).or_default().push(c.node_id);
+        }
+        let mut indexed = self.residents.by_addr.clone();
+        for ids in expected.values_mut().chain(indexed.values_mut()) {
+            ids.sort_unstable_by_key(|id| id.0);
+        }
+        assert_eq!(indexed, expected, "the address index drifted from the table");
     }
 
     /// Rough size of the whole network, from the density of the neighbourhood
@@ -1327,15 +1477,15 @@ impl RoutingTable {
         if count == 0 {
             return Vec::new();
         }
-        let mut verified: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
-        let mut leads: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        let mut verified: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
+        let mut leads: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
-                let entry = (target.distance(&contact.node_id), contact);
+                let dist = target.distance(&contact.node_id).0;
                 if contact.is_verified() {
-                    verified.push(entry);
+                    verified.push((dist, verified.len(), contact));
                 } else {
-                    leads.push(entry);
+                    leads.push((dist, leads.len(), contact));
                 }
             }
         }
@@ -1351,20 +1501,11 @@ impl RoutingTable {
         // `store_proximity_ok` on the storer side is strictly distance-based. A
         // non-zero `failed_queries` is normal mid-refresh anyway (see
         // `remove_stale`), and three strikes evicts outright.
-        verified.sort_by_key(|a| a.0 .0);
-        let mut out: Vec<EmberContact> = verified
-            .into_iter()
-            .take(count)
-            .map(|(_, c)| c.clone())
-            .collect();
+        keep_nearest(&mut verified, count);
+        let mut out: Vec<EmberContact> = verified.into_iter().map(|(_, _, c)| c.clone()).collect();
         if out.len() < count {
-            leads.sort_by_key(|a| a.0 .0);
-            out.extend(
-                leads
-                    .into_iter()
-                    .take(count - out.len())
-                    .map(|(_, c)| c.clone()),
-            );
+            keep_nearest(&mut leads, count - out.len());
+            out.extend(leads.into_iter().map(|(_, _, c)| c.clone()));
         }
         out
     }
@@ -1384,23 +1525,20 @@ impl RoutingTable {
     /// [`Self::find_closest_prefer_verified`] instead.
     pub fn find_closest(&self, target: &EmberNodeId, count: usize) -> Vec<EmberContact> {
         let verified_only = self.verified_len() > 0;
-        let mut all: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        let mut all: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
 
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
                 if verified_only && !contact.is_verified() {
                     continue;
                 }
-                let dist = target.distance(&contact.node_id);
-                all.push((dist, contact));
+                let dist = target.distance(&contact.node_id).0;
+                all.push((dist, all.len(), contact));
             }
         }
 
-        all.sort_by_key(|a| a.0 .0);
-        all.into_iter()
-            .take(count)
-            .map(|(_, c)| c.clone())
-            .collect()
+        keep_nearest(&mut all, count);
+        all.into_iter().map(|(_, _, c)| c.clone()).collect()
     }
 
     /// The distance of the `k`th closest contact to `target`, or `None` when
@@ -1409,25 +1547,20 @@ impl RoutingTable {
     /// Exactly the number [`Self::find_closest`] puts last in a `k`-long result,
     /// under the same verified-only rule — the proximity gate reads nothing else
     /// out of that call, and a `STORE_BATCH` asks it once per record. Going
-    /// through `find_closest` therefore cost a table scan, a full sort and `k`
+    /// through `find_closest` would cost a table scan, a selection and `k`
     /// [`EmberContact`] clones per record, up to sixty-four times for one
     /// datagram, for a value the caller compares and drops.
     ///
     /// A bounded max-heap of `k` distances answers the same question in one pass
     /// with no clone and no sort: the largest of the `k` smallest is the root
     /// once every contact has been offered. Contacts at equal distance can swap
-    /// places against the stable sort `find_closest` uses, which is invisible
-    /// here because only the distance leaves this function.
+    /// places against the scan-order tie-break `find_closest` uses, which is
+    /// invisible here because only the distance leaves this function.
     pub fn kth_closest_distance(&self, target: &EmberNodeId, k: usize) -> Option<EmberNodeId> {
         if k == 0 {
             return None;
         }
-        // `verified_len() > 0` with the count dropped: the gate is a boolean and
-        // the first verified contact settles it.
-        let verified_only = self
-            .buckets
-            .iter()
-            .any(|b| b.contacts.iter().any(|c| c.is_verified()));
+        let verified_only = self.verified_len() > 0;
 
         let mut furthest: BinaryHeap<[u8; 16]> = BinaryHeap::with_capacity(k);
         for bucket in &self.buckets {
@@ -3732,5 +3865,263 @@ mod tests {
         assert_eq!(rt.evict_filtered_contacts(), 1);
         assert!(rt.get_contact(&make_id(1)).is_none());
         assert!(rt.get_contact(&make_id(2)).is_some());
+    }
+
+    /// Deterministic xorshift, so a failing sequence replays exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Ids spread over the eight furthest buckets, fifty per bucket, so buckets
+    /// fill and spill into their replacement caches.
+    fn fuzz_id(n: u64) -> EmberNodeId {
+        let mut id = [0u8; 16];
+        id[0] = 1 << (n % 8);
+        id[1] = (n / 8) as u8;
+        id[2] = 0x5A;
+        EmberNodeId(id)
+    }
+
+    /// A small address pool, so node ids collide on addresses and /24s and
+    /// some addresses are private.
+    fn fuzz_addrs() -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for a in 0..96u8 {
+            let ip = if a.is_multiple_of(17) {
+                Ipv4Addr::new(192, 168, 1, a)
+            } else {
+                Ipv4Addr::new(80 + a % 5, (a / 5) % 8, 1, a)
+            };
+            for port in [4672, 4673] {
+                addrs.push(SocketAddr::new(IpAddr::V4(ip), port));
+            }
+        }
+        addrs
+    }
+
+    fn fuzz_contact(rng: &mut Rng, addrs: &[SocketAddr], now: i64) -> EmberContact {
+        let n = rng.below(400);
+        let last_seen = match rng.below(20) {
+            0..=7 => 0,
+            8 => now + 100_000,
+            _ => now - rng.below(120) as i64,
+        };
+        let noise = (n as u8) ^ u8::from(rng.below(6) == 0);
+        EmberContact {
+            node_id: fuzz_id(n),
+            addr: addrs[rng.below(addrs.len() as u64) as usize],
+            noise_pub: [noise; 32],
+            ed25519_pub: [n as u8; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    }
+
+    /// The verified count and the address index are maintained by hand on every
+    /// path that touches a bucket, so drive every such path in a long random
+    /// sequence and compare both against a recount after each step.
+    /// `verified_len` and `contact_at` also check themselves against a scan in
+    /// test builds, which covers every other test in the crate.
+    #[test]
+    fn the_resident_index_matches_a_recount_after_every_mutation() {
+        let addrs = fuzz_addrs();
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 7] {
+            let mut rng = Rng(seed);
+            let mut rt = RoutingTable::new(make_id(0), false);
+            let mut block_private = false;
+            let mut max_verified = 0;
+            let mut saw_shared_addr = false;
+            let mut saw_cache = false;
+            for step in 0..4000 {
+                let now = chrono::Utc::now().timestamp();
+                let residents = rt.all_contacts();
+                let pick = |rng: &mut Rng| -> Option<EmberContact> {
+                    (!residents.is_empty())
+                        .then(|| residents[rng.below(residents.len() as u64) as usize].clone())
+                };
+                match rng.below(100) {
+                    0..=44 => {
+                        rt.add_contact(fuzz_contact(&mut rng, &addrs, now));
+                    }
+                    45..=54 => {
+                        if let Some(c) = pick(&mut rng) {
+                            let addr = if rng.below(4) == 0 {
+                                addrs[rng.below(addrs.len() as u64) as usize]
+                            } else {
+                                c.addr
+                            };
+                            rt.mark_alive(&c.node_id, addr, &c.noise_pub);
+                        }
+                    }
+                    55..=59 => {
+                        if let Some(c) = pick(&mut rng) {
+                            if rt.mark_failed(&c.node_id) {
+                                rt.evict_and_replace(&c.node_id);
+                            }
+                        }
+                    }
+                    60..=64 => {
+                        rt.evict_and_replace(&fuzz_id(rng.below(400)));
+                    }
+                    65..=69 => {
+                        rt.remove_contact(&fuzz_id(rng.below(400)));
+                    }
+                    70..=74 => {
+                        let age = [60, 600, 3600, i64::MAX][rng.below(4) as usize];
+                        let in_use: HashSet<EmberNodeId> =
+                            residents.iter().take(3).map(|c| c.node_id).collect();
+                        rt.remove_stale(now, age, &in_use);
+                    }
+                    75..=77 => {
+                        // Now and then a clock that reads before the epoch,
+                        // which un-verifies whatever it pulls back.
+                        let at = if rng.below(10) == 0 { -100 } else { now };
+                        rt.clamp_future_timestamps(at);
+                    }
+                    78..=82 => {
+                        rt.enforce_scale_quotas();
+                    }
+                    83..=87 => {
+                        rt.promote_cached_contacts();
+                    }
+                    88..=90 => {
+                        block_private = !block_private;
+                        rt.set_block_private_ips(block_private);
+                    }
+                    _ => {
+                        let batch = (0..3)
+                            .map(|_| fuzz_contact(&mut rng, &addrs, now))
+                            .collect();
+                        rt.load_contacts(batch);
+                    }
+                }
+
+                rt.assert_residents_indexed();
+                if step % 8 == 0 {
+                    for addr in &addrs {
+                        let claimants = rt.residents.by_addr.get(addr).map_or(0, Vec::len);
+                        let found = rt.contact_at(*addr);
+                        saw_shared_addr |= claimants > 1 && found.is_some();
+                    }
+                }
+                max_verified = max_verified.max(rt.verified_len());
+                saw_cache |= rt.cached_len() > 0;
+            }
+            assert!(
+                max_verified >= 40,
+                "the sequence has to build a real table, reached {max_verified}"
+            );
+            assert!(saw_shared_addr, "and has to put several ids on one address");
+            assert!(saw_cache, "and has to spill into the replacement caches");
+        }
+    }
+
+    /// Several node ids claiming one address: the verified one wins, and among
+    /// equals the first in bucket order does, however the index stores them.
+    #[test]
+    fn contact_at_keeps_its_winner_among_several_claimants() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let shared = SocketAddr::from(([80, 7, 7, 7], 4672));
+        fn claimant(rt: &mut RoutingTable, addr: SocketAddr, first: u8, last_seen: i64) -> EmberNodeId {
+            let mut id = [0u8; 16];
+            id[0] = first;
+            let c = EmberContact {
+                node_id: EmberNodeId(id),
+                addr,
+                noise_pub: [first; 32],
+                ed25519_pub: [first; 32],
+                last_seen,
+                failed_queries: 0,
+            };
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            EmberNodeId(id)
+        }
+        let far_lead = claimant(&mut rt, shared, 0x80, 0);
+        let near_lead = claimant(&mut rt, shared, 0x01, 0);
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, near_lead);
+
+        let far_verified = claimant(&mut rt, shared, 0x40, chrono::Utc::now().timestamp());
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, far_verified);
+
+        assert!(rt.remove_contact(&far_verified));
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, near_lead);
+        assert!(rt.remove_contact(&near_lead));
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, far_lead);
+        assert!(rt.remove_contact(&far_lead));
+        assert!(rt.contact_at(shared).is_none());
+        rt.assert_residents_indexed();
+    }
+
+    /// `find_closest` and `find_closest_prefer_verified` select rather than
+    /// sort the whole table; the answer has to be exactly what a stable sort
+    /// by distance gives.
+    #[test]
+    fn bounded_selection_matches_a_full_stable_sort() {
+        fn by_sort(mut v: Vec<(EmberNodeId, EmberContact)>, count: usize) -> Vec<EmberNodeId> {
+            v.sort_by_key(|a| a.0 .0);
+            v.into_iter().take(count).map(|(_, c)| c.node_id).collect()
+        }
+        let ids = |v: Vec<EmberContact>| v.into_iter().map(|c| c.node_id).collect::<Vec<_>>();
+
+        let addrs = fuzz_addrs();
+        for (seed, lead_only) in [(11u64, false), (12, false), (13, true)] {
+            let mut rng = Rng(seed);
+            let mut rt = RoutingTable::new(make_id(0), false);
+            let now = chrono::Utc::now().timestamp();
+            for _ in 0..600 {
+                let mut c = fuzz_contact(&mut rng, &addrs, now);
+                if lead_only {
+                    c.last_seen = 0;
+                }
+                rt.add_contact(c);
+            }
+            let all = rt.all_contacts();
+            assert!(all.len() > K_BUCKET_SIZE);
+            assert_eq!(rt.verified_len() == 0, lead_only);
+
+            for _ in 0..24 {
+                let mut raw = [0u8; 16];
+                for b in raw.iter_mut() {
+                    *b = rng.next() as u8;
+                }
+                let target = EmberNodeId(raw);
+                let tagged = |keep: &dyn Fn(&EmberContact) -> bool| {
+                    all.iter()
+                        .filter(|c| keep(c))
+                        .map(|c| (target.distance(&c.node_id), c.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let verified_only = rt.verified_len() > 0;
+                for count in (0..=K_BUCKET_SIZE + 2).chain([all.len() - 1, all.len() + 5]) {
+                    assert_eq!(
+                        ids(rt.find_closest(&target, count)),
+                        by_sort(tagged(&|c| !verified_only || c.is_verified()), count),
+                        "find_closest, count {count}"
+                    );
+                    let mut expected = by_sort(tagged(&|c| c.is_verified()), count);
+                    if expected.len() < count {
+                        let room = count - expected.len();
+                        expected.extend(by_sort(tagged(&|c| !c.is_verified()), room));
+                    }
+                    assert_eq!(
+                        ids(rt.find_closest_prefer_verified(&target, count)),
+                        expected,
+                        "find_closest_prefer_verified, count {count}"
+                    );
+                }
+            }
+        }
     }
 }

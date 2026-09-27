@@ -1573,25 +1573,72 @@ mod friend_transfer_tests {
     fn ember_udp_fail_closed_still_admits_known_peers() {
         // Strangers wait until ipfilter.dat is applied.
         assert!(!ember_udp_ip_filter_allows(
-            false, true, false, false, false
+            false, true, || false, false, || false
         ));
         // Restored / just-dialled contacts must get their pongs through.
         assert!(ember_udp_ip_filter_allows(
-            false, true, true, false, false
+            false, true, || true, false, || false
         ));
         assert!(ember_udp_ip_filter_allows(
-            false, true, false, false, true
+            false, true, || false, false, || true
         ));
         // After the list is ready, a real block is LAN-session only.
         assert!(!ember_udp_ip_filter_allows(
-            true, false, true, false, false
+            true, false, || true, false, || false
         ));
         assert!(ember_udp_ip_filter_allows(
-            true, false, true, true, true
+            true, false, || true, true, || true
         ));
         assert!(ember_udp_ip_filter_allows(
-            false, false, false, false, false
+            false, false, || false, false, || false
         ));
+    }
+
+    /// The peer predicates are lazy, and being lazy changes no verdict: every
+    /// input gives the answer the eager form gave, and a predicate is asked
+    /// only when that answer depends on it.
+    #[test]
+    fn ember_udp_ip_filter_asks_peer_predicates_only_when_they_decide() {
+        let eager = |blocked: bool, fail_closed: bool, known: bool, lan: bool, introduced: bool| {
+            if fail_closed {
+                known || introduced
+            } else if blocked {
+                lan && introduced
+            } else {
+                true
+            }
+        };
+        for bits in 0..32u8 {
+            let [blocked, fail_closed, known, lan, introduced] =
+                [0, 1, 2, 3, 4].map(|bit| bits & (1 << bit) != 0);
+            let known_asked = std::cell::Cell::new(false);
+            let introduced_asked = std::cell::Cell::new(false);
+            let verdict = ember_udp_ip_filter_allows(
+                blocked,
+                fail_closed,
+                || {
+                    known_asked.set(true);
+                    known
+                },
+                lan,
+                || {
+                    introduced_asked.set(true);
+                    introduced
+                },
+            );
+            assert_eq!(
+                verdict,
+                eager(blocked, fail_closed, known, lan, introduced),
+                "blocked={blocked} fail_closed={fail_closed} known={known} lan={lan} introduced={introduced}"
+            );
+            assert_eq!(known_asked.get(), fail_closed, "known_peer asked only while failing closed");
+            assert_eq!(
+                introduced_asked.get(),
+                (fail_closed && !known) || (!fail_closed && blocked && lan),
+                "session_introduced asked only when it decides \
+                 (blocked={blocked} fail_closed={fail_closed} known={known} lan={lan})"
+            );
+        }
     }
 
     /// Every precondition a punch needs, each removed in turn. With relay

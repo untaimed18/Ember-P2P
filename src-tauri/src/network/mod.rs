@@ -22,6 +22,7 @@ pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;
 mod health;
+mod host_port_map;
 pub mod kad;
 mod kad_io;
 mod kad_search;
@@ -107,6 +108,7 @@ use self::browse::{
     remove_browse_requests_for_session, send_browse_response_to_origin, PendingBrowseRequests,
 };
 use self::command::handle_command;
+use self::host_port_map::HostPortMap;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,
     EmberProxyBuddyPacer, EmberPublishAttempts, EmberPublishKind, EmberPublishPassStats, EmberRecordRef,
@@ -884,10 +886,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         },
         ember_payload_dirty: true,
         ember_udp_payload: Arc::new(Vec::new()),
-        known_ember_peers: HashMap::new(),
+        known_ember_peers: HostPortMap::new(),
         ember_noise_keys: HashMap::new(),
-        ember_keyless_peers: HashMap::new(),
-        ember_session_dht_contacts: HashMap::new(),
+        ember_keyless_peers: HostPortMap::new(),
+        ember_session_dht_contacts: HostPortMap::new(),
         ember_rendezvous_published_at: 0,
         ember_rendezvous_search: None,
         ember_rendezvous_looked_up_at: 0,

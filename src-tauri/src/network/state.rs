@@ -683,7 +683,7 @@ pub(super) struct NetworkState {
     /// growth on long-running sessions. The wire cap is much smaller
     /// (`ember::MAX_EPX_PEERS = 50`); the in-memory headroom exists so we
     /// can rotate which subset gets advertised across rebuilds.
-    pub(super) known_ember_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    pub(super) known_ember_peers: HostPortMap<std::time::Instant>,
     /// `(ip, port) -> (noise_pub, last_seen)` cache populated from KAD
     /// source publishes that carry `kad::publish::EMBER_NOISE_PUB_TAG`.
     /// Lets `ember_ping_peer` (and future Ember-native callers) dial a
@@ -703,7 +703,7 @@ pub(super) struct NetworkState {
     /// trip. That is what lets a KAD-less client still join the DHT. Keyed by
     /// UDP port because the Noise transport rides the shared KAD UDP socket.
     /// Bounded and pruned exactly like `known_ember_peers`.
-    pub(super) ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    pub(super) ember_keyless_peers: HostPortMap<std::time::Instant>,
     /// Signed DHT identity of an eD2K-session Ember peer. Kept even when the
     /// routing table refuses the address (LAN / `block_private_ips`) so
     /// FIND_VALUE can still ask a connected publisher. A contact that has
@@ -712,7 +712,7 @@ pub(super) struct NetworkState {
     /// frames renews its entry without needing a fresh eD2K introduction. A LAN
     /// `PEER_LIST` lead not yet asked (`last_seen == 0`) stays only while an
     /// eD2K introduction for its host is still inside `KNOWN_EMBER_PEER_TTL`.
-    pub(super) ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+    pub(super) ember_session_dht_contacts: HostPortMap<ember::dht::EmberContact>,
     /// Every Ember peer we remember, across restarts — the thing
     /// `nodes_ember.dat` actually holds.
     ///

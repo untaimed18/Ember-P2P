@@ -31,7 +31,7 @@
 //! own table is starved: a node with nothing has to try everything, since
 //! probing junk costs only bandwidth while failing to join costs the overlay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -144,6 +144,10 @@ pub struct GossipReputation {
     /// caller skips a lead it is already pinging — so one entry per lead is
     /// enough.
     pending: HashMap<EmberNodeId, PendingLead>,
+    /// Every `pending` entry with its probe time, ordered by that time, so the
+    /// oldest is found from the front. A pair whose time `pending` no longer
+    /// holds for that lead is a resolved or re-probed lead, and is skipped.
+    pending_order: VecDeque<(EmberNodeId, Instant)>,
 }
 
 impl GossipReputation {
@@ -220,16 +224,14 @@ impl GossipReputation {
         // still to come. Dropping the newest also handed a free pass to
         // whoever filled the map — its later leads escaped being charged.
         if self.pending.len() >= MAX_PENDING_LEADS && !self.pending.contains_key(&lead) {
-            if let Some(oldest) = self
-                .pending
-                .iter()
-                .min_by_key(|(_, p)| p.probed_at)
-                .map(|(id, _)| *id)
-            {
-                self.pending.remove(&oldest);
+            while let Some((oldest, at)) = self.pending_order.pop_front() {
+                if self.pending.get(&oldest).is_some_and(|p| p.probed_at == at) {
+                    self.pending.remove(&oldest);
+                    break;
+                }
             }
         }
-        self.pending.insert(
+        let replaced = self.pending.insert(
             lead,
             PendingLead {
                 introducer,
@@ -237,6 +239,21 @@ impl GossipReputation {
                 probed_at: now,
             },
         );
+        if replaced.is_none_or(|p| p.probed_at != now) {
+            let pos = self.pending_order.partition_point(|(_, at)| *at <= now);
+            self.pending_order.insert(pos, (lead, now));
+        }
+        // Resolved leads leave their pair behind; past twice the cap most of
+        // the queue is such pairs, so dropping them keeps this amortised O(1).
+        if self.pending_order.len() > 2 * MAX_PENDING_LEADS {
+            self.compact_pending_order();
+        }
+    }
+
+    fn compact_pending_order(&mut self) {
+        let pending = &self.pending;
+        self.pending_order
+            .retain(|(lead, at)| pending.get(lead).is_some_and(|p| p.probed_at == *at));
     }
 
     /// `lead` spoke to us from `from`. Credits whoever named it, if anyone
@@ -311,6 +328,7 @@ impl GossipReputation {
                 self.pending.remove(&id);
             }
         }
+        self.compact_pending_order();
     }
 
     #[cfg(test)]
@@ -622,5 +640,93 @@ mod tests {
         rep.prune(then + INTRODUCER_TTL + Duration::from_secs(1));
         assert_eq!(rep.rationed_len(), 0);
         assert!(rep.introducers.is_empty());
+    }
+
+    /// A full pending map sheds its oldest probe from a time-ordered queue
+    /// rather than by scanning. Driven through probes, re-probes, answers,
+    /// silences and prunes, the map has to hold exactly what scanning for the
+    /// minimum would have left — and the queue has to stay bounded.
+    #[test]
+    fn a_full_pending_map_sheds_what_a_scan_for_the_oldest_would() {
+        let mut rep = GossipReputation::new();
+        let mut model: HashMap<EmberNodeId, (EmberNodeId, SocketAddr, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let mut seed = 0xE703_7ED1_A0B4_28DBu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lead = |n: u64| {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&n.to_le_bytes());
+            EmberNodeId(raw)
+        };
+        // Distinct probe times, since a scan breaks ties arbitrarily. Mostly
+        // rising, now and then earlier than the last.
+        let mut used = std::collections::HashSet::new();
+        let mut clock_us = 0u64;
+        let mut shed = 0;
+
+        for step in 0..20_000u64 {
+            let r = next();
+            let n = next() % 3_000;
+            let from = addr((n % 200) as u8);
+            match r % 20 {
+                0..=13 => {
+                    clock_us += 1_000;
+                    let mut us = if r.is_multiple_of(7) {
+                        clock_us.saturating_sub((r >> 8) % 2_000_000)
+                    } else {
+                        clock_us
+                    };
+                    while !used.insert(us) {
+                        us += 1;
+                    }
+                    let now = t0 + Duration::from_micros(us);
+                    let introducer = id((r >> 32) as u8 % 5);
+                    rep.note_probe(introducer, lead(n), from, now);
+                    if model.len() >= MAX_PENDING_LEADS && !model.contains_key(&lead(n)) {
+                        let oldest = *model.iter().min_by_key(|(_, p)| p.2).unwrap().0;
+                        model.remove(&oldest);
+                        shed += 1;
+                    }
+                    model.insert(lead(n), (introducer, from, now));
+                }
+                14..=16 => {
+                    let from = if (r >> 16).is_multiple_of(3) {
+                        addr(((n + 1) % 200) as u8)
+                    } else {
+                        from
+                    };
+                    rep.note_answered(&lead(n), from);
+                    if model.get(&lead(n)).is_some_and(|p| p.1 == from) {
+                        model.remove(&lead(n));
+                    }
+                }
+                17..=18 => {
+                    rep.note_silent(&lead(n));
+                    model.remove(&lead(n));
+                }
+                _ => {
+                    if r % 50 == 19 {
+                        let now = t0 + PENDING_TTL + Duration::from_micros(clock_us / 2);
+                        rep.prune(now);
+                        model.retain(|_, p| now.saturating_duration_since(p.2) < PENDING_TTL);
+                    }
+                }
+            }
+
+            assert_eq!(rep.pending.len(), model.len(), "step {step}");
+            if step.is_multiple_of(100) {
+                for (id, p) in &model {
+                    let held = rep.pending.get(id).expect("the same leads pending");
+                    assert_eq!((held.introducer, held.addr, held.probed_at), *p, "step {step}");
+                }
+            }
+            assert!(rep.pending_order.len() <= 2 * MAX_PENDING_LEADS);
+        }
+        assert!(shed > 1_000, "the cap has to bind, and often: {shed}");
     }
 }

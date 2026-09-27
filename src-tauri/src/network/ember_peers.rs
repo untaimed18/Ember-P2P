@@ -31,7 +31,7 @@ pub(super) const MAX_KNOWN_EMBER_NOISE_KEYS: usize = 500;
 /// evicted to make room — matches the LRU-by-timestamp policy that the
 /// pruner enforces against TTL.
 pub(super) fn record_known_ember_peer(
-    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    map: &mut HostPortMap<std::time::Instant>,
     ip: Ipv4Addr,
     port: u16,
 ) -> bool {
@@ -53,7 +53,7 @@ pub(super) fn record_known_ember_peer(
 /// Drop entries older than `KNOWN_EMBER_PEER_TTL`. Called lazily before
 /// the EPX rebuild iterates the map so we never advertise a peer we
 /// haven't heard about in a day.
-pub(super) fn prune_stale_ember_peers(map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>) {
+pub(super) fn prune_stale_ember_peers(map: &mut HostPortMap<std::time::Instant>) {
     prune_stale_ember_peers_at(map, std::time::Instant::now());
 }
 
@@ -64,7 +64,7 @@ pub(super) fn prune_stale_ember_peers(map: &mut HashMap<(Ipv4Addr, u16), std::ti
 /// than `KNOWN_EMBER_PEER_TTL` (notably Windows shortly after boot or
 /// inside short-lived CI containers).
 pub(super) fn prune_stale_ember_peers_at(
-    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    map: &mut HostPortMap<std::time::Instant>,
     now: std::time::Instant,
 ) {
     map.retain(|_, ts| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
@@ -469,7 +469,7 @@ pub(super) fn ember_rendezvous_converted_among(
 /// so it is dropped rather than stored under a port we'd never be able to
 /// dial. Otherwise this shares `record_known_ember_peer`'s TTL-and-LRU policy.
 pub(super) fn record_ember_keyless_peer(
-    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    map: &mut HostPortMap<std::time::Instant>,
     ip: Ipv4Addr,
     udp_port: u16,
 ) -> bool {
@@ -580,7 +580,7 @@ pub(super) fn ember_session_contact_is_live(contact: &ember::dht::EmberContact, 
 }
 
 pub(super) fn record_ember_session_dht_contact(
-    map: &mut HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+    map: &mut HostPortMap<ember::dht::EmberContact>,
     contact: ember::dht::EmberContact,
 ) {
     let IpAddr::V4(ip) = contact.addr.ip() else {
@@ -592,16 +592,13 @@ pub(super) fn record_ember_session_dht_contact(
     let key = (ip, contact.addr.port());
     // A NAT remap records a second UDP port for the same host. Keep at most
     // two so the IP-filter exemption cannot grow with every mapping change.
-    let extras: Vec<(Ipv4Addr, u16)> = map
-        .keys()
-        .copied()
-        .filter(|(peer_ip, port)| *peer_ip == ip && *port != contact.addr.port())
-        .collect();
-    if extras.len() >= 2 {
-        if let Some(oldest) = extras
+    let other_ports = map.host_port_count(ip) - usize::from(map.contains_key(&key));
+    if other_ports >= 2 {
+        if let Some(oldest) = map
             .iter()
-            .min_by_key(|k| map.get(*k).map(|c| c.last_seen).unwrap_or(0))
-            .copied()
+            .filter(|((peer_ip, port), _)| *peer_ip == ip && *port != contact.addr.port())
+            .min_by_key(|(_, c)| c.last_seen)
+            .map(|(k, _)| *k)
         {
             map.remove(&oldest);
         }
@@ -619,37 +616,39 @@ pub(super) fn record_ember_session_dht_contact(
 }
 
 pub(super) fn ember_session_introduced(state: &NetworkState, ip: Ipv4Addr, udp_port: u16) -> bool {
-    if state.ember_keyless_peers.contains_key(&(ip, udp_port))
-        || state.ember_session_dht_contacts.contains_key(&(ip, udp_port))
-        || state.ember_transport.recently_dialled(IpAddr::V4(ip))
-    {
-        return true;
-    }
-    let hold_a_udp_port = state
-        .ember_keyless_peers
-        .keys()
-        .any(|(peer_ip, _)| *peer_ip == ip)
-        || state
-            .ember_session_dht_contacts
-            .keys()
-            .any(|(peer_ip, _)| *peer_ip == ip);
-    let known_ember_host = state
-        .known_ember_peers
-        .keys()
-        .any(|(peer_ip, _)| *peer_ip == ip);
-    if !hold_a_udp_port {
-        // `known_ember_peers` is keyed by TCP port, so it can only ever vouch
-        // for the host, not for the datagram's source port. Accept that as a
-        // last resort — it is what lets a LAN peer whose UDP port we never
-        // learned join the overlay.
-        return known_ember_host;
-    }
-    // We already hold a UDP port for this host. A datagram from a different
+    ember_session_introduced_among(
+        &state.ember_keyless_peers,
+        &state.ember_session_dht_contacts,
+        &state.known_ember_peers,
+        || state.ember_transport.recently_dialled(IpAddr::V4(ip)),
+        ip,
+        udp_port,
+    )
+}
+
+/// [`ember_session_introduced`] over the maps it reads, for tests that cannot
+/// construct a `NetworkState`.
+pub(super) fn ember_session_introduced_among(
+    keyless: &HostPortMap<std::time::Instant>,
+    session: &HostPortMap<ember::dht::EmberContact>,
+    known: &HostPortMap<std::time::Instant>,
+    recently_dialled: impl FnOnce() -> bool,
+    ip: Ipv4Addr,
+    udp_port: u16,
+) -> bool {
+    // `known_ember_peers` is keyed by TCP port, so it can only ever vouch for
+    // the host, not for the datagram's source port. When we hold no UDP port
+    // for the host that is the last resort that lets a LAN peer whose UDP port
+    // we never learned join the overlay. When we do, a datagram from another
     // port is a NAT remap (or a Hello UDP change), not unsolicited LAN gossip,
     // but only while an eD2K Ember session still vouches for the IP. Without
     // that, matching on the bare IP would exempt every other port on the
-    // machine for as long as the session TTL lasts.
-    known_ember_host
+    // machine for as long as the session TTL lasts. Either way the answer
+    // past the exact-port checks is whether that session vouches for the host.
+    keyless.contains_key(&(ip, udp_port))
+        || session.contains_key(&(ip, udp_port))
+        || recently_dialled()
+        || known.has_host(ip)
 }
 
 pub(super) fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::dht::EmberContact) {
@@ -1083,25 +1082,15 @@ pub(super) fn remember_ember_lan_gossip(
 /// `recent_ips` map. Ember-only, KAD-off, and LAN session peers then sat on
 /// the stranger budget and could be dropped under load after introduction.
 pub(super) fn ember_udp_is_known_peer(state: &NetworkState, from: SocketAddr) -> bool {
-    if state.ember_dht.routing().contact_at(from).is_some() {
-        return true;
-    }
     if state.ember_transport.recently_dialled(from.ip()) {
         return true;
     }
-    match from.ip() {
-        IpAddr::V4(v4) => {
-            let port = from.port();
-            state.ember_session_dht_contacts.contains_key(&(v4, port))
-                || state.ember_keyless_peers.contains_key(&(v4, port))
-                || state
-                    .ember_session_dht_contacts
-                    .keys()
-                    .any(|(ip, _)| *ip == v4)
-                || state.ember_keyless_peers.keys().any(|(ip, _)| *ip == v4)
+    if let IpAddr::V4(v4) = from.ip() {
+        if state.ember_session_dht_contacts.has_host(v4) || state.ember_keyless_peers.has_host(v4) {
+            return true;
         }
-        _ => false,
     }
+    state.ember_dht.routing().contact_at(from).is_some()
 }
 
 /// Fill a publish target set from firsthand session peers the public table

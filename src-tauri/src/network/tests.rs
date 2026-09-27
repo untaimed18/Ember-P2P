@@ -94,7 +94,7 @@ fn a_session_contact_that_goes_quiet_stops_being_counted() {
     );
 
     // And as the sweep applies it.
-    let mut map: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact> = HashMap::new();
+    let mut map: HostPortMap<ember::dht::EmberContact> = HostPortMap::new();
     for c in [&answering, &quiet, &never_asked] {
         record_ember_session_dht_contact(&mut map, c.clone());
     }
@@ -3888,7 +3888,7 @@ fn a_better_supported_ember_digest_supersedes_a_weaker_pin() {
 
 #[test]
 fn record_known_ember_peer_returns_true_for_new_entries() {
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     let ip = Ipv4Addr::new(1, 2, 3, 4);
     assert!(record_known_ember_peer(&mut map, ip, 4662));
     assert_eq!(map.len(), 1);
@@ -4015,7 +4015,7 @@ fn udp_epx_budget_survives_source_port_rotation() {
 
 #[test]
 fn record_known_ember_peer_refreshes_existing_timestamp() {
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     let ip = Ipv4Addr::new(1, 2, 3, 4);
     assert!(record_known_ember_peer(&mut map, ip, 4662));
     let first_ts = *map.get(&(ip, 4662)).unwrap();
@@ -4031,7 +4031,7 @@ fn record_known_ember_peer_refreshes_existing_timestamp() {
 
 #[test]
 fn record_known_ember_peer_evicts_oldest_at_capacity() {
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     // Fill exactly to the cap with sequentially-aged entries — the
     // first insert is the oldest by timestamp. Use the high two bytes
     // of the IPv4 address so we get enough unique addresses to
@@ -4439,7 +4439,7 @@ fn a_loading_ember_ip_filter_neither_dials_strangers_nor_forgets_them() {
 /// dialing the same peer twice, once the slow way.
 #[test]
 fn xx_bridge_skips_peers_whose_noise_key_is_known() {
-    let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut keyless: HostPortMap<std::time::Instant> = HostPortMap::new();
     let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
 
     let keyed = (Ipv4Addr::new(10, 0, 0, 1), 4672u16);
@@ -4457,7 +4457,7 @@ fn xx_bridge_skips_peers_whose_noise_key_is_known() {
 /// unreachable peer gets re-pinged on every maintenance tick forever.
 #[test]
 fn xx_bridge_honours_the_attempted_set_and_its_budget() {
-    let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut keyless: HostPortMap<std::time::Instant> = HostPortMap::new();
     let keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
 
     let a = (Ipv4Addr::new(10, 0, 0, 1), 4672u16);
@@ -4490,7 +4490,7 @@ fn xx_bridge_honours_the_attempted_set_and_its_budget() {
 #[test]
 fn a_bridge_peer_becomes_a_candidate_again_after_the_retry_window() {
     let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
-    let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut keyless: HostPortMap<std::time::Instant> = HostPortMap::new();
     let peer = (Ipv4Addr::new(10, 0, 0, 7), 4672u16);
     record_ember_noise_key(&mut keys, peer.0, peer.1, [0xDD; 32]);
     record_ember_keyless_peer(&mut keyless, peer.0, peer.1);
@@ -4586,7 +4586,7 @@ fn a_starved_table_does_not_let_the_bridge_back_off() {
 #[test]
 fn a_starved_bridge_tries_untested_addresses_before_ones_that_kept_ignoring_it() {
     let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
-    let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut keyless: HostPortMap<std::time::Instant> = HostPortMap::new();
     let ignored_fresh = (Ipv4Addr::new(8, 8, 8, 1), 4672u16);
     let untried_old = (Ipv4Addr::new(8, 8, 8, 2), 4672u16);
     let untried_fresh = (Ipv4Addr::new(8, 8, 8, 3), 4672u16);
@@ -4685,7 +4685,7 @@ fn repeated_bridge_failures_lengthen_the_window() {
 /// would put an undialable entry in the cache and waste a ping budget slot.
 #[test]
 fn a_peer_without_a_udp_port_is_not_a_bridge_candidate() {
-    let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut keyless: HostPortMap<std::time::Instant> = HostPortMap::new();
     assert!(!record_ember_keyless_peer(
         &mut keyless,
         Ipv4Addr::new(10, 0, 0, 1),
@@ -4696,7 +4696,7 @@ fn a_peer_without_a_udp_port_is_not_a_bridge_candidate() {
 
 #[test]
 fn session_dht_contacts_keep_lan_and_drop_bogus() {
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     let lan = ember::dht::EmberContact {
         node_id: ember::dht::EmberNodeId([1u8; 16]),
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4672),
@@ -4725,7 +4725,7 @@ fn session_dht_contacts_keep_lan_and_drop_bogus() {
 /// grow with every Hello UDP change.
 #[test]
 fn session_dht_contacts_keep_at_most_two_udp_ports_per_host() {
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     let ip = Ipv4Addr::new(192, 168, 1, 10);
     for (i, port) in [4672u16, 4673, 4674].into_iter().enumerate() {
         record_ember_session_dht_contact(
@@ -4747,6 +4747,198 @@ fn session_dht_contacts_keep_at_most_two_udp_ports_per_host() {
     );
     assert!(map.contains_key(&(ip, 4673)));
     assert!(map.contains_key(&(ip, 4674)));
+}
+
+/// The two-port cap counts only the host's *other* ports: re-recording a port
+/// already held evicts nothing, and another host's ports never count.
+#[test]
+fn session_dht_contacts_refreshing_a_held_port_evicts_nothing() {
+    let mut map = HostPortMap::new();
+    let ip = Ipv4Addr::new(192, 168, 1, 10);
+    let neighbour = Ipv4Addr::new(192, 168, 1, 11);
+    let contact = |id: u8, ip: Ipv4Addr, port: u16, last_seen: i64| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([id; 16]),
+        addr: SocketAddr::new(IpAddr::V4(ip), port),
+        noise_pub: [2u8; 32],
+        ed25519_pub: [3u8; 32],
+        last_seen,
+        failed_queries: 0,
+    };
+    record_ember_session_dht_contact(&mut map, contact(1, ip, 4672, 1));
+    record_ember_session_dht_contact(&mut map, contact(2, ip, 4673, 2));
+    record_ember_session_dht_contact(&mut map, contact(3, neighbour, 4674, 3));
+    record_ember_session_dht_contact(&mut map, contact(4, neighbour, 4675, 4));
+
+    record_ember_session_dht_contact(&mut map, contact(2, ip, 4673, 9));
+    assert_eq!(map.len(), 4, "a refresh is not a third port");
+    assert_eq!(map.get(&(ip, 4673)).map(|c| c.last_seen), Some(9));
+    assert_eq!(map.host_port_count(ip), 2);
+
+    record_ember_session_dht_contact(&mut map, contact(5, ip, 4676, 10));
+    assert_eq!(map.len(), 4);
+    assert!(!map.contains_key(&(ip, 4672)), "the host's oldest other port goes");
+    assert!(map.contains_key(&(ip, 4673)));
+    assert!(map.contains_key(&(ip, 4676)));
+    assert_eq!(map.host_port_count(neighbour), 2, "another host is untouched");
+}
+
+/// `ember_session_introduced` reads the maps through their per-host index. It
+/// must reach exactly the verdict the key scans it replaced reached, for every
+/// mix of exact-port, other-port and TCP-port-only entries.
+#[test]
+fn session_introduced_matches_the_key_scans_it_replaced() {
+    fn by_scan(
+        keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+        session: &HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+        known: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+        recently_dialled: bool,
+        ip: Ipv4Addr,
+        udp_port: u16,
+    ) -> bool {
+        if keyless.contains_key(&(ip, udp_port))
+            || session.contains_key(&(ip, udp_port))
+            || recently_dialled
+        {
+            return true;
+        }
+        let hold_a_udp_port = keyless.keys().any(|(peer_ip, _)| *peer_ip == ip)
+            || session.keys().any(|(peer_ip, _)| *peer_ip == ip);
+        let known_ember_host = known.keys().any(|(peer_ip, _)| *peer_ip == ip);
+        if !hold_a_udp_port {
+            return known_ember_host;
+        }
+        known_ember_host
+    }
+
+    let now = std::time::Instant::now();
+    let ip = |d: u32| Ipv4Addr::new(192, 168, 1, (d % 4) as u8 + 1);
+    let port = |d: u32| 4672 + (d % 3) as u16;
+    let mut seed = 0x2545_F491u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for _ in 0..300 {
+        let mut keyless = HostPortMap::new();
+        let mut session = HostPortMap::new();
+        let mut known = HostPortMap::new();
+        for _ in 0..(next() % 6) {
+            let r = next();
+            keyless.insert((ip(r), port(r >> 4)), now);
+        }
+        for _ in 0..(next() % 6) {
+            let r = next();
+            let (peer_ip, peer_port) = (ip(r), port(r >> 4));
+            session.insert(
+                (peer_ip, peer_port),
+                ember::dht::EmberContact {
+                    node_id: ember::dht::EmberNodeId([r as u8; 16]),
+                    addr: SocketAddr::new(IpAddr::V4(peer_ip), peer_port),
+                    noise_pub: [1; 32],
+                    ed25519_pub: [2; 32],
+                    last_seen: 1,
+                    failed_queries: 0,
+                },
+            );
+        }
+        for _ in 0..(next() % 4) {
+            let r = next();
+            known.insert((ip(r), 4662), now);
+        }
+        for host in 0..4 {
+            for p in 0..3 {
+                for dialled in [false, true] {
+                    let (peer_ip, udp_port) = (ip(host), port(p));
+                    assert_eq!(
+                        ember_session_introduced_among(
+                            &keyless,
+                            &session,
+                            &known,
+                            || dialled,
+                            peer_ip,
+                            udp_port
+                        ),
+                        by_scan(&keyless, &session, &known, dialled, peer_ip, udp_port),
+                        "{peer_ip}:{udp_port} dialled={dialled}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `handle_ember_dht_message` copies the session map only when the frame's
+/// type byte says the engine will read it. The byte it peeks is the one the
+/// engine dispatches on; a FIND_NODE answer to a LAN neighbour carries the
+/// session peer, so skipping the copy there would change it; and a PING is
+/// answered identically either way.
+#[test]
+fn only_contact_list_requests_copy_the_session_map() {
+    use ember::dht::engine::EmberDht;
+
+    let mut asker = EmberDht::new([40; 32], [40; 32], true);
+    let asker_noise = [40u8; 32];
+    let asker_addr = SocketAddr::from(([192, 168, 1, 40], 4672));
+    let responder_noise = [42u8; 32];
+    let responder_addr = SocketAddr::from(([192, 168, 1, 42], 4672));
+    let responder = || EmberDht::new([42; 32], responder_noise, true);
+    let island = EmberDht::new([41; 32], [41; 32], true);
+    let lan = ember::dht::EmberContact {
+        node_id: island.local_id(),
+        addr: SocketAddr::from(([192, 168, 1, 41], 4672)),
+        noise_pub: [41; 32],
+        ed25519_pub: island.ed25519_public_key(),
+        last_seen: 500,
+        failed_queries: 0,
+    };
+
+    let (_, ping) = asker.build_ping();
+    let (_, find_node) = asker.build_find_node(ember::dht::EmberNodeId([0x55; 16]));
+    let (_, announce) = asker.build_announce_peer(Vec::new());
+    let (_, find_value) = asker.build_find_value(vec![[0x66; 16]], 0, Default::default());
+    let (_, store) = asker.build_store([0x77; 16], vec![1, 2, 3], [0; 64]);
+    for (name, frame, reads) in [
+        ("PING", &ping, false),
+        ("FIND_NODE", &find_node, true),
+        ("ANNOUNCE_PEER", &announce, true),
+        ("FIND_VALUE", &find_value, true),
+        ("STORE", &store, false),
+    ] {
+        assert_eq!(
+            ember_dht_frame_reads_session_contacts(frame[1]),
+            reads,
+            "{name}"
+        );
+    }
+
+    let with = responder().handle_incoming(
+        &find_node,
+        asker_addr,
+        asker_noise,
+        1000,
+        std::slice::from_ref(&lan),
+    );
+    let (_, contacts) = asker
+        .handle_message(&with.responses[0], responder_addr, responder_noise, 1001)
+        .found_node
+        .expect("FOUND_NODE");
+    assert!(
+        contacts.iter().any(|c| c.node_id == lan.node_id),
+        "a FIND_NODE from a LAN neighbour is answered with session peers"
+    );
+
+    let with = responder().handle_incoming(
+        &ping,
+        asker_addr,
+        asker_noise,
+        1000,
+        std::slice::from_ref(&lan),
+    );
+    let without = responder().handle_incoming(&ping, asker_addr, asker_noise, 1000, &[]);
+    assert!(with.ping_received);
+    assert_eq!(with.responses, without.responses, "a PING ignores session peers");
 }
 
 fn test_ember_contact(id_byte: u8, ip: [u8; 4], port: u16) -> ember::dht::EmberContact {
@@ -4869,7 +5061,7 @@ fn an_unproven_session_copy_does_not_hold_off_the_empty_overlay_rearm() {
         last_seen,
         failed_queries: 0,
     };
-    let mut session: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact> = HashMap::new();
+    let mut session: HostPortMap<ember::dht::EmberContact> = HostPortMap::new();
     record_ember_session_dht_contact(&mut session, session_contact(0, 3));
     assert_eq!(dht.routing().held_len(), 0);
     assert_eq!(
@@ -5343,7 +5535,7 @@ fn prune_stale_ember_peers_drops_expired_entries() {
     // Backdating `Instant` with `checked_sub` is unreliable on
     // Windows / freshly-booted systems where the monotonic clock
     // reference is younger than `KNOWN_EMBER_PEER_TTL`.
-    let mut map = HashMap::new();
+    let mut map = HostPortMap::new();
     let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
     let stale_ip = Ipv4Addr::new(5, 6, 7, 8);
     let stale_ts = std::time::Instant::now();

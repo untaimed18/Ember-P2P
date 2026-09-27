@@ -13,18 +13,21 @@ use super::*;
 /// for the whole `ipfilter.dat` parse and the overlay never rejoins. Once
 /// ranges are ready, only a LAN/CGNAT session introduction may bypass a real
 /// block (same as before).
+///
+/// `known_peer` and `session_introduced` read the routing table and the
+/// session maps, so they are only asked when the verdict turns on them.
 pub(super) fn ember_udp_ip_filter_allows(
     blocked: bool,
     fail_closed: bool,
-    known_peer: bool,
+    known_peer: impl FnOnce() -> bool,
     lan_or_cgnat: bool,
-    session_introduced: bool,
+    session_introduced: impl FnOnce() -> bool,
 ) -> bool {
     if fail_closed {
-        return known_peer || session_introduced;
+        return known_peer() || session_introduced();
     }
     if blocked {
-        return lan_or_cgnat && session_introduced;
+        return lan_or_cgnat && session_introduced();
     }
     true
 }
@@ -57,6 +60,12 @@ pub(super) fn verified_session_node_id(
 /// any v4 / v4-mapped source, while a genuinely v6-only Ember peer skips
 /// those two (they can't represent it) but is still rate-limited.
 pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr) -> bool {
+    // Both the IP filter and the rate limiter may ask; the answer cannot change
+    // in between, so it is computed at most once per datagram.
+    let mut ember_known = None;
+    let mut ember_known_peer = |state: &NetworkState| {
+        *ember_known.get_or_insert_with(|| ember_udp_is_known_peer(state, from))
+    };
     if let Some(v4) = match from.ip() {
         std::net::IpAddr::V4(v4) => Some(v4),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
@@ -74,9 +83,9 @@ pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr)
         if !ember_udp_ip_filter_allows(
             blocked,
             fail_closed,
-            ember_udp_is_known_peer(state, from),
+            || ember_known_peer(state),
             crate::security::is_lan_or_cgnat_v4(v4),
-            ember_session_introduced(state, v4, from.port()),
+            || ember_session_introduced(state, v4, from.port()),
         ) {
             debug!("Dropping Ember UDP from blocked IP {from}");
             return false;
@@ -94,11 +103,9 @@ pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr)
         std::net::IpAddr::V4(v4) => {
             state.routing_table.has_contact_ip(v4)
                 || state.flood_protection.has_recent_ip(from.ip())
-                || ember_udp_is_known_peer(state, from)
+                || ember_known_peer(state)
         }
-        _ => {
-            state.flood_protection.has_recent_ip(from.ip()) || ember_udp_is_known_peer(state, from)
-        }
+        _ => state.flood_protection.has_recent_ip(from.ip()) || ember_known_peer(state),
     };
     if state
         .flood_protection
