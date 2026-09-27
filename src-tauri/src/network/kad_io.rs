@@ -567,15 +567,17 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
         // An Ember source record embeds the address peers should dial, and is
-        // only re-announced once `EMBER_SOURCE_REPUBLISH` has elapsed. Leaving
-        // the schedule alone here meant a DHCP lease change or an ISP
-        // reconnection left every source record we had placed advertising the
-        // old address for up to two hours, sending downloaders to whoever holds
-        // it now. Dropping the schedule makes the next publish tick re-announce
-        // with the new address; that tick is already bounded per cycle, so a
-        // large library spreads the work rather than bursting. Keyword records
-        // carry no address, so their schedule is deliberately untouched.
-        state.ember_source_publish_at.clear();
+        // only re-announced once `EMBER_SOURCE_REPUBLISH` has elapsed, so after
+        // a DHCP lease change or an ISP reconnection every record we had placed
+        // would send downloaders to whoever holds the old address for up to two
+        // hours. Measured against the address those records were published
+        // under, not against `external_ip`: that starts out unknown and is
+        // cleared by a KAD disconnect, and an address that is unknown for a
+        // while has not moved. Keyword records carry no address, so their
+        // schedule is deliberately untouched.
+        if let Some(new_ip) = ip {
+            note_ember_source_address(state, new_ip);
+        }
         // Whatever proved our port was open, proved it about the old address.
         // A new address can mean a new NAT, a new router, or a different
         // network entirely, so the evidence has to be earned again rather than

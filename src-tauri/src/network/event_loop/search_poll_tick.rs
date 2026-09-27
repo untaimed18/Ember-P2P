@@ -577,7 +577,12 @@ pub(in crate::network) async fn on_search_poll_tick(
             // regardless of which path (stream vs completion)
             // sees a peer first.
             let established = ember_established_addrs(state);
-            harvest_ember_noise_keys(&mut state.ember_noise_keys, &all, &established);
+            harvest_ember_noise_keys(
+                &mut state.ember_noise_keys,
+                &all,
+                &established,
+                state.ember_transport.local_noise_public_key(),
+            );
             let kad_sources: Vec<KadSource> = all
                 .into_iter()
                 .filter(|s| !is_self_source(s, state))
@@ -743,6 +748,13 @@ pub(in crate::network) async fn on_search_poll_tick(
     }
 
     for sid in completed_ids {
+        if ember_rendezvous_id_reused(
+            state.ember_rendezvous_search,
+            sid,
+            state.search_manager.get(&sid).map(|s| s.target),
+        ) {
+            state.ember_rendezvous_search = None;
+        }
         if let Some(PendingKeywordSearch { tx, mut local_results, query_expr, request_id, file_type_filter, .. }) = state.pending_keyword_searches.remove(&sid) {
             let mut network_results = if let Some(search) = state.search_manager.get(&sid) {
                 let unique: std::collections::HashSet<&kad::types::KadId> =
@@ -887,7 +899,12 @@ pub(in crate::network) async fn on_search_poll_tick(
             // opposite of what the only cold-join diagnostic needs
             // to say.
             let keys_before = state.ember_noise_keys.len();
-            harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers, &established);
+            harvest_ember_noise_keys(
+                &mut state.ember_noise_keys,
+                &peers,
+                &established,
+                state.ember_transport.local_noise_public_key(),
+            );
             let keys_learned = state.ember_noise_keys.len().saturating_sub(keys_before);
             let converted = ember_rendezvous_converted_contacts(state, &peers);
             note_ember_rendezvous_lookup(state, peers.len(), converted);
@@ -923,7 +940,9 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // advertised no UDP port can't be Ember-
                         // dialed, so skip caching it.
                         if let Some(npub) = s.ember_noise_pub {
-                            if s.udp_port != 0 {
+                            if s.udp_port != 0
+                                && npub != *state.ember_transport.local_noise_public_key()
+                            {
                                 let pinned =
                                     established.contains(&(s.ip, s.udp_port));
                                 if let Some(_held) = cache_bound_ember_noise_key(
@@ -2522,9 +2541,16 @@ pub(in crate::network) async fn on_search_poll_tick(
     // never arrive — so without this they sit in the UI as "STOPPING"
     // until the slow 300s cleanup() sweep. Mirror eMule and reap them
     // here on the 1s tick (the same teardown the cleanup sweep uses).
+    let rendezvous_target = rendezvous_search_target(state);
     let (stopped_sids, stopped_in_use) =
         state.search_manager.prune_stopped(STOP_GRACE_SECS);
     if !stopped_sids.is_empty() {
-        finalize_removed_searches(state, app_handle, &stopped_sids, &stopped_in_use);
+        finalize_removed_searches(
+            state,
+            app_handle,
+            &stopped_sids,
+            &stopped_in_use,
+            rendezvous_target,
+        );
     }
 }

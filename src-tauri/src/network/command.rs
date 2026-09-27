@@ -2311,6 +2311,7 @@ async fn handle_command_inner(
 
         NetworkCommand::GetEmberDiagnostics { tx } => {
             let mut diag = state.ember_diagnostics.clone();
+            mirror_ember_dht_counters(state, &mut diag);
             diag.ember_peers_known = state.known_ember_peers.len() as u32;
             diag.ember_native_enabled = settings.ember_native_enabled;
             diag.ember_sessions = state.ember_transport.session_count() as u32;
@@ -2345,15 +2346,12 @@ async fn handle_command_inner(
                 .ember_dht
                 .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS))
                 as u32;
-            diag.ember_dht_seconds_since_inbound = state
-                .ember_last_inbound
-                .map(|at| {
-                    chrono::Utc::now()
-                        .timestamp()
-                        .saturating_sub(at)
-                        .clamp(0, u32::MAX as i64) as u32
-                })
-                .unwrap_or(0);
+            diag.ember_dht_seconds_since_inbound = state.ember_last_inbound.map(|at| {
+                chrono::Utc::now()
+                    .timestamp()
+                    .saturating_sub(at)
+                    .clamp(0, u32::MAX as i64) as u32
+            });
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
             diag.ember_dht_published_files = state.ember_published_sources.len() as u32;
             diag.ember_dht_publishable_files = state.publish_manager.complete_file_count() as u32;
@@ -2553,8 +2551,17 @@ async fn handle_command_inner(
             let local_id = state.ember_dht.local_id();
             let mut seen: HashSet<[u8; 16]> = HashSet::new();
             let mut contacts: Vec<EmberDhtContactInfo> = Vec::new();
-            for c in state.ember_dht.contacts() {
-                seen.insert(c.node_id.0);
+            // Replacement-cache entries too, so the rows add up to the headline
+            // contact count, which counts them (`ember_dht_ui_contact_counts`).
+            for c in state
+                .ember_dht
+                .contacts()
+                .into_iter()
+                .chain(state.ember_dht.cached_contacts())
+            {
+                if !seen.insert(c.node_id.0) {
+                    continue;
+                }
                 let mut info = ember_dht_contact_info(&c, local_id);
                 info.addr.clear();
                 info.noise_pub.clear();
@@ -3067,6 +3074,7 @@ async fn handle_command_inner(
                 }
             };
             seed_ember_local_records(state, search_id, &primary_hash, &extras);
+            seed_ember_session_search_contacts(state, search_id);
             let (records_tx, records_rx) = oneshot::channel();
             state
                 .ember_dht_pending_value_lookups
@@ -3756,6 +3764,7 @@ async fn handle_command_inner(
             // K30: release routing-table in-use refs first (so the
             // contacts can be cleaned up normally) then drop the search.
             let sid = crate::network::kad::search::SearchId(id);
+            let rendezvous_target = rendezvous_search_target(state);
             if let Some(removed) = state.search_manager.remove(&sid) {
                 // Beyond the in-use refs, a cancelled search can still have
                 // pending IPC oneshots (`pending_keyword_searches` /
@@ -3766,7 +3775,13 @@ async fn handle_command_inner(
                 // search hang until their own IPC timeout instead of
                 // resolving immediately, and `active_search_request.kad_pending`
                 // can be left stuck set so `search-complete` never fires.
-                finalize_removed_searches(state, app_handle, &[sid], &removed.in_use_ids);
+                finalize_removed_searches(
+                    state,
+                    app_handle,
+                    &[sid],
+                    &removed.in_use_ids,
+                    rendezvous_target,
+                );
                 info!("KAD search {id} cancelled by user");
             } else {
                 debug!("KAD search {id} not found (already completed?) — ignoring cancel");
@@ -4076,6 +4091,7 @@ async fn handle_command_inner(
                         .ip_filter
                         .update_shared_snapshot(&state.shared_ip_filter);
                     state.routing_table.evict_filtered_contacts();
+                    purge_ember_ip_blocked_peers(state);
                     state.ember_dht.evict_filtered_contacts();
                     info!(
                         "Reloaded IP filter: {} ranges",
@@ -4131,6 +4147,7 @@ async fn handle_command_inner(
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
                 state.routing_table.evict_filtered_contacts();
+                purge_ember_ip_blocked_peers(state);
                 state.ember_dht.evict_filtered_contacts();
                 spawn_save_ipfilter_dat(&state.ip_filter, state.data_dir.join("ipfilter.dat"));
                 info!(
@@ -4245,6 +4262,7 @@ async fn handle_command_inner(
                 .update_shared_snapshot(&state.shared_ip_filter);
             if enabled {
                 state.routing_table.evict_filtered_contacts();
+                purge_ember_ip_blocked_peers(state);
                 state.ember_dht.evict_filtered_contacts();
                 apply_server_ip_filter(
                     state,
@@ -4263,6 +4281,7 @@ async fn handle_command_inner(
                 .ip_filter
                 .update_shared_snapshot(&state.shared_ip_filter);
             state.routing_table.set_block_private_ips(block_private);
+            purge_ember_ip_blocked_peers(state);
             state.ember_dht.set_block_private_ips(block_private);
             info!("Block private IPs: {block_private}");
         }
@@ -4413,6 +4432,12 @@ async fn handle_command_inner(
                 cancel_search_request(state, app_handle, active_id);
             }
             state.search_manager = SearchManager::new();
+            // The rebuilt manager hands out ids from 1 again, so a tracked
+            // lookup id would capture whichever unrelated search reuses it. The
+            // lookup never finished, so it does not count toward the backoff.
+            if state.ember_rendezvous_search.take().is_some() {
+                state.ember_rendezvous_looked_up_at = 0;
+            }
             for (
                 _,
                 PendingKeywordSearch {

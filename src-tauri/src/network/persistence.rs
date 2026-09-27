@@ -467,6 +467,7 @@ pub(super) async fn load_ipfilter_on_enable(state: &mut NetworkState) {
                 .ip_filter
                 .update_shared_snapshot(&state.shared_ip_filter);
             state.routing_table.evict_filtered_contacts();
+            purge_ember_ip_blocked_peers(state);
             state.ember_dht.evict_filtered_contacts();
         }
         Ok(None) => {}

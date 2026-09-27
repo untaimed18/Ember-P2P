@@ -50,12 +50,21 @@ pub(super) fn save_ember_verified_highwater(path: &std::path::Path, hw: &EmberVe
 }
 
 /// Raise today's / all-time verified-contact peaks. Returns whether the
-/// persisted copy needs rewriting.
+/// persisted copy needs rewriting. "Today" is the local calendar day, because
+/// that is the day the user reading "peak today" means.
 pub(super) fn note_ember_verified_contacts(hw: &mut EmberVerifiedHighwater, verified: u32) -> bool {
-    let today = chrono::Utc::now().date_naive().to_string();
+    note_ember_verified_contacts_on(hw, verified, &chrono::Local::now().date_naive().to_string())
+}
+
+/// [`note_ember_verified_contacts`] for an explicit `today` (`YYYY-MM-DD`).
+pub(super) fn note_ember_verified_contacts_on(
+    hw: &mut EmberVerifiedHighwater,
+    verified: u32,
+    today: &str,
+) -> bool {
     let mut dirty = false;
     if hw.day != today {
-        hw.day = today;
+        hw.day = today.to_string();
         hw.daily = verified;
         dirty = true;
     } else if verified > hw.daily {
@@ -89,26 +98,33 @@ pub(super) fn record_ember_find_value_quality(
 }
 
 /// Last outstanding STORE for this record failed (every replica refused or
-/// timed out). Remove this key from the pending set; charge the file only
+/// timed out). Remove this key from the pending set; settle the file only
 /// when none of its keys remain, so a mixed ACK cannot wipe siblings.
+///
+/// A round that placed any of its other keys is then published, not failed;
+/// one that placed nothing is charged. Returns whether the file was stamped
+/// published, which the caller owes [`note_ember_file_published`].
 pub(super) fn fail_ember_record_pending(
-    schedule: EmberPublishSchedule<'_>,
+    mut schedule: EmberPublishSchedule<'_>,
     reference: EmberRecordRef,
     now: std::time::Instant,
-) {
+) -> bool {
     if reference.kind == EmberPublishKind::Replication {
-        return;
+        return false;
     }
     let slot = (reference.file_hash, reference.kind);
     let Some(unplaced) = schedule.unplaced.get_mut(&slot) else {
-        return;
+        return false;
     };
     unplaced.remove(&reference.key);
     if !unplaced.is_empty() {
-        return;
+        return false;
     }
-    schedule.unplaced.remove(&slot);
+    if schedule.finish_round(slot, now) {
+        return true;
+    }
     charge_ember_publish_round(schedule, reference.file_hash, reference.kind, now);
+    false
 }
 
 pub(super) fn note_ember_store_attempt_failed(
@@ -119,7 +135,9 @@ pub(super) fn note_ember_store_attempt_failed(
     if state.ember_batch_publish.record_still_outstanding(reference) {
         return;
     }
-    fail_ember_record_pending(state.publish_schedule(), reference, now);
+    if fail_ember_record_pending(state.publish_schedule(), reference, now) {
+        note_ember_file_published(state, reference.file_hash, reference.kind);
+    }
 }
 
 /// Charge one failed publish round against a file and, once it has gone
@@ -227,6 +245,65 @@ pub(super) fn forget_rendezvous_publish(state: &mut NetworkState, removed: Optio
             state.ember_rendezvous_published_at = 0;
         }
     }
+}
+
+/// A cumulative `u64` counter as a `u32` diagnostics field, pinned at the
+/// ceiling rather than wrapping back to a small number.
+pub(super) fn saturating_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Copy the counters the DHT store, engine and frame limiter keep themselves
+/// into `diag`. Done when diagnostics are read, not per frame: several of them
+/// only move on frames that are refused, so a copy taken on the accept path
+/// would lag exactly the numbers it exists to show.
+pub(super) fn mirror_ember_dht_counters(state: &NetworkState, diag: &mut EmberDiagnostics) {
+    let store_rejects = state.ember_dht.store_reject_stats();
+    diag.ember_dht_store_key_cap_rejections = saturating_u32(store_rejects.key_cap);
+    diag.ember_dht_store_reject_signature = saturating_u32(store_rejects.signature);
+    diag.ember_dht_store_reject_timestamp = saturating_u32(store_rejects.timestamp);
+    diag.ember_dht_store_reject_source_ip_cap = saturating_u32(store_rejects.source_ip_cap);
+    diag.ember_dht_store_reject_publisher_cap = saturating_u32(store_rejects.publisher_cap);
+    diag.ember_dht_store_reject_per_key_cap = saturating_u32(store_rejects.per_key_cap);
+    diag.ember_dht_store_reject_verify = saturating_u32(state.ember_dht.store_reject_verify());
+    diag.ember_dht_store_reject_source_ip = saturating_u32(state.ember_dht.store_reject_source_ip());
+    diag.ember_dht_store_reject_proximity = saturating_u32(state.ember_dht.store_reject_proximity());
+    diag.ember_dht_keyword_key_off_name = saturating_u32(state.ember_dht.keyword_key_off_name());
+    diag.ember_dht_unknown_record_types =
+        saturating_u32(state.ember_dht.unknown_record_types_stored());
+    diag.ember_dht_version_advertisers =
+        saturating_u32(state.ember_dht.peers_advertising_versions() as u64);
+    diag.ember_dht_rate_limited = saturating_u32(state.ember_dht_protection.dropped_rate_limited());
+    diag.ember_dht_store_addr_ceiling =
+        saturating_u32(state.ember_dht_protection.dropped_store_addr_ceiling());
+}
+
+/// Whether this node may advertise itself under the rendezvous key: an
+/// unsolicited DHT `PING` has to be able to reach it, because that is the
+/// whole join path — a cold node reads the address off the advert and
+/// bridge-pings it over UDP.
+///
+/// Either proof will do. KAD's UDP firewall check is answered by KAD peers, so
+/// it needs no Ember peer to exist yet, and the advert only goes out while KAD
+/// is up; the first nodes on an empty overlay therefore still list themselves.
+/// [`ember_udp_reachable`] covers a node whose KAD check has not run or has
+/// lapsed.
+pub(super) fn ember_rendezvous_advert_reachable(
+    udp_fw_verified: bool,
+    udp_firewalled: bool,
+    ember_udp_reachable: bool,
+) -> bool {
+    (udp_fw_verified && !udp_firewalled) || ember_udp_reachable
+}
+
+/// Whether the tracked rendezvous lookup id `tracked` has come to name some
+/// other search: `sid` matches it but the search's `target` is not the
+/// rendezvous key. KAD search ids restart at 1 whenever the search manager is
+/// rebuilt, and an unrelated search consumed as the rendezvous lookup never
+/// reaches its own completion branch. `None` (the search is already gone)
+/// cannot be told apart and reads as not reused.
+pub(super) fn ember_rendezvous_id_reused(tracked: Option<SearchId>, sid: SearchId, target: Option<KadId>) -> bool {
+    tracked == Some(sid) && target.is_some_and(|t| t != kad::publish::ember_rendezvous_key())
 }
 
 /// Count a failed query against an Ember DHT contact, evicting it once it has
@@ -846,34 +923,49 @@ pub(super) const EMBER_EMPTY_REARM_SECS: i64 = 300;
 
 /// How long a verified contact may go unheard before it is purged outright,
 /// matching KAD's two hours. Well beyond the liveness-ping interval, so this
-/// only catches contacts the ping budget never got around to probing.
+/// only catches contacts the ping budget never got around to probing — which
+/// holds only while the maintenance tick has been running; see
+/// [`ember_stale_purge_hold`].
 pub(super) const EMBER_CONTACT_STALE_SECS: i64 = 2 * 3600;
 
-// ── DHT source publishing (slice 9) ──
+/// A gap between maintenance ticks longer than this means the liveness pings
+/// were not going out — the machine was suspended, or the loop was stalled —
+/// so the silence it produced says nothing about the contacts.
+pub(super) const EMBER_MAINT_GAP_SECS: i64 = EMBER_CONTACT_PING_SECS;
 
-/// Dial Ember peers we know of but have never spoken to, so the signed `PONG`
-/// can teach us a verified contact through the normal inbound path.
+/// Until when the staleness purge must age nothing out, given the unix time of
+/// the previous maintenance tick, the hold already in force, and `now`.
 ///
-/// Two sources feed it. KAD source publishes carry a peer's Noise key but not
-/// its Ed25519 key or node ID, so we cannot build a contact directly — we
-/// DHT-`PING` `(addr, noise_pub)` on the 1-RTT Noise_IK path instead. A live
-/// eD2K client session is an introduction too, and one worth taking even when
-/// the public table is full, because a LAN or island 1.5.x peer would otherwise
-/// never be DHT-pinged and `FIND_VALUE` would never ask it; those go over
-/// Noise_XX. Returns how many pings went out.
+/// The purge's premise is that the liveness pings kept running, so a contact
+/// still unheard after two hours is one the budget never reached. A suspend
+/// longer than that breaks it for every contact at once: an unheld first tick
+/// after resume would purge each verified contact before a single ping had gone
+/// out, leaving the node to rejoin from nothing. Held for one liveness window —
+/// the span [`ember_maint_ping_budget`] is sized to probe the whole table in —
+/// so every contact is asked first, and whatever still has not answered when
+/// the hold lifts is purged as before.
 ///
-/// The IK pass self-disables once the table is bootstrapped so steady-state KAD
-/// traffic does not spray DHT pings. `force` (the dev-panel button) bypasses
-/// that size gate.
+/// Skipping the purge was preferred to demoting the stale contacts to leads.
+/// Demotion throws away the verified state the table leans on — the
+/// `noise_pub` pin that stops a replayed frame from rebinding a slot, the
+/// verified count the diversity tier is read from, and first claim on a slot
+/// against leads — for contacts most of which answer within minutes. Holding
+/// risks only keeping dead contacts one window longer, the same exposure the
+/// three-strike eviction already accepts.
 ///
-/// Split out of [`run_ember_maintenance`] so the 1 Hz search timer can drive it
-/// during a cold join. Owned by the 60-second maintenance tick alone, it was
-/// always a tick behind the thing that feeds it: the rendezvous lookup caches
-/// Noise keys mid-interval, so a node that had just discovered the only peers
-/// it could reach sat on them for the rest of the minute — 46 seconds of it in
-/// a measured cold start. Re-running it is close to free once the candidates
-/// are spent, because `bridge_retry_due` holds every attempted peer until its
-/// backoff expires and the extra passes just build an empty candidate list.
+/// Capped at one window past `now`, so a backwards clock step cannot hold the
+/// purge off for however far the clock moved.
+pub(super) fn ember_stale_purge_hold(last_run: Option<i64>, held_until: i64, now: i64) -> i64 {
+    let window_end = now.saturating_add(EMBER_CONTACT_PING_SECS);
+    let held_until = match last_run {
+        Some(prev) if now.saturating_sub(prev) > EMBER_MAINT_GAP_SECS => window_end,
+        _ => held_until,
+    };
+    held_until.min(window_end)
+}
+
+// ── Bucket pressure and the KAD bridge ──
+
 /// Probe the oldest contact of each bucket a newcomer could not enter.
 ///
 /// Kademlia bucket pressure: `add_contact` answers `PingOldest` when the bucket
@@ -978,6 +1070,29 @@ pub(super) async fn probe_bucket_oldest(
     }
 }
 
+/// Dial Ember peers we know of but have never spoken to, so the signed `PONG`
+/// can teach us a verified contact through the normal inbound path.
+///
+/// Two sources feed it. KAD source publishes carry a peer's Noise key but not
+/// its Ed25519 key or node ID, so we cannot build a contact directly — we
+/// DHT-`PING` `(addr, noise_pub)` on the 1-RTT Noise_IK path instead. A live
+/// eD2K client session is an introduction too, and one worth taking even when
+/// the public table is full, because a LAN or island 1.5.x peer would otherwise
+/// never be DHT-pinged and `FIND_VALUE` would never ask it; those go over
+/// Noise_XX. Returns how many pings went out.
+///
+/// The IK pass self-disables once the table is bootstrapped so steady-state KAD
+/// traffic does not spray DHT pings. `force` (the dev-panel button) bypasses
+/// that size gate.
+///
+/// Split out of [`run_ember_maintenance`] so the 1 Hz search timer can drive it
+/// during a cold join. Owned by the 60-second maintenance tick alone, it was
+/// always a tick behind the thing that feeds it: the rendezvous lookup caches
+/// Noise keys mid-interval, so a node that had just discovered the only peers
+/// it could reach sat on them for the rest of the minute — 46 seconds of it in
+/// a measured cold start. Re-running it is close to free once the candidates
+/// are spent, because `bridge_retry_due` holds every attempted peer until its
+/// backoff expires and the extra passes just build an empty candidate list.
 pub(super) async fn run_ember_kad_bridge(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -1113,7 +1228,8 @@ pub(super) async fn run_ember_maintenance(
             state.ember_rearmed_at = Some(now_secs);
         }
 
-        let contacts = ember_overlay_contact_count(state);
+        let contacts =
+            ember_rearm_contact_count(&state.ember_dht, &state.ember_session_dht_contacts);
         // Whether the "overlay just emptied" edge was acted on. It used to be
         // consumed either way, so a transition suppressed by the rate limiter
         // was lost for good: empty at t=100 re-arms, the fresh batch is
@@ -1165,10 +1281,26 @@ pub(super) async fn run_ember_maintenance(
     //     quietly disappeared could hold its slot for hours — blocking the
     //     newcomer that should replace it. Runs before the self-lookup so
     //     that lookup sees a table worth walking.
+    //
+    //     Held after a gap in these ticks — see `ember_stale_purge_hold`. The
+    //     call still runs while held, with an age nothing reaches, because it
+    //     is also what repairs timestamps a backwards clock step left in the
+    //     future.
+    state.ember_stale_purge_held_until = ember_stale_purge_hold(
+        state.ember_maint_last_run,
+        state.ember_stale_purge_held_until,
+        now_secs,
+    );
+    state.ember_maint_last_run = Some(now_secs);
+    let stale_after = if now_secs < state.ember_stale_purge_held_until {
+        i64::MAX
+    } else {
+        EMBER_CONTACT_STALE_SECS
+    };
     let in_use = state.ember_search.nodes_in_use();
     let purged = state
         .ember_dht
-        .remove_stale_contacts(now_secs, EMBER_CONTACT_STALE_SECS, &in_use);
+        .remove_stale_contacts(now_secs, stale_after, &in_use);
     if purged > 0 {
         state.ember_diagnostics.ember_dht_contacts_evicted = state
             .ember_diagnostics
@@ -1607,7 +1739,7 @@ pub(super) async fn run_ember_maintenance(
                 continue;
             }
         };
-        let targets = ember_overlay_publish_targets(state, record.keyword_hash);
+        let targets = ember_overlay_publish_targets_within(state, record.keyword_hash, 0);
         // Replication carries someone else's record, so there is no local
         // file schedule to advance; the reference is only used to line the
         // ack bitmap up.
@@ -1674,12 +1806,28 @@ pub(super) async fn run_ember_maintenance(
         state.ember_verified_highwater_dirty = true;
     }
     if state.ember_verified_highwater_dirty {
-        let path = ember_highwater_path(&state.data_dir);
-        let hw = state.ember_verified_highwater.clone();
-        tokio::task::spawn_blocking(move || {
-            save_ember_verified_highwater(&path, &hw);
-        });
-        state.ember_verified_highwater_dirty = false;
+        // A write still in flight keeps the flag set, so the next cycle saves
+        // whatever has changed since.
+        if let Ok(ownership) = state.ember_highwater_save_lock.clone().try_lock_owned() {
+            let path = ember_highwater_path(&state.data_dir);
+            let hw = state.ember_verified_highwater.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                save_ember_verified_highwater(&path, &hw);
+            });
+            state.ember_verified_highwater_dirty = false;
+        }
+    }
+    if state.ember_source_address_dirty {
+        if let Ok(ownership) = state.ember_source_address_save_lock.clone().try_lock_owned() {
+            let path = ember_source_address_path(&state.data_dir);
+            let address = state.ember_source_address;
+            tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                save_ember_source_address(&path, &address);
+            });
+            state.ember_source_address_dirty = false;
+        }
     }
 
     // Introducer records only change on a probe outcome, and pruning them is
@@ -1778,10 +1926,6 @@ pub(super) async fn handle_ember_dht_message(
     // its frame rate still bought a table scan per datagram, which is the
     // opposite of what a gate that exists to make junk cheap to reject is for.
     if !state.ember_dht_protection.allow_frame(from.ip()) {
-        state.ember_diagnostics.ember_dht_rate_limited = state
-            .ember_diagnostics
-            .ember_dht_rate_limited
-            .saturating_add(1);
         return;
     }
 
@@ -1823,10 +1967,6 @@ pub(super) async fn handle_ember_dht_message(
         .ember_dht_protection
         .allow_typed(from.ip(), msg_type, known_sender, store_records)
     {
-        state.ember_diagnostics.ember_dht_rate_limited = state
-            .ember_diagnostics
-            .ember_dht_rate_limited
-            .saturating_add(1);
         return;
     }
 
@@ -1880,9 +2020,10 @@ pub(super) async fn handle_ember_dht_message(
         }
         // And if this peer was a lead somebody named, that name has just been
         // shown to be worth something. Any signed frame counts, not only the
-        // `PONG`: what the probe was asking is whether the address is real.
+        // `PONG`: what the probe was asking is whether the address is real —
+        // which is also why it only counts from the address that was named.
         if let Some(id) = inbound.sender_id {
-            state.ember_gossip_reputation.note_answered(&id);
+            state.ember_gossip_reputation.note_answered(&id, from);
         }
     }
     if let Some(contact) = inbound.sender_contact.clone() {
@@ -1989,32 +2130,6 @@ pub(super) async fn handle_ember_dht_message(
             .saturating_add(1);
     }
 
-    // Cumulative on the store itself, so this mirrors rather than accumulates.
-    let store_rejects = state.ember_dht.store_reject_stats();
-    state.ember_diagnostics.ember_dht_store_key_cap_rejections = store_rejects.key_cap as u32;
-    state.ember_diagnostics.ember_dht_store_reject_signature = store_rejects.signature as u32;
-    state.ember_diagnostics.ember_dht_store_reject_timestamp = store_rejects.timestamp as u32;
-    state.ember_diagnostics.ember_dht_store_reject_source_ip_cap =
-        store_rejects.source_ip_cap as u32;
-    state.ember_diagnostics.ember_dht_store_reject_publisher_cap =
-        store_rejects.publisher_cap as u32;
-    state.ember_diagnostics.ember_dht_store_reject_per_key_cap = store_rejects.per_key_cap as u32;
-    state.ember_diagnostics.ember_dht_store_reject_verify =
-        state.ember_dht.store_reject_verify() as u32;
-    state.ember_diagnostics.ember_dht_store_reject_source_ip =
-        state.ember_dht.store_reject_source_ip() as u32;
-    state.ember_diagnostics.ember_dht_store_reject_proximity =
-        state.ember_dht.store_reject_proximity() as u32;
-    state.ember_diagnostics.ember_dht_keyword_key_off_name =
-        state.ember_dht.keyword_key_off_name() as u32;
-    state.ember_diagnostics.ember_dht_version_advertisers =
-        state.ember_dht.peers_advertising_versions() as u32;
-    // Cumulative on the limiter, so this mirrors rather than accumulates.
-    state.ember_diagnostics.ember_dht_rate_limited =
-        state.ember_dht_protection.dropped_rate_limited() as u32;
-    state.ember_diagnostics.ember_dht_store_addr_ceiling =
-        state.ember_dht_protection.dropped_store_addr_ceiling() as u32;
-
     if let Some(version) = inbound.version_mismatch {
         state.ember_diagnostics.ember_dht_version_mismatch = state
             .ember_diagnostics
@@ -2117,9 +2232,10 @@ pub(super) async fn handle_ember_dht_message(
             );
         } else if let Some(publisher) = inbound.sender_id {
             let now_inst = std::time::Instant::now();
-            if state.ember_dht.can_accept_proxy_forward(publisher, now_inst) {
+            if state.ember_dht.can_accept_proxy_forward(publisher, from.ip(), now_inst) {
                 let key = forward.keyword_hash;
-                let targets = ember_overlay_publish_targets(state, key);
+                let targets =
+                    ember_overlay_publish_targets_within(state, key, EMBER_FORWARDED_TARGET_QUEUE_MAX);
                 let replica = forward.clone();
                 if let Some(publish_id) =
                     state.ember_publish.start_publish_to(forward, targets)
@@ -2304,8 +2420,21 @@ pub(super) async fn handle_ember_dht_message(
                             if adopt {
                                 set_external_ip(state, Some(v4));
                                 state.stats.external_ip = v4.to_string();
-                                state.nat_info.external_addr = Some(confirmed);
                             }
+                        }
+                    }
+                }
+                // The quorum is on the IP; behind a NAT that maps a port per
+                // destination the port is only the most common one, and
+                // punching or advertising it would aim peers nowhere. It can
+                // earn a quorum of its own on any later vote, so this is asked
+                // on every one until STUN or the votes have filled it in.
+                if state.nat_info.external_addr.is_none()
+                    && state.ember_observed_votes.confirmed_port_has_quorum()
+                {
+                    if let Some(confirmed) = state.ember_observed_votes.confirmed() {
+                        if state.external_ip.map(std::net::IpAddr::V4) == Some(confirmed.ip()) {
+                            state.nat_info.external_addr = Some(confirmed);
                         }
                     }
                 }

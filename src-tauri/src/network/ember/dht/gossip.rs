@@ -32,6 +32,7 @@
 //! probing junk costs only bandwidth while failing to join costs the overlay.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::EmberNodeId;
@@ -89,7 +90,7 @@ struct Introducer {
     /// Leads skipped since it was last allowed one, driving
     /// [`NOISY_SAMPLE_EVERY`].
     skipped: u32,
-    /// Last time it named a lead, for eviction.
+    /// Last time one of its leads was probed, for eviction.
     seen: Instant,
 }
 
@@ -126,6 +127,11 @@ impl Introducer {
 #[derive(Debug, Clone, Copy)]
 struct PendingLead {
     introducer: EmberNodeId,
+    /// The address the introducer named and the probe went to. The claim is
+    /// that *this* address is the node, so only a frame from it settles the
+    /// lead in the introducer's favour — the same ID speaking from elsewhere
+    /// says nothing about the address it was named at.
+    addr: SocketAddr,
     probed_at: Instant,
 }
 
@@ -190,12 +196,18 @@ impl GossipReputation {
         }
     }
 
-    /// Note that we have just probed `lead` on `introducer`'s word.
+    /// Note that we have just probed `lead` at `addr` on `introducer`'s word.
     ///
     /// Attribution starts at the probe, not at the naming: a lead we never
     /// probed can never answer, so counting it would charge an introducer for
     /// our own budget running out.
-    pub fn note_probe(&mut self, introducer: EmberNodeId, lead: EmberNodeId, now: Instant) {
+    pub fn note_probe(
+        &mut self,
+        introducer: EmberNodeId,
+        lead: EmberNodeId,
+        addr: SocketAddr,
+        now: Instant,
+    ) {
         self.introducers
             .entry(introducer)
             .or_insert_with(|| Introducer::new(now))
@@ -221,23 +233,33 @@ impl GossipReputation {
             lead,
             PendingLead {
                 introducer,
+                addr,
                 probed_at: now,
             },
         );
     }
 
-    /// A lead answered. Credits whoever named it, if anyone still has a claim.
-    pub fn note_answered(&mut self, lead: &EmberNodeId) {
-        let Some(entry) = self.pending.remove(lead) else {
+    /// `lead` spoke to us from `from`. Credits whoever named it, if anyone
+    /// still has a claim and `from` is the address the lead was named at.
+    ///
+    /// A frame from any other address leaves the claim pending, so the probe
+    /// still resolves on its own timeout: otherwise an introducer could name
+    /// real, active IDs at addresses that go nowhere and be credited whenever
+    /// those nodes happened to talk to us.
+    pub fn note_answered(&mut self, lead: &EmberNodeId, from: SocketAddr) {
+        let Some(entry) = self.pending.get(lead).copied().filter(|p| p.addr == from) else {
             return;
         };
+        self.pending.remove(lead);
         if let Some(record) = self.introducers.get_mut(&entry.introducer) {
             record.answered = record.answered.saturating_add(1);
             record.decay();
         }
     }
 
-    /// A probed lead never answered.
+    /// A probed lead never answered from the address it was named at. A no-op
+    /// for a lead with no claim pending, so it is safe to call for every
+    /// expired probe.
     pub fn note_silent(&mut self, lead: &EmberNodeId) {
         let Some(entry) = self.pending.remove(lead) else {
             return;
@@ -305,6 +327,11 @@ mod tests {
         EmberNodeId([n; 16])
     }
 
+    /// The address lead `n` is named and probed at.
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, n], 4000))
+    }
+
     /// Resolve `count` leads from one introducer, `answered` of them by
     /// answering. Every lead is distinct, since the pending map is keyed on it.
     fn resolve_batch(
@@ -316,10 +343,11 @@ mod tests {
     ) {
         let now = Instant::now();
         for i in 0..count {
-            let lead = id(first_lead.wrapping_add(i as u8));
-            rep.note_probe(introducer, lead, now);
+            let n = first_lead.wrapping_add(i as u8);
+            let lead = id(n);
+            rep.note_probe(introducer, lead, addr(n), now);
             if i < answered {
-                rep.note_answered(&lead);
+                rep.note_answered(&lead, addr(n));
             } else {
                 rep.note_silent(&lead);
             }
@@ -451,10 +479,43 @@ mod tests {
     #[test]
     fn a_lead_we_never_probed_is_charged_to_nobody() {
         let mut rep = GossipReputation::new();
-        rep.note_answered(&id(99));
+        rep.note_answered(&id(99), addr(99));
         rep.note_silent(&id(98));
         assert_eq!(rep.rationed_len(), 0);
         assert!(rep.should_probe(&id(1)));
+    }
+
+    /// Naming a real, active node at an address that goes nowhere must not
+    /// earn credit when that node talks to us from where it actually is.
+    #[test]
+    fn an_answer_from_another_address_does_not_credit_the_introducer() {
+        let mut rep = GossipReputation::new();
+        let now = Instant::now();
+        rep.note_probe(id(1), id(50), addr(50), now);
+
+        rep.note_answered(&id(50), addr(51));
+        assert_eq!(rep.introducers[&id(1)].answered, 0);
+        assert_eq!(
+            rep.pending_len(),
+            1,
+            "the claim stays open for the probe's own timeout to settle"
+        );
+
+        rep.note_silent(&id(50));
+        let record = rep.introducers[&id(1)];
+        assert_eq!((record.answered, record.silent), (0, 1));
+    }
+
+    /// The honest case the address check must not break.
+    #[test]
+    fn an_answer_from_the_named_address_credits_the_introducer() {
+        let mut rep = GossipReputation::new();
+        let now = Instant::now();
+        rep.note_probe(id(1), id(50), addr(50), now);
+        rep.note_answered(&id(50), addr(50));
+        let record = rep.introducers[&id(1)];
+        assert_eq!((record.answered, record.silent), (1, 0));
+        assert_eq!(rep.pending_len(), 0);
     }
 
     /// An outcome consumes its claim, so one probe cannot be counted twice.
@@ -462,7 +523,7 @@ mod tests {
     fn an_outcome_is_counted_once() {
         let mut rep = GossipReputation::new();
         let now = Instant::now();
-        rep.note_probe(id(1), id(50), now);
+        rep.note_probe(id(1), id(50), addr(50), now);
         assert_eq!(rep.pending_len(), 1);
         rep.note_silent(&id(50));
         rep.note_silent(&id(50));
@@ -483,7 +544,7 @@ mod tests {
         for i in 0..(MAX_PENDING_LEADS * 2) {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), now);
+            rep.note_probe(id(1), EmberNodeId(raw), addr(1), now);
         }
         assert!(rep.pending_len() <= MAX_PENDING_LEADS);
     }
@@ -502,13 +563,13 @@ mod tests {
         for i in 0..MAX_PENDING_LEADS {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), start);
+            rep.note_probe(id(1), EmberNodeId(raw), addr(1), start);
         }
         assert_eq!(rep.pending_len(), MAX_PENDING_LEADS);
 
         // The next lead it names is probed a moment later and goes silent.
         let later = start + Duration::from_secs(1);
-        rep.note_probe(id(1), id(99), later);
+        rep.note_probe(id(1), id(99), addr(99), later);
         rep.note_silent(&id(99));
 
         let record = rep.introducers[&id(1)];
@@ -528,12 +589,12 @@ mod tests {
     fn an_unresolved_probe_expires_without_a_verdict() {
         let mut rep = GossipReputation::new();
         let probed = Instant::now();
-        rep.note_probe(id(1), id(50), probed);
+        rep.note_probe(id(1), id(50), addr(50), probed);
         rep.prune(probed + PENDING_TTL + Duration::from_secs(1));
         assert_eq!(rep.pending_len(), 0);
 
         // And the late answer finds no claim to credit.
-        rep.note_answered(&id(50));
+        rep.note_answered(&id(50), addr(50));
         assert!(rep.should_probe(&id(1)));
     }
 
@@ -556,7 +617,7 @@ mod tests {
     fn a_silent_introducers_record_is_forgotten() {
         let mut rep = GossipReputation::new();
         let then = Instant::now();
-        rep.note_probe(id(1), id(50), then);
+        rep.note_probe(id(1), id(50), addr(50), then);
         rep.note_silent(&id(50));
         rep.prune(then + INTRODUCER_TTL + Duration::from_secs(1));
         assert_eq!(rep.rationed_len(), 0);

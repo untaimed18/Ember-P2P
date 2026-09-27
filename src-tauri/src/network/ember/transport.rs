@@ -1626,15 +1626,39 @@ impl EmberTransport {
         self.sessions.remove(&slot);
         self.staged_sessions.remove(&slot);
         self.deferred_ik.remove(&slot);
-        if matches!(
+        self.abandon_stalled_handshake(addr, remote_noise_pub, Instant::now());
+    }
+
+    /// Drop our IK handshake to this identity if it began no later than
+    /// `begun_by` and is still pending, together with what is queued behind it,
+    /// so the next frame for the peer starts a fresh one. Returns whether one
+    /// was dropped.
+    ///
+    /// An initiator never retransmits msg1, so a handshake whose msg1 or msg2
+    /// was lost holds the address's slot until the 30-second sweep in
+    /// [`Self::cleanup`], and anything sent in the meantime queues behind it
+    /// and is lost with it. `begun_by` lets a caller that gave up on one frame
+    /// avoid discarding a newer handshake it did not wait on. Only an IK leg
+    /// aimed at this identity is touched, for the reason given on
+    /// [`Self::remove_session_for`].
+    pub fn abandon_stalled_handshake(
+        &mut self,
+        addr: &SocketAddr,
+        remote_noise_pub: &[u8; 32],
+        begun_by: Instant,
+    ) -> bool {
+        let stalled = matches!(
             self.pending.get(addr),
             Some(PendingHandshake::IkInitiator {
                 remote_noise_pub: target,
+                created,
                 ..
-            }) if target == remote_noise_pub
-        ) {
+            }) if target == remote_noise_pub && *created <= begun_by
+        );
+        if stalled {
             self.pending.remove(addr);
         }
+        stalled
     }
 
     /// Drop every session and pending handshake. Used when the
@@ -4510,6 +4534,46 @@ mod tests {
         assert_eq!(
             bob.dispatch_incoming(&third, alice_addr).app_payloads.len(),
             1
+        );
+    }
+
+    /// An initiator never retransmits msg1, so once one is lost every later
+    /// frame for that peer queues behind a handshake that will not complete.
+    /// Abandoning it lets the next frame start a fresh one — but not a newer
+    /// handshake than the one the caller actually waited on.
+    #[test]
+    fn a_stalled_handshake_can_be_abandoned_for_a_fresh_one() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (_bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let waited_since = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock has run for a second");
+        assert!(matches!(
+            alice.prepare_outgoing(bob_addr, Some(&bob_pub), &[0xA1u8; 96]),
+            OutgoingResult::HandshakeStarted { .. }
+        ));
+        assert!(
+            matches!(
+                alice.prepare_outgoing(bob_addr, Some(&bob_pub), &[0xB2u8; 96]),
+                OutgoingResult::Queued
+            ),
+            "a retry queues behind the lost msg1"
+        );
+
+        assert!(
+            !alice.abandon_stalled_handshake(&bob_addr, &bob_pub, waited_since),
+            "a handshake begun after the caller started waiting is left alone"
+        );
+        assert!(alice.abandon_stalled_handshake(&bob_addr, &bob_pub, Instant::now()));
+        assert!(
+            matches!(
+                alice.prepare_outgoing(bob_addr, Some(&bob_pub), &[0xB2u8; 96]),
+                OutgoingResult::HandshakeStarted { .. }
+            ),
+            "the retry now sends a fresh msg1"
         );
     }
 

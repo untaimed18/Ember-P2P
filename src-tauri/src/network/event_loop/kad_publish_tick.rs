@@ -79,9 +79,16 @@ pub(in crate::network) async fn on_kad_publish_tick(
     // bootstrap contact:
     //
     //   * Ember on — otherwise we would not answer a DHT PING.
-    //   * `build_source_publish` returns None for an unreachable
-    //     firewalled node, which is exactly who should not be
-    //     listed as a bootstrap contact.
+    //   * Our UDP port takes unsolicited datagrams. A cold node reads
+    //     our address off the advert and bridge-pings it, so TCP
+    //     reachability does not make us joinable: a HighID node behind
+    //     filtered UDP cannot be joined through, and a LowID node listed
+    //     with a KAD buddy is still pinged at its own address. See
+    //     `ember_rendezvous_advert_reachable`.
+    //   * The advert is still an ordinary KAD source record, so the TCP
+    //     rules of `build_source_publish` apply on top: a TCP-firewalled
+    //     node with neither a KAD buddy nor `direct_udp_callback` gets no
+    //     record to publish, however open its UDP port is.
     //
     // Deliberately *not* gated on sharing files any more. Ember has
     // no hardcoded bootstrap seeds, so this key is the only way a
@@ -93,7 +100,12 @@ pub(in crate::network) async fn on_kad_publish_tick(
     let rendezvous_now = chrono::Utc::now().timestamp();
     let rendezvous_due = settings.ember_native_enabled
         && rendezvous_now.saturating_sub(state.ember_rendezvous_published_at)
-            > EMBER_RENDEZVOUS_REPUBLISH_SECS;
+            > EMBER_RENDEZVOUS_REPUBLISH_SECS
+        && ember_rendezvous_advert_reachable(
+            state.udp_fw_verified,
+            state.udp_firewalled,
+            ember_udp_reachable(state),
+        );
     if rendezvous_due && state.store_source_searches.len() < KADEMLIA_TOTAL_STORE_SRC {
         let key = kad::publish::ember_rendezvous_key();
         let already_publishing = state

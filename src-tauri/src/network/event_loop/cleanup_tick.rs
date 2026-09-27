@@ -45,8 +45,15 @@ pub(in crate::network) async fn on_cleanup_tick(
     // that needs no KAD at all — so in an eD2K-only session (which
     // never leaves `Disconnected`) they grew for the whole session.
     // Every step below is a no-op on empty KAD state.
+    let rendezvous_target = rendezvous_search_target(state);
     let (removed_sids, released_in_use) = state.search_manager.cleanup(120);
-    finalize_removed_searches(state, app_handle, &removed_sids, &released_in_use);
+    finalize_removed_searches(
+        state,
+        app_handle,
+        &removed_sids,
+        &released_in_use,
+        rendezvous_target,
+    );
     state.dht_store.cleanup_expired();
     // Same cadence for the Ember DHT's signed-record store. This is the
     // only periodic sweep of it, and being ungated matters: a store

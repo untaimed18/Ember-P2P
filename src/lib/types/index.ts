@@ -392,9 +392,10 @@ export interface EmberDiagnostics {
    *  and have not been yet. Persistently high means replication is falling
    *  behind its per-cycle budget. */
   ember_dht_republish_backlog: number;
-  /** Seconds since any Ember DHT frame arrived, or 0 if none ever has. Separates
-   *  "still joining" from "joined and quiet" from "stuck". */
-  ember_dht_seconds_since_inbound: number;
+  /** Seconds since any Ember DHT frame arrived, or null if none ever has (0 is
+   *  a frame this second). Separates "still joining" from "joined and quiet"
+   *  from "stuck". */
+  ember_dht_seconds_since_inbound: number | null;
   ember_dht_pings_sent: number;
   ember_dht_pings_received: number;
   ember_dht_pongs_received: number;
@@ -412,9 +413,14 @@ export interface EmberDiagnostics {
   ember_dht_stored_for_others_records: number;
   ember_dht_stores_received: number;
   ember_dht_find_values_received: number;
+  /** Single-record publish operations plus `STORE_BATCH` frames awaiting an
+   *  ack. A gauge of work in flight, not a record count: one batch carries
+   *  many records. */
   ember_dht_active_publishes: number;
   /** Maintenance loop (slice 6) counters. */
   ember_dht_refreshes: number;
+  /** Every automatic "does it answer" PING, not only the maintenance pass:
+   *  gossip-lead probes and full-bucket incumbent probes land here too. */
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
   /** Contacts moved to a replacement cache because the diversity limits tightened. */
@@ -466,9 +472,11 @@ export interface EmberDiagnostics {
   /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
-  ember_dht_waiting_buddy?: boolean;
+  ember_dht_waiting_buddy: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
+  /** Whether the three reachability flags above have been evaluated since diagnostics were last reset. */
+  ember_dht_reachability_known: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
@@ -583,6 +591,8 @@ export interface EmberDiagnostics {
   ember_dht_store_reject_proximity?: number;
   /** Verified inbound keyword records whose key no word in their own signed name hashes to. */
   ember_dht_keyword_key_off_name?: number;
+  /** Inbound records of a type this build does not know that were stored (not replicated onward). */
+  ember_dht_unknown_record_types?: number;
   /** Peers that have told us which wire versions they can decode. */
   ember_dht_version_advertisers?: number;
   /** Frames refused by the aggregate per-address STORE ceiling. */

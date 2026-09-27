@@ -128,10 +128,43 @@ pub(in crate::network) async fn on_ember_search_tick(
     let mut touched: HashSet<u32> = HashSet::new();
     for wire_id in stale {
         if let Some(req) = state.ember_dht_search_requests.remove(&wire_id) {
+            let failure = match req.handshake_to {
+                Some((addr, key)) if !state.ember_transport.has_live_session(&addr, &key) => {
+                    let query = state
+                        .ember_search
+                        .get(req.search_id)
+                        .and_then(|s| s.pending_query(req.per_search_req_id));
+                    // Judged against the table, at the address and key the
+                    // query was sent to: the shortlist's copy of a contact
+                    // learned from a `FOUND_NODE` never reads as verified, and
+                    // that answer's sender chose the address it gave.
+                    let verified = query
+                        .and_then(|(node, _)| state.ember_dht.contact_for(&node))
+                        .is_some_and(|c| c.is_verified() && c.addr == addr && c.noise_pub == key);
+                    let is_page = query.is_some_and(|(_, is_page)| is_page);
+                    if verified || is_page {
+                        // A retry is coming, and would otherwise queue behind the
+                        // same handshake until the transport's own sweep.
+                        let waited_since = req
+                            .deadline
+                            .checked_sub(EMBER_SEARCH_QUEUED_QUERY_TIMEOUT)
+                            .unwrap_or(now);
+                        state
+                            .ember_transport
+                            .abandon_stalled_handshake(&addr, &key, waited_since);
+                    }
+                    if verified {
+                        ember::dht::search::QueryFailure::TimedOut
+                    } else {
+                        ember::dht::search::QueryFailure::HandshakeNeverCompleted
+                    }
+                }
+                _ => ember::dht::search::QueryFailure::TimedOut,
+            };
             let failed = state
                 .ember_search
                 .get_mut(req.search_id)
-                .and_then(|search| search.mark_failed(req.per_search_req_id));
+                .and_then(|search| search.mark_failed_with(req.per_search_req_id, failure));
             // Also hold it against the table, or the same dead lead
             // seeds the next lookup and stalls that one too — but
             // only when the peer has actually gone quiet. A lookup
@@ -230,6 +263,14 @@ pub(in crate::network) async fn on_ember_search_tick(
 
     for (wire_id, node_id, sent_unix) in expired {
         state.ember_dht_maint_pings.remove(&wire_id);
+        // Silence is also the answer to "was this lead real?", so
+        // it is charged to whoever named it. Asked before the fault
+        // gate, which only concerns contacts the table still holds:
+        // a lead the table refused or has since dropped was probed
+        // all the same. A lead that answered from the address it
+        // was named at already settled its claim where the frame
+        // arrived, so this is a no-op for it.
+        state.ember_gossip_reputation.note_silent(&node_id);
         // A missing PONG is not evidence of a dead peer if the
         // peer has spoken to us since we asked. Every signed frame
         // refreshes `last_seen`, so a contact answering our
@@ -242,11 +283,6 @@ pub(in crate::network) async fn on_ember_search_tick(
         if !ember_ping_timeout_is_a_fault(last_seen, sent_unix) {
             continue;
         }
-        // Silence is also the answer to "was this lead real?", so
-        // it is charged to whoever named it. Only reached when the
-        // peer has said nothing since we asked — a lead that spoke
-        // was already credited where its frame arrived.
-        state.ember_gossip_reputation.note_silent(&node_id);
         fault_ember_contact(state, &node_id, "unresponsive");
     }
 
@@ -682,12 +718,11 @@ pub(in crate::network) async fn on_ember_search_tick(
             if gathered < cursor + threshold {
                 continue;
             }
-            let Some(records) = state.ember_search.get(search_id).map(|s| {
-                s.results[cursor..]
-                    .iter()
-                    .map(|r| r.data.clone())
-                    .collect::<Vec<_>>()
-            }) else {
+            let Some(records) = state
+                .ember_search
+                .get(search_id)
+                .map(|s| s.results[cursor..].to_vec())
+            else {
                 continue;
             };
             let Some(kw) = state.ember_keyword_searches.get_mut(&search_id) else {

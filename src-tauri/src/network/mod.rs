@@ -109,7 +109,7 @@ use self::browse::{
 use self::command::handle_command;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,
-    EmberPublishAttempts, EmberPublishKind, EmberPublishPassStats, EmberRecordRef,
+    EmberProxyBuddyPacer, EmberPublishAttempts, EmberPublishKind, EmberPublishPassStats, EmberRecordRef,
     EMBER_BATCH_ACK_TIMEOUT, EMBER_BATCH_QUEUE_MAX, EMBER_FLUSH_INTERVAL,
     EMBER_MAX_BATCH_FRAMES_PER_PEER, EMBER_PUBLISH_MAX_ATTEMPTS,
     EMBER_STORE_RECORDS_PER_PEER_PER_MIN, K_EMBER_REPLICAS,
@@ -737,6 +737,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ember_highwater_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ember_source_address_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache::new(),
         ember_nodes_file: ember::dht::bootstrap::NodesFileState::Unread,
         external_ip: None,
@@ -892,6 +894,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_rendezvous_empty_streak: 0,
         ember_announced_at: HashMap::new(),
         ember_publish_unplaced: HashMap::new(),
+        ember_publish_placed: HashSet::new(),
         ember_publish_attempts: HashMap::new(),
         ember_publish_pass: EmberPublishPassStats::default(),
         ember_batch_publish: EmberBatchPublisher::default(),
@@ -902,6 +905,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_rearmed_at: None,
         ember_last_overlay_contacts: 0,
         ember_empty_rearmed_at: 0,
+        ember_maint_last_run: None,
+        ember_stale_purge_held_until: 0,
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
         ember_publish_target_lookups: HashMap::new(),
@@ -909,6 +914,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
         ember_reach_external_ip: None,
+        ember_source_address: EmberSourceAddress::default(),
+        ember_source_address_dirty: false,
         shares_browsed_seen: HashMap::new(),
             ember_kad_bridge_attempted: HashMap::new(),
         ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
@@ -1013,6 +1020,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_source_injections: Vec::new(),
         ember_pending_callback_connects: Vec::new(),
         ember_pending_proxy_overlay: HashMap::new(),
+        ember_proxy_buddies: EmberProxyBuddyPacer::default(),
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_history_sync_times: HashMap::new(),
@@ -1155,34 +1163,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 );
             }
             Ok(Err(e)) => {
-                // A file we cannot parse would otherwise wedge saving forever:
-                // `ember_nodes_loaded` stays false on every launch, so the
-                // shrink guard refuses every write and the node can never
-                // persist a contact again. Quarantine it once — a version
-                // downgrade, a corrupt header or an over-large file are all
-                // permanent for this build — and carry on as if the file had
-                // been absent. The truncation path already keeps a dated copy
-                // this way.
-                warn!("Failed to load nodes_ember.dat: {e}");
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let quarantine = nodes_ember_path.with_extension(format!("dat.unreadable.{ts}"));
-                match std::fs::rename(&nodes_ember_path, &quarantine) {
-                    Ok(()) => {
-                        state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
-                        warn!(
-                            "Moved the unreadable nodes_ember.dat aside to {} so this node can \
-                             remember peers again",
-                            quarantine.display()
-                        );
-                    }
-                    Err(e) => warn!(
-                        "Could not move the unreadable nodes_ember.dat aside ({e}); peer \
-                         persistence stays disabled until it is removed"
-                    ),
-                }
+                // A corrupt file would otherwise wedge saving forever:
+                // `ember_nodes_file` stays `Unread` on every launch, so the
+                // save guard refuses every write and the node can never
+                // persist a contact again. A newer build's file or a failed
+                // read is left alone and stays guarded instead.
+                state.ember_nodes_file =
+                    ember::dht::bootstrap::settle_unloadable_nodes(&nodes_ember_path, &e);
             }
             // A panicked or cancelled task says nothing about the file, so the
             // guard stays armed and the next launch tries again.
@@ -1200,6 +1187,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     state.ember_verified_highwater =
         load_ember_verified_highwater(&ember_highwater_path(&data_dir));
+    state.ember_source_address = load_ember_source_address(&ember_source_address_path(&data_dir));
 
     // Carry the record store across the restart too. Every record is re-verified
     // and re-dated on the way in, so anything that expired while we were closed

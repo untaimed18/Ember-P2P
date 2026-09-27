@@ -1,6 +1,6 @@
-//! The Ember refresh tick: when the advertised Ember payload is dirty, prunes
-//! stale peers and Noise keys and rebuilds the exchange payload (AICH roots,
-//! relay attestation, known peers).
+//! The Ember refresh tick: prunes stale peers and Noise keys every tick, and
+//! when the advertised Ember payload is dirty rebuilds the exchange payload
+//! (AICH roots, relay attestation, known peers).
 
 use super::*;
 
@@ -17,6 +17,9 @@ pub(in crate::network) async fn on_ember_refresh_tick(
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
 ) {
+    // Ahead of the dirty check: these caches age on the clock, and a node that
+    // only seeds or only searches never dirties the payload.
+    prune_ember_peer_caches(state, transfer_manager, local_index);
     if !state.ember_payload_dirty {
         return;
     }
@@ -200,62 +203,6 @@ pub(in crate::network) async fn on_ember_refresh_tick(
         file_entries
     };
 
-    // Drop entries older than `KNOWN_EMBER_PEER_TTL` before
-    // building the wire list so we never advertise a peer
-    // we haven't heard from in a day. Cheap O(N) sweep — N
-    // is hard-capped at MAX_KNOWN_EMBER_PEERS = 500. The
-    // sibling Noise-key cache uses the same TTL so prune
-    // it on the same cadence.
-    let pruned_before = state.known_ember_peers.len();
-    prune_stale_ember_peers(&mut state.known_ember_peers);
-    prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
-    prune_stale_ember_peers(&mut state.ember_keyless_peers);
-    // Keep a session contact while it is still talking to us, not
-    // merely while one of the two sibling caches remembers it.
-    // Those are refreshed by `note_connected_ember_peer` on an eD2K
-    // introduction, so a session that stays up longer than the TTL
-    // without reconnecting used to lose its pin — and
-    // `ember_session_introduced` then refuses to re-learn it from
-    // the signed frames the peer is still sending, which silently
-    // drops the LAN publisher this pin exists to reach.
-    // `sender_contact` stamps `last_seen` on every signed frame, so
-    // an active peer now renews its own entry.
-    let session_contact_cutoff = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(KNOWN_EMBER_PEER_TTL.as_secs())
-        as i64;
-    state
-        .ember_session_dht_contacts
-        .retain(|(ip, port), contact| {
-            contact.last_seen > session_contact_cutoff
-                || state.ember_keyless_peers.contains_key(&(*ip, *port))
-                || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
-        });
-    // The bridge's "already attempted" set has no TTL of its own;
-    // bound it to the two caches it mirrors. Once a peer ages out
-    // of both (and is later re-learned) we want to be able to
-    // bridge-ping it again, and this also stops the set growing
-    // without limit over a long session. Both caches must be
-    // consulted — retaining against the Noise keys alone would
-    // evict every Noise_XX peer immediately and re-ping it on the
-    // very next tick.
-    state.ember_kad_bridge_attempted.retain(|key, _| {
-        state.ember_noise_keys.contains_key(key)
-            || state.ember_keyless_peers.contains_key(key)
-    });
-    prune_ember_content_hashes(state, transfer_manager, local_index);
-    let pruned_after = state.known_ember_peers.len();
-    if pruned_after != pruned_before {
-        state.stats.ember_peers = pruned_after as u32;
-        tracing::debug!(
-            "Pruned {} stale Ember peer(s) (now {})",
-            pruned_before - pruned_after,
-            pruned_after
-        );
-    }
-
     // Build peer discovery list from previously-discovered peers
     // (we don't have IP:port for session keys — they're ember
     // hashes — so the EPX peer section is sourced entirely from
@@ -308,4 +255,67 @@ pub(in crate::network) async fn on_ember_refresh_tick(
     *shared_ember_payload.write().await = Arc::new(payload);
     ember_payload_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.ember_payload_dirty = false;
+}
+
+fn prune_ember_peer_caches(
+    state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
+) {
+    // Drop entries older than `KNOWN_EMBER_PEER_TTL` so we never
+    // advertise a peer we haven't heard from in a day. Cheap O(N)
+    // sweep — N is hard-capped at MAX_KNOWN_EMBER_PEERS = 500. The
+    // sibling Noise-key cache uses the same TTL so prune it on the
+    // same cadence.
+    let pruned_before = state.known_ember_peers.len();
+    prune_stale_ember_peers(&mut state.known_ember_peers);
+    prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
+    prune_stale_ember_peers(&mut state.ember_keyless_peers);
+    // Keep a session contact while it is still talking to us, not
+    // merely while one of the two sibling caches remembers it.
+    // Those are refreshed by `note_connected_ember_peer` on an eD2K
+    // introduction, so keyed on them a session that stays up longer
+    // than the TTL without reconnecting would lose its pin — and
+    // `ember_session_introduced` then refuses to re-learn it from
+    // the signed frames the peer is still sending, which silently
+    // drops the LAN publisher this pin exists to reach.
+    // `sender_contact` stamps `last_seen` on every signed frame, so
+    // an active peer renews its own entry.
+    let session_contact_cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_sub(KNOWN_EMBER_PEER_TTL.as_secs())
+        as i64;
+    state
+        .ember_session_dht_contacts
+        .retain(|(ip, port), contact| {
+            contact.last_seen > session_contact_cutoff
+                || state.ember_keyless_peers.contains_key(&(*ip, *port))
+                || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
+        });
+    // The bridge's "already attempted" set has no TTL of its own;
+    // bound it to the two caches it mirrors. Once a peer ages out
+    // of both (and is later re-learned) we want to be able to
+    // bridge-ping it again, and this also stops the set growing
+    // without limit over a long session. Both caches must be
+    // consulted — retaining against the Noise keys alone would
+    // evict every Noise_XX peer immediately and re-ping it on the
+    // very next tick.
+    state.ember_kad_bridge_attempted.retain(|key, _| {
+        state.ember_noise_keys.contains_key(key)
+            || state.ember_keyless_peers.contains_key(key)
+    });
+    prune_ember_content_hashes(state, transfer_manager, local_index);
+    let pruned_after = state.known_ember_peers.len();
+    if pruned_after != pruned_before {
+        state.stats.ember_peers = pruned_after as u32;
+        // The advertised peer list is built from this map.
+        state.ember_payload_dirty = true;
+        tracing::debug!(
+            "Pruned {} stale Ember peer(s) (now {})",
+            pruned_before - pruned_after,
+            pruned_after
+        );
+    }
 }

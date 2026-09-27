@@ -203,11 +203,11 @@ mod tests {
             "the per-bucket subnet cap must not cancel the per-IP allowance"
         );
         // But not so loose that a cold-start adversary can hold a large share of
-        // one bucket for the life of the process — tightening never evicts what an
-        // earlier tier admitted.
+        // one bucket for as long as the table takes to grow enough for
+        // `enforce_scale_quotas` to demote the excess.
         assert!(
             boot.max_contacts_per_subnet_per_bucket() <= K_BUCKET_SIZE / 4,
-            "a single /24 must not be able to hold a quarter of a bucket"
+            "a single /24 must not be able to hold more than a quarter of a bucket"
         );
     }
 }

@@ -82,9 +82,11 @@ const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
 /// in the dedup set and a signature check either way, and a peer that sends
 /// nothing but junk would never reach its own limit.
 ///
-/// A repeat of a blob this search already holds is the one thing not charged,
-/// because the responder is not the only reason one arrives: a page resuming at
-/// a record it passed over re-sends the tail of the previous page by design.
+/// A repeat is the one thing not charged — of a blob this search already holds,
+/// or of one it already turned away from the same node — because the responder
+/// is not the only reason one arrives: a page resuming at a record it passed
+/// over re-sends the tail of the previous page by design. A record the per-file
+/// share turns away is charged the first time, like any other offer.
 /// Duplicates cannot fill the result budget this cap protects — dedup drops
 /// them before `MAX_SEARCH_RESULTS` sees them — so charging for them only ever
 /// cut a well-stocked storer off part-way through its own key.
@@ -94,6 +96,42 @@ const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
 /// the shortlist is exhausted.
 const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 
+/// Keyword records naming one file and one digest that a node may contribute
+/// to a search on its own word.
+///
+/// A keyword row's availability and complete-sources count the distinct
+/// publishers behind it, and its digest is the one most of them name. A record
+/// proves only the key it carries and keys are free, so without this one
+/// responder could return seventy-five records for a popular file, each signed
+/// by a fresh key, and decide both: lift a fake to the top of a list sorted by
+/// sources, or out-vote the file's real BLAKE3 digest so the download a click
+/// starts fails its content check.
+///
+/// Per digest, with "names none" a digest of its own, because a storer returns
+/// what it holds in its own order and anyone may STORE to it. Shared across the
+/// file, the share would go to whichever records come first, so records planted
+/// on an honest storer under a fake digest could fill it and leave the real
+/// digest's publishers nothing. Per digest, each claim a storer holds gets its
+/// own share. What one node can add to a row by inventing digests is bounded
+/// where the row is built, which counts only the publishers that agree with it.
+///
+/// A record the share turns away is held rather than dropped — see
+/// [`IterativeSearch::turned_away`] — and taken once a node in another /24
+/// returns the same blob, or once the walk ends with the node that offered it
+/// the only one to have returned a record. Our own store's seed is held to the
+/// same share, as one more responder.
+pub(super) const MAX_PUBLISHERS_PER_FILE_PER_NODE: usize = 5;
+
+/// Turned-away records one node may unlock per file and digest by returning a
+/// second copy.
+///
+/// A second copy is taken as independent word, but anyone may STORE to an
+/// honest node, so a record planted there is "confirmed" by it. Bounding what
+/// one confirmer unlocks keeps that linear in the storers an attacker reaches,
+/// while an honest popular file answered by two storers still shows most of
+/// its publishers.
+const MAX_CONFIRMED_PER_FILE_PER_NODE: usize = 4 * MAX_PUBLISHERS_PER_FILE_PER_NODE;
+
 /// How many times one node may be queried within a single search.
 ///
 /// A timeout is not proof a node is gone — it may have been mid-handshake,
@@ -101,7 +139,27 @@ const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 /// failed forever on the first miss threw away real peers on lossy paths. Two
 /// is the smallest value that tolerates a single loss, and it bounds the extra
 /// work at one repeat query per node so a search still converges.
+///
+/// A contact nothing has verified gets one, when its handshake never
+/// completed — see [`QueryFailure::HandshakeNeverCompleted`].
 const MAX_QUERY_ATTEMPTS: u8 = 2;
+
+/// Shortlist entries one responder's contacts may occupy.
+///
+/// The node IDs inside a `FOUND_NODE` are the sender's to invent, so without a
+/// quota one peer answering the first round could fill the top of the shortlist
+/// with IDs closer than every real node, at addresses nobody answers. The walk
+/// dispatches those first and each waits out the twelve-second queued-query
+/// budget behind a handshake that never completes, so seventeen of them, α at a
+/// time, spend most of `SEARCH_TIMEOUT_SECS` — all of it, at two attempts —
+/// before a single honest hop is taken.
+///
+/// A bucket's worth spread across one round of α answers is k/α each, so a
+/// round of honest answers still fills the shortlist while one liar holds at
+/// most a fifth of it. The closest contacts a responder names are the ones
+/// kept. Seeds from our own table and pinned session peers were referred by
+/// nobody and are exempt.
+const MAX_SHORTLIST_ENTRIES_PER_REFERRER: usize = K_BUCKET_SIZE.div_ceil(ALPHA);
 
 /// Firsthand session peers [`IterativeSearch::seed_extra_contacts`] may pin
 /// onto one shortlist.
@@ -120,9 +178,11 @@ const MAX_PINNED_EXTRA_CONTACTS: usize = super::K_BUCKET_SIZE / 2;
 ///
 /// One round's worth: with [`ALPHA`] queries outstanding, this many answers in a
 /// row that fail to improve on the best node we have seen means the frontier has
-/// stopped moving. Kademlia's own termination rule is that a lookup ends once it
-/// has heard from the k closest nodes it knows of, and continuing past that is
-/// spending round trips to re-learn what we already have.
+/// stopped moving. That is necessary but not sufficient. Kademlia's own
+/// termination rule is that a lookup ends once it has heard from the k closest
+/// nodes it knows of, which [`IterativeSearch::closest_have_responded`] checks;
+/// continuing past that is spending round trips to re-learn what we already
+/// have.
 ///
 /// Deliberately not applied to `FIND_VALUE`. There, every extra node asked is
 /// another chance at a record the closer ones did not hold, so recall is worth
@@ -274,6 +334,18 @@ pub enum QueryFailure {
     /// address, unusable `noise_pub`. No wire request is registered for it, so
     /// no deadline exists that could expire and re-drive the walk.
     NotSent,
+    /// The query waited behind a Noise handshake that had still not completed
+    /// when its deadline passed, to a contact our routing table does not hold
+    /// verified at that address and key. That is no evidence anything lives at
+    /// the address at all, and a second attempt would buy an invented contact
+    /// another full handshake budget, so it is not retried.
+    ///
+    /// Not for a contact the table does hold verified: the shortlist's own copy
+    /// cannot say, since every `FOUND_NODE` contact arrives with `last_seen: 0`.
+    /// The caller reports that case as [`Self::TimedOut`], after dropping the
+    /// stalled handshake — an initiator never retransmits msg1, so a retry
+    /// queued behind it would only wait out the same handshake.
+    HandshakeNeverCompleted,
 }
 
 /// State of a node in the search shortlist.
@@ -297,6 +369,10 @@ struct ShortlistEntry {
     /// Live eD2K-session peers. Kept past the k-cap and queried first so a
     /// connected publisher is asked even when it is not XOR-closest to the key.
     pinned: bool,
+    /// The responder whose `FOUND_NODE` named this contact, charged against
+    /// [`MAX_SHORTLIST_ENTRIES_PER_REFERRER`]. `None` for a seed from our own
+    /// table or a pinned session peer.
+    referrer: Option<EmberNodeId>,
 }
 
 /// Type of iterative search.
@@ -370,11 +446,17 @@ impl PendingQuery {
 #[derive(Debug, Clone)]
 pub struct SearchResultRecord {
     pub data: Vec<u8>,
-    /// Which node returned this record. Recorded for provenance in
-    /// diagnostics and `Debug` output; callers trust the record's own
-    /// publisher signature rather than the peer that relayed it.
-    #[allow(dead_code)]
+    /// The first node that returned this record — our own id for a record
+    /// seeded from the local store.
+    ///
+    /// The publisher signature proves the record is intact and names the key
+    /// that signed it, but keys are free, so it says nothing about how many
+    /// parties stand behind a claim. Consumers that count publishers use this
+    /// to bound what one responder can vouch for.
     pub from_node: EmberNodeId,
+    /// A second node that returned the identical blob, if any. A record held
+    /// by two responders is not one responder's word.
+    pub confirmed_by: Option<EmberNodeId>,
 }
 
 /// An active iterative search.
@@ -399,6 +481,45 @@ pub struct IterativeSearch {
     /// [`MAX_SEARCH_RESULTS`] with copies of a handful of files and completed
     /// the search, hiding everything the later hops would have found.
     seen_results: HashSet<[u8; 32]>,
+    /// Where in `results` each held blob sits, so a repeat from another node
+    /// can be noted as [`SearchResultRecord::confirmed_by`].
+    result_slots: HashMap<[u8; 32], usize>,
+    /// Keyword records taken per `(node, file, digest)`, against
+    /// [`MAX_PUBLISHERS_PER_FILE_PER_NODE`].
+    publishers_taken: HashMap<(EmberNodeId, [u8; 16], [u8; 32]), usize>,
+    /// Authentic records the per-file share turned away, by blob digest, with
+    /// the node that offered them and that node's /24 (none for our own store).
+    ///
+    /// Not in `seen_results`, so another node's copy is still taken — and taken
+    /// as confirmed, since two nodes returned it — provided it comes from a
+    /// different /24: a second keypair on the same host is not a second word.
+    /// A repeat from the node that offered it is free, like any other repeat,
+    /// because a page that resumes mid-window re-sends it by design. Bounded by
+    /// the offer allowances remote entries were charged to, and our own store's
+    /// entries by [`MAX_LOCAL_SEED_RESULTS`].
+    turned_away: HashMap<[u8; 32], (EmberNodeId, Option<u64>)>,
+    /// Turned-away records each node has unlocked by returning a second copy,
+    /// per file and digest, against [`MAX_CONFIRMED_PER_FILE_PER_NODE`].
+    confirmations_taken: HashMap<(EmberNodeId, [u8; 16], [u8; 32]), usize>,
+    /// The /24 each node answered from, recorded when it answers so a record's
+    /// first offerer can still be told apart after the shortlist trims it.
+    /// Bounded by the nodes that answer.
+    responder_subnets: HashMap<EmberNodeId, u64>,
+    /// The bytes of turned-away records, kept only for the one node whose
+    /// records could still be taken without a second copy: the sole remote node
+    /// to have contributed anything, or our own store while no remote node has.
+    /// Emptied the moment that stops being true. See
+    /// [`IterativeSearch::take_sole_contributors_held`].
+    sole_held: Vec<([u8; 32], Vec<u8>)>,
+    /// Remote nodes that have handed this search at least one authentic record,
+    /// taken, turned away, or a copy of one already held.
+    contributors: HashSet<EmberNodeId>,
+    /// The id our own store's seed is attributed to, once it has seeded.
+    local_node: Option<EmberNodeId>,
+    /// Authentic records each node offered that the per-file share turned away.
+    /// Counted toward the page rate only while they could still be taken — see
+    /// [`IterativeSearch::per_node_page_allowance`].
+    held_delivered: HashMap<EmberNodeId, usize>,
     /// Blobs each node has offered, against [`MAX_RESULTS_PER_NODE`]. Bounded
     /// by the number of nodes that answer, which the shortlist bounds.
     offered_results: HashMap<EmberNodeId, usize>,
@@ -492,6 +613,19 @@ fn budget_identity(data: &[u8], blob_digest: &[u8; 32]) -> [u8; 16] {
     identity
 }
 
+/// The share a keyword record is charged to under
+/// [`MAX_PUBLISHERS_PER_FILE_PER_NODE`]: the file it names and the digest it
+/// claims for it. `None` for every other record type, which has no such share.
+pub(super) fn publisher_share(data: &[u8]) -> Option<([u8; 16], [u8; 32])> {
+    if data.first() != Some(&super::publish::RECORD_TYPE_KEYWORD) {
+        return None;
+    }
+    Some((
+        super::publish::file_hash_from_record_data(data)?,
+        super::publish::ember_digest_from_record_data(data)?,
+    ))
+}
+
 impl IterativeSearch {
     fn new(
         id: u32,
@@ -510,6 +644,7 @@ impl IterativeSearch {
                     distance,
                     state: NodeState::Pending,
                     pinned: false,
+                    referrer: None,
                 }
             })
             .collect();
@@ -524,6 +659,15 @@ impl IterativeSearch {
             shortlist,
             results: Vec::new(),
             seen_results: HashSet::new(),
+            result_slots: HashMap::new(),
+            publishers_taken: HashMap::new(),
+            turned_away: HashMap::new(),
+            confirmations_taken: HashMap::new(),
+            responder_subnets: HashMap::new(),
+            sole_held: Vec::new(),
+            contributors: HashSet::new(),
+            local_node: None,
+            held_delivered: HashMap::new(),
             offered_results: HashMap::new(),
             delivered_results: HashMap::new(),
             queried: HashSet::new(),
@@ -548,6 +692,121 @@ impl IterativeSearch {
     /// Records held that came from the network rather than our own store.
     fn remote_blobs(&self) -> usize {
         self.results.len().saturating_sub(self.seeded_count)
+    }
+
+    /// Note that `node` handed this search an authentic record.
+    ///
+    /// Held bytes are only worth keeping while one node's word is all there is,
+    /// so the first remote contributor ends our own store's claim to them and a
+    /// second ends the first's.
+    fn note_contributor(&mut self, node: EmberNodeId) {
+        if self.local_node == Some(node) {
+            return;
+        }
+        if self.contributors.insert(node) {
+            self.sole_held = Vec::new();
+        }
+    }
+
+    /// The /24 (IPv6 /48) a responding node answered from, or `None` for our own
+    /// store and for a node the shortlist no longer holds.
+    fn node_subnet(&self, node: &EmberNodeId) -> Option<u64> {
+        if self.local_node == Some(*node) {
+            return None;
+        }
+        self.responder_subnets.get(node).copied().or_else(|| {
+            self.shortlist
+                .iter()
+                .find(|e| e.contact.node_id == *node)
+                .map(|e| e.contact.subnet_key())
+        })
+    }
+
+    /// Whether `node`'s turned-away records could still be taken without a
+    /// second node's copy — see [`Self::take_sole_contributors_held`].
+    ///
+    /// Our own store is one more responder here as everywhere else: once it
+    /// has seeded a record under the key, a single remote node is no longer the
+    /// only word.
+    fn holds_sole_word(&self, node: &EmberNodeId) -> bool {
+        if self.local_node == Some(*node) {
+            self.contributors.is_empty()
+        } else {
+            self.seeded_count == 0
+                && self.contributors.len() == 1
+                && self.contributors.contains(node)
+        }
+    }
+
+    /// Hold an authentic record `node`'s per-file share turned away. See
+    /// [`Self::turned_away`].
+    fn hold_turned_away(&mut self, node: EmberNodeId, blob_digest: [u8; 32], data: Vec<u8>) {
+        self.note_contributor(node);
+        let subnet = self.node_subnet(&node);
+        self.turned_away.insert(blob_digest, (node, subnet));
+        *self.held_delivered.entry(node).or_insert(0) += 1;
+        if self.holds_sole_word(&node) {
+            self.sole_held.push((blob_digest, data));
+        }
+    }
+
+    /// Take what the per-file share turned away from the only node to have
+    /// returned an authentic record, now the walk has nobody left to ask.
+    /// Nodes that answered with contacts only, or not at all, are not a
+    /// second word.
+    ///
+    /// The share stops one node's word outweighing another's. With a single
+    /// node answering there is no other word, and holding it to five
+    /// publishers a file just under-reports every popular file on the overlays
+    /// where that happens: a young one, where one storer holds a keyword, or a
+    /// keyword whose other replicas have gone. The digest is not at stake —
+    /// pinning one needs two responders whatever this admits.
+    fn take_sole_contributors_held(&mut self) {
+        if self.search_type != SearchType::FindValue || self.sole_held.is_empty() {
+            return;
+        }
+        let node = match self.contributors.len() {
+            0 => match self.local_node {
+                Some(local) => local,
+                None => return,
+            },
+            1 => match self.contributors.iter().next() {
+                Some(&only) => only,
+                None => return,
+            },
+            _ => return,
+        };
+        if !self.holds_sole_word(&node) {
+            self.sole_held = Vec::new();
+            return;
+        }
+        let seeded = self.local_node == Some(node);
+        for (blob_digest, data) in std::mem::take(&mut self.sole_held) {
+            let full = if seeded {
+                self.seeded_count >= MAX_LOCAL_SEED_RESULTS
+            } else {
+                self.value_budget_full()
+            };
+            if full {
+                break;
+            }
+            if self.turned_away.remove(&blob_digest).is_none()
+                || !self.seen_results.insert(blob_digest)
+            {
+                continue;
+            }
+            if seeded {
+                self.seeded_count = self.seeded_count.saturating_add(1);
+            } else {
+                self.budget_spent.insert(budget_identity(&data, &blob_digest));
+            }
+            self.result_slots.insert(blob_digest, self.results.len());
+            self.results.push(SearchResultRecord {
+                data,
+                from_node: node,
+                confirmed_by: None,
+            });
+        }
     }
 
     /// Whether a `FIND_VALUE` has collected everything it set out to collect.
@@ -636,12 +895,33 @@ impl IterativeSearch {
     /// A node the share cuts off is parked rather than dropped, so it gets the
     /// rest of the budget once whatever was binding it has finished — see
     /// [`Self::parked_pages`].
+    ///
+    /// The upper tier is for recall, so a node must also have been offering
+    /// records the search can take: see [`Self::offers_mostly_admissible`].
     fn per_node_result_allowance(&self, node: &EmberNodeId) -> usize {
-        if self.share_binds(node) {
+        if self.share_binds(node) || !self.offers_mostly_admissible(node) {
             MAX_RESULTS_PER_NODE
         } else {
             MAX_SEARCH_RESULTS
         }
+    }
+
+    /// Whether at least half of what `node` has offered this search could be
+    /// taken: authentic, and within its per-file share or held where
+    /// [`Self::take_sole_contributors_held`] can still take it.
+    ///
+    /// Junk and turned-away records are charged to the offer allowance, which
+    /// bounds a node's pages at that allowance's worth of them. Granting the
+    /// upper tier regardless would let a node answering nothing but a hot file's
+    /// minted publishers be paged on through it once the walk ran out of other
+    /// nodes, for records none of which are taken.
+    fn offers_mostly_admissible(&self, node: &EmberNodeId) -> bool {
+        let offered = self.offered_results.get(node).copied().unwrap_or(0);
+        let mut admissible = self.delivered_results.get(node).copied().unwrap_or(0);
+        if self.holds_sole_word(node) {
+            admissible += self.held_delivered.get(node).copied().unwrap_or(0);
+        }
+        admissible.saturating_mul(2) >= offered
     }
 
     /// Page follow-ups one node may be queued, on the same two tiers — but the
@@ -665,6 +945,12 @@ impl IterativeSearch {
     /// carrying the target's sixteen bytes is free to produce, and charging it
     /// to the offer cap — which is right, since checking it costs us either way
     /// — meant it also bought the tier the cap exists to ration.
+    ///
+    /// Records the per-file share turned away count as delivered only while
+    /// [`Self::take_sole_contributors_held`] could still take them. A lone storer
+    /// of a hot file then earns the pages to hand the file over; a node among
+    /// others, whose turned-away records only a second copy can admit, does not
+    /// earn pages to send more of them.
     fn per_node_page_allowance(&self, node: &EmberNodeId) -> u8 {
         if self.share_binds(node) {
             return MAX_PAGES_PER_NODE;
@@ -676,7 +962,10 @@ impl IterativeSearch {
         // Pages this node has actually answered: the opening query, then one per
         // follow-up queued.
         let served = usize::from(queued).saturating_add(1);
-        let delivered = self.delivered_results.get(node).copied().unwrap_or(0);
+        let mut delivered = self.delivered_results.get(node).copied().unwrap_or(0);
+        if self.holds_sole_word(node) {
+            delivered += self.held_delivered.get(node).copied().unwrap_or(0);
+        }
         if delivered >= served.saturating_mul(MIN_RECORDS_PER_PAGE_TO_CONTINUE) {
             MAX_PAGES_PER_NODE_EXHAUSTED
         } else {
@@ -928,6 +1217,7 @@ impl IterativeSearch {
                 distance,
                 state: NodeState::Pending,
                 pinned: true,
+                referrer: None,
             });
             added += 1;
         }
@@ -944,7 +1234,7 @@ impl IterativeSearch {
         &mut self,
         request_id: u32,
         from_id: &EmberNodeId,
-        closer_nodes: Vec<EmberContact>,
+        mut closer_nodes: Vec<EmberContact>,
         mut value_records: Vec<Vec<u8>>,
         mut page: Option<ValuePage>,
     ) -> ResponseOutcome {
@@ -1016,6 +1306,10 @@ impl IterativeSearch {
         // shortlist states this reads cannot change inside it (the responder was
         // marked above, and nothing here queries anyone).
         let offer_allowance = self.per_node_result_allowance(from_id);
+        let from_subnet = self.node_subnet(from_id);
+        if let Some(subnet) = from_subnet.filter(|_| value_answer_expected) {
+            self.responder_subnets.insert(*from_id, subnet);
+        }
         let mut cut_short = false;
         let mut delivered_now = 0usize;
         for data in value_records {
@@ -1046,7 +1340,7 @@ impl IterativeSearch {
             // `MAX_SEARCH_RESULTS` is what let a well-replicated record end
             // the search before the closer hops were reached.
             let blob_digest = *blake3::hash(&data).as_bytes();
-            if !self.seen_results.insert(blob_digest) {
+            if self.seen_results.contains(&blob_digest) {
                 // And before the *allowance*, because a page that resumes at a
                 // record it passed over deliberately re-sends everything
                 // between that record and the end of the previous page. Those
@@ -1055,9 +1349,60 @@ impl IterativeSearch {
                 // already had, cutting it off before it ran out of either pages
                 // or key — so the searcher saw fewer *distinct* records than
                 // paging exists to reach.
+                if let Some(&slot) = self.result_slots.get(&blob_digest) {
+                    let first = self.results[slot].from_node;
+                    let independent = self.local_node == Some(first)
+                        || matches!(
+                            (self.node_subnet(&first), from_subnet),
+                            (Some(a), Some(b)) if a != b
+                        );
+                    let held = &mut self.results[slot];
+                    if independent && held.from_node != *from_id && held.confirmed_by.is_none() {
+                        held.confirmed_by = Some(*from_id);
+                    }
+                    self.note_contributor(*from_id);
+                }
                 continue;
             }
+            // A record another node's share turned away is taken on this second
+            // copy, and charged to no one's share: it is not one node's word.
+            // Only from another /24: a copy from the same block is an offer
+            // that takes nothing. Past what one confirmer may unlock, the copy
+            // is weighed as this node's own word instead.
+            let (first_offered_by, prior_offerer) = match self.turned_away.get(&blob_digest).copied() {
+                None => (None, None),
+                Some((first, _)) if first == *from_id => continue,
+                Some((first, first_subnet)) => {
+                    let independent = self.local_node == Some(first)
+                        || matches!((first_subnet, from_subnet), (Some(a), Some(b)) if a != b);
+                    if !independent {
+                        *offered += 1;
+                        continue;
+                    }
+                    let within = publisher_share(&data).is_none_or(|(file, digest)| {
+                        self.confirmations_taken
+                            .get(&(*from_id, file, digest))
+                            .is_none_or(|&n| n < MAX_CONFIRMED_PER_FILE_PER_NODE)
+                    });
+                    (within.then_some(first), Some(first))
+                }
+            };
+            let share = publisher_share(&data).filter(|_| first_offered_by.is_none());
+            let over_share = share.is_some_and(|(file, digest)| {
+                self.publishers_taken
+                    .get(&(*from_id, file, digest))
+                    .is_some_and(|&n| n >= MAX_PUBLISHERS_PER_FILE_PER_NODE)
+            });
             *offered += 1;
+            if over_share {
+                // Charged like any other offer, or a node could be paged to its
+                // ceiling handing over records none of which are taken.
+                if SignedRecord::value_blob_is_authentic(&data) {
+                    self.hold_turned_away(*from_id, blob_digest, data);
+                }
+                continue;
+            }
+            self.seen_results.insert(blob_digest);
             // Check the signature before the blob takes a slot. Consumers
             // re-parse through `from_value_blob` and drop anything forged, so
             // a junk blob was never going to reach the caller — but until it
@@ -1073,12 +1418,37 @@ impl IterativeSearch {
             }
             *self.delivered_results.entry(*from_id).or_insert(0) += 1;
             delivered_now += 1;
+            self.note_contributor(*from_id);
             if !self.value_budget_full() {
                 self.budget_spent
                     .insert(budget_identity(&data, &blob_digest));
+                if let Some((file, digest)) = share {
+                    *self
+                        .publishers_taken
+                        .entry((*from_id, file, digest))
+                        .or_insert(0) += 1;
+                }
+                let (from_node, confirmed_by) = match first_offered_by {
+                    Some(first) => {
+                        self.turned_away.remove(&blob_digest);
+                        if let Some((file, digest)) = publisher_share(&data) {
+                            *self
+                                .confirmations_taken
+                                .entry((*from_id, file, digest))
+                                .or_insert(0) += 1;
+                        }
+                        (first, Some(*from_id))
+                    }
+                    None => {
+                        self.turned_away.remove(&blob_digest);
+                        (*from_id, prior_offerer)
+                    }
+                };
+                self.result_slots.insert(blob_digest, self.results.len());
                 self.results.push(SearchResultRecord {
                     data,
-                    from_node: *from_id,
+                    from_node,
+                    confirmed_by,
                 });
             }
         }
@@ -1095,6 +1465,14 @@ impl IterativeSearch {
             .map(|e| e.distance)
             .unwrap_or(EmberNodeId([0xFF; 16]));
 
+        // Closest first, so the quota keeps the contacts this responder named
+        // nearest the target rather than whichever it happened to list first.
+        closer_nodes.sort_by_key(|c| self.target.distance(&c.node_id).0);
+        let mut referred = self
+            .shortlist
+            .iter()
+            .filter(|e| e.referrer == Some(*from_id))
+            .count();
         for contact in closer_nodes {
             if !contact.is_dialable() {
                 continue;
@@ -1116,6 +1494,10 @@ impl IterativeSearch {
             {
                 continue;
             }
+            if referred >= MAX_SHORTLIST_ENTRIES_PER_REFERRER {
+                break;
+            }
+            referred += 1;
 
             if distance.0 < current_best.0 {
                 new_closer = true;
@@ -1126,6 +1508,7 @@ impl IterativeSearch {
                 distance,
                 state: NodeState::Pending,
                 pinned: false,
+                referrer: Some(*from_id),
             });
         }
 
@@ -1135,7 +1518,9 @@ impl IterativeSearch {
         // in-flight work and could declare itself complete while a response
         // is genuinely outstanding, and `next_to_query` would undercount the
         // in-flight total and exceed ALPHA. Entries awaiting a reply are kept
-        // regardless of rank, which bounds the list at K + ALPHA.
+        // regardless of rank, as are pinned session peers, verified contacts
+        // and nodes still owed a page, so the list can run past K by up to
+        // ALPHA in-flight entries plus those.
         self.shortlist
             .sort_by_key(|a| a.distance.0);
         if self.shortlist.len() > K_BUCKET_SIZE {
@@ -1348,6 +1733,9 @@ impl IterativeSearch {
     /// forever. A one-entry shortlist — the shape of a handful-of-nodes
     /// deployment — then held its search slot and its waiter until the
     /// whole-search backstop, two minutes later.
+    ///
+    /// [`QueryFailure::HandshakeNeverCompleted`] does the same for a contact
+    /// nothing has verified; see that variant.
     pub fn mark_failed_with(
         &mut self,
         request_id: u32,
@@ -1397,7 +1785,11 @@ impl IterativeSearch {
                 .get(&node_id)
                 .copied()
                 .unwrap_or(MAX_QUERY_ATTEMPTS);
-            let retryable = failure == QueryFailure::TimedOut && spent < MAX_QUERY_ATTEMPTS;
+            let retryable = spent < MAX_QUERY_ATTEMPTS
+                && match failure {
+                    QueryFailure::TimedOut => true,
+                    QueryFailure::HandshakeNeverCompleted | QueryFailure::NotSent => false,
+                };
             for entry in &mut self.shortlist {
                 if entry.contact.node_id == node_id {
                     entry.state = if retryable {
@@ -1413,7 +1805,9 @@ impl IterativeSearch {
                 // kept, so this can only happen `MAX_QUERY_ATTEMPTS` times.
                 self.queried.remove(&node_id);
             }
-        } else if failure == QueryFailure::TimedOut {
+        } else if failure != QueryFailure::NotSent {
+            // A page goes to a node that has already answered this search, so a
+            // handshake that stalled here is a dropped session, not a phantom.
             let start = pending.start_position;
             let spent = self
                 .page_attempts
@@ -1437,6 +1831,15 @@ impl IterativeSearch {
         fault_worthy.then_some(node_id)
     }
 
+    /// The node a query is outstanding to, and whether it is a page follow-up,
+    /// so a caller about to report its failure can tell what a retry would be
+    /// sent to — see [`QueryFailure::HandshakeNeverCompleted`].
+    pub fn pending_query(&self, request_id: u32) -> Option<(EmberNodeId, bool)> {
+        self.pending_requests
+            .get(&request_id)
+            .map(|p| (p.node, p.is_page()))
+    }
+
     /// Re-evaluate and return the completion state. Unlike the internal
     /// [`Self::check_complete`] (only run on a response or failure), the
     /// driver calls this after dispatching a batch so a search that has
@@ -1455,6 +1858,7 @@ impl IterativeSearch {
 
         // Complete if timed out
         if self.started_at.elapsed().as_secs() > SEARCH_TIMEOUT_SECS {
+            self.take_sole_contributors_held();
             self.complete = true;
             return;
         }
@@ -1474,16 +1878,18 @@ impl IterativeSearch {
         let has_pages = !self.page_queue.is_empty() || self.pages_in_flight() > 0;
 
         if !has_pending && !has_in_flight && !has_pages {
+            self.take_sole_contributors_held();
             self.complete = true;
             return;
         }
 
-        // A FIND_NODE walk whose frontier has stopped moving has the answer it
-        // came for; querying the rest of the shortlist only re-learns nodes we
-        // already hold. FIND_VALUE is excluded on purpose — see
+        // A FIND_NODE walk whose frontier has stopped moving, and that has heard
+        // from the k closest nodes it knows of, has the answer it came for;
+        // querying the rest of the shortlist only re-learns nodes we already
+        // hold. FIND_VALUE is excluded on purpose — see
         // [`STALE_RESPONSES_TO_CONVERGE`].
         if self.search_type == SearchType::FindNode
-            && self.head_has_responded()
+            && self.closest_have_responded()
             && self.stale_responses >= STALE_RESPONSES_TO_CONVERGE
             && self.responded_count() >= MIN_RESPONSES_TO_CONVERGE
         {
@@ -1503,37 +1909,32 @@ impl IterativeSearch {
         }
     }
 
-    /// Whether the closest node we know of has actually answered.
+    /// Whether the k closest entries that can still answer all have.
     ///
-    /// Required before a walk may converge early, and it is what stops one
-    /// fabricated contact ending every lookup. Progress is measured against the
-    /// head of the shortlist, and contacts arrive inside `FOUND_NODE` unverified,
-    /// so a peer queried in the first round can return an invented ID one bit
-    /// from the target. It is not the target itself, so the only exclusion misses
-    /// it; it sorts to the head; and it is never removed, even once it has failed
-    /// to answer. From then on no real node can be "closer", every later answer
-    /// counts as stale, and the walk would stop at the response floor having
-    /// reached the attacker's node and a few of our own existing contacts —
-    /// which, for a publish-target lookup, then became the cached target set for
-    /// four hours.
+    /// This is Kademlia's termination rule, and the stale count cannot stand in
+    /// for it: that measures progress against the head alone, so a walk could
+    /// converge with entries ranked two to k never asked — and a publish-target
+    /// lookup files its answer as where a record lives for four hours.
     ///
-    /// An invented ID cannot answer, so requiring the head to have *responded*
-    /// (not merely to have been resolved — a failed entry stays at the head)
-    /// makes the pin block convergence instead of forcing it, and the walk falls
-    /// back to exhausting its shortlist. A node close enough to the target to
-    /// hold the head legitimately has to answer to keep it, which is the
-    /// ordinary eclipse cost rather than a free lunch.
-    ///
-    /// The fallback is not rare, and is not meant to be: any dead contact at the
-    /// head does the same thing, which stale gossip near a popular target produces
-    /// often enough. That costs a walk roughly the difference between the response
-    /// floor and a full shortlist — around six extra queries — and it is the right
-    /// side to err on, since the alternative is ending walks on the word of a peer
-    /// that never spoke.
-    fn head_has_responded(&self) -> bool {
+    /// Failed entries are passed over, which is what keeps one fabricated
+    /// contact from deciding when a walk ends in either direction. Contacts
+    /// arrive inside `FOUND_NODE` unverified, so a peer queried in the first
+    /// round can return an invented ID one bit from the target. It is not the
+    /// target itself, so the only exclusion misses it; it sorts to the head; and
+    /// it stays there once it has failed, so no real node is ever "closer" and
+    /// every later answer counts as stale. While it is pending or in flight it
+    /// holds the walk open like any other close entry. Once it has failed it
+    /// leaves the window, which is then the k closest nodes that can still
+    /// answer, and every one of those has to respond before the walk ends. The
+    /// pin can neither end a walk early nor hold it open past its own timeout,
+    /// and a dead contact near the target — which stale gossip produces often
+    /// enough — costs its own timeouts rather than the rest of the shortlist.
+    fn closest_have_responded(&self) -> bool {
         self.shortlist
-            .first()
-            .is_some_and(|entry| entry.state == NodeState::Responded)
+            .iter()
+            .filter(|entry| entry.state != NodeState::Failed)
+            .take(K_BUCKET_SIZE)
+            .all(|entry| entry.state == NodeState::Responded)
     }
 
     /// Shortlist entries that have answered us.
@@ -1730,6 +2131,7 @@ impl SearchManager {
         let Some(search) = self.searches.get_mut(&search_id) else {
             return 0;
         };
+        search.local_node = Some(local_id);
         let mut added = 0;
         for data in records {
             if search.results.len() >= MAX_LOCAL_SEED_RESULTS {
@@ -1751,12 +2153,31 @@ impl SearchManager {
             // records; at `MAX_LOCAL_SEED_RESULTS` it is a hundred and fifty of
             // them, and a walk that spends its remote budget re-collecting what
             // it already started with ends before the closer hops are reached.
-            if !search.seen_results.insert(*blake3::hash(&data).as_bytes()) {
+            let blob_digest = *blake3::hash(&data).as_bytes();
+            if search.seen_results.contains(&blob_digest)
+                || search.turned_away.contains_key(&blob_digest)
+            {
                 continue;
             }
+            // Anyone may store to us, so our own store is one more responder
+            // and gets one responder's share of a file's publishers.
+            if let Some((file, digest)) = publisher_share(&data) {
+                let taken = search
+                    .publishers_taken
+                    .entry((local_id, file, digest))
+                    .or_insert(0);
+                if *taken >= MAX_PUBLISHERS_PER_FILE_PER_NODE {
+                    search.hold_turned_away(local_id, blob_digest, data);
+                    continue;
+                }
+                *taken += 1;
+            }
+            search.seen_results.insert(blob_digest);
+            search.result_slots.insert(blob_digest, search.results.len());
             search.results.push(SearchResultRecord {
                 data,
                 from_node: local_id,
+                confirmed_by: None,
             });
             search.seeded_count = search.seeded_count.saturating_add(1);
             added += 1;
@@ -2122,29 +2543,196 @@ mod tests {
         answered
     }
 
-    /// A lookup used to query every entry that ever reached the shortlist, so a
-    /// walk whose frontier had already stopped moving still spent round trips
-    /// re-learning nodes it held. Kademlia ends a lookup once it has heard from
-    /// the closest nodes it knows of.
+    /// Querying every entry that ever reached the shortlist spends round trips
+    /// re-learning nodes the walk already holds. Kademlia ends a lookup once it
+    /// has heard from the k closest nodes it knows of — and not before, since
+    /// the answer is what a publish-target lookup files as where a record lives.
+    /// Verified seeds that closer leads pushed past rank k stay on the shortlist
+    /// (the trim exempts them), and asking them is exactly that wasted work.
     #[test]
-    fn a_find_node_walk_stops_once_the_frontier_stops_moving() {
+    fn a_find_node_walk_stops_once_the_k_closest_have_answered() {
         let target = make_id(0x01);
         let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
 
         let mut sm = SearchManager::new();
         let sid = sm.start_find_node(target, &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        let answered = walk_until_done(search);
+
+        // Round one: each seed names two leads closer than every seed, which
+        // pushes the ten farthest seeds past rank k.
+        let mut answered = 0usize;
+        let mut next_lead = 0x02u8;
+        for (contact, req_id) in search.query_pairs() {
+            let leads = vec![make_lead(next_lead), make_lead(next_lead + 1)];
+            next_lead += 2;
+            search.process_unpaged(req_id, &contact.node_id, leads, vec![]);
+            answered += 1;
+        }
+        let beyond_k: Vec<EmberNodeId> = search
+            .shortlist
+            .iter()
+            .skip(K_BUCKET_SIZE)
+            .map(|e| e.contact.node_id)
+            .collect();
+        assert_eq!(beyond_k.len(), 10, "verified seeds survive the trim");
+
+        answered += walk_until_done(search);
 
         assert!(search.complete, "the walk must finish");
-        assert!(
-            answered >= MIN_RESPONSES_TO_CONVERGE,
-            "convergence must not fire before the response floor, got {answered}"
+        assert_eq!(
+            answered, K_BUCKET_SIZE,
+            "every one of the k closest has to answer, and nothing past them"
         );
         assert!(
-            answered < K_BUCKET_SIZE,
-            "stopping early is the point: asked {answered} of {K_BUCKET_SIZE}"
+            beyond_k.iter().all(|id| !search.queried.contains(id)),
+            "stopping short of the seeds past rank k is the point"
         );
+    }
+
+    /// The stale count only measures progress against the head, so it can call
+    /// a walk converged while nodes ranked two to k have never answered. The
+    /// walk has to wait for every one of the k closest — and still end when one
+    /// of them never answers at all.
+    #[test]
+    fn a_find_node_walk_waits_for_every_one_of_the_k_closest() {
+        let target = make_id(0x01);
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+
+        for straggler_answers in [true, false] {
+            let mut sm = SearchManager::new();
+            let sid = sm.start_find_node(target, &rt).expect("slot");
+            let search = sm.get_mut(sid).unwrap();
+
+            // The second-closest seed stays silent; everyone else answers with
+            // nothing closer, so the head responds and the frontier stalls.
+            let batch = search.query_pairs();
+            let (straggler, mut straggler_req) = batch[1].clone();
+            for (contact, req_id) in batch {
+                if contact.node_id != straggler.node_id {
+                    search.process_unpaged(req_id, &contact.node_id, vec![], vec![]);
+                }
+            }
+            let answered = walk_until_done(search);
+            assert_eq!(answered, K_BUCKET_SIZE - 5, "the rest of the seeds are asked");
+            assert!(
+                search.responded_count() >= MIN_RESPONSES_TO_CONVERGE
+                    && search.stale_responses >= STALE_RESPONSES_TO_CONVERGE,
+                "the stale count and response floor alone would end the walk here"
+            );
+            assert!(
+                !search.complete,
+                "not while one of the k closest is still outstanding"
+            );
+
+            if straggler_answers {
+                search.process_unpaged(straggler_req, &straggler.node_id, vec![], vec![]);
+                assert!(search.complete);
+                assert_eq!(search.closest_responded().len(), K_BUCKET_SIZE);
+            } else {
+                // A verified contact gets its retry, then the walk ends without it.
+                for _ in 0..MAX_QUERY_ATTEMPTS {
+                    assert!(!search.complete);
+                    search.mark_failed(straggler_req);
+                    if let Some((contact, req_id)) = search.query_pairs().pop() {
+                        assert_eq!(contact.node_id, straggler.node_id);
+                        straggler_req = req_id;
+                    }
+                }
+                assert!(search.complete, "a node that never answers cannot hold it open");
+                assert_eq!(search.closest_responded().len(), K_BUCKET_SIZE - 1);
+            }
+        }
+    }
+
+    /// One responder answering the first round with a shortlist's worth of IDs
+    /// closer than every real node, at addresses that never complete a
+    /// handshake, must not be able to run a lookup past `SEARCH_TIMEOUT_SECS`
+    /// before it reaches the honest nodes nearer the target.
+    ///
+    /// Simulated on a clock rather than waited out: an honest node answers in a
+    /// tenth of a second, and a phantom costs the driver's queued-query budget
+    /// before the sweep reports its handshake never completed.
+    #[test]
+    fn one_responder_stuffing_the_shortlist_cannot_stall_a_lookup() {
+        let phantom_ms = crate::network::EMBER_SEARCH_QUEUED_QUERY_TIMEOUT.as_millis() as u64;
+        const HONEST_MS: u64 = 100;
+        let target = make_id(0x01);
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+        let phantoms: Vec<EmberContact> = (1..=17u8)
+            .map(|i| {
+                let mut id = target.0;
+                id[15] = i;
+                EmberContact {
+                    node_id: EmberNodeId(id),
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, i)), 4672),
+                    noise_pub: [0xEE; 32],
+                    ed25519_pub: [0xEE; 32],
+                    last_seen: 0,
+                    failed_queries: 0,
+                }
+            })
+            .collect();
+        let honest: Vec<EmberContact> = (0x02..=0x05u8).map(make_lead).collect();
+        let is_phantom = |id: &EmberNodeId| phantoms.iter().any(|p| p.node_id == *id);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let round_one: Vec<EmberNodeId> = search
+            .shortlist
+            .iter()
+            .take(ALPHA)
+            .map(|e| e.contact.node_id)
+            .collect();
+        let mut now = 0u64;
+        let mut in_flight: Vec<(u64, EmberNodeId, u32)> = Vec::new();
+        let mut phantom_queries = 0usize;
+        loop {
+            for (contact, req_id) in search.query_pairs() {
+                let cost = if is_phantom(&contact.node_id) {
+                    phantom_queries += 1;
+                    phantom_ms
+                } else {
+                    HONEST_MS
+                };
+                in_flight.push((now + cost, contact.node_id, req_id));
+            }
+            if search.complete || in_flight.is_empty() {
+                break;
+            }
+            in_flight.sort_by_key(|(at, _, _)| std::cmp::Reverse(*at));
+            let (at, node, req_id) = in_flight.pop().unwrap();
+            now = at;
+            if is_phantom(&node) {
+                search.mark_failed_with(req_id, QueryFailure::HandshakeNeverCompleted);
+                continue;
+            }
+            // The closest seed is the liar; the other seeds of round one each
+            // name one honest node nearer the target.
+            let closer = match round_one.iter().position(|id| *id == node) {
+                Some(0) => phantoms.clone(),
+                Some(i) => vec![honest[i - 1].clone()],
+                None => vec![],
+            };
+            search.process_unpaged(req_id, &node, closer, vec![]);
+        }
+
+        assert!(search.complete, "the walk must end on its own");
+        assert!(
+            now < SEARCH_TIMEOUT_SECS * 1000,
+            "the walk took {now} ms against a {SEARCH_TIMEOUT_SECS} s cap"
+        );
+        assert!(
+            phantom_queries <= MAX_SHORTLIST_ENTRIES_PER_REFERRER,
+            "{phantom_queries} queries went to invented contacts"
+        );
+        let found = search.closest_responded();
+        assert!(
+            honest.iter().all(|h| found.iter().any(|c| c.node_id == h.node_id)),
+            "the honest nodes nearer the target are what the lookup returns"
+        );
+        assert!(found.iter().all(|c| !is_phantom(&c.node_id)));
     }
 
     /// Contacts inside a `FOUND_NODE` are unverified, so the first peer queried
@@ -3011,6 +3599,37 @@ mod tests {
         assert_eq!(retry[0].0.node_id, peer.node_id);
     }
 
+    /// Whether a contact whose handshake never completed deserves a retry is
+    /// the routing table's call, made by the caller before it reports the
+    /// failure. The shortlist's own copy cannot make it: a `FOUND_NODE`
+    /// contact never reads as verified, and a seed's copy does even once the
+    /// table no longer vouches for it at that address.
+    #[test]
+    fn a_stalled_handshake_is_retried_only_when_reported_as_a_timeout() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, first) = search.query_pairs().remove(0);
+        assert_eq!(search.pending_query(first), Some((peer.node_id, false)));
+        search.mark_failed_with(first, QueryFailure::HandshakeNeverCompleted);
+        assert!(
+            search.query_pairs().is_empty(),
+            "a verified-looking shortlist copy does not earn a retry by itself"
+        );
+        assert!(search.poll_complete());
+
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, first) = search.query_pairs().remove(0);
+        search.mark_failed_with(first, QueryFailure::TimedOut);
+        assert_eq!(search.query_pairs().len(), 1, "the table vouched for it");
+    }
+
     /// Only if something is going to ask again. The send-failure path registers
     /// no wire request, so no deadline exists to expire and re-drive the walk —
     /// a node put back on `Pending` there is work `check_complete` sees as
@@ -3657,18 +4276,28 @@ mod tests {
             "need four answers to fill a budget that counts blobs"
         );
 
-        // Four nodes, each spending its whole offer allowance on the publishers
-        // of a single file: 300 blobs — the entire budget, when blobs are what
-        // it counts — describing four files.
+        // Four nodes, each spending its whole offer allowance on files of five
+        // publishers apiece: 300 blobs — the entire budget, when blobs are what
+        // it counts — describing sixty files.
+        let files_per_node = MAX_RESULTS_PER_NODE / MAX_PUBLISHERS_PER_FILE_PER_NODE;
         for (i, (contact, req)) in batch.iter().take(4).enumerate() {
-            let publishers = one_files_publishers("ubuntu", i as u16, MAX_RESULTS_PER_NODE);
+            let publishers = (0..files_per_node)
+                .flat_map(|f| {
+                    one_files_publishers(
+                        "ubuntu",
+                        (i * files_per_node + f) as u16,
+                        MAX_PUBLISHERS_PER_FILE_PER_NODE,
+                    )
+                })
+                .collect();
             search.process_unpaged(*req, &contact.node_id, vec![], publishers);
         }
 
         assert_eq!(search.results.len(), 4 * MAX_RESULTS_PER_NODE);
+        assert_eq!(search.budget_spent.len(), 4 * files_per_node);
         assert!(
             !search.complete,
-            "four files must not exhaust a three-hundred-file budget"
+            "sixty files must not exhaust a three-hundred-file budget"
         );
         assert!(
             !search.next_to_query().is_empty(),
@@ -3677,9 +4306,9 @@ mod tests {
     }
 
     /// What keeps the file budget from being unbounded: a key holding nothing
-    /// but publishers of the same file must still end the walk, rather than have
-    /// every node on the shortlist paged, verified and buffered to reach a row
-    /// count it cannot supply.
+    /// but publishers of the same few files must still end the walk, rather than
+    /// have every node on the shortlist paged, verified and buffered to reach a
+    /// row count it cannot supply.
     #[test]
     fn a_key_of_nothing_but_repeat_publishers_still_ends_the_walk() {
         let target = keyword_target("ubuntu");
@@ -3688,6 +4317,7 @@ mod tests {
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
 
+        let files = (MAX_RESULTS_PER_NODE / MAX_PUBLISHERS_PER_FILE_PER_NODE) as u16;
         let mut node = 0u16;
         while !search.complete {
             let batch = search.query_pairs();
@@ -3695,11 +4325,16 @@ mod tests {
                 break;
             }
             for (contact, req) in batch {
-                // Its whole allowance, all of it about one file, and distinct
-                // from every other node's so the blob dedup cannot help.
+                // Its whole allowance, all of it about the same few files every
+                // other node names, in records distinct from every other node's
+                // so the blob dedup cannot help.
                 let publishers: Vec<Vec<u8>> = (0..MAX_RESULTS_PER_NODE)
                     .map(|i| {
-                        signed_value_blob_named("ubuntu", 0, &format!("release.{node}.{i}.iso"))
+                        signed_value_blob_named(
+                            "ubuntu",
+                            i as u16 % files,
+                            &format!("release.{node}.{i}.iso"),
+                        )
                     })
                     .collect();
                 node += 1;
@@ -3710,10 +4345,346 @@ mod tests {
         assert!(search.complete, "the blob ceiling has to end the walk");
         assert_eq!(
             search.budget_spent.len(),
-            1,
-            "one file, however many publishers named it"
+            usize::from(files),
+            "fifteen files, however many publishers named them"
         );
         assert!(search.remote_blobs() >= MAX_SEARCH_RESULT_BLOBS);
+    }
+
+    /// The same key reduced to one hot file, where the blob ceiling never binds:
+    /// each node's share of the file is taken and everything after it is turned
+    /// away. Those records have to cost the node its offer allowance, or every
+    /// storer is paged to its page ceiling for the five records it was allowed.
+    #[test]
+    fn a_key_of_one_hot_file_pages_each_node_only_its_allowance() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Small records, so a page carries more than the page ceiling assumes
+        // and the allowance is what binds.
+        const PER_PAGE: u16 = 5;
+        let mut queries: HashMap<EmberNodeId, usize> = HashMap::new();
+        drive_value_search(search, |node, start| {
+            *queries.entry(*node).or_insert(0) += 1;
+            let end = start + PER_PAGE;
+            let records = (start..end)
+                .map(|i| signed_value_blob_named("ubuntu", 0, &format!("r.{}.{i}", node.0[0])))
+                .collect();
+            (
+                records,
+                Some(ValuePage {
+                    next_position: end,
+                    total_available: 600,
+                }),
+            )
+        });
+
+        assert!(search.poll_complete(), "the walk has to end");
+        assert_eq!(queries.len(), K_BUCKET_SIZE);
+        let bound = MAX_RESULTS_PER_NODE / usize::from(PER_PAGE);
+        for (node, asked) in &queries {
+            assert!(
+                *asked <= bound,
+                "a node was asked {asked} times for its share of one file, past the {bound} \
+                 its offer allowance pays for"
+            );
+            assert!(search.offered_results[node] <= MAX_RESULTS_PER_NODE);
+            assert_eq!(
+                search.results.iter().filter(|r| r.from_node == *node).count(),
+                MAX_PUBLISHERS_PER_FILE_PER_NODE
+            );
+        }
+    }
+
+    /// A keyword row counts distinct publishers, and a publisher is a key
+    /// anyone can mint, so one node's answer may only speak for its share of a
+    /// file's publishers. A record a second node also returns is no longer one
+    /// node's word, so it is taken — noted against both — whichever node's
+    /// share turned it away first.
+    #[test]
+    fn one_node_speaks_for_only_its_share_of_a_files_publishers() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), 4);
+        let local = make_id(0x00);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let publishers = one_files_publishers("ubuntu", 7, 20);
+
+        // Our own store is one more responder, held to the same share.
+        assert_eq!(
+            sm.seed_local_results(sid, local, publishers.clone()),
+            MAX_PUBLISHERS_PER_FILE_PER_NODE
+        );
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.query_pairs();
+        let (a, a_req) = batch[0].clone();
+        let (b, b_req) = batch[1].clone();
+
+        // A holds the same twenty: every one now has two responders behind it.
+        search.process_unpaged(a_req, &a.node_id, vec![], publishers.clone());
+        assert_eq!(search.results.len(), publishers.len());
+        assert!(
+            search
+                .results
+                .iter()
+                .all(|r| r.from_node == local && r.confirmed_by == Some(a.node_id)),
+            "a copy from a second node is taken, and noted against the first"
+        );
+
+        // B holds twenty publishers of the same file nobody else returned.
+        let only_b: Vec<Vec<u8>> = (0..20)
+            .map(|i| signed_value_blob_named("ubuntu", 7, &format!("mirror.{i}.iso")))
+            .collect();
+        search.process_unpaged(b_req, &b.node_id, vec![], only_b);
+        let from_b = search
+            .results
+            .iter()
+            .filter(|r| r.from_node == b.node_id)
+            .count();
+        assert_eq!(
+            from_b, MAX_PUBLISHERS_PER_FILE_PER_NODE,
+            "what only one node vouches for is held to its share"
+        );
+    }
+
+    /// [`signed_value_blob_named`] claiming `digest` as the file's content hash.
+    fn signed_value_blob_claiming(filler: u16, file_name: &str, digest: [u8; 32]) -> Vec<u8> {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut file_hash = [0u8; 16];
+        file_hash[..2].copy_from_slice(&filler.to_le_bytes());
+        let rec = SignedRecord::keyword("ubuntu", file_hash, digest, 100, file_name, &sk);
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    /// Anyone may STORE to a storer, and a storer answers in its own order, so
+    /// records planted under a fake digest can come first on every storer near
+    /// a keyword. A share per file would go to them and leave the real digest's
+    /// publishers nothing from any storer; a share per digest leaves each claim
+    /// its own.
+    #[test]
+    fn records_planted_first_cannot_squeeze_out_another_digests_publishers() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), 4);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (fake, real) = ([0xEEu8; 32], [0x77u8; 32]);
+
+        let batch = search.query_pairs();
+        assert!(batch.len() >= 3);
+        for (n, (contact, req)) in batch.iter().take(3).enumerate() {
+            let mut held: Vec<Vec<u8>> = (0..40)
+                .map(|i| signed_value_blob_claiming(7, &format!("planted.{n}.{i}.iso"), fake))
+                .collect();
+            held.extend(
+                (0..MAX_PUBLISHERS_PER_FILE_PER_NODE)
+                    .map(|i| signed_value_blob_claiming(7, &format!("real.{n}.{i}.iso"), real)),
+            );
+            search.process_unpaged(*req, &contact.node_id, vec![], held);
+        }
+
+        for (contact, _) in batch.iter().take(3) {
+            let claiming = |digest: [u8; 32]| {
+                search
+                    .results
+                    .iter()
+                    .filter(|r| {
+                        r.from_node == contact.node_id
+                            && super::super::publish::ember_digest_from_record_data(&r.data)
+                                == Some(digest)
+                    })
+                    .count()
+            };
+            assert_eq!(
+                claiming(real),
+                MAX_PUBLISHERS_PER_FILE_PER_NODE,
+                "every storer's real-digest publishers are taken behind the planted ones"
+            );
+            assert_eq!(claiming(fake), MAX_PUBLISHERS_PER_FILE_PER_NODE);
+        }
+    }
+
+    /// A lone storer of a popular file is what a young overlay, or a keyword
+    /// whose other replicas are gone, looks like. With nobody else answering
+    /// there is no other node's word to weigh it against, so the walk takes
+    /// what the share turned away once it has nobody left to ask — and the
+    /// records it turned away still count toward the storer's page rate.
+    #[test]
+    fn a_lone_storer_hands_over_every_publisher_of_a_hot_file() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // More than the base page ceiling can carry, so the storer has to earn
+        // the upper tier with records the share mostly turns away.
+        const HELD: u16 = 120;
+        let file = one_files_publishers("ubuntu", 7, usize::from(HELD));
+        drive_value_search(search, |_, start| {
+            let end = (start + RECORDS_PER_UNFRAGMENTED_PAGE as u16).min(HELD);
+            (
+                file[usize::from(start)..usize::from(end)].to_vec(),
+                Some(ValuePage {
+                    next_position: end,
+                    total_available: HELD,
+                }),
+            )
+        });
+
+        assert!(search.poll_complete());
+        assert_eq!(
+            search.results.len(),
+            usize::from(HELD),
+            "every publisher the only storer holds is taken once the walk is over"
+        );
+        assert!(search.results.iter().all(|r| r.from_node == peer.node_id));
+    }
+
+    /// Two storers holding the same records vouch for each other's, however
+    /// the share split them.
+    #[test]
+    fn two_storers_holding_a_hot_file_hand_over_all_of_it() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        rt.add_contact(make_contact(0xF0));
+        rt.add_contact(make_contact(0xE0));
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        const HELD: u16 = 30;
+        let file = one_files_publishers("ubuntu", 7, usize::from(HELD));
+        drive_value_search(search, |_, start| {
+            let end = (start + RECORDS_PER_UNFRAGMENTED_PAGE as u16).min(HELD);
+            (
+                file[usize::from(start)..usize::from(end)].to_vec(),
+                Some(ValuePage {
+                    next_position: end,
+                    total_available: HELD,
+                }),
+            )
+        });
+
+        assert!(search.poll_complete());
+        assert_eq!(search.results.len(), usize::from(HELD));
+        assert!(
+            search.results.iter().all(|r| r.confirmed_by.is_some()),
+            "each record has both storers behind it"
+        );
+    }
+
+    /// A second keypair on the same /24 is not a second word: its copies of
+    /// what the share turned away unlock nothing, so the two together still
+    /// speak for one share of the file.
+    #[test]
+    fn a_second_copy_from_the_same_block_is_not_a_confirmation() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let first = make_contact(0xF0);
+        let mut sibling = make_contact(0xE0);
+        sibling.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 0xF0, 2)), 4662);
+        rt.add_contact(first.clone());
+        rt.add_contact(sibling);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        const HELD: u16 = 30;
+        let file = one_files_publishers("ubuntu", 7, usize::from(HELD));
+        drive_value_search(search, |_, start| {
+            let end = (start + RECORDS_PER_UNFRAGMENTED_PAGE as u16).min(HELD);
+            (
+                file[usize::from(start)..usize::from(end)].to_vec(),
+                Some(ValuePage {
+                    next_position: end,
+                    total_available: HELD,
+                }),
+            )
+        });
+
+        assert!(search.poll_complete());
+        assert_eq!(
+            search.results.len(),
+            MAX_PUBLISHERS_PER_FILE_PER_NODE,
+            "one block's word is one share, however many keys answer from it"
+        );
+        assert!(search.results.iter().all(|r| r.confirmed_by.is_none()));
+    }
+
+    /// Our own store is one more responder. Once it has seeded a record under
+    /// the key, the lone remote storer is no longer the only word, so what its
+    /// share turned away stays turned away.
+    #[test]
+    fn a_seeded_local_store_keeps_a_lone_remote_storer_to_its_share() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        rt.add_contact(make_contact(0xF0));
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let local = make_id(0x00);
+        let ours = one_files_publishers("ubuntu", 9, 1);
+        assert_eq!(sm.seed_local_results(sid, local, ours), 1);
+        let search = sm.get_mut(sid).unwrap();
+
+        const HELD: u16 = 30;
+        let file = one_files_publishers("ubuntu", 7, usize::from(HELD));
+        drive_value_search(search, |_, start| {
+            let end = (start + RECORDS_PER_UNFRAGMENTED_PAGE as u16).min(HELD);
+            (
+                file[usize::from(start)..usize::from(end)].to_vec(),
+                Some(ValuePage {
+                    next_position: end,
+                    total_available: HELD,
+                }),
+            )
+        });
+
+        assert!(search.poll_complete());
+        assert_eq!(
+            search.results.len(),
+            1 + MAX_PUBLISHERS_PER_FILE_PER_NODE,
+            "our record plus the remote storer's share"
+        );
+    }
+
+    /// The other side of taking a lone storer's word: with anyone else
+    /// answering, publishers only one node returned stay at its share when the
+    /// walk ends, so minting them still cannot lift a row.
+    #[test]
+    fn a_minting_node_among_others_stays_at_its_share_when_the_walk_ends() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let minter = make_contact(0xF0);
+        rt.add_contact(minter.clone());
+        rt.add_contact(make_contact(0xE0));
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        drive_value_search(search, |node, _| {
+            if *node == minter.node_id {
+                (one_files_publishers("ubuntu", 7, 40), None)
+            } else {
+                ((100..110).map(|i| signed_value_blob("ubuntu", i)).collect(), None)
+            }
+        });
+
+        assert!(search.poll_complete());
+        let from_minter = search
+            .results
+            .iter()
+            .filter(|r| r.from_node == minter.node_id)
+            .count();
+        assert_eq!(from_minter, MAX_PUBLISHERS_PER_FILE_PER_NODE);
+        assert_eq!(search.results.len(), MAX_PUBLISHERS_PER_FILE_PER_NODE + 10);
     }
 
     /// [`MAX_RESULTS_PER_NODE`] is meant to be the limit that decides how much

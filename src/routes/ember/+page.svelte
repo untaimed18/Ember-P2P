@@ -11,7 +11,6 @@
    * The overlay is always on.
    */
   import { onMount } from 'svelte';
-  import { goto } from '$app/navigation';
   import {
     getEmberDiagnostics,
     getEmberDhtContacts,
@@ -25,6 +24,7 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
+  import { getLocale } from '$lib/i18n';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { checkForUpdates, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
@@ -196,52 +196,47 @@
   let joining = $derived(isActive && verifiedCount === 0 && !joinTimedOut);
   let isConnected = $derived(isActive && verifiedCount > 0);
 
-  type HeroState = 'loading' | 'off' | 'connecting' | 'connected' | 'no_peers';
+  // No "off" state: the backend forces the overlay on at load and on every
+  // settings save, so a diagnostics reply never reports it disabled.
+  type HeroState = 'loading' | 'connecting' | 'connected' | 'no_peers';
   let heroState: HeroState = $derived(
     diag === null
       ? 'loading'
-      : !isActive
-        ? 'off'
-        : isConnected
-          ? 'connected'
-          : joining
-            ? 'connecting'
-            : 'no_peers',
+      : isConnected
+        ? 'connected'
+        : joining
+          ? 'connecting'
+          : 'no_peers',
   );
 
-  // Until the first diagnostics land we genuinely don't know the state, and
-  // an enabled node would otherwise be announced as "Off" with a "turn it
-  // on" hint for a round trip.
+  // Until the first diagnostics land we genuinely don't know the state.
   let statusLabel = $derived(
     heroState === 'loading'
       ? m.common_loading()
-      : heroState === 'off'
-        ? m.ember_status_disabled()
-        : heroState === 'connected'
-          ? m.ember_status_connected()
-          : heroState === 'connecting'
-            ? m.ember_status_connecting()
-            : m.ember_status_no_peers(),
+      : heroState === 'connected'
+        ? m.ember_status_connected()
+        : heroState === 'connecting'
+          ? m.ember_status_connecting()
+          : m.ember_status_no_peers(),
   );
 
   let statusHint = $derived(
     heroState === 'loading'
       ? ''
-      : heroState === 'off'
-        ? m.ember_disabled_explainer()
-        : heroState === 'connected'
-          ? m.ember_status_connected_hint()
-          : heroState === 'connecting'
-            ? m.ember_joining_hint()
-            : m.ember_no_contacts_hint(),
+      : heroState === 'connected'
+        ? m.ember_status_connected_hint()
+        : heroState === 'connecting'
+          ? m.ember_joining_hint()
+          : m.ember_no_contacts_hint(),
   );
 
   // "Checking" outranks "relayed": without a known external address the
   // firewall verdict isn't settled yet, so claiming a relay is in use
-  // would be guessing.
+  // would be guessing. Before the flags have been evaluated at all they
+  // all read false, which must not be taken for "direct".
   type Reachability = 'direct' | 'relayed' | 'checking' | 'waiting_buddy';
   let reachability: Reachability = $derived(
-    diag?.ember_dht_udp_unreachable
+    diag?.ember_dht_udp_unreachable || !diag?.ember_dht_reachability_known
       ? 'checking'
       : diag?.ember_dht_waiting_buddy
         ? 'waiting_buddy'
@@ -320,13 +315,24 @@
       ? `~${formatNumber(diag?.ember_dht_estimated_nodes ?? 0)}`
       : '\u2014',
   );
-  // Zero means nothing has ever arrived, which reads as unknown rather than as
-  // "a frame landed this instant".
-  let lastInboundLabel = $derived(
-    (diag?.ember_dht_seconds_since_inbound ?? 0) > 0
-      ? formatDurationSecs(diag?.ember_dht_seconds_since_inbound ?? 0)
-      : '\u2014',
-  );
+  // Null means nothing has ever arrived, which reads as unknown; zero is a
+  // frame this second.
+  let lastInboundLabel = $derived.by(() => {
+    const secs = diag?.ember_dht_seconds_since_inbound;
+    return secs == null ? '\u2014' : formatDurationSecs(secs);
+  });
+
+  const msFormat = new Intl.NumberFormat(getLocale(), {
+    style: 'unit',
+    unit: 'millisecond',
+    unitDisplay: 'short',
+    maximumFractionDigits: 0,
+  });
+  // The storer's load byte is a percentage of its per-key capacity.
+  const percentFormat = new Intl.NumberFormat(getLocale(), {
+    style: 'percent',
+    maximumFractionDigits: 0,
+  });
 
   function searchAvg(sum: number | undefined, outcomes: number): string {
     if (outcomes <= 0) return '\u2014';
@@ -381,7 +387,7 @@
     { id: 'search-hits', k: m.ember_stat_search_hits(), v: String(diag?.ember_dht_search_hits ?? 0) },
     { id: 'search-misses', k: m.ember_stat_search_misses(), v: String(diag?.ember_dht_search_misses ?? 0) },
     { id: 'search-avg-nodes', k: m.ember_stat_search_avg_nodes(), v: searchAvg(diag?.ember_dht_search_nodes_answered, outcomes) },
-    { id: 'search-avg-ms', k: m.ember_stat_search_avg_ms(), v: outcomes <= 0 ? '\u2014' : `${searchAvg(diag?.ember_dht_search_elapsed_ms_sum, outcomes)}ms` },
+    { id: 'search-avg-ms', k: m.ember_stat_search_avg_ms(), v: outcomes <= 0 ? '\u2014' : msFormat.format(Math.round((diag?.ember_dht_search_elapsed_ms_sum ?? 0) / outcomes)) },
     { id: 'search-avg-records', k: m.ember_stat_search_avg_records(), v: searchAvg(diag?.ember_dht_search_records_sum, outcomes) },
     { id: 'store-acks', k: m.ember_stat_stores_acked(), v: String(diag?.ember_dht_stores_acked ?? 0) },
     { id: 'store-fails', k: m.ember_stat_stores_failed(), v: String(diag?.ember_dht_stores_failed ?? 0) },
@@ -405,7 +411,7 @@
     { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
     { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
     { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
-    { id: 'rendezvous-key-load', k: m.ember_stat_rendezvous_key_load(), v: String(diag?.ember_dht_rendezvous_key_load ?? 0) },
+    { id: 'rendezvous-key-load', k: m.ember_stat_rendezvous_key_load(), v: percentFormat.format((diag?.ember_dht_rendezvous_key_load ?? 0) / 100) },
     { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
     { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
@@ -422,6 +428,7 @@
     { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: String(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
     { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
     { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: String(diag?.ember_dht_keyword_key_off_name ?? 0) },
+    { id: 'unknown-record-types', k: m.ember_stat_unknown_record_types(), v: String(diag?.ember_dht_unknown_record_types ?? 0) },
     { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: String(diag?.ember_dht_version_advertisers ?? 0) },
     { id: 'recall-searches', k: m.ember_stat_recall_searches(), v: String(diag?.ember_dht_recall_searches ?? 0) },
     { id: 'recall-both', k: m.ember_stat_recall_both(), v: String(diag?.ember_dht_recall_both ?? 0) },
@@ -476,7 +483,7 @@
   <div class="ember-inner">
   <div class="banner banner-info" role="note">{m.ember_network_growing()}</div>
 
-  <section class="hero" class:state-off={heroState === 'off' || heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
+  <section class="hero" class:state-off={heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
     <div class="hero-main">
       <span
@@ -491,27 +498,6 @@
           {#if joining}<span class="spinner" aria-hidden="true"></span>{/if}
         </div>
         {#if statusHint}<p class="hint">{statusHint}</p>{/if}
-        {#if heroState === 'off'}
-          <!--
-            "Off" used to end the conversation: the explainer says the service
-            is not running, the health checklist below is hidden while
-            inactive, and there was nothing to press. The overlay is a setting,
-            so send the user to the one that turns it back on — and offer a
-            re-check, since a failed diagnostics poll looks identical to a
-            genuinely disabled overlay from here.
-          -->
-          <div class="hero-actions">
-            <button
-              type="button"
-              onclick={() => void goto('/settings?section=network').catch((e) => console.warn('Failed to open settings:', e))}
-            >{m.ember_open_network_settings()}</button>
-            <button
-              type="button"
-              class="ghost"
-              onclick={() => void refreshDiag()}
-            >{m.common_retry()}</button>
-          </div>
-        {/if}
       </div>
     </div>
   </section>
@@ -891,13 +877,6 @@
     gap: 16px;
     min-width: 0;
     flex: 1;
-  }
-
-  .hero-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 12px;
   }
 
   .status-dot {

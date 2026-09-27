@@ -1349,11 +1349,15 @@ pub(super) fn maybe_finish_active_search(
 /// channels and publish bookkeeping keyed by those search ids. Idempotent:
 /// a second call for the same id is a no-op (every lookup returns `None`),
 /// so it's safe for the cleanup sweep and the fast reap to overlap.
+///
+/// `rendezvous_target` is [`rendezvous_search_target`] read before the
+/// removal.
 pub(super) fn finalize_removed_searches(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
+    rendezvous_target: Option<KadId>,
 ) {
     finalize_removed_searches_with_keyword_results(
         state,
@@ -1361,23 +1365,42 @@ pub(super) fn finalize_removed_searches(
         removed_sids,
         released_in_use,
         &HashMap::new(),
+        rendezvous_target,
     );
+}
+
+/// The target of the search `ember_rendezvous_search` names, while the manager
+/// still holds it. Read before any removal, so teardown can tell the rendezvous
+/// lookup from an unrelated search that reused its id.
+pub(super) fn rendezvous_search_target(state: &NetworkState) -> Option<KadId> {
+    state
+        .ember_rendezvous_search
+        .and_then(|rendezvous| state.search_manager.get(&rendezvous))
+        .map(|search| search.target)
 }
 
 /// Like [`finalize_removed_searches`], but when capacity eviction already
 /// extracted FindKeyword / FindSource / FindNotes result entries, deliver or
 /// inject those instead of dropping them with the removed `SearchState`.
+///
+/// `rendezvous_target` is the target of the search `ember_rendezvous_search`
+/// named, read before the removal took it out of the manager; see
+/// [`ember_rendezvous_id_reused`].
 pub(super) fn finalize_removed_searches_with_keyword_results(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
     preserved_results: &HashMap<SearchId, Vec<kad::messages::SearchResultEntry>>,
+    rendezvous_target: Option<KadId>,
 ) {
     if !released_in_use.is_empty() {
         state.routing_table.release_contacts_in_use(released_in_use);
     }
     for sid in removed_sids {
+        if ember_rendezvous_id_reused(state.ember_rendezvous_search, *sid, rendezvous_target) {
+            state.ember_rendezvous_search = None;
+        }
         if let Some(PendingKeywordSearch {
             tx,
             mut local_results,
@@ -1432,7 +1455,12 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
                 })
                 .unwrap_or_default();
             let established = ember_established_addrs(state);
-            harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers, &established);
+            harvest_ember_noise_keys(
+                &mut state.ember_noise_keys,
+                &peers,
+                &established,
+                state.ember_transport.local_noise_public_key(),
+            );
             note_ember_rendezvous_lookup(
                 state,
                 peers.len(),
@@ -1458,7 +1486,12 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
             if let Some(entries) = preserved_results.get(sid) {
                 let all = extract_kad_sources(entries);
                 let established = ember_established_addrs(state);
-                harvest_ember_noise_keys(&mut state.ember_noise_keys, &all, &established);
+                harvest_ember_noise_keys(
+                    &mut state.ember_noise_keys,
+                    &all,
+                    &established,
+                    state.ember_transport.local_noise_public_key(),
+                );
                 let kad_sources: Vec<KadSource> = all
                     .into_iter()
                     .filter(|s| !is_self_source(s, state))
@@ -1537,6 +1570,7 @@ pub(super) fn start_kad_search(
     search_type: SearchType,
     initial_contacts: Vec<KadContact>,
 ) -> SearchId {
+    let rendezvous_target = rendezvous_search_target(state);
     let (sid, evicted, released, preserved_results) =
         state
             .search_manager
@@ -1548,6 +1582,7 @@ pub(super) fn start_kad_search(
             &evicted,
             &released,
             &preserved_results,
+            rendezvous_target,
         );
     }
     sid

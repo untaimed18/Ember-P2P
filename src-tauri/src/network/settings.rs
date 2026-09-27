@@ -196,8 +196,10 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_search = ember::dht::search::SearchManager::new();
     state.ember_publish = ember::dht::publish::PublishManager::new();
     state.ember_batch_publish.clear();
+    state.ember_proxy_buddies.clear();
     state.ember_announced_at.clear();
     state.ember_publish_unplaced.clear();
+    state.ember_publish_placed.clear();
     state.ember_publish_attempts.clear();
     state.ember_publish_pass = EmberPublishPassStats::default();
 
@@ -344,6 +346,7 @@ pub(super) fn apply_network_settings(
             .update_shared_snapshot(&state.shared_ip_filter);
         if new_settings.ip_filter_enabled {
             state.routing_table.evict_filtered_contacts();
+            purge_ember_ip_blocked_peers(state);
             state.ember_dht.evict_filtered_contacts();
         }
     }
@@ -362,6 +365,7 @@ pub(super) fn apply_network_settings(
         // Ember shares the user's IP policy: both stacks dial peers from the
         // same socket, so a contact the user has blocked must be refused by
         // whichever table would otherwise hand it to us.
+        purge_ember_ip_blocked_peers(state);
         state
             .ember_dht
             .set_block_private_ips(new_settings.block_private_ips);

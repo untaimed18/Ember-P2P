@@ -11,8 +11,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use super::messages::{
-    MSG_BUDDY_ENDORSE_REQ, MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE,
-    MSG_STORE_BATCH, MSG_STORE_RECORD,
+    MSG_ANNOUNCE_PEER, MSG_BUDDY_ENDORSE_REQ, MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE,
+    MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD,
 };
 
 /// Sliding window for per-IP message counts.
@@ -410,10 +410,17 @@ impl DhtProtection {
         }
 
         // `BUDDY_ENDORSE_REQ` shares this budget because answering one costs a
-        // signature, the same order of work as serving a lookup.
+        // signature, the same order of work as serving a lookup. `ANNOUNCE_PEER`
+        // is a lookup in all but name — it is answered with the same signed
+        // contact list as `FIND_NODE` — and costs more besides, since every
+        // contact it carries is offered to the routing table.
         if matches!(
             msg_type,
-            MSG_FIND_NODE | MSG_FIND_VALUE | MSG_CALLBACK_REQ | MSG_BUDDY_ENDORSE_REQ
+            MSG_FIND_NODE
+                | MSG_FIND_VALUE
+                | MSG_CALLBACK_REQ
+                | MSG_BUDDY_ENDORSE_REQ
+                | MSG_ANNOUNCE_PEER
         ) {
             let budget_key = match sender_id {
                 Some(id) => StoreBudgetKey::Node(id),
@@ -648,6 +655,28 @@ mod tests {
         // A cheap frame is not charged to it at all.
         assert!(p.allow_message(quiet, MSG_PING, None, 1));
         assert_eq!(p.lookup_counters.len(), 2);
+    }
+
+    /// `ANNOUNCE_PEER` is answered with the same signed contact list as
+    /// `FIND_NODE`, and every contact it carries is offered to the routing
+    /// table, so it cannot be the one lookup that escapes the lookup budget.
+    #[test]
+    fn announce_peer_draws_on_the_lookup_budget() {
+        let mut p = DhtProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let now = Instant::now();
+        let counter = p.lookup_counters.entry(StoreBudgetKey::Addr(ip)).or_default();
+        for _ in 0..MAX_LOOKUPS_PER_WINDOW {
+            assert!(counter.allow(now, LOOKUP_WINDOW, MAX_LOOKUPS_PER_WINDOW));
+        }
+        assert!(
+            !p.allow_typed(ip, MSG_ANNOUNCE_PEER, None, 1),
+            "a spent lookup budget must refuse ANNOUNCE_PEER too"
+        );
+        assert!(
+            p.allow_typed(ip, MSG_PING, None, 1),
+            "while frames that cost nothing to answer still pass"
+        );
     }
 
     /// Two instances behind one NAT must not eat each other's STORE budget.

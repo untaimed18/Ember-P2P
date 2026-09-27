@@ -1702,6 +1702,20 @@ fn source_injection_reports_closed_channel() {
     );
 }
 
+/// Blobs as a finished search holds them, each returned by a different node —
+/// what a walk that reached several storers looks like.
+fn held_records(blobs: &[Vec<u8>]) -> Vec<ember::dht::search::SearchResultRecord> {
+    blobs
+        .iter()
+        .enumerate()
+        .map(|(i, data)| ember::dht::search::SearchResultRecord {
+            data: data.clone(),
+            from_node: ember::dht::EmberNodeId([i as u8 + 1; 16]),
+            confirmed_by: None,
+        })
+        .collect()
+}
+
 /// Build a `FOUND_VALUE`-shaped keyword blob (`record_data || signature`)
 /// signed by `sk`, matching what `build_ember_keyword_built` parses.
 fn ember_kw_blob(
@@ -1802,6 +1816,7 @@ fn only_acked_records_advance_the_republish_schedule() {
             node_id: node,
             records: vec![a],
             deadline: std::time::Instant::now() + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
 
@@ -1822,6 +1837,7 @@ fn only_acked_records_advance_the_republish_schedule() {
             node_id: node,
             records: vec![a],
             deadline: std::time::Instant::now() + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
     let refused = pub_.note_ack(2, 0, node);
@@ -1859,6 +1875,7 @@ fn a_batch_every_storer_refuses_releases_the_file_for_another_round() {
             node_id: node,
             records: vec![reference],
             deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
 
@@ -1910,6 +1927,7 @@ fn a_refusal_does_not_clear_unplaced_while_another_replica_is_in_flight() {
             node_id: a,
             records: vec![reference],
             deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
     pub_.in_flight.insert(
@@ -1918,6 +1936,7 @@ fn a_refusal_does_not_clear_unplaced_while_another_replica_is_in_flight() {
             node_id: b,
             records: vec![reference],
             deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
 
@@ -1969,6 +1988,7 @@ fn a_partial_batch_ack_confirms_only_the_accepted_records() {
             node_id: node,
             records: refs.clone(),
             deadline: std::time::Instant::now() + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
 
@@ -2034,6 +2054,7 @@ fn unacked_batches_expire() {
             node_id: ember::dht::EmberNodeId([1u8; 16]),
             records: vec![record_ref(0, 0)],
             deadline: std::time::Instant::now() - EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
         },
     );
     let abandoned = pub_.expire(std::time::Instant::now());
@@ -2061,6 +2082,7 @@ fn a_queued_batch_uses_the_handshake_extended_deadline() {
             node_id: ember::dht::EmberNodeId([1u8; 16]),
             records: vec![record_ref(0, 0)],
             deadline: queued,
+            voided: 0,
         },
     );
     assert!(
@@ -2073,11 +2095,12 @@ fn a_queued_batch_uses_the_handshake_extended_deadline() {
     assert_eq!(abandoned, vec![record_ref(0, 0)]);
 }
 
-/// The four maps `EmberPublishSchedule` borrows, owned so a test can drive
+/// The maps `EmberPublishSchedule` borrows, owned so a test can drive
 /// the state machine without a whole `NetworkState`.
 #[derive(Default)]
 struct TestSchedule {
     unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    placed: HashSet<([u8; 16], EmberPublishKind)>,
     attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     source_at: HashMap<[u8; 16], std::time::Instant>,
     keyword_at: HashMap<[u8; 16], std::time::Instant>,
@@ -2087,6 +2110,7 @@ impl TestSchedule {
     fn borrow(&mut self) -> EmberPublishSchedule<'_> {
         EmberPublishSchedule {
             unplaced: &mut self.unplaced,
+            placed: &mut self.placed,
             attempts: &mut self.attempts,
             source_at: &mut self.source_at,
             keyword_at: &mut self.keyword_at,
@@ -2279,6 +2303,203 @@ fn a_file_awaiting_placement_is_not_selected_again() {
     );
 }
 
+/// Which of a file's keys resolves last is timing, not outcome: a timeout
+/// always lands after the acks. A round in which one keyword landed and
+/// another was refused everywhere is published, not a failed round.
+#[test]
+fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(4, 40);
+    let refused = record_ref(4, 41);
+    let slot = (landed.file_hash, landed.kind);
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), refused);
+    assert!(
+        !place_ember_record_pending(sched.borrow(), landed, now),
+        "a sibling key is still out"
+    );
+    assert!(
+        fail_ember_record_pending(sched.borrow(), refused, now),
+        "the round placed something, so it closes as published"
+    );
+    assert!(!sched.unplaced.contains_key(&slot));
+    assert!(!sched.placed.contains(&slot));
+    assert_eq!(sched.rounds_failed(landed), 0, "and nothing is charged");
+    assert_eq!(
+        ember_publish_staleness(
+            &sched.unplaced,
+            &sched.keyword_at,
+            landed.file_hash,
+            landed.kind,
+            EMBER_KEYWORD_REPUBLISH,
+            now,
+        ),
+        None,
+        "the file waits out its interval like any confirmed one"
+    );
+}
+
+/// The same when the last key is dropped before it reaches the wire.
+#[test]
+fn a_round_that_placed_one_key_is_published_when_its_last_key_is_dropped() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(5, 50);
+    let dropped = record_ref(5, 51);
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), dropped);
+    assert!(!place_ember_record_pending(sched.borrow(), landed, now));
+    assert!(untrack_ember_record_pending(sched.borrow(), dropped));
+    assert!(sched.keyword_at.contains_key(&landed.file_hash));
+    assert!(sched.unplaced.is_empty() && sched.placed.is_empty());
+}
+
+fn queued_copy(reference: EmberRecordRef) -> EmberQueuedRecord {
+    EmberQueuedRecord {
+        reference,
+        record: ember::dht::messages::BatchedRecord {
+            key: reference.key,
+            record: vec![0x01; 32],
+            record_signature: [reference.key[0]; 64],
+        },
+        queued_at: std::time::Instant::now(),
+    }
+}
+
+/// Releasing records a destination will never be sent reports the rounds it
+/// closed as published, so the caller can light the badge and count them.
+#[test]
+fn releasing_the_last_key_of_a_round_that_placed_one_reports_it_published() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(8, 80);
+    let released = record_ref(8, 81);
+    let replicated = EmberRecordRef {
+        kind: EmberPublishKind::Replication,
+        ..record_ref(9, 90)
+    };
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), released);
+    assert!(!place_ember_record_pending(sched.borrow(), landed, now));
+
+    let outcome = settle_released_ember_records(
+        sched.borrow(),
+        vec![queued_copy(released), queued_copy(replicated)],
+        |_| false,
+    );
+    assert_eq!(outcome.published, vec![released]);
+    assert_eq!(outcome.dropped, 1);
+    assert_eq!(outcome.rearm.len(), 1, "replication goes back to the store");
+    assert!(sched.keyword_at.contains_key(&landed.file_hash));
+    assert!(sched.unplaced.is_empty());
+}
+
+/// A copy another replica still carries can still place the record, so
+/// releasing this one must leave the round open.
+#[test]
+fn releasing_a_record_another_replica_still_carries_leaves_the_round_open() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(10, 100);
+    let carried = record_ref(10, 101);
+    let slot = (carried.file_hash, carried.kind);
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), carried);
+    assert!(!place_ember_record_pending(sched.borrow(), landed, now));
+
+    let mut publisher = EmberBatchPublisher::default();
+    publisher.in_flight.insert(
+        7,
+        EmberBatchInFlight {
+            node_id: ember::dht::EmberNodeId([7; 16]),
+            records: vec![carried],
+            deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            voided: 0,
+        },
+    );
+    let outcome = settle_released_ember_records(sched.borrow(), vec![queued_copy(carried)], |r| {
+        publisher.record_still_outstanding(r)
+    });
+    assert!(outcome.published.is_empty());
+    assert_eq!(outcome.dropped, 1);
+    assert!(sched.unplaced[&slot].contains(&carried.key));
+    assert!(!sched.keyword_at.contains_key(&carried.file_hash));
+}
+
+/// A dropped round costs nothing, but it must not forgive earlier failures
+/// either, or a file whose rounds alternate between refusal and drop never
+/// reaches the park and returns every tick without backoff.
+#[test]
+fn a_dropped_round_keeps_the_failures_counted_before_it() {
+    let mut sched = TestSchedule::default();
+    let reference = record_ref(6, 60);
+    let start = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), reference);
+    fail_ember_record_pending(sched.borrow(), reference, start);
+    assert_eq!(sched.rounds_failed(reference), 1);
+
+    track_ember_record_pending(sched.borrow(), reference);
+    assert!(!untrack_ember_record_pending(sched.borrow(), reference));
+    assert_eq!(sched.rounds_failed(reference), 1, "the drop charged nothing and forgave nothing");
+    assert!(!sched.keyword_at.contains_key(&reference.file_hash));
+}
+
+/// A placement left over from a round that ended some other way must not
+/// count for the next one.
+#[test]
+fn a_new_round_starts_with_nothing_placed() {
+    let mut sched = TestSchedule::default();
+    let reference = record_ref(7, 70);
+    let now = std::time::Instant::now();
+    sched.placed.insert((reference.file_hash, reference.kind));
+
+    track_ember_record_pending(sched.borrow(), reference);
+    assert!(!fail_ember_record_pending(sched.borrow(), reference, now));
+    assert_eq!(sched.rounds_failed(reference), 1, "charged, not published");
+    assert!(!sched.keyword_at.contains_key(&reference.file_hash));
+}
+
+/// Replication keys are close to our own ID, where the table is already right,
+/// and a store holds far more of them than the lookup cache. Queueing them would
+/// fill the 512-slot lookup queue and refuse our own keys, so records that are
+/// not ours queue under a lower limit, or none.
+#[test]
+fn only_our_own_publishes_may_fill_the_target_lookup_queue() {
+    let local = ember::dht::EmberNodeId([0u8; 16]);
+    let mut routing = ember::dht::routing::RoutingTable::new(local, false);
+    for i in 0..4u8 {
+        routing.add_contact(ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0x40 + i; 16]),
+            addr: SocketAddr::from(([80, 1, i + 1, 1], 4672)),
+            noise_pub: [i; 32],
+            ed25519_pub: [i; 32],
+            last_seen: 1_700_000_000,
+            failed_queries: 0,
+        });
+    }
+    let cache = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+
+    let targets = ember_publish_targets_for(&cache, &mut queue, 0, &routing, [0xA1; 16], now);
+    assert_eq!(targets.len(), 4, "replication still publishes from the table");
+    assert!(queue.is_empty(), "but never queues a lookup");
+
+    for key in 0..4u8 {
+        let _ = ember_publish_targets_for(&cache, &mut queue, 2, &routing, [key; 16], now);
+    }
+    assert_eq!(queue.len(), 2, "a lower limit stops at its share");
+
+    let _ = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, [0xB2; 16], now);
+    assert_eq!(queue.len(), 3, "our own key still queues past that share");
+}
+
 #[test]
 fn ember_publish_instant_treats_never_and_expired_as_due() {
     let now = std::time::Instant::now();
@@ -2307,28 +2528,86 @@ fn ember_publish_instant_keeps_a_stamp_still_inside_the_interval() {
     let interval = std::time::Duration::from_secs(2 * 3600);
     let now_unix = 1_700_000_000i64;
     let last = (now_unix as u32).saturating_sub(60);
-    let at = ember_publish_instant(last, now_unix, now, interval)
+    let due = ember_publish_instant(last, now_unix, now, interval)
         .expect("a one-minute-old stamp must still be scheduled");
-    let elapsed = now.duration_since(at).as_secs();
-    assert!(
-        elapsed <= 60 + 2,
-        "hydrated Instant should be ~60s ago, got {elapsed}s"
+    assert_eq!(
+        due.duration_since(now),
+        interval - std::time::Duration::from_secs(60),
+        "the file falls due when the rest of its interval has passed"
+    );
+}
+
+/// `Instant` counts from boot on Windows, so a stamp from before the boot has
+/// no `Instant` of its own. Representing the schedule as a deadline is what
+/// keeps an app started at login from treating the whole library as never
+/// published. Eleven hours is longer than a freshly booted machine has been up,
+/// and the result must not depend on how long this one has.
+#[test]
+fn ember_publish_instant_keeps_a_stamp_older_than_the_machine_uptime() {
+    let now = std::time::Instant::now();
+    let now_unix = 1_700_000_000i64;
+    let last = (now_unix - 11 * 3600) as u32;
+    let due = ember_publish_instant(last, now_unix, now, EMBER_KEYWORD_REPUBLISH)
+        .expect("an eleven-hour-old keyword stamp still has an hour to run");
+    assert_eq!(due.duration_since(now), std::time::Duration::from_secs(3600));
+
+    let mut due_at = HashMap::new();
+    due_at.insert([0x5A; 16], due);
+    let unplaced = HashMap::new();
+    assert_eq!(
+        ember_publish_staleness(
+            &unplaced,
+            &due_at,
+            [0x5A; 16],
+            EmberPublishKind::Keyword,
+            EMBER_KEYWORD_REPUBLISH,
+            now,
+        ),
+        None,
+        "not due for another hour"
+    );
+    assert_eq!(
+        ember_publish_staleness(
+            &unplaced,
+            &due_at,
+            [0x5A; 16],
+            EmberPublishKind::Keyword,
+            EMBER_KEYWORD_REPUBLISH,
+            due + std::time::Duration::from_secs(90),
+        ),
+        Some(EMBER_KEYWORD_REPUBLISH.as_secs() + 90),
+        "once due, staleness is still the time since the last publish"
     );
 }
 
 #[test]
 fn note_ember_verified_contacts_tracks_daily_and_alltime_peaks() {
     let mut hw = EmberVerifiedHighwater {
-        day: chrono::Utc::now().date_naive().to_string(),
+        day: "2026-09-26".to_string(),
         daily: 3,
         alltime: 10,
     };
-    assert!(note_ember_verified_contacts(&mut hw, 12));
+    assert!(note_ember_verified_contacts_on(&mut hw, 12, "2026-09-26"));
     assert_eq!(hw.daily, 12);
     assert_eq!(hw.alltime, 12);
-    assert!(!note_ember_verified_contacts(&mut hw, 8));
+    assert!(!note_ember_verified_contacts_on(&mut hw, 8, "2026-09-26"));
     assert_eq!(hw.daily, 12);
     assert_eq!(hw.alltime, 12);
+    // A new day starts the daily peak over from the live count.
+    assert!(note_ember_verified_contacts_on(&mut hw, 5, "2026-09-27"));
+    assert_eq!(hw.day, "2026-09-27");
+    assert_eq!(hw.daily, 5);
+    assert_eq!(hw.alltime, 12);
+}
+
+#[test]
+fn the_daily_verified_peak_follows_the_local_calendar_day() {
+    let today = chrono::Local::now().date_naive().to_string();
+    let mut hw = EmberVerifiedHighwater::default();
+    note_ember_verified_contacts(&mut hw, 4);
+    // A midnight between the two reads is the only way these can differ.
+    let after = chrono::Local::now().date_naive().to_string();
+    assert!(hw.day == today || hw.day == after);
 }
 
 /// A ping is the only way a lead becomes usable, so the ping budget is also
@@ -2384,6 +2663,7 @@ fn queued_record(seed: u8) -> EmberQueuedRecord {
             record: vec![seed, seed, seed],
             record_signature: [0u8; 64],
         },
+        queued_at: std::time::Instant::now(),
     }
 }
 
@@ -2678,7 +2958,7 @@ fn one_publisher_cannot_seed_a_digest_a_transfer_will_enforce() {
         ember_kw_blob_with_digest(&honest_a, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
         ember_kw_blob_with_digest(&honest_b, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
     ];
-    let built = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None);
+    let built = build_ember_keyword_built(&held_records(&blobs), &["ubuntu".to_string()], None);
 
     assert_eq!(built.results.len(), 2, "both files are still shown");
     let shown = built
@@ -2717,6 +2997,75 @@ fn one_publisher_cannot_seed_a_digest_a_transfer_will_enforce() {
                 *hash == agreed && *digest == real && *publishers == 2
             }),
         "a corroborated digest is what automatic seeding may pin"
+    );
+}
+
+/// A record proves only the key it carries, and keys are free. One responder
+/// returning forty records for a popular file, each under a fresh key and all
+/// naming the same bogus digest, must neither pin that digest nor out-vote the
+/// real one on the row a click pins — the download would finish its eD2K parts
+/// and then fail the content check for good.
+#[test]
+fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
+    use ed25519_dalek::SigningKey;
+
+    let file = [0xF1u8; 16];
+    let bogus = [0xEEu8; 32];
+    let real = [0x77u8; 32];
+    let from = |node: u8, data: Vec<u8>| ember::dht::search::SearchResultRecord {
+        data,
+        from_node: ember::dht::EmberNodeId([node; 16]),
+        confirmed_by: None,
+    };
+    let minted: Vec<_> = (0..40u8)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(&[0x80 | (i & 0x3F); 32]);
+            from(9, ember_kw_blob_with_digest(&sk, "ubuntu", file, bogus, 100, "ubuntu.iso"))
+        })
+        .collect();
+
+    let built = build_ember_keyword_built(&minted, &["ubuntu".to_string()], None);
+    assert!(built.corroborated.is_empty(), "one responder's publishers never corroborate");
+
+    let mut held = minted.clone();
+    for node in [1u8, 2] {
+        let sk = SigningKey::from_bytes(&[node; 32]);
+        held.push(from(
+            node,
+            ember_kw_blob_with_digest(&sk, "ubuntu", file, real, 100, "ubuntu.iso"),
+        ));
+    }
+    let built = build_ember_keyword_built(&held, &["ubuntu".to_string()], None);
+    assert_eq!(built.results.len(), 1);
+    assert_eq!(
+        built.results[0].file.ember_file_hash,
+        hex::encode(real),
+        "the digest two storers vouch for is the one a click pins"
+    );
+    assert_eq!(built.corroborated, vec![(file, real, 2)]);
+
+    // The source path applies the same rule to the digest it pins.
+    let minted_sources: Vec<_> = (0..40u8)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(&[0x80 | (i & 0x3F); 32]);
+            from(9, ember_source_blob(&sk, file, bogus, i))
+        })
+        .collect();
+    let mut content_hashes = HashMap::new();
+    let sources = parse_ember_source_records(
+        &minted_sources,
+        file,
+        None,
+        &[0u8; 32],
+        &mut crate::types::EmberDiagnostics::default(),
+        &mut HashMap::new(),
+        &HashSet::new(),
+        &mut content_hashes,
+    );
+    assert_eq!(sources.len(), 40, "every contact stays connectable");
+    assert!(
+        content_hashes.is_empty(),
+        "but no digest is pinned on one responder's word"
     );
 }
 
@@ -2950,7 +3299,7 @@ fn ember_keyword_results_dedup_counts_distinct_publishers() {
         ember_kw_blob(&sk2, "ubuntu", hash_a, 100, "ubuntu-24.iso"),
         ember_kw_blob(&sk1, "ubuntu", hash_b, 200, "ubuntu-server.iso"),
     ];
-    let results = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None).results;
+    let results = build_ember_keyword_built(&held_records(&blobs), &["ubuntu".to_string()], None).results;
     assert_eq!(results.len(), 2, "two distinct files");
     let a = results
         .iter()
@@ -3056,6 +3405,16 @@ fn an_ember_keyword_search_sends_size_type_and_extension_but_not_availability() 
     // An unfiltered search must send nothing at all, so its payload stays
     // byte-identical to what a build predating the block produces.
     assert!(ember_keyword_constraints(None, None, None, None).is_empty());
+
+    // Zero is the search page's "no limit". Sent as a ceiling it would have
+    // every responder refuse every record under the key.
+    let unbounded = ember_keyword_constraints(None, Some(0), Some(0), None);
+    assert_eq!(unbounded.min_size, None);
+    assert_eq!(unbounded.max_size, None);
+    assert!(unbounded.is_empty());
+    let floor_only = ember_keyword_constraints(None, Some(1024), Some(0), None);
+    assert_eq!(floor_only.min_size, Some(1024));
+    assert_eq!(floor_only.max_size, None);
 }
 
 /// A record's media has to reach the row, which is the entire user-visible
@@ -3113,7 +3472,7 @@ fn ember_keyword_results_carry_the_publishers_media() {
         ),
     ];
     let results =
-        build_ember_keyword_built(&blobs, &["heliopause".to_string()], None).results;
+        build_ember_keyword_built(&held_records(&blobs), &["heliopause".to_string()], None).results;
 
     let row = results
         .iter()
@@ -3149,7 +3508,7 @@ fn ember_keyword_results_multi_word_and_filter() {
         ember_kw_blob(&sk, "ubuntuiso", hash_b, 1, "ubuntuiso desktop amd64"),
     ];
     let results = build_ember_keyword_built(
-        &blobs,
+        &held_records(&blobs),
         &["ubuntuiso".to_string(), "server".to_string()],
         None,
     )
@@ -3179,7 +3538,7 @@ fn ember_keyword_results_accept_the_key_the_lookup_actually_walked() {
         "ubuntu server amd64.iso",
     )];
 
-    let results = build_ember_keyword_built(&blobs, &keywords, None).results;
+    let results = build_ember_keyword_built(&held_records(&blobs), &keywords, None).results;
     assert_eq!(
         results.len(),
         1,
@@ -3206,14 +3565,14 @@ fn ember_keyword_results_honor_boolean_queries() {
     // keyword AND would drop it.
     let or_expr = crate::search::query::parse("matrix OR reloaded")
         .expect("query parses to an expression");
-    let or_results = build_ember_keyword_built(&blobs, &keywords, Some(&or_expr)).results;
+    let or_results = build_ember_keyword_built(&held_records(&blobs), &keywords, Some(&or_expr)).results;
     assert_eq!(or_results.len(), 2, "OR keeps both sides");
 
     // A NOT query must drop the excluded file even though the excluded
     // term never appears in the flattened positive keywords.
     let not_expr = crate::search::query::parse("reloaded -documentary").expect("query parses");
     let not_results =
-        build_ember_keyword_built(&blobs, &["reloaded".to_string()], Some(&not_expr)).results;
+        build_ember_keyword_built(&held_records(&blobs), &["reloaded".to_string()], Some(&not_expr)).results;
     assert_eq!(not_results.len(), 1, "NOT excludes the negated match");
     assert_eq!(not_results[0].file.hash, hex::encode(hash_a));
 }
@@ -3241,7 +3600,7 @@ fn ember_keyword_results_ignore_source_and_garbage_blobs() {
     source_blob.extend_from_slice(&source.signature);
     // A source record (wrong type) and an undersized garbage blob.
     let blobs = vec![source_blob, vec![0u8; 8]];
-    let results = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None).results;
+    let results = build_ember_keyword_built(&held_records(&blobs), &["ubuntu".to_string()], None).results;
     assert!(
         results.is_empty(),
         "source records and garbage must not become keyword hits"
@@ -3269,9 +3628,10 @@ fn one_ember_source_publisher_cannot_name_the_expected_digest() {
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
     let sources = parse_ember_source_records(
-        &blobs,
+        &held_records(&blobs),
         file_hash,
         None,
+        &[0u8; 32],
         &mut diag,
         &mut noise_keys,
         &HashSet::new(),
@@ -3312,9 +3672,10 @@ fn firewalled_source_records_do_not_cache_noise_keys() {
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
     let sources = parse_ember_source_records(
-        &[blob],
+        &held_records(&[blob]),
         file_hash,
         None,
+        &[0u8; 32],
         &mut diag,
         &mut noise_keys,
         &HashSet::new(),
@@ -3358,9 +3719,10 @@ fn firewalled_source_records_preserve_callback_buddy() {
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
     let sources = parse_ember_source_records(
-        &[blob],
+        &held_records(&[blob]),
         file_hash,
         None,
+        &[0u8; 32],
         &mut diag,
         &mut noise_keys,
         &HashSet::new(),
@@ -3400,9 +3762,10 @@ fn highid_source_records_cache_bound_noise_keys() {
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
     parse_ember_source_records(
-        &[blob],
+        &held_records(&[blob]),
         file_hash,
         None,
+        &[0u8; 32],
         &mut diag,
         &mut noise_keys,
         &HashSet::new(),
@@ -3433,9 +3796,10 @@ fn ember_source_records_never_overwrite_a_trusted_digest() {
         },
     )]);
     parse_ember_source_records(
-        &blobs,
+        &held_records(&blobs),
         file_hash,
         None,
+        &[0u8; 32],
         &mut diag,
         &mut noise_keys,
         &HashSet::new(),
@@ -3586,14 +3950,14 @@ fn udp_epx_budget_refills_after_the_window() {
     let stale = std::time::Instant::now()
         .checked_sub(EPX_UDP_RATE_WINDOW)
         .expect("clock far enough from boot to back-date");
-    map.get_mut(&addr).unwrap().1 = stale;
+    map.get_mut(&addr.ip()).unwrap().1 = stale;
 
     assert!(
         check_and_record_udp_epx_rate(&mut map, addr),
         "the window has rolled, so the peer is served again"
     );
     assert_eq!(
-        map.get(&addr).unwrap().0,
+        map.get(&addr.ip()).unwrap().0,
         1,
         "and its budget starts over rather than resuming mid-window"
     );
@@ -3623,9 +3987,30 @@ fn udp_epx_rate_map_is_bounded_by_evicting_the_oldest() {
         "the map must stay within its cap"
     );
     assert!(
-        !map.contains_key(&first),
+        !map.contains_key(&first.ip()),
         "the oldest entry is the one given up"
     );
+}
+
+/// A new source port is only a new Noise session away, so the budget belongs
+/// to the host: rotating ports must not buy a fresh one.
+#[test]
+fn udp_epx_budget_survives_source_port_rotation() {
+    let mut map = HashMap::new();
+    let ip = Ipv4Addr::new(80, 2, 2, 9);
+    for port in 0..u16::from(ember::MAX_EPX_PACKETS_PER_CONNECTION) {
+        assert!(check_and_record_udp_epx_rate(
+            &mut map,
+            SocketAddr::from((ip, 40_000 + port))
+        ));
+    }
+    assert!(!check_and_record_udp_epx_rate(
+        &mut map,
+        SocketAddr::from((ip, 50_000))
+    ));
+    // The v4-mapped form of the same host is the same host.
+    let mapped = SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), 50_001);
+    assert!(!check_and_record_udp_epx_rate(&mut map, mapped));
 }
 
 #[test]
@@ -3841,6 +4226,37 @@ fn the_rendezvous_empty_streak_follows_conversion_not_listing() {
 }
 
 #[test]
+fn mirrored_ember_counters_pin_at_the_ceiling_instead_of_wrapping() {
+    assert_eq!(saturating_u32(0), 0);
+    assert_eq!(saturating_u32(u64::from(u32::MAX)), u32::MAX);
+    assert_eq!(saturating_u32(u64::from(u32::MAX) + 5), u32::MAX);
+}
+
+#[test]
+fn the_rendezvous_advert_follows_udp_reachability_not_tcp() {
+    // KAD proved the port open: advertise, whatever TCP says.
+    assert!(ember_rendezvous_advert_reachable(true, false, false));
+    // Filtered UDP (a HighID node's case) and no Ember evidence: stay unlisted.
+    assert!(!ember_rendezvous_advert_reachable(true, true, false));
+    // Not yet checked is not proof.
+    assert!(!ember_rendezvous_advert_reachable(false, false, false));
+    // Ember's own evidence stands in for a KAD check that has not run.
+    assert!(ember_rendezvous_advert_reachable(false, true, true));
+}
+
+#[test]
+fn a_reused_kad_search_id_is_not_taken_for_the_rendezvous_lookup() {
+    let rendezvous = kad::publish::ember_rendezvous_key();
+    let other = KadId([0x42; 16]);
+    let sid = SearchId(1);
+    assert!(!ember_rendezvous_id_reused(Some(sid), sid, Some(rendezvous)));
+    assert!(ember_rendezvous_id_reused(Some(sid), sid, Some(other)));
+    assert!(!ember_rendezvous_id_reused(Some(SearchId(2)), sid, Some(other)));
+    assert!(!ember_rendezvous_id_reused(None, sid, Some(other)));
+    assert!(!ember_rendezvous_id_reused(Some(sid), sid, None));
+}
+
+#[test]
 fn stun_may_replace_a_kad_vote_but_not_a_live_highid() {
     let stun = Ipv4Addr::new(8, 8, 8, 8);
     let kad = Ipv4Addr::new(4, 4, 4, 4);
@@ -3931,6 +4347,91 @@ fn kad_bridge_candidates_skip_documentation_addresses() {
     let picked = kad_bridge_candidates(&map, &empty, 8, false);
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].0, ok);
+}
+
+#[test]
+fn our_own_echoed_source_record_is_not_harvested_as_a_bridge_key() {
+    let source = |ip: Ipv4Addr, npub: [u8; 32]| KadSource {
+        ip,
+        tcp_port: 4662,
+        udp_port: 4672,
+        source_type: 1,
+        connect_options: 0,
+        buddy_ip: None,
+        buddy_port: None,
+        buddy_hash: None,
+        source_user_hash: None,
+        lowid: 0,
+        ed2k_server_ip: 0,
+        ed2k_server_port: 0,
+        is_ember_capable: true,
+        ember_noise_pub: Some(npub),
+    };
+    let ours = [0x5A; 32];
+    let peer = Ipv4Addr::new(8, 8, 8, 8);
+    // Our own record can come back under an address that is not the one we
+    // currently report, so the key is what identifies it.
+    let sources = [
+        source(Ipv4Addr::new(9, 9, 9, 9), ours),
+        source(peer, [0xAA; 32]),
+    ];
+    let mut keys = HashMap::new();
+    harvest_ember_noise_keys(&mut keys, &sources, &HashSet::new(), &ours);
+    assert_eq!(keys.len(), 1);
+    assert_eq!(lookup_ember_noise_key(&keys, peer, 4672), Some([0xAA; 32]));
+}
+
+#[test]
+fn the_ember_ip_verdict_honours_ranges_and_bans_but_spares_introduced_lan_peers() {
+    let public = Ipv4Addr::new(8, 8, 8, 8);
+    let listed = Ipv4Addr::new(9, 9, 9, 9);
+    let lan = Ipv4Addr::new(192, 168, 1, 20);
+    let mut filter = IpFilter::new(true, true);
+    filter.add_range(listed, listed, "test".into());
+    filter.add_range(lan, lan, "private space on the list".into());
+    filter.mark_ranges_ready();
+    let mut banned = HashSet::new();
+
+    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Allowed);
+    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || false), EmberIpVerdict::Blocked);
+    // An introduction exempts only a LAN/CGNAT address, as inbound does.
+    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || true), EmberIpVerdict::Blocked);
+    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || false), EmberIpVerdict::Blocked);
+    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || true), EmberIpVerdict::Allowed);
+
+    // A ban refuses the peer without forgetting it, even where the introduction
+    // would exempt it from the filter; a filter hit still wins over a ban.
+    banned.insert(public);
+    banned.insert(lan);
+    banned.insert(listed);
+    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Banned);
+    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || true), EmberIpVerdict::Banned);
+    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || false), EmberIpVerdict::Blocked);
+    assert!(EmberIpVerdict::Banned.refuses() && EmberIpVerdict::Blocked.refuses());
+    assert!(!EmberIpVerdict::Pending.refuses() && !EmberIpVerdict::Allowed.refuses());
+    assert_eq!(
+        ember_ip_verdict(&filter, &banned, Ipv4Addr::new(203, 0, 113, 5), || true),
+        EmberIpVerdict::Blocked
+    );
+}
+
+#[test]
+fn a_loading_ember_ip_filter_neither_dials_strangers_nor_forgets_them() {
+    let filter = IpFilter::new(true, false);
+    assert!(!filter.ranges_ready());
+    let banned = HashSet::new();
+    let public = Ipv4Addr::new(8, 8, 8, 8);
+    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Pending);
+    assert_eq!(ember_ip_verdict(&filter, &banned, public, || true), EmberIpVerdict::Allowed);
+
+    // The introduction lookup walks the session maps, so a public address on a
+    // settled filter must not pay for it.
+    let mut settled = IpFilter::new(false, false);
+    settled.mark_ranges_ready();
+    assert_eq!(
+        ember_ip_verdict(&settled, &banned, public, || panic!("not needed")),
+        EmberIpVerdict::Allowed
+    );
 }
 
 /// A peer we already hold a Noise key for must go through the 1-RTT IK
@@ -4316,6 +4817,126 @@ fn a_contact_heard_from_since_the_ping_is_not_faulted() {
     );
 }
 
+/// Silence the node slept through says nothing about its contacts. After a
+/// suspend longer than the stale threshold, the first tick purged every
+/// verified contact before a single liveness ping had gone out.
+#[test]
+fn a_suspend_holds_the_stale_purge_for_one_liveness_window() {
+    let interval = EMBER_MAINT_INTERVAL.as_secs() as i64;
+    let before = 1_000_000i64;
+    let resumed = before + EMBER_CONTACT_STALE_SECS + 3600;
+
+    assert_eq!(
+        ember_stale_purge_hold(Some(before), 0, before + interval),
+        0,
+        "an ordinary tick holds nothing"
+    );
+    assert_eq!(ember_stale_purge_hold(None, 0, before), 0, "nor does the first");
+
+    let held_until = ember_stale_purge_hold(Some(before), 0, resumed);
+    assert_eq!(held_until, resumed + EMBER_CONTACT_PING_SECS);
+
+    // The ticks after resume keep the hold until the window has passed.
+    let next = resumed + interval;
+    assert_eq!(ember_stale_purge_hold(Some(resumed), held_until, next), held_until);
+    assert!(next < held_until, "still held one tick later");
+    let after = held_until + interval;
+    assert!(
+        ember_stale_purge_hold(Some(after - interval), held_until, after) <= after,
+        "and the purge runs again once it has"
+    );
+
+    // A clock stepped back a day must not stretch the hold by a day.
+    let stepped_back = resumed - 86_400;
+    assert_eq!(
+        ember_stale_purge_hold(Some(resumed), held_until, stepped_back),
+        stepped_back + EMBER_CONTACT_PING_SECS
+    );
+}
+
+/// The "overlay emptied" re-arm is how a spent address book becomes offerable
+/// again. A session copy learned from a LAN `PEER_LIST` is never pinged and
+/// never ages out, so counting it held the overlay above zero for good and
+/// the re-arm never fired.
+#[test]
+fn an_unproven_session_copy_does_not_hold_off_the_empty_overlay_rearm() {
+    let dht = ember::dht::engine::EmberDht::new([8; 32], [8; 32], false);
+    let session_contact = |last_seen: i64, last: u8| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([last; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last)), 4672),
+        noise_pub: [last; 32],
+        ed25519_pub: [last; 32],
+        last_seen,
+        failed_queries: 0,
+    };
+    let mut session: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact> = HashMap::new();
+    record_ember_session_dht_contact(&mut session, session_contact(0, 3));
+    assert_eq!(dht.routing().held_len(), 0);
+    assert_eq!(
+        ember_rearm_contact_count(&dht, &session),
+        0,
+        "an empty table with only an unproven LAN copy beside it is empty"
+    );
+
+    // A session peer that has answered us is a live overlay, however empty the
+    // public table.
+    record_ember_session_dht_contact(
+        &mut session,
+        session_contact(chrono::Utc::now().timestamp(), 4),
+    );
+    assert_eq!(ember_rearm_contact_count(&dht, &session), 1);
+}
+
+/// A friend's contact that lands behind a full bucket is parked until the
+/// incumbent fails a probe. Reading the table's answer as "added or not"
+/// dropped that request, so the contact waited on an eviction nothing would
+/// ever trigger.
+#[test]
+fn friend_contacts_behind_a_full_bucket_ask_for_the_incumbent_to_be_probed() {
+    let mut dht = ember::dht::engine::EmberDht::new([7; 32], [7; 32], false);
+    let local = dht.local_id();
+    let in_far_bucket = |i: u8, ip: [u8; 4], last_seen: i64| {
+        let mut id = local.0;
+        id[0] ^= 0x80;
+        id[15] ^= i;
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId(id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 4672),
+            noise_pub: [i; 32],
+            ed25519_pub: [i; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    for i in 1..=ember::dht::K_BUCKET_SIZE as u8 {
+        assert!(matches!(
+            dht.offer_contact(in_far_bucket(i, [80, i, 1, 1], now)),
+            ember::dht::routing::AddResult::Added
+        ));
+    }
+    let incumbent = in_far_bucket(1, [80, 1, 1, 1], now).node_id;
+
+    let fresh_bucket = {
+        let mut id = local.0;
+        id[0] ^= 0x40;
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId(id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(82, 1, 1, 1)), 4672),
+            noise_pub: [9; 32],
+            ed25519_pub: [9; 32],
+            last_seen: 0,
+            failed_queries: 0,
+        }
+    };
+    let offered = [in_far_bucket(0xF0, [81, 1, 1, 1], 0), fresh_bucket];
+    let (learned, pressure) = offer_friend_ember_contacts(&mut dht, &offered);
+
+    assert_eq!(learned, 1, "the one with room is admitted");
+    assert_eq!(pressure.len(), 1, "the one behind the full bucket asks for a probe");
+    assert_eq!(pressure[0].1, incumbent, "of that bucket's oldest contact");
+}
+
 /// A ping still queued behind a Noise handshake has not been transmitted,
 /// so it must not be judged on the on-the-wire budget.
 #[test]
@@ -4395,6 +5016,29 @@ fn a_friend_is_only_ever_told_about_contacts_that_answered_us() {
     let answer = ember_friend_contact_answer(&table, &target);
     assert_eq!(answer.len(), 1);
     assert_eq!(answer[0].node_id, proven.node_id);
+}
+
+#[test]
+fn an_epx_sender_is_only_credited_with_a_verified_contact_on_its_own_session_key() {
+    let mut table =
+        ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0xFF; 16]), false);
+
+    // Gossip filed the victim's node ID at the sender's address.
+    let mut planted = test_ember_contact(2, [10, 2, 0, 20], 4672);
+    planted.last_seen = 0;
+    table.add_contact(planted.clone());
+    let sender_key = [0x77; 32];
+    assert_eq!(verified_session_node_id(&table, planted.addr, &sender_key), None);
+    assert_eq!(verified_session_node_id(&table, planted.addr, &planted.noise_pub), None);
+
+    let proven = test_ember_contact(3, [10, 3, 0, 30], 4672);
+    table.add_contact(proven.clone());
+    assert_eq!(
+        verified_session_node_id(&table, proven.addr, &proven.noise_pub),
+        Some(proven.node_id.0)
+    );
+    // Same address, another session: not that contact's frames.
+    assert_eq!(verified_session_node_id(&table, proven.addr, &sender_key), None);
 }
 
 /// Every friend has to get a turn. The ask interval equals the maintenance

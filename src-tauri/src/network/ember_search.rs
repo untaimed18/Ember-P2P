@@ -208,6 +208,7 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
                 per_search_req_id,
                 deadline: std::time::Instant::now() + budget,
                 sent_unix: chrono::Utc::now().timestamp(),
+                handshake_to: behind_handshake.then_some((contact.addr, contact.noise_pub)),
             },
         );
         }
@@ -312,11 +313,12 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             if let Some(search) = state.ember_search.get(search_id) {
                 record_ember_find_value_quality(&mut state.ember_diagnostics, search);
             }
-            let records = state
+            let held = state
                 .ember_search
                 .get(search_id)
-                .map(|s| s.results.iter().map(|r| r.data.clone()).collect::<Vec<_>>())
+                .map(|s| s.results.clone())
                 .unwrap_or_default();
+            let records: Vec<Vec<u8>> = held.iter().map(|r| r.data.clone()).collect();
             if records.is_empty() {
                 state.ember_diagnostics.ember_dht_search_misses = state
                     .ember_diagnostics
@@ -338,11 +340,13 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // into connectable sources and queue them for async injection
                 // into the matching download on the next sweep tick.
                 let self_ip = state.external_ip;
+                let local_noise_pub = *state.ember_transport.local_noise_public_key();
                 let established = ember_established_addrs(state);
                 let sources = parse_ember_source_records(
-                    &records,
+                    &held,
                     file_hash,
                     self_ip,
+                    &local_noise_pub,
                     &mut state.ember_diagnostics,
                     &mut state.ember_noise_keys,
                     &established,
@@ -365,8 +369,10 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // aggregates across the records it is handed: `availability` is
                 // the number of distinct publishers, and a row carries a
                 // plurality digest for display/click while automatic map
-                // seeding still requires two publishers to agree. Handing it
-                // one batch at a time computes both per batch, so a file whose
+                // seeding still requires two publishers, vouched for by two
+                // responders, to agree with no rival digest doing the same.
+                // Handing it one batch at a time
+                // computes both per batch, so a file whose
                 // publishers arrived in different batches is under-counted and
                 // loses its corroborated digest — which silently drops the
                 // BLAKE3 check the corroboration rule exists to guarantee.
@@ -375,13 +381,13 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // in the emit sweep turns any hash already streamed into an
                 // availability update carrying these corrected values.
                 let built =
-                    build_ember_keyword_built(&records, &kw.keywords, kw.query_expr.as_ref());
-                for (ed2k, digest, publishers) in &built.corroborated {
+                    build_ember_keyword_built(&held, &kw.keywords, kw.query_expr.as_ref());
+                for (ed2k, digest, responders) in &built.corroborated {
                     seed_ember_content_hash(
                         &mut state.ember_content_hashes,
                         *ed2k,
                         *digest,
-                        EmberDigestProvenance::Corroborated(*publishers),
+                        EmberDigestProvenance::Corroborated(*responders),
                     );
                 }
                 let results = built.results;
@@ -450,16 +456,17 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
 ///
 /// Each blob is re-verified (`from_value_blob` checks the publisher
 /// signature), filtered to source records whose embedded file hash matches
-/// the download we asked about, self-filtered against our own external IP,
-/// and counted for diagnostics. When a record carries a Noise pubkey and
+/// the download we asked about, self-filtered against our own external IP
+/// and Noise key, and counted for diagnostics. When a record carries a Noise pubkey and
 /// UDP port, it is cached under that UDP endpoint so later Ember dials
 /// (bridge / native) can find it. Dedup / ban / cap handling is left to
 /// `handle_epx_sources` downstream; the drain path applies the same
 /// `ip_filter` / banlist gates before writing SourceManager.
 pub(super) fn parse_ember_source_records(
-    blobs: &[Vec<u8>],
+    held: &[ember::dht::search::SearchResultRecord],
     file_hash: [u8; 16],
     self_ip: Option<Ipv4Addr>,
+    local_noise_pub: &[u8; 32],
     diag: &mut crate::types::EmberDiagnostics,
     noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     established: &HashSet<(Ipv4Addr, u16)>,
@@ -468,12 +475,14 @@ pub(super) fn parse_ember_source_records(
     let mut out = Vec::new();
     // Expected-digest votes, keyed by publisher. A source record is signed
     // only by a key the record carries itself, so there is no trust anchor —
-    // any node can assert any digest for any file hash. Collect the claims and
-    // take the publisher majority below (same defence the keyword path
-    // applies) instead of believing whichever record parsed last.
-    let mut publisher_digests: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
-    for blob in blobs {
-        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
+    // any node can assert any digest for any file hash, and mint as many
+    // publishers as it likes. Collect the claims with the responders behind
+    // them and take the corroborated plurality below (same defence the keyword
+    // path applies) instead of believing whichever record parsed last.
+    let mut publisher_digests = EmberDigestVotes::new();
+    for held_record in held {
+        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
+        else {
             continue;
         };
         if rec.record_type != ember::dht::publish::RECORD_TYPE_SOURCE {
@@ -485,14 +494,24 @@ pub(super) fn parse_ember_source_records(
             continue;
         }
         if rec.ember_file_hash != [0u8; 32] {
-            publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
+            note_ember_digest_vote(
+                &mut publisher_digests,
+                rec.publisher_key,
+                rec.ember_file_hash,
+                held_record,
+            );
         }
         let Some(sc) = rec.source_contact else {
             continue;
         };
         diag.ember_dht_source_records_found = diag.ember_dht_source_records_found.saturating_add(1);
-        // Never inject ourselves, and drop unusable contacts.
-        if Some(sc.ip) == self_ip || sc.tcp_port == 0 {
+        // Never inject ourselves, and drop unusable contacts. Our external IP
+        // is unknown until it is confirmed and stale after an address change,
+        // so our own record is also recognised by the Noise key it carries —
+        // which would otherwise be cached as a peer's under our own address.
+        let ours = Some(sc.ip) == self_ip
+            || (sc.noise_pub != [0u8; 32] && sc.noise_pub == *local_noise_pub);
+        if ours || sc.tcp_port == 0 {
             continue;
         }
         if sc.udp_port != 0 && sc.noise_pub != [0u8; 32] {
@@ -522,17 +541,18 @@ pub(super) fn parse_ember_source_records(
         });
     }
     // Only ever on corroboration, and only if this plurality rests on more
-    // publishers than whatever is already pinned. This map is the digest the
-    // transfer enforces at completion, so a careless overwrite fails the verify,
-    // leaves `corrupt_part_indices_on_disk` nothing to point at, and re-downloads
-    // every part forever — which is why `seed_ember_content_hash` demands
-    // strictly better evidence rather than taking the newest claim.
-    if let Some((digest, publishers)) = corroborated_ember_digest_with_count(&publisher_digests) {
+    // responders than whatever is already pinned. This map is the digest the
+    // transfer enforces at completion, so a careless overwrite fails the
+    // download at the very end: the eD2K parts all match, the content check
+    // does not, and the transfer is failed rather than re-queued, since no
+    // source can change the digest — which is why `seed_ember_content_hash`
+    // demands strictly better evidence rather than taking the newest claim.
+    if let Some((digest, responders)) = corroborated_ember_digest_with_count(&publisher_digests) {
         seed_ember_content_hash(
             content_hashes,
             file_hash,
             digest,
-            EmberDigestProvenance::Corroborated(publishers),
+            EmberDigestProvenance::Corroborated(responders),
         );
     }
     out
@@ -541,9 +561,12 @@ pub(super) fn parse_ember_source_records(
 pub(super) struct EmberKeywordBuilt {
     pub(super) results: Vec<SearchResult>,
     /// Digests at least [`MIN_EMBER_DIGEST_PUBLISHERS`] publishers agree on,
-    /// with the number that agreed — safe to seed into `ember_content_hashes`
-    /// without a user click. The count travels with the digest so a later or
-    /// more complete walk can supersede a pin made on thinner evidence.
+    /// vouched for by at least [`MIN_EMBER_DIGEST_RESPONDERS`] responders, for
+    /// files no rival digest also clears that bar — with how many responders
+    /// that was. What automatic seeding of `ember_content_hashes` may use; see
+    /// [`corroborated_ember_digest_with_count`] for what that does and does not
+    /// bound. The count travels with the digest so a later or more complete
+    /// walk can supersede a pin made on thinner evidence.
     pub(super) corroborated: Vec<([u8; 16], [u8; 32], usize)>,
 }
 
@@ -572,12 +595,17 @@ pub(super) struct EmberKeywordBuilt {
 /// which ranks that field first, put Ember last. It is also the honest side of
 /// the comparison with KAD, whose `TAG_COMPLETE_SOURCES` is one peer's claim
 /// about a swarm it cannot see; this one is counted from distinct signatures.
+/// Signatures are free to mint, so what one responder can add on its own word
+/// is bounded where the records are collected, by the search's
+/// `MAX_PUBLISHERS_PER_FILE_PER_NODE` share per file and digest, and here, by
+/// counting only publishers that name the row's digest or none.
 ///
 /// Each row's `ember_file_hash` is the plurality digest (shown so a click
-/// can pin a unique file). Automatic seeding of the enforced map uses only
-/// [`EmberKeywordBuilt::corroborated`].
+/// can pin a unique file), ranked first by how many responders vouch for it —
+/// or empty when the file is [contested](ember_digest_contested). Automatic
+/// seeding of the enforced map uses only [`EmberKeywordBuilt::corroborated`].
 pub(super) fn build_ember_keyword_built(
-    blobs: &[Vec<u8>],
+    held: &[ember::dht::search::SearchResultRecord],
     keywords: &[String],
     query_expr: Option<&crate::search::query::QueryExpr>,
 ) -> EmberKeywordBuilt {
@@ -598,10 +626,11 @@ pub(super) fn build_ember_keyword_built(
         .first()
         .map(|(h, _)| *h);
     // file_hash -> (result, publisher_key -> ember digest votes)
-    let mut dedup: HashMap<[u8; 16], (SearchResult, HashMap<[u8; 32], [u8; 32]>)> = HashMap::new();
+    let mut dedup: HashMap<[u8; 16], (SearchResult, EmberDigestVotes)> = HashMap::new();
 
-    for blob in blobs {
-        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
+    for held_record in held {
+        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
+        else {
             continue;
         };
         if rec.record_type != ember::dht::publish::RECORD_TYPE_KEYWORD {
@@ -634,13 +663,12 @@ pub(super) fn build_ember_keyword_built(
 
         match dedup.get_mut(&rec.file_hash) {
             Some((existing, publisher_digests)) => {
-                if rec.ember_file_hash != [0u8; 32] {
-                    publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
-                } else {
-                    publisher_digests
-                        .entry(rec.publisher_key)
-                        .or_insert([0u8; 32]);
-                }
+                note_ember_digest_vote(
+                    publisher_digests,
+                    rec.publisher_key,
+                    rec.ember_file_hash,
+                    held_record,
+                );
                 existing.availability = publisher_digests.len() as u32;
                 existing.file.complete_sources = publisher_digests.len() as u32;
                 existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
@@ -658,12 +686,13 @@ pub(super) fn build_ember_keyword_built(
                     .unwrap_or_default();
                 let file_type = infer_file_type(&extension);
                 let hash_hex = hex::encode(rec.file_hash);
-                let mut publisher_digests = HashMap::new();
-                if rec.ember_file_hash != [0u8; 32] {
-                    publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
-                } else {
-                    publisher_digests.insert(rec.publisher_key, [0u8; 32]);
-                }
+                let mut publisher_digests = EmberDigestVotes::new();
+                note_ember_digest_vote(
+                    &mut publisher_digests,
+                    rec.publisher_key,
+                    rec.ember_file_hash,
+                    held_record,
+                );
                 let ember_hex = majority_ember_digest_hex(&publisher_digests);
                 let sr = SearchResult {
                     file: FileInfo {
@@ -714,14 +743,46 @@ pub(super) fn build_ember_keyword_built(
 
     // The digest on the row is what the search page hands to start_download
     // on click (user-chosen pin, even a plurality of one). Automatic fills
-    // of ember_content_hashes still require two publishers.
+    // of ember_content_hashes still require corroboration.
     let mut corroborated = Vec::new();
     for (hash, (result, votes)) in dedup.iter_mut() {
-        result.file.ember_file_hash = majority_ember_digest(votes)
-            .map(hex::encode)
-            .unwrap_or_default();
-        if let Some((digest, publishers)) = corroborated_ember_digest_with_count(votes) {
-            corroborated.push((*hash, digest, publishers));
+        let plurality = majority_ember_digest(votes);
+        // A click pins whatever the row carries, so a contested row carries
+        // nothing: showing the plurality would let whoever planted more
+        // records choose the pin that way instead.
+        let contested = ember_digest_contested(votes);
+        result.file.ember_file_hash = if contested {
+            String::new()
+        } else {
+            plurality.map(hex::encode).unwrap_or_default()
+        };
+        // The search holds one node's word to a share per file *and digest*, so
+        // a node inventing digests gets a share for each. Counting only the
+        // publishers that agree with the row, or name no digest, holds it to
+        // two shares whatever it invents. A contested row has no digest of its
+        // own; it counts the claim most publishers make, so a planted digest
+        // that outranks the real one on responders cannot also shrink the
+        // count to its own publishers.
+        let counted = if contested {
+            let mut publishers: HashMap<[u8; 32], usize> = HashMap::new();
+            for vote in votes.values().filter(|v| v.digest != [0u8; 32]) {
+                *publishers.entry(vote.digest).or_insert(0) += 1;
+            }
+            publishers
+                .into_iter()
+                .max_by_key(|(digest, n)| (*n, *digest))
+                .map(|(digest, _)| digest)
+        } else {
+            plurality
+        };
+        let sources = votes
+            .values()
+            .filter(|vote| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
+            .count() as u32;
+        result.availability = sources;
+        result.file.complete_sources = sources;
+        if let Some((digest, responders)) = corroborated_ember_digest_with_count(votes) {
+            corroborated.push((*hash, digest, responders));
         }
     }
     EmberKeywordBuilt {
@@ -730,65 +791,160 @@ pub(super) fn build_ember_keyword_built(
     }
 }
 
-/// Pick the most common non-zero Ember BLAKE3 among publishers; empty if none.
-pub(super) fn majority_ember_digest_hex(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> String {
+/// One publisher's digest claim and the responders that carried it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct EmberDigestVote {
+    /// The digest this publisher named; all zero when it named none.
+    pub(super) digest: [u8; 32],
+    /// Every node that returned one of this publisher's records.
+    pub(super) responders: Vec<ember::dht::EmberNodeId>,
+}
+
+/// Digest votes keyed by publisher key.
+pub(super) type EmberDigestVotes = HashMap<[u8; 32], EmberDigestVote>;
+
+/// Count one record's claim. A later non-zero digest from the same publisher
+/// replaces an earlier one; a record naming none leaves what is there.
+pub(super) fn note_ember_digest_vote(
+    votes: &mut EmberDigestVotes,
+    publisher_key: [u8; 32],
+    digest: [u8; 32],
+    held: &ember::dht::search::SearchResultRecord,
+) {
+    let vote = votes.entry(publisher_key).or_default();
+    if digest != [0u8; 32] {
+        vote.digest = digest;
+    }
+    for node in std::iter::once(held.from_node).chain(held.confirmed_by) {
+        if !vote.responders.contains(&node) {
+            vote.responders.push(node);
+        }
+    }
+}
+
+/// Pick the best-supported non-zero Ember BLAKE3; empty if none.
+pub(super) fn majority_ember_digest_hex(publisher_digests: &EmberDigestVotes) -> String {
     majority_ember_digest(publisher_digests)
         .map(hex::encode)
         .unwrap_or_default()
 }
 
 /// Raw-byte form of [`majority_ember_digest_hex`]: the digest the most
-/// distinct publishers agree on, or `None` when none of them published one.
+/// responders vouch for, then the most distinct publishers name, or `None`
+/// when none of them published one.
 ///
-/// This is a plurality with no minimum, which is right for display — one
-/// publisher's claim is worth showing — but not for anything enforced. Use
-/// [`corroborated_ember_digest`] for that.
-pub(super) fn majority_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
-    majority_ember_digest_with_count(publisher_digests).map(|(digest, _)| digest)
+/// Responders rank first because publishers do not: a responder may return as
+/// many freshly keyed records as it likes, so a count of publishers alone lets
+/// the one node that minted them out-vote every storer holding the real
+/// file's records. This is a plurality with no minimum, which is right for
+/// display — one publisher's claim is worth showing — but not for anything
+/// enforced. Use [`corroborated_ember_digest`] for that.
+pub(super) fn majority_ember_digest(publisher_digests: &EmberDigestVotes) -> Option<[u8; 32]> {
+    ranked_ember_digest(publisher_digests).map(|(digest, _, _)| digest)
 }
 
-pub(super) fn majority_ember_digest_with_count(
-    publisher_digests: &HashMap<[u8; 32], [u8; 32]>,
-) -> Option<([u8; 32], usize)> {
-    let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
-    for digest in publisher_digests.values() {
-        if *digest != [0u8; 32] {
-            *counts.entry(*digest).or_insert(0) += 1;
+/// Every non-zero digest named, with `(publishers, responders)` behind it.
+fn ember_digest_tallies(
+    publisher_digests: &EmberDigestVotes,
+) -> impl Iterator<Item = ([u8; 32], usize, usize)> {
+    let mut tallies: HashMap<[u8; 32], (usize, HashSet<ember::dht::EmberNodeId>)> =
+        HashMap::new();
+    for vote in publisher_digests.values() {
+        if vote.digest != [0u8; 32] {
+            let (publishers, responders) = tallies.entry(vote.digest).or_default();
+            *publishers += 1;
+            responders.extend(vote.responders.iter().copied());
         }
     }
-    counts.into_iter().max_by_key(|(_, n)| *n)
+    tallies
+        .into_iter()
+        .map(|(digest, (publishers, responders))| (digest, publishers, responders.len()))
+}
+
+/// The top digest with `(publishers, responders)` behind it.
+fn ranked_ember_digest(publisher_digests: &EmberDigestVotes) -> Option<([u8; 32], usize, usize)> {
+    ember_digest_tallies(publisher_digests)
+        .max_by_key(|(_, publishers, responders)| (*responders, *publishers))
 }
 
 /// Distinct publishers that must agree before a DHT-sourced digest is allowed
 /// into the map a transfer *enforces* at completion.
 ///
-/// Publisher keys are free to mint, so this does not bound a determined Sybil —
-/// it only stops a single record from deciding, which is what a plurality of one
-/// amounted to. The cost of being wrong is asymmetric: a missing digest just
-/// means the ed2k/AICH hashes carry the verification, while a wrong one fails
-/// completion forever and leaves `corrupt_part_indices_on_disk` nothing to point
-/// at, so the file re-downloads endlessly.
+/// Publisher keys are free to mint, so on its own this only stops a single
+/// record from deciding — which is what a plurality of one amounted to — and
+/// [`MIN_EMBER_DIGEST_RESPONDERS`] is what stops a single node's reply. The
+/// cost of being wrong is asymmetric: a missing digest just means the ed2k/AICH
+/// hashes carry the verification, while a wrong one fails the download at the
+/// end — every eD2K part matches, the content check does not, and the transfer
+/// is failed rather than re-queued, since no other source can change the digest.
 pub(super) const MIN_EMBER_DIGEST_PUBLISHERS: usize = 2;
 
-/// The plurality digest, but only once [`MIN_EMBER_DIGEST_PUBLISHERS`] agree.
+/// Distinct responders whose answers must carry those publishers.
 ///
-/// Runtime callers need the agreeing-publisher count as well, so they use
-/// [`corroborated_ember_digest_with_count`]; this is the shape the corroboration
-/// tests assert against.
+/// What this bounds is fabrication inside one reply: a responder can mint any
+/// number of publishers and sign a record from each, and none of them count
+/// for more than that one responder until a second node returns a record
+/// naming the same digest. A record two nodes both returned counts as two,
+/// which is the ordinary case for an honest record: it was stored on every node
+/// near its key. Our own store's seed counts as one responder.
+///
+/// It does not bound what a node can STORE. A storer returns planted records
+/// as its own, so records planted on the storers near a keyword arrive with as
+/// many responders as the real ones. What keeps planting from choosing the pin
+/// is [`corroborated_ember_digest_with_count`] refusing a contested file: a
+/// fake digest corroborated beside the real one pins nothing. Colluding nodes
+/// are not bounded by either rule.
+pub(super) const MIN_EMBER_DIGEST_RESPONDERS: usize = 2;
+
+/// Digests that clear both [`MIN_EMBER_DIGEST_PUBLISHERS`] and
+/// [`MIN_EMBER_DIGEST_RESPONDERS`], with the responders behind each.
+fn corroborated_ember_digests(publisher_digests: &EmberDigestVotes) -> Vec<([u8; 32], usize)> {
+    ember_digest_tallies(publisher_digests)
+        .filter(|(_, publishers, responders)| {
+            *publishers >= MIN_EMBER_DIGEST_PUBLISHERS && *responders >= MIN_EMBER_DIGEST_RESPONDERS
+        })
+        .map(|(digest, _, responders)| (digest, responders))
+        .collect()
+}
+
+/// Whether more than one digest is corroborated for the same file.
+///
+/// A file has one content digest, so two corroborated claims mean at least one
+/// set of records is planted, and nothing here can tell which.
+pub(super) fn ember_digest_contested(publisher_digests: &EmberDigestVotes) -> bool {
+    corroborated_ember_digests(publisher_digests).len() > 1
+}
+
+/// The corroborated digest, when exactly one digest is — see
+/// [`corroborated_ember_digest_with_count`].
+///
+/// Runtime callers need the responder count as well, so they use that; this is
+/// the shape the corroboration tests assert against.
 #[cfg(test)]
-pub(super) fn corroborated_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
+pub(super) fn corroborated_ember_digest(publisher_digests: &EmberDigestVotes) -> Option<[u8; 32]> {
     corroborated_ember_digest_with_count(publisher_digests).map(|(digest, _)| digest)
 }
 
-/// [`corroborated_ember_digest`] plus how many publishers agreed.
+/// The digest automatic pinning may use, and how many responders vouched for
+/// it: the one digest that clears both thresholds, or nothing when none does or
+/// the file is [contested](ember_digest_contested).
+///
+/// Refusing a contested file is what turns planting records on honest storers
+/// into, at worst, suppressing the pin rather than choosing it. Picking the
+/// better-supported claim instead would hand the choice to whoever planted
+/// more.
 ///
 /// The count is what lets a later, more complete walk supersede a pin an
-/// earlier one made on thinner evidence — see [`EmberDigestProvenance`].
+/// earlier one made on thinner evidence — see [`EmberDigestProvenance`]. It is
+/// responders rather than publishers for the reason they rank first in
+/// [`majority_ember_digest`].
 pub(super) fn corroborated_ember_digest_with_count(
-    publisher_digests: &HashMap<[u8; 32], [u8; 32]>,
+    publisher_digests: &EmberDigestVotes,
 ) -> Option<([u8; 32], usize)> {
-    majority_ember_digest_with_count(publisher_digests)
-        .filter(|(_, agreeing)| *agreeing >= MIN_EMBER_DIGEST_PUBLISHERS)
+    match corroborated_ember_digests(publisher_digests).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// How much evidence stands behind an entry in
@@ -804,13 +960,14 @@ pub(super) fn corroborated_ember_digest_with_count(
 /// silently overridden by a guess.
 ///
 /// Derived `Ord` is the precedence, so variants are declared weakest first:
-/// more agreeing publishers beat fewer, an explicit user pick beats any DHT
+/// more vouching responders beat fewer, an explicit user pick beats any DHT
 /// plurality, and bytes hashed on this machine beat everything remote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum EmberDigestProvenance {
-    /// Plurality agreement among this many distinct DHT publishers. Publisher
-    /// keys are free to mint, so this only ranks claims against each other; it
-    /// is not a trust anchor.
+    /// A corroborated plurality, vouched for by this many distinct responders
+    /// — see [`corroborated_ember_digest_with_count`]. Responders are dearer
+    /// than publisher keys but not scarce, so this only ranks claims against
+    /// each other; it is not a trust anchor.
     Corroborated(usize),
     /// The digest carried by the search row the user clicked to download. One
     /// publisher is enough here because the user chose it.
@@ -893,11 +1050,64 @@ pub(super) async fn start_ember_source_search(
 mod ember_digest_corroboration_tests {
     use super::*;
 
-    fn digests(pairs: &[(u8, u8)]) -> HashMap<[u8; 32], [u8; 32]> {
+    /// Each publisher's claim, returned by a node of its own.
+    fn digests(pairs: &[(u8, u8)]) -> EmberDigestVotes {
         pairs
             .iter()
-            .map(|(publisher, digest)| ([*publisher; 32], [*digest; 32]))
+            .map(|(publisher, digest)| {
+                (
+                    [*publisher; 32],
+                    EmberDigestVote {
+                        digest: [*digest; 32],
+                        responders: vec![ember::dht::EmberNodeId([*publisher; 16])],
+                    },
+                )
+            })
             .collect()
+    }
+
+    fn held_from(node: u8, confirmed_by: Option<u8>) -> ember::dht::search::SearchResultRecord {
+        ember::dht::search::SearchResultRecord {
+            data: Vec::new(),
+            from_node: ember::dht::EmberNodeId([node; 16]),
+            confirmed_by: confirmed_by.map(|n| ember::dht::EmberNodeId([n; 16])),
+        }
+    }
+
+    /// Publisher keys are free, so any number of them agreeing means nothing
+    /// while one node returned them all — however many it minted.
+    #[test]
+    fn publishers_from_one_responder_do_not_corroborate() {
+        let mut votes = EmberDigestVotes::new();
+        for publisher in 1..=40u8 {
+            note_ember_digest_vote(&mut votes, [publisher; 32], [0xEE; 32], &held_from(9, None));
+        }
+        assert_eq!(corroborated_ember_digest(&votes), None);
+
+        // Two honest publishers the other storers returned outrank the forty on
+        // display, because more responders stand behind them.
+        note_ember_digest_vote(&mut votes, [0xA1; 32], [0xAA; 32], &held_from(1, None));
+        note_ember_digest_vote(&mut votes, [0xA2; 32], [0xAA; 32], &held_from(2, None));
+        assert_eq!(majority_ember_digest(&votes), Some([0xAA; 32]));
+        assert_eq!(corroborated_ember_digest_with_count(&votes), Some(([0xAA; 32], 2)));
+    }
+
+    /// An honest record is stored on every node near its key, so the walk
+    /// usually sees it from more than one — and the second copy is what makes
+    /// publishers that all first arrived from one storer corroborate.
+    #[test]
+    fn a_record_a_second_node_also_returned_counts_both() {
+        let mut votes = EmberDigestVotes::new();
+        note_ember_digest_vote(&mut votes, [1; 32], [0xAA; 32], &held_from(1, None));
+        note_ember_digest_vote(&mut votes, [2; 32], [0xAA; 32], &held_from(1, None));
+        assert_eq!(corroborated_ember_digest(&votes), None, "one storer's word");
+
+        note_ember_digest_vote(&mut votes, [2; 32], [0u8; 32], &held_from(1, Some(3)));
+        assert_eq!(
+            corroborated_ember_digest_with_count(&votes),
+            Some(([0xAA; 32], 2)),
+            "a record naming no digest keeps its publisher's claim and adds a voucher"
+        );
     }
 
     #[test]
@@ -944,13 +1154,201 @@ mod ember_digest_corroboration_tests {
             None
         );
     }
+
+    #[test]
+    fn two_corroborated_digests_pin_neither() {
+        let mut votes = EmberDigestVotes::new();
+        for (publisher, node, digest) in [(1u8, 1u8, 0xAA), (2, 2, 0xAA), (3, 1, 0xBB), (4, 2, 0xBB)] {
+            note_ember_digest_vote(&mut votes, [publisher; 32], [digest; 32], &held_from(node, None));
+        }
+        assert!(ember_digest_contested(&votes));
+        assert_eq!(corroborated_ember_digest_with_count(&votes), None);
+    }
+
+    const FILE: [u8; 16] = [0xF1; 16];
+    const REAL: [u8; 32] = [0x77; 32];
+    const FAKE: [u8; 32] = [0xEE; 32];
+
+    /// A keyword record for [`FILE`] under a key of its own.
+    fn publisher_blob(key_seed: u16, digest: [u8; 32]) -> Vec<u8> {
+        let mut seed = [0x5Au8; 32];
+        seed[..2].copy_from_slice(&key_seed.to_le_bytes());
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let rec = ember::dht::publish::SignedRecord::keyword(
+            "ubuntu", FILE, digest, 100, "ubuntu.iso", &sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    /// Run a keyword search over `storers` nodes that each answer with
+    /// `answer`, and build its rows as the finished search would.
+    fn search_storers(storers: u8, answer: &[Vec<u8>]) -> EmberKeywordBuilt {
+        use ember::dht::{routing::RoutingTable, search::SearchManager, EmberContact, EmberNodeId};
+        use std::net::{IpAddr, SocketAddr};
+
+        let mut rt = RoutingTable::new(EmberNodeId([0; 16]), false);
+        for i in 1..=storers {
+            let mut id = [0u8; 16];
+            id[0] = 0x40 + i;
+            rt.add_contact(EmberContact {
+                node_id: EmberNodeId(id),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, i, 1)), 4662),
+                noise_pub: [i; 32],
+                ed25519_pub: [i; 32],
+                last_seen: chrono::Utc::now().timestamp(),
+                failed_queries: 0,
+            });
+        }
+        let target = EmberNodeId(ember::dht::search::keyword_hash("ubuntu"));
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).expect("held");
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for query in batch {
+                search.process_response(
+                    query.request_id,
+                    &query.contact.node_id,
+                    vec![],
+                    answer.to_vec(),
+                    None,
+                );
+            }
+        }
+        assert!(search.poll_complete());
+        build_ember_keyword_built(&search.results, &["ubuntu".to_string()], None)
+    }
+
+    /// One node STOREs forty freshly keyed records naming a fake digest onto
+    /// every honest storer near the keyword, ahead of the real publishers in
+    /// each storer's order. Every storer returns them as its own, so the fake
+    /// has as many responders as the real digest: nothing may be pinned, by the
+    /// map or by a click.
+    #[test]
+    fn records_planted_on_honest_storers_pin_nothing() {
+        let mut held: Vec<Vec<u8>> = (0..40).map(|i| publisher_blob(1000 + i, FAKE)).collect();
+        held.extend((0..6).map(|i| publisher_blob(i, REAL)));
+
+        let built = search_storers(4, &held);
+        assert_eq!(built.results.len(), 1);
+        assert!(built.corroborated.is_empty(), "a contested file is not pinned");
+        assert_eq!(
+            built.results[0].file.ember_file_hash, "",
+            "nor does its row carry a digest a click would pin"
+        );
+    }
+
+    /// The same storers holding only the real publishers still pin them.
+    #[test]
+    fn an_uncontested_file_answered_by_honest_storers_still_pins() {
+        let held: Vec<Vec<u8>> = (0..6).map(|i| publisher_blob(i, REAL)).collect();
+
+        let built = search_storers(4, &held);
+        assert_eq!(built.results.len(), 1);
+        assert_eq!(built.results[0].file.ember_file_hash, hex::encode(REAL));
+        assert_eq!(built.results[0].availability, 6);
+        // A record notes its first two responders, so two however many held it.
+        assert_eq!(built.corroborated, vec![(FILE, REAL, 2)]);
+    }
+
+    /// The search gives one node a share per digest, so a node inventing
+    /// digests would get a share for each. The row counts only publishers that
+    /// agree with it, or name none.
+    #[test]
+    fn invented_digests_do_not_add_to_a_rows_sources() {
+        let from = |node: u8, data: Vec<u8>| ember::dht::search::SearchResultRecord {
+            data,
+            from_node: ember::dht::EmberNodeId([node; 16]),
+            confirmed_by: None,
+        };
+        let mut held = Vec::new();
+        for invented in 0..10u16 {
+            let mut digest = FAKE;
+            digest[..2].copy_from_slice(&invented.to_le_bytes());
+            held.extend((0..5).map(|i| from(9, publisher_blob(invented * 10 + i, digest))));
+        }
+        held.extend((0..3).map(|i| from(9, publisher_blob(500 + i, [0u8; 32]))));
+
+        let built = build_ember_keyword_built(&held, &["ubuntu".to_string()], None);
+        assert_eq!(built.results.len(), 1);
+        assert_eq!(
+            built.results[0].availability, 8,
+            "one digest's share plus the publishers naming none"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ember_source_self_filter_tests {
+    use super::*;
+
+    /// Our own source record comes back from any walk for a file we share.
+    /// Before our external IP is confirmed, or after it changes, the IP check
+    /// cannot recognise it; the Noise key still does, so we neither cache our
+    /// own key as a peer's nor offer ourselves as a source.
+    #[test]
+    fn our_own_source_record_is_skipped_by_its_noise_key() {
+        let ours = [0x5Cu8; 32];
+        let file_hash = [0x61u8; 16];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+        let rec = ember::dht::publish::SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            1,
+            "shared.iso",
+            ember::dht::publish::SourceContact {
+                ip: Ipv4Addr::new(81, 2, 3, 4),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: ours,
+                ..Default::default()
+            },
+            &sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        let held = vec![ember::dht::search::SearchResultRecord {
+            data: blob,
+            from_node: ember::dht::EmberNodeId([1; 16]),
+            confirmed_by: None,
+        }];
+
+        let parse = |self_ip: Option<Ipv4Addr>, local: [u8; 32]| {
+            let mut noise_keys = HashMap::new();
+            let sources = parse_ember_source_records(
+                &held,
+                file_hash,
+                self_ip,
+                &local,
+                &mut crate::types::EmberDiagnostics::default(),
+                &mut noise_keys,
+                &HashSet::new(),
+                &mut HashMap::new(),
+            );
+            (sources.len(), noise_keys.len())
+        };
+
+        assert_eq!(parse(None, ours), (0, 0), "unknown external IP");
+        assert_eq!(
+            parse(Some(Ipv4Addr::new(82, 1, 1, 1)), ours),
+            (0, 0),
+            "stale external IP"
+        );
+        assert_eq!(parse(None, [0x5Du8; 32]), (1, 1), "a peer's record is kept");
+    }
 }
 
 #[cfg(test)]
 mod ember_keyword_sanitize_tests {
     use super::*;
 
-    fn kw_blob(name: &str) -> Vec<u8> {
+    fn kw_blob(name: &str) -> ember::dht::search::SearchResultRecord {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let rec = ember::dht::publish::SignedRecord::keyword(
             "holiday",
@@ -962,7 +1360,11 @@ mod ember_keyword_sanitize_tests {
         );
         let mut blob = rec.data.clone();
         blob.extend_from_slice(&rec.signature);
-        blob
+        ember::dht::search::SearchResultRecord {
+            data: blob,
+            from_node: ember::dht::EmberNodeId([1; 16]),
+            confirmed_by: None,
+        }
     }
 
     #[test]

@@ -815,11 +815,12 @@ pub struct EmberDiagnostics {
     /// replication is falling behind, which a republish count cannot show.
     #[serde(default)]
     pub ember_dht_republish_backlog: u32,
-    /// Seconds since any Ember DHT frame arrived, or zero if none ever has.
-    /// The one number that separates "still joining" from "joined and quiet"
-    /// from "stuck", none of which the other counters distinguish.
+    /// Seconds since any Ember DHT frame arrived, or `None` if none ever has
+    /// (zero is a frame this second). The one number that separates "still
+    /// joining" from "joined and quiet" from "stuck", none of which the other
+    /// counters distinguish.
     #[serde(default)]
-    pub ember_dht_seconds_since_inbound: u32,
+    pub ember_dht_seconds_since_inbound: Option<u32>,
     /// Ember DHT `PING` frames the dev panel sent this session.
     ///
     /// Only the debug harness increments this, not the three automatic probe
@@ -914,8 +915,9 @@ pub struct EmberDiagnostics {
     /// `FIND_VALUE` queries we received and answered this session.
     #[serde(default)]
     pub ember_dht_find_values_received: u32,
-    /// Keyword/source publishes currently in flight (gauge, not a
-    /// counter).
+    /// Publishes currently in flight (gauge, not a counter): single-record
+    /// publish operations plus `STORE_BATCH` frames awaiting an ack. Not a
+    /// record count — one batch carries many records.
     #[serde(default)]
     pub ember_dht_active_publishes: u32,
     /// Bucket-refresh lookups launched by the maintenance loop this
@@ -1025,6 +1027,11 @@ pub struct EmberDiagnostics {
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
     pub ember_dht_udp_unreachable: bool,
+    /// Whether the source publisher has evaluated the three reachability
+    /// flags above since diagnostics were last reset. Until then all three read
+    /// false, which says nothing about reachability.
+    #[serde(default)]
+    pub ember_dht_reachability_known: bool,
     /// Buddy PROXY_STORE requests we sent this session (firewalled publisher).
     #[serde(default)]
     pub ember_dht_buddy_publishes: u32,
@@ -1254,6 +1261,12 @@ pub struct EmberDiagnostics {
     /// here too, since no word could find it.
     #[serde(default)]
     pub ember_dht_keyword_key_off_name: u32,
+    /// Inbound records of a type this build does not know that were stored.
+    /// Not a refusal — refusing would make every new record type a wire break —
+    /// but such a record escapes every type-specific rule, and it is not
+    /// replicated onward.
+    #[serde(default)]
+    pub ember_dht_unknown_record_types: u32,
     /// Completed FIND_VALUE searches this session (hits, misses, and timeouts).
     /// Denominator for the search-quality averages below.
     #[serde(default)]
@@ -1267,7 +1280,8 @@ pub struct EmberDiagnostics {
     /// Sum of verified records gathered across those searches.
     #[serde(default)]
     pub ember_dht_search_records_sum: u64,
-    /// Highest verified-contact count seen today (UTC), persisted across restart.
+    /// Highest verified-contact count seen today (local calendar day),
+    /// persisted across restart.
     #[serde(default)]
     pub ember_dht_verified_highwater_today: u32,
     /// Highest verified-contact count ever recorded on this node.

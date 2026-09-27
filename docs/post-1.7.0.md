@@ -68,6 +68,27 @@ the one forwarded port carries everything. Deferred because it changes how every
 inbound UDP packet is read (KAD, Ember DHT, room chat, presence); it needs
 careful packet classification and broad testing.
 
+## Ember DHT
+
+### Resume `FIND_VALUE` pages by record, not by index
+
+**Why:** A responder pages a key's records by position in its live list. When a
+record lapses between two page requests, or a secondary key's intersection
+turns empty, every later index shifts and one record is skipped for that walk.
+Duplicates are harmless (the searcher dedupes); a skip is a lost result.
+
+**To do:** Resume from the last blob's signature prefix instead of an index, as
+an additive field on `FIND_VALUE` / `FOUND_VALUE`, keeping the index as the
+fallback for peers that do not send it.
+
+### Digest corroboration against colluding storers (low)
+
+Automatic digest pinning needs two publishers vouched for by two different
+responders. Two colluding nodes on the same shortlist can still meet that bar
+for a bogus digest; the download then fails its BLAKE3 check and the pin is
+cleared. Consider requiring responders from different /24s, or weighting by
+how long each responder has been a verified contact.
+
 ## Friend chat attachments
 
 ### 6. Warn about executable files (UX)

@@ -86,12 +86,17 @@ pub(super) const MAX_EMBER_UDP_EPX_RATE_ENTRIES: usize = 2000;
 /// closes; a Noise_IK UDP session has no such natural connection boundary,
 /// so an authenticated peer could otherwise send unlimited `ExchangeData`
 /// packets bounded only by `MAX_EPX_TOTAL_SOURCES` per packet.
+///
+/// Charged to the source IP, not the socket address: a new source port is
+/// only a new Noise session away, so a per-port budget would be a fresh budget
+/// for the asking. Peers sharing one public address share its allowance.
 pub(super) fn check_and_record_udp_epx_rate(
-    map: &mut HashMap<SocketAddr, (u32, std::time::Instant)>,
+    map: &mut HashMap<IpAddr, (u32, std::time::Instant)>,
     addr: SocketAddr,
 ) -> bool {
     let now = std::time::Instant::now();
-    if let Some((count, window_start)) = map.get_mut(&addr) {
+    let ip = addr.ip().to_canonical();
+    if let Some((count, window_start)) = map.get_mut(&ip) {
         if now.duration_since(*window_start) >= EPX_UDP_RATE_WINDOW {
             *count = 1;
             *window_start = now;
@@ -108,7 +113,7 @@ pub(super) fn check_and_record_udp_epx_rate(
             map.remove(&oldest_key);
         }
     }
-    map.insert(addr, (1, now));
+    map.insert(ip, (1, now));
     true
 }
 
@@ -232,13 +237,6 @@ pub(super) fn lookup_ember_noise_key_at(
     }
 }
 
-/// Pick KAD-learned Ember peers to fold into the DHT via a bridge `PING`
-/// (slice 13). Returns up to `max` `(ip, port, noise_pub)` entries from the
-/// `ember_noise_keys` cache that we haven't bridge-pinged yet (`attempted`),
-/// freshest first so the most recently KAD-advertised peers are tried
-/// before stale cache entries. The caller sends each a DHT `PING`; the
-/// signed `PONG` carries the peer's Ed25519 key, which is what actually
-/// turns it into a verified routing-table contact.
 /// How long a bridge peer is left alone after a ping attempt before it may be
 /// tried again.
 ///
@@ -319,6 +317,12 @@ pub(super) fn bridge_retry_due(
     }
 }
 
+/// Pick KAD-learned Ember peers to fold into the DHT via a bridge `PING`
+/// (slice 13). Returns up to `max` `(ip, port, noise_pub)` entries from the
+/// `ember_noise_keys` cache whose retry backoff in `attempted` has run out,
+/// ranked by [`bridge_candidate_rank`]. The caller sends each a DHT `PING`;
+/// the signed `PONG` carries the peer's Ed25519 key, which is what actually
+/// turns it into a verified routing-table contact.
 pub(super) fn kad_bridge_candidates(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
@@ -392,10 +396,15 @@ pub(super) fn kad_bridge_candidates_at(
 /// `established` is the set of addresses we currently hold an Ember DHT
 /// contact at. Only those get the first-seen key pin; see
 /// [`cache_bound_ember_noise_key`].
+///
+/// A source carrying `local_noise_pub` is our own record echoed back — any
+/// lookup for a file we share returns it — so it is never cached, whatever
+/// address it names.
 pub(super) fn harvest_ember_noise_keys(
     noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     sources: &[KadSource],
     established: &HashSet<(Ipv4Addr, u16)>,
+    local_noise_pub: &[u8; 32],
 ) {
     for s in sources {
         if s.ip.is_unspecified() || s.tcp_port == 0 || s.udp_port == 0 {
@@ -404,6 +413,9 @@ pub(super) fn harvest_ember_noise_keys(
         let Some(npub) = s.ember_noise_pub else {
             continue;
         };
+        if npub == *local_noise_pub {
+            continue;
+        }
         let pinned = established.contains(&(s.ip, s.udp_port));
         if cache_bound_ember_noise_key(noise_keys, s.ip, s.udp_port, npub, pinned).is_some() {
             debug!(
@@ -650,6 +662,186 @@ pub(super) fn remember_ember_session_dht_contact(state: &mut NetworkState, conta
     record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);
 }
 
+/// What the user's IP policy says about talking to an Ember peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmberIpVerdict {
+    Allowed,
+    /// Bogus space or a filter hit.
+    Blocked,
+    /// A ban. Refused like a block, but bans expire and are per IP, where one
+    /// misbehaving client can share its address with other Ember peers behind
+    /// the same NAT, so it is no reason to forget the peers cached there.
+    Banned,
+    /// An enabled filter is still loading its ranges. Not grounds to forget the
+    /// peer, but not grounds to dial a stranger either: inbound fails closed in
+    /// the same window.
+    Pending,
+}
+
+impl EmberIpVerdict {
+    /// Whether nothing may be sent to the peer.
+    pub(super) fn refuses(self) -> bool {
+        matches!(self, Self::Blocked | Self::Banned)
+    }
+}
+
+/// The user's IP policy for an Ember peer at `ip`, on the terms
+/// [`ember_udp_ip_filter_allows`] applies to inbound traffic. A LAN/CGNAT peer
+/// introduced over a live session is exempt from the filter — that is what keeps
+/// a LAN friend reachable under `block_private_ips`, or under a list that covers
+/// private space — and while the filter loads only introduced peers are allowed.
+/// A ban holds whatever the filter says.
+///
+/// `session_introduced` walks the session maps, so it is only asked when its
+/// answer can change the verdict.
+pub(super) fn ember_ip_verdict(
+    filter: &IpFilter,
+    banned: &HashSet<Ipv4Addr>,
+    ip: Ipv4Addr,
+    session_introduced: impl FnOnce() -> bool,
+) -> EmberIpVerdict {
+    if crate::security::is_bogus_v4(ip) {
+        return EmberIpVerdict::Blocked;
+    }
+    let ban = banned.contains(&ip);
+    let lan = crate::security::is_lan_or_cgnat_v4(ip);
+    let loading = filter.is_enabled() && !filter.ranges_ready();
+    let verdict = if (lan || loading) && session_introduced() {
+        EmberIpVerdict::Allowed
+    } else if loading {
+        EmberIpVerdict::Pending
+    } else if filter.is_blocked_readonly(ip) {
+        return EmberIpVerdict::Blocked;
+    } else {
+        EmberIpVerdict::Allowed
+    };
+    if ban {
+        EmberIpVerdict::Banned
+    } else {
+        verdict
+    }
+}
+
+pub(super) fn ember_peer_ip_verdict(state: &NetworkState, ip: Ipv4Addr, udp_port: u16) -> EmberIpVerdict {
+    ember_ip_verdict(&state.ip_filter, &state.banned_ips, ip, || {
+        ember_session_introduced(state, ip, udp_port)
+    })
+}
+
+/// [`ember_peer_ip_verdict`] for a socket address. A genuinely IPv6 peer is
+/// outside what the IPv4 filter and ban list can represent.
+pub(super) fn ember_addr_ip_verdict(state: &NetworkState, addr: SocketAddr) -> EmberIpVerdict {
+    let v4 = match addr.ip() {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4,
+            None => return EmberIpVerdict::Allowed,
+        },
+    };
+    ember_peer_ip_verdict(state, v4, addr.port())
+}
+
+/// Forget cached Ember peers the user's IP policy now refuses, and stop the
+/// queued STOREs and buddy proxy publishes aimed at them.
+///
+/// `evict_filtered_contacts` covers the routing table; these are the caches
+/// beside it that feed the bridge, search seeding and the publish top-up, so
+/// every site that changes the policy calls both — this one first, while the
+/// table still holds the address of a buddy it is about to evict. Only a firm
+/// [`EmberIpVerdict::Blocked`] forgets cached peers: a filter still loading
+/// leaves the caches for the call that follows its load, and a ban only stops
+/// the queued work.
+pub(super) fn purge_ember_ip_blocked_peers(state: &mut NetworkState) {
+    // Every verdict is taken before anything is removed: a LAN peer's exemption
+    // rests on the very session maps this clears.
+    let blocked: HashSet<(Ipv4Addr, u16)> = state
+        .ember_noise_keys
+        .keys()
+        .chain(state.ember_keyless_peers.keys())
+        .chain(state.ember_session_dht_contacts.keys())
+        .copied()
+        .filter(|(ip, port)| ember_peer_ip_verdict(state, *ip, *port) == EmberIpVerdict::Blocked)
+        .collect();
+    let refused: HashSet<ember::dht::EmberNodeId> = state
+        .ember_batch_publish
+        .queued
+        .iter()
+        .filter(|(_, (contact, _))| ember_addr_ip_verdict(state, contact.addr).refuses())
+        .map(|(node_id, _)| *node_id)
+        .collect();
+    // The buddy's PROXY_STORE_ACK is what releases one of these, and inbound
+    // drops anything from a refused address, so the record would otherwise sit
+    // out `EMBER_PROXY_OVERLAY_TTL` before its file could be selected again.
+    let stranded: Vec<(ember::dht::EmberNodeId, u32)> = state
+        .ember_pending_proxy_overlay
+        .keys()
+        .filter(|(buddy, _)| {
+            let held = state.ember_dht.contact_for(buddy).map(|c| c.addr).or_else(|| {
+                state
+                    .ember_session_dht_contacts
+                    .values()
+                    .find(|c| c.node_id == *buddy)
+                    .map(|c| c.addr)
+            });
+            held.is_some_and(|addr| ember_addr_ip_verdict(state, addr).refuses())
+        })
+        .copied()
+        .collect();
+
+    for key in &blocked {
+        state.ember_noise_keys.remove(key);
+        state.ember_keyless_peers.remove(key);
+        state.ember_session_dht_contacts.remove(key);
+        state.ember_kad_bridge_attempted.remove(key);
+    }
+    let dropped = state
+        .ember_batch_publish
+        .drop_destinations(|contact| refused.contains(&contact.node_id));
+    release_ember_queued_records(state, dropped);
+    for key in stranded {
+        if let Some(pending) = state.ember_pending_proxy_overlay.remove(&key) {
+            drop_ember_record_pending(state, pending.reference);
+        }
+    }
+
+    if !blocked.is_empty() {
+        debug!(
+            "Ember: forgot {} cached peer address(es) the IP policy now refuses",
+            blocked.len()
+        );
+    }
+}
+
+/// Hand queued records that will not be sent back to the publish schedule, so
+/// their files are selected again rather than left waiting on a placement that
+/// cannot come. A record another replica still carries is left to that replica.
+///
+/// Returns `(dropped, rearmed)` in the flush heartbeat's terms: a replication
+/// record handed back to the store's republish clock is rearmed, anything else
+/// is dropped.
+pub(super) fn release_ember_queued_records(
+    state: &mut NetworkState,
+    records: Vec<super::ember_publish::EmberQueuedRecord>,
+) -> (usize, usize) {
+    let outstanding: HashSet<EmberRecordRef> = records
+        .iter()
+        .map(|queued| queued.reference)
+        .filter(|reference| state.ember_batch_publish.record_still_outstanding(*reference))
+        .collect();
+    let released = settle_released_ember_records(state.publish_schedule(), records, |reference| {
+        outstanding.contains(&reference)
+    });
+    for record in &released.rearm {
+        state
+            .ember_dht
+            .mark_republish_due(&record.key, &record.record_signature);
+    }
+    for reference in released.published {
+        note_ember_file_published(state, reference.file_hash, reference.kind);
+    }
+    (released.dropped, released.rearm.len())
+}
+
 /// Verified routing-table (and cache) contacts plus firsthand session peers
 /// the table refused (typically LAN while `block_private_ips` is on).
 ///
@@ -668,15 +860,14 @@ pub(super) fn ember_dht_ui_contact_counts(state: &NetworkState) -> (u32, u32) {
 /// Routing-table contacts (including the replacement cache) plus firsthand
 /// session peers the table refused.
 ///
-/// Source search, empty-overlay re-arm, and self-lookup key off this rather
-/// than `ember_dht.contact_count()` so a LAN island with `block_private_ips`
-/// on still searches — FIND_VALUE already pins those session peers — and so
-/// a `nodes_ember.dat` lead is still a reason not to declare the overlay
-/// empty. Cache-only contacts (fail-closed parking, full-bucket) count too:
-/// `contact_for` includes the cache, so treating that as "already in the
-/// table" without adding `cached_len` made overlay/publishable read 0 while
-/// a firsthand peer sat only in the cache. Publish STOREs use
-/// [`ember_publishable_peer_count`] instead.
+/// Source search and self-lookup key off this rather than
+/// `ember_dht.contact_count()` so a LAN island with `block_private_ips` on
+/// still searches — FIND_VALUE already pins those session peers. Cache-only
+/// contacts (fail-closed parking, full-bucket) count too: `contact_for`
+/// includes the cache, so treating that as "already in the table" without
+/// adding `cached_len` made overlay/publishable read 0 while a firsthand peer
+/// sat only in the cache. Publish STOREs use [`ember_publishable_peer_count`]
+/// and the empty-overlay re-arm [`ember_rearm_contact_count`] instead.
 pub(super) fn ember_overlay_contact_count(state: &NetworkState) -> usize {
     state.ember_dht.routing().held_len() + ember_session_overlay_extras(state, false)
 }
@@ -685,13 +876,34 @@ pub(super) fn ember_overlay_contact_count(state: &NetworkState) -> usize {
 /// verified session peers the public table refused.
 ///
 /// [`ember_overlay_contact_count`] also includes unverified leads, which is
-/// right for bootstrap/re-arm (a seed we have not pinged yet is still a
+/// right for bootstrap (a seed we have not pinged yet is still a
 /// reason not to declare the overlay empty) and wrong for publish: STOREs
 /// queued at a lead sit behind a Noise handshake that never completes and
 /// expire as failures — 82 records / 102 failures in one measured minute
 /// against a single `nodes_ember.dat` seed that never answered.
 pub(super) fn ember_publishable_peer_count(state: &NetworkState) -> usize {
     state.ember_dht.routing().verified_held() + ember_session_overlay_extras(state, true)
+}
+
+/// What the "overlay emptied" re-arm counts: every routing-table and cache
+/// entry, plus the session peers the table refused that have answered us.
+///
+/// Not [`ember_overlay_contact_count`], which also counts unverified session
+/// copies. Those arrive from a LAN `PEER_LIST` with `last_seen == 0`, no
+/// liveness ping ever reaches them, and [`ember_session_contact_is_live`] keeps
+/// them until the LRU needs the slot — so one of them would hold that count
+/// above zero indefinitely, and the re-arm, the only way a spent address book
+/// becomes offerable again, would never fire. A table lead is different: it is
+/// pinged, and faults out if it never answers.
+pub(super) fn ember_rearm_contact_count(
+    dht: &ember::dht::engine::EmberDht,
+    session: &HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+) -> usize {
+    dht.routing().held_len()
+        + session
+            .values()
+            .filter(|c| c.is_verified() && dht.contact_for(&c.node_id).is_none())
+            .count()
 }
 
 /// Everything worth writing to `nodes_ember.dat`, from all three places a
@@ -915,15 +1127,40 @@ pub(super) fn ember_top_up_session_targets(
     }
 }
 
-/// Lookup-backed publish targets, topped up with session peers.
+/// Lookup-backed publish targets for one of our own records, topped up with
+/// session peers.
 pub(super) fn ember_overlay_publish_targets(
     state: &mut NetworkState,
     key: [u8; 16],
+) -> Vec<ember::dht::EmberContact> {
+    ember_overlay_publish_targets_within(state, key, EMBER_PUBLISH_TARGET_QUEUE_MAX)
+}
+
+/// Target-lookup queue slots a buddy's `PROXY_STORE` forwards may occupy.
+///
+/// The queue drains [`EMBER_MAINT_MAX_TARGET_LOOKUPS`] keys a cycle and is
+/// first come, first served, so every key queued on someone else's behalf
+/// delays one of ours. A forwarded key is as distant as any of ours, so it
+/// still gets a share — just not one that can crowd our own keys out.
+pub(super) const EMBER_FORWARDED_TARGET_QUEUE_MAX: usize = EMBER_PUBLISH_TARGET_QUEUE_MAX / 4;
+
+/// [`ember_overlay_publish_targets`], queueing a lookup for `key` only while the
+/// queue holds fewer than `queue_limit` keys.
+///
+/// Replication passes zero. A record we replicate is one we were asked to hold
+/// because its key is near our own ID, which is where our table is already
+/// accurate, and a store holds far more keys than the lookup cache, so letting
+/// it queue would fill the queue with replicated keys and refuse our own.
+pub(super) fn ember_overlay_publish_targets_within(
+    state: &mut NetworkState,
+    key: [u8; 16],
+    queue_limit: usize,
 ) -> Vec<ember::dht::EmberContact> {
     let now = chrono::Utc::now().timestamp();
     let mut targets = ember_publish_targets_for(
         &state.ember_publish_targets,
         &mut state.ember_publish_target_queue,
+        queue_limit,
         state.ember_dht.routing(),
         key,
         now,
@@ -1259,8 +1496,24 @@ pub(super) async fn send_ember_bridge_ping(
     udp_port: u16,
     noise_pub: Option<&[u8; 32]>,
 ) -> bool {
-    if crate::security::is_bogus_v4(ip) {
-        return false;
+    // Candidates come from KAD tags and eD2K sessions, neither of which the
+    // user's filter or ban list has seen. A firm block is forgotten here so the
+    // address stops taking a candidate slot; a ban is rested on the retry
+    // backoff like an unanswered dial, since it lifts; a filter still loading
+    // is only waited out.
+    match ember_peer_ip_verdict(state, ip, udp_port) {
+        EmberIpVerdict::Allowed => {}
+        EmberIpVerdict::Blocked => {
+            state.ember_noise_keys.remove(&(ip, udp_port));
+            state.ember_keyless_peers.remove(&(ip, udp_port));
+            state.ember_kad_bridge_attempted.remove(&(ip, udp_port));
+            return false;
+        }
+        EmberIpVerdict::Banned => {
+            note_ember_bridge_attempt(state, ip, udp_port);
+            return false;
+        }
+        EmberIpVerdict::Pending => return false,
     }
     let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
     let (_wire_req_id, frame) = state.ember_dht.build_ping();
@@ -1294,13 +1547,7 @@ pub(super) async fn send_ember_bridge_ping(
     // means of converting a lead on our own transport hiccup. A lost or
     // unanswered ping still counts — that is what the window is for.
     if dialled {
-        let now = std::time::Instant::now();
-        let entry = state
-            .ember_kad_bridge_attempted
-            .entry((ip, udp_port))
-            .or_insert((now, 0));
-        entry.0 = now;
-        entry.1 = entry.1.saturating_add(1);
+        note_ember_bridge_attempt(state, ip, udp_port);
     }
     if sent {
         state.ember_diagnostics.ember_dht_kad_bridge_pings = state
@@ -1309,6 +1556,16 @@ pub(super) async fn send_ember_bridge_ping(
             .saturating_add(1);
     }
     sent
+}
+
+fn note_ember_bridge_attempt(state: &mut NetworkState, ip: Ipv4Addr, udp_port: u16) {
+    let now = std::time::Instant::now();
+    let entry = state
+        .ember_kad_bridge_attempted
+        .entry((ip, udp_port))
+        .or_insert((now, 0));
+    entry.0 = now;
+    entry.1 = entry.1.saturating_add(1);
 }
 
 /// Ask live friend sessions for the Ember DHT contacts they hold.
@@ -1512,21 +1769,7 @@ pub(super) async fn ingest_friend_ember_contacts(
         );
         return;
     }
-    let local_id = state.ember_dht.local_id();
-    let mut learned = 0usize;
-    for contact in &contacts {
-        if contact.node_id == local_id {
-            continue;
-        }
-        let known = state.ember_dht.contact_for(&contact.node_id).is_some();
-        if matches!(
-            state.ember_dht.offer_contact(contact.clone()),
-            ember::dht::routing::AddResult::Added
-        ) && !known
-        {
-            learned += 1;
-        }
-    }
+    let (learned, pressure) = offer_friend_ember_contacts(&mut state.ember_dht, &contacts);
     if learned > 0 {
         state.ember_diagnostics.ember_dht_friend_contacts_learned = state
             .ember_diagnostics
@@ -1538,9 +1781,43 @@ pub(super) async fn ingest_friend_ember_contacts(
         crate::security::short_hash(&friend),
         contacts.len()
     );
+    probe_bucket_oldest(socket, state, &pressure, chrono::Utc::now().timestamp()).await;
     // No introducer: see the note above. The probe budget and its one-second
     // window still apply, so this cannot outspend ordinary gossip.
     probe_ember_gossip_leads(socket, state, &contacts, None).await;
+}
+
+/// Offer a friend's contacts to the routing table. Returns how many took a
+/// slot that no contact of ours held before, and the incumbents of the full
+/// buckets the rest were parked behind — which [`probe_bucket_oldest`] has to
+/// probe, or those contacts wait on an eviction nothing will trigger.
+pub(super) fn offer_friend_ember_contacts(
+    dht: &mut ember::dht::engine::EmberDht,
+    contacts: &[ember::dht::EmberContact],
+) -> (usize, Vec<(SocketAddr, ember::dht::EmberNodeId, [u8; 32])>) {
+    let local_id = dht.local_id();
+    let mut learned = 0usize;
+    let mut pressure = Vec::new();
+    for contact in contacts {
+        if contact.node_id == local_id {
+            continue;
+        }
+        let known = dht.contact_for(&contact.node_id).is_some();
+        match dht.offer_contact(contact.clone()) {
+            ember::dht::routing::AddResult::Added => {
+                if !known {
+                    learned += 1;
+                }
+            }
+            ember::dht::routing::AddResult::PingOldest {
+                addr,
+                node_id,
+                noise_pub,
+            } => pressure.push((addr, node_id, noise_pub)),
+            ember::dht::routing::AddResult::Rejected => {}
+        }
+    }
+    (learned, pressure)
 }
 
 /// Pin connected eD2K Ember peers onto a FIND_VALUE walk. Their records live
@@ -1798,6 +2075,7 @@ pub(super) async fn probe_ember_gossip_leads(
                 state.ember_gossip_reputation.note_probe(
                     intro,
                     contact.node_id,
+                    contact.addr,
                     std::time::Instant::now(),
                 );
             }

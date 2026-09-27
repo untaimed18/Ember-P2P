@@ -1120,12 +1120,12 @@ mod friend_transfer_tests {
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
 
         // Nothing learned yet: fall back to the table, but queue the key.
-        let from_table = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let from_table = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert_eq!(from_table.len(), 4, "publishing must not stall on a lookup");
         assert_eq!(queue.len(), 1, "the key is queued for a real lookup");
 
         // Asking again must not queue it twice.
-        let _ = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let _ = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert_eq!(queue.len(), 1, "one entry per key");
 
         // A resolved lookup is remembered by ID. Only IDs the table still holds
@@ -1136,7 +1136,7 @@ mod friend_transfer_tests {
         let evicted_since = ember::dht::EmberNodeId([0xAA; 16]);
         cache.insert(key, (vec![known, also_known, evicted_since], now));
         queue.clear();
-        let fresh = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let fresh = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert!(
             fresh.iter().any(|c| c.node_id == known),
             "a target the table still holds is used"
@@ -1171,7 +1171,7 @@ mod friend_transfer_tests {
             ),
         );
         queue.clear();
-        let all_gone = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let all_gone = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert_eq!(
             queue.len(),
             1,
@@ -1186,7 +1186,7 @@ mod friend_transfer_tests {
         cache.insert(key, (vec![known], now));
         queue.clear();
         let stale_at = now + EMBER_PUBLISH_TARGETS_TTL_SECS;
-        let stale = ember_publish_targets_for(&cache, &mut queue, &routing, key, stale_at);
+        let stale = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, stale_at);
         assert_eq!(queue.len(), 1, "an aged set queues the key again");
         assert!(
             !stale.is_empty(),
@@ -1225,7 +1225,7 @@ mod friend_transfer_tests {
         let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
 
-        let from_table = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let from_table = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert_eq!(from_table.len(), 1);
         assert!(from_table[0].is_verified());
         assert_eq!(from_table[0].node_id, ember::dht::EmberNodeId([0x41; 16]));
@@ -1235,7 +1235,7 @@ mod friend_transfer_tests {
         // anyone still unverified.
         cache.insert(key, (vec![ember::dht::EmberNodeId([0x40; 16])], now));
         queue.clear();
-        let from_cache = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        let from_cache = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert!(
             !from_cache
                 .iter()
@@ -1260,7 +1260,7 @@ mod friend_transfer_tests {
         let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
         let key = [0xCD; 16];
-        let mut targets = ember_publish_targets_for(&cache, &mut queue, &routing, key, 1_700_000_000);
+        let mut targets = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, 1_700_000_000);
         assert!(
             targets.is_empty(),
             "an empty public table has no closest contacts"

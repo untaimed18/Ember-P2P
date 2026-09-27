@@ -467,7 +467,12 @@ pub(super) fn record_matches_constraints(
     if constraints.min_size.is_some_and(|min| file_size < min) {
         return false;
     }
-    if constraints.max_size.is_some_and(|max| file_size > max) {
+    // Zero is "no limit" on every search path this overlay borrows from, so a
+    // sender that forwards it unfiltered is asking for everything, not nothing.
+    if constraints
+        .max_size
+        .is_some_and(|max| max > 0 && file_size > max)
+    {
         return false;
     }
     if constraints.file_type.is_some() || constraints.file_extension.is_some() {
@@ -513,6 +518,15 @@ pub(super) fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&data[17..33]);
     Some(hash)
+}
+
+/// The Ember BLAKE3 a packed record body names, read at its fixed offset — all
+/// zero when it names none. `None` when the body is too short to hold one.
+///
+/// Unverified, like [`file_hash_from_record_data`], and for the same callers:
+/// ones that bucket records by what they claim and parse nothing else.
+pub(super) fn ember_digest_from_record_data(data: &[u8]) -> Option<[u8; 32]> {
+    data.get(33..65)?.try_into().ok()
 }
 
 /// DHT key under which a file's source records live: `BLAKE3(file_hash)[..16]`.
@@ -2531,8 +2545,15 @@ impl PublishManager {
         }
     }
 
-    /// Store on the closest verified contacts currently in `routing`.
-    /// Channel presence, moderation, and handoff still use this snapshot.
+    /// Store on the closest contacts currently in `routing`: verified ones
+    /// first, with unverified leads filling any slots they leave empty (see
+    /// `RoutingTable::find_closest_prefer_verified`). Channel presence,
+    /// moderation, and handoff still use this snapshot.
+    ///
+    /// Leads stay in deliberately. On a young network they are most of the
+    /// table, and one that never answers costs a handshake and a target that
+    /// times out rather than a lost publish: nothing here parks a record for
+    /// failing, and the callers that care retry when it stored on nobody.
     pub fn start_publish(
         &mut self,
         record: SignedRecord,
@@ -2623,6 +2644,46 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    /// A maximum size of zero is how every search path here spells "no limit",
+    /// and a sender that forwards it unfiltered must not have every record under
+    /// the key refused.
+    #[test]
+    fn a_zero_max_size_constraint_is_no_limit() {
+        let sk = SigningKey::from_bytes(&[0x5C; 32]);
+        let record = SignedRecord::keyword(
+            "holiday",
+            [0x11; 16],
+            [0u8; 32],
+            700_000,
+            "holiday.mkv",
+            &sk,
+        );
+        let zero = super::super::messages::ValueConstraints {
+            max_size: Some(0),
+            ..Default::default()
+        };
+        assert!(record_matches_constraints(&record.data, &zero));
+
+        let zero_with_type = super::super::messages::ValueConstraints {
+            max_size: Some(0),
+            file_type: Some("Video".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            record_matches_constraints(&record.data, &zero_with_type),
+            "the other constraints still apply on their own"
+        );
+
+        let real_ceiling = super::super::messages::ValueConstraints {
+            max_size: Some(1_000),
+            ..Default::default()
+        };
+        assert!(
+            !record_matches_constraints(&record.data, &real_ceiling),
+            "a non-zero ceiling is still enforced"
+        );
+    }
 
     /// A keyword record's media block has to survive the wire, and — the property
     /// that lets it exist at all — a build that has never heard of it has to

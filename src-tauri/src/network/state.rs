@@ -92,13 +92,27 @@ pub struct EmberMaintenanceResult {
 /// erase the only number that answers "is this table growing?".
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct EmberVerifiedHighwater {
-    /// UTC calendar day `daily` belongs to (`YYYY-MM-DD`).
+    /// Local calendar day `daily` belongs to (`YYYY-MM-DD`).
     #[serde(default)]
     pub(super) day: String,
     #[serde(default)]
     pub(super) daily: u32,
     #[serde(default)]
     pub(super) alltime: u32,
+}
+
+/// The external address our Ember source records are published under, and the
+/// unix time it became that address.
+///
+/// Persisted because the publish stamps in known.met outlive the session: on
+/// the next launch this says which of them still vouch for records naming the
+/// right address. See [`hydrate_ember_publish_schedule`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct EmberSourceAddress {
+    #[serde(default)]
+    pub(super) ip: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub(super) since: i64,
 }
 
 /// Returned by the network task when an iterative `FIND_VALUE` lookup has
@@ -220,6 +234,12 @@ pub(super) struct NetworkState {
     /// nodes.dat task, so sharing one would either stall the event loop or skip
     /// the ember save every tick.
     pub(super) ember_nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The same rule for the verified-contact high-water file. On Windows two
+    /// atomic replaces of one file in flight at once can collide on the fixed
+    /// replace-backup name, and an older snapshot must not land last.
+    pub(super) ember_highwater_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The same rule for `ember_source_address.json`.
+    pub(super) ember_source_address_save_lock: Arc<tokio::sync::Mutex<()>>,
     pub(super) external_ip: Option<Ipv4Addr>,
     pub(super) external_udp_port: Option<u16>,
     /// STUN-over-TCP-confirmed public TCP port (probe from the listen port),
@@ -686,10 +706,12 @@ pub(super) struct NetworkState {
     pub(super) ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
     /// Signed DHT identity of an eD2K-session Ember peer. Kept even when the
     /// routing table refuses the address (LAN / `block_private_ips`) so
-    /// FIND_VALUE can still ask a connected publisher. Retained while the
-    /// contact's own `last_seen` is inside `KNOWN_EMBER_PEER_TTL` — a peer that
-    /// keeps sending signed frames renews its entry without needing a fresh
-    /// eD2K introduction.
+    /// FIND_VALUE can still ask a connected publisher. A contact that has
+    /// answered us is purged once it goes `EMBER_CONTACT_STALE_SECS` unheard
+    /// (see `ember_session_contact_is_live`) — a peer that keeps sending signed
+    /// frames renews its entry without needing a fresh eD2K introduction. A LAN
+    /// `PEER_LIST` lead not yet asked (`last_seen == 0`) stays only while an
+    /// eD2K introduction for its host is still inside `KNOWN_EMBER_PEER_TTL`.
     pub(super) ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
     /// Every Ember peer we remember, across restarts — the thing
     /// `nodes_ember.dat` actually holds.
@@ -732,6 +754,10 @@ pub(super) struct NetworkState {
     /// republish schedule advances only when this empties, so a file is not
     /// retired while some of its keywords remain unsearchable.
     pub(super) ember_publish_unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    /// Files in `ember_publish_unplaced` whose current round has already
+    /// placed at least one record, so the round counts as published however
+    /// its last key resolves.
+    pub(super) ember_publish_placed: HashSet<([u8; 16], EmberPublishKind)>,
     /// Consecutive publish rounds each file has left unconfirmed, driving the
     /// [`EMBER_PUBLISH_MAX_ATTEMPTS`] backoff.
     pub(super) ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
@@ -771,6 +797,12 @@ pub(super) struct NetworkState {
     /// that re-arm may fire so a node with no reachable peers cannot hammer
     /// the rendezvous lookup every eviction cycle.
     pub(super) ember_empty_rearmed_at: i64,
+    /// Unix time the maintenance tick last ran, so the next one can tell that
+    /// nothing was pinging the table in between. `None` before the first.
+    pub(super) ember_maint_last_run: Option<i64>,
+    /// Unix time until which the staleness purge ages nothing out. 0 = never
+    /// held. See `ember_stale_purge_hold`.
+    pub(super) ember_stale_purge_held_until: i64,
     /// Nodes a real lookup found to be closest to a record key, per key, with
     /// the unix time we learned them.
     ///
@@ -834,6 +866,11 @@ pub(super) struct NetworkState {
     /// disconnect clears the address until STUN reports the same one again.
     /// See [`reach_evidence_survives`].
     pub(super) ember_reach_external_ip: Option<Ipv4Addr>,
+    /// The address our source records carry. Unlike `external_ip` this is
+    /// never cleared: an address that is unknown for a while has not moved.
+    pub(super) ember_source_address: EmberSourceAddress,
+    /// Whether `ember_source_address` changed since it was last written out.
+    pub(super) ember_source_address_dirty: bool,
     /// When each peer's last browse of our shares was reported, so repeats
     /// inside the quiet window stay out of the log and off the screen. See
     /// [`shares_browse_is_new`].
@@ -883,8 +920,9 @@ pub(super) struct NetworkState {
     /// "connection" to bound the count, so a single IK-authenticated peer
     /// could otherwise send unlimited `ExchangeData` packets. Bounded by
     /// `MAX_EMBER_UDP_EPX_RATE_ENTRIES` with LRU-by-window-start eviction,
-    /// mirroring `known_ember_peers`.
-    pub(super) ember_udp_epx_rate: HashMap<SocketAddr, (u32, std::time::Instant)>,
+    /// mirroring `known_ember_peers`. Keyed by source IP; see
+    /// `check_and_record_udp_epx_rate`.
+    pub(super) ember_udp_epx_rate: HashMap<IpAddr, (u32, std::time::Instant)>,
     /// The same budget applied to inbound `ExchangeRequest`, which is the frame
     /// that makes us *build and send* an EPX payload. Only the receive side was
     /// bounded, so an authenticated peer could drive an unlimited number of
@@ -892,7 +930,7 @@ pub(super) struct NetworkState {
     /// rather than sharing `ember_udp_epx_rate` so the two directions of one
     /// exchange cannot eat each other's allowance — a peer legitimately sends us
     /// data and asks for ours inside the same window.
-    pub(super) ember_udp_epx_req_rate: HashMap<SocketAddr, (u32, std::time::Instant)>,
+    pub(super) ember_udp_epx_req_rate: HashMap<IpAddr, (u32, std::time::Instant)>,
     /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
@@ -1174,19 +1212,18 @@ pub(super) struct NetworkState {
     /// `EMBER_MAINT_PING_TIMEOUT`. Unlike `ember_dht_pending_pings` these
     /// have no waiter — they exist purely to drive eviction.
     pub(super) ember_dht_maint_pings: HashMap<u32, EmberMaintPing>,
-    /// Last time we (re)published an Ember DHT *source* record for each
-    /// shared file, keyed by its 16-byte eD2K hash (slice 9). The publish
-    /// tick republishes a file only after `EMBER_SOURCE_REPUBLISH` has
-    /// elapsed, mirroring KAD's per-file source-publish schedule but driven
-    /// independently of KAD connectivity so it works on a KAD-less network.
+    /// When each shared file's Ember DHT *source* record next falls due,
+    /// keyed by its 16-byte eD2K hash (slice 9): `EMBER_SOURCE_REPUBLISH`
+    /// after it was last placed. Mirrors KAD's per-file source-publish
+    /// schedule but is driven independently of KAD connectivity so it works
+    /// on a KAD-less network. A file with no entry is due now.
     pub(super) ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     pub(super) ember_source_publish_unix: HashMap<[u8; 16], u32>,
-    /// Last time we (re)published Ember DHT *keyword* records for each
-    /// shared file, keyed by its 16-byte eD2K hash (slice 8). The publish
-    /// tick republishes a file's keywords only after
-    /// `EMBER_KEYWORD_REPUBLISH` has elapsed.
+    /// When each shared file's Ember DHT *keyword* records next fall due,
+    /// keyed by its 16-byte eD2K hash (slice 8): `EMBER_KEYWORD_REPUBLISH`
+    /// after they were last placed. A file with no entry is due now.
     pub(super) ember_keyword_publish_at: HashMap<[u8; 16], std::time::Instant>,
     /// Unix-second copy of the keyword-publish stamps, written to known.met
     /// so a restart does not republish every keyword on launch.
@@ -1237,6 +1274,9 @@ pub(super) struct NetworkState {
     /// Firewalled source records waiting for `PROXY_STORE_ACK` before overlay
     /// `STORE_BATCH`. Keyed by `(buddy, request_id)`.
     pub(super) ember_pending_proxy_overlay: HashMap<(ember::dht::EmberNodeId, u32), EmberPendingProxyOverlay>,
+    /// How much of each buddy's `PROXY_STORE` allowance we have used, and
+    /// which buddies have stopped answering.
+    pub(super) ember_proxy_buddies: EmberProxyBuddyPacer,
     /// Channel gossip ids already persisted or flooded this session.
     pub(super) channel_gossip_seen: HashMap<[u8; 16], std::time::Instant>,
     pub(super) channel_gossip_seen_order: VecDeque<[u8; 16]>,
@@ -1506,4 +1546,10 @@ pub(super) struct EmberSearchRequest {
     /// answered something else while this query was outstanding is alive, and
     /// charging it a strike walks a working contact toward eviction.
     pub(super) sent_unix: i64,
+    /// The session this query was queued behind, when it was sent behind a
+    /// Noise handshake. The sweep asks whether that session exists by the
+    /// deadline: if not, the peer never answered the handshake either, which
+    /// the search treats differently from a lost reply — see
+    /// [`ember::dht::search::QueryFailure::HandshakeNeverCompleted`].
+    pub(super) handshake_to: Option<(std::net::SocketAddr, [u8; 32])>,
 }

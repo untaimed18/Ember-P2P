@@ -29,6 +29,21 @@ pub(super) fn ember_udp_ip_filter_allows(
     true
 }
 
+/// The node ID of the verified contact behind the Noise session `session_key`
+/// at `from`, if we hold one. An unverified gossip entry at the address names
+/// whatever node ID its introducer chose, so crediting it would let a peer
+/// charge its frames to someone else.
+pub(super) fn verified_session_node_id(
+    routing: &ember::dht::routing::RoutingTable,
+    from: SocketAddr,
+    session_key: &[u8; 32],
+) -> Option<[u8; 16]> {
+    routing
+        .contact_at(from)
+        .filter(|c| c.is_verified() && c.noise_pub == *session_key)
+        .map(|c| c.node_id.0)
+}
+
 /// Security gate for inbound Ember-native UDP, mirroring the IP-filter +
 /// ban-list + per-IP rate-limit checks `handle_udp_packet` applies to
 /// KAD/eD2K traffic. The event loop's Ember fast-path dispatches *above*
@@ -413,11 +428,8 @@ pub(super) async fn handle_ember_control_message(
                     // charged against the routing table's binding for this
                     // address. A peer we hold no contact for stays uncharged,
                     // bounded by the global relay-pool cap alone.
-                    let from_ember_hash = state
-                        .ember_dht
-                        .routing()
-                        .contact_at(from)
-                        .map(|c| c.node_id.0);
+                    let from_ember_hash =
+                        verified_session_node_id(state.ember_dht.routing(), from, &session_key);
                     let we_are_unreachable = state.firewalled || state.low_id;
                     let injected = handle_epx_sources(
                         state,

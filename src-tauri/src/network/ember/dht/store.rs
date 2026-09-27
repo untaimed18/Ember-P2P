@@ -7,7 +7,7 @@ use crate::network::ember::crypto;
 
 use super::publish::{
     channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_INDEX,
-    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
+    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -19,10 +19,10 @@ use super::{scale, EmberNodeId};
 /// right; the absolute number was the part a user felt.
 ///
 /// [`MAX_STORE_BYTES`] is deliberately left where it is, so this raises capacity
-/// per *key* without raising what the process may resident-hold. Whichever binds
-/// first, the byte budget still sheds the records this node is least responsible
-/// for rather than refusing the newcomer — so the interaction degrades by
-/// distance, not by arrival order.
+/// per *key* without raising what the process may resident-hold. The two degrade
+/// differently: the byte budget sheds the records this node is least responsible
+/// for rather than refusing the newcomer, so it degrades by distance, while a key
+/// at this count refuses every further record, which is by arrival order.
 const MAX_RECORDS_PER_KEY: usize = 1000;
 /// Maximum records one publisher may hold under a single key.
 ///
@@ -124,9 +124,10 @@ const KEYWORD_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// hinted that it was stale.
 ///
 /// Publishers re-announce their own source records every two hours
-/// (`EMBER_SOURCE_REPUBLISH` in `network::mod`), so six hours survives two
-/// missed republishes while clearing a departed peer four times sooner than
-/// before. KAD settles on five hours against a five-hour republish, which is a
+/// (`EMBER_SOURCE_REPUBLISH` in `network::ember_publishing`), so six hours
+/// survives one missed republish with two hours to spare — two in a row leave
+/// it lapsing just as the third lands — while clearing a departed peer four
+/// times sooner than before. KAD settles on five hours against a five-hour republish, which is a
 /// tighter margin than this.
 const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 
@@ -491,7 +492,9 @@ pub struct DhtStore {
     publisher_cap_rejections: u64,
     /// The key already holds `MAX_RECORDS_PER_KEY` live records.
     per_key_cap_rejections: u64,
-    /// Body too short to carry a record header, so nothing could ever parse it.
+    /// Body that no reader would accept: too short to carry a record header,
+    /// truncated before the signed identity fields, or naming a different key
+    /// in its signed body than the one it was filed under.
     unparseable_rejections: u64,
     /// Upper bound on the XOR distance of the furthest key currently held,
     /// or `None` when unknown.
@@ -1408,9 +1411,7 @@ impl DhtStore {
                 // re-announces its own source records on its publish tick, so
                 // they stay alive without storer-side replication. Only
                 // address-free records (e.g. keyword) replicate here.
-                if r.data.first() == Some(&RECORD_TYPE_SOURCE)
-                    || channel_kind_from_data(&r.data) == Some(CHANNEL_KIND_PRESENCE)
-                {
+                if !storer_replicates(&r.data) {
                     continue;
                 }
                 // A lapsed record is not worth a replica set of frames. Expiry is
@@ -1442,7 +1443,8 @@ impl DhtStore {
     /// Records worth carrying across a restart, closest keys first.
     ///
     /// A restart drops every record this node was holding for other publishers.
-    /// Storer replication refills them within the hour and the original
+    /// Storer replication refills them within a republish interval (two hours)
+    /// and the original
     /// publishers re-announce on their own schedule, so nothing is lost
     /// permanently — but on a young network with few replicas per record, and
     /// especially when an update restarts many nodes at once, that leaves a
@@ -1591,15 +1593,15 @@ impl DhtStore {
     ///
     /// Purely a gauge, so a maintainer can see replication falling behind its
     /// per-cycle budget instead of inferring it from a flat republish counter.
-    /// Source records are excluded for the same reason the batch skips them.
+    /// Records the batch never replicates are excluded for the same reason it
+    /// skips them.
     pub fn republish_backlog(&self, interval: Duration) -> usize {
         let now = Instant::now();
         let now_unix = chrono::Utc::now().timestamp();
         self.entries
             .values()
             .flat_map(|records| records.iter())
-            .filter(|r| r.data.first() != Some(&RECORD_TYPE_SOURCE))
-            .filter(|r| channel_kind_from_data(&r.data) != Some(CHANNEL_KIND_PRESENCE))
+            .filter(|r| storer_replicates(&r.data))
             // Counted on the same terms the batch selects on, or the gauge
             // reports work that will never be done.
             .filter(|r| r.expires_at_unix > now_unix)
@@ -1614,8 +1616,8 @@ impl DhtStore {
     /// can still fail to queue one: `EmberBatchPublisher::enqueue` refuses
     /// when the target list is momentarily empty (an ipfilter reload, a
     /// staleness purge, a cold start) or when the queue cap would be
-    /// overshot. Left stamped, the record sat unreplicated for a full hour
-    /// against a 24-hour TTL — drifting out of the k-closest set during churn
+    /// overshot. Left stamped, the record sat unreplicated for a full two-hour
+    /// republish interval against a 24-hour TTL — drifting out of the k-closest set during churn
     /// while the diagnostics counted a republish that never happened.
     pub fn mark_republish_due(&mut self, key: &[u8; 16], signature: &[u8; 64]) {
         let Some(records) = self.entries.get_mut(key) else {
@@ -1739,6 +1741,23 @@ impl DhtStore {
         out.sort_by_key(|entry| std::cmp::Reverse(entry.record_count));
         out.truncate(max);
         out
+    }
+}
+
+/// Whether a storer re-STOREs this record on the replication pass.
+///
+/// Only the address-free types we know: keywords, and channel records other
+/// than presence beats (which are only worth their short life). A source record
+/// binds its publisher's address, so a copy from us is refused as reflection.
+/// A type this build does not know is not relayed either: whether a copy from a
+/// third party is valid, or useful past its publisher's own republish, is
+/// exactly what we cannot tell, and relaying it would spend our uplink on
+/// records that escape every rule tied to a known type.
+fn storer_replicates(data: &[u8]) -> bool {
+    match data.first() {
+        Some(&RECORD_TYPE_KEYWORD) => true,
+        Some(&RECORD_TYPE_CHANNEL) => channel_kind_from_data(data) != Some(CHANNEL_KIND_PRESENCE),
+        _ => false,
     }
 }
 
@@ -2951,7 +2970,7 @@ mod tests {
     fn republish_batch_respects_interval_and_force() {
         let mut store = DhtStore::new();
         let (sk, _) = keypair();
-        let (d, d_sig) = signed_body([1u8; 16], &[7], &sk);
+        let (d, d_sig) = signed_body([1u8; 16], &[RECORD_TYPE_KEYWORD, 7], &sk);
         assert!(store.store([1u8; 16], d.clone(), d_sig));
 
         // Freshly stored ⇒ not due within a long interval.
@@ -2968,7 +2987,7 @@ mod tests {
 
         // A zero interval makes everything due (and `max` bounds the batch).
         let (sk2, _) = keypair();
-        let (d2, d2_sig) = signed_body([2u8; 16], &[8], &sk2);
+        let (d2, d2_sig) = signed_body([2u8; 16], &[RECORD_TYPE_KEYWORD, 8], &sk2);
         assert!(store.store([2u8; 16], d2, d2_sig));
         let all_due = store.take_republish_batch(Duration::from_secs(0), 1, false);
         assert_eq!(all_due.len(), 1, "max bounds the batch to 1");
@@ -3145,6 +3164,30 @@ mod tests {
             1,
             "source records must be excluded from republish"
         );
+        assert_eq!(batch[0].0, kw);
+    }
+
+    /// A record type this build cannot read is held — refusing it would make
+    /// every new type a wire break — but not relayed: whether a third party's
+    /// copy is valid or useful is exactly what we cannot tell.
+    #[test]
+    fn records_of_an_unknown_type_are_held_but_not_republished() {
+        let mut store = DhtStore::new();
+        let (sk, _) = keypair();
+        let (unknown, unknown_sig) = signed_body([1u8; 16], &[0x7E, 1], &sk);
+        assert!(store.store([1u8; 16], unknown, unknown_sig), "held");
+
+        let (sk2, _) = keypair();
+        let (kw, kw_sig) = signed_body([2u8; 16], &[RECORD_TYPE_KEYWORD, 2], &sk2);
+        assert!(store.store([2u8; 16], kw.clone(), kw_sig));
+
+        assert_eq!(
+            store.republish_backlog(Duration::from_secs(0)),
+            1,
+            "the gauge counts only what the batch will hand out"
+        );
+        let batch = store.take_republish_batch(Duration::from_secs(0), 10, true);
+        assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].0, kw);
     }
 

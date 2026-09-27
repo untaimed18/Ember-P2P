@@ -253,19 +253,36 @@ pub(in crate::network) async fn save_on_shutdown(
         // the nodes.dat path above does. Writing anyway would race that task on
         // the same file: whichever rename landed last would win, so the older
         // periodic snapshot could bury this newer one.
+        //
+        // The write itself goes to the blocking pool under the same deadline:
+        // `save_nodes` fsyncs the file and its directory, and inline on the
+        // runtime nothing would bound that stall.
+        let phase_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
         match tokio::time::timeout_at(
-            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2)),
-            state.ember_nodes_save_lock.lock(),
+            phase_deadline,
+            state.ember_nodes_save_lock.clone().lock_owned(),
         )
         .await
         {
-            Ok(_ownership) => {
-                if let Err(e) = ember::dht::bootstrap::save_nodes(
-                    &ember_nodes_path,
-                    &ember_contacts,
-                    state.ember_nodes_file,
-                ) {
-                    error!("Failed to save nodes_ember.dat on shutdown: {e}");
+            Ok(ownership) => {
+                let nodes_file_state = state.ember_nodes_file;
+                let writer = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    ember::dht::bootstrap::save_nodes(
+                        &ember_nodes_path,
+                        &ember_contacts,
+                        nodes_file_state,
+                    )
+                });
+                match tokio::time::timeout_at(phase_deadline, writer).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => error!("Failed to save nodes_ember.dat on shutdown: {e}"),
+                    Ok(Err(e)) => error!("nodes_ember.dat shutdown writer failed: {e}"),
+                    Err(_) => warn!(
+                        "Stopped waiting for the nodes_ember.dat shutdown writer at its phase \
+                         deadline; the save may not complete"
+                    ),
                 }
             }
             Err(_) => {
@@ -281,10 +298,64 @@ pub(in crate::network) async fn save_on_shutdown(
         || state.ember_verified_highwater.alltime > 0
         || state.ember_verified_highwater.daily > 0
     {
-        save_ember_verified_highwater(
-            &ember_highwater_path(&state.data_dir),
-            &state.ember_verified_highwater,
-        );
+        // Behind a maintenance-tick write still in flight, so this newer
+        // snapshot is the one that lands; off the runtime and bounded, like
+        // the saves around it.
+        let phase_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+        match tokio::time::timeout_at(
+            phase_deadline,
+            state.ember_highwater_save_lock.clone().lock_owned(),
+        )
+        .await
+        {
+            Ok(ownership) => {
+                let path = ember_highwater_path(&state.data_dir);
+                let hw = state.ember_verified_highwater.clone();
+                let writer = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    save_ember_verified_highwater(&path, &hw);
+                });
+                if tokio::time::timeout_at(phase_deadline, writer).await.is_err() {
+                    warn!(
+                        "Stopped waiting for the Ember high-water shutdown writer at its phase \
+                         deadline; the save may not complete"
+                    );
+                }
+            }
+            Err(_) => warn!(
+                "Skipping the Ember high-water shutdown save: a periodic save still holds the lock"
+            ),
+        }
+    }
+    if state.ember_source_address_dirty {
+        let phase_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+        match tokio::time::timeout_at(
+            phase_deadline,
+            state.ember_source_address_save_lock.clone().lock_owned(),
+        )
+        .await
+        {
+            Ok(ownership) => {
+                let path = ember_source_address_path(&state.data_dir);
+                let address = state.ember_source_address;
+                let writer = tokio::task::spawn_blocking(move || {
+                    let _ownership = ownership;
+                    save_ember_source_address(&path, &address);
+                });
+                if tokio::time::timeout_at(phase_deadline, writer).await.is_err() {
+                    warn!(
+                        "Stopped waiting for the Ember source-address shutdown writer at its \
+                         phase deadline; the save may not complete"
+                    );
+                }
+            }
+            Err(_) => warn!(
+                "Skipping the Ember source-address shutdown save: a periodic save still holds \
+                 the lock"
+            ),
+        }
     }
 
     // Persist the record store so the next session starts holding what this one

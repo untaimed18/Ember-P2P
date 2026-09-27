@@ -37,14 +37,26 @@ gets in through, in rough order of who arrives first:
    fixed KAD key as an ordinary source record carrying their Noise pubkey
    tag; a node with a near-empty table runs a plain source lookup there.
    Re-advertised every 5 hours (`EMBER_RENDEZVOUS_REPUBLISH_SECS`, matching
-   KAD's source TTL) and only while the node is reachable and already
-   publishing something, so a leecher never generates publish traffic
-   purely to list itself. Lookups are spaced 10 minutes apart and stop
-   once the table reaches one k-bucket.
+   KAD's source TTL), whether or not the node shares anything, but only
+   while its UDP port is known to take unsolicited datagrams — KAD's UDP
+   firewall check passed, or Ember's own evidence
+   (`ember_udp_reachable`) — because the joiner reads the address off the
+   advert and DHT-pings it. TCP reachability alone does not get a node
+   listed: a HighID node behind filtered UDP stays unlisted. It can still
+   keep one off, because the advert is built like any KAD source record: a
+   LowID node needs an open UDP port *and* either a KAD buddy or direct UDP
+   callback support, or it has no record to publish. While no listed peer has become a contact, lookups
+   are retried after 60 seconds, doubling to 10 minutes
+   (`EMBER_RENDEZVOUS_FIRST_RETRY_SECS` up to
+   `EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS`); once one has, they wait the
+   full 10 minutes. Lookups stop once the table reaches one k-bucket.
 2. **The KAD bridge.** Ember peers noticed in ordinary KAD traffic get
    DHT-pinged so their signed `PONG` folds them into the routing table.
-   Capped at `EMBER_KAD_BRIDGE_MAX_PINGS` per maintenance cycle and quiet
-   above `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`.
+   Capped at `EMBER_KAD_BRIDGE_MAX_PINGS` per maintenance cycle, plus a fast
+   pass of up to `EMBER_BRIDGE_FAST_MAX_PINGS` every
+   `EMBER_BRIDGE_FAST_INTERVAL` off the 1 Hz search timer while the table is
+   starved, and quiet above `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`. Candidates the
+   IP filter or ban list refuses are skipped.
 3. **eD2K client-to-client sessions.** Peers that advertise the Ember
    capability bit over a normal eD2K transfer are cached with their UDP
    port and bridged too, via Noise_XX when no static key is known. This is
@@ -284,8 +296,10 @@ unexercised end to end:
   which says nothing about whether the chain completes.
 
   The chain to walk, with the counter that shows each hop:
-  `BUDDY_ENDORSE_REQ` → endorsement absorbed → `PROXY_STORE` accepted
-  (`ember_dht_buddy_publishes`) → `PROXY_STORE_ACK` → overlay `STORE` → searcher
+  `BUDDY_ENDORSE_REQ` → endorsement absorbed → `PROXY_STORE` sent
+  (`ember_dht_buddy_publishes`) → accepted and fanned out by the buddy
+  (`ember_dht_buddy_forwards`, on the buddy) → `PROXY_STORE_ACK` → overlay
+  `STORE` → searcher
   finds the record → `CALLBACK_REQ` (`ember_dht_callback_sent`) → buddy bounces
   `CALLBACK` (`ember_dht_callback_forwards`) → publisher connects back
   (`ember_dht_callback_connects`).
@@ -767,9 +781,39 @@ against KAD.
   measure that prices identity directly, and being a one-time cost it prices
   mass Sybils rather than a hundred-identity one. The honest alternative is to
   accept the bound and rely on the byte ceiling and the per-address STORE cap to
-  keep the damage to bandwidth and memory rather than correctness. Nothing here
-  is a correctness break today: a flood cannot forge a record, displace a validly
-  signed one, or make a search return something unsigned.
+  keep the damage to bandwidth and memory rather than correctness. A flood cannot
+  forge a record, displace a validly signed one, or make a search return
+  something unsigned.
+
+  It *can* manufacture agreement, which is the one place free keys reach
+  correctness. A keyword row's availability and the digest a download enforces
+  are both votes among publishers, and a single responder can answer with as
+  many freshly keyed records as it likes. A digest that wins that vote pins a
+  BLAKE3 the real file does not have: every eD2K part verifies, the content check
+  fails, and the download is failed rather than re-queued. So the searcher
+  counts responders as well as publishers. On its own word, one node's answer
+  contributes at most `MAX_PUBLISHERS_PER_FILE_PER_NODE` (5) keyword records per
+  file and digest to a search (our own store's seed counts as one node); the rest
+  are held, and taken only when a node in another /24 returns the same record
+  (each confirmer unlocking at most four shares' worth per file and digest) or
+  the walk ends with that node the only one to have returned a record, our own
+  store included. A row counts only the
+  publishers that name its digest or none; a digest is ranked by how many
+  responders vouch for it before how many publishers name it; and automatic
+  pinning needs `MIN_EMBER_DIGEST_PUBLISHERS` (2) publishers carried by
+  `MIN_EMBER_DIGEST_RESPONDERS` (2) distinct responders, where a record two
+  nodes both returned counts as two. That bounds what a responder can fabricate
+  in its own reply: the attack costs a second node on the searcher's shortlist
+  rather than a second keypair.
+
+  It does not bound what a node can STORE. The storers near a keyword return
+  records planted on them as their own, so a fake digest planted there arrives
+  with as many responders as the real one. What keeps that from choosing the pin
+  is that a contested file — more than one digest clearing both thresholds — is
+  not pinned at all, and its row carries no digest for a click to pin either.
+  Planting beside the real records can therefore suppress the optional BLAKE3
+  check, leaving the eD2K/AICH hashes to carry verification, but not choose it.
+  Neither rule bounds colluding nodes.
 
   **"If abuse appears" is now a number rather than a judgement.**
   `MAX_STORE_IDENTITIES_PER_ADDR` (8) is the only cap keyed on something a

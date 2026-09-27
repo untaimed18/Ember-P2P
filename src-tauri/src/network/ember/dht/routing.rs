@@ -7,11 +7,18 @@ use crate::network::kad::{dht_common, ip_filter};
 
 use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
 
+/// How far past `now` a stamp may sit before
+/// [`RoutingTable::clamp_future_timestamps`] treats it as left behind by a
+/// backwards clock step rather than ordinary jitter.
+const CLOCK_STEP_SLACK_SECS: i64 = 60;
+
 /// A single routing-table bucket with a replacement cache.
 struct Bucket {
     contacts: VecDeque<EmberContact>,
     /// Replacement cache: contacts that couldn't be added because the bucket was full.
-    /// When a bucket contact is evicted (failed liveness), the newest cache entry replaces it.
+    /// When a bucket contact is evicted (failed liveness), the best eligible cache entry
+    /// replaces it — verified before unverified, then newest; see
+    /// [`RoutingTable::best_promotable_cached`].
     replacement_cache: VecDeque<EmberContact>,
     /// Timestamp of last activity in this bucket (for adaptive refresh).
     last_activity: i64,
@@ -183,11 +190,17 @@ impl RoutingTable {
     /// and every lookup frontier. An adversary present while we knew almost
     /// nobody could hold a quarter of the bucket that matters most, permanently.
     ///
-    /// Demoted rather than dropped. The cache is where a contact the caps turn
-    /// away already waits, `promote_cached_contacts` brings it back if a slot
-    /// frees up, and the distinction between "we cannot route through this peer
-    /// right now" and "stop remembering this peer" is one the rest of this
-    /// subsystem is careful about — see [`super::peer_cache`].
+    /// Demoted rather than dropped, as far as the cache has room. The cache is
+    /// where a contact the caps turn away already waits, `promote_cached_contacts`
+    /// brings it back if a slot frees up, and the distinction between "we cannot
+    /// route through this peer right now" and "stop remembering this peer" is
+    /// one the rest of this subsystem is careful about — see
+    /// [`super::peer_cache`]. A full cache still applies its own eviction rules,
+    /// and a demotee is over quota by construction: it may take the place of a
+    /// lead or of another over-quota entry, but never of a proven, promotable
+    /// one, so a crowded bucket can shed some of its demotees outright. Keeping
+    /// them would cost the cache the promotable entries it exists to hold, for
+    /// contacts the current quotas refuse anyway.
     ///
     /// Acting is deliberately later than admitting. The tier is read from
     /// four-fifths of the verified count, so `Small` admission starts at 10
@@ -216,7 +229,8 @@ impl RoutingTable {
     /// enough to widen the band has a `target` at or under the tier it widens
     /// to.
     ///
-    /// Returns how many contacts were demoted.
+    /// Returns how many demoted contacts a replacement cache still holds once
+    /// the pass is done; the rest were dropped.
     pub fn enforce_scale_quotas(&mut self) -> usize {
         let verified = self.verified_len();
         let floor = scale::NetworkScale::from_contacts(verified.saturating_mul(5) / 4);
@@ -285,7 +299,7 @@ impl RoutingTable {
             *per_ip.entry(ip).or_insert(0) += 1;
         }
 
-        let mut demoted = 0usize;
+        let mut moved: Vec<(usize, EmberNodeId)> = Vec::new();
         for (idx, node_id) in doomed {
             let Some(pos) = self.buckets[idx].find(&node_id) else {
                 continue;
@@ -294,12 +308,20 @@ impl RoutingTable {
             self.release_subnet(contact.subnet_key());
             self.release_ip(contact.addr.ip());
             self.add_to_cache(idx, contact, target);
-            demoted += 1;
+            moved.push((idx, node_id));
         }
-        if demoted > 0 {
+        // Counted once every demotee is in, not as each goes in: a later one
+        // from the same bucket can evict an earlier one from a full cache.
+        let demoted = moved
+            .iter()
+            .filter(|(idx, id)| self.buckets[*idx].find_in_cache(id).is_some())
+            .count();
+        let dropped = moved.len() - demoted;
+        if !moved.is_empty() {
             info!(
                 "Ember DHT: limits tightened to {target:?}; demoted {demoted} over-quota \
-                 contact(s) to their replacement caches"
+                 contact(s) to their replacement caches and dropped {dropped} a full cache \
+                 could not keep"
             );
         }
         demoted
@@ -363,12 +385,17 @@ impl RoutingTable {
     /// Unverified contacts are deliberately exempt: they have no meaningful
     /// `last_seen` to age, and they are leads we may not have tried yet.
     /// Their pressure is handled by the replacement-cache rules instead.
+    ///
+    /// Runs [`Self::clamp_future_timestamps`] first, so this is also where the
+    /// table recovers from the clock stepping backwards. An `i64::MAX` age
+    /// purges nothing and does only that.
     pub fn remove_stale(
         &mut self,
         now: i64,
         max_age_secs: i64,
         in_use: &HashSet<EmberNodeId>,
     ) -> usize {
+        self.clamp_future_timestamps(now);
         let doomed: Vec<EmberNodeId> = self
             .buckets
             .iter()
@@ -408,6 +435,47 @@ impl RoutingTable {
             );
         }
         removed
+    }
+
+    /// Pull every contact `last_seen` and bucket `last_activity` stamped more
+    /// than [`CLOCK_STEP_SLACK_SECS`] after `now` back to `now`. Returns how
+    /// many timestamps moved.
+    ///
+    /// Every stamp here comes from our own clock, so one from the future means
+    /// the clock stepped backwards since it was taken. Each age test reads
+    /// `now - stamp`, which for such a stamp stays negative until the clock
+    /// catches up again — possibly days: the contact is never due a liveness
+    /// ping, never old enough to purge, and a bucket-pressure probe's
+    /// `seen < sent` fault test never holds, while the bucket is never due a
+    /// refresh. Pulling it back to `now` claims nothing it had not already
+    /// claimed, and puts it back on the normal schedule. Leads (`0`) are
+    /// untouched and stay leads.
+    pub fn clamp_future_timestamps(&mut self, now: i64) -> usize {
+        let limit = now.saturating_add(CLOCK_STEP_SLACK_SECS);
+        let mut clamped = 0usize;
+        for bucket in &mut self.buckets {
+            if bucket.last_activity > limit {
+                bucket.last_activity = now;
+                clamped += 1;
+            }
+            for c in bucket
+                .contacts
+                .iter_mut()
+                .chain(bucket.replacement_cache.iter_mut())
+            {
+                if c.last_seen > limit {
+                    c.last_seen = now;
+                    clamped += 1;
+                }
+            }
+        }
+        if clamped > 0 {
+            info!(
+                "Ember DHT: pulled {clamped} future-dated timestamp(s) back to now; the clock \
+                 has stepped backwards"
+            );
+        }
+        clamped
     }
 
     /// Drop contacts the current IP policy would no longer admit. Run after
@@ -637,11 +705,29 @@ impl RoutingTable {
                 || self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip
         };
         if contact.is_verified() && would_be_refused {
+            // Same address first, then same /24, then — only in a full bucket —
+            // any lead. When the cap that binds is the newcomer's own address or
+            // /24, only a lead sharing it frees room under that cap; taking the
+            // first lead of another /24 fails the checks below and parks the
+            // proven newcomer while a squatter that could have made way for it
+            // keeps its slot.
             let pos = {
                 let bucket = &self.buckets[bucket_idx];
-                bucket.contacts.iter().position(|c| {
-                    !c.is_verified() && (c.subnet_key() == subnet || bucket.is_full())
-                })
+                let lead_where = |pred: &dyn Fn(&EmberContact) -> bool| {
+                    bucket
+                        .contacts
+                        .iter()
+                        .position(|c| !c.is_verified() && pred(c))
+                };
+                lead_where(&|c| c.addr.ip() == ip)
+                    .or_else(|| lead_where(&|c| c.subnet_key() == subnet))
+                    .or_else(|| {
+                        if bucket.is_full() {
+                            lead_where(&|_| true)
+                        } else {
+                            None
+                        }
+                    })
             };
             if let Some(pos) = pos {
                 let evicted_ip = self.buckets[bucket_idx].contacts[pos].addr.ip();
@@ -653,7 +739,7 @@ impl RoutingTable {
                 // be consulted — that is the case this fast path was written
                 // for. Taking a slot from a different /24 raises our count, and
                 // this branch returned `Added` without ever reaching the checks
-                // below. Because the `|| bucket.is_full()` disjunct above
+                // below. Because the full-bucket fallback above
                 // matches *any* unverified resident, and a contact counts as
                 // verified after one signed frame, a single /24 running one
                 // keypair per host could take every slot in a full bucket —
@@ -947,11 +1033,12 @@ impl RoutingTable {
     /// Returns whether a **replacement was promoted** — *not* whether the
     /// contact was evicted. `false` covers three different outcomes: the id was
     /// not in the table at all, or it was removed and nothing in the cache was
-    /// eligible to take the slot, or the bucket index was out of range. Only
-    /// the first leaves the table unchanged.
+    /// eligible to take the slot, or the bucket index was out of range. The
+    /// first and the last leave the table unchanged; only the middle one
+    /// removed anything.
     ///
     /// The distinction matters because reading `false` as "the contact is still
-    /// there" is wrong in two of the three cases. The sole production caller
+    /// there" is wrong in all three cases. The sole production caller
     /// uses it to pick a log line, so nothing depends on it today; it is spelled
     /// out here because the signature invites exactly that misreading.
     pub fn evict_and_replace(&mut self, dead_id: &EmberNodeId) -> bool {
@@ -1059,7 +1146,16 @@ impl RoutingTable {
     }
 
     /// Mark a contact as having responded successfully (reset fail count, update timestamp).
-    pub fn mark_alive(&mut self, node_id: &EmberNodeId) {
+    ///
+    /// Only when the entry is the one that answered: the same `addr` and
+    /// `noise_pub` the response arrived on. A node ID alone says nothing about
+    /// which endpoint is alive, and [`Self::add_contact`] deliberately leaves an
+    /// entry untouched when it refuses the session's endpoint (a pinned key, a
+    /// refused move, a diversity cap on the new address). Refreshing it here
+    /// anyway would keep an endpoint nobody has answered from alive and mortal
+    /// only on paper — and stamp an unverified lead verified, so the pin then
+    /// refuses the real peer.
+    pub fn mark_alive(&mut self, node_id: &EmberNodeId, addr: SocketAddr, noise_pub: &[u8; 32]) {
         let bucket_idx = match self.local_id.bucket_index(node_id) {
             Some(idx) => idx,
             None => return,
@@ -1069,7 +1165,11 @@ impl RoutingTable {
         }
 
         let bucket = &mut self.buckets[bucket_idx];
-        if let Some(pos) = bucket.find(node_id) {
+        let answered = bucket.find(node_id).filter(|&pos| {
+            let held = &bucket.contacts[pos];
+            held.addr == addr && held.noise_pub == *noise_pub
+        });
+        if let Some(pos) = answered {
             // Move the contact to the back of the deque so it becomes the
             // most-recently-seen entry. Kademlia's liveness rule relies on the
             // front being the least-recently-seen (the one we ping when the
@@ -1561,12 +1661,14 @@ impl RoutingTable {
             // IP-saturated entry is exactly as unpromotable as a subnet-saturated
             // one and was being treated as worth keeping.
             let bucket = &self.buckets[bucket_idx];
-            let ineligible = bucket.replacement_cache.iter().position(|c| {
+            let unpromotable = |c: &EmberContact| {
                 let s = c.subnet_key();
                 bucket.subnet_count(s) >= max_subnet_bucket
                     || self.global_subnet_count.get(&s).copied().unwrap_or(0) >= max_subnet_global
                     || self.global_ip_count.get(&c.addr.ip()).copied().unwrap_or(0) >= max_per_ip
-            });
+            };
+            let ineligible = bucket.replacement_cache.iter().position(unpromotable);
+            let newcomer_unpromotable = unpromotable(&contact);
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
                 Some(pos) => {
@@ -1601,6 +1703,10 @@ impl RoutingTable {
                         // recycle the whole cache through this arm and own the
                         // backfill for every later eviction.
                         None if !contact.is_verified() => return,
+                        // Likewise a contact the caps would refuse to promote —
+                        // a demotee from `enforce_scale_quotas` is one by
+                        // construction — must not displace one they would not.
+                        None if newcomer_unpromotable => return,
                         None => {
                             bucket.replacement_cache.pop_front();
                         }
@@ -1767,6 +1873,69 @@ mod tests {
             rt.enforce_scale_quotas(),
             0,
             "a tier already enforced does not re-run"
+        );
+    }
+
+    /// A full cache keeps its promotable entries ahead of a demotee, which is
+    /// over quota by construction, so a cache full of proven, promotable peers
+    /// turns every demotee away. The count has to say what is still held, not
+    /// what was moved.
+    #[test]
+    fn the_demotion_count_is_what_a_full_cache_actually_kept() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        let crowded: Vec<EmberContact> = (1..=5u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = 0x80;
+                id[1] = i;
+                contact_with(id, Ipv4Addr::new(80, 7, 7, i))
+            })
+            .collect();
+        for c in &crowded {
+            assert!(matches!(rt.add_contact(c.clone()), AddResult::Added));
+        }
+        let bucket = local.bucket_index(&crowded[0].node_id).expect("a bucket");
+        grow_verified(&mut rt, 15);
+
+        // Fill the same bucket, then its cache, with proven peers that share
+        // nothing — every cache entry is promotable.
+        let mut n = 0u8;
+        while rt.buckets[bucket].replacement_cache.len() < K_BUCKET_SIZE {
+            let mut id = [0u8; 16];
+            id[0] = 0x80;
+            id[1] = 0x40 + n;
+            rt.add_contact(contact_with(id, Ipv4Addr::new(90, n, 1, 1)));
+            n += 1;
+        }
+        assert!(rt.buckets[bucket].is_full());
+        assert_eq!(rt.scale(), scale::NetworkScale::Established);
+        let promotable: Vec<EmberNodeId> = rt.buckets[bucket]
+            .replacement_cache
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+
+        let demoted = rt.enforce_scale_quotas();
+        let excess = crowded.len()
+            - scale::NetworkScale::Established.max_contacts_per_subnet_per_bucket();
+        let held = crowded
+            .iter()
+            .filter(|c| rt.buckets[bucket].find_in_cache(&c.node_id).is_some())
+            .count();
+        let gone = crowded
+            .iter()
+            .filter(|c| rt.get_contact(&c.node_id).is_none())
+            .count();
+        assert_eq!(demoted, held, "the count is what the cache still holds");
+        assert_eq!(held + gone, excess);
+        assert!(gone > 0, "the fixture has to make the cache drop one");
+        assert!(
+            promotable
+                .iter()
+                .all(|id| rt.buckets[bucket].find_in_cache(id).is_some()),
+            "no promotable entry is given up for a demotee"
         );
     }
 
@@ -2271,7 +2440,8 @@ mod tests {
         }
         // Refresh the current oldest (0x80); it must no longer be the eviction
         // candidate once it moves to the back of the LRU deque.
-        rt.mark_alive(&make_id(0x80));
+        let oldest = contact_at(0x80, 80, 0x80, 1, 1);
+        rt.mark_alive(&oldest.node_id, oldest.addr, &oldest.noise_pub);
         // The next add overflows the bucket — the ping target is the new oldest.
         match rt.add_contact(contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1)) {
             AddResult::PingOldest { node_id, .. } => assert_eq!(node_id, make_id(0x81)),
@@ -2455,14 +2625,43 @@ mod tests {
     fn mark_alive_resets_failures() {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
-        rt.add_contact(make_contact(1, 4662));
+        let held = make_contact(1, 4662);
+        rt.add_contact(held.clone());
 
         rt.mark_failed(&make_id(1));
         rt.mark_failed(&make_id(1));
-        rt.mark_alive(&make_id(1));
+        rt.mark_alive(&held.node_id, held.addr, &held.noise_pub);
 
         let c = rt.get_contact(&make_id(1)).unwrap();
         assert_eq!(c.failed_queries, 0);
+    }
+
+    /// A response proves the endpoint it arrived on is alive, not whatever the
+    /// table files under that node ID. `add_contact` leaves an entry alone when
+    /// it refuses the session's endpoint, and refreshing it here regardless kept
+    /// an address nobody answered from alive, and stamped a gossiped lead
+    /// verified so the Noise-key pin then refused the real peer.
+    #[test]
+    fn mark_alive_ignores_a_response_from_another_endpoint() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut lead = make_contact(1, 4662);
+        lead.last_seen = 0;
+        rt.add_contact(lead.clone());
+        rt.mark_failed(&lead.node_id);
+
+        let elsewhere = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, 4)), 4662);
+        rt.mark_alive(&lead.node_id, elsewhere, &lead.noise_pub);
+        rt.mark_alive(&lead.node_id, lead.addr, &[0xEE; 32]);
+
+        let held = rt.get_contact(&lead.node_id).unwrap();
+        assert!(!held.is_verified(), "a different address must not verify the lead");
+        assert_eq!(held.failed_queries, 1, "nor clear its strikes");
+
+        rt.mark_alive(&lead.node_id, lead.addr, &lead.noise_pub);
+        let held = rt.get_contact(&lead.node_id).unwrap();
+        assert!(held.is_verified(), "the endpoint it holds answering does");
+        assert_eq!(held.failed_queries, 0);
     }
 
     /// Gossip is the only way most contacts arrive, and a peer can put any
@@ -2688,6 +2887,56 @@ mod tests {
         );
     }
 
+    /// A clock that steps backwards leaves stamps in the future, and every age
+    /// test reads those as younger than now until the clock catches up — so
+    /// the contact is never pinged, purged or faulted, and its bucket is never
+    /// refreshed.
+    #[test]
+    fn a_backwards_clock_step_does_not_make_contacts_immortal() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let now = 1_700_000_000i64;
+        let ahead = now + 3 * 86_400;
+
+        let mut dated = make_contact(1, 4672);
+        dated.last_seen = ahead;
+        let mut recent = make_contact(2, 4672);
+        recent.last_seen = now - 10;
+        let mut jitter = make_contact(4, 4672);
+        jitter.last_seen = now + CLOCK_STEP_SLACK_SECS;
+        let lead = gossip_contact(3);
+        for c in [dated.clone(), recent.clone(), jitter.clone(), lead.clone()] {
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        // A second observation is what stamps the bucket with the contact's time.
+        rt.add_contact(dated.clone());
+        let idx = local.bucket_index(&dated.node_id).expect("a bucket");
+        assert_eq!(rt.buckets[idx].last_activity, ahead);
+
+        assert_eq!(rt.remove_stale(now, 7200, &HashSet::new()), 0);
+        assert_eq!(rt.get_contact(&dated.node_id).unwrap().last_seen, now);
+        assert_eq!(rt.buckets[idx].last_activity, now);
+        assert_eq!(
+            rt.get_contact(&recent.node_id).unwrap().last_seen,
+            now - 10,
+            "a stamp in the past is left alone"
+        );
+        assert_eq!(
+            rt.get_contact(&jitter.node_id).unwrap().last_seen,
+            now + CLOCK_STEP_SLACK_SECS,
+            "and so is one within the slack"
+        );
+        assert!(
+            !rt.get_contact(&lead.node_id).unwrap().is_verified(),
+            "a lead stays a lead"
+        );
+
+        // From there it ages like any other contact.
+        assert_eq!(rt.remove_stale(now + 7200, 7200, &HashSet::new()), 2);
+        assert!(rt.get_contact(&dated.node_id).is_none());
+        assert!(rt.get_contact(&recent.node_id).is_none());
+    }
+
     /// The purge runs on the first maintenance tick, before any contact has
     /// been probed. Contacts restored from `nodes_ember.dat` must survive it,
     /// or a restart after the stale threshold leaves the node with nothing to
@@ -2743,7 +2992,11 @@ mod tests {
         assert_eq!(rt.total_contacts(), saved.len());
 
         // Once one answers, it counts as proven and ages normally from there.
-        rt.mark_alive(&saved[0].contact.node_id);
+        rt.mark_alive(
+            &saved[0].contact.node_id,
+            saved[0].contact.addr,
+            &saved[0].contact.noise_pub,
+        );
         assert!(rt
             .get_contact(&saved[0].contact.node_id)
             .unwrap()
@@ -2832,6 +3085,90 @@ mod tests {
             "the lead keeps its slot"
         );
         assert!(rt.buckets[bucket_idx].find(&live.node_id).is_some());
+    }
+
+    /// When the newcomer's own /24 is what the cap binds on, only a lead in that
+    /// /24 can make room. Displacing the first lead of any /24 fails the subnet
+    /// check and parks the proven peer while a same-/24 squatter keeps its slot.
+    #[test]
+    fn a_verified_peer_displaces_a_lead_in_its_own_subnet_when_that_cap_binds() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let cap = scale::NetworkScale::Bootstrap.max_contacts_per_subnet_per_bucket();
+
+        let mut first = contact_at(0x80, 80, 0, 1, 1);
+        first.last_seen = 0;
+        assert!(matches!(rt.add_contact(first.clone()), AddResult::Added));
+        for k in 0..cap as u8 {
+            let mut c = contact_at(0x81 + k, 80, 1, 1, k + 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        let mut id = 0x81 + cap as u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            let mut c = contact_at(id, 80, id, 1, 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            id += 1;
+        }
+
+        let live = contact_at(id, 80, 1, 1, 200);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "a lead in the newcomer's /24 can make room under the cap that binds"
+        );
+        let bucket_idx = local.bucket_index(&live.node_id).expect("a bucket");
+        let bucket = &rt.buckets[bucket_idx];
+        assert!(bucket.find(&live.node_id).is_some());
+        assert!(
+            bucket.find(&first.node_id).is_some(),
+            "the lead of another /24 is not the one to go"
+        );
+        assert_eq!(bucket.subnet_count(live.subnet_key()), cap);
+    }
+
+    /// The per-address cap is the tightest: only a lead at the newcomer's own
+    /// address frees room under it, so that lead goes before one merely sharing
+    /// the /24.
+    #[test]
+    fn a_verified_peer_displaces_a_lead_at_its_own_address_when_that_cap_binds() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let max_per_ip = scale::NetworkScale::Bootstrap.max_contacts_per_ip();
+
+        let mut other_subnet = contact_at(0x80, 80, 0, 1, 1);
+        other_subnet.last_seen = 0;
+        let mut same_subnet = contact_at(0x81, 80, 1, 1, 2);
+        same_subnet.last_seen = 0;
+        let mut same_ip = contact_at(0x82, 80, 1, 1, 9);
+        same_ip.last_seen = 0;
+        for c in [other_subnet.clone(), same_subnet.clone(), same_ip.clone()] {
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        let mut id = 0x83u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            let mut c = contact_at(id, 80, id, 1, 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            id += 1;
+        }
+        // Take the address to its cap from other buckets, verified but too few
+        // to leave the Bootstrap tier.
+        for bit in 0..(max_per_ip - 1) as u8 {
+            let elsewhere = contact_at(0x40 >> bit, 80, 1, 1, 9);
+            assert!(matches!(rt.add_contact(elsewhere), AddResult::Added));
+        }
+        assert_eq!(rt.scale(), scale::NetworkScale::Bootstrap);
+
+        let live = contact_at(id, 80, 1, 1, 9);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "the lead at the newcomer's address can make room under the per-IP cap"
+        );
+        assert!(rt.get_contact(&live.node_id).is_some());
+        assert!(rt.get_contact(&same_ip.node_id).is_none());
+        assert!(rt.get_contact(&same_subnet.node_id).is_some());
+        assert!(rt.get_contact(&other_subnet.node_id).is_some());
     }
 
     /// A move we refuse must leave the entry alone. Pairing the old address
